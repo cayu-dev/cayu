@@ -193,6 +193,11 @@ MAX_BROWSER_SESSION_MAX_UPLOAD_FILENAME_BYTES = 255
 MAX_BROWSER_SESSION_MAX_UPLOAD_MATERIALIZATION_MS = 120_000
 
 _MAX_BROWSER_ID_LENGTH = 128
+# Operator control needs the guest to dial the Cayu control plane. A Lambda
+# MicroVM's agent namespace routes only to the egress proxy relay, so control is
+# refused there before any credential is delivered. Recording is gated to Docker
+# separately.
+_BROWSER_CONTROL_UNREACHABLE_BACKENDS = frozenset({"lambda-microvm"})
 _MAX_OPERATION_ID_LENGTH = 128
 _MAX_REF_LENGTH = 128
 _MAX_ELEMENT_TEXT_BYTES = 2 * 1024
@@ -295,8 +300,10 @@ _ERROR_MESSAGES = {
     "browser_crash": "The interactive browser stopped unexpectedly.",
     "browser_unavailable": "The selected runner does not provide the interactive browser.",
     "browser_sandbox_unavailable": (
-        "Chromium sandbox startup was denied. Use Cayu's packaged browser_seccomp_profile() "
-        "with DockerEgressAdapter(seccomp_profile=...) and a host supporting sandbox namespaces."
+        "Chromium sandbox startup was denied. The guest must allow unprivileged sandbox "
+        "namespaces: on Docker, use Cayu's packaged browser_seccomp_profile() with "
+        "DockerEgressAdapter(seccomp_profile=...); on Lambda MicroVM, use the browser variant "
+        "of the first-party image."
     ),
     "browser_dependencies_unavailable": (
         "Chromium or its dependencies are missing. Build and select the pinned Cayu browser image."
@@ -1410,6 +1417,18 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
         if isinstance(prepared, BrowserBackendResponse):
             raise RuntimeError("Browser control runner authority is unavailable.")
         runner = prepared[0]
+        try:
+            control_candidate = runner.execution_admission_candidate()
+        except Exception:
+            control_candidate = None
+        if (
+            control_candidate is None
+            or control_candidate.candidate in _BROWSER_CONTROL_UNREACHABLE_BACKENDS
+        ):
+            raise RuntimeError(
+                "Browser operator control is unavailable: the selected runner has no "
+                "guest-to-control-plane network path."
+            )
         private_exec = getattr(runner, "_exec_private_browser_control", None)
         if not callable(private_exec):
             raise RuntimeError("Browser control requires private runner transport.")

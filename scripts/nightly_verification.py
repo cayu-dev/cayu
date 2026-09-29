@@ -701,6 +701,39 @@ CHECKS: tuple[VerificationCheck, ...] = (
         requires_structured_evidence=True,
     ),
     VerificationCheck(
+        id="aws-lambda-microvm-browser-live",
+        capability=(
+            "AWS Lambda MicroVM browser: verified worker workload, JavaScript web_fetch, "
+            "screenshot, and an interactive session through the Cayu proxy with Chromium's "
+            "sandbox enabled as UID 1000"
+        ),
+        lane="aws-lambda-microvm",
+        command=(
+            "uv",
+            "run",
+            "--extra",
+            "aws",
+            "--extra",
+            "egress",
+            "python",
+            "-m",
+            "examples.aws.lambda_microvm_browser_live",
+        ),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=(
+            "CAYU_LAMBDA_MICROVM_BROWSER_LIVE=1",
+            "CAYU_LAMBDA_MICROVM_IMAGE built from `cayu lambda-microvm sidecar export --browser`",
+            "CAYU_LAMBDA_MICROVM_EGRESS_CONNECTOR whose VPC reaches this host's private address",
+            "a host inside that VPC (the proxy listens on its private IPv4)",
+            "AWS_REGION or AWS_DEFAULT_REGION",
+            "AWS credential chain with Lambda MicroVM run, read, and terminate",
+        ),
+        required_env=("CAYU_LAMBDA_MICROVM_IMAGE", "CAYU_LAMBDA_MICROVM_EGRESS_CONNECTOR"),
+        required_env_values={"CAYU_LAMBDA_MICROVM_BROWSER_LIVE": "1"},
+        required_any_env=(("AWS_REGION", "AWS_DEFAULT_REGION"),),
+        requires_structured_evidence=True,
+    ),
+    VerificationCheck(
         id="aws-durable-services-live",
         capability="AWS S3 artifact store and Secrets Manager vault",
         lane="aws-durable-services",

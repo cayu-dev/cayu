@@ -19,7 +19,7 @@ from .supervisor import (
 )
 
 ROOT = os.environ.get("CAYU_MICROVM_WORKSPACE_ROOT", "/workspace")
-PROTOCOL_VERSION = "3"
+PROTOCOL_VERSION = "4"
 AGENT_UID = int(os.environ.get("CAYU_MICROVM_AGENT_UID", "1000"))
 AGENT_GID = int(os.environ.get("CAYU_MICROVM_AGENT_GID", "1000"))
 AGENT_NETNS = os.environ.get("CAYU_MICROVM_AGENT_NETNS", "cayu-agent")
@@ -146,6 +146,17 @@ async def start_command(payload: dict[str, Any]) -> dict[str, Any]:
 async def get_command(command_id: str) -> dict[str, Any]:
     try:
         result = await asyncio.to_thread(SUPERVISOR.get, command_id)
+    except CommandRequestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if result["state"] == "not_found":
+        raise HTTPException(status_code=404, detail="command not found")
+    return result
+
+
+@app.post("/v1/commands/{command_id}/release")
+async def release_command(command_id: str) -> dict[str, Any]:
+    try:
+        result = await asyncio.to_thread(SUPERVISOR.release, command_id)
     except CommandRequestError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if result["state"] == "not_found":

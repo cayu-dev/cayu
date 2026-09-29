@@ -28,6 +28,8 @@ from cayu.cli._guarded_tree_publication import (
 
 _MANIFEST_NAME = "cayu-lambda-microvm-sidecar-manifest.json"
 _PACKAGE_RESOURCE_DIRECTORY = "lambda_microvm_sidecar"
+_BROWSER_DOCKERFILE = "browser/Dockerfile"
+_BROWSER_WORKER_DIRECTORY = "browser-worker"
 _MANIFEST_KEYS = {
     "artifact_version",
     "cayu_version",
@@ -119,12 +121,25 @@ def add_lambda_microvm_parser(subparsers: Any) -> None:
         action="store_true",
         help="Delete and replace all contents of an existing destination directory.",
     )
+    export.add_argument(
+        "--browser",
+        action="store_true",
+        help=(
+            "Export the browser image variant: the sidecar under lambda_microvm_sidecar/, "
+            "this release's browser worker under browser-worker/, and a root Dockerfile "
+            "that installs Chromium and Playwright."
+        ),
+    )
 
 
 def run_lambda_microvm(args: argparse.Namespace) -> int:
     """Dispatch a parsed ``lambda-microvm`` invocation."""
     try:
-        result = _export_sidecar(args.destination, replace=args.replace)
+        result = _export_sidecar(
+            args.destination,
+            replace=args.replace,
+            browser=getattr(args, "browser", False),
+        )
         print(
             f"exported Lambda MicroVM sidecar to {result.destination}\n"
             f"content digest: {result.content_digest}"
@@ -139,6 +154,7 @@ def _export_sidecar(
     destination: Path,
     *,
     replace: bool,
+    browser: bool = False,
     resource_root: Traversable | None = None,
     expected_cayu_version: str | None = None,
 ) -> _SidecarExportResult:
@@ -153,22 +169,23 @@ def _export_sidecar(
             resource_root,
             expected_cayu_version=expected_cayu_version,
         )
+    contents = _browser_build_context(artifact) if browser else artifact.contents
     try:
         validate_guarded_tree_files(
-            artifact.contents,
+            contents,
             file_mode=0o644,
             directory_mode=0o755,
         )
     except GuardedTreePublicationError as exc:
         raise _translated_publication_error(exc) from exc
-    publication_digest = _sidecar_publication_request_digest(artifact.contents)
+    publication_digest = _sidecar_publication_request_digest(contents)
     destination = _validate_destination(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     _reject_link_components(destination.parent)
 
     def populate(staging: GuardedTreeStage) -> None:
         staging.write_files(
-            artifact.contents,
+            contents,
             file_mode=0o644,
             directory_mode=0o755,
         )
@@ -195,6 +212,37 @@ def _export_sidecar(
         destination=destination,
         content_digest=artifact.manifest.content_digest,
     )
+
+
+def _browser_build_context(artifact: _ValidatedSidecarArtifact) -> dict[str, bytes]:
+    """Compose the browser variant from the validated sidecar and installed worker.
+
+    The sidecar tree is copied unchanged, manifest included, so its digest still
+    identifies it. The worker files come from this installed Cayu release, the
+    same sources ``LambdaMicroVMRunner.verify_browser_workload`` compares
+    against, so an image built from this context proves itself only to hosts
+    running the same release.
+    """
+
+    from cayu.runners.workloads import browser_worker_sources
+
+    dockerfile = artifact.contents.get(_BROWSER_DOCKERFILE)
+    if dockerfile is None:
+        raise _SidecarArtifactError(f"sidecar artifact omits {_BROWSER_DOCKERFILE}")
+    context = {"Dockerfile": dockerfile}
+    context.update(
+        {
+            f"{_PACKAGE_RESOURCE_DIRECTORY}/{path}": content
+            for path, content in artifact.contents.items()
+        }
+    )
+    context.update(
+        {
+            f"{_BROWSER_WORKER_DIRECTORY}/{name}": content
+            for name, content in browser_worker_sources().items()
+        }
+    )
+    return context
 
 
 def _sidecar_publication_request_digest(contents: dict[str, bytes]) -> str:

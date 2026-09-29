@@ -63,6 +63,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.runners.aws_lambda_microvm",
         "LambdaMicroVMAllocationTerminated",
     ),
+    "LambdaMicroVMBrowserWorkloadError": (
+        "cayu.runners.aws_lambda_microvm",
+        "LambdaMicroVMBrowserWorkloadError",
+    ),
     "LambdaMicroVMClientTokenConflict": (
         "cayu.runners.aws_lambda_microvm",
         "LambdaMicroVMClientTokenConflict",
@@ -175,6 +179,7 @@ PUBLIC_NAMES = [
     "ExecResult",
     "HttpxLambdaMicroVMEndpointTransport",
     "LambdaMicroVMAllocationTerminated",
+    "LambdaMicroVMBrowserWorkloadError",
     "LambdaMicroVMClientTokenConflict",
     "LambdaMicroVMCloseAction",
     "LambdaMicroVMEndpointTransientError",

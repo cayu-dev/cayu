@@ -145,6 +145,7 @@ from cayu.runners.base import (
     Runner,
     RunnerExecutionAdmissionObserver,
     RunnerLifecycleState,
+    RunnerWorkloadAuthority,
     RunnerWorkspaceCapabilityT,
     _clean_runner_preflight,
     _clear_preflight_traceback_frames,
@@ -1019,10 +1020,19 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         )
 
     def workload_authority(self, name: str):
-        """Bind the built-in Docker factory to its exact selected workload image."""
+        """Bind the factory to the exact workload its runners are proven to carry.
+
+        Docker binds by the exact selected image. Other runner kinds bind only
+        when their adapter declares a workload that runner creation verifies.
+        """
 
         if self._runner_kind != "docker":
-            return None
+            adapter = self._adapter or self._resolve_adapter(None)
+            declare = getattr(adapter, "declared_workload_authority", None)
+            if not callable(declare):
+                return None
+            authority = declare(name, image=self._image)
+            return authority if type(authority) is RunnerWorkloadAuthority else None
         if (
             name == BROWSER_FETCH_WORKLOAD_NAME
             and self._image == PINNED_BROWSER_FETCH_WORKLOAD.image

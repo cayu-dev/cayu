@@ -63,7 +63,15 @@ class _FakeAuthority:
 
 
 class _FakeProxyServer:
-    def __init__(self, broker: Any, *, loop: Any, host: str) -> None:
+    def __init__(
+        self,
+        broker: Any,
+        *,
+        loop: Any,
+        host: str,
+        transport_auth_token: bytes | None = None,
+    ) -> None:
+        self.transport_auth_token = transport_auth_token
         del broker, loop, host
         self.authority = _FakeAuthority()
 

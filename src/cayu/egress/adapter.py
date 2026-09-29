@@ -31,7 +31,7 @@ from cayu.environments.admission import (
     ExecutionCapabilityEvidence,
     ExecutionRequirements,
 )
-from cayu.runners.base import Runner
+from cayu.runners.base import Runner, RunnerWorkloadAuthority
 from cayu.workspaces.revisions import (
     WorkspaceWriterIsolationEvidence,
 )
@@ -832,6 +832,23 @@ class SandboxEgressAdapter(ABC):
         raise UnsupportedEgressError(
             f"Runner {self.runner_kind!r} does not implement durable create-or-lookup."
         )
+
+    def declared_workload_authority(
+        self,
+        name: str,
+        *,
+        image: str,
+    ) -> RunnerWorkloadAuthority | None:
+        """Declare a workload every runner created for ``image`` will prove.
+
+        A factory uses this before any allocation exists. Returning an authority
+        is a promise that runner creation verifies it and fails otherwise, so a
+        created runner reports the same authority or is never admitted. The
+        default declares nothing.
+        """
+
+        del name, image
+        return None
 
     async def prepare_allocation_metadata(
         self,

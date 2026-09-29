@@ -15,6 +15,9 @@ from cayu.runners.aws_lambda_microvm import (
     LambdaMicroVMAllocationTerminated as LambdaMicroVMAllocationTerminated,
 )
 from cayu.runners.aws_lambda_microvm import (
+    LambdaMicroVMBrowserWorkloadError as LambdaMicroVMBrowserWorkloadError,
+)
+from cayu.runners.aws_lambda_microvm import (
     LambdaMicroVMClientTokenConflict as LambdaMicroVMClientTokenConflict,
 )
 from cayu.runners.aws_lambda_microvm import LambdaMicroVMCloseAction as LambdaMicroVMCloseAction

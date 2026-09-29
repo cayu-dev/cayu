@@ -139,7 +139,15 @@ def test_lambda_microvm_declares_planned_executable_checks_without_claiming_them
 class _FakeProxyServer:
     instances: list[_FakeProxyServer] = []
 
-    def __init__(self, broker: Any, *, loop: Any, host: str) -> None:
+    def __init__(
+        self,
+        broker: Any,
+        *,
+        loop: Any,
+        host: str,
+        transport_auth_token: bytes | None = None,
+    ) -> None:
+        self.transport_auth_token = transport_auth_token
         self.host = host
         self.authority = _FakeAuthority()
         self.closed = False

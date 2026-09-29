@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import email.utils
+import secrets
 import time
 import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -51,6 +52,13 @@ from cayu.runners.aws_lambda_microvm import (
     read_microvm_state,
     run_microvm_with_client_token,
     terminate_microvm_confirmed,
+)
+from cayu.runners.base import RunnerWorkloadAuthority
+from cayu.runners.workloads import (
+    BROWSER_FETCH_WORKLOAD_NAME,
+    BROWSER_SESSION_WORKLOAD_NAME,
+    PINNED_BROWSER_FETCH_WORKLOAD,
+    PINNED_BROWSER_SESSION_WORKLOAD,
 )
 from cayu.workspaces.revisions import (
     WorkspaceWriterIsolationEvidence,
@@ -199,6 +207,7 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
         metadata_isolation: LambdaMicroVMMetadataIsolationMode = "required",
         runner_options: Mapping[str, Any] | None = None,
         client_token_replay_window_s: int = DEFAULT_CLIENT_TOKEN_REPLAY_WINDOW_SECONDS,
+        browser_workload: bool = False,
     ) -> None:
         if (
             type(client_token_replay_window_s) is not int
@@ -217,6 +226,8 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
             raise TypeError("metadata_isolation must be 'required' or 'unverified'.")
         if metadata_isolation not in {"required", "unverified"}:
             raise ValueError("metadata_isolation must be 'required' or 'unverified'.")
+        if type(browser_workload) is not bool:
+            raise TypeError("browser_workload must be a boolean.")
         self.region_name = region_name
         self.egress_network_connector_arn = egress_network_connector_arn
         self.exposure = exposure
@@ -237,6 +248,7 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
         self.metadata_isolation = metadata_isolation
         self.runner_options = dict(runner_options or {})
         self.client_token_replay_window_s = client_token_replay_window_s
+        self.browser_workload = browser_workload
         self._runner_session_ids: weakref.WeakKeyDictionary[Runner, str] = (
             weakref.WeakKeyDictionary()
         )
@@ -272,6 +284,28 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
                 + ", ".join(sorted(overlap))
             )
 
+    def declared_workload_authority(
+        self,
+        name: str,
+        *,
+        image: str,
+    ) -> RunnerWorkloadAuthority | None:
+        """Declare the browser workload that every admitted MicroVM must prove.
+
+        With ``browser_workload=True`` each created or reconnected MicroVM runs
+        :meth:`LambdaMicroVMRunner.verify_browser_workload` before admission,
+        so a runner either reports this same authority or is never returned.
+        """
+
+        del image
+        if not self.browser_workload:
+            return None
+        if name == BROWSER_FETCH_WORKLOAD_NAME:
+            return PINNED_BROWSER_FETCH_WORKLOAD
+        if name == BROWSER_SESSION_WORKLOAD_NAME:
+            return PINNED_BROWSER_SESSION_WORKLOAD
+        return None
+
     async def prepare(
         self,
         *,
@@ -279,6 +313,13 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
         grants: Sequence[VirtualCredentialGrant],
         broker: TransparentEgressBroker,
     ) -> EgressBinding:
+        # The connector is shared by every MicroVM behind it, so the listener is
+        # reachable from other sessions. In the verified first-party topology the
+        # root relay authenticates each connection with this session's token,
+        # which isolates the listener and admits credentialless destinations.
+        transport_token = (
+            secrets.token_hex(32).encode("ascii") if self.metadata_isolation == "required" else None
+        )
         return await prepare_exposed_proxy_binding(
             runner_kind=self.runner_kind,
             session_id=session_id,
@@ -288,6 +329,7 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
             bind_host=self.bind_host,
             loop=self.loop,
             proxy_server_factory=self.proxy_server_factory,
+            transport_auth_token=transport_token,
         )
 
     async def prepare_reconnect(
@@ -637,6 +679,15 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
             if self.metadata_isolation == "required":
                 await _verify_agent_privilege_boundary(runner, timeout_s=self.preflight_timeout_s)
                 self._runner_privilege_verified.add(runner)
+                # The probe proved agent commands cannot see the proxy transport
+                # token, so only virtual grants can reach command output.
+                if request.env_overlay_secret_values_present is not None:
+                    runner._env_overlay_secret_values_present = (
+                        request.env_overlay_secret_values_present
+                    )
+            if self.browser_workload:
+                # The launch step keeps its own budget for a cold Chromium start.
+                await runner.verify_browser_workload(timeout_s=self.preflight_timeout_s)
             self._runner_preflight_observations[runner] = preflight_observed_at
         except BaseException:
             if owns_allocation:
@@ -852,6 +903,7 @@ _PRIVILEGE_PROBE_FAILURES = {
     12: "agent commands retain Linux capabilities",
     13: "agent command environment contains AWS credential variables",
     14: "agent commands can read an AWS credentials file",
+    15: "agent commands can read the egress proxy transport token",
 }
 _PRIVILEGE_PROBE_SCRIPT = """
 import os, sys
@@ -876,6 +928,8 @@ for path in ('/root/.aws/credentials', os.path.expanduser('~/.aws/credentials'))
     except OSError:
         continue
     sys.exit(14)
+if 'CAYU_EGRESS_PROXY_TRANSPORT_TOKEN' in os.environ:
+    sys.exit(15)
 """
 
 

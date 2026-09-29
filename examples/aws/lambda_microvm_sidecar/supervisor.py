@@ -21,15 +21,23 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 DEFAULT_OUTPUT_LIMIT_BYTES = 1024 * 1024
-MAX_OUTPUT_LIMIT_BYTES = 16 * 1024 * 1024
+# Sized for the built-in browser worker: a default session response envelope
+# plus a browser-profile checkpoint, and a default upload batch on stdin.
+MAX_OUTPUT_LIMIT_BYTES = 32 * 1024 * 1024
 DEFAULT_CANCEL_TIMEOUT_SECONDS = 5.0
-MAX_STDIN_BYTES = 1024 * 1024
+MAX_STDIN_BYTES = 24 * 1024 * 1024
 READ_CHUNK_BYTES = 64 * 1024
 
-_TERMINAL_STATES = frozenset({"completed", "cancelled", "failed"})
+_TERMINAL_STATES = frozenset({"completed", "cancelled", "failed", "released"})
 _PROXY_ENV_KEYS = ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy")
 _AGENT_PROXY_RELAY_PORT = 18080
 LIFECYCLE_ACTIONS = frozenset({"suspend", "terminate"})
+# A per-session token the relay presents to the Cayu proxy before any agent
+# bytes, so a listener reachable from other MicroVMs on the shared connector is
+# usable only through this MicroVM's root relay. Agent commands never see it.
+TRANSPORT_TOKEN_ENV = "CAYU_EGRESS_PROXY_TRANSPORT_TOKEN"
+_TRANSPORT_TUNNEL_TARGET = "cayu-transport.invalid:443"
+_MAX_TRANSPORT_RESPONSE_BYTES = 4096
 DEFAULT_COMMAND_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 ExecutionProfile = Literal["agent", "trusted"]
@@ -193,8 +201,25 @@ class CommandConflictError(RuntimeError):
 class _TcpRelay:
     """Root-namespace TCP relay exposed only on the agent veth gateway."""
 
-    def __init__(self, host: str, port: int, *, listen_host: str = "192.0.2.1") -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        *,
+        transport_token: bytes | None = None,
+        listen_host: str = "192.0.2.1",
+    ) -> None:
         self.target = (host, port)
+        self._transport_request = (
+            None
+            if transport_token is None
+            else (
+                f"CONNECT {_TRANSPORT_TUNNEL_TARGET} HTTP/1.1\r\n"
+                f"Host: {_TRANSPORT_TUNNEL_TARGET}\r\n"
+                "Proxy-Authorization: Basic "
+                f"{base64.b64encode(b'cayu:' + transport_token).decode('ascii')}\r\n\r\n"
+            ).encode("ascii")
+        )
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._listener.bind((listen_host, _AGENT_PROXY_RELAY_PORT))
@@ -236,6 +261,10 @@ class _TcpRelay:
         upstream: socket.socket | None = None
         try:
             upstream = socket.create_connection(self.target, timeout=5)
+            if self._transport_request is not None and not _open_transport_tunnel(
+                upstream, self._transport_request
+            ):
+                return
             upstream.settimeout(None)
             client.settimeout(None)
             with self._lock:
@@ -258,6 +287,25 @@ class _TcpRelay:
             if upstream is not None:
                 with contextlib.suppress(OSError):
                     upstream.close()
+
+
+def _open_transport_tunnel(upstream: socket.socket, request: bytes) -> bool:
+    """Authenticate this connection to the Cayu proxy before relaying agent bytes.
+
+    The proxy answers with a bare status head and then waits, so reading up to
+    the blank line never consumes tunneled data.
+    """
+    upstream.sendall(request)
+    head = bytearray()
+    while not head.endswith(b"\r\n\r\n"):
+        if len(head) >= _MAX_TRANSPORT_RESPONSE_BYTES:
+            return False
+        chunk = upstream.recv(1)
+        if not chunk:
+            return False
+        head.extend(chunk)
+    status = head.split(b"\r\n", 1)[0].split(b" ", 2)
+    return len(status) >= 2 and status[1] == b"200"
 
 
 class CommandExecutionBoundary:
@@ -285,7 +333,7 @@ class CommandExecutionBoundary:
         self.agent_netns = agent_netns
         self._relay_factory = relay_factory or _TcpRelay
         self._relay: Any | None = None
-        self._relay_target: tuple[str, int] | None = None
+        self._relay_target: tuple[tuple[str, int], bytes | None] | None = None
         self._relay_lock = threading.Lock()
 
     def argv_for(
@@ -324,7 +372,10 @@ class CommandExecutionBoundary:
         execution_profile: ExecutionProfile,
     ) -> dict[str, str]:
         copied = dict(environment)
-        if execution_profile == "trusted" or self.agent_netns is None:
+        if execution_profile == "trusted":
+            return copied
+        raw_token = copied.pop(TRANSPORT_TOKEN_ENV, None)
+        if self.agent_netns is None:
             return copied
         configured = [copied[key] for key in _PROXY_ENV_KEYS if key in copied]
         if not configured:
@@ -333,11 +384,17 @@ class CommandExecutionBoundary:
         if len(targets) != 1:
             raise CommandRequestError("agent proxy environment must name one private endpoint")
         target = next(iter(targets))
+        token = None if raw_token is None else _transport_token(raw_token)
+        relay_key = (target, token)
         with self._relay_lock:
             if self._relay is None:
-                self._relay = self._relay_factory(*target)
-                self._relay_target = target
-            elif self._relay_target != target:
+                self._relay = (
+                    self._relay_factory(*target)
+                    if token is None
+                    else self._relay_factory(*target, transport_token=token)
+                )
+                self._relay_target = relay_key
+            elif self._relay_target != relay_key:
                 raise CommandRequestError("agent proxy endpoint changed within one MicroVM")
             proxy_url = self._relay.proxy_url
         for key in _PROXY_ENV_KEYS:
@@ -431,7 +488,11 @@ class CommandSupervisor:
             root=self.root,
             execution_boundary=self.execution_boundary,
         )
-        fingerprint = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        # Only a digest is retained for idempotent replays: the payload can carry
+        # stdin and environment values that must not outlive the command.
+        fingerprint = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
         self._prune()
         with self._lock:
             existing = self._records.get(identifier)
@@ -466,6 +527,26 @@ class CommandSupervisor:
         if record is None:
             return {"command_id": identifier, "state": "not_found"}
         return self._snapshot(record)
+
+    def release(self, command_id: str) -> dict[str, Any]:
+        """Drop a delivered terminal result so its output is not retained.
+
+        The host releases a command after it has read the terminal result. The
+        record keeps only its payload digest, so a replayed start stays
+        idempotent while stdout and stderr are gone. Releasing a running or
+        unknown command changes nothing.
+        """
+        identifier = _command_id(command_id)
+        self._prune()
+        with self._lock:
+            record = self._records.get(identifier)
+        if record is None:
+            return {"command_id": identifier, "state": "not_found"}
+        with record.lock:
+            if record.state in _TERMINAL_STATES:
+                record.state = "released"
+                record.result = None
+            return self._snapshot_locked(record)
 
     def cancel(self, command_id: str, *, reason: str | None = None) -> dict[str, Any]:
         identifier = _command_id(command_id)
@@ -770,6 +851,12 @@ def _private_http_proxy(value: str) -> tuple[str, int]:
     ):
         raise CommandRequestError("agent proxy host must be a private IPv4 literal")
     return str(address), port
+
+
+def _transport_token(value: str) -> bytes:
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise CommandRequestError("agent proxy transport token is malformed")
+    return value.encode("ascii")
 
 
 def _validated_execution_profile(value: object) -> ExecutionProfile:

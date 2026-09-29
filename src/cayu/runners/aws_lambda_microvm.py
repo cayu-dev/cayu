@@ -62,12 +62,25 @@ from cayu.runners.base import (
     Runner,
     RunnerExecutionAdmissionObserver,
     RunnerSystemExecutionMode,
+    RunnerWorkloadAuthority,
     RunnerWorkspaceCapabilityT,
     _clean_runner_preflight,
     _clear_preflight_traceback_frames,
     _contains_runner_fatal_signal,
     attach_cancellation_artifacts,
     copy_exec_command,
+)
+from cayu.runners.workloads import (
+    BROWSER_FETCH_WORKLOAD_NAME,
+    BROWSER_SESSION_WORKLOAD_NAME,
+    BROWSER_WORKER_DIRECTORY,
+    BROWSER_WORKER_FILES,
+    BROWSER_WORKER_PLAYWRIGHT_BROWSERS_PATH,
+    BROWSER_WORKER_PLAYWRIGHT_VERSION,
+    BROWSER_WORKER_WEBSOCKETS_VERSION,
+    PINNED_BROWSER_FETCH_WORKLOAD,
+    PINNED_BROWSER_SESSION_WORKLOAD,
+    browser_worker_source_digests,
 )
 from cayu.vaults import SecretRedactor
 
@@ -80,8 +93,15 @@ DEFAULT_LAMBDA_MICROVM_READY_TIMEOUT_SECONDS = 60.0
 DEFAULT_LAMBDA_MICROVM_TOKEN_REFRESH_SKEW_SECONDS = 60.0
 DEFAULT_LAMBDA_MICROVM_EXEC_TIMEOUT_GRACE_SECONDS = 5.0
 DEFAULT_LAMBDA_MICROVM_MIN_POLL_INTERVAL_SECONDS = 0.01
-LAMBDA_MICROVM_PROTOCOL_VERSION = "3"
-LAMBDA_MICROVM_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+LAMBDA_MICROVM_PROTOCOL_VERSION = "4"
+# Sized for the built-in browser worker: a default session response envelope
+# plus a browser-profile checkpoint, and a default upload batch on stdin. Both
+# match the first-party sidecar's own ceilings.
+LAMBDA_MICROVM_MAX_OUTPUT_BYTES = 32 * 1024 * 1024
+LAMBDA_MICROVM_MAX_STDIN_BYTES = 24 * 1024 * 1024
+# A MicroVM fetches its root filesystem lazily, so a first Chromium start
+# measured from a few seconds to about a minute.
+LAMBDA_MICROVM_BROWSER_LAUNCH_TIMEOUT_SECONDS = 120
 LAMBDA_MICROVM_MAX_ENCODED_OUTPUT_BYTES = 4 * ((LAMBDA_MICROVM_MAX_OUTPUT_BYTES + 2) // 3)
 LAMBDA_MICROVM_MAX_RESPONSE_BYTES = 2 * LAMBDA_MICROVM_MAX_ENCODED_OUTPUT_BYTES + 64 * 1024
 _LAMBDA_TRANSIENT_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
@@ -313,6 +333,10 @@ class _LambdaMicroVMAdmissionIdentityDrift(LambdaMicroVMError):
     """The exact MicroVM changed while admission evidence was being observed."""
 
 
+class LambdaMicroVMBrowserWorkloadError(LambdaMicroVMError):
+    """The MicroVM image does not contain this Cayu release's browser worker."""
+
+
 class LambdaMicroVMClientTokenConflict(LambdaMicroVMError):
     """AWS rejected a client-token replay because its request parameters changed.
 
@@ -468,6 +492,22 @@ class HttpxLambdaMicroVMEndpointTransport:
             endpoint=endpoint,
             token=token,
             path=f"/v1/commands/{command_id}",
+            timeout_s=timeout_s,
+        )
+
+    async def release_command(
+        self,
+        *,
+        endpoint: str,
+        token: str,
+        command_id: str,
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        return await self._request(
+            "POST",
+            endpoint=endpoint,
+            token=token,
+            path=f"/v1/commands/{command_id}/release",
             timeout_s=timeout_s,
         )
 
@@ -698,6 +738,11 @@ class LambdaMicroVMRunner(Runner):
         # Advanced by every lifecycle transition so retained admission evidence
         # never outlives the running incarnation it observed.
         self._admission_epoch = 0
+        # Set only by a trusted probe of this MicroVM's image; never configured.
+        self._browser_workload_verified = False
+        # Fail closed: an overlay may carry secret values unless the adapter that
+        # built it declares otherwise after verifying the guest boundary.
+        self._env_overlay_secret_values_present = bool(self.env_overlay)
 
     def execution_admission_observer(self, requirements):
         """Own live executable evidence for this exact MicroVM and requirement set."""
@@ -741,6 +786,87 @@ class LambdaMicroVMRunner(Runner):
             tuple(sorted(copy_runner_env(self.env_overlay, inherit_env=False).items())),
             self._admission_epoch,
         )
+
+    def workload_authority(self, name: str) -> RunnerWorkloadAuthority | None:
+        """Declare the browser workload only after this MicroVM's image proved it."""
+
+        if not self._browser_workload_verified:
+            return None
+        if name == BROWSER_FETCH_WORKLOAD_NAME:
+            return PINNED_BROWSER_FETCH_WORKLOAD
+        if name == BROWSER_SESSION_WORKLOAD_NAME:
+            return PINNED_BROWSER_SESSION_WORKLOAD
+        return None
+
+    def output_secret_values_present(self) -> bool:
+        """Declare whether command output can contain runner-owned secret values."""
+
+        return self._env_overlay_secret_values_present
+
+    async def verify_browser_workload(
+        self,
+        *,
+        timeout_s: int = 30,
+        launch_timeout_s: int = LAMBDA_MICROVM_BROWSER_LAUNCH_TIMEOUT_SECONDS,
+    ) -> None:
+        """Prove the image carries this Cayu release's browser worker, or raise.
+
+        A trusted-profile probe hashes the root-owned worker files and reads the
+        pinned component versions through the exact interpreter the worker
+        command names. Then the agent profile launches Chromium once with its
+        sandbox enabled and renders a page, which proves the sandbox works on
+        this MicroVM and pays the first, lazily loaded Chromium start before any
+        tool can run. Only when both pass does :meth:`workload_authority` report
+        the browser workloads; the image is immutable for the MicroVM's lifetime
+        and unwritable by agent commands, so the proof holds until this runner
+        is discarded.
+        """
+
+        expected = browser_worker_source_digests()
+        result = await self.exec_system(
+            ExecCommand.process(
+                PINNED_BROWSER_SESSION_WORKLOAD.command[0],
+                "-I",
+                "-c",
+                _BROWSER_WORKLOAD_PROBE_SCRIPT,
+                BROWSER_WORKER_DIRECTORY,
+                BROWSER_WORKER_PLAYWRIGHT_BROWSERS_PATH,
+                *(name for name, _source in BROWSER_WORKER_FILES),
+            ),
+            timeout_s=timeout_s,
+            output_limit_bytes=_BROWSER_WORKLOAD_PROBE_OUTPUT_LIMIT_BYTES,
+        )
+        if result.timed_out or result.exit_code != 0 or result.stdout_truncated:
+            raise LambdaMicroVMBrowserWorkloadError(
+                "Lambda MicroVM image has no browser worker interpreter at "
+                f"{PINNED_BROWSER_SESSION_WORKLOAD.command[0]}; build it from the browser "
+                "variant of the first-party sidecar image."
+            )
+        try:
+            observed = json.loads(result.stdout)
+        except ValueError:
+            observed = None
+        mismatch = _browser_workload_mismatch(observed, expected)
+        if mismatch is not None:
+            raise LambdaMicroVMBrowserWorkloadError(
+                f"Lambda MicroVM browser workload is not this Cayu release's: {mismatch}."
+            )
+        launched = await self.exec(
+            ExecCommand.process(
+                PINNED_BROWSER_SESSION_WORKLOAD.command[0], "-I", "-c", _BROWSER_LAUNCH_PROBE_SCRIPT
+            ),
+            env={"PLAYWRIGHT_BROWSERS_PATH": BROWSER_WORKER_PLAYWRIGHT_BROWSERS_PATH},
+            timeout_s=launch_timeout_s,
+            output_limit_bytes=_BROWSER_WORKLOAD_PROBE_OUTPUT_LIMIT_BYTES,
+        )
+        if launched.timed_out or launched.exit_code != 0:
+            reason = (
+                "did not start within its launch timeout"
+                if launched.timed_out
+                else "could not start with its sandbox as the agent user"
+            )
+            raise LambdaMicroVMBrowserWorkloadError(f"Lambda MicroVM Chromium {reason}.")
+        self._browser_workload_verified = True
 
     @classmethod
     async def create(
@@ -1210,6 +1336,14 @@ class LambdaMicroVMRunner(Runner):
             environment.update(env_overlay)
         timeout = validate_timeout(timeout_s)
         standard_input = validate_stdin(stdin)
+        if (
+            standard_input is not None
+            and len(standard_input.encode("utf-8")) > LAMBDA_MICROVM_MAX_STDIN_BYTES
+        ):
+            raise ValueError(
+                f"Lambda MicroVM stdin exceeds the sidecar limit of "
+                f"{LAMBDA_MICROVM_MAX_STDIN_BYTES} bytes."
+            )
         output_limit = validate_output_limit(output_limit_bytes)
         output_limit = min(
             LAMBDA_MICROVM_MAX_OUTPUT_BYTES,
@@ -1288,6 +1422,7 @@ class LambdaMicroVMRunner(Runner):
             del command
         handle = _LambdaMicroVMCommandHandle(self, command_id)
         start_acknowledged = False
+        release_after_read = False
         loop = asyncio.get_running_loop()
         deadline = (
             loop.time() + timeout + DEFAULT_LAMBDA_MICROVM_EXEC_TIMEOUT_GRACE_SECONDS
@@ -1308,6 +1443,8 @@ class LambdaMicroVMRunner(Runner):
                                 "A newer Lambda MicroVM owner cancelled this command."
                             )
                         result = _exec_result(response)
+                        del response
+                        release_after_read = True
                         if output_redactor is not None:
                             result = redact_completed_exec_result(
                                 result,
@@ -1322,7 +1459,7 @@ class LambdaMicroVMRunner(Runner):
                                 start_acknowledged=start_acknowledged,
                             )
                             result.artifacts.append(cleanup.artifact)
-                        return result
+                        break
                     if state not in {"accepted", "running"}:
                         raise LambdaMicroVMProtocolError(
                             f"Lambda MicroVM command returned unsupported state: {state}"
@@ -1363,6 +1500,25 @@ class LambdaMicroVMRunner(Runner):
                 start_acknowledged=start_acknowledged,
             )
             raise
+        if release_after_read:
+            await self._release_command(command_id)
+        return result
+
+    async def _release_command(self, command_id: str) -> None:
+        """Ask the sidecar to drop a terminal result the host has now read.
+
+        Browser profile and upload traffic carries cookies and file contents, so
+        the delivered output should not stay in sidecar memory (or in a suspend
+        snapshot) until the result TTL expires. Failure leaves that TTL as the
+        bound and never changes the command's outcome.
+        """
+
+        if not callable(getattr(self._endpoint_transport, "release_command", None)):
+            return
+        try:
+            await self._endpoint_call("release_command", command_id=command_id)
+        except Exception:
+            _LOGGER.debug("Lambda MicroVM command release failed", exc_info=True)
 
     async def _cleanup_exec_command(
         self,
@@ -1415,6 +1571,7 @@ class LambdaMicroVMRunner(Runner):
             if state not in {"completed", "cancelled", "failed"}:
                 return result
             terminal = _exec_result(response)
+            del response
             if output_redactor is not None:
                 terminal = redact_completed_exec_result(
                     terminal,
@@ -1424,6 +1581,7 @@ class LambdaMicroVMRunner(Runner):
                 )
         except Exception:
             return result
+        await self._release_command(command_id)
         return ExecResult(
             stdout=terminal.stdout,
             stderr=terminal.stderr,
@@ -2341,6 +2499,102 @@ class _LambdaAdmissionObserver(RunnerExecutionAdmissionObserver):
 
     async def refresh(self):
         await self.collect()
+
+
+_BROWSER_WORKLOAD_PROBE_OUTPUT_LIMIT_BYTES = 4096
+# Runs in the agent profile. Exit status is the whole protocol.
+_BROWSER_LAUNCH_PROBE_SCRIPT = """
+import asyncio, shutil, tempfile
+from playwright.async_api import async_playwright
+
+async def launch(home):
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(chromium_sandbox=True, env={'HOME': home})
+        page = await browser.new_page()
+        await page.set_content('<main>cayu</main>')
+        await browser.close()
+
+home = tempfile.mkdtemp(prefix='cayu-browser-probe-')
+try:
+    asyncio.run(launch(home))
+finally:
+    shutil.rmtree(home, ignore_errors=True)
+"""
+# Runs in the trusted profile with the worker's own interpreter. It reports
+# digests and versions only; the host compares them for equality and never
+# interprets other guest text.
+_BROWSER_WORKLOAD_PROBE_SCRIPT = """
+import glob, hashlib, importlib.metadata as metadata, json, os, stat, sys
+root, browsers, names = sys.argv[1], sys.argv[2], sys.argv[3:]
+def owned(path, directory=False):
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    kind = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+    return kind and info.st_uid == 0 and not info.st_mode & 0o022
+files = {}
+for name in names:
+    path = os.path.join(root, name)
+    if owned(path):
+        with open(path, 'rb') as handle:
+            files[name] = hashlib.sha256(handle.read()).hexdigest()
+    else:
+        files[name] = None
+versions = {}
+for name in ('playwright', 'websockets'):
+    try:
+        versions[name] = metadata.version(name)
+    except metadata.PackageNotFoundError:
+        versions[name] = None
+shells = [
+    path
+    for pattern in ('headless_shell', 'chrome-headless-shell')
+    for path in glob.glob(os.path.join(browsers, 'chromium_headless_shell-*', '**', pattern),
+                          recursive=True)
+]
+print(json.dumps({
+    'directory': owned(root, directory=True),
+    'files': files,
+    'versions': versions,
+    'interpreter': owned(os.path.realpath(sys.executable)),
+    'headless_shell': any(owned(path) and os.access(path, os.X_OK) for path in shells),
+    'certutil': owned('/usr/bin/certutil') and os.access('/usr/bin/certutil', os.X_OK),
+}, sort_keys=True))
+"""
+
+
+def _browser_workload_mismatch(observed: object, expected: Mapping[str, str]) -> str | None:
+    if not isinstance(observed, dict):
+        return "the probe returned no report"
+    observed = cast("dict[str, Any]", observed)
+    if observed.get("directory") is not True:
+        return f"{BROWSER_WORKER_DIRECTORY} is not a root-owned, read-only directory"
+    if observed.get("interpreter") is not True:
+        return "the worker interpreter is not root-owned and read-only"
+    files = observed.get("files")
+    if not isinstance(files, dict):
+        return "the probe reported no worker files"
+    for name, digest in expected.items():
+        if files.get(name) != digest:
+            return f"worker file {name} is missing, writable, or from another release"
+    versions = observed.get("versions")
+    if not isinstance(versions, dict):
+        return "the probe reported no component versions"
+    pins = {
+        "playwright": BROWSER_WORKER_PLAYWRIGHT_VERSION,
+        "websockets": BROWSER_WORKER_WEBSOCKETS_VERSION,
+    }
+    for name, version in pins.items():
+        if versions.get(name) != version:
+            return f"{name} is not the pinned {version}"
+    if observed.get("headless_shell") is not True:
+        return (
+            f"no root-owned Chromium headless shell under {BROWSER_WORKER_PLAYWRIGHT_BROWSERS_PATH}"
+        )
+    if observed.get("certutil") is not True:
+        return "/usr/bin/certutil (NSS tools) is not installed"
+    return None
 
 
 def _exec_result(response: Mapping[str, Any]) -> ExecResult:

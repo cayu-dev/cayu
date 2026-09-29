@@ -168,6 +168,7 @@ class SupervisorTransport(OwnerFencedTransport):
         self.boot_id = boot_id
         self.execution_profiles: list[str] = []
         self.payloads: list[dict[str, Any]] = []
+        self.released: list[str] = []
         self._scripted_results: dict[str, dict[str, Any]] = {}
 
     async def health(self, **_kwargs: Any) -> dict[str, str]:
@@ -212,6 +213,12 @@ class SupervisorTransport(OwnerFencedTransport):
         if command_id in self._scripted_results:
             return {"command_id": command_id, "state": "cancelled"}
         return await asyncio.to_thread(self.supervisor.cancel, command_id)
+
+    async def release_command(self, *, command_id: str, **_kwargs: Any) -> dict[str, Any]:
+        self.released.append(command_id)
+        if self._scripted_results.pop(command_id, None) is not None:
+            return {"command_id": command_id, "state": "released"}
+        return await asyncio.to_thread(self.supervisor.release, command_id)
 
     def on_owner_superseded(self, generation: int) -> None:
         self.supervisor.cancel_all(reason="owner_superseded", before_generation=generation)

@@ -1,7 +1,7 @@
 {
   "artifact_version": 1,
   "cayu_version": "0.7.0",
-  "content_digest": "sha256:d565a9963825c4d748356480270c008a5366607b7e1d4eae18c1db03cd2e49ce",
+  "content_digest": "sha256:c1e1d42cac35fb572c0efbc6be93688fa594219933bd34bba3331315456b5194",
   "files": [
     {
       "path": "Dockerfile",
@@ -10,8 +10,8 @@
     },
     {
       "path": "README.md",
-      "sha256": "sha256:98b214516c03cba0d014e8b0259d6f7e774735871cd2d2a6ab29aae24ab77876",
-      "size": 9343
+      "sha256": "sha256:f6d2c5a29d7a377fb5a43be7bc972d1542dd49d922c4ca1ecd2ada00ed5ba39c",
+      "size": 10547
     },
     {
       "path": "__init__.py",
@@ -20,8 +20,18 @@
     },
     {
       "path": "app.py",
-      "sha256": "sha256:e7ee156f9d9689bb7de3858490da012c636d2bfe14f22652fdc2dfa00d0afcf7",
-      "size": 7412
+      "sha256": "sha256:88cb16494fb4c53e7568f3336b0c0a963be8580ac9fb01e432a0924e7c1e7a37",
+      "size": 7845
+    },
+    {
+      "path": "browser/Dockerfile",
+      "sha256": "sha256:6ac1d33afd8069c5c334552e4f6c077ee3e4fe526298e88ce3959dea325c970c",
+      "size": 4160
+    },
+    {
+      "path": "browser/start.sh",
+      "sha256": "sha256:f90f03771f3df80ba26e25251f79b4c378b8ea0de9bd7992875265f50f3cc577",
+      "size": 651
     },
     {
       "path": "entrypoint.sh",
@@ -35,10 +45,10 @@
     },
     {
       "path": "supervisor.py",
-      "sha256": "sha256:d5f1bc1f2b440dc7f6421d5d8ed2ec2d75ee35637d942a164a0a7c890256fe8e",
-      "size": 35656
+      "sha256": "sha256:060e4d1af923544e5b9935b5e02401187e40676ed421577988b0d17deebfcb3f",
+      "size": 39281
     }
   ],
-  "protocol_version": "3",
+  "protocol_version": "4",
   "schema_version": 1
 }

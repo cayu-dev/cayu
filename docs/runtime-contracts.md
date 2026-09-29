@@ -12247,8 +12247,13 @@ extra. `create(...)` calls the distinct `lambda-microvms` control API, waits for
 sidecar health interface, and terminates a newly created MicroVM if setup fails or is cancelled.
 `from_existing(...)` restores identity from `get_microvm` and generates a fresh endpoint token;
 JWE tokens are memory-only and never belong in reconnect metadata. Both process and shell forms
-cross sidecar protocol version `3` without host-environment inheritance; readiness rejects an
-image that reports another version. Protocol 3 adds a single-owner fence: each runner claims the
+cross sidecar protocol version `4` without host-environment inheritance; readiness rejects an
+image that reports another version. Protocol 4 carries up to 24 MiB of stdin (larger stdin is
+refused by `preflight_exec` before dispatch) and up to 32 MiB of output per command, keeps only a
+digest of each start payload, and lets the runner release a terminal result after reading it so
+command output does not stay in sidecar memory. `verify_browser_workload()` runs a trusted probe
+that hashes the image's browser worker against the installed Cayu sources; only then does
+`workload_authority(...)` report the pinned browser workloads. Protocol 3 added a single-owner fence: each runner claims the
 MicroVM once, with a random memory-only claim whose digest alone is kept by the sidecar, and
 every command start carries that claim. A newer claim cancels earlier owners' commands, resets
 the agent proxy relay, and makes the sidecar reject older owners' starts, which surface as

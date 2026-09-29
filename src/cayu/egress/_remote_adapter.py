@@ -22,6 +22,9 @@ from cayu.egress.proxy_server import SessionCertificateAuthority, TransparentEgr
 from cayu.runners.base import ExecCommand, Runner
 
 GUEST_CA_PATH = "/etc/cayu/ca.pem"
+#: Binding env key carrying a per-session proxy transport token to a trusted
+#: guest relay. The first-party Lambda sidecar strips it from agent commands.
+PROXY_TRANSPORT_TOKEN_ENV = "CAYU_EGRESS_PROXY_TRANSPORT_TOKEN"
 DEFAULT_REMOTE_SETUP_COMMAND_TIMEOUT_SECONDS = 300
 _METADATA_ISOLATION_UNSUPPORTED_EXIT_CODE = 42
 
@@ -41,6 +44,7 @@ async def prepare_exposed_proxy_binding(
     bind_port: int = 0,
     certificate_authority: SessionCertificateAuthority | None = None,
     owns_certificate_authority: bool = True,
+    transport_auth_token: bytes | None = None,
 ) -> EgressBinding:
     """Start and expose one session proxy listener as an ``EgressBinding``.
 
@@ -48,12 +52,21 @@ async def prepare_exposed_proxy_binding(
     that before closing the exposure and the listener. Any failure while
     starting or exposing the listener runs the same rollback, bounded by the
     default egress teardown timeout, before the original error propagates.
-    Credentialless destinations require an exposure that asserts
-    ``credentialless_isolated``.
+
+    With ``transport_auth_token`` every connection must first present the
+    session's token in an authenticated transport tunnel. The token reaches only
+    a trusted guest relay through the binding env, so the listener is usable
+    only by this session even when the exposure is reachable from other
+    sandboxes. Without that token, credentialless destinations require an
+    exposure that asserts ``credentialless_isolated``.
     """
 
     if type(bind_port) is not int or not 0 <= bind_port <= 65535:
         raise ValueError("bind_port must be an integer between 0 and 65535.")
+    if transport_auth_token is not None and (
+        type(transport_auth_token) is not bytes or len(transport_auth_token) != 64
+    ):
+        raise ValueError("transport_auth_token must be 64 bytes of lowercase hex.")
     validate_grant_scope(session_id=session_id, grants=grants)
     resolved_loop = loop or asyncio.get_running_loop()
     server_kwargs: dict[str, object] = {
@@ -65,6 +78,8 @@ async def prepare_exposed_proxy_binding(
             authority=certificate_authority,
             owns_authority=owns_certificate_authority,
         )
+    if transport_auth_token is not None:
+        server_kwargs["transport_auth_token"] = transport_auth_token
     if bind_port:
         server = proxy_server_factory(broker, port=bind_port, **server_kwargs)
     else:
@@ -91,7 +106,8 @@ async def prepare_exposed_proxy_binding(
     try:
         proxy_port = await server.start()
         exposed = await exposure.expose(local_host=bind_host, local_port=proxy_port)
-        if broker.has_credentialless_destinations and not exposed.credentialless_isolated:
+        session_isolated = exposed.credentialless_isolated or transport_auth_token is not None
+        if broker.has_credentialless_destinations and not session_isolated:
             raise UnsupportedEgressError(
                 f"{runner_kind} credentialless egress requires a session-isolated "
                 "proxy exposure; shared or public proxy endpoints would be usable "
@@ -139,6 +155,8 @@ async def prepare_exposed_proxy_binding(
         "CURL_CA_BUNDLE": GUEST_CA_PATH,
         "NODE_EXTRA_CA_CERTS": GUEST_CA_PATH,
     }
+    if transport_auth_token is not None:
+        env[PROXY_TRANSPORT_TOKEN_ENV] = transport_auth_token.decode("ascii")
 
     async def teardown() -> None:
         await cleanup()

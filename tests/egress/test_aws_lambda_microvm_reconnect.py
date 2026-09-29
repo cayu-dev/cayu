@@ -62,7 +62,15 @@ _IDENTITY = {
 class _RecordingProxyServer(_FakeProxyServer):
     instances: list[_RecordingProxyServer] = []
 
-    def __init__(self, broker: Any, *, loop: Any, host: str) -> None:
+    def __init__(
+        self,
+        broker: Any,
+        *,
+        loop: Any,
+        host: str,
+        transport_auth_token: bytes | None = None,
+    ) -> None:
+        self.transport_auth_token = transport_auth_token
         super().__init__(broker, loop=loop, host=host)
         self.broker = broker
         self.closed = False

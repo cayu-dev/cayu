@@ -21,7 +21,9 @@ for tool in browser.tools:
 ```
 
 The environment or factory must prove the exact
-`cayu-browser-fetch:17-playwright-1.62.0` image, the
+`cayu-browser-fetch:17-playwright-1.62.0` workload (the Docker image, or on
+Lambda MicroVM the verified worker described in
+[Lambda MicroVM browser image and admission](#lambda-microvm-browser-image-and-admission)), the
 `cayu.browser-session.v4` protocol and worker version 17, brokered deny-by-default egress,
 confirmed cancellation and cleanup, and one stable ArtifactStore. Construction
 is side-effect-free for factories; the same candidate, workload, and artifact
@@ -915,6 +917,74 @@ These codes appear in the normal tool failure evidence with concise remediation.
 A startup failure reports a retired allocation only after daemon cleanup succeeds.
 `browser_unavailable` remains the fallback for an absent/unreachable worker or
 startup loss without a known safe diagnostic.
+
+### Lambda MicroVM browser image and admission
+
+On AWS Lambda MicroVM the same browser tools run through
+`VirtualEgressEnvironmentFactory` with
+`LambdaMicroVMEgressAdapter(browser_workload=True, ...)` and an image built from
+the browser variant of the first-party sidecar:
+
+```bash
+cayu lambda-microvm sidecar export --browser ./cayu-browser-microvm
+# Zip the directory and pass it to CreateMicrovmImage as the code artifact.
+```
+
+The export places the unchanged sidecar under `lambda_microvm_sidecar/`, this
+Cayu release's five browser worker sources under `browser-worker/`, and a root
+Dockerfile that installs Playwright 1.62.0, `chromium-headless-shell`, and NSS
+tools on Amazon Linux 2023. `WebBridge.sandboxed_browser(...)` takes the same
+`browser_image=DEFAULT_WEBBRIDGE_INTERACTIVE_BROWSER_IMAGE` value: on Lambda it
+names the pinned workload release, not a container tag.
+
+The workload is proven rather than declared. Before a created or reconnected
+MicroVM is admitted, a trusted-profile probe runs the worker's own interpreter,
+hashes the root-owned, read-only files in `/opt/cayu-browser`, and reads the
+Playwright and websockets versions. After exact equality with the installed Cayu
+sources and pins, the agent profile launches Chromium once with its sandbox
+enabled and renders a page. Only when both pass does the runner report the
+browser workload; a mismatch
+terminates the new MicroVM with `LambdaMicroVMBrowserWorkloadError`. An image
+built by a different Cayu release therefore never passes admission. A directly
+constructed `LambdaMicroVMRunner` reports the workload only after
+`await runner.verify_browser_workload()`.
+
+Chromium runs with its own sandbox enabled as the unprivileged agent user
+(UID 1000, no capabilities, `no_new_privs`). Because `no_new_privs` rules out a
+setuid helper, the sandbox uses unprivileged user namespaces, which the Lambda
+MicroVM kernel provides; renderers are also confined by Chromium's seccomp
+filter. There is no `--no-sandbox` fallback.
+
+Browser pages carry no virtual credential, so their destinations are
+credentialless, and a Lambda egress connector is shared by every MicroVM
+behind it. In `metadata_isolation="required"` mode each session's proxy listener
+therefore requires a per-session transport token that only the MicroVM's root
+relay presents before relaying agent bytes; agent commands never see it. Without
+that verified relay (`metadata_isolation="unverified"`), credentialless
+destinations, and with them the browser, are refused.
+
+A MicroVM restores from a snapshot and fetches its root filesystem lazily. The
+browser image reads Chromium's files before that snapshot, but the first
+Chromium start on a fresh MicroVM still measured from a few seconds to about a
+minute; later starts take under a second. Verification therefore ends with one
+sandboxed Chromium launch as the agent user (up to 120 seconds), which both
+proves the sandbox works on that MicroVM and pays the slow first start during
+admission, before any tool call. Allocation of a browser MicroVM takes that
+much longer.
+
+Transfer bounds on Lambda are 24 MiB of stdin and 32 MiB of output per worker
+call. That fits the default upload batch (16 MiB) and a default session response
+plus a profile checkpoint; larger configured uploads are refused before
+dispatch. The sidecar keeps only a digest of each request and drops a result
+once the host has read it.
+
+Not available on Lambda yet: operator view and takeover (refused before any
+control credential is delivered, because the agent namespace has no route to
+the control plane), recording (`unsupported_backend`), and live browser state
+across suspend, reconnect, or replacement. The browser shares UID 1000 with
+other agent commands in the same MicroVM, as it shares `pwuser` with them on
+Docker; a shell tool in the same session can reach the browser's daemon
+socket and profile directory.
 
 ### Large documentation pages
 

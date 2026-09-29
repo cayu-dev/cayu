@@ -529,6 +529,16 @@ credential is never mounted or injected into the container. A host/LAN peer
 cannot use the broker listener, and an unrelated container on Docker's shared
 bridge cannot use the sidecar.
 
+Lambda MicroVM provides it in `metadata_isolation="required"` mode. Every
+MicroVM behind an egress connector can reach the proxy's private address, so
+each session's listener requires a per-session transport token in an
+authenticated tunnel before any request. The token travels to the MicroVM's
+root sidecar in the command environment; the sidecar removes it from agent
+commands and its relay presents it on every connection it forwards. Another
+MicroVM on the same connector, or an agent without the relay, cannot use the
+listener. In `unverified` mode there is no such relay and credentialless routes
+fail closed.
+
 There is no default runtime path. Every factory must receive an explicit
 `adapter` or `runner_kind`; a registry-backed selection must name a registered
 adapter. Omitted and unsupported selections fail before grants, proxies,
@@ -913,7 +923,7 @@ Reconnect support is explicit by adapter:
 | Adapter | Virtual-egress reconnect |
 | --- | --- |
 | Microsandbox | Supported; attested single-owner sandbox plus host-listener and guest-endpoint ports, fresh grants/broker/CA, full preflight. |
-| Lambda MicroVM | Supported for the same MicroVM: allowlisted non-secret identity, resume when suspended, never replaces an ended MicroVM, fresh grants/broker/CA, full preflight plus an agent privilege probe. A sidecar owner claim (protocol 3) fences stale owners across processes: their commands are cancelled and rejected, and a lifecycle lease stops them from suspending or terminating the successor's MicroVM; an unconfirmable owner mutates nothing. |
+| Lambda MicroVM | Supported for the same MicroVM: allowlisted non-secret identity, resume when suspended, never replaces an ended MicroVM, fresh grants/broker/CA, full preflight plus an agent privilege probe. A sidecar owner claim (protocol 3 and later) fences stale owners across processes: their commands are cancelled and rejected, and a lifecycle lease stops them from suspending or terminating the successor's MicroVM; an unconfirmable owner mutates nothing. |
 | Docker | Opt-in local POSIX ownership directory, exact container/network identity, fresh proxy/CA, repeated preflight; see below. Default configuration remains unsupported. |
 | E2B | Generic reconnect is unsupported; crash-safe creation/recovery instead uses the durable exact-sandbox handoff described below. |
 
@@ -1325,7 +1335,7 @@ custom `EgressPolicy` when you need business-level limits such as spend caps.
 | `docker` | Egress enforced (per-session internal network + sidecar-only broker authentication + TLS MITM), including credentialless routes; opt-in local reconnect. Container isolation is not a secure sandbox boundary. |
 | `microsandbox` | Virtual credentials are enforced with a deny-by-default host policy allowing only the Cayu proxy port. Credentialless routes require a custom session-isolated exposure; reconnect supported. |
 | `e2b` | Enforced with a dedicated E2B-reachable, IPv4-literal raw TCP proxy exposure and fail-closed preflight. Credentialless routes additionally require `credentialless_isolated=True`; durable exact-sandbox create/recovery and process-local parked resume are supported. |
-| `lambda-microvm` | Enforced in the integrated image: a VPC connector limits destinations, while a dedicated agent network namespace has no default route and can reach only a narrow relay to the Cayu proxy. Credentialless routes require a session-isolated exposure; crash-safe client-token creation, recovery, and reaping; same-MicroVM factory reconnect with fresh authority. |
+| `lambda-microvm` | Enforced in the integrated image: a VPC connector limits destinations, while a dedicated agent network namespace has no default route and can reach only a narrow relay to the Cayu proxy. In `metadata_isolation="required"` mode that relay authenticates each connection with a per-session transport token, which admits credentialless routes (including the browser); crash-safe client-token creation, recovery, and reaping; same-MicroVM factory reconnect with fresh authority. |
 | `local` | Unsupported by the virtual-egress factory. Direct runner construction may still set `credential_mode` for raw-secret checks, but that is not an egress boundary. |
 
 Notes on the Docker adapter:

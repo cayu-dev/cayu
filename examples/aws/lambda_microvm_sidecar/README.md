@@ -53,6 +53,11 @@ aws lambda-microvms create-microvm-image \
 Wait for the image build to reach `CREATED`, then pass its ARN to
 `LambdaMicroVMRunner.create(...)` or set `CAYU_LAMBDA_MICROVM_IMAGE` for the live contract.
 
+For browser tools, export the browser variant instead with
+`cayu lambda-microvm sidecar export --browser DESTINATION`. It adds Playwright 1.62.0,
+`chromium-headless-shell`, NSS tools, and this Cayu release's browser worker; see
+[Lambda MicroVM browser image and admission](https://github.com/cayu-dev/cayu/blob/main/docs/browser-session.md#lambda-microvm-browser-image-and-admission).
+
 Keep three identities separate:
 
 - the operator creating the image may call the image API and pass the build role;
@@ -98,8 +103,8 @@ uv run python scripts/generate_sidecar_manifest.py --check
 
 ## Protocol
 
-The sidecar implements Cayu Lambda MicroVM command protocol version `3`. `GET /health` returns
-`{"status":"ok","protocol_version":"3"}` so the host can reject an incompatible image before
+The sidecar implements Cayu Lambda MicroVM command protocol version `4`. `GET /health` returns
+`{"status":"ok","protocol_version":"4"}` so the host can reject an incompatible image before
 sending a command. Version 2 added the boolean `omit_truncated_output` command field: redacted
 executions use it to suppress a channel whose unavailable suffix could complete a workload
 secret, while ordinary and trusted executions retain their bounded output.
@@ -143,6 +148,16 @@ it, and at the latest AWS ends it at its maximum duration. A MicroVM idle policy
 own and also fires the suspend hook, so with an idle policy configured a suspend lease can be
 settled by the platform's suspension rather than the owner's request.
 
+Version 4 sizes transfers for the browser worker and stops retaining request and result data.
+Stdin may be up to 24 MiB and output up to 32 MiB per command; the host refuses larger stdin
+before dispatch. The sidecar keeps only a SHA-256 digest of each start payload for idempotent
+replays, and `POST /v1/commands/{command_id}/release` drops a terminal result once the host has
+read it, leaving a digest-only tombstone. A start payload may carry
+`CAYU_EGRESS_PROXY_TRANSPORT_TOKEN` in its environment: the sidecar removes it from agent
+commands and its root relay presents it to the Cayu proxy in an authenticated transport tunnel
+before relaying any agent bytes, so a proxy listener reachable from other MicroVMs on the shared
+connector is usable only through this MicroVM.
+
 - `GET /health`
 - `POST /v1/owner`
 - `POST /v1/owner/check`
@@ -150,6 +165,7 @@ settled by the platform's suspension rather than the owner's request.
 - `POST /v1/owner/lifecycle/release`
 - `POST /v1/commands`
 - `GET /v1/commands/{command_id}`
+- `POST /v1/commands/{command_id}/release`
 - `DELETE /v1/commands/{command_id}`
 - AWS lifecycle hooks under `/aws/lambda-microvms/runtime/v1/`
 
