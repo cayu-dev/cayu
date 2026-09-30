@@ -154,6 +154,32 @@ tools, policy, stores, proposal and approval adapter. It runs no authoring CLI.
 The deterministic script proves Runtime/service boundaries; it does not establish
 live-model judgment or behavior. Live mode is optional and is validated separately.
 
+## When every turn must end in a tool
+
+Many support agents end each turn through one of a few tools, for example
+`ask_customer` for a clarification or `propose_resolution` for a recorded
+proposal. Live models occasionally stop before calling one, sometimes with an
+empty step (`model.completed` with `step_classification.type == "invalid"`).
+Cayu completes that turn normally unless a loop policy says otherwise, and your
+application then has neither a question nor a proposal to return.
+
+Pass `RequireFinalTool` on every `RunRequest` and `ResumeRequest` for that agent:
+
+```python
+from cayu import RequireFinalTool
+
+final_tool = RequireFinalTool(["ask_customer", "propose_resolution"])
+RunRequest(..., loop_policies=(final_tool,))
+ResumeRequest(..., loop_policies=(final_tool,))
+```
+
+If the model stops before one of those tools has returned, the policy appends a
+reminder and the model continues, up to two times. After that, the session is
+interrupted with a reason instead of completing. A tool result counts only when
+`is_error` is false, so return `ToolResult(..., is_error=True)` for failures such
+as rejected evidence or an unavailable service. The policy's identity comes from
+its configuration, so use the same tool names in every process.
+
 ## Troubleshooting and limits
 
 - Duplicate session: `run` creates, `resume(ResumeRequest(...))` continues an

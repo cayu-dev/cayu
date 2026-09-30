@@ -396,6 +396,11 @@ from cayu.runtime._invocation_terminal_decision import (
     invocation_terminal_event_id,
     settled_invocation_terminal_decision_from_checkpoint,
 )
+from cayu.runtime._loop_policy_continuations import (
+    before_stop_continuation_checkpoint_transform,
+    before_stop_continuation_indices,
+    before_stop_policy_key,
+)
 from cayu.runtime._memory_evidence import (
     close_context_exposure_without_provider_effect,
     close_unrecoverable_context_exposure,
@@ -3951,6 +3956,12 @@ def _loop_policy_supports_before_stop(policy: LoopPolicy) -> bool:
     policy_method = type(policy).before_stop
     default_method = LoopPolicy.before_stop
     return policy_method is not default_method
+
+
+@dataclass(frozen=True)
+class _BeforeStopPolicySelection:
+    decision: BeforeStopDecision
+    policy_key: str
 
 
 def _before_stop_policy_event(
@@ -26421,6 +26432,7 @@ class SessionEngine:
                     if assistant_step_result is None:
                         raise RuntimeError("Before-stop policies require an assistant step result.")
                     before_stop_decision: BeforeStopDecision | None = None
+                    selected_policy_key: str | None = None
                     async for event, policy_decision in self._run_before_stop_policies(
                         session=session,
                         registered_agent=registered_agent,
@@ -26434,7 +26446,8 @@ class SessionEngine:
                     ):
                         yield event
                         if policy_decision is not None:
-                            before_stop_decision = policy_decision
+                            before_stop_decision = policy_decision.decision
+                            selected_policy_key = policy_decision.policy_key
                     if execution_to_wait is not None and (
                         before_stop_decision is None
                         or before_stop_decision.action == BeforeStopAction.COMPLETE
@@ -26468,6 +26481,8 @@ class SessionEngine:
                                     "Before-stop continue decision requires a message."
                                 )
                             repair_message = before_stop_decision.message
+                            if selected_policy_key is None:
+                                raise RuntimeError("Before-stop continuation lost its policy.")
                             messages.append(repair_message)
                             runtime_message_transform = (
                                 _runtime_authored_user_message_checkpoint_transform(
@@ -26475,11 +26490,20 @@ class SessionEngine:
                                     message=repair_message,
                                 )
                             )
+                            continuation_transform = before_stop_continuation_checkpoint_transform(
+                                snapshot=await self.session_store.load_transcript_snapshot(
+                                    session.id
+                                ),
+                                message=repair_message,
+                                policy_key=selected_policy_key,
+                                checkpoint_transform=runtime_message_transform,
+                            )
                             await self.session_store.append_transcript_messages_and_transform_checkpoint(
                                 session.id,
                                 [repair_message],
-                                runtime_message_transform,
+                                continuation_transform,
                             )
+                            del continuation_transform
                             continue
                         if before_stop_decision.action == BeforeStopAction.INTERRUPT:
                             (
@@ -32635,7 +32659,7 @@ class SessionEngine:
         request_metadata: dict[str, Any],
         request_loop_policies: tuple[LoopPolicy, ...],
         invocation_context: InvocationContext | None = None,
-    ) -> AsyncGenerator[tuple[Event, BeforeStopDecision | None], None]:
+    ) -> AsyncGenerator[tuple[Event, _BeforeStopPolicySelection | None], None]:
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
             or registered_agent is not invocation_context.registered_agent
@@ -32670,10 +32694,16 @@ class SessionEngine:
                 ),
             ),
         )
+        snapshot = None
+        checkpoint = None
         for scope, policies in policy_groups:
-            for policy in policies:
+            for position, policy in enumerate(policies):
                 if not _loop_policy_supports_before_stop(policy):
                     continue
+                if snapshot is None:
+                    snapshot = await self.session_store.load_transcript_snapshot(session.id)
+                    checkpoint = await self.session_store.load_checkpoint(session.id)
+                policy_key = before_stop_policy_key(policy, scope=scope, position=position)
                 policy_name = require_clean_nonblank(policy.name, "loop_policy.name")
                 yield (
                     await self._event_writer.emit(
@@ -32698,6 +32728,13 @@ class SessionEngine:
                     step=step,
                     max_steps=max_steps,
                     metadata=request_metadata,
+                    messages=[record.message for record in snapshot.records],
+                    continuation_message_indices=before_stop_continuation_indices(
+                        checkpoint,
+                        snapshot=snapshot,
+                        session_id=session.id,
+                        policy_key=policy_key,
+                    ),
                 )
                 try:
                     decision = copy_before_stop_decision(await policy.before_stop(context))
@@ -32767,6 +32804,6 @@ class SessionEngine:
                                 },
                             )
                         ),
-                        decision,
+                        _BeforeStopPolicySelection(decision=decision, policy_key=policy_key),
                     )
                     return

@@ -751,6 +751,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "LocalExecutionProcessIdentity",
     ),
     "LoopPolicy": ("cayu.runtime.loop_policies", "LoopPolicy"),
+    "RequireFinalTool": ("cayu.runtime.loop_policies", "RequireFinalTool"),
     "MAX_CHILD_SESSION_RESULT_MAX_CHARS": (
         "cayu.sessions.child_results",
         "MAX_CHILD_SESSION_RESULT_MAX_CHARS",
@@ -2311,6 +2312,7 @@ PUBLIC_NAMES = [
     "LocalExecutionEffectPolicy",
     "LocalExecutionProcessIdentity",
     "LoopPolicy",
+    "RequireFinalTool",
     "MAX_CHILD_SESSION_RESULT_MAX_CHARS",
     "MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES",
     "MAX_PENDING_ACTION_RESULT_BYTES",

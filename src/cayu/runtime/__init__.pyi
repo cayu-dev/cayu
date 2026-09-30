@@ -730,6 +730,7 @@ from cayu.runtime.loop_policies import BeforeStopAction as BeforeStopAction
 from cayu.runtime.loop_policies import BeforeStopContext as BeforeStopContext
 from cayu.runtime.loop_policies import BeforeStopDecision as BeforeStopDecision
 from cayu.runtime.loop_policies import LoopPolicy as LoopPolicy
+from cayu.runtime.loop_policies import RequireFinalTool as RequireFinalTool
 from cayu.runtime.manifest import APP_MANIFEST_SCHEMA_VERSION as APP_MANIFEST_SCHEMA_VERSION
 from cayu.runtime.manifest import AgentManifest as AgentManifest
 from cayu.runtime.manifest import ApplicationDefaultsManifest as ApplicationDefaultsManifest

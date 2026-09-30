@@ -7390,7 +7390,16 @@ instead of parsing raw provider payloads or guessing from transcript shape.
 `LoopPolicy.before_stop(...)` is the runtime seam immediately before Cayu marks a
 no-tool-call assistant step as complete. It receives a `BeforeStopContext` with
 the current `Session`, `AssistantStepResult`, `StepClassification`, step number,
-max steps, and request metadata. Policies are ordinary Python objects and can be
+max steps, request metadata, and `messages`: detached copies of the durable
+conversation at that boundary, including tool results and earlier runtime-authored
+continuation messages. An empty `invalid` step is not a message and is absent.
+`continuation_message_indices` identifies the positions in `messages` that the
+runtime durably appended for this policy. Provenance is bound to the session,
+policy scope/position/identity, and each message's absolute transcript index and
+digest; matching text alone does not establish runtime authorship. The runtime
+stores these anchors in the checkpoint atomically with the continuation append
+and retains only the policy's current consecutive continuation sequence.
+Policies are ordinary Python objects and can be
 registered on `CayuApp`, on an agent, or on an individual `RunRequest`,
 `ResumeRequest`, `DispatchRequest`, or tool-approval continuation request.
 The generic before-stop seam runs for ordinary final assistant steps. When a
@@ -7423,6 +7432,23 @@ Cayu emits durable `custom.loop.before_stop.started`,
 exception fails the session; this is intentional because before-stop policies
 control whether the runtime is allowed to complete. Side-effect-only behavior
 belongs in runtime hooks instead.
+
+`RequireFinalTool(tool_names, reminder=None, max_reminders=2,
+on_exhausted=BeforeStopAction.INTERRUPT)` is a shipped before-stop policy for
+agents whose turns must end through specific tools, such as a clarification
+question or a recorded proposal. The current turn is the conversation after the
+latest user message other than the policy's own reminder. If a listed tool
+returned a result with `is_error=False` in that turn, the policy completes.
+Otherwise it continues with its reminder, up to `max_reminders` times, and then
+interrupts or fails the session with a reason and `{"reminders", "tool_names"}`
+metadata. It keeps no state between calls, so a restarted or recovered process
+counts reminders using the durable transcript and continuation provenance. A real
+user message always starts a new scan, even when it equals the configured reminder.
+Its execution-profile identity is
+derived from its configuration, so an identically configured instance in a new
+process passes profile admission. Tool names are not checked against the agent's
+registered tools. The policy does not skip the extra model step that follows a
+successful final tool; that step normally returns nothing and completes.
 
 ## Structured Output
 

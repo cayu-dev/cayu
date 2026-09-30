@@ -3566,6 +3566,7 @@ from cayu.runtime.loop_policies import BeforeStopAction as BeforeStopAction
 from cayu.runtime.loop_policies import BeforeStopContext as BeforeStopContext
 from cayu.runtime.loop_policies import BeforeStopDecision as BeforeStopDecision
 from cayu.runtime.loop_policies import LoopPolicy as LoopPolicy
+from cayu.runtime.loop_policies import RequireFinalTool as RequireFinalTool
 from cayu.runtime.manifest import AppManifest as AppManifest
 from cayu.runtime.manifest import RecoveryCleanupPolicyManifest as RecoveryCleanupPolicyManifest
 from cayu.runtime.mcp_manifest_policy import McpManifestPolicy as McpManifestPolicy

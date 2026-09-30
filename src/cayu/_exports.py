@@ -3342,6 +3342,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "LocalWorkspace": ("cayu.workspaces.local", "LocalWorkspace"),
     "LoggingEventSink": ("cayu.observability.logging", "LoggingEventSink"),
     "LoopPolicy": ("cayu.runtime.loop_policies", "LoopPolicy"),
+    "RequireFinalTool": ("cayu.runtime.loop_policies", "RequireFinalTool"),
     "MATERIALIZE_SHARED_ARTIFACT_TOOL_NAME": (
         "cayu.tools.shared_artifacts",
         "MATERIALIZE_SHARED_ARTIFACT_TOOL_NAME",
@@ -8074,6 +8075,7 @@ PUBLIC_NAMES = [
     "LocalWorkspace",
     "LoggingEventSink",
     "LoopPolicy",
+    "RequireFinalTool",
     "MATERIALIZE_SHARED_ARTIFACT_TOOL_NAME",
     "MAX_AGENT_RECALL_DELIVERY_BYTES",
     "MAX_AGENT_RECALL_DELIVERY_LEASE_SECONDS",
