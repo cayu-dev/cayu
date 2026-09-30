@@ -121,3 +121,23 @@ expensive. Provider and database I/O are outside this workload.
 Use `--calls-per-round 2 --history-messages 0 --sessions 1 --samples 1` for a
 small smoke run. Compare matching cases under comparable machine load; the script
 reports measurements and does not enforce a performance threshold.
+
+## Leased adapter workload
+
+Use the development environment and existing characterization fixtures to
+compare fresh public verification and result-resolution operations:
+
+```sh
+uv run python scripts/benchmark_leased_adapters.py --repo . --samples 15 --output /tmp/leased-after.json
+uv run python scripts/benchmark_leased_adapters.py --repo /path/to/base-checkout --samples 15 --output /tmp/leased-before.json
+```
+
+Run the same script and Python environment in a separate process for each
+revision. The matrix uses 1, 8, and 32 concurrent operations with fresh in-memory
+stores and application instances. Setup and a warmup batch precede each timing
+window. A separate pass counts public async store calls, including internal
+calls; fixture setup is excluded from those counts. Temporary class wrappers
+await the exact original store implementations and are restored after the pass.
+Reports retain raw latency samples, medians, the target revision, runtime source
+digest, script digest, Python version, and call counts. This workload measures
+fresh in-memory completion dispatch and publication.
