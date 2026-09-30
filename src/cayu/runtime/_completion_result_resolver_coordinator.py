@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from hashlib import sha256
@@ -38,6 +36,7 @@ from cayu.runtime._diagnostics import (
     exception_diagnostic,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._leased_adapter_runner import LeasedAdapterLease, LeasedAdapterRunner
 from cayu.runtime._task_store_operation_boundary import (
     capture_sensitive_validation,
     capture_task_store_operation,
@@ -88,16 +87,6 @@ _PUBLICATION_RELEASE_SETTLEMENT_SECONDS = 5.0
 
 class _GroupResultResolutionNotDispatched(Exception):
     """Runtime gate refusal, never supplied by the resolver callback."""
-
-
-@dataclass(slots=True)
-class _SingleFlightLock:
-    lock: asyncio.Lock
-    users: int = 0
-
-    def __init__(self) -> None:
-        self.lock = asyncio.Lock()
-        self.users = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,33 +173,18 @@ class CompletionResultResolverCoordinator:
         self._session_store = session_store
         self._event_writer = event_writer
         self._secret_redactor = secret_redactor
-        self._process_id = os.getpid()
         self._resolvers: dict[tuple[str, str, str], CompletionResultResolver] = {}
-        self._locks: dict[str, _SingleFlightLock] = {}
-        self._adapter_tasks: set[asyncio.Task[CapturedAwaitableOutcome[dict[str, object]]]] = set()
-        self._resolution_capacity_reservations: set[object] = set()
         self._group_resolution_settlements: dict[str, _GroupResolutionSettlement] = {}
-        self._draining_adapter_tasks: dict[
-            str,
-            asyncio.Task[CapturedAwaitableOutcome[None]],
-        ] = {}
+        self._adapter_runner = LeasedAdapterRunner[asyncio.Task[CapturedAwaitableOutcome[None]]]()
 
     def _ensure_process_local_generation(self) -> None:
-        process_id = os.getpid()
-        if process_id == self._process_id:
-            return
-        if (
-            self._locks
-            or self._adapter_tasks
-            or self._resolution_capacity_reservations
-            or self._draining_adapter_tasks
-            or self._group_resolution_settlements
-        ):
-            raise self._safe_execution_error(
+        self._adapter_runner.ensure_process_local(
+            lambda: self._safe_execution_error(
                 "Result resolver coordinator inherited active execution state across a "
                 "process boundary; rebuild the application in this worker."
-            ) from None
-        self._process_id = process_id
+            ),
+            additional_active=bool(self._group_resolution_settlements),
+        )
 
     def register(
         self,
@@ -292,18 +266,13 @@ class CompletionResultResolverCoordinator:
             ) from None
 
         key = copied.decision_id
-        entry = self._locks.get(key)
-        if entry is None:
-            entry = _SingleFlightLock()
-            self._locks[key] = entry
-        entry.users += 1
-        try:
+        with self._adapter_runner.single_flight(key) as lock:
             current_task = asyncio.current_task()
             cancellation_baseline = 0 if current_task is None else current_task.cancelling()
             safe_cancellation = None
             cancellation_failure = None
             try:
-                await entry.lock.acquire()
+                await lock.acquire()
             except asyncio.CancelledError as cancellation:
                 current_requests = 0 if current_task is None else current_task.cancelling()
                 if current_requests > cancellation_baseline:
@@ -356,11 +325,7 @@ class CompletionResultResolverCoordinator:
                     if not capacity_lease.transferred:
                         self._release_resolution_capacity(capacity_lease)
             finally:
-                entry.lock.release()
-        finally:
-            entry.users -= 1
-            if entry.users == 0 and self._locks.get(key) is entry:
-                self._locks.pop(key, None)
+                lock.release()
 
     async def _resolve_locked(
         self,
@@ -601,7 +566,7 @@ class CompletionResultResolverCoordinator:
                 or isinstance(failure, _CompletionDecisionApplicationNotCommitted)
                 or application_settlement.not_committed
             )
-            and request.decision_id not in self._draining_adapter_tasks
+            and self._adapter_runner.draining(request.decision_id) is None
             and publication_authority is not None
             and publication_owner is not None
         ):
@@ -747,22 +712,23 @@ class CompletionResultResolverCoordinator:
         publication_heartbeat: _PublicationHeartbeat,
         capacity_lease: _ResolutionCapacityLease,
     ) -> dict[str, object]:
-        task = asyncio.create_task(
-            capture_awaitable_outcome(
+        try:
+            invocation = await self._adapter_runner.run(
+                decision_id,
                 lambda adapter=resolver, value=request: self._resolve_with_group_ownership(
                     adapter, value
-                )
-            ),
-            name="cayu-completion-result-resolver",
-        )
-        del resolver, request
-        self._adapter_tasks.add(task)
-        task.add_done_callback(self._adapter_task_settled)
-        shielded = await await_shielded_task_outcome(
-            task,
-            timeout_s=timeout_seconds,
-            timeout_after_cancellation_s=0,
-        )
+                ),
+                name="cayu-completion-result-resolver",
+                timeout_seconds=timeout_seconds,
+                lease=LeasedAdapterLease(
+                    ownership_lost=publication_heartbeat.ownership_lost,
+                    heartbeat=publication_heartbeat.task,
+                ),
+            )
+        finally:
+            del resolver, request
+        task, shielded = invocation.task, invocation.outcome
+        del invocation
         if shielded.cancellation is not None:
             cancellation = shielded.cancellation
             safe_cancellation = self._safe_caller_cancellation(cancellation)
@@ -772,7 +738,6 @@ class CompletionResultResolverCoordinator:
             if fatal is not None and exception_tree_contains(fatal, _PROCESS_CONTROL_SIGNALS):
                 safe_fatal = self._detached_process_control_failure(fatal)
                 restore_task_cancellation_requests(consumed, cancellation=safe_cancellation)
-                self._adapter_tasks.discard(task)
                 del cancellation, fatal, captured, shielded, task
                 raise safe_fatal from safe_cancellation
             self._retain_draining(
@@ -805,7 +770,6 @@ class CompletionResultResolverCoordinator:
                 "Completion result resolver exceeded its bounded execution timeout."
             ) from None
 
-        self._adapter_tasks.discard(task)
         captured = shielded.result
         task_failure = shielded.error
         del shielded, task
@@ -1040,14 +1004,14 @@ class CompletionResultResolverCoordinator:
         acknowledgement = self._group_resolution_settlements.get(decision_id)
         if acknowledgement is not None and acknowledgement.callback_settled:
             await self.reconcile_group_settlement(acknowledgement.task_id, decision_id)
-        settlement = self._draining_adapter_tasks.get(decision_id)
+        settlement = self._adapter_runner.draining(decision_id)
         if settlement is not None and not settlement.done():
             raise self._safe_execution_error(
                 "The prior exact completion result resolver execution is still draining."
             ) from None
         if settlement is None:
             return
-        self._draining_adapter_tasks.pop(decision_id, None)
+        self._adapter_runner.acknowledge_drain(decision_id, settlement)
         captured = settlement.result()
         if captured.error is not None:
             failure = captured.error
@@ -1253,7 +1217,7 @@ class CompletionResultResolverCoordinator:
             ),
             name="cayu-completion-result-resolver-settlement",
         )
-        self._draining_adapter_tasks[decision_id] = settlement
+        self._adapter_runner.retain_drain(decision_id, settlement)
         capacity_lease.transferred = True
         settlement.add_done_callback(
             lambda completed, key=decision_id, lease=capacity_lease: (
@@ -1272,7 +1236,7 @@ class CompletionResultResolverCoordinator:
         *,
         capacity_lease: _ResolutionCapacityLease,
     ) -> None:
-        self._draining_adapter_tasks[decision_id] = settlement
+        self._adapter_runner.retain_drain(decision_id, settlement)
         capacity_lease.transferred = True
         settlement.add_done_callback(
             lambda completed, key=decision_id, lease=capacity_lease: (
@@ -1478,7 +1442,7 @@ class CompletionResultResolverCoordinator:
         stop = asyncio.Event()
         lease_deadline = _PublicationLeaseDeadline(claim_deadline_monotonic)
         ownership_lost: asyncio.Future[BaseException] = asyncio.get_running_loop().create_future()
-        task = asyncio.create_task(
+        task = self._adapter_runner.start_heartbeat(
             self._heartbeat_publication_owner(
                 authority,
                 owner.owner_id,
@@ -1577,30 +1541,29 @@ class CompletionResultResolverCoordinator:
         capacity_lease: _ResolutionCapacityLease,
     ) -> None:
         self._release_resolution_capacity(capacity_lease)
-        if self._draining_adapter_tasks.get(decision_id) is not completed:
+        if self._adapter_runner.draining(decision_id) is not completed:
             return
         try:
             captured = completed.result()
         except BaseException:
             return
         if captured.error is None:
-            self._draining_adapter_tasks.pop(decision_id, None)
+            self._adapter_runner.acknowledge_drain(decision_id, completed)
 
     def _reserve_resolution_capacity(self, lease: _ResolutionCapacityLease) -> None:
         if lease.reservation is not None:
             return
-        if len(self._resolution_capacity_reservations) >= _MAX_ACTIVE_RESULT_RESOLVERS:
-            raise self._safe_execution_error(
+        lease.reservation = self._adapter_runner.reserve_capacity(
+            _MAX_ACTIVE_RESULT_RESOLVERS,
+            lambda: self._safe_execution_error(
                 "Completion result resolver execution capacity is exhausted."
-            ) from None
-        reservation = object()
-        self._resolution_capacity_reservations.add(reservation)
-        lease.reservation = reservation
+            ),
+        )
 
     def _release_resolution_capacity(self, lease: _ResolutionCapacityLease) -> None:
         reservation = lease.reservation
         if reservation is not None:
-            self._resolution_capacity_reservations.discard(reservation)
+            self._adapter_runner.release_capacity(reservation)
 
     def _resolved_event_publication_authority(
         self,
@@ -1792,14 +1755,6 @@ class CompletionResultResolverCoordinator:
             ),
             events=[],
         )
-
-    def _adapter_task_settled(
-        self,
-        completed: asyncio.Task[CapturedAwaitableOutcome[dict[str, object]]],
-    ) -> None:
-        self._adapter_tasks.discard(completed)
-        with suppress(BaseException):
-            completed.result()
 
     def _prepare_resolved_event(
         self,

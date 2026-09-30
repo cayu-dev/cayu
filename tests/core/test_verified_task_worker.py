@@ -3575,9 +3575,9 @@ def test_worker_close_retains_exact_verifier_until_settlement(
                 == before_cleanup
             )
             assert (await tasks.load_task(task.id)).status is expected_status
-            assert not app._completion_verifier_coordinator._adapter_tasks
-            assert not app._completion_verifier_coordinator._adapter_capacity_reservations
-            assert not app._completion_verifier_coordinator._draining_adapter_tasks
+            assert not app._completion_verifier_coordinator._adapter_runner.active_adapter_count
+            assert not app._completion_verifier_coordinator._adapter_runner._capacity_reservations
+            assert not app._completion_verifier_coordinator._adapter_runner._drains
         finally:
             release.set()
             if not run.done():
@@ -4765,19 +4765,21 @@ def test_worker_settles_expired_published_proposal(backend, fault, tmp_path, mon
                     if fault == "live_verifier":
                         await asyncio.wait_for(verifier_settled.wait(), 5)
                     coordinator = app._completion_verifier_coordinator
-                    if coordinator._adapter_tasks:
-                        _, pending = await asyncio.wait(coordinator._adapter_tasks, timeout=5)
+                    if coordinator._adapter_runner._adapter_tasks:
+                        _, pending = await asyncio.wait(
+                            coordinator._adapter_runner._adapter_tasks, timeout=5
+                        )
                         assert not pending
                     await asyncio.sleep(0)
                     settlements = {
                         draining.settlement_task
-                        for draining in coordinator._draining_adapter_tasks.values()
+                        for draining in coordinator._adapter_runner._drains.values()
                         if draining.settlement_task is not None
                     }
                     if settlements:
                         _, pending = await asyncio.wait(settlements, timeout=5)
                         assert not pending
-                    assert not coordinator._adapter_tasks
+                    assert not coordinator._adapter_runner._adapter_tasks
                 elif fault == "restart":
                     with pytest.raises(ConnectionError, match="restart after proposal"):
                         await worker.run(max_tasks=1)
@@ -5386,7 +5388,7 @@ def test_worker_decision_phase_composes_real_execution_and_existing_owners(
                         ),
                     )
                 assert verifier.requests == []
-                assert not app._completion_verifier_coordinator._adapter_tasks
+                assert not app._completion_verifier_coordinator._adapter_runner.active_adapter_count
             async for _ in app._execute_work_attempt(
                 WorkAttemptRunRequest(
                     admission_id=admission.admission_id,

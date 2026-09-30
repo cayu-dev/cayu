@@ -7,16 +7,14 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, TypeVar, cast
+from typing import TYPE_CHECKING, TypeVar
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from cayu._exception_groups import exception_cause, iter_exception_tree, set_exception_cause
+from cayu._exception_groups import exception_cause
 from cayu._task_wait import (
     CapturedAwaitableOutcome,
     await_shielded_task_outcome,
-    capture_awaitable_outcome,
-    consume_pending_task_cancellation,
     restore_task_cancellation_requests,
     unexpected_child_cancellation_error,
 )
@@ -28,6 +26,11 @@ from cayu.runtime._durable_worker_loop import (
     run_durable_lease_heartbeat,
     run_durable_worker_loop,
     validate_worker_interval,
+)
+from cayu.runtime._leased_adapter_runner import (
+    LeasedAdapterRunner,
+    capture_owned_task_outcome,
+    merge_owned_failures,
 )
 from cayu.runtime._session_request_boundary import prepare_run_request
 from cayu.runtime._task_store_operation_boundary import (
@@ -128,65 +131,6 @@ class _RetainedPreparationSettlement:
 
 class _PreparationOwnershipTransferred(WorkAttemptRecoveryRequired):
     """Only store-authenticated admission readback produces this local handoff."""
-
-
-async def _capture_owned_task_outcome(
-    factory: Callable[[], Awaitable[_T]],
-) -> CapturedAwaitableOutcome[_T]:
-    """Carry owned child cancellation as data to the outward worker boundary.
-
-    Inner cleanup helpers may restore the cancellation they temporarily
-    consumed. Letting that pending request override this boxed return would
-    discard its cleanup cause when asyncio finishes the Task. Only a directly
-    captured current cancellation is consumed here; historical causes/counts
-    never change an ordinary outcome's classification.
-    """
-    outcome = await capture_awaitable_outcome(factory)
-    if isinstance(outcome.error, asyncio.CancelledError):
-        consume_pending_task_cancellation(outcome.error)
-    return outcome
-
-
-def _merge_worker_failures(
-    primary: BaseException | None, secondary: BaseException | None
-) -> BaseException | None:
-    """Preserve ordered failures while keeping current cancellation outward.
-
-    Causes are inspected only for identity deduplication, never to classify an
-    ordinary error as cancellation because of historical causal evidence.
-    """
-    if primary is None:
-        return secondary
-    if secondary is None:
-        return primary
-
-    def contains(root, target):
-        pending = [root]
-        seen = set()
-        while pending:
-            current = pending.pop()
-            if id(current) in seen:
-                continue
-            seen.add(id(current))
-            if current is target:
-                return True
-            pending.extend(item for item in iter_exception_tree(current) if item is not current)
-            cause = exception_cause(current)
-            if cause is not None:
-                pending.append(cause)
-        return False
-
-    if contains(primary, secondary):
-        return primary
-    if contains(secondary, primary):
-        return secondary
-    if isinstance(primary, asyncio.CancelledError):
-        set_exception_cause(primary, _merge_worker_failures(exception_cause(primary), secondary))
-        return primary
-    if isinstance(secondary, asyncio.CancelledError):
-        set_exception_cause(secondary, _merge_worker_failures(primary, exception_cause(secondary)))
-        return secondary
-    return BaseExceptionGroup("Verified task owned failures", [primary, secondary])
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,6 +301,7 @@ class VerifiedTaskWorker:
         self._preparation_settlement: _RetainedPreparationSettlement | None = None
         self._pre_entry_settlement: WorkAttemptLifecycleSettlement | None = None
         self._pre_entry_publication: asyncio.Task | None = None
+        self._adapter_runner = LeasedAdapterRunner[None]()
         self._closed = False
         self._recovery_cursor: str | None = None
         from cayu.tasks._group_maintenance import TaskGroupMaintenance
@@ -407,7 +352,7 @@ class VerifiedTaskWorker:
         # Callback cancellation is owned by _callback, not the storage mutation
         # boundary. Reusing that await boundary would manufacture a second
         # cancellation alongside the one this owner already retains.
-        captured = await _capture_owned_task_outcome(factory)
+        captured = await capture_owned_task_outcome(factory)
         if captured.error is None or isinstance(captured.error, asyncio.CancelledError):
             return captured
 
@@ -511,11 +456,11 @@ class VerifiedTaskWorker:
             elif await self._group_cancellation_requested(state.task_id):
                 await self._settle_runtime_stop(owner, "work_contract_group_cancelled")
 
-        work = asyncio.create_task(_capture_owned_task_outcome(settle))
+        work = asyncio.create_task(capture_owned_task_outcome(settle))
         result = await await_shielded_task_outcome(work, cancellation=cancellation)
         cleanup = result.error or (None if result.result is None else result.result.error)
-        failure = _merge_worker_failures(cancellation, cleanup)
-        failure = _merge_worker_failures(failure, result.cancellation)
+        failure = merge_owned_failures(cancellation, cleanup)
+        failure = merge_owned_failures(failure, result.cancellation)
         restore_task_cancellation_requests(
             result.cancellation_requests_consumed, cancellation=cancellation
         )
@@ -629,7 +574,7 @@ class VerifiedTaskWorker:
             return
         if retained.settlement is None:
             retained.settlement = asyncio.create_task(
-                _capture_owned_task_outcome(lambda: self._reconcile_preparation_entry(retained)),
+                capture_owned_task_outcome(lambda: self._reconcile_preparation_entry(retained)),
                 name="cayu-undispatched-preparation-settlement",
             )
         settlement = retained.settlement
@@ -648,11 +593,11 @@ class VerifiedTaskWorker:
             else:
                 retained.settlement = None
         if outcome.timed_out:
-            failure = _merge_worker_failures(
+            failure = merge_owned_failures(
                 failure, VerifiedTaskWorkerDraining("Preparation entry settlement is draining.")
             )
         if outcome.cancellation is not None:
-            failure = _merge_worker_failures(failure, outcome.cancellation)
+            failure = merge_owned_failures(failure, outcome.cancellation)
             restore_task_cancellation_requests(
                 outcome.cancellation_requests_consumed, cancellation=outcome.cancellation
             )
@@ -727,7 +672,7 @@ class VerifiedTaskWorker:
             source_request_sha256=source,
             execution_owner_id=self.app._current_work_attempt_execution_owner_id(),
             operation=asyncio.create_task(
-                _capture_owned_task_outcome(
+                capture_owned_task_outcome(
                     lambda: self.app.admit_work_attempt(request, execution=execution)
                 ),
                 name="cayu-preparation-admission",
@@ -749,68 +694,19 @@ class VerifiedTaskWorker:
         return admission
 
     async def _with_heartbeat(self, owner: _LeaseOwner, action: Callable[[], Awaitable[_T]]) -> _T:
-        stop = asyncio.Event()
-
         async def after(update: bool) -> bool | None:
             return True if update else None
 
-        heartbeat = asyncio.create_task(
-            _capture_owned_task_outcome(
-                lambda: run_durable_lease_heartbeat(
-                    owner.heartbeat,
-                    lease_seconds=self.lease_seconds,
-                    stop=stop,
-                    stopped_outcome=True,
-                    after_heartbeat=after,
-                )
-            )
+        return await self._adapter_runner.run_to_settlement(
+            action,
+            lambda stop: run_durable_lease_heartbeat(
+                owner.heartbeat,
+                lease_seconds=self.lease_seconds,
+                stop=stop,
+                stopped_outcome=True,
+                after_heartbeat=after,
+            ),
         )
-        work = asyncio.create_task(_capture_owned_task_outcome(action))
-        failure = None
-        result = None
-        consumed = 0
-        try:
-            done, _ = await asyncio.wait({work, heartbeat}, return_when=asyncio.FIRST_COMPLETED)
-            if heartbeat in done:
-                heartbeat_result = heartbeat.result()
-                if heartbeat_result.error is not None:
-                    raise heartbeat_result.error
-            completed = await asyncio.shield(work)
-            if completed.error is not None:
-                raise completed.error
-            result = completed.result
-        except BaseException as error:
-            failure = error
-            forwarded = work.cancel()
-            settled = await await_shielded_task_outcome(
-                work,
-                cancellation=error if isinstance(error, asyncio.CancelledError) else None,
-            )
-            consumed += settled.cancellation_requests_consumed
-            child_error = settled.error or (
-                None if settled.result is None else settled.result.error
-            )
-            if forwarded and isinstance(child_error, asyncio.CancelledError):
-                # This is the cancellation we forwarded, not a second control
-                # signal. Its cleanup cause still belongs in the final outcome.
-                child_error = exception_cause(child_error)
-            failure = _merge_worker_failures(failure, child_error)
-            failure = _merge_worker_failures(failure, settled.cancellation)
-        finally:
-            stop.set()
-            settled_heartbeat = await await_shielded_task_outcome(heartbeat)
-            consumed += settled_heartbeat.cancellation_requests_consumed
-            heartbeat_error = settled_heartbeat.error or (
-                None if settled_heartbeat.result is None else settled_heartbeat.result.error
-            )
-            failure = _merge_worker_failures(failure, heartbeat_error)
-            failure = _merge_worker_failures(failure, settled_heartbeat.cancellation)
-        restore_task_cancellation_requests(
-            consumed, cancellation=failure if isinstance(failure, asyncio.CancelledError) else None
-        )
-        if failure is not None:
-            raise failure from exception_cause(failure)
-        return cast("_T", result)
 
     async def run(self, stop: asyncio.Event | None = None, max_tasks: int | None = None) -> int:
         if self._closed:
@@ -840,7 +736,7 @@ class VerifiedTaskWorker:
                 "The task store does not implement the complete verified-worker contract."
             )
         running = asyncio.create_task(
-            _capture_owned_task_outcome(
+            capture_owned_task_outcome(
                 lambda: run_durable_worker_loop(
                     self._step,
                     poll_interval_s=self.poll_interval_s,
@@ -874,7 +770,7 @@ class VerifiedTaskWorker:
             )
             if isinstance(child_error, asyncio.CancelledError) and child_error is not propagated:
                 child_error = exception_cause(child_error)
-            propagated = _merge_worker_failures(propagated, child_error)
+            propagated = merge_owned_failures(propagated, child_error)
             assert propagated is not None
             raise propagated from exception_cause(propagated)
         finally:
@@ -896,19 +792,19 @@ class VerifiedTaskWorker:
                 max(0.0, deadline - asyncio.get_running_loop().time())
             )
         except BaseException as error:
-            failure = _merge_worker_failures(failure, error)
+            failure = merge_owned_failures(failure, error)
         try:
             await self._consume_pre_entry_settlement(
                 max(0.0, deadline - asyncio.get_running_loop().time())
             )
         except BaseException as error:
-            failure = _merge_worker_failures(failure, error)
+            failure = merge_owned_failures(failure, error)
         try:
             await self._consume_verifier_settlement(
                 max(0.0, deadline - asyncio.get_running_loop().time())
             )
         except BaseException as error:
-            failure = _merge_worker_failures(failure, error)
+            failure = merge_owned_failures(failure, error)
         if failure is not None:
             raise failure from exception_cause(failure)
 
@@ -930,7 +826,7 @@ class VerifiedTaskWorker:
             # Deferred cleanup failures remain observable through this handle.
             failure = exception_cause(failure)
         if outcome.cancellation is not None:
-            failure = _merge_worker_failures(outcome.cancellation, failure)
+            failure = merge_owned_failures(outcome.cancellation, failure)
             assert failure is not None
             raise failure from exception_cause(failure)
         if outcome.timed_out:
@@ -951,7 +847,7 @@ class VerifiedTaskWorker:
                 return (settlement.failure,)
 
             retained.observation = asyncio.create_task(
-                _capture_owned_task_outcome(observe), name="cayu-worker-verifier-settlement"
+                capture_owned_task_outcome(observe), name="cayu-worker-verifier-settlement"
             )
         observation = retained.observation
         outcome = await await_shielded_task_outcome(
@@ -969,7 +865,7 @@ class VerifiedTaskWorker:
             # own cancellation below remains independently authoritative.
             failure = None
         elif captured is not None and captured.result is not None:
-            failure = _merge_worker_failures(failure, captured.result[0])
+            failure = merge_owned_failures(failure, captured.result[0])
             retained.execution.acknowledge_settlement()
             if self._verification is retained:
                 self._verification = None
@@ -980,12 +876,12 @@ class VerifiedTaskWorker:
             if failure is None:
                 failure = RuntimeError("Verifier observation returned no settlement evidence.")
         if outcome.cancellation is not None:
-            failure = _merge_worker_failures(failure, outcome.cancellation)
+            failure = merge_owned_failures(failure, outcome.cancellation)
             restore_task_cancellation_requests(
                 outcome.cancellation_requests_consumed, cancellation=outcome.cancellation
             )
         elif outcome.timed_out:
-            failure = _merge_worker_failures(
+            failure = merge_owned_failures(
                 failure,
                 VerifiedTaskWorkerDraining(
                     "Owned completion verification is still draining; keep stores open "
@@ -1005,7 +901,7 @@ class VerifiedTaskWorker:
             await self.aclose()
         except BaseException as cleanup:
             primary = exc[1] if len(exc) > 1 and isinstance(exc[1], BaseException) else None
-            failure = _merge_worker_failures(primary, cleanup)
+            failure = merge_owned_failures(primary, cleanup)
             assert failure is not None
             raise failure from exception_cause(failure)
 
@@ -1336,11 +1232,11 @@ class VerifiedTaskWorker:
                             if committed is None:
                                 raise conflict
                         except BaseException as reconciliation:
-                            combined = _merge_worker_failures(failure, reconciliation)
+                            combined = merge_owned_failures(failure, reconciliation)
                             assert combined is not None
                             raise combined from exception_cause(combined)
                     except BaseException as settlement:
-                        combined = _merge_worker_failures(failure, settlement)
+                        combined = merge_owned_failures(failure, settlement)
                         assert combined is not None
                         raise combined from exception_cause(combined)
                 # Expiry is durable state, not a reason to erase a real
@@ -1398,7 +1294,7 @@ class VerifiedTaskWorker:
                     owner, "work_contract_elapsed_limit", proposal=proposal, decision_id=decision_id
                 )
             except BaseException as settlement:
-                combined = _merge_worker_failures(failure, settlement)
+                combined = merge_owned_failures(failure, settlement)
                 assert combined is not None
                 raise combined from exception_cause(combined)
             if isinstance(failure, ExecutionDeadlineExceeded):
@@ -1464,7 +1360,7 @@ class VerifiedTaskWorker:
                     try:
                         await self._consume_preparation_settlement(self.callback_timeout_seconds)
                     except BaseException as settlement_failure:
-                        combined = _merge_worker_failures(entry_failure, settlement_failure)
+                        combined = merge_owned_failures(entry_failure, settlement_failure)
                         assert combined is not None
                         raise combined from exception_cause(combined)
                     raise
@@ -1525,7 +1421,7 @@ class VerifiedTaskWorker:
                             )
                             owner.state = state
                     except BaseException as settlement_failure:
-                        combined = _merge_worker_failures(hold_failure, settlement_failure)
+                        combined = merge_owned_failures(hold_failure, settlement_failure)
                         assert combined is not None
                         raise combined from exception_cause(combined)
                 raise
@@ -1759,7 +1655,7 @@ class VerifiedTaskWorker:
                 self._retain_pre_entry_settlement(admission)
             return await self._settle_runtime_stop(owner, reason)
         except asyncio.CancelledError as cancellation:
-            combined = _merge_worker_failures(failure, cancellation)
+            combined = merge_owned_failures(failure, cancellation)
             assert combined is not None
             raise combined from exception_cause(combined)
         except BaseException as cleanup:
@@ -1879,7 +1775,7 @@ class VerifiedTaskWorker:
                         name="Verified task runtime stop reconciliation",
                     )
                 except BaseException as reconciliation_failure:
-                    combined = _merge_worker_failures(publication_failure, reconciliation_failure)
+                    combined = merge_owned_failures(publication_failure, reconciliation_failure)
                     assert combined is not None
                     raise combined from exception_cause(combined)
                 if raw is None:
@@ -1927,7 +1823,7 @@ class VerifiedTaskWorker:
                         lambda: require_receipt(raw), "Verified runtime stop receipt"
                     )
                 except BaseException as validation_failure:
-                    combined = _merge_worker_failures(publication_failure, validation_failure)
+                    combined = merge_owned_failures(publication_failure, validation_failure)
                     assert combined is not None
                     raise combined from exception_cause(combined)
             else:
@@ -2011,7 +1907,7 @@ class VerifiedTaskWorker:
                         name="Verified pre-entry settlement readback",
                     )
                 except BaseException as readback_failure:
-                    failure = _merge_worker_failures(publication_failure, readback_failure)
+                    failure = merge_owned_failures(publication_failure, readback_failure)
                     assert failure is not None
                     raise failure from exception_cause(failure)
                 if raw is None:
@@ -2030,7 +1926,7 @@ class VerifiedTaskWorker:
             return self._validate(validate, "Verified pre-entry settlement receipt")
 
         if self._pre_entry_publication is None:
-            self._pre_entry_publication = asyncio.create_task(_capture_owned_task_outcome(publish))
+            self._pre_entry_publication = asyncio.create_task(capture_owned_task_outcome(publish))
         publication = self._pre_entry_publication
         outcome = await await_shielded_task_outcome(
             publication, timeout_s=timeout_s, timeout_after_cancellation_s=0
@@ -2043,10 +1939,10 @@ class VerifiedTaskWorker:
             if captured is not None and failure is None:
                 self._pre_entry_settlement = None
         if outcome.timed_out:
-            failure = _merge_worker_failures(
+            failure = merge_owned_failures(
                 failure, VerifiedTaskWorkerDraining("Pre-entry settlement is still draining.")
             )
-        failure = _merge_worker_failures(failure, outcome.cancellation)
+        failure = merge_owned_failures(failure, outcome.cancellation)
         restore_task_cancellation_requests(
             outcome.cancellation_requests_consumed, cancellation=outcome.cancellation
         )

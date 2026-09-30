@@ -41158,5 +41158,17 @@
   "tests/core/test_session_steering_completion.py::test_stop_winner_survives_settlement_faults[sqlite-rejection-ack]": 0.9778479172382504,
   "tests/core/test_session_steering_completion.py::test_stop_winner_survives_settlement_faults[sqlite-steering-ack]": 0.8076330830808729,
   "tests/core/test_session_steering.py::test_unqualified_completion_override_rejects_new_steering[publish_interaction_transition]": 0.0018776662182062864,
-  "tests/core/test_session_steering.py::test_unqualified_completion_override_rejects_new_steering[settle_session_invocation]": 0.5883512082509696
+  "tests/core/test_session_steering.py::test_unqualified_completion_override_rejects_new_steering[settle_session_invocation]": 0.5883512082509696,
+    "tests/core/test_leased_adapter_runner.py::test_cancelled_single_flight_waiter_cannot_split_an_active_queue": 0.006,
+    "tests/core/test_leased_adapter_runner.py::test_lease_loss_and_heartbeat_failure_cancel_the_same_drain_only_once": 0.017,
+    "tests/core/test_leased_adapter_runner.py::test_stale_drain_acknowledgement_does_not_release_a_successor": 0.0,
+    "tests/core/test_leased_adapter_runner.py::test_inherited_execution_requires_settlement_before_generation_refresh[lock]": 0.002,
+    "tests/core/test_leased_adapter_runner.py::test_inherited_execution_requires_settlement_before_generation_refresh[capacity]": 0.007,
+    "tests/core/test_leased_adapter_runner.py::test_inherited_execution_requires_settlement_before_generation_refresh[adapter]": 0.006,
+    "tests/core/test_leased_adapter_runner.py::test_inherited_execution_requires_settlement_before_generation_refresh[heartbeat]": 0.003,
+    "tests/core/test_leased_adapter_runner.py::test_inherited_execution_requires_settlement_before_generation_refresh[drain]": 0.002,
+    "tests/core/test_leased_adapter_runner.py::test_inherited_execution_requires_settlement_before_generation_refresh[domain]": 0.005,
+    "tests/core/test_leased_adapter_runner.py::test_worker_settlement_retains_cleanup_failure_and_repeated_caller_cancellation": 0.006,
+    "tests/core/test_leased_adapter_runner.py::test_successful_dispatch_detaches_its_lease_watch": 0.004,
+    "tests/core/test_leased_adapter_runner.py::test_tracking_a_heartbeat_preserves_its_cancellation_cleanup_cause": 0.0
 }

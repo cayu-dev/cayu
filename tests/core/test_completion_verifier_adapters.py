@@ -1376,8 +1376,8 @@ def test_inherited_active_verifier_state_fails_before_store_mutation() -> None:
             RecordingVerifier(_accepted_decision()),
         )
         coordinator = app._completion_verifier_coordinator
-        coordinator._execution_owner_process_id = -1
-        coordinator._adapter_capacity_reservations.add(object())
+        coordinator._adapter_runner._process_id = -1
+        coordinator._reserve_adapter_capacity()
 
         with pytest.raises(
             CompletionVerifierExecutionError,
@@ -1599,8 +1599,8 @@ def test_retry_cannot_steal_a_completed_adapter_drain_before_its_callback() -> N
         assert decision.decision_id == replacement.decision_id
         assert verifier.calls == 2
         await asyncio.sleep(0)
-        assert not coordinator._draining_adapter_tasks
-        assert not coordinator._claim_heartbeat_tasks
+        assert coordinator._adapter_runner.draining(proposal_id) is None
+        assert coordinator._adapter_runner.active_heartbeat_count == 0
 
     asyncio.run(scenario())
 
@@ -2368,7 +2368,7 @@ def test_owned_verification_retains_its_exact_drain_after_retry(trigger, late_fa
                 await waiter
             assert waiter.cancelling() == 1
             assert waiter.cancelled()
-            assert len(coordinator._adapter_tasks) == 1
+            assert coordinator._adapter_runner.active_adapter_count == 1
             contender = coordinator.start_owned_verification(
                 _execution_request(proposal_id, suffix="other")
             )
@@ -2378,7 +2378,7 @@ def test_owned_verification_retains_its_exact_drain_after_retry(trigger, late_fa
             # A denied invocation cannot acquire the incumbent's resources
             # merely by naming the same proposal.
             assert (await asyncio.wait_for(contender.settlement(), 5)).failure is None
-            assert len(coordinator._adapter_tasks) == 1
+            assert coordinator._adapter_runner.active_adapter_count == 1
             verifier.release.set()
             settled = await asyncio.wait_for(owned.settlement(), 5)
             if late_failure:
@@ -2388,7 +2388,7 @@ def test_owned_verification_retains_its_exact_drain_after_retry(trigger, late_fa
             else:
                 assert settled.failure is None
             await asyncio.sleep(0)
-            assert proposal_id not in coordinator._draining_adapter_tasks
+            assert coordinator._adapter_runner.draining(proposal_id) is None
             again = await owned.settlement()
             assert again.failure is settled.failure
             owned.acknowledge_settlement()
@@ -2473,17 +2473,17 @@ def test_old_verifier_settlement_acknowledgement_cannot_remove_retried_drain() -
                 outcome = await owned.operation
                 assert isinstance(outcome.error, CompletionVerifierExecutionError)
                 await asyncio.wait_for(verifier.cancelled[index].wait(), 5)
-                current = coordinator._draining_adapter_tasks[proposal_id]
+                current = coordinator._adapter_runner.draining(proposal_id)
                 if index:
                     handles[0].acknowledge_settlement()
-                    assert coordinator._draining_adapter_tasks[proposal_id] is current
+                    assert coordinator._adapter_runner.draining(proposal_id) is current
                 verifier.release[index].set()
                 assert isinstance(
                     (await asyncio.wait_for(owned.settlement(), 5)).failure,
                     CompletionVerifierExecutionError,
                 )
                 owned.acknowledge_settlement()
-                assert proposal_id not in coordinator._draining_adapter_tasks
+                assert coordinator._adapter_runner.draining(proposal_id) is None
             assert verifier.calls == 2
             assert await store.load_completion_decision_for_proposal(proposal_id) is None
         finally:
@@ -2568,7 +2568,7 @@ def test_background_drain_observes_late_adapter_cleanup_once(trigger, cleanup) -
                     await invocation
             await asyncio.wait_for(verifier.cancelled.wait(), 5)
             coordinator = app._completion_verifier_coordinator
-            draining = coordinator._draining_adapter_tasks[proposal_id]
+            draining = coordinator._adapter_runner.draining(proposal_id)
             assert not draining.task.done()
             with pytest.raises(CompletionVerifierExecutionError, match="still draining"):
                 await app.verify_completion_proposal(request)
@@ -2602,8 +2602,8 @@ def test_background_drain_observes_late_adapter_cleanup_once(trigger, cleanup) -
                     else ["ValueError: late cleanup first"]
                 )
                 assert verifier.calls == 1
-            assert proposal_id not in coordinator._draining_adapter_tasks
-            assert not coordinator._adapter_capacity_reservations
+            assert coordinator._adapter_runner.draining(proposal_id) is None
+            assert not coordinator._adapter_runner._capacity_reservations
             # Failure observation is once-only and cannot dispatch another
             # adapter. A distinct subsequent retry may now complete normally.
             result = await app.verify_completion_proposal(request)
@@ -2677,7 +2677,7 @@ def test_background_drain_replays_late_claim_renewal_failure_once(late_adapter_f
             await app.verify_completion_proposal(request)
 
         coordinator = app._completion_verifier_coordinator
-        draining = coordinator._draining_adapter_tasks[proposal_id]
+        draining = coordinator._adapter_runner.draining(proposal_id)
         while not draining.heartbeat.ownership_lost.done():
             await asyncio.sleep(0)
         assert draining.heartbeat.observed_failure_id is None
@@ -2705,7 +2705,7 @@ def test_background_drain_replays_late_claim_renewal_failure_once(late_adapter_f
         ) as captured:
             await app.verify_completion_proposal(request)
         assert verifier.calls == 1
-        assert proposal_id not in coordinator._draining_adapter_tasks
+        assert coordinator._adapter_runner.draining(proposal_id) is None
 
         pending: list[BaseException] = [captured.value]
         observed: set[int] = set()

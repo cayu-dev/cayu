@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -32,6 +31,7 @@ from cayu.runtime._diagnostics import (
 from cayu.runtime._execution_profile_identity_validation import (
     copy_secret_free_execution_profile_behavior_identity,
 )
+from cayu.runtime._leased_adapter_runner import LeasedAdapterLease, LeasedAdapterRunner
 from cayu.runtime._task_store_operation_boundary import (
     TaskStoreOperationOutcome,
     capture_sensitive_validation,
@@ -148,12 +148,6 @@ class _AdapterDrainCancellationMarker:
     __str__ = __repr__
 
 
-@dataclass(slots=True)
-class _SingleFlightLock:
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    users: int = 0
-
-
 @dataclass(frozen=True, slots=True)
 class _VerifierAuthority:
     proposal: CompletionProposal = field(repr=False)
@@ -190,7 +184,6 @@ class _ClaimHeartbeat:
     retained_for_drain: bool = False
     observed_failure_id: int | None = None
     shutdown_requested: bool = False
-    adapter_cancellation_requested: bool = False
 
     @property
     def ownership_lost(self) -> asyncio.Future[BaseException]:
@@ -703,16 +696,9 @@ class CompletionVerifierCoordinator:
                     "Completion verifier profile-policy identity is invalid."
                 ) from None
             self._profile_policy_identity = profile_policy_identity
-        self._execution_owner_process_id = os.getpid()
         self._execution_owner_id = f"cver_{uuid4().hex}"
         self._verifiers: dict[tuple[str, str, str, str], _RegisteredVerifier] = {}
-        self._locks: dict[_ExecutionKey, _SingleFlightLock] = {}
-        self._adapter_tasks: set[
-            asyncio.Task[CapturedAwaitableOutcome[CompletionVerifierDecision]]
-        ] = set()
-        self._adapter_capacity_reservations: set[object] = set()
-        self._draining_adapter_tasks: dict[_ExecutionKey, _DrainingAdapter] = {}
-        self._claim_heartbeat_tasks: set[asyncio.Task[None]] = set()
+        self._adapter_runner = LeasedAdapterRunner[_DrainingAdapter]()
 
     def _copy_profile_policy_identity(
         self,
@@ -735,22 +721,13 @@ class CompletionVerifierCoordinator:
     def _ensure_process_local_generation(self) -> None:
         """Refresh quiescent runtime ownership after a process fork."""
 
-        process_id = os.getpid()
-        if process_id == self._execution_owner_process_id:
-            return
-        if (
-            self._locks
-            or self._adapter_tasks
-            or self._adapter_capacity_reservations
-            or self._draining_adapter_tasks
-            or self._claim_heartbeat_tasks
-        ):
-            raise CompletionVerifierExecutionError(
+        if self._adapter_runner.ensure_process_local(
+            lambda: CompletionVerifierExecutionError(
                 "Completion verifier coordinator inherited active execution state "
                 "across a process boundary; rebuild the application in this worker."
-            ) from None
-        self._execution_owner_process_id = process_id
-        self._execution_owner_id = f"cver_{uuid4().hex}"
+            )
+        ):
+            self._execution_owner_id = f"cver_{uuid4().hex}"
 
     def register(
         self,
@@ -1041,15 +1018,10 @@ class CompletionVerifierCoordinator:
                 "Completion-verifier execution identity contains a workload secret."
             ) from None
         key = copied.proposal_id
-        entry = self._locks.get(key)
-        if entry is None:
-            entry = _SingleFlightLock()
-            self._locks[key] = entry
-        entry.users += 1
-        try:
+        with self._adapter_runner.single_flight(key) as lock:
             safe_cancellation: asyncio.CancelledError | None = None
             try:
-                await entry.lock.acquire()
+                await lock.acquire()
             except asyncio.CancelledError as cancellation:
                 safe_cancellation = _safe_caller_cancellation(
                     cancellation,
@@ -1061,11 +1033,7 @@ class CompletionVerifierCoordinator:
             try:
                 return await self._verify_locked(copied, deadline, retained_drain=retained_drain)
             finally:
-                entry.lock.release()
-        finally:
-            entry.users -= 1
-            if entry.users == 0 and self._locks.get(key) is entry:
-                self._locks.pop(key, None)
+                lock.release()
 
     async def _verify_locked(
         self,
@@ -1156,7 +1124,7 @@ class CompletionVerifierCoordinator:
             ) from None
 
         operation_key = self._execution_key(request)
-        draining = self._draining_adapter_tasks.get(operation_key)
+        draining = self._adapter_runner.draining(operation_key)
         if draining is not None and not draining.task.done():
             raise CompletionVerifierExecutionError(
                 "The prior exact completion-verifier execution is still draining."
@@ -1180,8 +1148,7 @@ class CompletionVerifierCoordinator:
                 ) from None
             settlement_failure = draining.settlement_failure
             if settlement_failure is not None:
-                if self._draining_adapter_tasks.get(operation_key) is draining:
-                    self._draining_adapter_tasks.pop(operation_key, None)
+                self._adapter_runner.acknowledge_drain(operation_key, draining)
                 raise_task_store_operation_failure(settlement_failure)
 
         registered = self._verifiers[verifier_key]
@@ -2378,7 +2345,7 @@ class CompletionVerifierCoordinator:
         stop = asyncio.Event()
         ownership_lost: asyncio.Future[BaseException] = asyncio.get_running_loop().create_future()
         state = _ClaimHeartbeatState(ownership_lost=ownership_lost)
-        task = asyncio.create_task(
+        task = self._adapter_runner.start_heartbeat(
             self._heartbeat_claim(
                 store_owner,
                 claim_request,
@@ -2398,10 +2365,8 @@ class CompletionVerifierCoordinator:
             cancellation_marker=_ClaimHeartbeatCancellationMarker(),
             shutdown_marker=_ClaimHeartbeatShutdownMarker(),
         )
-        self._claim_heartbeat_tasks.add(task)
 
         def settled(completed: asyncio.Task[None]) -> None:
-            self._claim_heartbeat_tasks.discard(completed)
             with suppress(BaseException):
                 completed.result()
 
@@ -2690,44 +2655,6 @@ class CompletionVerifierCoordinator:
             return failure
         return None
 
-    def _cancel_adapter_for_failed_heartbeat(
-        self,
-        ownership_lost: asyncio.Future[BaseException],
-        adapter_task: asyncio.Task[CapturedAwaitableOutcome[CompletionVerifierDecision]],
-        heartbeat: _ClaimHeartbeat,
-    ) -> None:
-        if ownership_lost.cancelled():
-            return
-        try:
-            ownership_lost.result()
-        except BaseException:
-            return
-        else:
-            self._request_adapter_cancellation_for_heartbeat(heartbeat, adapter_task)
-
-    def _cancel_adapter_for_terminal_heartbeat_failure(
-        self,
-        heartbeat_task: asyncio.Task[None],
-        adapter_task: asyncio.Task[CapturedAwaitableOutcome[CompletionVerifierDecision]],
-        heartbeat: _ClaimHeartbeat,
-    ) -> None:
-        if heartbeat_task.cancelled():
-            return
-        try:
-            heartbeat_task.result()
-        except BaseException:
-            self._request_adapter_cancellation_for_heartbeat(heartbeat, adapter_task)
-
-    @staticmethod
-    def _request_adapter_cancellation_for_heartbeat(
-        heartbeat: _ClaimHeartbeat,
-        adapter_task: asyncio.Task[CapturedAwaitableOutcome[CompletionVerifierDecision]],
-    ) -> None:
-        if heartbeat.adapter_cancellation_requested or adapter_task.done():
-            return
-        heartbeat.adapter_cancellation_requested = True
-        adapter_task.cancel(heartbeat.cancellation_marker)
-
     async def _invoke_adapter(
         self,
         verifier: DeterministicCompletionVerifier,
@@ -2744,46 +2671,22 @@ class CompletionVerifierCoordinator:
         if remaining is not None:
             timeout_seconds = min(timeout_seconds, remaining)
         try:
-            task = asyncio.create_task(
-                capture_awaitable_outcome(
-                    lambda adapter=verifier, value=request: adapter.verify(value)
-                ),
-                name="cayu-completion-verifier",
-            )
-        except BaseException:
-            del verifier, request
-            raise
-        del verifier, request
-        self._adapter_tasks.add(task)
-        task.add_done_callback(
-            lambda completed: self._release_adapter_task(
+            invocation = await self._adapter_runner.run(
                 operation_key,
-                completed,
+                lambda adapter=verifier, value=request: adapter.verify(value),
+                name="cayu-completion-verifier",
+                timeout_seconds=timeout_seconds,
+                lease=LeasedAdapterLease(
+                    ownership_lost=heartbeat.ownership_lost,
+                    heartbeat=heartbeat.task,
+                    marker=heartbeat.cancellation_marker,
+                ),
+                on_settled=self._release_adapter_task,
             )
-        )
-        heartbeat.ownership_lost.add_done_callback(
-            lambda completed, adapter_task=task, control=heartbeat: (
-                self._cancel_adapter_for_failed_heartbeat(
-                    completed,
-                    adapter_task,
-                    control,
-                )
-            )
-        )
-        heartbeat.task.add_done_callback(
-            lambda completed, adapter_task=task, control=heartbeat: (
-                self._cancel_adapter_for_terminal_heartbeat_failure(
-                    completed,
-                    adapter_task,
-                    control,
-                )
-            )
-        )
-        shielded = await await_shielded_task_outcome(
-            task,
-            timeout_s=timeout_seconds,
-            timeout_after_cancellation_s=0,
-        )
+        finally:
+            del verifier, request
+        task, shielded = invocation.task, invocation.outcome
+        del invocation
         if shielded.cancellation is not None:
             cancellation = shielded.cancellation
             cancellation_requests_consumed = shielded.cancellation_requests_consumed
@@ -2932,16 +2835,15 @@ class CompletionVerifierCoordinator:
         return decision
 
     def _reserve_adapter_capacity(self) -> object:
-        if len(self._adapter_capacity_reservations) >= _MAX_ACTIVE_COMPLETION_VERIFIERS:
-            raise CompletionVerifierExecutionError(
+        return self._adapter_runner.reserve_capacity(
+            _MAX_ACTIVE_COMPLETION_VERIFIERS,
+            lambda: CompletionVerifierExecutionError(
                 "Completion verifier execution capacity is exhausted."
-            ) from None
-        reservation = object()
-        self._adapter_capacity_reservations.add(reservation)
-        return reservation
+            ),
+        )
 
     def _release_adapter_capacity_reservation(self, reservation: object) -> None:
-        self._adapter_capacity_reservations.discard(reservation)
+        self._adapter_runner.release_capacity(reservation)
 
     def _cancel_and_retain_adapter_task(
         self,
@@ -2960,7 +2862,7 @@ class CompletionVerifierCoordinator:
             cancellation_marker=_AdapterDrainCancellationMarker(),
             observed_adapter_failures=observed_adapter_failures,
         )
-        self._draining_adapter_tasks[operation_key] = draining
+        self._adapter_runner.retain_drain(operation_key, draining)
         if retained_drain is not None:
             retained_drain.set_result(draining)
         if task.done():
@@ -3063,9 +2965,9 @@ class CompletionVerifierCoordinator:
         draining.settlement_failure = settlement.failure
         if draining.settlement_failure is not None:
             return True
-        current = self._draining_adapter_tasks.get(operation_key)
+        current = self._adapter_runner.draining(operation_key)
         if current is draining and current.settlement_task is completed:
-            self._draining_adapter_tasks.pop(operation_key, None)
+            self._adapter_runner.acknowledge_drain(operation_key, draining)
         return True
 
     def _acknowledge_owned_drain(self, draining: _DrainingAdapter) -> None:
@@ -3079,20 +2981,16 @@ class CompletionVerifierCoordinator:
             )
         ):
             raise RuntimeError("Completion verifier cleanup has not settled.")
-        if self._draining_adapter_tasks.get(draining.operation_key) is draining:
-            self._draining_adapter_tasks.pop(draining.operation_key, None)
+        self._adapter_runner.acknowledge_drain(draining.operation_key, draining)
 
     def _release_adapter_task(
         self,
         operation_key: _ExecutionKey,
         completed: asyncio.Task[CapturedAwaitableOutcome[CompletionVerifierDecision]],
     ) -> None:
-        self._adapter_tasks.discard(completed)
-        draining = self._draining_adapter_tasks.get(operation_key)
+        draining = self._adapter_runner.draining(operation_key)
         if draining is not None and draining.task is completed:
             self._ensure_draining_adapter_settlement(operation_key, draining)
-        with suppress(BaseException):
-            completed.result()
 
     @staticmethod
     def _execution_key(request: CompletionVerifierExecutionRequest) -> _ExecutionKey:
