@@ -68,6 +68,15 @@ each published result, the owner reads the run, result, and run again before
 accepting evidence, so a changed durable run cannot produce a report from
 inconsistent readback.
 
+`server/_judge_calibration_routes.py` owns fixed-evidence calibration preview,
+judge execution, durable report publication and retrieval. It receives the
+bounded eval router, runtime store and target registry, and shared auth
+dependencies. Each registration creates its own striped run-ID locks; a
+calibration checks for a stored run, validates current judge authority, executes
+trials and saves the report while holding its lock. Repeated requests reuse
+the stored report, and conflicting definitions retain their existing rejection.
+The eval worker lifespan remains in router composition.
+
 ## Runtime Shape
 
 ```text
