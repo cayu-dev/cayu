@@ -7335,9 +7335,12 @@ class ToolRoundRun:
         executor = self._executor
         session = self._session
         tool_outcomes: list[runtime_records.ToolCallOutcome] = []
-        source_checkpoint = await executor._session_store.load_checkpoint(session.id)
-        source_pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
-            source_checkpoint,
+        (
+            _source_checkpoint,
+            source_pending_round,
+        ) = await tool_round_recovery.load_pending_tool_round(
+            executor._session_store,
+            session.id,
             redactor=executor._secret_redactor,
             consume_on_rejection=True,
             runtime_session=session,

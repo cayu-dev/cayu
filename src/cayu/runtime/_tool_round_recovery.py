@@ -762,6 +762,35 @@ def _publication_with_legacy_projection(
     return AssistantToolRoundPublication(state="pending", message=projected)
 
 
+async def load_pending_tool_round(
+    session_store: SessionStore,
+    session_id: str,
+    *,
+    redactor: SecretRedactor | None = None,
+    consume_on_rejection: bool = False,
+    runtime_session: Session | None = None,
+) -> tuple[dict[str, Any] | None, PendingToolRound | None]:
+    """Read a fresh round and retain its exact source snapshot for publication.
+
+    Each call loads and validates once with the caller's current context. The
+    round is detached from the returned checkpoint; neither is cached. Callers
+    already inside a checkpoint transform use the synchronous parser instead.
+    """
+
+    checkpoint = await session_store.load_checkpoint(session_id)
+    try:
+        return checkpoint, pending_tool_round_from_checkpoint(
+            checkpoint,
+            redactor=redactor,
+            consume_on_rejection=consume_on_rejection,
+            runtime_session=runtime_session,
+        )
+    finally:
+        # The parser clears rejected private data. Its loader must not retain
+        # the original snapshot in an exception traceback either.
+        checkpoint = None
+
+
 def pending_tool_round_from_checkpoint(
     checkpoint: dict[str, Any] | None,
     *,

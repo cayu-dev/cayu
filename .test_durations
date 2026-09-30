@@ -41214,5 +41214,17 @@
     "tests/core/test_leased_adapter_heartbeat.py::test_extended_publication_deadline_reuses_the_same_pending_renewal": 0.026,
     "tests/core/test_leased_adapter_heartbeat.py::test_expiry_precedes_an_idle_stop_and_keeps_the_first_loss[False]": 0.004,
     "tests/core/test_leased_adapter_heartbeat.py::test_expiry_precedes_an_idle_stop_and_keeps_the_first_loss[True]": 0.001,
-    "tests/core/test_leased_adapter_heartbeat.py::test_repeated_cancellation_during_expired_renewal_settlement_restores_requests": 0.027
+    "tests/core/test_leased_adapter_heartbeat.py::test_repeated_cancellation_during_expired_renewal_settlement_restores_requests": 0.027,
+    "tests/core/test_pending_tool_round_reader.py::test_read_preserves_source_and_admits_checkpoint_once[0]": 0.001,
+    "tests/core/test_pending_tool_round_reader.py::test_read_preserves_source_and_admits_checkpoint_once[1000]": 0.003,
+    "tests/core/test_pending_tool_round_reader.py::test_read_is_fresh_after_checkpoint_changes_and_removal": 0.001,
+    "tests/core/test_pending_tool_round_reader.py::test_read_rejects_invalid_unrelated_retained_data[False]": 0.0,
+    "tests/core/test_pending_tool_round_reader.py::test_read_rejects_invalid_unrelated_retained_data[True]": 0.0,
+    "tests/core/test_pending_tool_round_reader.py::test_read_rechecks_redactor_and_preserves_rejection_ownership[False-False]": 0.001,
+    "tests/core/test_pending_tool_round_reader.py::test_read_rechecks_redactor_and_preserves_rejection_ownership[False-True]": 0.001,
+    "tests/core/test_pending_tool_round_reader.py::test_read_rechecks_redactor_and_preserves_rejection_ownership[True-False]": 0.001,
+    "tests/core/test_pending_tool_round_reader.py::test_read_rechecks_redactor_and_preserves_rejection_ownership[True-True]": 0.001,
+    "tests/core/test_pending_tool_round_reader.py::test_read_rechecks_runtime_session_provenance": 0.005,
+    "tests/core/test_pending_tool_round_reader.py::test_read_propagates_store_failure_without_retry[OSError]": 0.0,
+    "tests/core/test_pending_tool_round_reader.py::test_read_propagates_store_failure_without_retry[CancelledError]": 0.0
 }

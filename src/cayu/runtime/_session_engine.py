@@ -14414,8 +14414,10 @@ class SessionEngine:
                 parent, attached
             )
             return
-        checkpoint = await self.session_store.load_checkpoint(wait.parent_effect.session_id)
-        pending = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        checkpoint, pending = await tool_round_recovery.load_pending_tool_round(
+            self.session_store,
+            wait.parent_effect.session_id,
+        )
         if pending is None or pending.max_steps is None:
             raise RuntimeError("Foreground continuation lacks its original pending round.")
         if pending.tool_round_id != wait.parent_effect.tool_round_id:
@@ -22139,16 +22141,15 @@ class SessionEngine:
                         if active_model_stage is not None:
                             keep_recovery_interaction_open = True
                         else:
-                            failure_checkpoint = await self.session_store.load_checkpoint(
-                                session.id
-                            )
-                            pending_failure_round = (
-                                tool_round_recovery.pending_tool_round_from_checkpoint(
-                                    failure_checkpoint,
-                                    redactor=self._secret_redactor,
-                                    consume_on_rejection=True,
-                                    runtime_session=session,
-                                )
+                            (
+                                _failure_checkpoint,
+                                pending_failure_round,
+                            ) = await tool_round_recovery.load_pending_tool_round(
+                                self.session_store,
+                                session.id,
+                                redactor=self._secret_redactor,
+                                consume_on_rejection=True,
+                                runtime_session=session,
                             )
                             materialization_is_safe = pending_failure_round is None
                             keep_recovery_interaction_open = pending_failure_round is not None
@@ -25427,9 +25428,12 @@ class SessionEngine:
             recovery_tail_message_count = len(messages_to_append)
             recovery_expected_transcript_cursor: int | None = None
             if pending_tool_round_source_transcript_cursor is not None:
-                checkpoint = await self.session_store.load_checkpoint(session.id)
-                entrance_pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
-                    checkpoint
+                (
+                    _checkpoint,
+                    entrance_pending_round,
+                ) = await tool_round_recovery.load_pending_tool_round(
+                    self.session_store,
+                    session.id,
                 )
                 if entrance_pending_round is not None:
                     structured_output_retries = max(
@@ -26184,9 +26188,12 @@ class SessionEngine:
                 if tool_calls:
                     if tool_round_identity is None:
                         raise RuntimeError("Tool calls require a tool-round identity.")
-                    checkpoint = await self.session_store.load_checkpoint(session.id)
-                    pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(
-                        checkpoint
+                    (
+                        _checkpoint,
+                        pending_tool_round,
+                    ) = await tool_round_recovery.load_pending_tool_round(
+                        self.session_store,
+                        session.id,
                     )
                     if pending_tool_round is None:
                         raise RuntimeError(
@@ -30317,9 +30324,9 @@ class SessionEngine:
             )
             for outcome in skipped_outcomes
         ]
-        source_checkpoint = await self.session_store.load_checkpoint(session.id)
-        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
-            source_checkpoint,
+        source_checkpoint, pending_round = await tool_round_recovery.load_pending_tool_round(
+            self.session_store,
+            session.id,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
             runtime_session=session,
@@ -31939,8 +31946,10 @@ class SessionEngine:
         invocation_context: InvocationContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Close a round when interruption precedes creation of its live runner."""
-        checkpoint = await self.session_store.load_checkpoint(session.id)
-        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        _checkpoint, pending_round = await tool_round_recovery.load_pending_tool_round(
+            self.session_store,
+            session.id,
+        )
         if pending_round is None:
             return
         messages = await self.session_store.load_transcript(session.id)

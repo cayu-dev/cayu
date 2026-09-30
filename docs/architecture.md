@@ -146,6 +146,16 @@ sessions. It also coordinates workspace settlement and isolated dispatch evidenc
 An uncertain external effect retains its reconciliation fence. Selection and
 publication use the same round owner without authorizing a second tool execution.
 
+Execution, continuation and recovery share `load_pending_tool_round` in
+`_tool_round_recovery.py` for fresh loads followed immediately by round parsing.
+It returns the exact
+checkpoint snapshot and its detached validated round together, so publication
+uses the input it checked. Each call performs one store read with the caller's
+current redactor, rejection-consumption policy and runtime-session provenance;
+it retains no cache. Checkpoint transforms, reads with deadline handling, and
+callers already holding a shared or copied snapshot keep using the synchronous
+parser at that same boundary.
+
 Live and recovered structured-output tool rounds also publish through
 `DurableToolRound`. Live execution validates the original provider arguments and
 checks the result against the durable validation snapshot; recovery uses that

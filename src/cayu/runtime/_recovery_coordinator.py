@@ -8609,9 +8609,9 @@ class RecoveryCoordinator:
             request_loop_policies = request.loop_policies
         else:
             raise TypeError("Tool-round recovery requires an exact recovery action.")
-        checkpoint = await self._session_store.load_checkpoint(loaded_session.id)
-        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
-            checkpoint,
+        checkpoint, pending_round = await tool_round_recovery.load_pending_tool_round(
+            self._session_store,
+            loaded_session.id,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
             runtime_session=loaded_session,
@@ -10336,9 +10336,12 @@ class RecoveryCoordinator:
                 decision=request.decision,
             )
             resolved_by_payload = resolution_actor_payload(request.resolved_by)
-            current_checkpoint = await self._session_store.load_checkpoint(session.id)
-            publication_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+            (
                 current_checkpoint,
+                publication_round,
+            ) = await tool_round_recovery.load_pending_tool_round(
+                self._session_store,
+                session.id,
                 redactor=self._secret_redactor,
                 consume_on_rejection=True,
                 runtime_session=session,
@@ -11066,9 +11069,9 @@ class RecoveryCoordinator:
                         if outcome is not None:
                             tool_outcomes.append(outcome)
 
-            source_checkpoint = await self._session_store.load_checkpoint(session.id)
-            durable_round = tool_round_recovery.pending_tool_round_from_checkpoint(
-                source_checkpoint,
+            source_checkpoint, durable_round = await tool_round_recovery.load_pending_tool_round(
+                self._session_store,
+                session.id,
                 redactor=self._secret_redactor,
                 consume_on_rejection=True,
                 runtime_session=session,
@@ -14966,8 +14969,10 @@ class RecoveryCoordinator:
 
     async def deliver_pending_tool_effect_uncertainty(self, session: Session) -> list[Event]:
         """Deliver already-committed uncertainty through the existing event writer."""
-        checkpoint = await self._session_store.load_checkpoint(session.id)
-        pending = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        _checkpoint, pending = await tool_round_recovery.load_pending_tool_round(
+            self._session_store,
+            session.id,
+        )
         if pending is None:
             return []
         events = await ToolEffectStateOwner(self._session_store).load_uncertainty_events(
@@ -15704,9 +15709,9 @@ class RecoveryCoordinator:
             invocation_context=invocation_context,
             staged_only=staged_only,
         )
-        checkpoint = await self._session_store.load_checkpoint(session.id)
-        recovered_pending = tool_round_recovery.pending_tool_round_from_checkpoint(
-            checkpoint,
+        checkpoint, recovered_pending = await tool_round_recovery.load_pending_tool_round(
+            self._session_store,
+            session.id,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
             runtime_session=session,
@@ -15763,9 +15768,9 @@ class RecoveryCoordinator:
                     "Pending tool-round recovery substituted its validated execution profile."
                 )
             execution_profile = invocation_context.profile
-        checkpoint = await self._session_store.load_checkpoint(session.id)
-        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
-            checkpoint,
+        checkpoint, pending_round = await tool_round_recovery.load_pending_tool_round(
+            self._session_store,
+            session.id,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
             runtime_session=session,
@@ -22868,8 +22873,10 @@ class RecoveryCoordinator:
                 expected_transcript_cursor=snapshot.cursor,
             ):
                 events.append(event)
-            checkpoint = await self._session_store.load_checkpoint(session.id)
-            pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+            checkpoint, pending_tool_round = await tool_round_recovery.load_pending_tool_round(
+                self._session_store,
+                session.id,
+            )
             actions.append(IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND)
 
         if (

@@ -399,8 +399,10 @@ class DurableToolRound:
     ) -> tuple[dict[str, Any] | None, tool_round_recovery.PendingToolRound]:
         """Read one fresh snapshot; publication uses that same validated input."""
 
-        checkpoint = await self._session_store.load_checkpoint(self._session.id)
-        pending = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        checkpoint, pending = await tool_round_recovery.load_pending_tool_round(
+            self._session_store,
+            self._session.id,
+        )
         if (
             pending is None
             or tool_round_recovery.pending_tool_round_identity(pending) != self._identity
