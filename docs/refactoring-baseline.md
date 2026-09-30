@@ -141,3 +141,10 @@ await the exact original store implementations and are restored after the pass.
 Reports retain raw latency samples, medians, the target revision, runtime source
 digest, script digest, Python version, and call counts. This workload measures
 fresh in-memory completion dispatch and publication.
+
+Use `--isolate-gc` for an additional diagnostic comparison. It collects cyclic
+garbage before each batch, disables cyclic collection during the timing window,
+and restores its prior enabled state afterward. Reports record this option and
+the initial collector state. Default measurements include ambient garbage
+collection; isolated measurements help assess sensitivity to its scheduling
+and exclude cyclic collection cost from the measured window.

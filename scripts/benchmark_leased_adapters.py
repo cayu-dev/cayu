@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import gc
 import hashlib
 import inspect
 import json
@@ -23,9 +24,10 @@ import time
 from pathlib import Path
 
 
-async def measure(repo: Path, samples: int) -> dict[str, object]:
+async def measure(repo: Path, samples: int, *, isolate_gc: bool = False) -> dict[str, object]:
     # Select the target checkout before importing Cayu or its frozen fixtures.
     # A process measures exactly one revision.
+    gc_initially_enabled = gc.isenabled()
     sys.path[:0] = [str(repo / "src"), str(repo)]
     from tests.core.test_completion_result_resolvers import _contract as resolver_contract
     from tests.core.test_completion_result_resolvers import (
@@ -99,9 +101,17 @@ async def measure(repo: Path, samples: int) -> dict[str, object]:
                             originals[cls, name] = (name in vars(cls), function)
                             setattr(cls, name, wrapper)
             counts.clear()  # Exclude later fixture setup under the shared class wrappers.
-            started = time.perf_counter()
-            results = await asyncio.gather(*(operation() for operation in operations))
-            elapsed = time.perf_counter() - started
+            gc_was_enabled = gc.isenabled()
+            if isolate_gc:
+                gc.collect()
+                gc.disable()
+            try:
+                started = time.perf_counter()
+                results = await asyncio.gather(*(operation() for operation in operations))
+                elapsed = time.perf_counter() - started
+            finally:
+                if isolate_gc and gc_was_enabled:
+                    gc.enable()
             if len(results) != size or any(len(adapter.requests) != 1 for adapter in adapters):
                 raise RuntimeError("Benchmark did not complete exactly one dispatch per operation.")
             return elapsed, counts
@@ -134,6 +144,8 @@ async def measure(repo: Path, samples: int) -> dict[str, object]:
         ).strip(),
         "runtime_source_digest": current_runtime_build_provenance().artifact_digest,
         "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "isolate_gc": isolate_gc,
+        "gc_initially_enabled": gc_initially_enabled,
         "cases": rows,
     }
 
@@ -143,13 +155,21 @@ def main() -> None:
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--output", type=Path)
     parser.add_argument("--samples", type=int, default=5)
+    parser.add_argument(
+        "--isolate-gc",
+        action="store_true",
+        help="Collect cyclic garbage before each batch and disable collection during timing.",
+    )
     args = parser.parse_args()
     if args.samples < 1:
         parser.error("--samples must be positive")
     repo = args.repo.resolve()
     if not (repo / "src/cayu").is_dir() or not (repo / "tests/core").is_dir():
         parser.error("--repo must contain the Cayu source and characterization tests")
-    report = json.dumps(asyncio.run(measure(repo, args.samples)), indent=2) + "\n"
+    report = (
+        json.dumps(asyncio.run(measure(repo, args.samples, isolate_gc=args.isolate_gc)), indent=2)
+        + "\n"
+    )
     if args.output is None:
         sys.stdout.write(report)
     else:
