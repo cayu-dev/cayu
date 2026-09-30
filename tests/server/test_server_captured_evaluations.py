@@ -11,6 +11,8 @@ import pytest
 pytest.importorskip("fastapi")
 pytest.importorskip("sse_starlette")
 
+from fastapi import HTTPException
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from tests.server.test_server_evals import _execution_profile_revision
 from tests.server.test_server_evaluation_promotion import (
@@ -32,10 +34,211 @@ from cayu.project_control_plane import (
     ProjectControlPlaneAccess,
     _create_project_control_plane_context,
 )
-from cayu.server import DashboardConfig, ServerConfig, create_server
+from cayu.server import DashboardConfig, ServerApiConfig, ServerConfig, create_server
+from cayu.server.contracts import MAX_CAPTURED_EVALUATION_REQUEST_BYTES
 from cayu.server.routes import _eval_result_record_matches_document
 from cayu.sessions.invocation import InvocationOriginTrust, SessionExecutionSource
 from cayu.storage.evals_sqlite import SQLiteEvalStore
+
+
+@pytest.fixture
+def captured_route_server(tmp_path):
+    contexts = []
+
+    def build(*, prefix="/api", with_store=True, with_registry=True):
+        context = None
+        if with_registry:
+            store = SQLiteEvalStore(tmp_path / f"routes-{len(contexts)}.db") if with_store else None
+            context = _create_project_control_plane_context(
+                project_root=Path(__file__).resolve().parents[2],
+                project_id="captured-route-contract",
+                configured_release_id="release-current",
+                eval_store=store,
+                store_backend="sqlite" if store is not None else None,
+                store_source="project" if store is not None else None,
+                access=ProjectControlPlaneAccess.AUTHENTICATED_PRODUCTION,
+            )
+            contexts.append(context)
+        return create_server(
+            asyncio.run(_seed_app()),
+            config=ServerConfig.protected(
+                _authenticate,
+                api=ServerApiConfig(path=prefix),
+                dashboard=DashboardConfig(enabled=False),
+            ),
+            project_context=context,
+        )
+
+    yield build
+    for context in contexts:
+        asyncio.run(context.close())
+
+
+@pytest.mark.parametrize(
+    ("prefix", "operation_prefix"), [("/api", "api"), ("/custom/v2", "custom_v2")]
+)
+def test_captured_routes_preserve_prefix_order_and_shared_auth_dependency(
+    captured_route_server, prefix: str, operation_prefix: str
+) -> None:
+    server = captured_route_server(prefix=prefix)
+    routes = [route for route in server.routes if isinstance(route, APIRoute)]
+    expected_routes = [
+        (
+            f"{prefix}/evals/sessions/{{session_id}}/evaluation/{action}",
+            "post",
+            f"{action}_captured_evaluation",
+        )
+        for action in ("save", "preview", "export")
+    ] + [(f"{prefix}/evals/targets", "get", "list_eval_targets")]
+    captured_paths = {path for path, _, _ in expected_routes}
+    assert [route.path for route in routes if route.path in captured_paths] == [
+        path for path, _, _ in expected_routes
+    ]
+    session_route = next(route for route in routes if route.path == f"{prefix}/sessions")
+    auth_dependency = session_route.dependencies[0].dependency
+    schema = server.openapi()
+    for path, method, name in expected_routes:
+        route = next(route for route in routes if route.path == path)
+        assert route.dependencies[0].dependency is auth_dependency
+        operation_path = (
+            path.removeprefix(prefix).replace("/", "_").replace("{", "_").replace("}", "_")
+        )
+        assert schema["paths"][path][method]["operationId"] == (
+            f"{name}_{operation_prefix}{operation_path}_{method}"
+        )
+
+    calls = []
+
+    def deny_access() -> None:
+        calls.append("denied")
+        raise HTTPException(status_code=403, detail="operator access revoked")
+
+    server.dependency_overrides[auth_dependency] = deny_access
+    with TestClient(server) as client:
+        for path, method, _ in expected_routes:
+            response = client.request(
+                method,
+                path.replace("{session_id}", _SESSION_ID),
+                headers=_AUTH_HEADERS,
+                **({"json": {}} if method == "post" else {}),
+            )
+            assert response.status_code == 403
+            assert response.json() == {"detail": "operator access revoked"}
+    assert calls == ["denied"] * len(expected_routes)
+
+
+@pytest.mark.parametrize(
+    ("action", "content", "status_code", "detail"),
+    [
+        ("preview", b'{"draft":null,"draft":null}', 422, "Invalid captured evaluation request."),
+        (
+            "save",
+            b" " * (MAX_CAPTURED_EVALUATION_REQUEST_BYTES + 1),
+            413,
+            "Captured evaluation request exceeds the server byte limit.",
+        ),
+        ("export", b"{", 422, "Invalid captured evaluation request."),
+    ],
+    ids=["duplicate-preview", "oversized-save", "malformed-export"],
+)
+def test_captured_routes_reject_invalid_bodies_before_persistence(
+    captured_route_server, action: str, content: bytes, status_code: int, detail: str
+) -> None:
+    server = captured_route_server()
+    with TestClient(server) as client:
+        response = client.post(
+            f"/api/evals/sessions/{_SESSION_ID}/evaluation/{action}",
+            headers={**_AUTH_HEADERS, "Content-Type": "application/json"},
+            content=content,
+        )
+        assert response.status_code == status_code
+        assert response.json() == {"detail": detail}
+        assert response.headers["cache-control"] == "private, no-store"
+        target = client.get("/api/evals/targets", headers=_AUTH_HEADERS).json()["items"][0]
+        for catalog in ("results", "corpora"):
+            response = client.get(
+                f"/api/evals/{catalog}",
+                headers=_AUTH_HEADERS,
+                params={"target_key": target["target_key"]},
+            )
+            assert response.status_code == 200
+            assert response.json()["items"] == []
+
+
+def test_captured_routes_require_a_registry(captured_route_server) -> None:
+    server = captured_route_server(with_registry=False)
+    schema = server.openapi()
+    with TestClient(server) as client:
+        assert "/api/evals/targets" not in schema["paths"]
+        assert client.get("/api/evals/targets", headers=_AUTH_HEADERS).status_code == 404
+        for action in ("preview", "save", "export"):
+            path = f"/api/evals/sessions/{{session_id}}/evaluation/{action}"
+            assert path not in schema["paths"]
+            assert (
+                client.post(
+                    path.replace("{session_id}", _SESSION_ID), headers=_AUTH_HEADERS, json={}
+                ).status_code
+                == 404
+            )
+
+
+def test_captured_preview_and_export_work_without_a_durable_store(captured_route_server) -> None:
+    server = captured_route_server(with_store=False)
+    with TestClient(server) as client:
+        assert client.get("/api/evals/targets", headers=_AUTH_HEADERS).status_code == 200
+        preview = client.post(
+            f"/api/evals/sessions/{_SESSION_ID}/evaluation/preview", headers=_AUTH_HEADERS, json={}
+        )
+        assert preview.status_code == 200
+        candidate = preview.json()["candidate"]
+        body = {"candidate": candidate, "expected_candidate_revision": candidate["revision"]}
+        exported = client.post(
+            f"/api/evals/sessions/{_SESSION_ID}/evaluation/export", headers=_AUTH_HEADERS, json=body
+        )
+        assert exported.status_code == 200
+        assert exported.headers["content-type"] == "application/json"
+        assert exported.headers["content-disposition"] == (
+            f'attachment; filename="{candidate["target_key"]}-captured.eval.json"'
+        )
+        saved = client.post(
+            f"/api/evals/sessions/{_SESSION_ID}/evaluation/save", headers=_AUTH_HEADERS, json=body
+        )
+        assert saved.status_code == 409
+        assert saved.json() == {"detail": "Durable captured-result persistence is not available."}
+        assert "/api/evals/sessions/{session_id}/evaluation/launch" not in server.openapi()["paths"]
+
+
+def test_captured_launch_revalidates_the_reviewed_candidate_before_writing(
+    captured_route_server,
+) -> None:
+    server = captured_route_server()
+    with TestClient(server) as client:
+        preview = client.post(
+            f"/api/evals/sessions/{_SESSION_ID}/evaluation/preview", headers=_AUTH_HEADERS, json={}
+        )
+        assert preview.status_code == 200
+        candidate = preview.json()["candidate"]
+        launched = client.post(
+            f"/api/evals/sessions/{_SESSION_ID}/evaluation/launch",
+            headers={**_AUTH_HEADERS, "Idempotency-Key": "stale-captured-preview"},
+            json={
+                "candidate": candidate,
+                "expected_candidate_revision": "sha256:" + "0" * 64,
+                "expected_execution_profile_revision": _execution_profile_revision(
+                    client, candidate["target_key"]
+                ),
+            },
+        )
+        assert launched.status_code == 409
+        assert launched.json()["detail"]["code"] == "preview_stale"
+        for catalog in ("results", "corpora", "runs"):
+            response = client.get(
+                f"/api/evals/{catalog}",
+                headers=_AUTH_HEADERS,
+                params={"target_key": candidate["target_key"]},
+            )
+            assert response.status_code == 200
+            assert response.json()["items"] == []
 
 
 def _captured_draft(candidate: dict) -> dict:

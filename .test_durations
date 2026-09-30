@@ -41103,5 +41103,13 @@
     "tests/core/test_tool_completion_steering.py::test_recovery_retains_accepted_stop_after_final_tool_success[sqlite-tool-event-False]": 1.1320909580681473,
     "tests/core/test_tool_completion_steering.py::test_recovery_retains_accepted_stop_after_final_tool_success[sqlite-tool-event-True]": 1.3251143333036453,
     "tests/core/test_tool_completion_steering.py::test_recovery_retains_accepted_stop_after_final_tool_success[sqlite-tool-publication-False]": 1.071425582980737,
-    "tests/core/test_tool_completion_steering.py::test_recovery_retains_accepted_stop_after_final_tool_success[sqlite-tool-publication-True]": 1.0812489571981132
+    "tests/core/test_tool_completion_steering.py::test_recovery_retains_accepted_stop_after_final_tool_success[sqlite-tool-publication-True]": 1.0812489571981132,
+    "tests/server/test_server_captured_evaluations.py::test_captured_launch_revalidates_the_reviewed_candidate_before_writing": 0.8203591259662062,
+    "tests/server/test_server_captured_evaluations.py::test_captured_preview_and_export_work_without_a_durable_store": 2.506936999037862,
+    "tests/server/test_server_captured_evaluations.py::test_captured_routes_preserve_prefix_order_and_shared_auth_dependency[/api-api]": 3.2175627490505576,
+    "tests/server/test_server_captured_evaluations.py::test_captured_routes_preserve_prefix_order_and_shared_auth_dependency[/custom/v2-custom_v2]": 2.7339951682370156,
+    "tests/server/test_server_captured_evaluations.py::test_captured_routes_reject_invalid_bodies_before_persistence[duplicate-preview]": 0.742603667313233,
+    "tests/server/test_server_captured_evaluations.py::test_captured_routes_reject_invalid_bodies_before_persistence[malformed-export]": 0.9013233322184533,
+    "tests/server/test_server_captured_evaluations.py::test_captured_routes_reject_invalid_bodies_before_persistence[oversized-save]": 0.6975027490407228,
+    "tests/server/test_server_captured_evaluations.py::test_captured_routes_require_a_registry": 0.9173501243349165
 }
