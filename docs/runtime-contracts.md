@@ -2473,9 +2473,19 @@ wake a blocking TLS read. A CONNECT target receives only coarse destination
 admission before leaf-certificate work; the complete request is independently
 authorized after TLS. Certificate generation is serialized and bounded, and
 its per-session cache is entry- and lifetime-limited. Built-in upstream
-requests require identity content encoding and reject an encoded response
-before reading its body, so decompression cannot allocate outside the response
-ceiling. Their default DNS resolution runs in an owned helper process that is
+requests ask for identity content encoding. A response with one supported
+coding (`gzip`, `deflate`, and, when a bounded decoder is available, `br` or
+`zstd`) is decoded while streaming, with received and decoded bytes counted
+against the response ceiling and each decoder call's output bounded relative
+to the remaining allowance. Brotli may produce a discarded output block of
+under 32 KiB past that allowance. Zstandard's history window is capped at the
+response ceiling rounded up to a power of two (minimum 1 KiB), on every frame;
+larger windows fail with `oversized_response` before allocation. Codec bookkeeping
+is separate from the decoded-byte allowance. Deflate's raw-format fallback
+retains at most the received-byte ceiling and discards output from a failed
+wrapped interpretation before replaying through the bounded decoder. The
+decoded body is returned without `Content-Encoding`; unknown or stacked
+codings are rejected before the body is read. Their default DNS resolution runs in an owned helper process that is
 terminated and reaped at the same absolute total deadline. Custom upstreams
 must prepare a side-effect-free
 `EgressUpstreamOperation` from the supplied byte and time limits before

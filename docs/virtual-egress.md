@@ -95,8 +95,9 @@ Teardown first revokes new
 credentialed and credentialless admission, then settles dispatched upstream
 operations and credential resolutions, and only afterward waits for their
 request leases to drain. The
-built-in HTTPX path replaces `Accept-Encoding` with `identity` and rejects an
-origin that still announces compression before body iteration. Its default DNS
+built-in HTTPX path replaces `Accept-Encoding` with `identity` and decodes a
+single supported coding from an origin that compresses anyway, within the same
+response byte limit (see below). Its default DNS
 lookup runs in an owned helper process, so expiry terminates and reaps the
 resolver before returning the timeout. Application-injected HTTPX transports
 or destination resolvers carry no inferred cancellation authority and remain
@@ -379,12 +380,34 @@ the connection target and prevents DNS rebinding to private networks or cloud
 metadata. Application-owned `HttpxUpstream(routes=...)` mappings are an explicit
 trusted-control-plane override for private service origins; they still reject
 loopback, link-local/metadata, multicast, reserved, and unspecified addresses.
-The default upstream requires identity content encoding, retains at most 8 MiB
+The default upstream requests identity content encoding, retains at most 8 MiB
 of response data, and rejects larger responses. Applications that construct
 `HttpxUpstream` explicitly can select a lower limit or raise it as far as the
-hard 64 MiB ceiling. An origin that ignores the identity request is rejected
-before body iteration, so compressed expansion cannot cross the buffering
-boundary.
+hard 64 MiB ceiling. Some origins, such as the Internet Archive, return a
+stored coding regardless of that request. When the response carries exactly
+one `Content-Encoding` of `gzip` (or `x-gzip`), `deflate`, `br`, or `zstd`,
+the upstream reads the raw body and decodes it while streaming. Both the bytes
+received and the decoded bytes count against the same response limit, and
+every decoder call is capped at one byte more than the remaining allowance, so
+a decompression bomb fails with the ordinary oversized-response error before
+its expansion is buffered. Brotli emits whole output blocks, so its discarded
+overshoot is bounded by one block of under 32 KiB. The returned response
+contains the decoded body without `Content-Encoding`, and the proxy writes a
+`Content-Length` equal to the decoded length. `gzip`, `x-gzip`, and `deflate`
+(zlib-wrapped or raw) are always available; `br` requires the optional
+`brotli>=1.2` package and `zstd` requires Python 3.14's `compression.zstd`,
+because only those decoders can cap their output per call. An unknown,
+stacked, or unavailable coding is still rejected with `unsupported_content`
+before the body is read, and a malformed or truncated encoded body fails with
+`fetch_failed`.
+
+Zstandard history windows are capped separately at the response limit rounded
+up to a power of two (with a 1 KiB minimum), including every concatenated frame.
+Frames requiring a larger window fail with `oversized_response` before that window
+is allocated. Codec bookkeeping is separate from the decoded-byte allowance.
+Deflate may retain received bytes, bounded by the same response limit, while
+trying the zlib-wrapped interpretation; if that interpretation fails, it
+discards its output and replays the input through the bounded raw decoder.
 
 An application-owned `HttpxUpstream(destination_resolver=...)` callable can
 refuse a host as a deliberate policy decision by raising
@@ -506,8 +529,10 @@ redirect, script, stylesheet, image, and font host must be declared by the
 application; the browser never derives new authority from page content. Broker
 denials are returned through a
 reserved internal header which upstream responses cannot spoof. Browser-policy
-upstream requests require identity content encoding; an origin that ignores
-that requirement is rejected before its compressed body is read.
+upstream requests ask for identity content encoding. The built-in upstream
+decodes a single supported coding within the browser byte limit, as described
+above, so the guest never receives encoded bytes; a custom upstream response
+that still carries a non-identity `Content-Encoding` is rejected.
 
 The worker requires matching protocol, worker, and Playwright versions; a
 non-root guest; Chromium's sandbox; the managed HTTPS proxy and session CA; and

@@ -19,6 +19,12 @@ from cayu._task_wait import (
     restore_task_cancellation_requests,
 )
 from cayu._validation import require_clean_nonblank
+from cayu.egress._content_decoding import (
+    ContentDecodingError,
+    DecodedContentTooLargeError,
+    UnsupportedContentEncodingError,
+    content_decoder,
+)
 from cayu.egress._resolution import (
     InvalidResolvedAddressError,
     ProhibitedResolvedAddressError,
@@ -433,6 +439,10 @@ class _UpstreamUnsupportedEncodingError(RuntimeError):
     pass
 
 
+class _UpstreamContentDecodingError(RuntimeError):
+    pass
+
+
 class _UpstreamCapacityError(RuntimeError):
     pass
 
@@ -732,11 +742,18 @@ class HttpxUpstream:
                 extensions=extensions,
             ) as response,
         ):
-            content_encoding = response.headers.get("content-encoding")
-            if content_encoding is not None and content_encoding.strip().lower() != "identity":
-                raise _UpstreamUnsupportedEncodingError(
-                    "Upstream ignored the required identity content encoding."
+            # Identity is requested, but some origins return a stored coding
+            # regardless. One bounded coding is decoded here; unknown or stacked
+            # codings are rejected before the body is read.
+            try:
+                decoder = content_decoder(
+                    response.headers.get("content-encoding"),
+                    max_response_bytes=limits.max_response_bytes,
                 )
+            except UnsupportedContentEncodingError as exc:
+                raise _UpstreamUnsupportedEncodingError(
+                    "Upstream response content encoding is unsupported."
+                ) from exc
             content_length = response.headers.get("content-length")
             if content_length is not None:
                 with contextlib.suppress(ValueError):
@@ -745,12 +762,33 @@ class HttpxUpstream:
                             "Upstream response exceeded the configured byte limit."
                         )
             body = bytearray()
-            async for chunk in response.aiter_bytes():
-                if len(body) + len(chunk) > limits.max_response_bytes:
-                    raise _UpstreamResponseTooLargeError(
-                        "Upstream response exceeded the configured byte limit."
-                    )
-                body.extend(chunk)
+            try:
+                if decoder is None:
+                    async for chunk in response.aiter_bytes():
+                        if len(body) + len(chunk) > limits.max_response_bytes:
+                            raise DecodedContentTooLargeError
+                        body.extend(chunk)
+                else:
+                    # Read raw bytes so httpx's unbounded decoders never run.
+                    # Received and decoded bytes both count against the limit.
+                    received = 0
+                    async for chunk in response.aiter_raw():
+                        received += len(chunk)
+                        if received > limits.max_response_bytes:
+                            raise DecodedContentTooLargeError
+                        decoder.feed(chunk, body, limits.max_response_bytes)
+                    # HEAD, 204, and 304 responses may announce a coding with
+                    # no body; only a started encoded body must be complete.
+                    if received:
+                        decoder.finish(body, limits.max_response_bytes)
+            except DecodedContentTooLargeError as exc:
+                raise _UpstreamResponseTooLargeError(
+                    "Upstream response exceeded the configured byte limit."
+                ) from exc
+            except ContentDecodingError as exc:
+                raise _UpstreamContentDecodingError(
+                    "Upstream response content encoding is invalid."
+                ) from exc
             return CapturedResponse(
                 status_code=response.status_code,
                 headers=_identity_response_headers(
@@ -1575,9 +1613,19 @@ class TransparentEgressBroker:
                 authorization.grant_id,
                 authorization.policy_name,
                 502,
-                "Upstream ignored the required identity content encoding.",
+                "Upstream response content encoding is unsupported.",
                 authorization_kind=authorization.authorization_kind,
                 error_code="unsupported_content",
+            )
+        except _UpstreamContentDecodingError:
+            return self._deny(
+                request,
+                authorization.grant_id,
+                authorization.policy_name,
+                502,
+                "Upstream response content encoding is invalid.",
+                authorization_kind=authorization.authorization_kind,
+                error_code="fetch_failed",
             )
         except Exception as error:
             return self._deny(
@@ -1595,6 +1643,9 @@ class TransparentEgressBroker:
             except VirtualCredentialError:
                 return self._authority_revoked(request, authorization)
         if authorization.require_identity_encoding:
+            # The built-in upstream decodes any accepted coding and strips the
+            # header. A custom upstream must do the same: the guest never
+            # receives encoded bytes on browser or public-web paths.
             content_encoding = _header_get(response.headers, "content-encoding")
             if content_encoding is not None and content_encoding.strip().lower() != "identity":
                 return self._deny(
@@ -1602,7 +1653,7 @@ class TransparentEgressBroker:
                     authorization.grant_id,
                     authorization.policy_name,
                     502,
-                    "Upstream ignored the required identity content encoding.",
+                    "Upstream returned an encoded response body.",
                     authorization_kind=authorization.authorization_kind,
                     error_code="unsupported_content",
                 )
@@ -1973,8 +2024,9 @@ def _forwardable_headers(headers: Mapping[str, str]) -> dict[str, str]:
 
 
 def _identity_response_headers(headers: Mapping[str, str]) -> dict[str, str]:
-    # The response passed the identity-encoding gate above. Do not forward even
-    # a redundant identity marker as authority for a downstream transformation.
+    # The body is identity bytes: either the origin sent identity or the
+    # upstream decoded its single coding. Do not forward even a redundant
+    # identity marker as authority for a downstream transformation.
     return {
         key: value
         for key, value in _forwardable_headers(headers).items()

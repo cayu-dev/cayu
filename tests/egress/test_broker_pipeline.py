@@ -9,6 +9,7 @@ import ssl
 import threading
 import time
 import warnings
+import zlib
 from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
@@ -16,10 +17,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
+import brotli
 import httpx
 import pytest
 from pydantic import SecretStr
 
+import cayu.egress._content_decoding as content_decoding_module
 import cayu.egress._resolution as resolution_module
 import cayu.egress.broker as broker_module
 from cayu.egress import (
@@ -39,7 +42,14 @@ from cayu.egress import (
 )
 from cayu.egress.broker import CAYU_EGRESS_ERROR_HEADER
 from cayu.egress.errors import MAX_EGRESS_DESTINATION_DENIED_REASON_CHARS
+from cayu.egress.policy import PublicWebEgressPolicy
+from cayu.egress.proxy_server import _serialize_response as serialize_proxy_response
 from cayu.vaults import ResolvedSecret, SecretRef, StaticVault
+
+try:
+    from compression import zstd as _zstd  # type: ignore[import-not-found]
+except ImportError:  # Python < 3.14
+    _zstd = None
 
 REAL_SECRET = "sk_test_51RealDeadBeefSecretValue"
 GITHUB_SECRET = "github_pat_11RealDeadBeefSecretValue"
@@ -1207,45 +1217,285 @@ def test_successful_upstream_cannot_spoof_internal_broker_diagnostic() -> None:
     assert CAYU_EGRESS_ERROR_HEADER not in response.headers
 
 
-def test_httpx_upstream_rejects_compression_before_decoded_body_allocation() -> None:
-    body_started = False
-    captured: list[httpx.Request] = []
+def _encoded_upstream(
+    body: bytes | list[bytes],
+    *,
+    content_encoding: str,
+    max_response_bytes: int = 8 * 1024 * 1024,
+    extra_headers: Mapping[str, str] | None = None,
+    captured: list[httpx.Request] | None = None,
+    yielded: list[int] | None = None,
+) -> HttpxUpstream:
+    chunks = body if isinstance(body, list) else [body]
 
-    class _CompressedBody(httpx.AsyncByteStream):
+    class _Body(httpx.AsyncByteStream):
         async def __aiter__(self):  # type: ignore[no-untyped-def]
-            nonlocal body_started
-            body_started = True
-            yield gzip.compress(b"x" * (8 * 1024 * 1024 + 1))
+            for chunk in chunks:
+                if yielded is not None:
+                    yielded.append(len(chunk))
+                yield chunk
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        captured.append(request)
+        if captured is not None:
+            captured.append(request)
         return httpx.Response(
             200,
             headers={
-                "Content-Encoding": "gzip",
-                "Content-Type": "application/json",
+                "Content-Encoding": content_encoding,
+                "Content-Type": "text/html",
+                **(extra_headers or {}),
             },
-            stream=_CompressedBody(),
+            stream=_Body(),
             request=request,
         )
 
-    async def run() -> CapturedResponse:
-        upstream = HttpxUpstream(
-            transport=httpx.MockTransport(handler),
-            destination_resolver=_destination_resolver("93.184.216.34"),
-        )
-        return await upstream.send(
-            CapturedRequest(method="GET", host="api.stripe.com", path="/v1/customers")
-        )
+    return HttpxUpstream(
+        max_response_bytes=max_response_bytes,
+        transport=httpx.MockTransport(handler),
+        destination_resolver=_destination_resolver("93.184.216.34"),
+    )
 
-    with pytest.raises(RuntimeError, match="ignored the required identity"):
-        asyncio.run(run())
 
-    assert body_started is False
-    assert str(captured[0].url) == "https://93.184.216.34/v1/customers"
-    assert captured[0].headers["host"] == "api.stripe.com"
+def _send_direct(upstream: HttpxUpstream) -> CapturedResponse:
+    return asyncio.run(
+        upstream.send(CapturedRequest(method="GET", host="web.archive.org", path="/web/2020/x"))
+    )
+
+
+_DECODED_PAGE = b"<html>" + b"archived page " * 400 + b"</html>"
+
+
+def _zlib_deflate(data: bytes) -> bytes:
+    return zlib.compress(data)
+
+
+def _raw_deflate(data: bytes) -> bytes:
+    compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+    return compressor.compress(data) + compressor.flush()
+
+
+_ENCODERS: dict[str, Any] = {
+    "gzip": gzip.compress,
+    "x-gzip": gzip.compress,
+    "deflate": _zlib_deflate,
+    "br": brotli.compress,
+}
+if _zstd is not None:
+    _ENCODERS["zstd"] = _zstd.compress
+
+
+@pytest.mark.parametrize("coding", sorted(_ENCODERS))
+def test_httpx_upstream_decodes_single_content_coding_within_limit(coding: str) -> None:
+    encoded = _ENCODERS[coding](_DECODED_PAGE)
+    # Split so the decoder sees a coding boundary across several raw chunks.
+    chunks = [encoded[i : i + 7] for i in range(0, len(encoded), 7)]
+    captured: list[httpx.Request] = []
+    upstream = _encoded_upstream(
+        chunks,
+        content_encoding=coding.upper(),
+        max_response_bytes=len(_DECODED_PAGE),
+        extra_headers={"Content-Length": str(len(encoded))},
+        captured=captured,
+    )
+
+    response = _send_direct(upstream)
+
+    assert response.body == _DECODED_PAGE
+    assert {key.lower() for key in response.headers}.isdisjoint(
+        {"content-encoding", "content-length"}
+    )
+    assert response.headers["content-type"] == "text/html"
+    # Identity is still requested; decoding is only a fallback.
     assert captured[0].headers["accept-encoding"] == "identity"
-    assert captured[0].extensions["sni_hostname"] == "api.stripe.com"
+    head = serialize_proxy_response(response).split(b"\r\n\r\n", 1)[0]
+    assert f"Content-Length: {len(_DECODED_PAGE)}".encode() in head.split(b"\r\n")
+    assert b"content-encoding" not in head.lower()
+
+
+def test_httpx_upstream_decodes_raw_deflate_and_multi_member_gzip() -> None:
+    raw = _send_direct(_encoded_upstream(_raw_deflate(_DECODED_PAGE), content_encoding="deflate"))
+    members = _send_direct(
+        _encoded_upstream(
+            [gzip.compress(b"first "), gzip.compress(b"second")], content_encoding="gzip"
+        )
+    )
+
+    assert raw.body == _DECODED_PAGE
+    assert members.body == b"first second"
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 7, 166])
+@pytest.mark.parametrize("payload", [b"x" * 156, b"\x9c\x00" + b"x" * 154])
+def test_httpx_upstream_decodes_raw_deflate_with_zlib_like_prefix(
+    chunk_size: int, payload: bytes
+) -> None:
+    # A stored block may have nonzero padding bits. These first two bytes also
+    # pass the zlib-header heuristic, but the complete stream is raw deflate.
+    # The second payload makes the wrapped interpretation emit output before
+    # failing at EOF, so fallback must discard that output before replaying.
+    encoded = bytes.fromhex("789c0063ff") + payload + bytes.fromhex("010000ffff")
+    assert zlib.decompress(encoded, -zlib.MAX_WBITS) == payload
+    chunks = [encoded[i : i + chunk_size] for i in range(0, len(encoded), chunk_size)]
+
+    response = _send_direct(_encoded_upstream(chunks, content_encoding="deflate"))
+
+    assert response.body == payload
+
+
+@pytest.mark.parametrize("payload", [b"x" * 156, b"\x9c\x00" + b"x" * 154])
+def test_httpx_upstream_bounds_raw_deflate_fallback_output(payload: bytes) -> None:
+    encoded = bytes.fromhex("789c0063ff") + payload + _raw_deflate(b"y" * 4096)
+    assert zlib.decompress(encoded, -zlib.MAX_WBITS) == payload + b"y" * 4096
+    assert len(encoded) < 256
+
+    with pytest.raises(RuntimeError, match="exceeded the configured byte limit"):
+        _send_direct(
+            _encoded_upstream(
+                [encoded[:2], encoded[2:]], content_encoding="deflate", max_response_bytes=256
+            )
+        )
+
+
+@pytest.mark.skipif(_zstd is None, reason="Zstandard requires Python 3.14")
+@pytest.mark.parametrize("prefix_frame", [b"", b"(\xb5/\xfd\x00\x00\x09\x00\x00a"])
+@pytest.mark.parametrize("single_chunk", [False, True])
+def test_httpx_upstream_rejects_zstd_window_above_response_budget(
+    prefix_frame: bytes, single_chunk: bool
+) -> None:
+    assert _zstd is not None
+    # The frame expands to one byte but declares a 128 MiB history window.
+    encoded = bytes.fromhex("28b52ffd008800000009000078")
+    assert _zstd.decompress(encoded) == b"x"
+    chunks = [prefix_frame + encoded] if single_chunk else [prefix_frame, encoded[:9], encoded[9:]]
+    upstream = _encoded_upstream(
+        chunks,
+        content_encoding="zstd",
+        max_response_bytes=1024,
+    )
+
+    with pytest.raises(RuntimeError, match="exceeded the configured byte limit"):
+        _send_direct(upstream)
+
+
+@pytest.mark.skipif(_zstd is None, reason="Zstandard requires Python 3.14")
+def test_httpx_upstream_accepts_zstd_window_fitting_non_power_of_two_budget() -> None:
+    assert _zstd is not None
+    payload = b"x" * 5000
+    response = _send_direct(
+        _encoded_upstream(_zstd.compress(payload), content_encoding="zstd", max_response_bytes=6000)
+    )
+
+    assert response.body == payload
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        zlib.compress(_DECODED_PAGE)[:-1],
+        zlib.compress(_DECODED_PAGE) + b"junk",
+        _raw_deflate(_DECODED_PAGE)[:-1],
+        _raw_deflate(_DECODED_PAGE) + b"junk",
+    ],
+)
+def test_httpx_upstream_deflate_fallback_preserves_malformed_content_denial(encoded: bytes) -> None:
+    with pytest.raises(RuntimeError, match="content encoding is invalid"):
+        _send_direct(_encoded_upstream(encoded, content_encoding="deflate"))
+
+
+@pytest.mark.parametrize("coding", sorted(_ENCODERS))
+def test_httpx_upstream_aborts_decompression_bomb_at_decoded_limit(
+    coding: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limit = 64 * 1024
+    encoded = _ENCODERS[coding](b"\0" * (64 * limit))
+    if coding == "zstd":
+        assert _zstd is not None
+        # Keep the window admissible so this exercises the decoded-output
+        # bound independently of the earlier frame-window admission check.
+        encoded = _zstd.compress(
+            b"\0" * (64 * limit),
+            options={
+                _zstd.CompressionParameter.window_log: 16,
+                _zstd.CompressionParameter.content_size_flag: 0,
+            },
+        )
+    assert len(encoded) < limit
+    largest_sink: list[int] = []
+    original_append = content_decoding_module._append
+
+    def recording_append(sink: bytearray, output: bytes, bound: int) -> None:
+        largest_sink.append(len(sink) + len(output))
+        original_append(sink, output, bound)
+
+    monkeypatch.setattr(content_decoding_module, "_append", recording_append)
+    yielded: list[int] = []
+    upstream = _encoded_upstream(
+        [encoded[: len(encoded) // 2], encoded[len(encoded) // 2 :]],
+        content_encoding=coding,
+        max_response_bytes=limit,
+        yielded=yielded,
+    )
+
+    with pytest.raises(RuntimeError, match="exceeded the configured byte limit"):
+        _send_direct(upstream)
+
+    # Decoding stopped at the first byte past the limit. Brotli emits whole
+    # output blocks, so its discarded overshoot is bounded by one 32 KiB block.
+    overshoot = 32 * 1024 if coding == "br" else 1
+    assert limit < max(largest_sink) <= limit + overshoot
+
+
+@pytest.mark.parametrize("coding", ["compress", "gzip, gzip", "gzip, br", "identity, gzip", ""])
+def test_httpx_upstream_rejects_unknown_or_stacked_coding_before_body_read(coding: str) -> None:
+    yielded: list[int] = []
+    upstream = _encoded_upstream(
+        gzip.compress(_DECODED_PAGE), content_encoding=coding, yielded=yielded
+    )
+
+    with pytest.raises(RuntimeError, match="content encoding is unsupported"):
+        _send_direct(upstream)
+
+    assert yielded == []
+
+
+def test_httpx_upstream_rejects_codec_unavailable_in_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(content_decoding_module, "_brotli", None)
+    upstream = _encoded_upstream(brotli.compress(_DECODED_PAGE), content_encoding="br")
+
+    with pytest.raises(RuntimeError, match="content encoding is unsupported"):
+        _send_direct(upstream)
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [gzip.compress(_DECODED_PAGE)[:-9], b"not gzip at all", gzip.compress(b"x") + b"junk"],
+)
+def test_httpx_upstream_rejects_malformed_or_truncated_encoding(encoded: bytes) -> None:
+    upstream = _encoded_upstream(encoded, content_encoding="gzip")
+
+    with pytest.raises(RuntimeError, match="content encoding is invalid"):
+        _send_direct(upstream)
+
+
+def test_httpx_upstream_accepts_empty_body_with_announced_coding() -> None:
+    response = _send_direct(_encoded_upstream(b"", content_encoding="gzip"))
+
+    assert response.body == b""
+    assert "content-encoding" not in {key.lower() for key in response.headers}
+
+
+def test_httpx_upstream_counts_received_bytes_against_the_limit() -> None:
+    # A gzip header with an unbounded comment produces no decoded output.
+    endless_header = b"\x1f\x8b\x08\x10\0\0\0\0\0\xff" + b"c" * 4096
+    upstream = _encoded_upstream(
+        [endless_header] * 4, content_encoding="gzip", max_response_bytes=8192
+    )
+
+    with pytest.raises(RuntimeError, match="exceeded the configured byte limit"):
+        _send_direct(upstream)
 
 
 def test_httpx_upstream_accepts_response_at_exact_decoded_byte_limit() -> None:
@@ -1314,29 +1564,12 @@ def test_httpx_upstream_does_not_forward_reserved_broker_diagnostic() -> None:
     assert CAYU_EGRESS_ERROR_HEADER.lower() not in captured.headers
 
 
-def test_broker_rejects_encoded_upstream_response_before_body_read() -> None:
+def test_broker_denies_decoded_upstream_response_above_limit() -> None:
     decoded = b"decoded response exceeds the bound"
-    encoded = gzip.compress(decoded)
-    body_started = False
-
-    class _Body(httpx.AsyncByteStream):
-        async def __aiter__(self):  # type: ignore[no-untyped-def]
-            nonlocal body_started
-            body_started = True
-            yield encoded
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            headers={"Content-Encoding": "gzip"},
-            stream=_Body(),
-            request=request,
-        )
-
-    upstream = HttpxUpstream(
+    upstream = _encoded_upstream(
+        gzip.compress(decoded),
+        content_encoding="gzip",
         max_response_bytes=len(decoded) - 1,
-        transport=httpx.MockTransport(handler),
-        destination_resolver=_destination_resolver("93.184.216.34"),
     )
     broker, registry, _resolver, decisions = _build(upstream=upstream)
     grant = _mint(registry)
@@ -1344,61 +1577,115 @@ def test_broker_rejects_encoded_upstream_response_before_body_read() -> None:
     response = asyncio.run(broker.handle_request(_request(grant.presented_value, "/v1/customers")))
 
     assert response.status_code == 502
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "oversized_response"
+    assert decisions[-1].reason == "Upstream response exceeded the configured byte limit."
+
+
+def test_broker_denies_unsupported_upstream_encoding() -> None:
+    upstream = _encoded_upstream(b"opaque", content_encoding="compress")
+    broker, registry, _resolver, decisions = _build(upstream=upstream)
+    grant = _mint(registry)
+
+    response = asyncio.run(broker.handle_request(_request(grant.presented_value, "/v1/customers")))
+
+    assert response.status_code == 502
     assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "unsupported_content"
-    assert decisions[-1].reason == "Upstream ignored the required identity content encoding."
-    assert body_started is False
+    assert decisions[-1].reason == "Upstream response content encoding is unsupported."
 
 
-def test_browser_policy_requires_identity_encoding_before_upstream_body_read() -> None:
-    body_started = False
-    accepted_encoding: str | None = None
+def _identity_web_broker(
+    upstream: HttpxUpstream,
+    policy: EgressPolicy,
+    monkeypatch: pytest.MonkeyPatch,
+) -> TransparentEgressBroker:
+    if isinstance(policy, PublicWebEgressPolicy):
+        # Public research admits only a pinned upstream without an injected
+        # transport, so inject the mock at the HTTPX client seam instead.
+        transport = upstream._transport
+        client_class = httpx.AsyncClient
 
-    class _Body(httpx.AsyncByteStream):
-        async def __aiter__(self):  # type: ignore[no-untyped-def]
-            nonlocal body_started
-            body_started = True
-            yield gzip.compress(b"expanded browser content")
+        def client_with_transport(**kwargs: Any) -> httpx.AsyncClient:
+            assert kwargs["transport"] is None
+            return client_class(**{**kwargs, "transport": transport})
 
-    async def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal accepted_encoding
-        accepted_encoding = request.headers.get("accept-encoding")
-        return httpx.Response(
-            200,
-            headers={"Content-Encoding": "gzip"},
-            stream=_Body(),
-            request=request,
+        monkeypatch.setattr(broker_module.httpx, "AsyncClient", client_with_transport)
+        return TransparentEgressBroker(
+            registry=VirtualCredentialRegistry(),
+            resolver=None,
+            policies={policy.name: policy},
+            public_web_policy=policy.name,
+            upstream=HttpxUpstream(destination_resolver=_destination_resolver("93.184.216.34")),
         )
-
-    upstream = HttpxUpstream(
-        transport=httpx.MockTransport(handler),
-        destination_resolver=_destination_resolver("93.184.216.34"),
-    )
-    broker = TransparentEgressBroker(
+    return TransparentEgressBroker(
         registry=VirtualCredentialRegistry(),
         resolver=None,
-        policies={
-            "browser": BrowserEgressPolicy(
-                name="browser",
-                allowed_hosts=["docs.example.com"],
-            )
-        },
+        policies={policy.name: policy},
         approved_destinations=[
-            ApprovedEgressDestination(
-                destination="docs.example.com",
-                policy_name="browser",
-            )
+            ApprovedEgressDestination(destination="web.archive.org", policy_name=policy.name)
         ],
         upstream=upstream,
     )
 
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        BrowserEgressPolicy(name="browser", allowed_hosts=["web.archive.org"]),
+        PublicWebEgressPolicy(name="research"),
+    ],
+    ids=["browser", "public-web"],
+)
+def test_identity_policy_forwards_decoded_body_to_guest(
+    policy: EgressPolicy,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[httpx.Request] = []
+    upstream = _encoded_upstream(
+        gzip.compress(_DECODED_PAGE), content_encoding="gzip", captured=captured
+    )
+    broker = _identity_web_broker(upstream, policy, monkeypatch)
+
     response = asyncio.run(
-        broker.handle_request(CapturedRequest(method="GET", host="docs.example.com", path="/"))
+        broker.handle_request(
+            CapturedRequest(
+                method="GET",
+                host="web.archive.org",
+                path="/web/2020/x",
+                headers={"Accept-Encoding": "gzip, br"},
+            )
+        )
     )
 
-    assert accepted_encoding == "identity"
-    assert body_started is False
+    assert captured[0].headers["accept-encoding"] == "identity"
+    assert response.status_code == 200
+    assert CAYU_EGRESS_ERROR_HEADER not in response.headers
+    assert response.body == _DECODED_PAGE
+    head = serialize_proxy_response(response).split(b"\r\n\r\n", 1)[0].lower()
+    assert b"content-encoding" not in head
+    assert f"content-length: {len(_DECODED_PAGE)}".encode() in head.split(b"\r\n")
+
+
+def test_browser_policy_denies_decoded_body_above_browser_limit() -> None:
+    upstream = _encoded_upstream(gzip.compress(b"\0" * 4096), content_encoding="gzip")
+    broker = TransparentEgressBroker(
+        registry=VirtualCredentialRegistry(),
+        resolver=None,
+        policies={
+            "browser": BrowserEgressPolicy(name="browser", allowed_hosts=["web.archive.org"])
+        },
+        approved_destinations=[
+            ApprovedEgressDestination(destination="web.archive.org", policy_name="browser")
+        ],
+        upstream=upstream,
+        browser_max_response_bytes=1024,
+    )
+
+    response = asyncio.run(
+        broker.handle_request(CapturedRequest(method="GET", host="web.archive.org", path="/"))
+    )
+
     assert response.status_code == 502
-    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "unsupported_content"
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "oversized_response"
 
 
 @pytest.mark.parametrize(

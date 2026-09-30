@@ -25,6 +25,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  # Exercises the bounded Brotli decoder in egress; not a runtime dependency.
+  "brotli>=1.2,<2",
   "cryptography>=42",
   "fastapi>=0.115,<0.137",
   "httpx2>=2.12,<3",

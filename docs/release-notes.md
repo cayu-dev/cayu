@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Decode compressed upstream responses in virtual egress instead of rejecting
+  them. `HttpxUpstream` still requests identity encoding, but when an origin
+  (such as the Internet Archive) returns a single `gzip`, `deflate`, `br`, or
+  `zstd` coding anyway, it decodes the body while streaming and counts decoded
+  bytes against the same response limit, so a decompression bomb still fails as
+  an oversized response. Browser and public-web guests receive the decoded body
+  without `Content-Encoding`. `br` needs the optional `brotli>=1.2` package and
+  `zstd` needs Python 3.14; unknown or stacked codings are still rejected. The
+  deny reason for them is now "Upstream response content encoding is
+  unsupported.", and malformed encoded bodies fail with `fetch_failed`.
+  Zstandard history windows are capped relative to the response budget on
+  every frame. Raw deflate remains accepted when its prefix resembles a zlib
+  header, using a replay bounded by the received-byte limit.
 - Make `cayu storage migrate` usable as a deployment step. `status`, `migrate`,
   and `export` resolve their target from `CAYU_DATABASE_URL`, then
   `[tool.cayu.session_store]`, when no `--sqlite`/`--postgres` is given, and
