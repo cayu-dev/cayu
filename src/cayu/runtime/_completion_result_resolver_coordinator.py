@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from hashlib import sha256
 from time import monotonic
-from typing import Any, cast
+from typing import Any, ClassVar, NoReturn, cast
 from uuid import uuid4
 
 from cayu._exception_groups import exception_tree_contains
@@ -36,6 +36,7 @@ from cayu.runtime._diagnostics import (
     exception_diagnostic,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._leased_adapter_heartbeat import run_leased_adapter_heartbeat
 from cayu.runtime._leased_adapter_runner import LeasedAdapterLease, LeasedAdapterRunner
 from cayu.runtime._task_store_operation_boundary import (
     capture_sensitive_validation,
@@ -105,6 +106,74 @@ class _PublicationOwner:
 @dataclass(slots=True)
 class _PublicationLeaseDeadline:
     monotonic: float
+
+
+@dataclass(slots=True)
+class _PublicationLeaseHeartbeat:
+    coordinator: CompletionResultResolverCoordinator = field(repr=False)
+    authority: _ResolvedEventPublicationAuthority = field(repr=False)
+    owner_id: str = field(repr=False)
+    lease_deadline: _PublicationLeaseDeadline
+    ownership_lost: asyncio.Future[BaseException] = field(repr=False)
+
+    renewal_task_name: ClassVar[str] = "cayu-completion-result-publication-renewal"
+    cancel_renewal_on_shutdown: ClassVar[bool] = False
+    deadline_can_extend: ClassVar[bool] = True
+
+    @property
+    def interval_seconds(self) -> float:
+        return _PUBLICATION_OWNER_HEARTBEAT_SECONDS
+
+    @property
+    def deadline(self) -> float:
+        return self.lease_deadline.monotonic
+
+    async def renew(self) -> object:
+        authority = self.authority
+        owner_id = self.owner_id
+        return await self.coordinator._session_store._publish_completion_result_event_publication(
+            authority.session_id,
+            checkpoint_transform=lambda _session, checkpoint, store_now: (
+                _renew_completion_result_event_publication(
+                    checkpoint,
+                    publication_id=authority.publication_id,
+                    authority_sha256=authority.authority_sha256,
+                    owner_id=owner_id,
+                    owner_expires_at=store_now
+                    + timedelta(seconds=_PUBLICATION_OWNER_LEASE_SECONDS),
+                    now=store_now,
+                )
+            ),
+            events=[],
+        )
+
+    def acknowledge(self, result: object | None, started: float) -> None:
+        self.coordinator._acknowledge_publication_renewal_deadline(
+            started, lease_deadline=self.lease_deadline, ownership_lost=self.ownership_lost
+        )
+
+    def expiry_failure(self, *, renewing: bool) -> BaseException:
+        return self.coordinator._safe_execution_error(
+            "Completion-result publication ownership renewal was not acknowledged "
+            "before its local lease deadline."
+            if renewing
+            else "Completion-result publication ownership acknowledgement expired."
+        )
+
+    def safe_cancellation(self, cancellation: asyncio.CancelledError) -> asyncio.CancelledError:
+        return self.coordinator._safe_caller_cancellation(cancellation)
+
+    def raise_late_failure(self, expiry: BaseException, failure: BaseException) -> NoReturn:
+        if isinstance(expiry, asyncio.CancelledError):
+            expiry.__cause__ = self.coordinator._detached_cleanup_failure(failure)
+            expiry.__suppress_context__ = True
+            raise expiry
+        if exception_tree_contains(failure, _PROCESS_CONTROL_SIGNALS):
+            raise self.coordinator._detached_process_control_failure(failure) from expiry
+        raise expiry from self.coordinator._detached_cleanup_failure(failure)
+
+    def raise_cancellation(self, cancellation: asyncio.CancelledError) -> NoReturn:
+        raise cancellation
 
 
 @dataclass(slots=True)
@@ -1297,108 +1366,12 @@ class CompletionResultResolverCoordinator:
         lease_deadline: _PublicationLeaseDeadline,
         ownership_lost: asyncio.Future[BaseException],
     ) -> None:
-        while True:
-            remaining = lease_deadline.monotonic - monotonic()
-            if remaining <= 0:
-                failure = self._safe_execution_error(
-                    "Completion-result publication ownership acknowledgement expired."
-                )
-                self._record_publication_ownership_loss(ownership_lost, failure)
-                raise failure from None
-            try:
-                await asyncio.wait_for(
-                    stop.wait(),
-                    timeout=min(
-                        _PUBLICATION_OWNER_HEARTBEAT_SECONDS,
-                        remaining / 2.0,
-                    ),
-                )
-            except TimeoutError:
-                pass
-            else:
-                return
-            renewal_started_monotonic = monotonic()
-            renewal_task = asyncio.create_task(
-                self._session_store._publish_completion_result_event_publication(
-                    authority.session_id,
-                    checkpoint_transform=lambda _session, checkpoint, store_now: (
-                        _renew_completion_result_event_publication(
-                            checkpoint,
-                            publication_id=authority.publication_id,
-                            authority_sha256=authority.authority_sha256,
-                            owner_id=owner_id,
-                            owner_expires_at=store_now
-                            + timedelta(seconds=_PUBLICATION_OWNER_LEASE_SECONDS),
-                            now=store_now,
-                        )
-                    ),
-                    events=[],
-                ),
-                name="cayu-completion-result-publication-renewal",
-            )
-            while True:
-                renewal_outcome = await await_shielded_task_outcome(
-                    renewal_task,
-                    timeout_s=max(0.0, lease_deadline.monotonic - monotonic()),
-                )
-                if not renewal_outcome.timed_out or monotonic() >= lease_deadline.monotonic:
-                    break
-            if renewal_outcome.cancellation is not None:
-                settlement = await await_shielded_task_outcome(
-                    renewal_task,
-                    cancellation=renewal_outcome.cancellation,
-                    timeout_s=None,
-                    timeout_after_cancellation_s=None,
-                )
-                if settlement.error is not None:
-                    renewal_outcome.cancellation.__cause__ = self._detached_cleanup_failure(
-                        settlement.error
-                    )
-                    renewal_outcome.cancellation.__suppress_context__ = True
-                raise renewal_outcome.cancellation
-            if renewal_outcome.timed_out:
-                failure = self._safe_execution_error(
-                    "Completion-result publication ownership renewal was not acknowledged "
-                    "before its local lease deadline."
-                )
-                self._record_publication_ownership_loss(ownership_lost, failure)
-                settlement = await await_shielded_task_outcome(
-                    renewal_task,
-                    timeout_s=None,
-                    timeout_after_cancellation_s=None,
-                )
-                if settlement.cancellation is not None:
-                    safe_cancellation = self._safe_caller_cancellation(settlement.cancellation)
-                    safe_cancellation.__cause__ = failure
-                    safe_cancellation.__suppress_context__ = True
-                    retain_workspace_observation_pending_cancellation_requests(
-                        safe_cancellation,
-                        max(settlement.cancellation_requests_consumed, 1),
-                    )
-                    restore_task_cancellation_requests(
-                        settlement.cancellation_requests_consumed,
-                        cancellation=safe_cancellation,
-                    )
-                    raise safe_cancellation
-                if settlement.error is not None:
-                    if exception_tree_contains(
-                        settlement.error,
-                        _PROCESS_CONTROL_SIGNALS,
-                    ):
-                        raise self._detached_process_control_failure(settlement.error) from failure
-                    raise failure from self._detached_cleanup_failure(settlement.error)
-                raise failure from None
-            if renewal_outcome.error is not None:
-                self._record_publication_ownership_loss(
-                    ownership_lost,
-                    renewal_outcome.error,
-                )
-                raise renewal_outcome.error
-            self._acknowledge_publication_renewal_deadline(
-                renewal_started_monotonic,
-                lease_deadline=lease_deadline,
-                ownership_lost=ownership_lost,
-            )
+        await run_leased_adapter_heartbeat(
+            _PublicationLeaseHeartbeat(self, authority, owner_id, lease_deadline, ownership_lost),
+            stop=stop,
+            ownership_lost=ownership_lost,
+            clock=monotonic,
+        )
 
     def _acknowledge_publication_renewal_deadline(
         self,

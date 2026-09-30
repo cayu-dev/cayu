@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from time import monotonic
-from typing import TypeVar, cast
+from typing import ClassVar, NoReturn, TypeVar, cast
 from uuid import uuid4
 
 from pydantic import BaseModel
@@ -31,6 +31,7 @@ from cayu.runtime._diagnostics import (
 from cayu.runtime._execution_profile_identity_validation import (
     copy_secret_free_execution_profile_behavior_identity,
 )
+from cayu.runtime._leased_adapter_heartbeat import run_leased_adapter_heartbeat
 from cayu.runtime._leased_adapter_runner import LeasedAdapterLease, LeasedAdapterRunner
 from cayu.runtime._task_store_operation_boundary import (
     TaskStoreOperationOutcome,
@@ -171,6 +172,72 @@ class _TaskStoreOwner:
 class _ClaimHeartbeatState:
     ownership_lost: asyncio.Future[BaseException]
     late_settlement_failure: BaseException | None = None
+
+
+@dataclass(slots=True)
+class _ClaimLeaseHeartbeat:
+    coordinator: CompletionVerifierCoordinator = field(repr=False)
+    store_owner: _TaskStoreOwner = field(repr=False)
+    request: CompletionVerificationClaimRequest = field(repr=False)
+    execution: CompletionVerifierExecutionRequest = field(repr=False)
+    claim: CompletionVerificationClaim = field(repr=False)
+    deadline: float
+    state: _ClaimHeartbeatState = field(repr=False)
+
+    renewal_task_name: ClassVar[str] = "cayu-completion-verifier-claim-renewal"
+    cancel_renewal_on_shutdown: ClassVar[bool] = True
+    deadline_can_extend: ClassVar[bool] = False
+
+    @property
+    def interval_seconds(self) -> float:
+        return min(max(self.request.lease_seconds / 4.0, 0.05), 30.0)
+
+    async def renew(self) -> tuple[CompletionVerificationClaim, float]:
+        return await self.coordinator._renew_claim(
+            self.store_owner, self.request, self.execution, prior_claim=self.claim
+        )
+
+    def acknowledge(
+        self, result: tuple[CompletionVerificationClaim, float] | None, started: float
+    ) -> None:
+        if result is None:
+            raise WorkCompletionConflict(
+                "Completion verification claim renewal returned no result."
+            ) from None
+        self.claim, self.deadline = result
+
+    def expiry_failure(self, *, renewing: bool) -> BaseException:
+        return CompletionVerificationClaimLost(
+            "Completion verification claim renewal was not acknowledged before "
+            "its local lease deadline."
+            if renewing
+            else "Completion verification claim acknowledgement expired before renewal."
+        )
+
+    def safe_cancellation(self, cancellation: asyncio.CancelledError) -> asyncio.CancelledError:
+        return _safe_caller_cancellation(cancellation, redactor=self.coordinator._secret_redactor)
+
+    def raise_late_failure(self, expiry: BaseException, failure: BaseException) -> NoReturn:
+        detached = _detached_verifier_failure(failure, redactor=self.coordinator._secret_redactor)
+        self.state.late_settlement_failure = detached
+        raise expiry from detached
+
+    def raise_cancellation(self, cancellation: asyncio.CancelledError) -> NoReturn:
+        try:
+            evidence = _BASE_EXCEPTION_CAUSE_DESCRIPTOR.__get__(cancellation, BaseException)
+        except BaseException:
+            evidence = RuntimeError(
+                "Completion-verification claim renewal settlement evidence was inaccessible."
+            )
+        if evidence is None:
+            raise cancellation
+        # Retain detached cleanup evidence before Task cancellation can erase
+        # its cause. Claim settlement prunes only its owned shutdown signal.
+        cancellation.__cause__ = None
+        raise BaseExceptionGroup(
+            "Completion-verification claim renewal was cancelled during settlement.",
+            [evidence, cancellation],
+        ) from None
 
 
 @dataclass(slots=True)
@@ -2383,124 +2450,20 @@ class CompletionVerifierCoordinator:
         claim_deadline_monotonic: float,
         state: _ClaimHeartbeatState,
     ) -> None:
-        interval = min(max(claim_request.lease_seconds / 4.0, 0.05), 30.0)
-        current = claim
-        while True:
-            remaining = claim_deadline_monotonic - monotonic()
-            if remaining <= 0:
-                failure = CompletionVerificationClaimLost(
-                    "Completion verification claim acknowledgement expired before renewal."
-                )
-                self._record_claim_ownership_loss(state.ownership_lost, failure)
-                raise failure from None
-            try:
-                await asyncio.wait_for(
-                    stop.wait(),
-                    timeout=min(interval, remaining / 2.0),
-                )
-                return
-            except TimeoutError:
-                pass
-            renewal_task = asyncio.create_task(
-                self._renew_claim(
-                    store_owner,
-                    claim_request,
-                    execution_request,
-                    prior_claim=current,
-                ),
-                name="cayu-completion-verifier-claim-renewal",
-            )
-            try:
-                renewal_outcome = await await_shielded_task_outcome(
-                    renewal_task,
-                    timeout_s=max(0.0, claim_deadline_monotonic - monotonic()),
-                    timeout_after_cancellation_s=0,
-                )
-                if renewal_outcome.cancellation is not None:
-                    renewal_task.cancel()
-                    try:
-                        await renewal_task
-                    except BaseException as settlement:
-                        raise settlement
-                    raise renewal_outcome.cancellation
-                if renewal_outcome.timed_out:
-                    failure = CompletionVerificationClaimLost(
-                        "Completion verification claim renewal was not acknowledged before "
-                        "its local lease deadline."
-                    )
-                    self._record_claim_ownership_loss(state.ownership_lost, failure)
-                    settlement = await await_shielded_task_outcome(
-                        renewal_task,
-                        timeout_s=None,
-                        timeout_after_cancellation_s=None,
-                    )
-                    if settlement.cancellation is not None:
-                        safe_cancellation = _safe_caller_cancellation(
-                            settlement.cancellation,
-                            redactor=self._secret_redactor,
-                        )
-                        safe_cancellation.__cause__ = failure
-                        safe_cancellation.__suppress_context__ = True
-                        retain_workspace_observation_pending_cancellation_requests(
-                            safe_cancellation,
-                            max(settlement.cancellation_requests_consumed, 1),
-                        )
-                        restore_task_cancellation_requests(
-                            settlement.cancellation_requests_consumed,
-                            cancellation=safe_cancellation,
-                        )
-                        raise safe_cancellation
-                    if settlement.error is not None:
-                        settlement_failure = _detached_verifier_failure(
-                            settlement.error,
-                            redactor=self._secret_redactor,
-                        )
-                        state.late_settlement_failure = settlement_failure
-                        raise failure from settlement_failure
-                    raise failure from None
-                if renewal_outcome.error is not None:
-                    self._record_claim_ownership_loss(
-                        state.ownership_lost,
-                        renewal_outcome.error,
-                    )
-                    raise renewal_outcome.error
-                renewed = renewal_outcome.result
-                if renewed is None:
-                    raise WorkCompletionConflict(
-                        "Completion verification claim renewal returned no result."
-                    ) from None
-                current, claim_deadline_monotonic = renewed
-            except asyncio.CancelledError as cancellation:
-                try:
-                    settlement_evidence = _BASE_EXCEPTION_CAUSE_DESCRIPTOR.__get__(
-                        cancellation,
-                        BaseException,
-                    )
-                except BaseException:
-                    settlement_evidence = RuntimeError(
-                        "Completion-verification claim renewal settlement "
-                        "evidence was inaccessible."
-                    )
-                if settlement_evidence is None:
-                    raise
-                # A Task may normalize its terminal CancelledError before an
-                # owner calls result(), losing an explicit cause. Publish the
-                # already-detached evidence as a sibling while still inside
-                # the private heartbeat task. Settlement later removes only
-                # this authenticated shutdown cancellation.
-                cancellation.__cause__ = None
-                raise BaseExceptionGroup(
-                    "Completion-verification claim renewal was cancelled during settlement.",
-                    [settlement_evidence, cancellation],
-                ) from None
-
-    @staticmethod
-    def _record_claim_ownership_loss(
-        ownership_lost: asyncio.Future[BaseException],
-        failure: BaseException,
-    ) -> None:
-        if not ownership_lost.done():
-            ownership_lost.set_result(failure)
+        await run_leased_adapter_heartbeat(
+            _ClaimLeaseHeartbeat(
+                self,
+                store_owner,
+                claim_request,
+                execution_request,
+                claim,
+                claim_deadline_monotonic,
+                state,
+            ),
+            stop=stop,
+            ownership_lost=state.ownership_lost,
+            clock=monotonic,
+        )
 
     @staticmethod
     def _request_claim_heartbeat_stop(heartbeat: _ClaimHeartbeat) -> bool:

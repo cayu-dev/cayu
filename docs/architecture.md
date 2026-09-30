@@ -248,3 +248,11 @@ timeout. A stale drain acknowledgement cannot consume a successor's drain.
 Verified worker callbacks use the same owner to settle work and its heartbeat
 before returning. The coordinators retain durable authority, registration,
 lease renewal policy, result validation, and credential-safe diagnostics.
+
+Claim and publication heartbeats share a private renewal driver. It owns
+the renewal clock, exact renewal task, and first ownership-loss notification,
+retaining an in-flight renewal through timeout or cancellation settlement.
+Lease adapters retain authority validation, acknowledgement checks, and
+diagnostic policy. Verification shutdown cancels its renewal; publication
+shutdown waits for its mutation. Publication waits also recheck a deadline
+extended by a concurrent foreground renewal.
