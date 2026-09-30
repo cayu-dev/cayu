@@ -114,16 +114,21 @@ closure reads the existing receipt and transcript. Cancellation remains observab
 after publication and deferred input materialization. Only live execution creates
 dispatch state.
 
-`RecoveryCoordinator` delegates interruption snapshot validation and recovered
-round publication to the same owner. Interruption captures the transcript cursor
-before settlement; publication retains that cursor as its concurrency fence. The
-owner completes the assistant's secret projection, restores staged capacity,
-publishes safe terminals, and commits through the shared exact-replay operation.
+`RecoveryCoordinator` delegates interruption snapshot validation, missing-result
+selection and recovered round publication to the same owner. Interruption captures
+the transcript cursor before settlement; publication retains that cursor as its
+concurrency fence. The owner completes the assistant's secret projection, restores
+staged capacity, publishes safe terminals, and commits through the shared
+exact-replay operation.
 Recovered terminal events reach the caller after commit and deferred input
 materialization. An error while consuming a terminal hook closes that hook stream
-before returning. Recovery still selects safe outcomes and coordinates workspace
-settlement, uncertain external effects, isolated dispatch evidence and child
-sessions. Those operations do not authorize a second tool execution.
+before returning. Missing-result selection skips recorded and staged calls,
+retains blocked results for unexposed calls, and synthesizes unknown outcomes
+only after reconciliation permits closure. The recovery coordinator supplies
+one per-call resolver for native operations, external-effect journals and child
+sessions. It also coordinates workspace settlement and isolated dispatch evidence.
+An uncertain external effect retains its reconciliation fence. Selection and
+publication use the same round owner without authorizing a second tool execution.
 
 Live and recovered structured-output tool rounds also publish through
 `DurableToolRound`. Live execution validates the original provider arguments and

@@ -17,7 +17,7 @@ from decimal import Decimal
 from typing import Any, Literal, Protocol
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, MIN_DURABLE_JSON_INTEGER
-from cayu.approvals.tools import ToolPolicyEvidence
+from cayu.approvals.tools import PendingToolCallApproval, ToolPolicyEvidence
 from cayu.context.structured_output import StructuredOutputSpec, StructuredOutputValidation
 from cayu.events import Event, EventType, copy_event
 from cayu.messages import Message
@@ -57,7 +57,11 @@ from cayu.sessions.base import Session, SessionStatus, SessionStore
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools.base import ToolEffect, ToolResult
 from cayu.tools.catalogue import ToolExecutionContract
-from cayu.tools.exposure import NOT_EXPOSED_IN_REQUEST_REASON, ResolvedToolExposureAuthority
+from cayu.tools.exposure import (
+    NOT_EXPOSED_IN_REQUEST_REASON,
+    ResolvedToolExposureAuthority,
+    unexposed_tool_result,
+)
 from cayu.tools.terminal_publication import ToolTerminalPublicationGovernor
 from cayu.vaults.redaction import SecretRedactor
 
@@ -66,6 +70,15 @@ class NativeToolTerminalPublisher(Protocol):
     def __call__(
         self, *, session: Session, record: ToolEffectRecord, event: Event
     ) -> Awaitable[Event]: ...
+
+
+class ToolCallRecoveryResolver(Protocol):
+    def __call__(
+        self,
+        pending_tool_call: PendingToolCallApproval,
+        tool_call: runtime_records.ToolCallRequest,
+        /,
+    ) -> Awaitable[tuple[ToolResult | None, ToolEffectRecord | None]]: ...
 
 
 @dataclass(frozen=True)
@@ -1046,6 +1059,83 @@ class DurableToolRound:
             "Pending tool round changed while sealing its recovery publication projection."
         )
         return checkpoint or {}, recovered_round
+
+    async def recover_outcomes(
+        self,
+        *,
+        registered_agent: runtime_records.RegisteredAgentState,
+        pending_round: tool_round_recovery.PendingToolRound,
+        recorded_outcomes: Mapping[str, runtime_records.ToolCallOutcome],
+        effective_started_ids: set[str],
+        reconcile_call: ToolCallRecoveryResolver,
+        redactor: SecretRedactor,
+    ) -> tuple[list[runtime_records.ToolCallOutcome], dict[str, ToolEffectRecord]]:
+        """Select missing round results after specialized reconciliation proves them safe.
+
+        Recorded and staged calls are never reconciled again. The resolver owns
+        native operation, external-effect and child-session evidence; it must
+        raise when a call cannot safely receive an unknown-outcome terminal.
+        """
+        if tool_round_recovery.pending_tool_round_identity(pending_round) != self._identity:
+            raise RuntimeError("Recovered outcomes belong to a different tool round.")
+        synthesized_outcomes: list[runtime_records.ToolCallOutcome] = []
+        confirmed_native_effect_records: dict[str, ToolEffectRecord] = {}
+        staged_call_ids = {
+            staged.tool_call_id
+            for staged in tool_round_recovery.staged_terminal_records(pending_round)
+        }
+        for pending_tool_call in pending_round.tool_calls:
+            if (
+                recorded_outcomes.get(pending_tool_call.tool_call_id) is not None
+                or pending_tool_call.tool_call_id in staged_call_ids
+            ):
+                continue
+            tool_call = approval_support.tool_call_request_from_pending(pending_tool_call)
+            if (
+                approval_support.effective_tool_policy_evidence(pending_tool_call)
+                is ToolPolicyEvidence.UNEXPOSED
+            ):
+                exposure = pending_round.tool_exposure
+                if exposure is None:
+                    raise RuntimeError(
+                        "Unexposed recovered tool call lost its frozen exposure snapshot."
+                    )
+                if (
+                    tool_call.name not in registered_agent.executable_tool_names
+                    or tool_call.name in exposure.tool_names
+                ):
+                    raise RuntimeError(
+                        "Unexposed recovered tool call conflicts with its frozen exposure."
+                    )
+                synthesized_outcomes.append(
+                    runtime_records.ToolCallOutcome(
+                        call=runtime_records.copy_tool_call_request(
+                            tool_call,
+                            arguments={},
+                            arguments_state="unavailable",
+                        ),
+                        result=unexposed_tool_result(),
+                    )
+                )
+                continue
+            result, confirmed_effect_record = await reconcile_call(pending_tool_call, tool_call)
+            if result is None:
+                result = tool_round_recovery.unknown_recovered_tool_result(
+                    pending_tool_call=pending_tool_call,
+                    pending_round=pending_round,
+                    started=pending_tool_call.tool_call_id in effective_started_ids,
+                )
+            if confirmed_effect_record is not None:
+                confirmed_native_effect_records[pending_tool_call.tool_call_id] = (
+                    confirmed_effect_record
+                )
+            synthesized_outcomes.append(
+                runtime_records.ToolCallOutcome(call=tool_call, result=result)
+            )
+        return (
+            tool_results.redact_tool_call_outcomes(synthesized_outcomes, redactor),
+            confirmed_native_effect_records,
+        )
 
     async def publish_recovered(
         self,

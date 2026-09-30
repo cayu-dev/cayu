@@ -21,6 +21,7 @@ import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from functools import partial
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, cast
 from uuid import UUID, uuid4, uuid5
@@ -491,7 +492,6 @@ from cayu.tools.exposure import (
     ALL_REGISTERED_TOOLS_PROFILE_ID,
     ResolvedToolExposureAuthority,
     tool_capability_ceiling_from_session_metadata,
-    unexposed_tool_result,
     validate_resolved_tool_exposure_authority,
 )
 from cayu.tools.gateway import gateway_lifecycle_matches_outer_call
@@ -15127,7 +15127,7 @@ class RecoveryCoordinator:
             for outcome in interrupted_results
         ]
         async for event in self._publish_recovered_tool_outcomes(
-            session=request.session,
+            owner=owner,
             registered_agent=request.registered_agent,
             registered_environment=request.registered_environment,
             messages=request.messages,
@@ -16079,294 +16079,34 @@ class RecoveryCoordinator:
         ):
             subagent_children = await self._subagent_children_by_idempotency_key(session.id)
             subagent_recovery_checkpoint = await self._session_store.load_checkpoint(session.id)
-        synthesized_outcomes: list[runtime_records.ToolCallOutcome] = []
-        confirmed_native_effect_records: dict[str, ToolEffectRecord] = {}
-        staged_call_ids = {
-            staged.tool_call_id
-            for staged in tool_round_recovery.staged_terminal_records(pending_round)
-        }
-        for pending_tool_call in pending_round.tool_calls:
-            recorded_outcome = recorded_outcomes.get(pending_tool_call.tool_call_id)
-            if recorded_outcome is not None or pending_tool_call.tool_call_id in staged_call_ids:
-                continue
-
-            tool_call = approval_support.tool_call_request_from_pending(pending_tool_call)
-            policy_evidence = approval_support.effective_tool_policy_evidence(pending_tool_call)
-            if policy_evidence is ToolPolicyEvidence.UNEXPOSED:
-                exposure = pending_round.tool_exposure
-                if exposure is None:
-                    raise RuntimeError(
-                        "Unexposed recovered tool call lost its frozen exposure snapshot."
-                    )
-                if (
-                    tool_call.name not in registered_agent.executable_tool_names
-                    or tool_call.name in exposure.tool_names
-                ):
-                    raise RuntimeError(
-                        "Unexposed recovered tool call conflicts with its frozen exposure."
-                    )
-                synthesized_outcomes.append(
-                    runtime_records.ToolCallOutcome(
-                        call=runtime_records.copy_tool_call_request(
-                            tool_call,
-                            arguments={},
-                            arguments_state="unavailable",
-                        ),
-                        result=unexposed_tool_result(),
-                    )
-                )
-                continue
-            expected_idempotency_key = tool_execution.tool_idempotency_key(
-                session_id=session.id,
-                tool_round_id=pending_round.tool_round_id,
-                tool_call_id=pending_tool_call.tool_call_id,
-            )
-            recovery_arguments = await self._subagent_recovery_arguments(
-                checkpoint=subagent_recovery_checkpoint,
-                parent_session=session,
-                tool_name=pending_tool_call.tool_name,
-                tool_round_id=pending_round.tool_round_id,
-                tool_call_id=pending_tool_call.tool_call_id,
-                idempotency_key=expected_idempotency_key,
-                fallback=tool_call.arguments,
-            )
-            registered_tool = registered_agent.executable_tool(pending_tool_call.tool_name)
-            effect_record = None
-            if registered_tool is not None and registered_tool.effect is ToolEffect.EXTERNAL:
-                effect_record = await ToolEffectStateOwner(self._session_store).resolve_call(
-                    session,
-                    tool_round_id=pending_round.tool_round_id,
-                    tool_call_id=pending_tool_call.tool_call_id,
-                )
-                if effect_record is None:
-                    if (
-                        ambiguous_interrupt_close_intent
-                        and pending_tool_call.tool_call_id not in effective_started_ids
-                    ):
-                        # The exact approval-close intent is written by the
-                        # approval-pause publisher before round dispatch. It
-                        # positively proves this round was stopped at that gate;
-                        # absence of a journal alone is never sufficient proof.
-                        # A start or effect record would contradict that proof
-                        # and must retain the ordinary reconciliation fence.
-                        synthesized_outcomes.append(
-                            runtime_records.ToolCallOutcome(
-                                call=tool_call,
-                                result=tool_round_recovery.unknown_recovered_tool_result(
-                                    pending_tool_call=pending_tool_call,
-                                    pending_round=pending_round,
-                                    started=False,
-                                ),
-                            )
-                        )
-                        continue
-                    raise ToolEffectReconciliationRequired()
-            result: ToolResult | None = None
-            if registered_tool is not None and registered_tool.durable_tool_recovery is not None:
-
-                async def load_durable_tool_operation(
-                    storage_key: str,
-                ) -> dict[str, Any] | None:
-                    return await self._session_store.load_session_operation(
-                        session.id,
-                        storage_key,
-                    )
-
-                async def compare_and_set_durable_tool_operation(
-                    storage_key: str,
-                    expected: dict[str, Any] | None,
-                    desired: dict[str, Any],
-                    secondary_records: Mapping[str, dict[str, Any]],
-                ) -> dict[str, Any]:
-                    expected_copy = (
-                        None
-                        if expected is None
-                        else copy_durable_json_object(
-                            expected,
-                            "durable_tool_recovery.expected",
-                        )
-                    )
-                    desired_copy = copy_durable_json_object(
-                        desired,
-                        "durable_tool_recovery.desired",
-                    )
-                    secondary_copy = {
-                        key: copy_durable_json_object(
-                            value,
-                            f"durable_tool_recovery.secondary[{key!r}]",
-                        )
-                        for key, value in secondary_records.items()
-                    }
-                    if storage_key in secondary_copy:
-                        raise ValueError("Durable tool recovery cannot duplicate its primary key.")
-
-                    def publish(
-                        current_session: Session,
-                        checkpoint: dict[str, Any] | None,
-                        current: dict[str, Any] | None,
-                    ) -> SessionOperationPublication:
-                        if (
-                            current_session.id != session.id
-                            or current_session.run_epoch != session.run_epoch
-                        ):
-                            raise SessionRunFenced(
-                                "Durable tool recovery lost its parent run authority."
-                            )
-                        if current != expected_copy:
-                            raise DurableToolOperationConflict(
-                                "Durable tool recovery state changed before publication."
-                            )
-                        return SessionOperationPublication(
-                            checkpoint={} if checkpoint is None else checkpoint,
-                            operation_records={storage_key: desired_copy, **secondary_copy},
-                        )
-
-                    await self._session_store.publish_session_operation(
-                        session.id,
-                        idempotency_key=storage_key,
-                        operation_transform=publish,
-                        events=[],
-                        expected_statuses={session.status},
-                        expected_run_epoch=session.run_epoch,
-                    )
-                    return copy_durable_json_object(
-                        desired_copy,
-                        "durable_tool_recovery.result",
-                    )
-
-                recovery_artifact_store = (
-                    None
-                    if registered_environment is None
-                    else registered_environment.environment.artifact_store
-                )
-                recovery_runner = (
-                    None
-                    if registered_environment is None
-                    else registered_environment.environment.runner
-                )
-                runner_resource_identity, reconcile_runner_operation = (
-                    durable_runner_recovery_authority(recovery_runner)
-                )
-                recovery_authority = DurableToolRecoveryAuthority(
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    workspace=(
-                        None
-                        if registered_environment is None
-                        else registered_environment.environment.workspace
-                    ),
-                    artifact_reader=(
-                        None
-                        if recovery_artifact_store is None
-                        else _DurableArtifactRecoveryReader(recovery_artifact_store)
-                    ),
-                    compare_and_set_operation=compare_and_set_durable_tool_operation,
-                    runner_resource_identity=runner_resource_identity,
-                    reconcile_runner_operation=reconcile_runner_operation,
-                )
-
-                evidence = await registered_tool.durable_tool_recovery.reconcile_durable_tool_call(
-                    parent_session_id=session.id,
-                    parent_run_epoch=(
-                        pending_round.source_run_epoch
-                        if pending_round.source_run_epoch is not None
-                        else session.run_epoch
-                    ),
-                    execution_profile_fingerprint=(
-                        None if execution_profile is None else execution_profile.fingerprint
-                    ),
-                    environment_name=environment_name,
-                    environment_allocation_fingerprint=(
-                        None
-                        if registered_environment is None
-                        else registered_environment.live_allocation_fingerprint
-                    ),
-                    model_step_id=pending_round.model_step_id,
-                    model_attempt_id=pending_round.model_attempt_id,
-                    tool_round_id=pending_round.tool_round_id,
-                    tool_call_id=pending_tool_call.tool_call_id,
-                    idempotency_key=expected_idempotency_key,
-                    arguments=copy_json_value(
-                        tool_call.arguments,
-                        "durable_tool_recovery.arguments",
-                    ),
-                    started=pending_tool_call.tool_call_id in effective_started_ids,
-                    load_operation=load_durable_tool_operation,
-                    recovery_authority=recovery_authority,
-                )
-                if evidence is not None:
-                    if type(evidence) is not DurableToolRecoveryEvidence:
-                        raise TypeError("Durable tool recovery requires explicit typed evidence.")
-                    evidence = DurableToolRecoveryEvidence(evidence.disposition, evidence.result)
-                    if (
-                        registered_tool.effect is ToolEffect.EXTERNAL
-                        and evidence.disposition != "confirmed"
-                    ):
-                        raise ToolEffectReconciliationRequired()
-                    result = evidence.result
-                    if effect_record is not None:
-                        confirmed_native_effect_records[pending_tool_call.tool_call_id] = (
-                            effect_record
-                        )
-            reconciled_result = None
-            if result is None:
-                reconciled_result = await self._reconcile_subagent_child(
-                    subagent_children,
-                    idempotency_key=expected_idempotency_key,
-                    tool_call_id=pending_tool_call.tool_call_id,
-                    tool_name=pending_tool_call.tool_name,
-                    tool_round_id=pending_round.tool_round_id,
-                    arguments=recovery_arguments,
-                    parent_session=session,
-                    registered_agent=registered_agent,
-                )
-                result = reconciled_result
-                if result is not None and effect_record is not None:
-                    # The child recovery contract returns a ToolResult only for
-                    # a durably settled submission, not an unverified child.
-                    confirmed_native_effect_records[pending_tool_call.tool_call_id] = effect_record
-            if result is None:
-                result = await self._reattached_subagent_result(
-                    subagent_children,
-                    expected_idempotency_key,
-                    parent_checkpoint=subagent_recovery_checkpoint,
-                    tool_call_id=pending_tool_call.tool_call_id,
-                    tool_name=pending_tool_call.tool_name,
-                    tool_round_id=pending_round.tool_round_id,
-                    arguments=recovery_arguments,
-                    parent_session=session,
-                    registered_agent=registered_agent,
-                )
-                if result is not None and effect_record is not None:
-                    child = subagent_children.get(expected_idempotency_key)
-                    if (
-                        child is None
-                        or child.status
-                        not in tool_round_recovery._SUBAGENT_RECOVERY_TERMINAL_STATUSES
-                    ):
-                        raise ToolEffectReconciliationRequired()
-                    confirmed_native_effect_records[pending_tool_call.tool_call_id] = effect_record
-            if result is None:
-                if registered_tool is not None and registered_tool.effect is ToolEffect.EXTERNAL:
-                    # Neither a missing journal nor an unsuccessful lookup proves
-                    # an external call safe to synthesize or redispatch. Only the
-                    # typed journal confirmation above can supply its terminal.
-                    raise ToolEffectReconciliationRequired()
-                result = tool_round_recovery.unknown_recovered_tool_result(
-                    pending_tool_call=pending_tool_call,
-                    pending_round=pending_round,
-                    started=pending_tool_call.tool_call_id in effective_started_ids,
-                )
-            synthesized_outcomes.append(
-                runtime_records.ToolCallOutcome(call=tool_call, result=result)
-            )
-
-        synthesized_outcomes = tool_results.redact_tool_call_outcomes(
-            synthesized_outcomes,
-            self._secret_redactor,
+        owner = DurableToolRound(
+            session=session,
+            tool_round_identity=tool_round_identity,
+            session_store=self._session_store,
+            event_writer=self._event_writer,
+        )
+        synthesized_outcomes, confirmed_native_effect_records = await owner.recover_outcomes(
+            registered_agent=registered_agent,
+            pending_round=pending_round,
+            recorded_outcomes=recorded_outcomes,
+            effective_started_ids=effective_started_ids,
+            reconcile_call=partial(
+                self._reconcile_recovered_tool_call,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+                pending_round=pending_round,
+                execution_profile=execution_profile,
+                effective_started_ids=effective_started_ids,
+                subagent_children=subagent_children,
+                subagent_recovery_checkpoint=subagent_recovery_checkpoint,
+                ambiguous_interrupt_close_intent=ambiguous_interrupt_close_intent,
+            ),
+            redactor=self._secret_redactor,
         )
         async for event in self._publish_recovered_tool_outcomes(
-            session=session,
+            owner=owner,
             registered_agent=registered_agent,
             registered_environment=registered_environment,
             messages=messages,
@@ -16381,10 +16121,267 @@ class RecoveryCoordinator:
         ):
             yield event
 
+    async def _reconcile_recovered_tool_call(
+        self,
+        pending_tool_call: PendingToolCallApproval,
+        tool_call: runtime_records.ToolCallRequest,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        environment_name: str | None,
+        pending_round: tool_round_recovery.PendingToolRound,
+        execution_profile: ExecutionProfileIdentity | None,
+        effective_started_ids: set[str],
+        subagent_children: dict[str, Session | None],
+        subagent_recovery_checkpoint: dict[str, Any] | None,
+        ambiguous_interrupt_close_intent: bool,
+    ) -> tuple[ToolResult | None, ToolEffectRecord | None]:
+        """Resolve one missing call through existing native, effect and child authority.
+
+        A missing result permits ordinary unknown-outcome synthesis only after
+        external-effect fences have passed. This operation never dispatches a tool.
+        """
+        expected_idempotency_key = tool_execution.tool_idempotency_key(
+            session_id=session.id,
+            tool_round_id=pending_round.tool_round_id,
+            tool_call_id=pending_tool_call.tool_call_id,
+        )
+        recovery_arguments = await self._subagent_recovery_arguments(
+            checkpoint=subagent_recovery_checkpoint,
+            parent_session=session,
+            tool_name=pending_tool_call.tool_name,
+            tool_round_id=pending_round.tool_round_id,
+            tool_call_id=pending_tool_call.tool_call_id,
+            idempotency_key=expected_idempotency_key,
+            fallback=tool_call.arguments,
+        )
+        registered_tool = registered_agent.executable_tool(pending_tool_call.tool_name)
+        effect_record = None
+        if registered_tool is not None and registered_tool.effect is ToolEffect.EXTERNAL:
+            effect_record = await ToolEffectStateOwner(self._session_store).resolve_call(
+                session,
+                tool_round_id=pending_round.tool_round_id,
+                tool_call_id=pending_tool_call.tool_call_id,
+            )
+            if effect_record is None:
+                if (
+                    ambiguous_interrupt_close_intent
+                    and pending_tool_call.tool_call_id not in effective_started_ids
+                ):
+                    # The exact approval-close intent is written by the
+                    # approval-pause publisher before round dispatch. It
+                    # positively proves this round was stopped at that gate;
+                    # absence of a journal alone is never sufficient proof.
+                    # A start or effect record would contradict that proof
+                    # and must retain the ordinary reconciliation fence.
+                    return (
+                        tool_round_recovery.unknown_recovered_tool_result(
+                            pending_tool_call=pending_tool_call,
+                            pending_round=pending_round,
+                            started=False,
+                        ),
+                        None,
+                    )
+                raise ToolEffectReconciliationRequired()
+        result: ToolResult | None = None
+        confirmed_effect_record: ToolEffectRecord | None = None
+        if registered_tool is not None and registered_tool.durable_tool_recovery is not None:
+
+            async def load_durable_tool_operation(
+                storage_key: str,
+            ) -> dict[str, Any] | None:
+                return await self._session_store.load_session_operation(
+                    session.id,
+                    storage_key,
+                )
+
+            async def compare_and_set_durable_tool_operation(
+                storage_key: str,
+                expected: dict[str, Any] | None,
+                desired: dict[str, Any],
+                secondary_records: Mapping[str, dict[str, Any]],
+            ) -> dict[str, Any]:
+                expected_copy = (
+                    None
+                    if expected is None
+                    else copy_durable_json_object(
+                        expected,
+                        "durable_tool_recovery.expected",
+                    )
+                )
+                desired_copy = copy_durable_json_object(
+                    desired,
+                    "durable_tool_recovery.desired",
+                )
+                secondary_copy = {
+                    key: copy_durable_json_object(
+                        value,
+                        f"durable_tool_recovery.secondary[{key!r}]",
+                    )
+                    for key, value in secondary_records.items()
+                }
+                if storage_key in secondary_copy:
+                    raise ValueError("Durable tool recovery cannot duplicate its primary key.")
+
+                def publish(
+                    current_session: Session,
+                    checkpoint: dict[str, Any] | None,
+                    current: dict[str, Any] | None,
+                ) -> SessionOperationPublication:
+                    if (
+                        current_session.id != session.id
+                        or current_session.run_epoch != session.run_epoch
+                    ):
+                        raise SessionRunFenced(
+                            "Durable tool recovery lost its parent run authority."
+                        )
+                    if current != expected_copy:
+                        raise DurableToolOperationConflict(
+                            "Durable tool recovery state changed before publication."
+                        )
+                    return SessionOperationPublication(
+                        checkpoint={} if checkpoint is None else checkpoint,
+                        operation_records={storage_key: desired_copy, **secondary_copy},
+                    )
+
+                await self._session_store.publish_session_operation(
+                    session.id,
+                    idempotency_key=storage_key,
+                    operation_transform=publish,
+                    events=[],
+                    expected_statuses={session.status},
+                    expected_run_epoch=session.run_epoch,
+                )
+                return copy_durable_json_object(
+                    desired_copy,
+                    "durable_tool_recovery.result",
+                )
+
+            recovery_artifact_store = (
+                None
+                if registered_environment is None
+                else registered_environment.environment.artifact_store
+            )
+            recovery_runner = (
+                None
+                if registered_environment is None
+                else registered_environment.environment.runner
+            )
+            runner_resource_identity, reconcile_runner_operation = (
+                durable_runner_recovery_authority(recovery_runner)
+            )
+            recovery_authority = DurableToolRecoveryAuthority(
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                workspace=(
+                    None
+                    if registered_environment is None
+                    else registered_environment.environment.workspace
+                ),
+                artifact_reader=(
+                    None
+                    if recovery_artifact_store is None
+                    else _DurableArtifactRecoveryReader(recovery_artifact_store)
+                ),
+                compare_and_set_operation=compare_and_set_durable_tool_operation,
+                runner_resource_identity=runner_resource_identity,
+                reconcile_runner_operation=reconcile_runner_operation,
+            )
+
+            evidence = await registered_tool.durable_tool_recovery.reconcile_durable_tool_call(
+                parent_session_id=session.id,
+                parent_run_epoch=(
+                    pending_round.source_run_epoch
+                    if pending_round.source_run_epoch is not None
+                    else session.run_epoch
+                ),
+                execution_profile_fingerprint=(
+                    None if execution_profile is None else execution_profile.fingerprint
+                ),
+                environment_name=environment_name,
+                environment_allocation_fingerprint=(
+                    None
+                    if registered_environment is None
+                    else registered_environment.live_allocation_fingerprint
+                ),
+                model_step_id=pending_round.model_step_id,
+                model_attempt_id=pending_round.model_attempt_id,
+                tool_round_id=pending_round.tool_round_id,
+                tool_call_id=pending_tool_call.tool_call_id,
+                idempotency_key=expected_idempotency_key,
+                arguments=copy_json_value(
+                    tool_call.arguments,
+                    "durable_tool_recovery.arguments",
+                ),
+                started=pending_tool_call.tool_call_id in effective_started_ids,
+                load_operation=load_durable_tool_operation,
+                recovery_authority=recovery_authority,
+            )
+            if evidence is not None:
+                if type(evidence) is not DurableToolRecoveryEvidence:
+                    raise TypeError("Durable tool recovery requires explicit typed evidence.")
+                evidence = DurableToolRecoveryEvidence(evidence.disposition, evidence.result)
+                if (
+                    registered_tool.effect is ToolEffect.EXTERNAL
+                    and evidence.disposition != "confirmed"
+                ):
+                    raise ToolEffectReconciliationRequired()
+                result = evidence.result
+                if effect_record is not None:
+                    confirmed_effect_record = effect_record
+        reconciled_result = None
+        if result is None:
+            reconciled_result = await self._reconcile_subagent_child(
+                subagent_children,
+                idempotency_key=expected_idempotency_key,
+                tool_call_id=pending_tool_call.tool_call_id,
+                tool_name=pending_tool_call.tool_name,
+                tool_round_id=pending_round.tool_round_id,
+                arguments=recovery_arguments,
+                parent_session=session,
+                registered_agent=registered_agent,
+            )
+            result = reconciled_result
+            if result is not None and effect_record is not None:
+                # The child recovery contract returns a ToolResult only for
+                # a durably settled submission, not an unverified child.
+                confirmed_effect_record = effect_record
+        if result is None:
+            result = await self._reattached_subagent_result(
+                subagent_children,
+                expected_idempotency_key,
+                parent_checkpoint=subagent_recovery_checkpoint,
+                tool_call_id=pending_tool_call.tool_call_id,
+                tool_name=pending_tool_call.tool_name,
+                tool_round_id=pending_round.tool_round_id,
+                arguments=recovery_arguments,
+                parent_session=session,
+                registered_agent=registered_agent,
+            )
+            if result is not None and effect_record is not None:
+                child = subagent_children.get(expected_idempotency_key)
+                if (
+                    child is None
+                    or child.status not in tool_round_recovery._SUBAGENT_RECOVERY_TERMINAL_STATUSES
+                ):
+                    raise ToolEffectReconciliationRequired()
+                confirmed_effect_record = effect_record
+        if (
+            result is None
+            and registered_tool is not None
+            and registered_tool.effect is ToolEffect.EXTERNAL
+        ):
+            # Neither a missing journal nor an unsuccessful lookup proves
+            # an external call safe to synthesize or redispatch. Only the
+            # typed journal confirmation above can supply its terminal.
+            raise ToolEffectReconciliationRequired()
+        return result, confirmed_effect_record
+
     async def _publish_recovered_tool_outcomes(
         self,
         *,
-        session: Session,
+        owner: DurableToolRound,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         messages: list[Message],
@@ -16399,12 +16396,6 @@ class RecoveryCoordinator:
         confirmed_native_effect_records: Mapping[str, ToolEffectRecord] | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Supply recovery collaborators to the durable round publication owner."""
-        owner = DurableToolRound(
-            session=session,
-            tool_round_identity=tool_round_recovery.pending_tool_round_identity(pending_round),
-            session_store=self._session_store,
-            event_writer=self._event_writer,
-        )
         async with contextlib.aclosing(
             owner.publish_recovered(
                 registered_agent=registered_agent,
