@@ -166,11 +166,13 @@ application then has neither a question nor a proposal to return.
 Pass `RequireFinalTool` on every `RunRequest` and `ResumeRequest` for that agent:
 
 ```python
-from cayu import RequireFinalTool
+from cayu import RequireFinalTool, ToolCompletionPolicy
 
-final_tool = RequireFinalTool(["ask_customer", "propose_resolution"])
-RunRequest(..., loop_policies=(final_tool,))
-ResumeRequest(..., loop_policies=(final_tool,))
+names = ("ask_customer", "propose_resolution")
+final_tool = RequireFinalTool(names)
+completion = ToolCompletionPolicy(tool_names=names)
+RunRequest(..., loop_policies=(final_tool,), tool_completion=completion)
+ResumeRequest(..., loop_policies=(final_tool,), tool_completion=completion)
 ```
 
 If the model stops before one of those tools has returned, the policy appends a
@@ -179,6 +181,30 @@ interrupted with a reason instead of completing. A tool result counts only when
 `is_error` is false, so return `ToolResult(..., is_error=True)` for failures such
 as rejected evidence or an unavailable service. The policy's identity comes from
 its configuration, so use the same tool names in every process.
+
+`tool_completion` skips the provider request after a successful final tool when
+the host displays the question or proposal from that tool's result. Both tools
+must be registered with `ToolEffect.NONE` or `ToolEffect.IDEMPOTENT`; an
+`EXTERNAL` execution tool is ineligible. The SDK and HTTP run/resume requests
+accept the same `{"tool_names": [...]}` setting. Unknown, blank, duplicate and
+ineligible names fail before provider dispatch.
+
+A single successful call completes with `session.completed` reason
+`host_rendered_tool`. `run_to_completion(...).tool_completion` contains its
+published call, effect and result, including the tool-round identity. Render
+that result in the application. Cayu keeps the assistant call and tool result
+in the conversation and does not generate an extra answer. A failed, denied,
+blocked or malformed call does not trigger this completion. A round containing
+sibling calls executes through the ordinary loop, preserving every call.
+
+`RequireFinalTool` supplies reminders when the model stops too early;
+`ToolCompletionPolicy` completes immediately when the designated tool succeeds.
+Without `tool_completion`, the existing post-tool model step still runs. Pass
+both settings consistently on fresh turns. They belong to the execution profile,
+so changing or omitting an established policy requires the existing profile
+adoption flow. Approval resolution and crash recovery retain the admitted policy.
+`tool_completion` cannot be combined with `structured_output`, which owns a
+separate validated output contract.
 
 ## Troubleshooting and limits
 

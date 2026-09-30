@@ -303,6 +303,13 @@ from cayu.runtime._terminal_evidence import (
     interruption_request_id_from_payload,
     require_interruption_event_matches_pending_marker,
 )
+from cayu.runtime._tool_completion import (
+    load_recorded_tool_completion_policy,
+    pending_round_has_completion_success,
+    recorded_terminal_tool_completion_payload,
+    recorded_tool_completion_result,
+    tool_completion_requires_execution,
+)
 from cayu.runtime._tool_effect_preparation_recovery import (
     requires_explicit_effect_continuation,
     settle_prepared_tool_effects,
@@ -379,6 +386,7 @@ from cayu.runtime.provider_operations import (
 )
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.stop_policy import RunLimits, StopDecision, copy_run_limits, has_run_limits
+from cayu.runtime.tool_completion import ToolCompletionPolicy, ToolCompletionResult
 from cayu.runtime.tool_effects import (
     ToolEffectReconciliationRequest,
     ToolEffectReconciliationTarget,
@@ -1312,6 +1320,8 @@ class RecoverySessionRunRequest:
     start_event_payload: dict[str, Any]
     start_task_on_enter: bool
     release_run_fence_on_exit: bool
+    tool_completion_replay: ToolCompletionResult | None = None
+    tool_completion: ToolCompletionPolicy | None = None
     run_limit_accounting: RunLimitAccountingContext | None = None
     initial_model_step_identity: ModelStepIdentity | None = None
     initial_model_step_number: int | None = None
@@ -17925,6 +17935,14 @@ class RecoveryCoordinator:
                 )
             raise
         registered_provider = self._resolve_registered_provider(session.provider_name)
+        if (
+            session.status is SessionStatus.RUNNING
+            and _work_attempt is None
+            and await tool_completion_requires_execution(
+                self._session_store, session, checkpoint, registered_agent
+            )
+        ):
+            await self._require_participant_execution(session, participant_context)
         if workspace_observations:
             # A static registration already provides the complete stable
             # environment authority. Reject a foreign lifecycle before profile
@@ -18726,6 +18744,10 @@ class RecoveryCoordinator:
                 pending_action_interrupt_payload=(inspection.pending_action_interrupt_payload),
                 run_operation=inspection.run_operation,
             )
+            if session.status is SessionStatus.COMPLETED:
+                repair_event.payload.update(
+                    await recorded_terminal_tool_completion_payload(self._session_store, session)
+                )
             terminal_event = await self._persist_terminal_evidence_repair_event(repair_event)
         if inspection.pending_interrupt_payload is not None:
             await self._clear_repaired_pending_interrupt(
@@ -22051,7 +22073,12 @@ class RecoveryCoordinator:
                         session_id=session.id,
                         agent_name=registered_agent.spec.name,
                         environment_name=resolved_environment.spec.name,
-                        payload={"completion_finalization_recovery": True},
+                        payload={
+                            "completion_finalization_recovery": True,
+                            **await recorded_terminal_tool_completion_payload(
+                                self._session_store, session
+                            ),
+                        },
                     ),
                     session=session,
                     registered_environment=resolved_environment,
@@ -22788,6 +22815,7 @@ class RecoveryCoordinator:
                         budget_limits=semantics.budget_limits,
                         retry_policy=semantics.retry_policy,
                         structured_output=semantics.structured_output,
+                        tool_completion=semantics.tool_completion,
                         thinking=semantics.thinking,
                         request_metadata=semantics.request_metadata,
                         task_id=None,
@@ -22879,6 +22907,100 @@ class RecoveryCoordinator:
                         f"statuses={','.join(statuses)})."
                     ),
                 )
+
+        if (
+            session.status is SessionStatus.RUNNING
+            and invocation_context is not None
+            and invocation_context.work_attempt is None
+            and pending_approval is None
+            and pending_user_input is None
+            and model_boundary.completed_stage is not None
+        ):
+            semantics = model_completion_recovery_context_from_stage(model_boundary.completed_stage)
+            if semantics is not None and semantics.tool_completion is not None:
+                policy = await load_recorded_tool_completion_policy(
+                    self._session_store,
+                    session,
+                    checkpoint,
+                    execution_profile=invocation_context.profile,
+                    max_steps=semantics.max_steps,
+                    limits=semantics.limits,
+                    retry_policy=semantics.retry_policy,
+                    context=semantics,
+                )
+                if (
+                    policy is not None
+                    and pending_tool_round is not None
+                    and await pending_round_has_completion_success(
+                        self._session_store,
+                        session,
+                        pending_tool_round,
+                        policy=policy,
+                        interaction_id=invocation_context.binding.interaction_id,
+                    )
+                ):
+                    snapshot = await self._session_store.load_transcript_snapshot(session.id)
+                    async for event in self.recover_pending_tool_round(
+                        session=session,
+                        invocation_context=invocation_context,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        messages=[detach_message(record.message) for record in snapshot.records],
+                        execution_profile=invocation_context.profile,
+                        incomplete_recovery_claimed=True,
+                        expected_transcript_cursor=snapshot.cursor,
+                    ):
+                        events.append(event)
+                    actions.append(IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND)
+                result = await recorded_tool_completion_result(
+                    self._session_store,
+                    session,
+                    policy=policy,
+                    execution_profile=invocation_context.profile,
+                    registered_agent=registered_agent,
+                )
+                if result is not None:
+                    stream = self._run_session(
+                        RecoverySessionRunRequest(
+                            session=session,
+                            invocation_context=invocation_context,
+                            participant_context=participant_context,
+                            messages=await self._session_store.load_transcript(session.id),
+                            messages_to_append=[],
+                            max_steps=semantics.max_steps,
+                            limits=semantics.limits,
+                            budget_limits=semantics.budget_limits,
+                            retry_policy=semantics.retry_policy,
+                            structured_output=semantics.structured_output,
+                            tool_completion=policy,
+                            tool_completion_replay=result,
+                            thinking=semantics.thinking,
+                            request_metadata=semantics.request_metadata,
+                            task_id=semantics.task_id,
+                            task_worker_id=None,
+                            task_handoff_id=None,
+                            start_event_type=None,
+                            start_event_payload={},
+                            start_task_on_enter=False,
+                            release_run_fence_on_exit=False,
+                            run_limit_accounting=semantics.run_limit_accounting,
+                        )
+                    )
+                    async with _close_delegated_event_stream(stream) as owned:
+                        async for event in owned:
+                            events.append(event)
+                    current = await self._require_session(session.id)
+                    return IncompleteSessionRecoveryResult(
+                        session_id=session.id,
+                        previous_status=previous_status,
+                        status=current.status,
+                        actions=(
+                            *actions,
+                            IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,
+                        ),
+                        events=tuple(events),
+                        message="Completed from the recorded final tool without another tool or provider dispatch.",
+                    )
 
         failed_with_recoverable_tool_round = (
             session.status is SessionStatus.FAILED

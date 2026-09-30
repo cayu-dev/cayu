@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from cayu._validation import copy_json_value
 from cayu.events import Event, EventType, copy_event
+from cayu.runtime.tool_completion import ToolCompletionResult
 from cayu.sessions.base import SessionStatus
 
 if TYPE_CHECKING:
@@ -48,6 +49,8 @@ class RunOutcome:
     - ``events`` is the full event stream, if you need more than the summary.
     - ``structured_output`` is the last successfully validated structured value,
       including valid JSON ``null``, or ``None`` when the run had no validated output.
+    - ``tool_completion`` is the successful final tool's durable host-rendering basis,
+      or ``None`` for ordinary model completion. It does not synthesize ``final_text``.
     - ``interaction_id`` identifies the interaction that produced ``final_text`` or
       the final interaction-scoped terminal outcome.
     """
@@ -59,9 +62,20 @@ class RunOutcome:
     events: tuple[Event, ...]
     structured_output: StructuredOutputResult | None = None
     interaction_id: str | None = None
+    tool_completion: ToolCompletionResult | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "events", tuple(copy_event(event) for event in self.events))
+        if self.tool_completion is not None:
+            if type(self.tool_completion) is not ToolCompletionResult:
+                raise TypeError("tool_completion must be a ToolCompletionResult.")
+            object.__setattr__(
+                self,
+                "tool_completion",
+                ToolCompletionResult.model_validate(
+                    self.tool_completion.model_dump(mode="python", warnings=False)
+                ),
+            )
         if self.structured_output is not None:
             if type(self.structured_output) is not StructuredOutputResult:
                 raise TypeError("structured_output must be a StructuredOutputResult.")
@@ -99,6 +113,7 @@ async def run_to_completion(app: CayuApp, request: RunRequest) -> RunOutcome:
     final_text = ""
     status = SessionStatus.INTERRUPTED
     error: str | None = None
+    tool_completion: ToolCompletionResult | None = None
     structured_output: StructuredOutputResult | None = None
     interaction_id: str | None = None
     session_id = request.session_id or ""
@@ -129,6 +144,10 @@ async def run_to_completion(app: CayuApp, request: RunRequest) -> RunOutcome:
                 )
             elif event.type == EventType.SESSION_COMPLETED:
                 status = SessionStatus.COMPLETED
+                value = payload.get("tool_completion")
+                tool_completion = (
+                    None if value is None else ToolCompletionResult.model_validate(value)
+                )
             elif event.type == EventType.SESSION_FAILED:
                 status = SessionStatus.FAILED
                 failure = payload.get("error")
@@ -146,5 +165,6 @@ async def run_to_completion(app: CayuApp, request: RunRequest) -> RunOutcome:
         error=error,
         events=tuple(events),
         structured_output=structured_output,
+        tool_completion=tool_completion,
         interaction_id=interaction_id,
     )

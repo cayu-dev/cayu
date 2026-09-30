@@ -810,6 +810,7 @@ export type ApiInteractionSummary = {
      * Tool Call Count
      */
     tool_call_count?: number;
+    tool_completion?: ToolCompletionResult | null;
     /**
      * Updated At
      */
@@ -14736,6 +14737,7 @@ export type ResumeBody = {
      */
     task_worker_id?: string | null;
     thinking?: ThinkingConfig | null;
+    tool_completion?: ToolCompletionPolicy | null;
 };
 
 /**
@@ -14857,6 +14859,7 @@ export type RunBody = {
     structured_output?: StructuredOutputSpec | null;
     target?: ModelTarget | null;
     thinking?: ThinkingConfig | null;
+    tool_completion?: ToolCompletionPolicy | null;
 };
 
 /**
@@ -17625,6 +17628,42 @@ export type ToolCalledAssertionSpec = {
 };
 
 /**
+ * ToolCompletionPolicy
+ *
+ * Complete a single-call round from a designated successful tool.
+ *
+ * The host renders the tool result. Eligible application tools declare
+ * ``NONE`` or ``IDEMPOTENT`` effects. Rounds with sibling calls continue
+ * through the ordinary model loop. Supply this policy on each new run or
+ * resumed turn; approval and crash recovery retain the admitted policy.
+ */
+export type ToolCompletionPolicy = {
+    /**
+     * Tool Names
+     */
+    tool_names: Array<string>;
+};
+
+/**
+ * ToolCompletionResult
+ *
+ * Detached host-rendering basis from the canonical published tool outcome.
+ */
+export type ToolCompletionResult = {
+    call: ToolCallPart;
+    effect: ToolEffect;
+    /**
+     * Reason
+     */
+    reason?: 'host_rendered_tool';
+    result: ToolResultPart;
+    /**
+     * Status
+     */
+    status?: 'completed';
+};
+
+/**
  * ToolDiscoveryGrantInspection
  *
  * Content-minimized discovery grant state safe for control-plane reads.
@@ -17707,6 +17746,23 @@ export type ToolDiscoveryViewInspection = {
      */
     session_id: string;
 };
+
+/**
+ * ToolEffect
+ *
+ * Declared side-effect semantics for a tool execution.
+ *
+ * Classify what replay can do to externally meaningful durable state. ``NONE``
+ * does not mutate it, ``IDEMPOTENT`` may mutate it but a stable downstream
+ * identity or equivalent contract collapses replay, and ``EXTERNAL`` has a
+ * non-idempotent or outcome-ambiguous durable mutation. Transport, billing,
+ * observability, and names such as "read" do not determine the value.
+ *
+ * The runtime uses this as execution metadata, not as an authorization
+ * decision: policy still decides whether a call may run. Run
+ * ``cayu guide tool-effects`` for the canonical decision table.
+ */
+export type ToolEffect = 'none' | 'idempotent' | 'external';
 
 /**
  * ToolExecutableRequirement

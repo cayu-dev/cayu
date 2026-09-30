@@ -7447,8 +7447,51 @@ user message always starts a new scan, even when it equals the configured remind
 Its execution-profile identity is
 derived from its configuration, so an identically configured instance in a new
 process passes profile admission. Tool names are not checked against the agent's
-registered tools. The policy does not skip the extra model step that follows a
-successful final tool; that step normally returns nothing and completes.
+registered tools. By itself, this policy retains the extra model step after a
+successful final tool. Use the request's `tool_completion` setting to complete
+from that result.
+
+### Completion from a final application tool
+
+`ToolCompletionPolicy(tool_names=(...))` is an opt-in `RunRequest` and
+`ResumeRequest` setting. The named application tools must be registered with
+`ToolEffect.NONE` or `ToolEffect.IDEMPOTENT`. Blank, duplicate, unknown,
+unregistered, runtime-owned structured submission and `EXTERNAL` tool names are
+rejected before any provider request. The bounded configuration is detached,
+immutable and included in the invocation's finalization profile. Without it,
+ordinary behavior and the existing profile identity are unchanged.
+
+After a **single-call** round succeeds, normal assistant/tool publication and
+tool hooks finish first. Cayu completes through the existing queue, session,
+task and environment finalization owners, with no additional model call.
+`session.completed` carries `reason="host_rendered_tool"` and a typed
+`tool_completion` basis containing the canonical published call and result,
+effect, status and completion reason. `RunOutcome.tool_completion` exposes that
+same basis; `final_text` contains only actual model text. Interaction completion
+persists the basis atomically with settlement so terminal-event repair can retain
+it after a crash. Usage continues to count only actual provider requests.
+
+Failed, denied, blocked and malformed calls do not trigger completion. Rounds
+with sibling calls follow the ordinary model loop and preserve every sibling.
+Tool exposure, capabilities, approval, secret projection and hooks retain their
+normal owners. This policy grants no permission to execute a tool.
+An accepted `stop_after_current_tool_round` request is honored before final-tool
+completion, including after approval resolution or crash recovery.
+
+The policy is recorded in model-step recovery semantics. Recovery authenticates
+that configuration against the admitted execution profile, reconciles the normal
+round publication from its successful terminal, and completes without executing
+the tool or dispatching another provider request. Recovery requires current
+execution permission before claiming an epoch or running lifecycle hooks.
+Pending approvals/continuations
+retain the configuration. Exact result-only recovery leaves queued successors
+for a separately authorized invocation. Fresh run/resume requests supply their
+configuration explicitly; changing it uses existing profile adoption rules.
+HTTP run/resume accepts `tool_completion: {"tool_names": [...]}` with the same
+semantics. Combining it with `structured_output` is rejected before dispatch.
+
+Use it alongside `RequireFinalTool` when both premature model stops and unused
+post-tool replies must be avoided. See `cayu guide order-support` for an example.
 
 ## Structured Output
 

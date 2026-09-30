@@ -48,7 +48,10 @@ async def inherit_resume_configuration(
         ExecutionProfileComponentClass.FINALIZATION,
         ExecutionProfileIdentityStrength.STRUCTURAL,
         model_finalization_material(
-            max_steps=context.max_steps, limits=context.limits, retry_policy=context.retry_policy
+            max_steps=context.max_steps,
+            limits=context.limits,
+            retry_policy=context.retry_policy,
+            tool_completion=context.tool_completion,
         ),
     )
     if any(
@@ -62,6 +65,15 @@ async def inherit_resume_configuration(
         for name in ("max_steps", "limits", "retry_policy")
         if name not in fields
     }
+    pending_continuation = any(
+        checkpoint is not None and checkpoint.get(key) is not None
+        for key in ("pending_tool_round", "pending_tool_approval", "pending_user_input")
+    )
+    if pending_continuation:
+        if "tool_completion" not in fields:
+            updates["tool_completion"] = context.tool_completion
+        elif request.tool_completion != context.tool_completion:
+            raise ValueError("tool_completion cannot change during a pending continuation.")
     resolved = request.model_copy(update=updates)
     # Do not turn inherited values into caller-supplied overrides.
     object.__setattr__(resolved, "__pydantic_fields_set__", set(fields))

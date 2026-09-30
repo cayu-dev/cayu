@@ -15,6 +15,7 @@ from cayu.budgets.usage import (
     session_usage_summary,
 )
 from cayu.events import Event, EventType
+from cayu.runtime.tool_completion import ToolCompletionResult
 from cayu.tools.grants import TARGETED_TOOL_GRANT_MAX_REQUESTS
 
 
@@ -95,6 +96,10 @@ class InteractionSummaryEvidence(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    tool_completion: ToolCompletionResult | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     status: InteractionStatus
     start_event_id: str
     start_event_sequence: StrictInt | None = Field(default=None, ge=1)
@@ -164,6 +169,8 @@ class InteractionSummaryEvidence(BaseModel):
 
     @model_validator(mode="after")
     def validate_ranges_and_terminal_time(self) -> InteractionSummaryEvidence:
+        if self.tool_completion is not None and self.status is not InteractionStatus.COMPLETED:
+            raise ValueError("Tool completion requires a completed interaction.")
         if (self.targeted_tool_grant_count is None) != (
             self.targeted_tool_grant_batch_fingerprint is None
         ):

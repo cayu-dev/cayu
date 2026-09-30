@@ -1099,6 +1099,16 @@
           "title": "Tool Call Count",
           "type": "integer"
         },
+        "tool_completion": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ToolCompletionResult"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "updated_at": {
           "format": "date-time",
           "title": "Updated At",
@@ -8603,6 +8613,16 @@
               "type": "null"
             }
           ]
+        },
+        "tool_completion": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ToolCompletionPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -8802,6 +8822,16 @@
           "anyOf": [
             {
               "$ref": "#/components/schemas/ThinkingConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tool_completion": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ToolCompletionPolicy"
             },
             {
               "type": "null"
@@ -12098,6 +12128,60 @@
       "title": "ToolCallPart",
       "type": "object"
     },
+    "ToolCompletionPolicy": {
+      "additionalProperties": false,
+      "description": "Complete a single-call round from a designated successful tool.\n\nThe host renders the tool result. Eligible application tools declare\n``NONE`` or ``IDEMPOTENT`` effects. Rounds with sibling calls continue\nthrough the ordinary model loop. Supply this policy on each new run or\nresumed turn; approval and crash recovery retain the admitted policy.",
+      "properties": {
+        "tool_names": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Tool Names",
+          "type": "array"
+        }
+      },
+      "required": [
+        "tool_names"
+      ],
+      "title": "ToolCompletionPolicy",
+      "type": "object"
+    },
+    "ToolCompletionResult": {
+      "additionalProperties": false,
+      "description": "Detached host-rendering basis from the canonical published tool outcome.",
+      "properties": {
+        "call": {
+          "$ref": "#/components/schemas/ToolCallPart"
+        },
+        "effect": {
+          "$ref": "#/components/schemas/ToolEffect"
+        },
+        "reason": {
+          "const": "host_rendered_tool",
+          "default": "host_rendered_tool",
+          "title": "Reason",
+          "type": "string"
+        },
+        "result": {
+          "$ref": "#/components/schemas/ToolResultPart"
+        },
+        "status": {
+          "const": "completed",
+          "default": "completed",
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "call",
+        "effect",
+        "result"
+      ],
+      "title": "ToolCompletionResult",
+      "type": "object"
+    },
     "ToolDiscoveryGrantInspection": {
       "additionalProperties": false,
       "description": "Content-minimized discovery grant state safe for control-plane reads.",
@@ -12217,6 +12301,16 @@
       ],
       "title": "ToolDiscoveryViewInspection",
       "type": "object"
+    },
+    "ToolEffect": {
+      "description": "Declared side-effect semantics for a tool execution.\n\nClassify what replay can do to externally meaningful durable state. ``NONE``\ndoes not mutate it, ``IDEMPOTENT`` may mutate it but a stable downstream\nidentity or equivalent contract collapses replay, and ``EXTERNAL`` has a\nnon-idempotent or outcome-ambiguous durable mutation. Transport, billing,\nobservability, and names such as \"read\" do not determine the value.\n\nThe runtime uses this as execution metadata, not as an authorization\ndecision: policy still decides whether a call may run. Run\n``cayu guide tool-effects`` for the canonical decision table.",
+      "enum": [
+        "none",
+        "idempotent",
+        "external"
+      ],
+      "title": "ToolEffect",
+      "type": "string"
     },
     "ToolResultPart": {
       "additionalProperties": false,

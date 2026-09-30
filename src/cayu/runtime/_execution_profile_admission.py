@@ -45,6 +45,7 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.stop_policy import RunLimits
+from cayu.runtime.tool_completion import ToolCompletionPolicy, copy_tool_completion_policy
 from cayu.sessions._model_failover import (
     ModelFailoverCandidate,
     ModelFailoverPlan,
@@ -140,6 +141,7 @@ def model_finalization_material(
     max_steps: int,
     limits: RunLimits,
     retry_policy: RetryPolicy,
+    tool_completion: ToolCompletionPolicy | None = None,
 ) -> dict[str, Any]:
     """Return the versioned structural identity for model-loop finalization."""
 
@@ -149,12 +151,17 @@ def model_finalization_material(
         raise TypeError("limits must be a RunLimits instance.")
     if type(retry_policy) is not RetryPolicy:
         raise TypeError("retry_policy must be a RetryPolicy instance.")
-    return {
+    material = {
         "kind": _MODEL_FINALIZATION_MATERIAL_KIND,
         "max_steps": max_steps,
         "limits": limits.model_dump(mode="json"),
         "retry_policy": retry_policy.model_dump(mode="json"),
     }
+
+    policy = copy_tool_completion_policy(tool_completion)
+    if policy is not None:
+        material["tool_completion"] = policy.model_dump(mode="json")
+    return material
 
 
 class ProcessLocalBehaviorIdentityRegistry:

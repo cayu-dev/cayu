@@ -381,6 +381,7 @@ from cayu.runtime.session_message_lifecycle import (
     session_message_rejection,
 )
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
+from cayu.runtime.tool_completion import ToolCompletionPolicy, copy_tool_completion_policy
 from cayu.sessions._model_failover import (
     MODEL_FAILOVER_CHECKPOINT_KEY,
     ModelFailoverProgress,
@@ -1812,6 +1813,11 @@ class RunRequest(BaseModel):
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
     thinking: ThinkingConfig | None = None
+    tool_completion: ToolCompletionPolicy | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="Complete a single-call round from a designated successful none or idempotent tool.",
+    )
     loop_policies: SkipJsonSchema[tuple[LoopPolicy, ...]] = Field(
         default_factory=tuple,
         exclude=True,
@@ -1910,6 +1916,11 @@ class RunRequest(BaseModel):
     @classmethod
     def copy_limits(cls, value: RunLimits) -> RunLimits:
         return copy_run_limits(value)
+
+    @field_validator("tool_completion", mode="before")
+    @classmethod
+    def copy_tool_completion(cls, value: object) -> ToolCompletionPolicy | None:
+        return copy_tool_completion_policy(value)
 
     @field_validator("loop_policies", mode="before")
     @classmethod
@@ -2089,6 +2100,11 @@ class ResumeRequest(BaseModel):
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
     thinking: ThinkingConfig | None = None
+    tool_completion: ToolCompletionPolicy | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="Complete a single-call round from a designated successful none or idempotent tool.",
+    )
     loop_policies: SkipJsonSchema[tuple[LoopPolicy, ...]] = Field(
         default_factory=tuple,
         exclude=True,
@@ -2172,6 +2188,11 @@ class ResumeRequest(BaseModel):
     @classmethod
     def copy_limits(cls, value: RunLimits) -> RunLimits:
         return copy_run_limits(value)
+
+    @field_validator("tool_completion", mode="before")
+    @classmethod
+    def copy_tool_completion(cls, value: object) -> ToolCompletionPolicy | None:
+        return copy_tool_completion_policy(value)
 
     @field_validator("loop_policies", mode="before")
     @classmethod
@@ -26714,6 +26735,8 @@ def _outcome_reason_and_details(
 
     payload = event.payload
     if event.type == EventType.SESSION_COMPLETED:
+        if payload.get("reason") == "host_rendered_tool":
+            return "host_rendered_tool", _copy_payload_fields(payload, ("tool_completion",))
         return "completed", {}
     if event.type == EventType.SESSION_FAILED:
         return "failed", _copy_payload_fields(payload, ("error", "error_type"))
@@ -26872,6 +26895,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         budget_limits=copy_request_budget_limits(request.budget_limits),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
         structured_output=copy_structured_output_spec(request.structured_output),
+        tool_completion=copy_tool_completion_policy(request.tool_completion),
         loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
     )
     copied = copied.model_copy(
@@ -26891,7 +26915,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         }
     )
     copied_fields_set = set(copied.model_fields_set)
-    for field_name in ("max_steps", "limits", "thinking"):
+    for field_name in ("max_steps", "limits", "thinking", "tool_completion"):
         if field_name not in request.model_fields_set:
             copied_fields_set.discard(field_name)
     object.__setattr__(copied, "__pydantic_fields_set__", copied_fields_set)
@@ -28252,6 +28276,7 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
         budget_limits=copy_request_budget_limits(request.budget_limits),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
         structured_output=copy_structured_output_spec(request.structured_output),
+        tool_completion=copy_tool_completion_policy(request.tool_completion),
         loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
     )
     copied = copied.model_copy(
@@ -28271,7 +28296,7 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
         }
     )
     copied_fields_set = set(copied.model_fields_set)
-    for field_name in ("max_steps", "limits", "thinking", "retry_policy"):
+    for field_name in ("max_steps", "limits", "thinking", "retry_policy", "tool_completion"):
         if field_name not in request.model_fields_set:
             copied_fields_set.discard(field_name)
     object.__setattr__(copied, "__pydantic_fields_set__", copied_fields_set)

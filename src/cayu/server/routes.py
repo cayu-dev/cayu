@@ -311,6 +311,7 @@ from cayu.runtime.session_message_lifecycle import (
     SessionMessageSource,
 )
 from cayu.runtime.stop_policy import RunLimits
+from cayu.runtime.tool_completion import ToolCompletionPolicy
 from cayu.server._browser_client import (
     BROWSER_CLIENT_MODULE,
     BROWSER_CLIENT_TYPES,
@@ -2005,6 +2006,7 @@ class RunBody(_BoundedControlPlanePromptBody):
     limits: RunLimits = Field(default_factory=RunLimits)
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
+    tool_completion: ToolCompletionPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
     thinking: ThinkingConfig | None = None
 
@@ -2047,6 +2049,7 @@ class ResumeBody(_BoundedControlPlanePromptBody):
     limits: RunLimits = Field(default_factory=RunLimits)
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
+    tool_completion: ToolCompletionPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
     thinking: ThinkingConfig | None = None
 
@@ -9125,6 +9128,7 @@ def create_router(
             budget_limits=body.budget_limits,
             retry_policy=body.retry_policy,
             structured_output=body.structured_output,
+            tool_completion=body.tool_completion,
             metadata=trace_metadata,
         )
         run_default_overrides: dict[str, object] = {}
@@ -9247,6 +9251,8 @@ def create_router(
             run_default_overrides["thinking"] = body.thinking
         if "retry_policy" in body.model_fields_set:
             run_default_overrides["retry_policy"] = body.retry_policy
+        if "tool_completion" in body.model_fields_set:
+            run_default_overrides["tool_completion"] = body.tool_completion
         if run_default_overrides:
             request = request.model_copy(update=run_default_overrides)
         request = _with_runtime_resume_transport_metadata(request, trace_metadata)

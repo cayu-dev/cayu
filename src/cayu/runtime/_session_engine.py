@@ -502,6 +502,11 @@ from cayu.runtime._terminal_evidence import (
     interruption_request_id_from_payload,
     require_interruption_event_matches_pending_marker,
 )
+from cayu.runtime._tool_completion import (
+    load_recorded_tool_completion_policy,
+    recorded_tool_completion_result,
+    require_registered_completion_tools,
+)
 from cayu.runtime._tool_effect_state import (
     ToolEffectReconciliationCleanupFailure,
     ToolEffectReconciliationRequired,
@@ -617,6 +622,11 @@ from cayu.runtime.stop_policy import (
     StopLimit,
     copy_run_limits,
     has_run_limits,
+)
+from cayu.runtime.tool_completion import (
+    ToolCompletionPolicy,
+    ToolCompletionResult,
+    copy_tool_completion_policy,
 )
 from cayu.runtime.work_attempt_semantics import WorkAttemptRunSemantics
 from cayu.runtime.work_attempt_source import WorkAttemptSourceRequest, work_attempt_source_digest
@@ -3422,9 +3432,18 @@ def _execution_profile_identity(
     limits: RunLimits | None = None,
     retry_policy: RetryPolicy | None = None,
     finalization_material: dict[str, Any] | None = None,
+    tool_completion: ToolCompletionPolicy | None = None,
     tool_capability_ceiling: ToolCapabilityCeiling | None = None,
     runtime_identity: SessionRuntimeIdentity | None = None,
 ) -> ExecutionProfileIdentity:
+    tool_completion = copy_tool_completion_policy(tool_completion)
+    require_registered_completion_tools(tool_completion, registered_agent)
+    if tool_completion is not None and structured_output is not None:
+        raise ValueError("tool_completion and structured_output cannot be combined.")
+    if tool_completion is not None:
+        material = tool_completion.model_dump(mode="json")
+        if redactor.redact_json(material) != material:
+            raise ValueError("tool_completion names must be free of workload secrets.")
     if finalization_material is None and max_steps is None:
         raise ValueError("Execution profile requires resolved invocation max_steps.")
     runtime_identity = (
@@ -3497,6 +3516,7 @@ def _execution_profile_identity(
                 max_steps=cast("int", max_steps),
                 limits=copy_run_limits(limits),
                 retry_policy=copy_retry_policy(retry_policy),
+                tool_completion=tool_completion,
             )
             if finalization_material is None
             else copy_json_value(finalization_material, "finalization_material")
@@ -5308,6 +5328,8 @@ class SessionEngine:
         # when failover is present in the request's explicit fields_set.
         if request.failover is None:
             document["failover"] = None
+        if request.tool_completion is None and "tool_completion" in request.model_fields_set:
+            document["tool_completion"] = None
         if type(request) is RunRequest:
             # An unbounded deadline must not become an inherited replacement
             # deadline merely because the ordinary serializer omits it.
@@ -5661,6 +5683,7 @@ class SessionEngine:
         require_open_interaction: bool = True,
         additional_profile_fingerprints: tuple[str, ...] = (),
         record_rejection: bool = True,
+        tool_completion: ToolCompletionPolicy | None = None,
     ) -> ActiveInvocationExecutionProfile:
         """Validate without exporting process-local candidate collaborators."""
 
@@ -5677,6 +5700,7 @@ class SessionEngine:
             max_steps=max_steps,
             limits=limits,
             retry_policy=retry_policy,
+            tool_completion=tool_completion,
             invocation_semantics_available=invocation_semantics_available,
             frozen_candidate_profile=frozen_candidate_profile,
             require_open_interaction=require_open_interaction,
@@ -5706,6 +5730,7 @@ class SessionEngine:
         require_open_interaction: bool = True,
         additional_profile_fingerprints: tuple[str, ...] = (),
         record_rejection: bool = True,
+        tool_completion: ToolCompletionPolicy | None = None,
     ) -> execution_profile_admission.ExecutionProfileContinuationPlan:
         """Resolve a recovery continuation against its durable invocation profile."""
 
@@ -5754,6 +5779,24 @@ class SessionEngine:
                 limits=request_budget_limits,
                 agent_name=registered_agent.spec.name,
                 causal_budget_id=session.causal_budget_id,
+            )
+        tool_completion = copy_tool_completion_policy(tool_completion)
+        require_registered_completion_tools(tool_completion, registered_agent)
+        recorded_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        if (
+            invocation_semantics_available
+            and recorded_profile is not None
+            and tool_completion is None
+        ):
+            tool_completion = await load_recorded_tool_completion_policy(
+                self.session_store,
+                session,
+                checkpoint,
+                execution_profile=recorded_profile.profile,
+                max_steps=cast("int", max_steps),
+                limits=copy_run_limits(limits),
+                retry_policy=copy_retry_policy(retry_policy),
+                context=model_completion_context,
             )
         plan = execution_profile_admission.prepare_execution_profile_continuation(
             session=session,
@@ -5807,6 +5850,7 @@ class SessionEngine:
                     max_steps=cast("int", max_steps),
                     limits=copy_run_limits(limits),
                     retry_policy=copy_retry_policy(retry_policy),
+                    tool_completion=tool_completion,
                 )
                 if invocation_semantics_available
                 else None
@@ -8070,6 +8114,7 @@ class SessionEngine:
         observed_at: datetime | None = None,
         event_id: str | None = None,
         settlement_status: SessionStatus | None = None,
+        tool_completion_result: ToolCompletionResult | None = None,
     ) -> Event | None:
         interaction_id = _current_session_interaction_id(session.id)
         if interaction_id is None:
@@ -8208,6 +8253,7 @@ class SessionEngine:
         try:
             evidence = InteractionSummaryEvidence(
                 status=status,
+                tool_completion=tool_completion_result,
                 start_event_id=start_record.event.id,
                 start_event_sequence=start_record.sequence,
                 source_transcript_start=source_start,
@@ -8821,6 +8867,7 @@ class SessionEngine:
         checkpoint_mutation: dict[str, Any] | None = None,
         terminal_event: Event | None = None,
         terminal_decision: InvocationTerminalDecision | None = None,
+        tool_completion_result: ToolCompletionResult | None = None,
     ) -> tuple[Session, Event | None, bool]:
         if invocation_context is not None:
             if type(invocation_context) is not InvocationContext or not isinstance(
@@ -9086,6 +9133,7 @@ class SessionEngine:
             event_type=event_type,
             status=interaction_status,
             settlement_status=to_status,
+            tool_completion_result=tool_completion_result,
             pending_action_kind=pending_action_kind,
             recovered_active_through=recovered_active_through,
             observed_at=observed_at,
@@ -10306,6 +10354,7 @@ class SessionEngine:
             limits=request.limits,
             retry_policy=self._effective_retry_policy(request.retry_policy),
             tool_capability_ceiling=effective_tool_capability_ceiling,
+            tool_completion=request.tool_completion,
         )
         model_failover = None
         if request.failover is None:
@@ -12065,6 +12114,7 @@ class SessionEngine:
             budget_limits=semantics.budget_limits,
             retry_policy=semantics.retry_policy,
             structured_output=semantics.structured_output,
+            tool_completion=semantics.tool_completion,
             thinking=semantics.thinking,
             request_metadata=semantics.request_metadata,
             task_id=elected.task_id,
@@ -12206,6 +12256,7 @@ class SessionEngine:
             budget_policy=budget_policy,
             request_budget_limits=semantics.budget_limits,
             structured_output=semantics.structured_output,
+            tool_completion=semantics.tool_completion,
             thinking=semantics.thinking,
             max_steps=semantics.max_steps,
             limits=semantics.limits,
@@ -12285,6 +12336,7 @@ class SessionEngine:
                 retry_policy=self._effective_retry_policy(prepared_request.retry_policy),
                 failover=prepared_request.failover,
                 structured_output=prepared_request.structured_output,
+                tool_completion=prepared_request.tool_completion,
                 thinking=(
                     prepared_request.thinking
                     if prepared_request.thinking is not None
@@ -14045,6 +14097,7 @@ class SessionEngine:
                     ),
                 },
                 start_task_on_enter=not pre_run_task_started,
+                tool_completion=request.tool_completion,
             )
         except BaseException as exc:
             try:
@@ -17619,6 +17672,7 @@ class SessionEngine:
         environment_name: str | None,
         execution_profile: ExecutionProfileIdentity | None,
         task_id: str | None,
+        tool_completion_result: ToolCompletionResult | None = None,
     ) -> tuple[Session, Event | None, bool, dict[str, Any] | None]:
         completion_marker: dict[str, Any] | None = None
         checkpoint_mutation: dict[str, Any] | None = None
@@ -17659,6 +17713,7 @@ class SessionEngine:
                 only_if_no_queued_messages=True,
                 from_statuses={SessionStatus.RUNNING},
                 checkpoint_mutation=checkpoint_mutation,
+                tool_completion_result=tool_completion_result,
             )
             return transitioned, event, completed, completion_marker if completed else None
         except (SessionRunFenced, SessionStatusConflict):
@@ -20607,6 +20662,7 @@ class SessionEngine:
                 retry_policy=self._effective_retry_policy(request.retry_policy),
                 tool_capability_ceiling=effective_tool_capability_ceiling,
                 runtime_identity=runtime_identity,
+                tool_completion=request.tool_completion,
             )
             return execution_profile_with_component(
                 candidate,
@@ -20986,6 +21042,7 @@ class SessionEngine:
                 registered_agent=registered_agent,
                 registered_provider=registered_provider,
                 request_failover=request.failover,
+                tool_completion=request.tool_completion,
                 request_loop_policies=request.loop_policies,
                 budget_policy=budget_policy,
                 request_budget_limits=request.budget_limits,
@@ -21163,6 +21220,7 @@ class SessionEngine:
                         limits=request.limits,
                         retry_policy=self._effective_retry_policy(request.retry_policy),
                         tool_capability_ceiling=stored_tool_capability_ceiling,
+                        tool_completion=request.tool_completion,
                     )
                     source_registration_profile = execution_profile_with_component(
                         source_registration_profile,
@@ -21313,6 +21371,7 @@ class SessionEngine:
                 registered_agent=registered_agent,
                 registered_provider=registered_provider,
                 request_failover=request.failover,
+                tool_completion=request.tool_completion,
                 request_loop_policies=request.loop_policies,
                 budget_policy=budget_policy,
                 request_budget_limits=request.budget_limits,
@@ -22222,6 +22281,7 @@ class SessionEngine:
             previous_tool_exposure_profile_id=previous_tool_exposure_profile_id,
             egress_environment_handoff=egress_environment_handoff,
             parked_egress_factory_result=parked_egress_factory_result,
+            tool_completion=request.tool_completion,
         )
         authoritative_failure: BaseExceptionGroup | None = None
         try:
@@ -22675,6 +22735,9 @@ class SessionEngine:
                 ),
                 tool_capability_ceiling=initial_tool_capability_ceiling,
                 runtime_identity=current_child_runtime_identity,
+                tool_completion=None
+                if initial_invocation is None
+                else initial_invocation.tool_completion,
             )
             if (
                 prompt_workflow.rendered_child_prompt is None
@@ -24091,6 +24154,7 @@ class SessionEngine:
             budget_limits=request.budget_limits,
             retry_policy=request.retry_policy,
             structured_output=request.structured_output,
+            tool_completion=request.tool_completion,
             thinking=request.thinking,
             request_metadata=request.request_metadata,
             task_id=request.task_id,
@@ -24111,6 +24175,7 @@ class SessionEngine:
                 request.preserve_failure_until_initial_provider_dispatch
             ),
             producer_replay=request.producer_replay,
+            tool_completion_replay=request.tool_completion_replay,
         )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:
@@ -24135,6 +24200,7 @@ class SessionEngine:
         task_handoff_id: str | None,
         start_event_type: EventType | None,
         start_event_payload: dict[str, Any],
+        tool_completion: ToolCompletionPolicy | None = None,
         start_task_on_enter: bool = True,
         release_run_fence_on_exit: bool = True,
         deliver_queued_input_before_first_step: bool = True,
@@ -24148,9 +24214,19 @@ class SessionEngine:
         messages_deferred: bool = False,
         participant_context: CollaborationAccessContext | None = None,
         producer_replay: _ProducerCompletionReplay | None = None,
+        tool_completion_replay: ToolCompletionResult | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(invocation_context) is not InvocationContext:
             raise TypeError("invocation_context must be an authenticated InvocationContext.")
+        if tool_completion is None:
+            tool_completion = await load_recorded_tool_completion_policy(
+                self.session_store,
+                session,
+                execution_profile=invocation_context.profile,
+                max_steps=max_steps,
+                limits=limits,
+                retry_policy=retry_policy,
+            )
         registered_agent = invocation_context.registered_agent
         registered_provider = invocation_context.registered_provider
         model_failover = None
@@ -24237,6 +24313,8 @@ class SessionEngine:
                 preserve_failure_until_initial_provider_dispatch
             ),
             producer_replay=producer_replay,
+            tool_completion_replay=tool_completion_replay,
+            tool_completion=tool_completion,
         )
         for grant_event in targeted_tool_grant_events:
             yield grant_event
@@ -24348,6 +24426,7 @@ class SessionEngine:
         task_handoff_id: str | None,
         start_event_type: EventType | None,
         start_event_payload: dict[str, Any],
+        tool_completion: ToolCompletionPolicy | None = None,
         start_task_on_enter: bool = True,
         release_run_fence_on_exit: bool = True,
         messages_already_persisted: bool = False,
@@ -24369,6 +24448,7 @@ class SessionEngine:
         participant_context: CollaborationAccessContext | None = None,
         execution_to_wait: _ExecutionToWait | None = None,
         producer_replay: _ProducerCompletionReplay | None = None,
+        tool_completion_replay: ToolCompletionResult | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(invocation_context) is not InvocationContext:
             raise TypeError("invocation_context must be an authenticated InvocationContext.")
@@ -24610,10 +24690,19 @@ class SessionEngine:
         )
         task_start_attempted = task_started
         task_finished = False
+        tool_completion_result: ToolCompletionResult | None = None
         completion_finalization_marker: dict[str, Any] | None = None
         current_task = asyncio.current_task()
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None
         run_started_at = time.monotonic()
+
+        def completion_payload() -> dict[str, Any]:
+            if tool_completion_result is None:
+                return {}
+            return {
+                "reason": tool_completion_result.reason,
+                "tool_completion": tool_completion_result.model_dump(mode="json"),
+            }
 
         async def complete_session(
             completed_session: Session,
@@ -24647,6 +24736,7 @@ class SessionEngine:
                 completion_event = await self._bind_event_to_session_run_operation(
                     Event(
                         type=EventType.SESSION_COMPLETED,
+                        payload=completion_payload(),
                         session_id=session.id,
                         agent_name=registered_agent.spec.name,
                         environment_name=environment_name,
@@ -24820,6 +24910,7 @@ class SessionEngine:
                     if prefinalized_completion is not None
                     else Event(
                         type=EventType.SESSION_COMPLETED,
+                        payload=completion_payload(),
                         session_id=session.id,
                         agent_name=registered_agent.spec.name,
                         environment_name=environment_name,
@@ -25404,12 +25495,32 @@ class SessionEngine:
                     session.id,
                     messages_to_append,
                 )
+            tool_completion_result = (
+                await recorded_tool_completion_result(
+                    self.session_store,
+                    session,
+                    policy=tool_completion,
+                    execution_profile=execution_profile,
+                    registered_agent=registered_agent,
+                )
+                if not messages_to_append
+                else None
+            )
+            if (
+                tool_completion_replay is not None
+                and tool_completion_result != tool_completion_replay
+            ):
+                raise RuntimeError("Final-tool recovery lost its exact durable completion basis.")
             skip_model_steps = False
             if (
-                recovered_structured_outcome is not None
-                and recovered_structured_outcome.type == EventType.STRUCTURED_OUTPUT_VALIDATED
-                and not messages_to_append
-            ):
+                (
+                    recovered_structured_outcome is not None
+                    and recovered_structured_outcome.type == EventType.STRUCTURED_OUTPUT_VALIDATED
+                )
+                or tool_completion_result is not None
+            ) and not messages_to_append:
+                if tool_completion_result is not None:
+                    await self._stop_at_requested_tool_round_boundary(session)
                 (
                     session,
                     interaction_completed_event,
@@ -25423,13 +25534,18 @@ class SessionEngine:
                     environment_name=environment_name,
                     execution_profile=execution_profile,
                     task_id=task_id,
+                    tool_completion_result=tool_completion_result,
                 )
                 if interaction_completed_event is not None:
                     yield interaction_completed_event
                 if not session_completed:
-                    if producer_replay is not None:
+                    if producer_replay is not None or tool_completion_replay is not None:
                         raise SessionInterruptedByRequest(session.id)
-                    recovered_step = recovered_structured_outcome.payload.get("step")
+                    recovered_step = (
+                        recovered_structured_outcome.payload.get("step")
+                        if recovered_structured_outcome is not None
+                        else completed_tool_round_model_step or 1
+                    )
                     if type(recovered_step) is not int:
                         raise RuntimeError(
                             "Recovered structured-output result has no valid model step."
@@ -25468,6 +25584,14 @@ class SessionEngine:
                     rebound_invocation_context = queued_completion.invocation_context
                     if rebound_invocation_context is None:
                         raise RuntimeError("Queued handoff lost live invocation authority.")
+                    if rebound_invocation_context is not invocation_context:
+                        if rebound_invocation_context.profile.component(
+                            ExecutionProfileComponentClass.FINALIZATION
+                        ) != invocation_context.profile.component(
+                            ExecutionProfileComponentClass.FINALIZATION
+                        ):
+                            tool_completion = None
+                        tool_completion_result = None
                     invocation_context = rebound_invocation_context
                     for event in queued_completion.events:
                         yield event
@@ -25558,7 +25682,7 @@ class SessionEngine:
                     )
                     for reservation in reservations
                 )
-                if not background_provider_operation:
+                if not background_provider_operation and tool_completion is None:
                     return ModelCompletionRecoveryContext(
                         interaction_id=interaction_id,
                         execution_profile_fingerprint=execution_profile_fingerprint,
@@ -25566,6 +25690,7 @@ class SessionEngine:
                         max_steps=max_steps,
                         limits=limits,
                         retry_policy=retry_policy,
+                        tool_completion=tool_completion,
                     )
                 context = ModelCompletionRecoveryContext(
                     interaction_id=interaction_id,
@@ -25589,6 +25714,7 @@ class SessionEngine:
                         else None
                     ),
                     billing_identity=billing_identity,
+                    tool_completion=tool_completion,
                 )
                 payload = context.model_dump(mode="json")
                 if self._secret_redactor.redact_json(payload) != payload:
@@ -25673,6 +25799,7 @@ class SessionEngine:
                     tool_capability_ceiling=_session_tool_capability_ceiling(
                         session,
                     ),
+                    tool_completion=tool_completion,
                 )
                 return execution_profile_with_component(
                     candidate,
@@ -25771,7 +25898,19 @@ class SessionEngine:
             def install_queued_invocation_context(
                 rebound: InvocationContext | None,
             ) -> None:
-                nonlocal invocation_context
+                nonlocal invocation_context, tool_completion_result, tool_completion
+                tool_completion_result = None
+                if (
+                    rebound is not None
+                    and rebound is not invocation_context
+                    and (
+                        rebound.profile.component(ExecutionProfileComponentClass.FINALIZATION)
+                        != invocation_context.profile.component(
+                            ExecutionProfileComponentClass.FINALIZATION
+                        )
+                    )
+                ):
+                    tool_completion = None
                 if rebound is None:
                     raise RuntimeError("Queued handoff lost live invocation authority.")
                 if rebound is invocation_context:
@@ -25811,7 +25950,9 @@ class SessionEngine:
                 if recovered_assistant_step is not None
                 else initial_model_step_number or 1
             )
-            await self._stop_at_requested_tool_round_boundary(session)
+            # Retained final-tool completion checked steering before its settlement.
+            if tool_completion_result is None:
+                await self._stop_at_requested_tool_round_boundary(session)
             model_steps = () if skip_model_steps else range(first_model_step, max_steps + 1)
             # A resumed round can have consumed the final allowed step already.
             # The empty-loop limit path must report that consumed step, not an
@@ -26182,6 +26323,7 @@ class SessionEngine:
                             environment_name=environment_name,
                             execution_profile=execution_profile,
                             task_id=task_id,
+                            tool_completion_result=None,
                         )
                         if interaction_completed_event is not None:
                             yield interaction_completed_event
@@ -26305,6 +26447,7 @@ class SessionEngine:
                                     environment_name=environment_name,
                                     execution_profile=execution_profile,
                                     task_id=task_id,
+                                    tool_completion_result=None,
                                 )
                                 if interaction_completed_event is not None:
                                     yield interaction_completed_event
@@ -26574,6 +26717,7 @@ class SessionEngine:
                         environment_name=environment_name,
                         execution_profile=execution_profile,
                         task_id=task_id,
+                        tool_completion_result=None,
                     )
                     if interaction_completed_event is not None:
                         yield interaction_completed_event
@@ -26655,7 +26799,77 @@ class SessionEngine:
                     )
                 if tool_round_runner.stopped_for_limit:
                     return
+                tool_completion_result = await recorded_tool_completion_result(
+                    self.session_store,
+                    session,
+                    policy=tool_completion,
+                    execution_profile=execution_profile,
+                    registered_agent=registered_agent,
+                )
                 await self._stop_at_requested_tool_round_boundary(session)
+                if tool_completion_result is not None:
+                    (
+                        session,
+                        interaction_completed_event,
+                        session_completed,
+                        completion_finalization_marker,
+                    ) = await self._complete_session_if_no_queued_messages(
+                        session=session,
+                        invocation_context=invocation_context,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=environment_name,
+                        execution_profile=execution_profile,
+                        task_id=task_id,
+                        tool_completion_result=tool_completion_result,
+                    )
+                    if interaction_completed_event is not None:
+                        yield interaction_completed_event
+                    if not session_completed:
+                        if producer_replay is not None:
+                            # A retained result may complete its own interaction,
+                            # but cannot consume a queue or admit its successor.
+                            raise SessionInterruptedByRequest(session.id)
+                        queued_completion = None
+                        async with contextlib.aclosing(
+                            self._handle_queued_messages_before_completion(
+                                participant_context=participant_context,
+                                finish_completion=complete_session,
+                                session=session,
+                                registered_agent=registered_agent,
+                                registered_environment=registered_environment,
+                                environment_name=environment_name,
+                                messages=messages,
+                                step=step,
+                                max_steps=max_steps,
+                                run_started_at=run_started_at,
+                                turn_usage_tracker=turn_usage_tracker,
+                                active_run=active_run,
+                                execution_profile=execution_profile,
+                                invocation_context=invocation_context,
+                                predecessor_settlement_event=interaction_completed_event,
+                                task_id=task_id,
+                            )
+                        ) as queued_stream:
+                            async for queued_item in queued_stream:
+                                if isinstance(queued_item, Event):
+                                    yield queued_item
+                                else:
+                                    queued_completion = queued_item
+                        assert queued_completion is not None
+                        session = queued_completion.session
+                        completion_finalization_marker = (
+                            queued_completion.completion_finalization_marker
+                        )
+                        install_queued_invocation_context(queued_completion.invocation_context)
+                        for event in queued_completion.events:
+                            yield event
+                        if queued_completion.outcome == "stopped":
+                            return
+                        if queued_completion.outcome == "complete":
+                            return
+                        continue
+                    break
             else:
                 if not skip_model_steps:
                     async for event in self._stop_session_for_model_step_limit(

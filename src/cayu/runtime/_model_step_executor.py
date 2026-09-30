@@ -405,6 +405,7 @@ from cayu.runtime.retry_policy import (
     retry_event_payload,
 )
 from cayu.runtime.stop_policy import RunLimits
+from cayu.runtime.tool_completion import ToolCompletionPolicy
 from cayu.sessions._model_failover import (
     MODEL_FAILOVER_CHECKPOINT_KEY,
     ModelFailoverProgress,
@@ -598,6 +599,10 @@ class ModelCompletionRecoveryContext(BaseModel):
     hosted_tool_discovery: HostedToolDiscoveryRecoveryAuthority | None = None
     task_id: str | None = None
     request_metadata: dict[str, Any] = Field(default_factory=dict)
+    tool_completion: ToolCompletionPolicy | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     structured_output: StructuredOutputSpec | None = None
     thinking: ThinkingConfig | None = None
     # A missing field can be a persisted schema-v1 payload, so changing this
