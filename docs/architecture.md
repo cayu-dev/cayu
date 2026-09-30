@@ -275,6 +275,11 @@ Verified worker callbacks use the same owner to settle work and its heartbeat
 before returning. The coordinators retain durable authority, registration,
 lease renewal policy, result validation, and credential-safe diagnostics.
 
+Retained drains share one settlement record. The runner creates or adopts its
+exact cleanup task once, observes its returned failure once, and automatically
+clears only a successful matching drain. Failed cleanup stays available until
+its owner acknowledges it. Lease policies retain their capacity-release boundaries.
+
 Claim and publication heartbeats share a private renewal driver. It owns
 the renewal clock, exact renewal task, and first ownership-loss notification,
 retaining an in-flight renewal through timeout or cancellation settlement.

@@ -53,6 +53,15 @@ class LeasedAdapterInvocation(Generic[_T]):
     outcome: ShieldedTaskOutcome[CapturedAwaitableOutcome[_T]] = field(repr=False)
 
 
+@dataclass(slots=True)
+class LeasedAdapterSettlement(Generic[_T]):
+    """Retain one exact settlement and its observed domain failure."""
+
+    settlement_task: asyncio.Task[_T] | None = field(default=None, init=False, repr=False)
+    settlement_failure: BaseException | None = field(default=None, init=False, repr=False)
+    settlement_processed: bool = field(default=False, init=False)
+
+
 class LeasedAdapterRunner(Generic[_DrainT]):
     """Own local locks, admission slots, tasks, heartbeats and retained drains.
 
@@ -143,6 +152,74 @@ class LeasedAdapterRunner(Generic[_DrainT]):
         """An old callback or handle must never consume a successor's drain."""
         if self._drains.get(key) is expected:
             self._drains.pop(key, None)
+
+    def start_settlement(
+        self,
+        key: str,
+        drain: LeasedAdapterSettlement[_T],
+        operation: Callable[[], Coroutine[object, object, _T]],
+        *,
+        name: str,
+        failure_for: Callable[[_T], BaseException | None],
+    ) -> asyncio.Task[_T]:
+        """Start the settlement once, including when an observer beats its callback."""
+        if drain.settlement_task is None:
+            self.adopt_settlement(
+                key,
+                drain,
+                asyncio.create_task(operation(), name=name),
+                failure_for=failure_for,
+            )
+        assert drain.settlement_task is not None
+        return drain.settlement_task
+
+    def adopt_settlement(
+        self,
+        key: str,
+        drain: LeasedAdapterSettlement[_T],
+        task: asyncio.Task[_T],
+        *,
+        failure_for: Callable[[_T], BaseException | None],
+        on_settled: Callable[[], None] | None = None,
+    ) -> None:
+        """Own an existing task without restarting work or duplicating completion."""
+        if drain.settlement_task is not None:
+            if drain.settlement_task is not task:
+                raise RuntimeError("A drain already owns a different settlement task.")
+            return
+        drain.settlement_task = task
+
+        def settled(completed: asyncio.Task[_T]) -> None:
+            # A replaced drain still owns its original capacity reservation.
+            if on_settled is not None:
+                on_settled()
+            self.finalize_settlement(key, drain, completed, failure_for=failure_for)
+
+        task.add_done_callback(settled)
+
+    def finalize_settlement(
+        self,
+        key: str,
+        drain: LeasedAdapterSettlement[_T],
+        completed: asyncio.Task[_T],
+        *,
+        failure_for: Callable[[_T], BaseException | None],
+    ) -> bool:
+        """Observe a terminal result once; retain failure until explicit acknowledgement."""
+        if drain.settlement_task is not completed:
+            return False
+        if drain.settlement_processed:
+            return True
+        try:
+            result = completed.result()
+        except BaseException:
+            return False
+        failure = failure_for(result)
+        drain.settlement_failure = failure
+        drain.settlement_processed = True
+        if failure is None and self._drains.get(key) is drain:
+            self._drains.pop(key, None)
+        return True
 
     def start_heartbeat(
         self, operation: Coroutine[object, object, _T], *, name: str

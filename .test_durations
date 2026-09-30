@@ -41285,5 +41285,13 @@
     "tests/evals/test_workflow_profile_settlement.py::test_first_profile_inspection_obeys_remaining_close_budget[0.0]": 0.3195967079991533,
     "tests/evals/test_workflow_profile_settlement.py::test_first_profile_inspection_waits_for_settlement_and_preserves_cancellation[False]": 0.22853820899763377,
     "tests/evals/test_workflow_profile_settlement.py::test_first_profile_inspection_waits_for_settlement_and_preserves_cancellation[True]": 0.008978582995041506,
-    "tests/evals/test_workflow_profile_settlement.py::test_inspection_owned_timeout_is_not_a_settlement_deadline": 0.003638500998931704
+    "tests/evals/test_workflow_profile_settlement.py::test_inspection_owned_timeout_is_not_a_settlement_deadline": 0.003638500998931704,
+    "tests/core/test_leased_adapter_settlement.py::test_settlement_starts_once_and_retains_the_exact_task_until_completion": 0.004,
+    "tests/core/test_leased_adapter_settlement.py::test_completed_settlement_is_observed_once_even_before_its_callback[False]": 0.003,
+    "tests/core/test_leased_adapter_settlement.py::test_completed_settlement_is_observed_once_even_before_its_callback[True]": 0.002,
+    "tests/core/test_leased_adapter_settlement.py::test_superseded_settlement_releases_only_its_original_capacity[False]": 0.003,
+    "tests/core/test_leased_adapter_settlement.py::test_superseded_settlement_releases_only_its_original_capacity[True]": 0.001,
+    "tests/core/test_leased_adapter_settlement.py::test_unsuccessful_settlement_task_remains_owned[False]": 0.002,
+    "tests/core/test_leased_adapter_settlement.py::test_unsuccessful_settlement_task_remains_owned[True]": 0.005,
+    "tests/core/test_leased_adapter_settlement.py::test_adoption_and_observation_cannot_replace_the_owned_settlement_task": 0.002
 }

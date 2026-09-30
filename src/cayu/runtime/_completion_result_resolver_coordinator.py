@@ -37,7 +37,11 @@ from cayu.runtime._diagnostics import (
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._leased_adapter_heartbeat import run_leased_adapter_heartbeat
-from cayu.runtime._leased_adapter_runner import LeasedAdapterLease, LeasedAdapterRunner
+from cayu.runtime._leased_adapter_runner import (
+    LeasedAdapterLease,
+    LeasedAdapterRunner,
+    LeasedAdapterSettlement,
+)
 from cayu.runtime._task_store_operation_boundary import (
     capture_sensitive_validation,
     capture_task_store_operation,
@@ -244,7 +248,9 @@ class CompletionResultResolverCoordinator:
         self._secret_redactor = secret_redactor
         self._resolvers: dict[tuple[str, str, str], CompletionResultResolver] = {}
         self._group_resolution_settlements: dict[str, _GroupResolutionSettlement] = {}
-        self._adapter_runner = LeasedAdapterRunner[asyncio.Task[CapturedAwaitableOutcome[None]]]()
+        self._adapter_runner = LeasedAdapterRunner[
+            LeasedAdapterSettlement[CapturedAwaitableOutcome[None]]
+        ]()
 
     def _ensure_process_local_generation(self) -> None:
         self._adapter_runner.ensure_process_local(
@@ -1074,21 +1080,23 @@ class CompletionResultResolverCoordinator:
         if acknowledgement is not None and acknowledgement.callback_settled:
             await self.reconcile_group_settlement(acknowledgement.task_id, decision_id)
         settlement = self._adapter_runner.draining(decision_id)
-        if settlement is not None and not settlement.done():
+        if settlement is None:
+            return
+        task = settlement.settlement_task
+        assert task is not None
+        if not task.done():
             raise self._safe_execution_error(
                 "The prior exact completion result resolver execution is still draining."
             ) from None
-        if settlement is None:
-            return
         self._adapter_runner.acknowledge_drain(decision_id, settlement)
-        captured = settlement.result()
+        captured = task.result()
         if captured.error is not None:
             failure = captured.error
             if exception_tree_contains(failure, _PROCESS_CONTROL_SIGNALS):
                 safe_failure = self._detached_process_control_failure(failure)
             else:
                 safe_failure = self._detached_cleanup_failure(failure)
-            del captured, settlement, failure
+            del captured, settlement, task, failure
             raise safe_failure from None
 
     def _safe_execution_error(self, message: str) -> CompletionResultResolverExecutionError:
@@ -1286,17 +1294,7 @@ class CompletionResultResolverCoordinator:
             ),
             name="cayu-completion-result-resolver-settlement",
         )
-        self._adapter_runner.retain_drain(decision_id, settlement)
-        capacity_lease.transferred = True
-        settlement.add_done_callback(
-            lambda completed, key=decision_id, lease=capacity_lease: (
-                self._publication_settlement_completed(
-                    key,
-                    completed,
-                    capacity_lease=lease,
-                )
-            )
-        )
+        self._retain_publication_settlement(decision_id, settlement, capacity_lease=capacity_lease)
 
     def _retain_publication_settlement(
         self,
@@ -1305,16 +1303,15 @@ class CompletionResultResolverCoordinator:
         *,
         capacity_lease: _ResolutionCapacityLease,
     ) -> None:
-        self._adapter_runner.retain_drain(decision_id, settlement)
+        drain = LeasedAdapterSettlement[CapturedAwaitableOutcome[None]]()
+        self._adapter_runner.retain_drain(decision_id, drain)
         capacity_lease.transferred = True
-        settlement.add_done_callback(
-            lambda completed, key=decision_id, lease=capacity_lease: (
-                self._publication_settlement_completed(
-                    key,
-                    completed,
-                    capacity_lease=lease,
-                )
-            )
+        self._adapter_runner.adopt_settlement(
+            decision_id,
+            drain,
+            settlement,
+            failure_for=lambda captured: captured.error,
+            on_settled=lambda: self._release_resolution_capacity(capacity_lease),
         )
 
     async def _settle_draining_resolver(
@@ -1505,23 +1502,6 @@ class CompletionResultResolverCoordinator:
             raise release_failure
         if heartbeat_failure is not None:
             raise heartbeat_failure
-
-    def _publication_settlement_completed(
-        self,
-        decision_id: str,
-        completed: asyncio.Task[CapturedAwaitableOutcome[None]],
-        *,
-        capacity_lease: _ResolutionCapacityLease,
-    ) -> None:
-        self._release_resolution_capacity(capacity_lease)
-        if self._adapter_runner.draining(decision_id) is not completed:
-            return
-        try:
-            captured = completed.result()
-        except BaseException:
-            return
-        if captured.error is None:
-            self._adapter_runner.acknowledge_drain(decision_id, completed)
 
     def _reserve_resolution_capacity(self, lease: _ResolutionCapacityLease) -> None:
         if lease.reservation is not None:

@@ -32,7 +32,11 @@ from cayu.runtime._execution_profile_identity_validation import (
     copy_secret_free_execution_profile_behavior_identity,
 )
 from cayu.runtime._leased_adapter_heartbeat import run_leased_adapter_heartbeat
-from cayu.runtime._leased_adapter_runner import LeasedAdapterLease, LeasedAdapterRunner
+from cayu.runtime._leased_adapter_runner import (
+    LeasedAdapterLease,
+    LeasedAdapterRunner,
+    LeasedAdapterSettlement,
+)
 from cayu.runtime._task_store_operation_boundary import (
     TaskStoreOperationOutcome,
     capture_sensitive_validation,
@@ -265,15 +269,12 @@ class _ClaimHeartbeatSettlement:
 
 
 @dataclass(slots=True)
-class _DrainingAdapter:
+class _DrainingAdapter(LeasedAdapterSettlement[_ClaimHeartbeatSettlement]):
     operation_key: _ExecutionKey
     task: asyncio.Task[CapturedAwaitableOutcome[CompletionVerifierDecision]]
     heartbeat: _ClaimHeartbeat
     cancellation_marker: _AdapterDrainCancellationMarker
     observed_adapter_failures: tuple[BaseException, ...] = field(repr=False)
-    settlement_task: asyncio.Task[_ClaimHeartbeatSettlement] | None = None
-    settlement_failure: BaseException | None = None
-    settlement_processed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1205,10 +1206,11 @@ class CompletionVerifierCoordinator:
                 raise CompletionVerifierExecutionError(
                     "The prior exact completion-verifier execution is still draining."
                 ) from None
-            if not self._finalize_draining_adapter_settlement(
+            if not self._adapter_runner.finalize_settlement(
                 operation_key,
                 draining,
                 settlement_task,
+                failure_for=lambda settlement: settlement.failure,
             ):
                 raise CompletionVerifierExecutionError(
                     "The prior exact completion-verifier execution is still draining."
@@ -2895,43 +2897,13 @@ class CompletionVerifierCoordinator:
         operation_key: _ExecutionKey,
         draining: _DrainingAdapter,
     ) -> asyncio.Task[_ClaimHeartbeatSettlement]:
-        settlement_task = draining.settlement_task
-        if settlement_task is not None:
-            return settlement_task
-        settlement_task = asyncio.create_task(
-            self._settle_draining_adapter(draining),
+        return self._adapter_runner.start_settlement(
+            operation_key,
+            draining,
+            lambda: self._settle_draining_adapter(draining),
             name="cayu-completion-verifier-drain-settlement",
+            failure_for=lambda settlement: settlement.failure,
         )
-        draining.settlement_task = settlement_task
-        settlement_task.add_done_callback(
-            lambda completed, expected=draining: self._finalize_draining_adapter_settlement(
-                operation_key,
-                expected,
-                completed,
-            )
-        )
-        return settlement_task
-
-    def _finalize_draining_adapter_settlement(
-        self,
-        operation_key: _ExecutionKey,
-        draining: _DrainingAdapter,
-        completed: asyncio.Task[_ClaimHeartbeatSettlement],
-    ) -> bool:
-        if draining.settlement_processed:
-            return True
-        try:
-            settlement = completed.result()
-        except BaseException:
-            return False
-        draining.settlement_processed = True
-        draining.settlement_failure = settlement.failure
-        if draining.settlement_failure is not None:
-            return True
-        current = self._adapter_runner.draining(operation_key)
-        if current is draining and current.settlement_task is completed:
-            self._adapter_runner.acknowledge_drain(operation_key, draining)
-        return True
 
     def _acknowledge_owned_drain(self, draining: _DrainingAdapter) -> None:
         completed = draining.settlement_task
@@ -2939,8 +2911,11 @@ class CompletionVerifierCoordinator:
             not draining.task.done()
             or completed is None
             or not completed.done()
-            or not self._finalize_draining_adapter_settlement(
-                draining.operation_key, draining, completed
+            or not self._adapter_runner.finalize_settlement(
+                draining.operation_key,
+                draining,
+                completed,
+                failure_for=lambda settlement: settlement.failure,
             )
         ):
             raise RuntimeError("Completion verifier cleanup has not settled.")
