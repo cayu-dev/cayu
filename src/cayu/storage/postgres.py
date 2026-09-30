@@ -31841,6 +31841,29 @@ class PostgresSessionStore(
                             (session_id,),
                         )
                         queued = await cur.fetchone() is not None
+                    from cayu.runtime._session_steering import (
+                        interaction_completion_steering_key,
+                        prepare_interaction_completion_steering_record,
+                    )
+
+                    steering_key = interaction_completion_steering_key(
+                        loaded, checkpoint, copied_event
+                    )
+                    completion_record = None
+                    if steering_key is not None:
+                        await cur.execute(
+                            "SELECT record FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = %s",
+                            (session_id, steering_key),
+                        )
+                        steering_row = await cur.fetchone()
+                        completion_record = prepare_interaction_completion_steering_record(
+                            loaded,
+                            checkpoint,
+                            copied_event,
+                            None if steering_row is None else _json_obj(steering_row[0]),
+                            keeps_running=queued or target_status is SessionStatus.RUNNING,
+                        )
                     updated_at = await self._session_store_now(cur)
                     settlement_record = None
                     settlement_storage_key = None
@@ -32070,6 +32093,14 @@ class PostgresSessionStore(
                             updated_at,
                         ),
                     )
+                    if completion_record is not None:
+                        assert steering_key is not None
+                        await cur.execute(
+                            "INSERT INTO cayu_session_operations "
+                            "(session_id, idempotency_key, record, updated_at) "
+                            "VALUES (%s, %s, %s, %s)",
+                            (session_id, steering_key, _dumps(completion_record), updated_at),
+                        )
                 await conn.commit()
             except Exception:
                 await conn.rollback()
@@ -34866,7 +34897,9 @@ class PostgresSessionStore(
                                 "Queued interaction handoff lost its predecessor "
                                 "settlement receipt."
                             )
-                        await self._reject_new_work_after_steering(cur, loaded)
+                        await self._reject_new_work_after_steering(
+                            cur, loaded, allow_completed_interaction=True
+                        )
                         rebound_checkpoint = _checkpoint_after_queued_interaction_profile_handoff(
                             loaded,
                             await self._load_checkpoint(cur, session_id),
@@ -42523,7 +42556,9 @@ class PostgresSessionStore(
             labels_by_session_id[row[0]][row[1]] = row[2]
         return labels_by_session_id
 
-    async def _reject_new_work_after_steering(self, cur: Any, session: Session) -> None:
+    async def _reject_new_work_after_steering(
+        self, cur: Any, session: Session, *, allow_completed_interaction: bool = False
+    ) -> None:
         from cayu.runtime._session_steering import (
             reject_new_work_after_steering,
             steering_operation_key_from_checkpoint,
@@ -42542,6 +42577,7 @@ class PostgresSessionStore(
                 session,
                 checkpoint,
                 None if row is None else _decode_model_completion_stage_record(row[0]),
+                allow_completed_interaction=allow_completed_interaction,
             )
 
     async def _load_checkpoint(self, cur: Any, session_id: str) -> dict[str, Any] | None:

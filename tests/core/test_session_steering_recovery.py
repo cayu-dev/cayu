@@ -126,6 +126,7 @@ def test_steering_promotion_ack_loss_preserves_terminal_and_cancellation(
         class PromotionStore(base):
             invocation_lifecycle_command_version = 1
             terminal_interaction_publication_version = 1
+            session_steering_version = 1
 
             async def transition_status_and_checkpoint(self, *args, **kwargs):
                 nonlocal delivered_cancellation, fail_next_checkpoint

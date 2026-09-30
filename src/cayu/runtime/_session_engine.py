@@ -2396,12 +2396,16 @@ def _interaction_transition_replay_is_authoritatively_rejected(
 ) -> bool:
     """Return whether retry cannot reconcile the rejected transition."""
 
+    from cayu.runtime._session_steering import SessionSteeringBoundaryReached
+
     leaves = tuple(
         candidate
         for candidate in iter_exception_tree(error)
         if not isinstance(candidate, BaseExceptionGroup)
     )
-    return bool(leaves) and all(isinstance(leaf, SessionStatusConflict) for leaf in leaves)
+    return bool(leaves) and all(
+        isinstance(leaf, (SessionStatusConflict, SessionSteeringBoundaryReached)) for leaf in leaves
+    )
 
 
 def _transcript_snapshot_messages(snapshot: TranscriptSnapshot) -> list[Message]:
@@ -8469,8 +8473,11 @@ class SessionEngine:
         Pending approvals, user input, or tool recovery remain authoritative.
         """
 
-        from cayu.runtime._session_steering import steering_operation_key
-        from cayu.runtime.session_steering import SessionSteeringConflict, SessionSteeringReceipt
+        from cayu.runtime._session_steering import (
+            steering_operation_key,
+            steering_receipt_from_record,
+        )
+        from cayu.runtime.session_steering import SessionSteeringConflict
 
         checkpoint = await self.session_store.load_checkpoint(session.id)
         profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
@@ -8480,7 +8487,9 @@ class SessionEngine:
         stored = await self.session_store.load_session_operation(session.id, key)
         if stored is None:
             return
-        receipt = SessionSteeringReceipt.model_validate(stored)
+        receipt = steering_receipt_from_record(stored)
+        if receipt is None:
+            return
         request = receipt.request
         if (
             request.session_id != session.id
@@ -8558,6 +8567,15 @@ class SessionEngine:
             and pending.get("interruption_request_id")
             == steering_operation_key(session.instance_id, profile.interaction_id)
         )
+
+    async def _promote_rejected_completion_stop(self, session: Session) -> None:
+        """Let the existing interruption owner settle an atomic stop rejection."""
+
+        try:
+            await self._stop_at_requested_tool_round_boundary(session)
+        except SessionInterruptedByRequest:
+            return
+        raise SessionRunFenced("Safe steering did not establish its terminal boundary.")
 
     async def _ensure_interruption_terminal_decision(
         self,
@@ -9205,6 +9223,8 @@ class SessionEngine:
             return transitioned, None, True
 
         replay_event = copy_event(event)
+        from cayu.runtime._session_steering import SessionSteeringBoundaryReached
+
         replay_from_statuses = frozenset(
             {SessionStatus.RUNNING, SessionStatus.INTERRUPTING}
             if from_statuses is None
@@ -9332,6 +9352,17 @@ class SessionEngine:
                     attempt_failure = result_failure
             if outcome.cancellation is not None:
                 if attempt_failure is not None:
+                    if isinstance(attempt_failure, SessionSteeringBoundaryReached):
+                        await _run_interaction_transition_cancellation_cleanup_steps(
+                            outcome.cancellation,
+                            supervisor=self._recovery_cleanup_supervisor,
+                            steps=(
+                                (
+                                    "cooperative stop promotion after completion rejection",
+                                    lambda: self._promote_rejected_completion_stop(session),
+                                ),
+                            ),
+                        )
                     cancellation_failures = [*replay_failures, attempt_failure]
                     _raise_interaction_transition_cancellation(
                         outcome.cancellation,
@@ -9386,6 +9417,14 @@ class SessionEngine:
                     )
                 raise attempt_failure
             terminal_failure = _interaction_transition_replay_failure(replay_failures)
+            if isinstance(attempt_failure, SessionSteeringBoundaryReached):
+                if prior_failures:
+                    _raise_primary_with_secondary_failure(
+                        attempt_failure,
+                        _interaction_transition_replay_failure(prior_failures),
+                        group_message="Cooperative stop rejection and prior publication failures.",
+                    )
+                raise attempt_failure
             if _interaction_transition_replay_is_authoritatively_rejected(attempt_failure):
                 raise terminal_failure from None
             if attempt + 1 >= _INTERACTION_TRANSITION_REPLAY_MAX_ATTEMPTS:
@@ -27090,12 +27129,7 @@ class SessionEngine:
             from cayu.runtime._session_steering import SessionSteeringBoundaryReached
 
             if isinstance(interruption, SessionSteeringBoundaryReached):
-                try:
-                    await self._stop_at_requested_tool_round_boundary(session)
-                except SessionInterruptedByRequest:
-                    pass
-                else:
-                    raise SessionRunFenced("Safe steering did not establish its terminal boundary.")
+                await self._promote_rejected_completion_stop(session)
             await materialize_deferred_messages_after_failure()
             interruption_events: list[Event] = []
             if close_new_pending_round_on_interrupt:

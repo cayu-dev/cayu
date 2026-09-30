@@ -125,9 +125,9 @@ async def accept_native_producer_stop(store, registration, closure, *, authority
     if index.record_commitment != _digest(attachment):
         raise ValueError("Producer stop attachment commitment conflicts.")
     from cayu.runtime._producer_lineage import require_producer_epoch
-    from cayu.runtime._session_steering import steering_operation_key
+    from cayu.runtime._session_steering import require_steering_receipt, steering_operation_key
     from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
-    from cayu.runtime.session_steering import SessionSteeringConflict, SessionSteeringReceipt
+    from cayu.runtime.session_steering import SessionSteeringConflict
 
     def require_current(session, current_checkpoint):
         active = active_invocation_execution_profile_from_checkpoint(current_checkpoint)
@@ -154,7 +154,7 @@ async def accept_native_producer_stop(store, registration, closure, *, authority
         steering_operation_key(target.session_instance_id, index.invocation.interaction_id),
     )
     if existing is not None:
-        prior = SessionSteeringReceipt.model_validate(existing)
+        prior = require_steering_receipt(existing)
         require_producer_epoch(index, checkpoint, active.profile, prior.request.expected_run_epoch)
         if (
             prior.request.expected_run_epoch > active.run_epoch

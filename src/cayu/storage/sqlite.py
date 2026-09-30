@@ -902,7 +902,9 @@ def _load_checkpoint_state(
     return None if value is None else _checkpoint_from_json(value)
 
 
-def _reject_new_work_after_steering(connection: sqlite3.Connection, session: Session) -> None:
+def _reject_new_work_after_steering(
+    connection: sqlite3.Connection, session: Session, *, allow_completed_interaction: bool = False
+) -> None:
     from cayu.runtime._session_steering import (
         reject_new_work_after_steering,
         steering_operation_key_from_checkpoint,
@@ -920,6 +922,7 @@ def _reject_new_work_after_steering(connection: sqlite3.Connection, session: Ses
             session,
             checkpoint,
             None if row is None else _decode_model_completion_stage_record(row["record_json"]),
+            allow_completed_interaction=allow_completed_interaction,
         )
 
 
@@ -7951,6 +7954,30 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
                         ).fetchone()
                         is not None
                     )
+                from cayu.runtime._session_steering import (
+                    interaction_completion_steering_key,
+                    prepare_interaction_completion_steering_record,
+                )
+
+                steering_key = interaction_completion_steering_key(
+                    loaded, current_checkpoint, copied_event
+                )
+                completion_record = None
+                if steering_key is not None:
+                    steering_row = connection.execute(
+                        "SELECT record_json FROM cayu_session_operations "
+                        "WHERE session_id = ? AND idempotency_key = ?",
+                        (session_id, steering_key),
+                    ).fetchone()
+                    completion_record = prepare_interaction_completion_steering_record(
+                        loaded,
+                        current_checkpoint,
+                        copied_event,
+                        None
+                        if steering_row is None
+                        else _decode_model_completion_stage_record(steering_row["record_json"]),
+                        keeps_running=queued or target_status is SessionStatus.RUNNING,
+                    )
                 updated_at = self._ownership_clock()
                 formatted_updated_at = sqlite_support.format_datetime(updated_at)
                 settlement_record = None
@@ -8186,6 +8213,19 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
                         formatted_updated_at,
                     ),
                 )
+                if completion_record is not None:
+                    assert steering_key is not None
+                    connection.execute(
+                        "INSERT INTO cayu_session_operations "
+                        "(session_id, idempotency_key, record_json, updated_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (
+                            session_id,
+                            steering_key,
+                            sqlite_support.json_dumps(completion_record),
+                            formatted_updated_at,
+                        ),
+                    )
                 connection.commit()
                 return InteractionTransitionResult(
                     session=transitioned,
@@ -10226,7 +10266,9 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
                 rows = deliverable_rows
                 rebound_checkpoint: dict[str, Any] | None = None
                 if rows and profile_handoff is not None:
-                    _reject_new_work_after_steering(connection, loaded)
+                    _reject_new_work_after_steering(
+                        connection, loaded, allow_completed_interaction=True
+                    )
                     receipt_row = connection.execute(
                         "SELECT record_json FROM cayu_session_operations "
                         "WHERE session_id = ? AND idempotency_key = ?",

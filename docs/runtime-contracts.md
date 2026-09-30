@@ -2141,6 +2141,12 @@ with access to its session store can observe the session and use
 a claim: acceptance atomically rejects a changed incarnation, interaction, or
 epoch, a non-running session, or an already elected terminal decision.
 
+Stop acceptance and successful interaction settlement also share that atomic
+boundary. An accepted stop wins over later completion and uses the ordinary
+interruption owner. If completion commits first, a new stop conflicts, including
+while queued input or workspace finalization keeps the session running. Exact
+replay of a previously accepted stop receipt remains valid after settlement.
+
 The returned `SessionSteeringReceipt` proves durable acceptance, not completion.
 One immutable request belongs to the exact session incarnation and interaction.
 Replaying the same complete request returns its receipt, including after lost
@@ -2172,7 +2178,7 @@ terminal hooks, and cleanup keep their existing single-winner ownership rules.
 
 Memory, SQLite, and PostgreSQL implement `SessionStore.session_steering_version = 1`.
 A custom store must explicitly own atomic receipt publication, model-stage
-exclusion, and queued-interaction handoff exclusion, including overrides of
+exclusion, completion exclusion, and queued-interaction handoff exclusion, including overrides of
 these operations, before accepting new stops.
 Missing, boolean, or unsupported versions fail closed. The runtime checkpoint
 wrapper delegates this capability to the underlying store. Read-only replay of

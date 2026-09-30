@@ -12237,7 +12237,7 @@ class SessionStore(ABC):
         )
 
     def _supports_session_steering_protocol(self) -> bool:
-        """Require one owner for acceptance and atomic new-stage exclusion."""
+        """Require one owner for acceptance, completion, and new-work exclusion."""
 
         mro = type(self).__mro__
         capability_owner = next(
@@ -12258,6 +12258,8 @@ class SessionStore(ABC):
                     "prepare_model_completion_stage",
                     "_prepare_model_completion_stage_atomic",
                     "deliver_queued_session_messages",
+                    "publish_interaction_transition",
+                    "settle_session_invocation",
                 )
             )
         )
@@ -20001,6 +20003,23 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 (session_id, delivery_mode) in self._pending_session_messages
                 for delivery_mode in SessionMessageDeliveryMode
             )
+            from cayu.runtime._session_steering import (
+                interaction_completion_steering_key,
+                prepare_interaction_completion_steering_record,
+            )
+
+            steering_key = interaction_completion_steering_key(
+                session, current_checkpoint, copied_event
+            )
+            completion_record = None
+            if steering_key is not None:
+                completion_record = prepare_interaction_completion_steering_record(
+                    session,
+                    current_checkpoint,
+                    copied_event,
+                    operation_records.get(steering_key),
+                    keeps_running=queued or target_status is SessionStatus.RUNNING,
+                )
             now = self._ownership_clock()
             settlement_record = None
             settlement_storage_key = None
@@ -20105,6 +20124,9 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 operation_records[settlement_storage_key] = settlement_record
                 del operation_records[MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY]
             operation_records[receipt_storage_key] = receipt_record
+            if completion_record is not None:
+                assert steering_key is not None
+                operation_records[steering_key] = completion_record
             return InteractionTransitionResult(
                 session=updated,
                 event=copied_event,
@@ -22675,7 +22697,9 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
 
             rebound_checkpoint: dict[str, Any] | None = None
             if profile_handoff is not None and selected:
-                self._reject_new_work_after_steering_unlocked(session)
+                self._reject_new_work_after_steering_unlocked(
+                    session, allow_completed_interaction=True
+                )
                 receipt_record = self._session_operation_records.get(session_id, {}).get(
                     _interaction_transition_storage_key(
                         profile_handoff.predecessor_settlement_event_id
@@ -23564,7 +23588,9 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
             )
             return dispatch
 
-    def _reject_new_work_after_steering_unlocked(self, session: Session) -> None:
+    def _reject_new_work_after_steering_unlocked(
+        self, session: Session, *, allow_completed_interaction: bool = False
+    ) -> None:
         from cayu.runtime._session_steering import (
             reject_new_work_after_steering,
             steering_operation_key_from_checkpoint,
@@ -23574,7 +23600,10 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
         key = steering_operation_key_from_checkpoint(session, checkpoint)
         if key is not None:
             reject_new_work_after_steering(
-                session, checkpoint, self._session_operation_records[session.id].get(key)
+                session,
+                checkpoint,
+                self._session_operation_records[session.id].get(key),
+                allow_completed_interaction=allow_completed_interaction,
             )
 
     async def _prepare_model_completion_stage_atomic(

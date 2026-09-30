@@ -9,7 +9,7 @@ from cayu.runtime._producer_output_store import (
     _publication_scope,
 )
 from cayu.runtime._producer_release import release_from_snapshot
-from cayu.runtime._session_steering import steering_operation_key
+from cayu.runtime._session_steering import require_steering_receipt, steering_operation_key
 from cayu.runtime.session_steering import SessionSteeringConflict, SessionSteeringReceipt
 from cayu.sessions.base import (
     SessionOperationPublication,
@@ -58,7 +58,7 @@ async def accept_paused_stop(store, command, index, attachment, request, closure
                 "sha256:"
             ),
         )
-        if existing is not None and SessionSteeringReceipt.model_validate(existing) != receipt:
+        if existing is not None and require_steering_receipt(existing) != receipt:
             raise SessionSteeringConflict()
         return SessionOperationPublication(
             checkpoint={**checkpoint, ROOT_KEY: desired.model_dump(mode="json")},

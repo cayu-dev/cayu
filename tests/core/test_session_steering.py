@@ -764,7 +764,7 @@ def test_stop_accepted_after_round_poll_prevents_next_model_dispatch(
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
-def test_stop_accepted_before_queued_interaction_handoff_preserves_queue(
+def test_completed_interaction_rejects_stop_before_queued_handoff(
     tmp_path, backend, request
 ) -> None:
     dsn = request.getfixturevalue("conformance_postgres_dsn") if backend == "postgres" else None
@@ -819,29 +819,20 @@ def test_stop_accepted_before_queued_interaction_handoff_preserves_queue(
                 await store.load_checkpoint(session.id)
             )
             assert profile is not None
-            await controller.stop_after_current_tool_round(
-                StopAfterCurrentToolRoundRequest(
-                    session_id=session.id,
-                    session_instance_id=session.instance_id,
-                    interaction_id=profile.interaction_id,
-                    expected_run_epoch=session.run_epoch,
-                    idempotency_key="stop-before-handoff",
-                )
-            )
-            release_handoff.set()
-            events = await asyncio.wait_for(owner, timeout=20)
-            assert len(provider.requests) == 2
-            assert events[-1].type is EventType.SESSION_INTERRUPTED
-            assert not any(e.type is EventType.SESSION_MESSAGE_DELIVERED for e in events)
-            resumed = [
-                event
-                async for event in app.resume(
-                    ResumeRequest(
-                        session_id=session.id, messages=[Message.text("user", "continue")]
+            with pytest.raises(SessionSteeringConflict):
+                await controller.stop_after_current_tool_round(
+                    StopAfterCurrentToolRoundRequest(
+                        session_id=session.id,
+                        session_instance_id=session.instance_id,
+                        interaction_id=profile.interaction_id,
+                        expected_run_epoch=session.run_epoch,
+                        idempotency_key="stop-before-handoff",
                     )
                 )
-            ]
-            assert resumed[-1].type is EventType.SESSION_COMPLETED
+            release_handoff.set()
+            events = await asyncio.wait_for(owner, timeout=20)
+            assert events[-1].type is EventType.SESSION_COMPLETED
+            assert not any(e.type is EventType.SESSION_INTERRUPTED for e in events)
             assert len(provider.requests) == 3
             durable = await store.load_events(session.id)
             assert sum(e.type is EventType.SESSION_MESSAGE_DELIVERED for e in durable) == 1
@@ -856,3 +847,12 @@ def test_stop_accepted_before_queued_interaction_handoff_preserves_queue(
                 await store.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("method", ["publish_interaction_transition", "settle_session_invocation"])
+def test_unqualified_completion_override_rejects_new_steering(method):
+    async def override(self, *args, **kwargs):
+        raise AssertionError("Unqualified completion override was dispatched.")
+
+    store_type = type("UnqualifiedCompletionStore", (InMemorySessionStore,), {method: override})
+    assert not store_type()._supports_session_steering_protocol()

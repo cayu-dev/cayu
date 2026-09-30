@@ -26830,6 +26830,17 @@ def test_session_store_conformance_repairs_exact_legacy_queued_handoff(
     session_store_case,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from cayu.runtime import _session_steering as steering
+
+    # Historical writers left the predecessor profile in place and did not
+    # persist completion evidence for steering. Simulate both parts of that
+    # stored state; current writers fence new work on a closed predecessor.
+    monkeypatch.setattr(
+        steering,
+        "prepare_interaction_completion_steering_record",
+        lambda *args, **kwargs: None,
+    )
+
     class BlockingLegacyHandoffProvider(ModelProvider):
         name = "legacy-queued-handoff"
 
@@ -26925,6 +26936,13 @@ def test_session_store_conformance_repairs_exact_legacy_queued_handoff(
             checkpoint = await store.load_checkpoint(session_id)
             assert session is not None
             assert active_invocation_execution_profile_from_checkpoint(checkpoint) == active_a
+            assert (
+                await store.load_session_operation(
+                    session_id,
+                    steering.steering_operation_key(session.instance_id, active_a.interaction_id),
+                )
+                is None
+            )
             starts = [
                 event
                 for event in await store.load_events(session_id)
