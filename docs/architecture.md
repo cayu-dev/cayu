@@ -52,6 +52,22 @@ core
 `core` should stay small and stable. It defines events, messages, agents, tools, the abstract workflow contract, and shared value objects.
 `workflows` contains orchestration-as-code helper primitives layered above the runtime; it may depend on runtime session/event contracts, but runtime should not depend on workflow helpers.
 
+## HTTP route ownership
+
+`server/routes.py` composes the HTTP routers and owns the durable eval worker
+lifespan. `server/_memory_report_routes.py` owns memory experiment report
+readback, exact stored-result and execution-profile validation, construction,
+and JSON/HTML responses. Its registrar receives the bounded report router,
+eval store, runtime target registry, and shared authentication dependency.
+
+The specialized report route class retains authentication before parsing,
+private request byte limits, redacted errors, cache headers, and request-schema
+publication. Both composition and report handlers use `server/_http_json.py`
+for the same parsed-body identity and JSON validation/rendering helpers. For
+each published result, the owner reads the run, result, and run again before
+accepting evidence, so a changed durable run cannot produce a report from
+inconsistent readback.
+
 ## Runtime Shape
 
 ```text

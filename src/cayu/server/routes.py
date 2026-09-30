@@ -123,7 +123,6 @@ from cayu.evals.corpus import (
 )
 from cayu.evals.execution import (
     CompiledCorpusSuite,
-    CorpusExecutionResult,
     CorpusTarget,
     _candidate_judge_route_relation,
     _validate_corpus_target_compatibility,
@@ -138,10 +137,7 @@ from cayu.evals.execution_reporting import (
 )
 from cayu.evals.memory_reporting import (
     MEMORY_EXPERIMENT_REPORT_MAX_BYTES,
-    MemoryExperimentReport,
     MemoryExperimentReportRequest,
-    build_memory_experiment_report,
-    render_memory_experiment_report_html,
 )
 from cayu.evals.promotion import (
     SessionPromotionError,
@@ -314,6 +310,7 @@ from cayu.server._http_json import (
     _render_utf8,
     _validated_private_json_body,
 )
+from cayu.server._memory_report_routes import register_memory_report_routes
 from cayu.server._request_timing import RequestTimingRecorder
 from cayu.server.auth import AuthContext, AuthDependency, server_auth_dependency
 from cayu.server.config import EvalsConfig, EvaluationPromotionConfig, normalize_api_path
@@ -4668,109 +4665,12 @@ def create_router(
             optional_auth_context=optional_auth_context,
         )
 
-        async def _build_stored_memory_experiment_report(
-            body: MemoryExperimentReportRequest,
-        ) -> MemoryExperimentReport:
-            store = captured_eval_store
-            if store is None:
-                raise HTTPException(status_code=409, detail="Eval result storage is unavailable.")
-            runs_by_result_revision: dict[str, EvalRunRecord] = {}
-            for evidence in body.published_results:
-                try:
-                    run = await store.load_run(evidence.run_id)
-                    stored = await store.load_result(evidence.run_id)
-                    current_run = await store.load_run(evidence.run_id)
-                except EvalStoreResultTooLarge as exc:
-                    raise HTTPException(
-                        status_code=413,
-                        detail="Eval result is too large.",
-                    ) from exc
-                except (TypeError, ValueError) as exc:
-                    raise HTTPException(
-                        status_code=422,
-                        detail="Invalid memory experiment result identity.",
-                    ) from exc
-                if run is None or current_run is None or stored is None:
-                    raise HTTPException(status_code=404, detail="Eval result not found.")
-                if (
-                    current_run.status is not EvalRunStatus.COMPLETED
-                    or current_run.result is None
-                    or current_run.result.revision != evidence.result.revision
-                    or run != current_run
-                ):
-                    raise HTTPException(
-                        status_code=409,
-                        detail="Memory report eval run evidence changed during readback.",
-                    )
-                if active_eval_registry.get(current_run.spec.target_key) is None:
-                    raise HTTPException(status_code=404, detail="Eval result not found.")
-                if type(stored) is not CorpusExecutionResult:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="Memory reports require fresh corpus execution results.",
-                    )
-                if stored != evidence.result:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=("Memory report evidence does not match the exact stored result."),
-                    )
-                runs_by_result_revision[evidence.result.revision] = current_run
-            variants = {item.variant_id: item for item in body.variants}
-            for trial in body.trials:
-                revision = trial.published_result_revision
-                if revision is None:
-                    continue
-                run = runs_by_result_revision[revision]
-                variant = variants[trial.variant_id]
-                invocation = run.spec.invocation
-                if (
-                    invocation.execution_profile != variant.execution_profile_binding
-                    or invocation.execution_profile_snapshot != variant.execution_profile
-                ):
-                    raise HTTPException(
-                        status_code=409,
-                        detail=(
-                            "Memory report profile evidence does not match the exact eval run."
-                        ),
-                    )
-            try:
-                return await asyncio.to_thread(build_memory_experiment_report, body)
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Invalid memory experiment report request.",
-                ) from exc
-
-        @bounded_memory_report_router.post(
-            "/evals/memory-reports",
-            response_model=MemoryExperimentReport,
-            responses=CAPTURED_EVALUATION_ENDPOINT_RESPONSES,
-            dependencies=protected,
+        register_memory_report_routes(
+            bounded_memory_report_router,
+            captured_eval_store=captured_eval_store,
+            active_eval_registry=(eval_registry if eval_runtime is None else eval_runtime.registry),
+            protected=protected,
         )
-        async def build_stored_memory_report(request: Request) -> Response:
-            body = await _validated_private_json_body(
-                request,
-                MemoryExperimentReportRequest,
-                invalid_detail="Invalid memory experiment report request.",
-            )
-            report = await _build_stored_memory_experiment_report(body)
-            return await _model_json_response(report, MemoryExperimentReport)
-
-        @bounded_memory_report_router.post(
-            "/evals/memory-reports/report.html",
-            response_class=Response,
-            responses=CAPTURED_EVALUATION_ENDPOINT_RESPONSES,
-            dependencies=protected,
-        )
-        async def build_stored_memory_report_html(request: Request) -> Response:
-            body = await _validated_private_json_body(
-                request,
-                MemoryExperimentReportRequest,
-                invalid_detail="Invalid memory experiment report request.",
-            )
-            report = await _build_stored_memory_experiment_report(body)
-            rendered = await asyncio.to_thread(render_memory_experiment_report_html, report)
-            return Response(content=rendered, media_type="text/html")
 
     if eval_runtime is not None:
         eval_store = eval_runtime.store

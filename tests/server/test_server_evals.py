@@ -17,6 +17,7 @@ pytest.importorskip("fastapi")
 pytest.importorskip("sse_starlette")
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from tests.evals.test_corpus_execution import (
     _corpus,
@@ -44,6 +45,7 @@ from cayu.evals.corpus import (
 from cayu.evals.execution import CorpusTarget, ModelJudgeTarget, run_corpus_suite
 from cayu.evals.execution_profiles import EvalExecutionProfilePolicyV1
 from cayu.evals.memory_reporting import (
+    MEMORY_EXPERIMENT_REPORT_MAX_BYTES,
     MemoryExperimentReportRequest,
     build_memory_experiment_report,
 )
@@ -953,47 +955,270 @@ def test_eval_result_refreshes_run_after_concurrent_publication(tmp_path, monkey
         asyncio.run(store.close())
 
 
+async def _seed_memory_report_results(
+    report_request: MemoryExperimentReportRequest,
+    target: CorpusTarget,
+    corpus: EvalCorpusDocument,
+    store: SQLiteEvalStore,
+) -> None:
+    await store.save_corpus(corpus, redact_json=target.app.redact_json)
+    variants = {item.variant_id: item for item in report_request.variants}
+    for index, evidence in enumerate(report_request.published_results, start=1):
+        trial = next(
+            item
+            for item in report_request.trials
+            if item.published_result_revision == evidence.result.revision
+        )
+        variant = variants[trial.variant_id]
+        published = evidence.result.run
+        request = EvalRunRequest(
+            run_id=evidence.run_id,
+            idempotency_key="sha256:" + str(index) * 64,
+            corpus_revision=published.corpus_revision,
+            target_key=evidence.result.target.target_key,
+            suite_id=published.suite_id,
+            suite_revision=published.suite_revision,
+            max_concurrency=1,
+            invocation=EvalRunInvocation(
+                execution_profile=variant.execution_profile_binding,
+                execution_profile_snapshot=variant.execution_profile,
+            ),
+        )
+        await store.admit_run(request, redact_json=target.app.redact_json)
+        lease = await store.claim_run(target_key=target.key, lease_seconds=300)
+        assert lease is not None
+        assert lease.run.id == evidence.run_id
+        await store.publish_result(
+            lease.claim,
+            evidence.result,
+            redact_json=target.app.redact_json,
+        )
+
+
+@pytest.fixture
+def stored_memory_report(tmp_path):
+    report_request, target, corpus = asyncio.run(_report_fixture())
+    store = SQLiteEvalStore(tmp_path / "memory-report-boundaries.db")
+    try:
+        asyncio.run(_seed_memory_report_results(report_request, target, corpus, store))
+        yield report_request, target, store
+    finally:
+        asyncio.run(store.close())
+
+
+@pytest.mark.parametrize(
+    ("prefix", "operation_prefix"), [("/api", "api"), ("/custom/v2", "custom_v2")]
+)
+def test_memory_report_routes_preserve_auth_prefix_and_private_body_boundary(
+    stored_memory_report, prefix: str, operation_prefix: str
+) -> None:
+    report_request, target, store = stored_memory_report
+    calls = []
+
+    def authenticate(request: Request) -> AuthContext:
+        calls.append(request.url.path)
+        return _authenticate(request)
+
+    server = create_server(
+        target.app,
+        config=ServerConfig.protected(
+            authenticate,
+            api=ServerApiConfig(path=prefix),
+            dashboard=DashboardConfig(enabled=False),
+            evals=_evals_config(target, store),
+        ),
+    )
+    routes = [route for route in server.routes if isinstance(route, APIRoute)]
+    paths = [f"{prefix}/evals/memory-reports", f"{prefix}/evals/memory-reports/report.html"]
+    report_routes = [route for route in routes if route.path in paths]
+    assert [route.path for route in report_routes] == paths
+    auth_dependency = (
+        next(route for route in routes if route.path == f"{prefix}/sessions")
+        .dependencies[0]
+        .dependency
+    )
+    schema = server.openapi()
+    for route, name, suffix in zip(
+        report_routes,
+        ("build_stored_memory_report", "build_stored_memory_report_html"),
+        ("", "_report_html"),
+        strict=True,
+    ):
+        assert route.dependencies[0].dependency is auth_dependency
+        assert issubclass(type(route), routes_module._BoundedMemoryReportRoute)
+        assert type(route).preparse_auth is authenticate
+        assert route.max_request_bytes == MEMORY_EXPERIMENT_REPORT_MAX_BYTES
+        operation = schema["paths"][route.path]["post"]
+        assert operation["operationId"] == (
+            f"{name}_{operation_prefix}_evals_memory_reports{suffix}_post"
+        )
+        assert operation["requestBody"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/MemoryExperimentReportRequest"
+        }
+
+    def deny_access() -> None:
+        raise HTTPException(status_code=403, detail="report access revoked")
+
+    with TestClient(server) as client:
+        for path in paths:
+            calls.clear()
+            response = client.post(
+                path,
+                headers={**_AUTH_HEADERS, "Content-Type": "application/vnd.cayu+json"},
+                content=report_request.model_dump_json(),
+            )
+            assert response.status_code == 200
+            assert response.headers["cache-control"] == "private, no-store"
+            assert calls == [path]
+
+            calls.clear()
+            response = client.post(
+                path,
+                headers={"Content-Length": str(MEMORY_EXPERIMENT_REPORT_MAX_BYTES + 1)},
+                content=b"invalid private input",
+            )
+            assert response.status_code == 401
+            assert response.json() == {"detail": "unauthorized"}
+            assert response.headers["cache-control"] == "private, no-store"
+            assert calls == [path]
+
+            calls.clear()
+            response = client.post(
+                path,
+                headers={
+                    **_AUTH_HEADERS,
+                    "Content-Length": str(MEMORY_EXPERIMENT_REPORT_MAX_BYTES + 1),
+                },
+                content=b"{}",
+            )
+            assert response.status_code == 413
+            assert response.json() == {
+                "detail": "Memory experiment report request exceeds the server byte limit."
+            }
+            assert response.headers["cache-control"] == "private, no-store"
+            assert calls == [path]
+
+        server.dependency_overrides[auth_dependency] = deny_access
+        for path in paths:
+            response = client.post(path, headers=_AUTH_HEADERS, json={})
+            assert response.status_code == 403
+            assert response.json() == {"detail": "report access revoked"}
+            assert response.headers["cache-control"] == "private, no-store"
+
+
+@pytest.mark.parametrize("with_registry", [False, True], ids=["unconfigured", "registry-only"])
+def test_memory_report_routes_preserve_unconfigured_and_unavailable_storage(
+    tmp_path, with_registry: bool
+) -> None:
+    report_request, target, _ = asyncio.run(_report_fixture())
+    context = (
+        _create_project_control_plane_context(
+            project_root=tmp_path.resolve(),
+            project_id="memory-report-contract",
+            configured_release_id="current-release",
+            eval_store=None,
+            store_backend=None,
+            store_source=None,
+            access=ProjectControlPlaneAccess.AUTHENTICATED_PRODUCTION,
+        )
+        if with_registry
+        else None
+    )
+    try:
+        server = create_server(
+            target.app,
+            config=ServerConfig.protected(_authenticate, dashboard=DashboardConfig(enabled=False)),
+            project_context=context,
+        )
+        paths = ("/api/evals/memory-reports", "/api/evals/memory-reports/report.html")
+        with TestClient(server) as client:
+            for path in paths:
+                response = client.post(
+                    path, headers=_AUTH_HEADERS, json=report_request.model_dump(mode="json")
+                )
+                assert response.status_code == (409 if with_registry else 404)
+                if with_registry:
+                    assert response.json() == {"detail": "Eval result storage is unavailable."}
+                    assert response.headers["cache-control"] == "private, no-store"
+        declared = server.openapi()["paths"]
+        assert all((path in declared) is with_registry for path in paths)
+    finally:
+        if context is not None:
+            asyncio.run(context.close())
+
+
+@pytest.mark.parametrize("mismatch", ["readback", "profile"])
+def test_memory_report_reads_preserve_exact_evidence_and_private_validation(
+    stored_memory_report, monkeypatch, mismatch: str
+) -> None:
+    report_request, target, store = stored_memory_report
+    reads = []
+    load_run = store.load_run
+    load_result = store.load_result
+
+    async def recorded_run(run_id):
+        reads.append(("run", run_id))
+        run = await load_run(run_id)
+        assert run is not None
+        if mismatch == "readback" and len(reads) == 3:
+            return run.model_copy(update={"status": EvalRunStatus.RUNNING})
+        if mismatch == "profile":
+            invocation = run.spec.invocation.model_copy(update={"execution_profile_snapshot": None})
+            return run.model_copy(
+                update={"spec": run.spec.model_copy(update={"invocation": invocation})}
+            )
+        return run
+
+    async def recorded_result(run_id):
+        reads.append(("result", run_id))
+        return await load_result(run_id)
+
+    monkeypatch.setattr(store, "load_run", recorded_run)
+    monkeypatch.setattr(store, "load_result", recorded_result)
+    payload = report_request.model_dump_json()
+    expected_detail = (
+        "Memory report eval run evidence changed during readback."
+        if mismatch == "readback"
+        else "Memory report profile evidence does not match the exact eval run."
+    )
+    with TestClient(_server(target, store)) as client:
+        for path in ("/api/evals/memory-reports", "/api/evals/memory-reports/report.html"):
+            reads.clear()
+            for content, content_type in (
+                ('{"private-marker":"sensitive","private-marker":"other"}', "application/json"),
+                ("NaN", "application/json"),
+                (payload, "text/plain"),
+            ):
+                rejected = client.post(
+                    path,
+                    headers={**_AUTH_HEADERS, "Content-Type": content_type},
+                    content=content,
+                )
+                assert rejected.status_code == 422
+                assert rejected.json() == {"detail": "Invalid memory experiment report request."}
+                assert rejected.headers["cache-control"] == "private, no-store"
+                assert reads == []
+            response = client.post(
+                path, headers={**_AUTH_HEADERS, "Content-Type": "application/json"}, content=payload
+            )
+            assert response.status_code == 409
+            assert response.json() == {"detail": expected_detail}
+            expected = report_request.published_results
+            if mismatch == "readback":
+                expected = expected[:1]
+            assert reads == [
+                (operation, evidence.run_id)
+                for evidence in expected
+                for operation in ("run", "result", "run")
+            ]
+
+
 def test_memory_report_routes_require_exact_stored_results_and_render_both_formats(
     tmp_path,
 ) -> None:
     report_request, target, corpus = asyncio.run(_report_fixture())
     store = SQLiteEvalStore(tmp_path / "memory-reports.db")
-
-    async def seed_results() -> None:
-        await store.save_corpus(corpus, redact_json=target.app.redact_json)
-        variants = {item.variant_id: item for item in report_request.variants}
-        for index, evidence in enumerate(report_request.published_results, start=1):
-            trial = next(
-                item
-                for item in report_request.trials
-                if item.published_result_revision == evidence.result.revision
-            )
-            variant = variants[trial.variant_id]
-            published = evidence.result.run
-            request = EvalRunRequest(
-                run_id=evidence.run_id,
-                idempotency_key="sha256:" + str(index) * 64,
-                corpus_revision=published.corpus_revision,
-                target_key=evidence.result.target.target_key,
-                suite_id=published.suite_id,
-                suite_revision=published.suite_revision,
-                max_concurrency=1,
-                invocation=EvalRunInvocation(
-                    execution_profile=variant.execution_profile_binding,
-                    execution_profile_snapshot=variant.execution_profile,
-                ),
-            )
-            await store.admit_run(request, redact_json=target.app.redact_json)
-            lease = await store.claim_run(target_key=target.key, lease_seconds=300)
-            assert lease is not None
-            assert lease.run.id == evidence.run_id
-            await store.publish_result(
-                lease.claim,
-                evidence.result,
-                redact_json=target.app.redact_json,
-            )
-
-    asyncio.run(seed_results())
+    asyncio.run(_seed_memory_report_results(report_request, target, corpus, store))
     try:
         server = _server(target, store)
         schema = server.openapi()
