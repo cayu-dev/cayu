@@ -41170,5 +41170,12 @@
     "tests/core/test_leased_adapter_runner.py::test_inherited_execution_requires_settlement_before_generation_refresh[domain]": 0.005,
     "tests/core/test_leased_adapter_runner.py::test_worker_settlement_retains_cleanup_failure_and_repeated_caller_cancellation": 0.006,
     "tests/core/test_leased_adapter_runner.py::test_successful_dispatch_detaches_its_lease_watch": 0.004,
-    "tests/core/test_leased_adapter_runner.py::test_tracking_a_heartbeat_preserves_its_cancellation_cleanup_cause": 0.0
+    "tests/core/test_leased_adapter_runner.py::test_tracking_a_heartbeat_preserves_its_cancellation_cleanup_cause": 0.0,
+    "tests/server/test_server_captured_evaluations.py::test_baseline_selection_preserves_actor_replay_and_generation_conflicts": 1.058568250387907,
+    "tests/server/test_server_captured_evaluations.py::test_result_comparison_reuses_one_stored_document_and_private_json_validation": 0.9045427488163114,
+    "tests/server/test_server_captured_evaluations.py::test_result_reads_reject_mismatched_stored_metadata": 0.9519106661900878,
+    "tests/server/test_server_captured_evaluations.py::test_result_routes_preserve_prefix_order_and_auth_dependencies[/api-api]": 3.146252374863252,
+    "tests/server/test_server_captured_evaluations.py::test_result_routes_preserve_prefix_order_and_auth_dependencies[/custom/v2-custom_v2]": 2.8290292497258633,
+    "tests/server/test_server_captured_evaluations.py::test_result_routes_require_durable_storage_for_a_configured_registry[no-registry]": 0.8869531259406358,
+    "tests/server/test_server_captured_evaluations.py::test_result_routes_require_durable_storage_for_a_configured_registry[registry-only]": 2.1831828749272972
 }

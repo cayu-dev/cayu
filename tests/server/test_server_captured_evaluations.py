@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 from decimal import Decimal
@@ -35,8 +36,8 @@ from cayu.project_control_plane import (
     _create_project_control_plane_context,
 )
 from cayu.server import DashboardConfig, ServerApiConfig, ServerConfig, create_server
+from cayu.server._evaluation_result_routes import _eval_result_record_matches_document
 from cayu.server.contracts import MAX_CAPTURED_EVALUATION_REQUEST_BYTES
-from cayu.server.routes import _eval_result_record_matches_document
 from cayu.sessions.invocation import InvocationOriginTrust, SessionExecutionSource
 from cayu.storage.evals_sqlite import SQLiteEvalStore
 
@@ -72,6 +73,276 @@ def captured_route_server(tmp_path):
     yield build
     for context in contexts:
         asyncio.run(context.close())
+
+
+@pytest.mark.parametrize(
+    ("prefix", "operation_prefix"), [("/api", "api"), ("/custom/v2", "custom_v2")]
+)
+def test_result_routes_preserve_prefix_order_and_auth_dependencies(
+    captured_route_server, prefix: str, operation_prefix: str
+) -> None:
+    server = captured_route_server(prefix=prefix)
+    routes = [route for route in server.routes if isinstance(route, APIRoute)]
+    expected = [
+        ("/evals/results", "get", "list_eval_results"),
+        ("/evals/results/{result_revision}", "get", "get_eval_result"),
+        (
+            "/evals/results/{result_revision}/report.json",
+            "get",
+            "download_catalog_eval_json_report",
+        ),
+        (
+            "/evals/results/{result_revision}/report.html",
+            "get",
+            "download_catalog_eval_html_report",
+        ),
+        ("/evals/result-comparisons", "post", "compare_catalog_eval_results"),
+        ("/evals/results/{result_revision}/baseline", "post", "select_eval_baseline"),
+    ]
+    paths = {prefix + path for path, _, _ in expected}
+    assert [route.path for route in routes if route.path in paths] == [
+        prefix + path for path, _, _ in expected
+    ]
+    session_route = next(route for route in routes if route.path == f"{prefix}/sessions")
+    auth_dependency = session_route.dependencies[0].dependency
+    run_route = next(
+        route
+        for route in routes
+        if route.path == f"{prefix}/evals/runs" and "POST" in route.methods
+    )
+    optional_auth = next(
+        dependency.call
+        for dependency in run_route.dependant.dependencies
+        if dependency.name == "auth_context"
+    )
+    optional_auth_default = inspect.signature(run_route.endpoint).parameters["auth_context"].default
+    schema = server.openapi()
+    for path, method, name in expected:
+        route = next(route for route in routes if route.path == prefix + path)
+        if name == "select_eval_baseline":
+            assert (
+                inspect.signature(route.endpoint).parameters["auth_context"].default
+                is optional_auth_default
+            )
+            assert (
+                next(
+                    dependency.call
+                    for dependency in route.dependant.dependencies
+                    if dependency.name == "auth_context"
+                )
+                is optional_auth
+            )
+        else:
+            assert route.dependencies[0].dependency is auth_dependency
+        operation_path = (
+            path.replace("/", "_")
+            .replace("{", "_")
+            .replace("}", "_")
+            .replace(".", "_")
+            .replace("-", "_")
+        )
+        assert schema["paths"][prefix + path][method]["operationId"] == (
+            f"{name}_{operation_prefix}{operation_path}_{method}"
+        )
+
+    calls = []
+
+    def deny_access() -> None:
+        calls.append("denied")
+        raise HTTPException(status_code=403, detail="operator access revoked")
+
+    with TestClient(server) as client:
+        for path, method, _ in expected:
+            response = client.request(
+                method,
+                prefix + path.replace("{result_revision}", "sha256:" + "0" * 64),
+                **({"json": {}} if method == "post" else {}),
+            )
+            assert response.status_code == 401
+        server.dependency_overrides[auth_dependency] = deny_access
+        server.dependency_overrides[optional_auth] = deny_access
+        for path, method, _ in expected:
+            response = client.request(
+                method,
+                prefix + path.replace("{result_revision}", "sha256:" + "0" * 64),
+                headers=_AUTH_HEADERS,
+                **({"json": {}} if method == "post" else {}),
+            )
+            assert response.status_code == 403
+            assert response.json() == {"detail": "operator access revoked"}
+    assert calls == ["denied"] * len(expected)
+
+
+def _save_captured_result(client: TestClient) -> dict:
+    preview = client.post(
+        f"/api/evals/sessions/{_SESSION_ID}/evaluation/preview", headers=_AUTH_HEADERS, json={}
+    )
+    assert preview.status_code == 200
+    candidate = preview.json()["candidate"]
+    saved = client.post(
+        f"/api/evals/sessions/{_SESSION_ID}/evaluation/save",
+        headers=_AUTH_HEADERS,
+        json={"candidate": candidate, "expected_candidate_revision": candidate["revision"]},
+    )
+    assert saved.status_code == 201
+    return saved.json()
+
+
+def test_result_comparison_reuses_one_stored_document_and_private_json_validation(
+    captured_route_server,
+    monkeypatch,
+) -> None:
+    with TestClient(captured_route_server()) as client:
+        saved = _save_captured_result(client)
+        revision = saved["record"]["revision"]
+        comparison = {"baseline_result_revision": revision, "current_result_revision": revision}
+        reads = []
+        original = SQLiteEvalStore.load_result_by_revision
+
+        async def counted_load(store, requested_revision, **kwargs):
+            reads.append(requested_revision)
+            return await original(store, requested_revision, **kwargs)
+
+        monkeypatch.setattr(SQLiteEvalStore, "load_result_by_revision", counted_load)
+        response = client.post(
+            "/api/evals/result-comparisons",
+            headers={**_AUTH_HEADERS, "Content-Type": "application/vnd.cayu+json"},
+            content=json.dumps(comparison),
+        )
+        assert response.status_code == 200
+        assert response.json()["baseline"] == saved["record"]
+        assert response.json()["current"] == saved["record"]
+        assert response.headers["cache-control"] == "private, no-store"
+        assert reads == [revision]
+        for content in (
+            json.dumps(comparison).removesuffix("}")
+            + ',"current_result_revision":"'
+            + revision
+            + '"}',
+            json.dumps(comparison).removesuffix("}") + ',"score_tolerance":NaN}',
+        ):
+            response = client.post(
+                "/api/evals/result-comparisons",
+                headers={**_AUTH_HEADERS, "Content-Type": "application/json"},
+                content=content,
+            )
+            assert response.status_code == 422
+            assert response.json() == {"detail": "Invalid captured evaluation request."}
+            assert response.headers["cache-control"] == "private, no-store"
+        response = client.post(
+            "/api/evals/result-comparisons",
+            headers={**_AUTH_HEADERS, "Content-Type": "text/plain"},
+            content=json.dumps(comparison),
+        )
+        assert response.status_code == 422
+        assert response.json() == {"detail": "Invalid Evals request."}
+        assert reads == [revision]
+
+
+def test_result_reads_reject_mismatched_stored_metadata(captured_route_server, monkeypatch) -> None:
+    with TestClient(captured_route_server()) as client:
+        saved = _save_captured_result(client)
+        revision = saved["record"]["revision"]
+        original = SQLiteEvalStore.load_result_record
+
+        async def mismatched_record(store, requested_revision):
+            record = await original(store, requested_revision)
+            assert record is not None
+            return record.model_copy(update={"document_bytes": record.document_bytes + 1})
+
+        monkeypatch.setattr(SQLiteEvalStore, "load_result_record", mismatched_record)
+        for suffix in ("", "/report.json", "/report.html"):
+            response = client.get(f"/api/evals/results/{revision}{suffix}", headers=_AUTH_HEADERS)
+            assert response.status_code == 409
+            assert response.json() == {
+                "detail": "Eval result catalog metadata does not match its stored document."
+            }
+        response = client.post(
+            "/api/evals/result-comparisons",
+            headers=_AUTH_HEADERS,
+            json={"baseline_result_revision": revision, "current_result_revision": revision},
+        )
+        assert response.status_code == 409
+        assert response.json() == {
+            "detail": "Eval result catalog metadata does not match its stored document."
+        }
+
+
+def test_baseline_selection_preserves_actor_replay_and_generation_conflicts(
+    captured_route_server,
+) -> None:
+    with TestClient(captured_route_server()) as client:
+        saved = _save_captured_result(client)
+        revision = saved["record"]["revision"]
+        path = f"/api/evals/results/{revision}/baseline"
+        body = {
+            "result_revision": revision,
+            "expected_generation": 0,
+            "operation_id": "sha256:" + "1" * 64,
+        }
+        selected = client.post(path, headers=_AUTH_HEADERS, json=body)
+        assert selected.status_code == 200
+        assert selected.json()["baseline"]["generation"] == 1
+        assert selected.json()["baseline"]["updated_by"] == "eval-operator"
+        repeated = client.post(path, headers=_AUTH_HEADERS, json=body)
+        assert repeated.status_code == 200
+        assert repeated.json() == selected.json()
+        stale = client.post(
+            path, headers=_AUTH_HEADERS, json={**body, "operation_id": "sha256:" + "2" * 64}
+        )
+        assert stale.status_code == 409
+        detail = client.get(f"/api/evals/results/{revision}", headers=_AUTH_HEADERS)
+        assert detail.status_code == 200
+        assert detail.json()["baseline"] == selected.json()["baseline"]
+
+
+@pytest.mark.parametrize("with_registry", [False, True], ids=["no-registry", "registry-only"])
+def test_result_routes_require_durable_storage_for_a_configured_registry(
+    captured_route_server, with_registry: bool
+) -> None:
+    server = captured_route_server(with_registry=with_registry, with_store=False)
+    revision = "sha256:" + "0" * 64
+    with TestClient(server) as client:
+        target_key = (
+            client.get("/api/evals/targets", headers=_AUTH_HEADERS).json()["default_target_key"]
+            if with_registry
+            else "unconfigured"
+        )
+        paths = [
+            "/api/evals/results",
+            f"/api/evals/results/{revision}",
+            f"/api/evals/results/{revision}/report.json",
+            f"/api/evals/results/{revision}/report.html",
+        ]
+        for path in paths:
+            response = client.get(
+                path,
+                headers=_AUTH_HEADERS,
+                params={"target_key": target_key} if path == "/api/evals/results" else {},
+            )
+            assert response.status_code == (409 if with_registry else 404)
+        for path, body in [
+            (
+                "/api/evals/result-comparisons",
+                {"baseline_result_revision": revision, "current_result_revision": revision},
+            ),
+            (
+                f"/api/evals/results/{revision}/baseline",
+                {
+                    "result_revision": revision,
+                    "expected_generation": 0,
+                    "operation_id": "sha256:" + "1" * 64,
+                },
+            ),
+        ]:
+            response = client.post(path, headers=_AUTH_HEADERS, json=body)
+            assert response.status_code == (409 if with_registry else 404)
+        declared = {
+            path
+            for path in server.openapi()["paths"]
+            if path.startswith("/api/evals/results") or path == "/api/evals/result-comparisons"
+        }
+        assert bool(declared) is with_registry
 
 
 @pytest.mark.parametrize(
