@@ -1292,8 +1292,19 @@ deliberately *out of scope*:
   `authorization_kind="transport"` and an `error_code` of
   `egress_sidecar_unreachable`, `proxy_broker_failed`, or `proxy_broker_timeout`.
   These records omit request data and exception text. Broker request denials
-  also include their existing response error code, such as `dns_failure` or
-  `fetch_failed`, so exported evidence can distinguish upstream failures.
+  also include their response error code, such as `dns_failure` or `timeout`,
+  in the `X-Cayu-Egress-Error` header, the JSON body's `error.code`, and the
+  audit record, so exported evidence can distinguish upstream failures.
+  Upstream transport failures without a more specific code keep status 502 and
+  are classified from the exception types only (never messages) as
+  `upstream_connect_failed`, `upstream_connection_reset`,
+  `upstream_tls_failed`, `upstream_protocol_error`, `upstream_read_timeout`,
+  or the fallback `upstream_failed`. `upstream_read_timeout` applies only to a
+  read timeout that reaches this generic path, such as one raised directly by
+  a custom upstream; the default `HttpxUpstream` still reports its bounded
+  timeouts as 504 `timeout`.
+  Browser tools continue to report these broker codes as their stable
+  `fetch_failed` result.
 
 ## Credential modes on runners
 

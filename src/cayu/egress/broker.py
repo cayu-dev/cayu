@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import math
+import ssl
 import threading
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -434,6 +435,60 @@ class _UpstreamUnsupportedEncodingError(RuntimeError):
 
 class _UpstreamCapacityError(RuntimeError):
     pass
+
+
+_UpstreamFailureCode = Literal[
+    "upstream_connect_failed",
+    "upstream_connection_reset",
+    "upstream_tls_failed",
+    "upstream_protocol_error",
+    "upstream_read_timeout",
+    "upstream_failed",
+]
+_MAX_UPSTREAM_FAILURE_CHAIN = 16
+
+
+def _upstream_failure_code(error: BaseException) -> _UpstreamFailureCode:
+    """Map an unclassified upstream failure to a stable, content-free code.
+
+    Only exception types are inspected, never messages or arguments. The
+    explicit cause/context chain is walked because transports and the upstream
+    operation machinery may wrap the originating error.
+    """
+
+    chain: list[BaseException] = []
+    current: BaseException | None = error
+    while current is not None and len(chain) < _MAX_UPSTREAM_FAILURE_CHAIN:
+        if any(current is seen for seen in chain):
+            break
+        chain.append(current)
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif current.__suppress_context__:
+            current = None
+        else:
+            current = current.__context__
+    if any(isinstance(item, ssl.SSLError) for item in chain):
+        return "upstream_tls_failed"
+    for item in chain:
+        if isinstance(item, httpx.ReadTimeout):
+            return "upstream_read_timeout"
+        if isinstance(item, (httpx.ConnectError, httpx.ConnectTimeout, ConnectionRefusedError)):
+            return "upstream_connect_failed"
+        if isinstance(item, httpx.ProtocolError):
+            return "upstream_protocol_error"
+        if isinstance(
+            item,
+            (
+                httpx.ReadError,
+                httpx.WriteError,
+                ConnectionResetError,
+                ConnectionAbortedError,
+                BrokenPipeError,
+            ),
+        ):
+            return "upstream_connection_reset"
+    return "upstream_failed"
 
 
 class _QuiescentUpstreamProcessControl(BaseException):
@@ -1524,7 +1579,7 @@ class TransparentEgressBroker:
                 authorization_kind=authorization.authorization_kind,
                 error_code="unsupported_content",
             )
-        except Exception:
+        except Exception as error:
             return self._deny(
                 request,
                 authorization.grant_id,
@@ -1532,7 +1587,7 @@ class TransparentEgressBroker:
                 502,
                 "Upstream request failed.",
                 authorization_kind=authorization.authorization_kind,
-                error_code="fetch_failed",
+                error_code=_upstream_failure_code(error),
             )
         if ensure_authority is not None:
             try:
@@ -1851,7 +1906,7 @@ class TransparentEgressBroker:
                 error_code=error_code,
             )
         )
-        body = json.dumps({"error": {"message": reason}}).encode()
+        body = json.dumps({"error": {"message": reason, "code": error_code}}).encode()
         return CapturedResponse(
             status_code=status_code,
             headers={

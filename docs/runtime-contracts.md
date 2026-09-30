@@ -11931,7 +11931,12 @@ proxy-to-broker call exceptions/timeouts use transport decisions with fixed code
 (`egress_sidecar_unreachable`, `proxy_broker_failed`, `proxy_broker_timeout`) and
 omit request and exception contents. These become `egress.request.denied` events
 through the existing audit sink; upstream denials retain their distinct response
-error codes. Older audit records may lack this field.
+error codes, which the denial body also carries as `error.code`. Otherwise
+unclassified upstream transport failures stay 502 and use a type-derived code:
+`upstream_connect_failed`, `upstream_connection_reset`, `upstream_tls_failed`,
+`upstream_protocol_error`, `upstream_read_timeout`, or `upstream_failed`,
+without request contents or exception text. Older audit records may lack this
+field, and older broker records used `fetch_failed` for the generic path.
 
 An `HttpxUpstream` destination resolver that raises
 `EgressDestinationDeniedError(reason)` produces a `403` `destination_denied`

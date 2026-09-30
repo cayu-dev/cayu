@@ -5,6 +5,7 @@ import base64
 import contextlib
 import gzip
 import json
+import ssl
 import threading
 import time
 import warnings
@@ -382,7 +383,7 @@ def test_revocation_before_prepared_upstream_dispatch_never_starts_operation() -
     response, revoked, dispatches = asyncio.run(run())
 
     assert response.status_code == 502
-    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "fetch_failed"
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "upstream_failed"
     assert revoked == 1
     assert dispatches == []
 
@@ -524,8 +525,8 @@ def test_revocation_arms_every_upstream_settlement_before_waiting() -> None:
 
     assert [response.status_code for response in responses] == [502, 502]
     assert [response.headers[CAYU_EGRESS_ERROR_HEADER] for response in responses] == [
-        "fetch_failed",
-        "fetch_failed",
+        "upstream_failed",
+        "upstream_failed",
     ]
     assert revoked == 1
     assert cancellation_requests == [True, True]
@@ -1047,9 +1048,146 @@ def test_upstream_failure_is_sanitized() -> None:
     )
 
     assert response.status_code == 502
-    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "fetch_failed"
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "upstream_failed"
+    assert json.loads(response.body) == {
+        "error": {"message": "Upstream request failed.", "code": "upstream_failed"}
+    }
+    assert [decision.error_code for decision in decisions] == ["upstream_failed"]
     assert REAL_SECRET not in response.body.decode()
     _no_real_secret(decisions)
+
+
+_UPSTREAM_FAILURE_DETAIL = "upstream-detail-must-not-leak"
+
+
+def _tls_connect_error() -> httpx.ConnectError:
+    try:
+        raise ssl.SSLCertVerificationError(_UPSTREAM_FAILURE_DETAIL)
+    except ssl.SSLError as exc:
+        try:
+            raise httpx.ConnectError(_UPSTREAM_FAILURE_DETAIL) from exc
+        except httpx.ConnectError as wrapped:
+            return wrapped
+
+
+@pytest.mark.parametrize(
+    ("make_error", "error_code"),
+    [
+        (lambda: httpx.ConnectError(_UPSTREAM_FAILURE_DETAIL), "upstream_connect_failed"),
+        (lambda: httpx.ReadError(_UPSTREAM_FAILURE_DETAIL), "upstream_connection_reset"),
+        (lambda: httpx.WriteError(_UPSTREAM_FAILURE_DETAIL), "upstream_connection_reset"),
+        (
+            lambda: httpx.RemoteProtocolError(_UPSTREAM_FAILURE_DETAIL),
+            "upstream_protocol_error",
+        ),
+        (_tls_connect_error, "upstream_tls_failed"),
+        (lambda: ValueError(_UPSTREAM_FAILURE_DETAIL), "upstream_failed"),
+    ],
+)
+def test_httpx_upstream_transport_failure_is_classified_without_detail(
+    make_error: Any,
+    error_code: str,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise make_error()
+
+    upstream = HttpxUpstream(
+        transport=httpx.MockTransport(handler),
+        destination_resolver=_destination_resolver("93.184.216.34"),
+    )
+    broker, registry, _resolver, decisions = _build(upstream=upstream)
+    grant = _mint(registry)
+
+    response = asyncio.run(
+        broker.handle_request(_request(grant.presented_value, "/v1/customers", {"email": "a@b.co"}))
+    )
+
+    assert response.status_code == 502
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == error_code
+    assert json.loads(response.body) == {
+        "error": {"message": "Upstream request failed.", "code": error_code}
+    }
+    assert len(decisions) == 1
+    decision = decisions[0]
+    assert decision.allowed is False
+    assert decision.status_code == 502
+    assert decision.error_code == error_code
+    assert decision.reason == "Upstream request failed."
+    for rendered in (response.body.decode(), str(asdict(decision))):
+        assert _UPSTREAM_FAILURE_DETAIL not in rendered
+        assert "a@b.co" not in rendered
+        assert REAL_SECRET not in rendered
+
+
+def test_httpx_upstream_read_timeout_keeps_existing_timeout_classification() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout(_UPSTREAM_FAILURE_DETAIL)
+
+    upstream = HttpxUpstream(
+        transport=httpx.MockTransport(handler),
+        destination_resolver=_destination_resolver("93.184.216.34"),
+    )
+    broker, registry, _resolver, decisions = _build(upstream=upstream)
+    grant = _mint(registry)
+
+    response = asyncio.run(broker.handle_request(_request(grant.presented_value, "/v1/customers")))
+
+    assert response.status_code == 504
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "timeout"
+    assert [decision.error_code for decision in decisions] == ["timeout"]
+
+
+def test_custom_upstream_read_timeout_is_classified_on_generic_path() -> None:
+    class _ReadTimeoutUpstream:
+        def prepare(
+            self,
+            request: CapturedRequest,
+            *,
+            limits: EgressUpstreamLimits,
+        ) -> EgressUpstreamOperation:
+            async def send() -> CapturedResponse:
+                raise httpx.ReadTimeout(_UPSTREAM_FAILURE_DETAIL)
+
+            return EgressUpstreamOperation(send)
+
+    broker, registry, _resolver, decisions = _build(upstream=_ReadTimeoutUpstream())
+    grant = _mint(registry)
+
+    response = asyncio.run(broker.handle_request(_request(grant.presented_value, "/v1/customers")))
+
+    assert response.status_code == 502
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "upstream_read_timeout"
+    assert [decision.error_code for decision in decisions] == ["upstream_read_timeout"]
+    assert _UPSTREAM_FAILURE_DETAIL not in response.body.decode()
+
+
+def test_upstream_failure_classification_follows_wrapped_os_errors() -> None:
+    def wrapped(inner: BaseException) -> RuntimeError:
+        try:
+            raise inner
+        except BaseException as exc:
+            try:
+                raise RuntimeError(_UPSTREAM_FAILURE_DETAIL) from exc
+            except RuntimeError as outer:
+                return outer
+
+    assert (
+        broker_module._upstream_failure_code(wrapped(ConnectionResetError()))
+        == "upstream_connection_reset"
+    )
+    assert (
+        broker_module._upstream_failure_code(wrapped(ConnectionRefusedError()))
+        == "upstream_connect_failed"
+    )
+    assert broker_module._upstream_failure_code(wrapped(ssl.SSLError())) == "upstream_tls_failed"
+    suppressed = RuntimeError("outer")
+    suppressed.__context__ = ConnectionResetError()
+    suppressed.__suppress_context__ = True
+    assert broker_module._upstream_failure_code(suppressed) == "upstream_failed"
+    cyclic = RuntimeError("cycle")
+    cyclic.__cause__ = RuntimeError("peer")
+    cyclic.__cause__.__cause__ = cyclic
+    assert broker_module._upstream_failure_code(cyclic) == "upstream_failed"
 
 
 def test_successful_upstream_cannot_spoof_internal_broker_diagnostic() -> None:
@@ -1422,7 +1560,10 @@ def test_resolver_denial_returns_403_destination_denied_without_contacting_upstr
     assert response.status_code == 403
     assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "destination_denied"
     assert json.loads(response.body) == {
-        "error": {"message": "Benchmark answer sources are excluded."}
+        "error": {
+            "message": "Benchmark answer sources are excluded.",
+            "code": "destination_denied",
+        }
     }
     denial = decisions[-1]
     assert denial.allowed is False
