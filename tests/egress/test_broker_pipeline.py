@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextlib
 import gzip
+import json
 import threading
 import time
 import warnings
@@ -26,6 +27,7 @@ from cayu.egress import (
     CapturedRequest,
     CapturedResponse,
     EgressDecision,
+    EgressDestinationDeniedError,
     EgressPolicy,
     EgressUpstreamLimits,
     EgressUpstreamOperation,
@@ -35,6 +37,7 @@ from cayu.egress import (
     VirtualCredentialRegistry,
 )
 from cayu.egress.broker import CAYU_EGRESS_ERROR_HEADER
+from cayu.egress.errors import MAX_EGRESS_DESTINATION_DENIED_REASON_CHARS
 from cayu.vaults import ResolvedSecret, SecretRef, StaticVault
 
 REAL_SECRET = "sk_test_51RealDeadBeefSecretValue"
@@ -1393,6 +1396,82 @@ def test_broker_classifies_upstream_dns_failure_without_contacting_transport() -
     assert response.status_code == 502
     assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "dns_failure"
     assert transport_called is False
+
+
+def _failing_transport() -> httpx.MockTransport:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("A denied destination must not contact the upstream.")
+
+    return httpx.MockTransport(handler)
+
+
+def test_resolver_denial_returns_403_destination_denied_without_contacting_upstream() -> None:
+    resolved: list[tuple[str, int]] = []
+
+    async def deny(host: str, port: int) -> tuple[str, ...]:
+        resolved.append((host, port))
+        raise EgressDestinationDeniedError("Benchmark answer sources are excluded.")
+
+    upstream = HttpxUpstream(transport=_failing_transport(), destination_resolver=deny)
+    broker, registry, _resolver, decisions = _build(upstream=upstream)
+    grant = _mint(registry)
+
+    response = asyncio.run(broker.handle_request(_request(grant.presented_value, "/v1/customers")))
+
+    assert resolved == [("api.stripe.com", 443)]
+    assert response.status_code == 403
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "destination_denied"
+    assert json.loads(response.body) == {
+        "error": {"message": "Benchmark answer sources are excluded."}
+    }
+    denial = decisions[-1]
+    assert denial.allowed is False
+    assert denial.status_code == 403
+    assert denial.error_code == "destination_denied"
+    assert denial.reason == "Benchmark answer sources are excluded."
+
+
+def test_resolver_os_error_remains_502_dns_failure() -> None:
+    async def fail(_host: str, _port: int) -> tuple[str, ...]:
+        raise OSError("temporary failure in name resolution")
+
+    upstream = HttpxUpstream(transport=_failing_transport(), destination_resolver=fail)
+    broker, registry, _resolver, decisions = _build(upstream=upstream)
+    grant = _mint(registry)
+
+    response = asyncio.run(broker.handle_request(_request(grant.presented_value, "/v1/customers")))
+
+    assert response.status_code == 502
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "dns_failure"
+    assert decisions[-1].error_code == "dns_failure"
+
+
+def test_resolver_denial_reason_is_bounded_single_line_text() -> None:
+    long_reason = "blocked\n\x1b[31m" + "x" * 5000
+    error = EgressDestinationDeniedError(long_reason)
+
+    assert len(error.reason) == MAX_EGRESS_DESTINATION_DENIED_REASON_CHARS
+    assert error.reason.startswith("blocked [31mx")
+    assert error.reason.endswith("...")
+    assert error.reason.isprintable()
+    assert EgressDestinationDeniedError(" \n\t ").reason == (
+        "Upstream destination is denied by application policy."
+    )
+    with pytest.raises(TypeError):
+        EgressDestinationDeniedError(b"blocked")  # type: ignore[arg-type]
+
+    async def deny(_host: str, _port: int) -> tuple[str, ...]:
+        raise EgressDestinationDeniedError(long_reason)
+
+    upstream = HttpxUpstream(transport=_failing_transport(), destination_resolver=deny)
+    broker, registry, _resolver, decisions = _build(upstream=upstream)
+    grant = _mint(registry)
+
+    response = asyncio.run(broker.handle_request(_request(grant.presented_value, "/v1/customers")))
+
+    assert response.status_code == 403
+    assert json.loads(response.body)["error"]["message"] == error.reason
+    assert decisions[-1].reason == error.reason
 
 
 def test_broker_classifies_prohibited_upstream_destination() -> None:

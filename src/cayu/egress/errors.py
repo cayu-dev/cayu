@@ -8,6 +8,40 @@ class EgressError(RuntimeError):
     """Base error for the virtual egress subsystem."""
 
 
+MAX_EGRESS_DESTINATION_DENIED_REASON_CHARS = 200
+_DEFAULT_DESTINATION_DENIED_REASON = "Upstream destination is denied by application policy."
+
+
+class EgressDestinationDeniedError(EgressError):
+    """An application destination resolver refused to resolve an upstream host.
+
+    Raise this from an ``HttpxUpstream(destination_resolver=...)`` callable to
+    express a deliberate policy refusal. The broker answers ``403`` with
+    ``error_code="destination_denied"`` and never contacts the upstream, unlike
+    ``OSError`` or other resolution failures, which remain ``502``
+    ``dns_failure``. ``reason`` is returned to the caller and recorded in the
+    egress audit event, so it must not contain secrets. It is normalized to
+    printable single-line text of at most
+    ``MAX_EGRESS_DESTINATION_DENIED_REASON_CHARS`` characters.
+    """
+
+    def __init__(self, reason: str = _DEFAULT_DESTINATION_DENIED_REASON) -> None:
+        if not isinstance(reason, str):
+            raise TypeError("reason must be a string.")
+        self.reason = _bounded_denial_reason(reason)
+        super().__init__(self.reason)
+
+
+def _bounded_denial_reason(reason: str) -> str:
+    printable = "".join(char if char.isprintable() else " " for char in reason)
+    normalized = " ".join(printable.split())
+    if not normalized:
+        return _DEFAULT_DESTINATION_DENIED_REASON
+    if len(normalized) > MAX_EGRESS_DESTINATION_DENIED_REASON_CHARS:
+        return normalized[: MAX_EGRESS_DESTINATION_DENIED_REASON_CHARS - 3].rstrip() + "..."
+    return normalized
+
+
 class UnsupportedEgressError(EgressError):
     """A runner cannot enforce or capture egress for ``virtual_egress``.
 

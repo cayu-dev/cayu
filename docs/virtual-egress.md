@@ -386,6 +386,29 @@ hard 64 MiB ceiling. An origin that ignores the identity request is rejected
 before body iteration, so compressed expansion cannot cross the buffering
 boundary.
 
+An application-owned `HttpxUpstream(destination_resolver=...)` callable can
+refuse a host as a deliberate policy decision by raising
+`EgressDestinationDeniedError(reason)` from `cayu.egress`:
+
+```python
+from cayu.egress import EgressDestinationDeniedError, HttpxUpstream
+
+async def resolve(host: str, port: int) -> list[str]:
+    if host in EXCLUDED_HOSTS:
+        raise EgressDestinationDeniedError("Benchmark answer sources are excluded.")
+    return await resolve_public(host, port)
+
+upstream = HttpxUpstream(destination_resolver=resolve)
+```
+
+The broker answers `403` with `error_code="destination_denied"`, puts the reason
+in the denial body and the `egress.request.denied` audit event, and never
+contacts the upstream. Clients can therefore treat the refusal as final instead
+of retrying it. The reason must not contain secrets; Cayu normalizes it to
+printable single-line text of at most 200 characters. A resolver `OSError` keeps
+the `502` `dns_failure` response, and other resolver exceptions remain `502`
+upstream failures.
+
 Credentialed and credentialless declarations can be combined in one factory.
 The adapter receives the union of their hostnames for enforcement preflight,
 while only `VirtualCredentialSpec` entries create guest credential values. A

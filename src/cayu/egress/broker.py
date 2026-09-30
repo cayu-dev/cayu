@@ -39,7 +39,7 @@ from cayu.egress.destinations import (
     normalize_egress_hostname,
     validate_approved_destinations,
 )
-from cayu.egress.errors import VirtualCredentialError
+from cayu.egress.errors import EgressDestinationDeniedError, VirtualCredentialError
 from cayu.egress.grants import VirtualCredentialGrant, VirtualCredentialRegistry
 from cayu.egress.policy import (
     BrowserEgressPolicy,
@@ -741,6 +741,8 @@ class HttpxUpstream:
                         cancellation=outcome.cancellation,
                     )
                     raise cancellation
+        except EgressDestinationDeniedError:
+            raise
         except OSError as exc:
             raise _UpstreamDnsError("Upstream destination resolution failed.") from exc
         if not addresses:
@@ -1469,6 +1471,16 @@ class TransparentEgressBroker:
                 authorization.policy_name,
                 403,
                 "Upstream destination is not publicly routable.",
+                authorization_kind=authorization.authorization_kind,
+                error_code="destination_denied",
+            )
+        except EgressDestinationDeniedError as exc:
+            return self._deny(
+                request,
+                authorization.grant_id,
+                authorization.policy_name,
+                403,
+                exc.reason,
                 authorization_kind=authorization.authorization_kind,
                 error_code="destination_denied",
             )

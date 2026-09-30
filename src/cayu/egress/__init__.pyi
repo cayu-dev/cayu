@@ -51,6 +51,7 @@ from cayu.egress.errors import EgressAuthorityCutoverError as EgressAuthorityCut
 from cayu.egress.errors import (
     EgressAuthorityCutoverNeedsAttention as EgressAuthorityCutoverNeedsAttention,
 )
+from cayu.egress.errors import EgressDestinationDeniedError as EgressDestinationDeniedError
 from cayu.egress.errors import EgressError as EgressError
 from cayu.egress.errors import EgressReconnectConflictError as EgressReconnectConflictError
 from cayu.egress.errors import EgressReconnectError as EgressReconnectError

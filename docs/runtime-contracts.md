@@ -11933,6 +11933,12 @@ omit request and exception contents. These become `egress.request.denied` events
 through the existing audit sink; upstream denials retain their distinct response
 error codes. Older audit records may lack this field.
 
+An `HttpxUpstream` destination resolver that raises
+`EgressDestinationDeniedError(reason)` produces a `403` `destination_denied`
+denial whose bounded, non-secret reason appears in the response body and audit
+decision; the upstream is not contacted. A resolver `OSError` remains `502`
+`dns_failure`.
+
 `DockerRunner.create(seccomp_profile=...)` accepts an explicit absolute host
 path for a Docker seccomp profile; `DockerEgressAdapter` forwards the same
 setting to its workload container. Cayu resolves the path, requires an existing
