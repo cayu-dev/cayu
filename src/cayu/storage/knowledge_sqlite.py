@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 import sqlite3
@@ -70,6 +69,7 @@ from cayu.storage._knowledge_closure import (
     KnowledgeClosureQuery,
     copy_knowledge_closure_query,
 )
+from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_LIMIT,
     KNOWLEDGE_CHUNK_TEXT_PROJECTION,
@@ -261,7 +261,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         )
         self._clock = utc_clock(clock)
         self._schema_mode = schema_mode
-        self._lock = asyncio.Lock()
+        self._lock = TimedStoreLock()
         self._connection = sqlite_support.connect(db_path)
         try:
             sqlite_support.reconcile_schema(

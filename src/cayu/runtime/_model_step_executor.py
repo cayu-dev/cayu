@@ -304,6 +304,7 @@ from cayu.runtime._model_failover import (
 )
 from cayu.runtime._model_failover_stage import model_failover_target_for_stored_stage
 from cayu.runtime._model_target import project_portable_transcript
+from cayu.runtime._phase_timing import timed_model_step, timed_phase
 from cayu.runtime._provider_cleanup_evidence import local_http_cleanup_event_id
 from cayu.runtime._provider_operation_cancellation_claim import (
     ProviderOperationCancellationClaim,
@@ -6643,6 +6644,7 @@ class ModelStepExecutor:
             return None
         return PromptContributionManifest.model_validate(payload)
 
+    @timed_phase("counting")
     async def _observe_context_pressure(
         self,
         *,
@@ -6697,6 +6699,7 @@ class ModelStepExecutor:
         )
         return observation, event
 
+    @timed_phase("counting")
     async def _observe_context_count(
         self,
         *,
@@ -9630,6 +9633,7 @@ class ModelStepRun:
                 )
             raise cancellation from authoritative_failure
 
+    @timed_model_step
     async def execute(
         self,
         *,
@@ -13716,6 +13720,7 @@ class ModelStepRun:
         targeted_tool_native: TargetedToolProjectionRequest | None,
         tool_discovery_native_tool_names: tuple[str, ...],
     ) -> Callable[[list[Message]], Awaitable[int | None]]:
+        @timed_phase("counting")
         async def count_input_tokens(context_messages: list[Message]) -> int | None:
             request = await self._executor.build_request(
                 session=self._session,
@@ -15150,6 +15155,7 @@ def _context_pressure_overhead(
     )
 
 
+@timed_phase("context_policy")
 async def _build_context(
     *,
     context_policy: ContextPolicy,

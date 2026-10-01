@@ -35,6 +35,7 @@ from cayu._validation import (
 )
 from cayu.events import Event, EventType, copy_event
 from cayu.failure_evidence import FailureEvidence
+from cayu.runtime._phase_timing import timed_phase
 from cayu.runtime.tool_effects import (
     ToolEffectConflict,
     ToolEffectReceipt,
@@ -443,6 +444,7 @@ class ToolEffectStateOwner:
             raise ToolEffectConflict("Unresolved effect has no exact uncertainty event.")
         return [found[call_id] for call_id in expected]
 
+    @timed_phase("effect_state")
     async def resolve_call(
         self,
         session: Session,
@@ -465,6 +467,7 @@ class ToolEffectStateOwner:
             raise ToolEffectConflict("Stored effect record conflicts with its call scope.")
         return record
 
+    @timed_phase("effect_state")
     async def preserve_unresolved(
         self,
         session: Session,
@@ -508,6 +511,7 @@ class ToolEffectStateOwner:
             unresolved = True
         return unresolved
 
+    @timed_phase("effect_state")
     async def require_unverified_recovery_allowed(
         self,
         session: Session,
@@ -546,6 +550,7 @@ class ToolEffectStateOwner:
             raise ToolEffectConflict("Stored effect intent differs from the expected call.")
         return record
 
+    @timed_phase("effect_state")
     async def prepare(
         self,
         intent: ToolEffectIntent,
@@ -566,6 +571,7 @@ class ToolEffectStateOwner:
             child_recovery_arguments=child_recovery_arguments,
         )
 
+    @timed_phase("effect_state")
     async def begin(
         self,
         intent: ToolEffectIntent,
@@ -584,6 +590,7 @@ class ToolEffectStateOwner:
         )
         return await self.transition(prepared, state="executing", run_epoch=run_epoch)
 
+    @timed_phase("effect_state")
     async def start_reconciliation(
         self,
         expected: ToolEffectRecord,
@@ -618,6 +625,7 @@ class ToolEffectStateOwner:
             events=(event,),
         )
 
+    @timed_phase("effect_state")
     async def transition(
         self,
         expected: ToolEffectRecord,

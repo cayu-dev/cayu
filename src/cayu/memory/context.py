@@ -104,6 +104,7 @@ from cayu.runtime._memory_evidence import (
     recall_receipt_document_sha256,
     recall_receipt_manifest_binding_hmac_sha256,
 )
+from cayu.runtime._phase_timing import timed_phase
 from cayu.runtime.recall_sources import (
     AutomaticRecallSourceRegistration,
     _FactoryRecallSource,
@@ -848,6 +849,7 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
             state=state,
         )
 
+    @timed_phase("recall")
     async def _recall_for_interaction(
         self,
         request: ContextRequest,
@@ -1098,6 +1100,7 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
         )
         return state, admission_payload
 
+    @timed_phase("recall")
     async def _maybe_append_delta(
         self,
         request: ContextRequest,
@@ -1557,6 +1560,7 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
             "memory_delta_trigger_sha256": trigger.fingerprint(),
         }
 
+    @timed_phase("recall")
     async def _maybe_append_reanchor(
         self,
         request: ContextRequest,

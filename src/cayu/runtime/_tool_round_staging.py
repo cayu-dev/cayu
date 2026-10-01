@@ -46,6 +46,7 @@ from cayu.runtime import _web_access_results as web_access_results
 from cayu.runtime._assistant_tool_round_publication import validate_tool_exposure_terminal_event
 from cayu.runtime._event_writer import prepare_runtime_event
 from cayu.runtime._invocation_lifecycle import InvocationContext
+from cayu.runtime._phase_timing import current_builder, timed_phase
 from cayu.runtime._tool_effect_state import (
     ToolEffectReconciliationRequired,
     ToolEffectStateOwner,
@@ -359,11 +360,16 @@ class _ToolRoundPublicationCoordinator:
             self._execution_profile_fingerprint,
         )
 
+    @timed_phase("publication")
     async def start_publication(
         self,
         staged: tool_round_recovery.StagedToolCallTerminal,
     ) -> tool_round_recovery.StagedToolCallTerminal:
         """Durably pin public timing before the first append attempt."""
+
+        builder = current_builder()
+        if builder is not None:
+            builder.mark_publication_started(staged.tool_call_id)
 
         effect_completed_at = _normalized_event_timestamp(
             staged.effect_completed_at or staged.event.timestamp
@@ -463,6 +469,7 @@ class _ToolRoundPublicationCoordinator:
             raise RuntimeError("Staged terminal event conflicts with its publication timing.")
         return event_with_runtime_payload_authority(restored, *expected)
 
+    @timed_phase("staging")
     async def register_redactor(
         self,
         *,
@@ -482,6 +489,7 @@ class _ToolRoundPublicationCoordinator:
                 ),
             )
 
+    @timed_phase("staging")
     async def seal_call(
         self,
         *,
@@ -504,6 +512,7 @@ class _ToolRoundPublicationCoordinator:
                 ),
             )
 
+    @timed_phase("staging")
     async def stage_terminal(
         self,
         *,
@@ -527,6 +536,9 @@ class _ToolRoundPublicationCoordinator:
             raise outcome.error
         if outcome.result is None:  # pragma: no cover - owned task invariant
             raise RuntimeError("Staged terminal publication returned no durable event.")
+        builder = current_builder()
+        if builder is not None:
+            builder.mark_staged(tool_call_id, outcome.result)
         if outcome.cancellation is not None:
             restore_task_cancellation_requests(
                 outcome.cancellation_requests_consumed,
@@ -736,16 +748,19 @@ class _ToolRoundPublicationCoordinator:
         self._stage_attempted_event_ids.discard(stored.event.id)
         self._staged_event_ids.add(stored.event.id)
 
+    @timed_phase("staging")
     async def record_projected_terminal(self, event: Event) -> Event:
         """Persist a public projection while retaining its current hook state."""
 
         return await self._persist_projected_terminal(event, hooks_completed=False)
 
+    @timed_phase("staging")
     async def record_workspace_capture(self, event: Event) -> Event:
         """Persist final workspace-capture controls on an owned terminal stage."""
 
         return await self._persist_projected_terminal(event, hooks_completed=False)
 
+    @timed_phase("staging")
     async def complete_terminal_hooks(self, event: Event) -> Event:
         """Persist the final hook projection and mark its hooks complete."""
 

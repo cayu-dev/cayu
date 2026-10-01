@@ -65,6 +65,7 @@ from cayu.sessions.base import (
 from cayu.storage import _creation_fence
 from cayu.storage._context_selection_fence import PostgresContextSelectionFenceMixin
 from cayu.storage._creation_fence import PostgresCreationFenceMixin
+from cayu.storage._phase_timing import PostgresTimingScope, timed_postgres_connection
 from cayu.storage._session_execution import POSTGRES_EXECUTION_DDL, PostgresSessionExecutionMixin
 
 if TYPE_CHECKING:
@@ -6614,7 +6615,7 @@ class _PostgresStoreBase:
 
     @asynccontextmanager
     async def _connection(self) -> AsyncIterator[Any]:
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             if self._read_only:
                 # Keep the guard in the same transaction as the store operation.
                 # Session defaults are not stable behind transaction-pooled PgBouncer.
@@ -6697,7 +6698,7 @@ class _PostgresStoreBase:
             concurrent_revision: schema.Revision | None = None
             concurrent_indexes: tuple[_ConcurrentIndexMigration, ...] = ()
             recorded_indexes: tuple[_ConcurrentIndexMigration, ...] = ()
-            async with self._pool.connection() as conn:
+            async with PostgresTimingScope(self._pool.connection()) as conn:
                 async with conn.cursor() as cur:
                     await _acquire_schema_transaction_lock(conn, cur)
                     # Resolve the exact input and every clean-break refusal
@@ -6963,7 +6964,7 @@ class _PostgresStoreBase:
             if concurrent_revision is None:
                 if not pending:
                     for index in recorded_indexes:
-                        async with self._pool.connection() as conn:
+                        async with PostgresTimingScope(self._pool.connection()) as conn:
                             await self._ensure_concurrent_index(conn, index)
                     return
                 continue
@@ -6972,7 +6973,7 @@ class _PostgresStoreBase:
                 await self._backfill_revision_seventeen()
 
             for index in concurrent_indexes:
-                async with self._pool.connection() as conn:
+                async with PostgresTimingScope(self._pool.connection()) as conn:
                     await self._ensure_concurrent_index(
                         conn,
                         index,
@@ -6982,7 +6983,7 @@ class _PostgresStoreBase:
             # Record the revision only after every non-transactional object is
             # valid. A competing migrator may have recorded it while this process
             # built or waited for the same index, so re-read under the xact lock.
-            async with self._pool.connection() as conn, conn.cursor() as cur:
+            async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
                 await _acquire_schema_transaction_lock(conn, cur)
                 await self._preflight_migration_authority(cur)
                 state = await self._read_schema_state(cur)
@@ -7090,7 +7091,7 @@ class _PostgresStoreBase:
     ) -> None:
         after_session_id: str | None = None
         while True:
-            async with self._pool.connection() as conn, conn.cursor() as cur:
+            async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
                 await cur.execute(
                     cast("LiteralString", batch_sql),
                     (after_session_id, after_session_id),
@@ -7118,7 +7119,7 @@ class _PostgresStoreBase:
     ) -> None:
         after_sequence = 0
         while True:
-            async with self._pool.connection() as conn, conn.cursor() as cur:
+            async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
                 await cur.execute(cast("LiteralString", batch_sql), (after_sequence,))
                 updated = await cur.fetchall()
                 if updated:
@@ -13334,7 +13335,7 @@ class PostgresEventWatcherStore(_PostgresStoreBase, EventWatcherStore):
     async def load_state(self, watcher_name: str) -> EventWatcherState:
         watcher_name = require_clean_nonblank(watcher_name, "watcher_name")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await cur.execute(
                 """
                 SELECT
@@ -13381,7 +13382,7 @@ class PostgresEventWatcherStore(_PostgresStoreBase, EventWatcherStore):
         record = copy_event_watcher_record(record)
         max_attempts = validate_watcher_max_attempts(max_attempts)
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             state = await self._load_watcher_state_for_update(
                 cur, watcher_name, now=await self._watcher_database_now(cur)
             )
@@ -13404,7 +13405,7 @@ class PostgresEventWatcherStore(_PostgresStoreBase, EventWatcherStore):
     ) -> EventWatcherClaim:
         claim = copy_event_watcher_claim(claim)
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             state = await self._load_watcher_state_for_update(
                 cur, claim.watcher_name, now=await self._watcher_database_now(cur)
             )
@@ -13444,7 +13445,7 @@ class PostgresEventWatcherStore(_PostgresStoreBase, EventWatcherStore):
     ) -> EventWatcherDelivery:
         claim = copy_event_watcher_claim(claim)
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             state = await self._load_watcher_state_for_update(
                 cur, claim.watcher_name, now=await self._watcher_database_now(cur)
             )
@@ -13498,7 +13499,7 @@ class PostgresEventWatcherStore(_PostgresStoreBase, EventWatcherStore):
         limit = _validate_dead_letter_limit(limit)
         await self._ensure_ready()
         clause = "" if include_resolved else "AND resolved_at IS NULL"
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await cur.execute(
                 f"""
                 SELECT
@@ -13529,7 +13530,7 @@ class PostgresEventWatcherStore(_PostgresStoreBase, EventWatcherStore):
         event_sequence = _validate_event_sequence(event_sequence)
         await self._ensure_ready()
         now = datetime.now(UTC)
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await cur.execute(
                 """
                 SELECT
@@ -13748,7 +13749,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
             binding_id, authority_digest, allowance
         )
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await cur.execute(
                 "SELECT authority_digest, allowance FROM cayu_budget_bindings WHERE binding_id = %s",
                 (binding_id,),
@@ -13765,7 +13766,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         binding_id = require_clean_nonblank(binding_id, "binding_id")
         authority_digest = require_clean_nonblank(authority_digest, "authority_digest")
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -13818,7 +13819,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         )
         publication_id = require_clean_nonblank(publication_id, "publication_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -13874,7 +13875,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         """Reserve all ceilings in one PostgreSQL transaction."""
         members = prepare_batch(members)
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     for member in sorted(members, key=lambda item: item.limit.budget_limit_id):
@@ -13999,7 +14000,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
         durable_billing_identity = copy_billing_identity(billing_identity)
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -14119,7 +14120,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
             pg_support.to_utc(dispatched_at) if dispatched_at is not None else None
         )
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     records_by_id = {
@@ -14187,7 +14188,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         reason = require_clean_nonblank(reason, "reason")
         released_at = pg_support.to_utc(occurred_at) if occurred_at is not None else self._clock()
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     records_by_id = {
@@ -14235,7 +14236,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
     async def heartbeat(self, *, reservation_id: str) -> bool:
         reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     record = await self._load_record(cur, reservation_id)
@@ -14270,7 +14271,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         actual_amount = _validate_amount(actual_amount, "actual_amount")
         reconciled_at = pg_support.to_utc(occurred_at) if occurred_at is not None else self._clock()
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     record = await self._reconcilable_record_for_update(cur, reservation_id)
@@ -14308,7 +14309,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         reason = require_clean_nonblank(reason, "reason")
         released_at = pg_support.to_utc(occurred_at) if occurred_at is not None else self._clock()
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     record = await self._releasable_record_for_update(cur, reservation_id)
@@ -14335,7 +14336,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
     async def load_settlement(self, settlement_id: str) -> BudgetSettlementRecord | None:
         settlement_id = require_clean_nonblank(settlement_id, "settlement_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await cur.execute(
                 """
                 SELECT settlement_json, event_published
@@ -14353,7 +14354,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
     ) -> BudgetReservationRecord | None:
         reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             try:
                 record = await self._load_record(cur, reservation_id, for_update=False)
             except KeyError:
@@ -14368,7 +14369,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         session_id = require_clean_nonblank(session_id, "session_id")
         after, limit = reservation_scan_bounds(after, limit)
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             await cur.execute(
                 "SELECT reservation_id FROM cayu_budget_reservations "
@@ -14390,7 +14391,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         after = _copy_budget_settlement_cursor(after)
         limit = _validate_settlement_page_limit(limit)
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             filters = ["NOT event_published"]
             parameters: list[object] = []
             if session_id is not None:
@@ -14432,7 +14433,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         settlement_id = require_clean_nonblank(settlement_id, "settlement_id")
         event_id = require_clean_nonblank(event_id, "event_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -15055,12 +15056,12 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
 
     @asynccontextmanager
     async def _mutation_cursor(self) -> AsyncIterator[Any]:
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection(), raw=True) as conn:
             _require_quiescent_postgres_mutation_connection(
                 conn,
                 boundary_name="work-context",
             )
-            async with conn.cursor() as cur:
+            async with timed_postgres_connection(conn).cursor() as cur:
                 yield cur
 
     async def publish_work_context(
@@ -15175,7 +15176,7 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
         if revision is not None:
             _positive_revision(revision, "revision")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             context = await self._load_context(cur, task_id, revision=revision)
             return None if context is None else copy_agent_work_context(context)
 
@@ -15185,7 +15186,7 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
     ) -> AgentWorkContextPublicationReceipt | None:
         operation_id = _bounded_identity(operation_id, "operation_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             receipt = await self._load_publication(cur, operation_id)
             return None if receipt is None else copy_agent_work_context_publication_receipt(receipt)
 
@@ -15251,7 +15252,7 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
         if revision is not None:
             _positive_revision(revision, "revision")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             checkpoint = await self._load_checkpoint(cur, key, revision=revision)
             return None if checkpoint is None else copy_agent_recall_checkpoint(checkpoint)
 
@@ -15356,7 +15357,7 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
     ) -> AgentRecallDeliveryRecord | None:
         delivery_id = _bounded_identity(delivery_id, "delivery_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             record = await self._load_delivery(cur, delivery_id)
             return None if record is None else copy_agent_recall_delivery_record(record)
 
@@ -15765,7 +15766,7 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
         if revision is not None:
             _positive_revision(revision, "revision")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             subscription = await self._load_subscription(
                 cur,
                 subscription_id,
@@ -16163,7 +16164,7 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
     ) -> AgentRecallSubscriptionEvaluation | None:
         evaluation_id = _bounded_identity(evaluation_id, "evaluation_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             evaluation = await self._load_subscription_evaluation(cur, evaluation_id)
             return (
                 None
@@ -16286,7 +16287,7 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
     ) -> AgentRecallSubscriptionWake | None:
         wake_id = _bounded_identity(wake_id, "wake_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             wake = await self._load_subscription_wake(cur, wake_id)
             return None if wake is None else copy_agent_recall_subscription_wake(wake)
 
@@ -17316,7 +17317,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             chunks=copied_chunks,
         )
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     # Every mutation acquires identity categories in the same
@@ -17393,7 +17394,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         entry = copy_knowledge_entry(entry)
         _validate_revision_append(entry, expected_revision=expected_revision)
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     await _lock_knowledge_entry(cur, entry.id)
@@ -17430,7 +17431,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         if max_bytes is not None:
             _validate_positive_int(max_bytes, "max_bytes")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             access_now = datetime.now(UTC)
             if max_bytes is None:
@@ -17500,7 +17501,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         )
         expected_labels = copy_label_map(expected_labels or {}, "expected_labels")
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     await _lock_knowledge_entry(cur, entry_id)
@@ -17581,7 +17582,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         if type(hard) is not bool:
             raise ValueError("`hard` must be a boolean.")
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     await _lock_knowledge_entry(cur, entry_id)
@@ -17707,7 +17708,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             else ""
         )
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -17819,7 +17820,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 access_scope=scope,
             )
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     await _lock_knowledge_write_identities(cur, operation_ids=(operation_id,))
@@ -18006,7 +18007,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         operation_id = _knowledge_publication_operation_id(operation_id)
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             receipt = await self._load_publication_receipt_in_scope(cur, operation_id, scope)
         return None if receipt is None else copy_knowledge_publication_receipt(receipt)
 
@@ -18020,7 +18021,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         operation_id = _knowledge_publication_operation_id(operation_id)
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             receipt = await self._load_activation_receipt(
                 cur,
@@ -18050,7 +18051,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         )
         expected_labels = copy_label_map(expected_labels or {}, "expected_labels")
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     await _lock_knowledge_write_identities(
@@ -18209,7 +18210,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             operation_id=operation_id,
         )
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     await _lock_knowledge_relation_write_identities(
@@ -18378,7 +18379,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         operation_id = _knowledge_relation_identity(operation_id, "operation_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             receipt = await self._load_relation_receipt(
                 cur,
                 operation_id,
@@ -18399,7 +18400,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         fingerprint = _knowledge_relation_query_fingerprint(query, scope)
         cursor = _decode_knowledge_relation_cursor(query.cursor, fingerprint=fingerprint)
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             reference = await self._load_entry_in_scope(
                 cur,
@@ -18489,7 +18490,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         )
         cursor = _decode_knowledge_lineage_cursor(query.cursor, fingerprint=fingerprint)
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             access_now = datetime.now(UTC)
             reference_exact = await self._load_entry(
@@ -18715,7 +18716,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         operation = "publish_maintenance_proposal"
         _require_knowledge_entry_access(scope, copied_entry, operation=operation)
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     await _lock_knowledge_write_identities(
@@ -18886,7 +18887,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         proposal_id = _knowledge_maintenance_identity(proposal_id, "proposal_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             await cur.execute(
                 "SELECT operation_id FROM cayu_knowledge_maintenance_proposals "
@@ -18981,7 +18982,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             raise KnowledgeAccessDenied("record_maintenance_governance_route")
         proposal = copied.request.proposal
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     await _lock_knowledge_write_identities(
@@ -19114,7 +19115,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         operation_id = _knowledge_maintenance_identity(operation_id, "operation_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             return await self._load_maintenance_governance_route(
                 cur,
                 operation_id,
@@ -19146,7 +19147,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             raise KnowledgeAccessDenied("record_semantic_watch_outcome")
         operation_id = copied.invocation.operation_id
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     await _lock_knowledge_semantic_watch_write_identities(
@@ -19241,7 +19242,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         operation_id = _knowledge_semantic_watch_identity(operation_id, "operation_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             return await self._load_semantic_watch_receipt(
                 cur,
                 operation_id,
@@ -19264,7 +19265,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         )
         operation = "apply_maintenance_decision"
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     await _lock_knowledge_maintenance_write_identities(
@@ -19573,7 +19574,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         proposal_id = _knowledge_maintenance_identity(proposal_id, "proposal_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             await cur.execute(
                 "SELECT operation_id FROM cayu_knowledge_maintenance_proposals "
@@ -19619,7 +19620,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         operation_id = _knowledge_maintenance_identity(operation_id, "operation_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             record = await self._load_maintenance_record(
                 cur,
                 operation_id,
@@ -19638,7 +19639,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         operation_id = _knowledge_maintenance_identity(operation_id, "operation_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             record = await self._load_maintenance_record(
                 cur,
                 operation_id,
@@ -19828,7 +19829,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         _validate_positive_int(max_records, "max_records")
         _validate_positive_int(max_bytes, "max_bytes")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             entry = await self._load_entry_in_scope(
                 cur,
@@ -19884,7 +19885,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             scope,
         )
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             await cur.execute(
                 cast(
@@ -19960,7 +19961,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             scope,
         )
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     state = await self._lock_or_create_change_consumer(
@@ -20096,7 +20097,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         _validate_knowledge_change_sequence(baseline_sequence, "baseline_sequence")
         scope_sha256 = _knowledge_access_scope_sha256(scope)
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -20141,7 +20142,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         claim_sha256 = _knowledge_change_claim_sha256(claim)
         scope_sha256 = _knowledge_access_scope_sha256(scope)
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     state = await self._load_change_consumer(
@@ -20209,7 +20210,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         claim = copy_knowledge_change_claim(claim)
         scope_sha256 = _knowledge_access_scope_sha256(scope)
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     state = await self._load_change_consumer(
@@ -20254,7 +20255,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         consumer_id = _knowledge_change_identity(consumer_id, "consumer_id")
         scope_sha256 = _knowledge_access_scope_sha256(scope)
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             state = await self._load_change_consumer(
                 cur,
                 consumer_id,
@@ -20285,7 +20286,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         identity_sha256 = _knowledge_embedding_identity_sha256(update.identity)
         update_sha256 = _knowledge_index_readiness_update_sha256(update)
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -20445,7 +20446,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         identity = copy_knowledge_embedding_identity(identity)
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             if not await self._index_identity_is_accessible(cur, scope, identity):
                 return None
@@ -20502,7 +20503,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         """
         access_params = [*exact_access_params, *current_access_params]
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             await cur.execute(
                 cast(
@@ -20610,7 +20611,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         _validate_knowledge_positive_int(max_chunks, "max_chunks")
         _validate_knowledge_positive_int(max_bytes, "max_bytes")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             entry = await self._load_entry_in_scope(
                 cur,
@@ -20649,7 +20650,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         if query.mode not in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD}:
             raise ValueError("PostgresKnowledgeStore supports only auto and keyword search modes.")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             return await self._keyword_search_in_snapshot(
                 cur,
@@ -20678,7 +20679,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         if query.mode not in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD}:
             raise ValueError("PostgresKnowledgeStore supports only auto and keyword search modes.")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             return await self._keyword_search_in_snapshot(
                 cur,
@@ -20708,7 +20709,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         if query.mode not in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD}:
             raise ValueError("PostgresKnowledgeStore supports only auto and keyword search modes.")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             return await self._keyword_search_in_snapshot(
                 cur,
@@ -20787,7 +20788,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         where_sql += access_sql
         params.extend(access_params)
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
             total_entries_known = await self._count_list_entries(cur, where_sql, params)
             await cur.execute(
@@ -23426,7 +23427,10 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                     await self.acknowledge_change(claim, access_scope=scope)
                     acknowledged_changes += 1
                     continue
-                async with self._pool.connection() as conn, conn.cursor() as cur:
+                async with (
+                    PostgresTimingScope(self._pool.connection()) as conn,
+                    conn.cursor() as cur,
+                ):
                     current = await self._load_entry(cur, claim.change.entry_id)
                     current_allowed = (
                         current is not None
@@ -23631,7 +23635,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             # Re-entering it would treat resource constraints as a caller override
             # of a store's bound default scope.
             await self._ensure_ready()
-            async with self._pool.connection() as conn, conn.cursor() as cur:
+            async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
                 await _begin_knowledge_read_snapshot(cur)
                 return await self._keyword_search_in_snapshot(
                     cur,
@@ -23692,7 +23696,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         query_vector = await self._embed_query(query, semantic_query_text)
         keyword_result: KnowledgeSearchResult | None = None
         async with (
-            self._pool.connection() as conn,
+            PostgresTimingScope(self._pool.connection()) as conn,
             conn.transaction(),
             conn.cursor() as cur,
         ):
@@ -23756,7 +23760,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         """Return a bounded result without a provider call when no vector is searchable."""
 
         async with (
-            self._pool.connection() as conn,
+            PostgresTimingScope(self._pool.connection()) as conn,
             conn.transaction(),
             conn.cursor() as cur,
         ):
@@ -23852,7 +23856,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
 
     async def _reconcile_embedding_schema(self) -> None:
         mode = self._schema_mode
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "SELECT pg_advisory_xact_lock(%s)", (_PGVECTOR_SCHEMA_ADVISORY_LOCK_KEY,)
@@ -24312,7 +24316,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         access_scope: KnowledgeAccessScope,
     ) -> tuple[list[tuple[str, str, float]], bool, int]:
         async with (
-            self._pool.connection() as conn,
+            PostgresTimingScope(self._pool.connection()) as conn,
             conn.transaction(),
             conn.cursor() as cur,
         ):
@@ -24818,7 +24822,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                 after.chunk_index,
                 after.chunk_id,
             ]
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await cur.execute(
                 cast(
                     "LiteralString",
@@ -24878,7 +24882,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             access_scope,
             entry_alias="e",
         )
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await cur.execute(
                 cast(
                     "LiteralString",
@@ -25288,7 +25292,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                     *access_params,
                 )
             )
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             # Keep the readiness pointer stable while accepting and activating
             # projection attempts. Readiness publication updates the same rows,
             # so this ordered row lock serializes a batch without adding a
@@ -25485,7 +25489,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
 
     async def _embedding_identity_exists(self, identity: KnowledgeEmbeddingIdentity) -> bool:
         identity_sha256 = _knowledge_embedding_identity_sha256(identity)
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await cur.execute(
                 """
                 SELECT entry_id, entry_revision, chunk_id, projection_type,
@@ -25531,7 +25535,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         return True
 
     async def _chunk_identity_is_current(self, identity: KnowledgeEmbeddingIdentity) -> bool:
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await cur.execute(
                 """
                 SELECT c.text
@@ -25584,7 +25588,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
     ) -> tuple[int, bool]:
         if isinstance(limit, bool) or type(limit) is not int or limit < 0:
             raise ValueError("`limit` must be a nonnegative integer.")
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await cur.execute(
                 """
                 SELECT DISTINCT embedding.identity_sha256
@@ -25641,7 +25645,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
     ) -> tuple[int, bool]:
         if isinstance(limit, bool) or type(limit) is not int or limit < 0:
             raise ValueError("`limit` must be a nonnegative integer.")
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             if expected_deleted_revision is None:
                 await cur.execute(
                     """
@@ -43293,7 +43297,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
     ) -> LocalExecutionAttemptRecord | None:
         attempt_id = require_clean_nonblank(attempt_id, "attempt_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             record = await self._load_local_execution_attempt_row(cur, attempt_id)
         return None if record is None else record.model_copy(deep=True)
 
@@ -43306,7 +43310,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         limit = _validate_task_positive_int(limit, "limit")
         after = _copy_local_execution_attempt_list_cursor(after)
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             predicate = "(phase <> %s OR quiescence IN (%s, %s))"
             parameters: list[Any] = [
                 "terminal",
@@ -43716,7 +43720,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("Schedule event limit must be between 1 and 1000.")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await cur.execute(
                 "SELECT event_json FROM cayu_task_schedule_events "
                 "WHERE task_id = %s AND sequence > %s ORDER BY sequence LIMIT %s",
@@ -43733,7 +43737,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         query = copy_task_query(query)
         _ensure_claim_query_supported(query)
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             now = self._clock() if self._clock_is_injected else await self._database_now(cur)
             if query.status is not None and query.status is not TaskStatus.PENDING:
                 return TaskScheduleWakeup(as_of=now)
@@ -43790,7 +43794,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             _access_bounds = await current_data_bounds("tasks")
         task_id = require_clean_nonblank(task_id, "task_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             task = await self._load_task(cur, task_id)
             if _access_bounds is not None:
                 from cayu.tasks.access import require_read
@@ -43814,7 +43818,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             "session_instance_id",
         )
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             task = await self._load_task(cur, task_id)
             now = await self._database_now(cur)
         if task is None:
@@ -43841,7 +43845,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             "session_instance_id",
         )
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             task = await self._load_task(cur, task_id)
         if task is None:
             raise KeyError(f"Task not found: {task_id}")
@@ -43857,7 +43861,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
     ) -> TaskInvocationSnapshot | None:
         task_id = require_clean_nonblank(task_id, "task_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await cur.execute(
                 "SELECT id, session_id, session_instance_id, invocation "
                 "FROM cayu_tasks WHERE id = %s",
@@ -43937,7 +43941,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         params.extend([query.limit, query.offset])
 
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             # Interpolations are trusted: TASK_COLUMNS is a constant, order_sql is an
             # enum-derived literal, where_sql is hard-coded clauses; values bind via %s.
             await cur.execute(
@@ -44342,7 +44346,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
@@ -44627,7 +44631,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
     async def terminalize_task(self, request: TaskTerminalizationRequest) -> Task:
         request, request_sha256 = prepare_task_terminalization(request)
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     task = await self._load_task_locked(cur, request.task_id)
@@ -44768,7 +44772,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             "session_instance_id",
         )
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     task = await self._load_task_locked(cur, request.task_id)
@@ -44899,7 +44903,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             idempotency_key,
         )
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await cur.execute(
                 "SELECT request_sha256, worker_id, terminal_kind, task_json, committed_at "
                 "FROM cayu_task_terminalization_receipts "
@@ -44941,7 +44945,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
     ) -> TaskInterruptedHandoffReceipt:
         request, request_sha256 = prepare_interrupted_task_handoff(request)
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -45075,7 +45079,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             handoff_id,
         )
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await cur.execute(
                 "SELECT request_sha256, request_json, task_json, committed_at "
                 "FROM cayu_task_interrupted_handoff_receipts "
@@ -45109,7 +45113,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             after_clause = "AND (lease_expires_at, id) > (%s, %s)"
             after_params = after
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             now = await self._database_now(cur)
             await cur.execute(
                 f"""
@@ -45141,7 +45145,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
     ) -> Task | None:
         task_id = require_clean_nonblank(task_id, "task_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await cur.execute(
                 cast(
                     "LiteralString",
@@ -45439,7 +45443,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         from cayu.storage._postgres_task_graphs import lock_task_graphs
 
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     await lock_task_graphs(cur, (request.task_id,))
@@ -45627,7 +45631,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         await self._ensure_ready()
         notification_sender_pid: int | None = None
         notification_sender_connection: Any | None = None
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     task = await self._load_task_locked(cur, request.task_id)
@@ -45783,7 +45787,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             idempotency_key,
         )
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await cur.execute(
                 "SELECT receipt_json FROM cayu_task_retry_settlements "
                 "WHERE task_id = %s AND idempotency_key = %s",
@@ -45802,7 +45806,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         from cayu.storage._postgres_task_graphs import lock_task_graphs
 
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     await lock_task_graphs(cur, (request.task_id,))
@@ -45988,7 +45992,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         from cayu.storage._postgres_task_graphs import lock_task_graphs
 
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     await lock_task_graphs(cur, (task_id,))
@@ -46089,7 +46093,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         worker_id = require_clean_nonblank(worker_id, "worker_id")
         expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -46244,7 +46248,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
     async def resume_task(self, task_id: str) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             async with conn.cursor() as cur:
                 prior = await self._load_task_locked(cur, task_id)
                 await cur.execute(
@@ -46805,7 +46809,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         extend_seconds = _validate_task_positive_int(extend_seconds, "extend_seconds")
 
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             async with conn.cursor() as cur:
                 task = await self._load_task_locked(cur, task_id)
                 now = await self._database_now(cur)
@@ -46870,7 +46874,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
 
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             async with conn.cursor() as cur:
                 task = await self._load_task_locked(cur, task_id)
                 now = await self._database_now(cur)
@@ -46938,7 +46942,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
 
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             async with conn.cursor() as cur:
                 task = await self._load_task_locked(cur, task_id)
                 now = await self._database_now(cur)
@@ -47158,7 +47162,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         reason = _copy_optional_status_reason(reason)
         payload = _copy_optional_status_payload(payload)
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with PostgresTimingScope(self._pool.connection()) as conn:
             async with conn.cursor() as cur:
                 prior = await self._load_task_locked(cur, task_id)
                 await cur.execute(

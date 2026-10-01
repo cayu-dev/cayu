@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Iterable
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from itertools import islice
 
@@ -22,11 +22,13 @@ from cayu.observability.events import (
     _emit_in_memory_delivery,
     _EventSinkDelivery,
 )
+from cayu.observability.timing import RuntimeTimingConfig, RuntimeTimingSink
 from cayu.runtime._event_projection import (
     prepare_budget_settlement_event_template,
     prepare_new_runtime_event,
     project_persisted_runtime_event,
 )
+from cayu.runtime._phase_timing import RuntimeTimingRecorder, observe_timing_event, phase_scope
 from cayu.runtime.event_side_effect_health import (
     PERSISTED_EVENT_SIDE_EFFECT_MAX_ATTEMPTS as _PERSISTED_SIDE_EFFECT_MAX_ATTEMPTS,
 )
@@ -90,6 +92,8 @@ class RuntimeEventWriter:
         public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
         continue_foreground_parent: Callable[[PersistedEventSideEffectClaim], Awaitable[bool]]
         | None = None,
+        runtime_timing: RuntimeTimingConfig | None = None,
+        timing_sinks: Iterable[RuntimeTimingSink] = (),
     ) -> None:
         if secret_redactor is not None and not isinstance(secret_redactor, SecretRedactor):
             raise TypeError("secret_redactor must be a SecretRedactor.")
@@ -114,6 +118,23 @@ class RuntimeEventWriter:
         self._public_authority_alias_codec = store_alias_codec
         self._prepared_event_owner = object()
         self._continue_foreground_parent = continue_foreground_parent
+        self.timing = RuntimeTimingRecorder(
+            config=runtime_timing,
+            sinks=(
+                *(
+                    sink
+                    for sink in self._event_sinks
+                    if (
+                        sink._accepts_runtime_timing()
+                        if isinstance(sink, EventSink)
+                        else callable(getattr(sink, "emit_timing", None))
+                    )
+                ),
+                *timing_sinks,
+            ),
+            redactor=self._secret_redactor,
+            codec=self._public_authority_alias_codec,
+        )
         if self._secret_redactor.has_values and (
             self._public_authority_alias_codec is None
             or not session_store.supports_public_authority_aliases
@@ -165,20 +186,38 @@ class RuntimeEventWriter:
         ):
             raise TypeError("Prepared runtime event authority is invalid.")
         event = prepared.event
-        await self._session_store.append_event(event.session_id, event)
-        note_execution_progress(event)
-        if persisted_observer is not None:
-            persisted_observer(event)
-        self._retain_terminal_event_authority(event)
-        claim = await self._session_store.claim_persisted_event_side_effect(
-            session_id=event.session_id,
-            event_id=event.id,
-        )
-        if claim is None:
-            sequence = await self._handle_unclaimed_persisted_side_effect(event)
-            return event_with_durable_sequence(event, sequence)
-        delivered_event, _ = await self._deliver_persisted_side_effect_claim(claim)
-        return delivered_event
+        if event.type == EventType.TOOL_CALL_STARTED:
+            phase = "started_persistence"
+        elif event.type in {
+            EventType.TOOL_CALL_COMPLETED,
+            EventType.TOOL_CALL_FAILED,
+            EventType.TOOL_CALL_BLOCKED,
+        }:
+            phase = "publication"
+        else:
+            phase = None
+        # A tool lifecycle append and its durable side-effect delivery are one
+        # publication step; other runtime events stay in their caller's phase.
+        with (
+            nullcontext()
+            if phase is None
+            else phase_scope(phase, call_id=event.payload.get("tool_call_id"))
+        ):
+            await self._session_store.append_event(event.session_id, event)
+            note_execution_progress(event)
+            observe_timing_event(event)
+            if persisted_observer is not None:
+                persisted_observer(event)
+            self._retain_terminal_event_authority(event)
+            claim = await self._session_store.claim_persisted_event_side_effect(
+                session_id=event.session_id,
+                event_id=event.id,
+            )
+            if claim is None:
+                sequence = await self._handle_unclaimed_persisted_side_effect(event)
+                return event_with_durable_sequence(event, sequence)
+            delivered_event, _ = await self._deliver_persisted_side_effect_claim(claim)
+            return delivered_event
 
     async def persist(self, event: Event) -> Event:
         """Commit an event to the durable side-effect handoff without delivering it.

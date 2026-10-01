@@ -14,7 +14,7 @@ from contextlib import aclosing
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, TypeVar
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, MIN_DURABLE_JSON_INTEGER
 from cayu.approvals.tools import PendingToolCallApproval, ToolPolicyEvidence
@@ -33,6 +33,17 @@ from cayu.runtime import _tool_round_publication as tool_round_publication
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._invocation_lifecycle import InvocationContext
+from cayu.runtime._phase_timing import (
+    current_builder,
+    finish_owned_timing,
+    phase_scope,
+    seal_owned_dispatch,
+    timed_owned_round,
+    timed_owned_stage,
+    timed_phase,
+    timed_stream,
+    timing_scope,
+)
 from cayu.runtime._tool_effect_state import (
     ToolEffectReconciliationRequired,
     ToolEffectRecord,
@@ -64,6 +75,8 @@ from cayu.tools.exposure import (
 )
 from cayu.tools.terminal_publication import ToolTerminalPublicationGovernor
 from cayu.vaults.redaction import SecretRedactor
+
+_T = TypeVar("_T")
 
 
 class NativeToolTerminalPublisher(Protocol):
@@ -171,6 +184,8 @@ class DurableToolRound:
         self._event_writer = event_writer
         self._execution: _ToolRoundExecution | None = None
         self._continuation: ToolRoundContinuation | None = None
+        # Timing for a round whose stages are not inside a live ToolRoundRun.
+        self._timing: Any = None
 
     @classmethod
     def for_execution(
@@ -304,6 +319,7 @@ class DurableToolRound:
     def continuation_redactor(self) -> SecretRedactor | None:
         return self._require_continuation().redactor
 
+    @timed_owned_stage("staging")
     async def record_continuation_scope(
         self,
         tool_call_id: str,
@@ -315,6 +331,7 @@ class DurableToolRound:
             execution_scope_unknown=execution_scope_unknown,
         )
 
+    @timed_owned_stage("staging")
     async def fence_restarted_continuation(
         self,
         *,
@@ -326,16 +343,42 @@ class DurableToolRound:
             resume_undispatched_siblings=resume_undispatched_siblings,
         )
 
-    def publish_continuation(
+    @timed_owned_round(recovered=False, finish=False)
+    async def publish_continuation(
         self,
         *,
         already_published_ids: set[str],
         restarted_staged_ids: set[str],
     ) -> AsyncGenerator[tuple[Event, runtime_records.ToolCallOutcome | None], None]:
-        return self._require_continuation().publish(
-            already_published_ids=already_published_ids,
-            restarted_staged_ids=restarted_staged_ids,
-        )
+        async with aclosing(
+            self._require_continuation().publish(
+                already_published_ids=already_published_ids,
+                restarted_staged_ids=restarted_staged_ids,
+            )
+        ) as published:
+            async for item in published:
+                yield item
+
+    def timed_continuation_dispatch(
+        self,
+        stream: AsyncGenerator[tuple[Event, runtime_records.ToolCallOutcome | None], None],
+    ) -> AsyncGenerator[tuple[Event, runtime_records.ToolCallOutcome | None], None]:
+        """Attribute a paused round's dispatch to this round's timing record."""
+        return stream if self._timing is None else timed_stream(self._timing, stream)
+
+    async def commit_continuation_close(self, close: Awaitable[_T]) -> _T:
+        """Measure the caller-owned durable close as this paused round's commit."""
+        builder = self._timing
+        if builder is None:
+            return await close
+        with timing_scope(builder), phase_scope("round_commit"):
+            result = await close
+        finish_owned_timing(self, committed=True)
+        return result
+
+    def finish_continuation_timing(self) -> None:
+        """Record a paused round whose close was not committed as incomplete."""
+        finish_owned_timing(self)
 
     @property
     def defers_terminals(self) -> bool:
@@ -352,6 +395,7 @@ class DurableToolRound:
             raise RuntimeError("Tool round has no execution admission.")
         return self._execution
 
+    @timed_owned_stage("admission")
     async def admit(self) -> None:
         """Reserve the complete private round before the caller dispatches tools."""
         if self._continuation is not None:
@@ -367,6 +411,7 @@ class DurableToolRound:
 
     def finish_dispatch(self) -> None:
         """Keep uncertain or durable stages fenced when dispatch stops."""
+        seal_owned_dispatch(self)
         if self._continuation is not None:
             self._continuation.finish_dispatch()
             return
@@ -408,8 +453,12 @@ class DurableToolRound:
             or tool_round_recovery.pending_tool_round_identity(pending) != self._identity
         ):
             raise RuntimeError(failure)
+        builder = current_builder()
+        if builder is not None:
+            builder.register_calls(pending.tool_calls)
         return checkpoint, pending
 
+    @timed_owned_round(recovered=False)
     async def publish(self, messages: list[Message]) -> AsyncGenerator[Event, None]:
         """Seal, publish ordered terminals, then commit the exact durable round."""
 
@@ -431,6 +480,7 @@ class DurableToolRound:
         if cancellation is not None:
             raise cancellation
 
+    @timed_phase("round_commit")
     async def _commit_snapshot(
         self,
         source_checkpoint: dict[str, Any] | None,
@@ -464,8 +514,12 @@ class DurableToolRound:
         cancellation = await tool_round_publication.publish_tool_round_with_exact_replay(
             prepared, session_store=self._session_store, event_writer=self._event_writer
         )
+        builder = current_builder()
+        if builder is not None:
+            builder.mark_committed()
         return prepared, cancellation
 
+    @timed_owned_round(recovered=False)
     async def publish_structured(
         self,
         *,
@@ -566,6 +620,8 @@ class DurableToolRound:
         messages.extend(prepared.request.transcript_messages)
         yield StructuredToolRoundPublication(validation, extension.events, cancellation)
 
+    # The same rebuild closes a structured round interrupted before its live runner.
+    @timed_owned_round(recovered=lambda kwargs: not kwargs.get("interrupted", False))
     async def recover_structured(
         self,
         *,
@@ -580,9 +636,14 @@ class DurableToolRound:
         tool_redactor: SecretRedactor,
         materialize_expected_deferred_input: DeferredInputMaterializer,
         invocation_context: InvocationContext | None = None,
+        interrupted: bool = False,
     ) -> AsyncGenerator[Event, None]:
-        """Rebuild one reserved finalizer round from its durable model output."""
+        """Rebuild one reserved finalizer round from its durable model output.
 
+        ``interrupted`` only labels the timing record of an interrupted close.
+        """
+
+        del interrupted
         session = self._session
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
@@ -865,6 +926,7 @@ class DurableToolRound:
             events=tuple(auxiliary_events),
         )
 
+    @timed_owned_round(recovered=False)
     async def close_for_limit(
         self,
         *,
@@ -1062,6 +1124,7 @@ class DurableToolRound:
         )
         return checkpoint or {}, recovered_round
 
+    @timed_owned_stage("effect_state", recovered=True)
     async def recover_outcomes(
         self,
         *,
@@ -1120,7 +1183,8 @@ class DurableToolRound:
                     )
                 )
                 continue
-            result, confirmed_effect_record = await reconcile_call(pending_tool_call, tool_call)
+            with phase_scope("effect_state", call_id=pending_tool_call.tool_call_id):
+                result, confirmed_effect_record = await reconcile_call(pending_tool_call, tool_call)
             if result is None:
                 result = tool_round_recovery.unknown_recovered_tool_result(
                     pending_tool_call=pending_tool_call,
@@ -1139,6 +1203,8 @@ class DurableToolRound:
             confirmed_native_effect_records,
         )
 
+    # The same publication closes a round interrupted before its live runner.
+    @timed_owned_round(recovered=lambda kwargs: not kwargs.get("interrupted", False))
     async def publish_recovered(
         self,
         *,
@@ -1562,6 +1628,7 @@ class DurableToolRound:
             if call.id in execution.staged_private_outcomes
         ]
 
+    @timed_owned_stage("staging")
     async def record_publication_snapshot(
         self,
         tool_call_id: str,
@@ -1587,6 +1654,7 @@ class DurableToolRound:
             ),
         )
 
+    @timed_owned_stage("staging")
     async def record_redactor(
         self,
         tool_call_id: str,
@@ -1604,6 +1672,7 @@ class DurableToolRound:
         )
         await self._synchronize_staged_outcomes()
 
+    @timed_owned_stage("staging")
     async def stage_terminal(
         self,
         event: Event,
@@ -1667,6 +1736,7 @@ class DurableToolRound:
             raise AssertionError("Projection recording requires a publication coordinator.")
         return await execution.coordinator.record_projected_terminal(event)
 
+    @timed_owned_stage("staging")
     async def record_workspace_capture(self, event: Event) -> Event:
         if self._continuation is not None:
             return await self._continuation.record_workspace_capture(event)

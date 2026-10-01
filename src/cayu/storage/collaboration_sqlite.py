@@ -15,6 +15,7 @@ from cayu.collaboration.base import CollaborationStore
 from cayu.collaboration.participants import CollaborationUnavailable
 from cayu.storage import _sqlite_support as sqlite
 from cayu.storage._collaboration_repository import _SQLRepository
+from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage._sqlite_connection import _run_off_thread_with_connection_ownership
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.targets import require_sqlite_store_allowed
@@ -44,8 +45,8 @@ class SQLiteCollaborationStore(CollaborationStore):
 
     def __init__(self, path: str | Path, *, schema_mode: SchemaMode = SchemaMode.CREATE) -> None:
         require_sqlite_store_allowed("SQLiteCollaborationStore")
-        self._lock = asyncio.Lock()
-        self._io_lock = asyncio.Lock()
+        self._lock = TimedStoreLock()
+        self._io_lock = TimedStoreLock()
         self._owners = _MutationOwners()
         self._close_task: asyncio.Task[None] | None = None
         self._connection = sqlite.connect(Path(path))

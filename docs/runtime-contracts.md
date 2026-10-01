@@ -2799,6 +2799,51 @@ publication lag. Large validation/projection work is offloaded under a
 separate bounded cooperative scheduling domain so unrelated sessions,
 interrupts, and lease heartbeats can run.
 
+## Runtime phase timing
+
+`ToolRoundTiming` and `ModelStepPreparationTiming` are content-free, bounded,
+process-local observations. Their records, sink queue and store counters do
+not grant execution authority, enter durable event fan-out, or add persistence
+operations. Maintained SQLite/PostgreSQL session-store connection paths update
+only the active phase's accumulator. A disabled recorder leaves those
+accumulators absent, and SQLite connections then return the driver's own
+cursors. Snapshot fields include monotonic phase duration, the wall-clock
+window of the phase's observed entries, transaction count, lock/admission
+wait, SQL execution and commit time, and bound write byte counts. They never
+retain SQL, parameters, results or prompts.
+
+Tool-round aggregate totals include per-call work and shared round work;
+exclusive phase times subtract nested intervals of the same record and exclude
+downstream generator consumer backpressure. A nested session, such as a
+foreground subagent, records its own phases; they are not subtracted from the
+parent call's `execution`. Round work outside the named phases is reported as
+`unattributed` rather than folded into `result_processing`. `sibling_wait`
+ends when the last sibling stages its terminal (zero for a single call), and
+the time from then until publication starts is `publication_queue_wait`.
+Both waits are measured between runtime marks and can include downstream
+consumer backpressure. Concurrent calls and both waits overlap other work and
+must not be summed as wall time. Only a live round charges orchestration
+outside the named phases to `unattributed`; a paused round's continuation
+record can leave part of its dispatch outside every phase. `round_commit`
+covers the round's closing publication, a paused attempt's approval or
+user-input pause write, and a continuation's approval/input close. Local
+incomplete, paused-continuation and recovered attempts are labeled by their
+caller, not inferred; old execution time is not reconstructed. Preparation starts from the most recent locally observed round
+commit in the same run epoch, consumes it, and ends at `model.started`; the
+time before the model step starts is `handoff`. A restart discards local
+timing history.
+
+Timing sinks receive immutable public records in a bounded, timed worker
+without invocation context. Event sinks participate only if they override
+`emit_timing`; `LoggingEventSink` participates only with
+`log_runtime_timing=True`. Queue overflow and failed deliveries are exposed
+through `runtime_timing_status()`; observation failure cannot replace the
+workload result. The queue and worker bind to the running event loop, and
+`close_runtime_timing()` stops delivery at shutdown. The public recent
+inspection methods perform no store operation. For phase boundaries, store
+measurement limits, export and an interpretation example, see
+`cayu guide durable-service-tools`.
+
 ## Tool exposure selection contracts
 
 Registration, cataloguing, exposure, and authorization are distinct. A

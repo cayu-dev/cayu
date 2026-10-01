@@ -38,6 +38,7 @@ from cayu.runtime._isolated_tool_process import (
     execute_process_isolated_tool,
     isolated_tool_execution_contract,
 )
+from cayu.runtime._phase_timing import phase_scope
 from cayu.runtime._tool_identity import tool_idempotency_key as tool_idempotency_key
 from cayu.tools._invocation_lifetime import tool_invocation_lifetime
 from cayu.tools._runner import (
@@ -509,7 +510,8 @@ async def _run_tool(
         async def invoke_registered_tool() -> ToolResult:
             if before_dispatch is not None:
                 try:
-                    await before_dispatch()
+                    with phase_scope("authorization"):
+                        await before_dispatch()
                 except ExecutionAdmissionError as refusal:
                     raise ToolDispatchAdmissionRefusal(refusal, owner=dispatch_owner) from None
             current_execution_deadline().require_admission("tool")
@@ -520,10 +522,12 @@ async def _run_tool(
                     async with inference_scope.lifetime():
                         with tool_invocation_lifetime(ctx):
                             async with model_data_access():
-                                return await tool.run(ctx, arguments)
+                                with phase_scope("execution"):
+                                    return await tool.run(ctx, arguments)
                 with tool_invocation_lifetime(ctx):
                     async with model_data_access():
-                        return await tool.run(ctx, arguments)
+                        with phase_scope("execution"):
+                            return await tool.run(ctx, arguments)
             if registered_schema is None:
                 raise IsolatedToolPreDispatchFailure("registered_schema_missing")
             if registered_execution_contract is None:
@@ -535,13 +539,14 @@ async def _run_tool(
             if current_execution_contract != registered_execution_contract:
                 raise IsolatedToolPreDispatchFailure("registered_execution_contract_mismatch")
             async with model_data_access():
-                return await execute_process_isolated_tool(
-                    tool=tool,
-                    context=ctx,
-                    arguments=arguments,
-                    registered_schema=registered_schema,
-                    redactor=_active_redactor(redactor),
-                )
+                with phase_scope("execution"):
+                    return await execute_process_isolated_tool(
+                        tool=tool,
+                        context=ctx,
+                        arguments=arguments,
+                        registered_schema=registered_schema,
+                        redactor=_active_redactor(redactor),
+                    )
 
         if timeout_seconds is None:
             raw_result = await invoke_registered_tool()

@@ -49,6 +49,126 @@ REMOTE_TRACE_ID = "11111111111111111111111111111111"
 REMOTE_TRACEPARENT = f"00-{REMOTE_TRACE_ID}-2222222222222222-01"
 
 
+def test_runtime_phase_records_remain_children_after_tool_and_session_end(sqlite_resources):
+    from tests.core.test_runtime_phase_timing import _app, _run
+
+    from cayu import SQLiteSessionStore
+
+    exporter, sink = _make_sink()
+
+    async def scenario():
+        async with sqlite_resources as resources:
+            store = resources.own(SQLiteSessionStore(resources.path("otel-phases.sqlite")))
+            app = _app(store, sinks=[sink])
+            await _run(app)
+            (record,) = await app.inspect_recent_tool_round_timing("timing")
+            return record
+
+    record = asyncio.run(scenario())
+    spans = exporter.get_finished_spans()
+    tool = next(s for s in spans if s.name == "execute_tool timed_tool")
+    phases = next(s for s in spans if s.name == "cayu.tool.phases")
+    assert phases.parent.span_id == tool.context.span_id
+    assert phases.context.trace_id == tool.context.trace_id
+    assert phases.attributes["cayu.timing.tool_round_id"] == record.tool_round_id
+    assert {e.name for e in phases.events} == {
+        "cayu.phase." + phase.name for phase in record.calls[0].phases
+    }
+    assert {e.name for e in tool.events} == {
+        "cayu.tool_effect_completed_at",
+        "cayu.tool_terminal_staged_at",
+        "cayu.tool_terminal_publication_started_at",
+    }
+    assert tool.end_time == int(record.calls[0].tool_effect_completed_at.timestamp() * 1e9)
+    # The per-call span covers the call's observed phases, from authorization
+    # through its publication, which ends after the effect completed.
+    observed = [p for p in record.calls[0].phases if p.first_started_at is not None]
+    assert phases.start_time == otel._datetime_ns(min(p.first_started_at for p in observed))
+    assert phases.end_time == otel._datetime_ns(max(p.last_completed_at for p in observed))
+    assert phases.end_time >= tool.end_time
+    round_span = next(s for s in spans if s.name == "cayu.tool_round")
+    assert round_span.start_time <= phases.start_time <= phases.end_time <= round_span.end_time
+    stamped = {e.name: e.timestamp for e in phases.events}
+    for phase in observed:
+        assert stamped["cayu.phase." + phase.name] == otel._datetime_ns(phase.first_started_at)
+    assert len(set(stamped.values())) > 1
+    assert any(s.name == "cayu.model_step_preparation" for s in spans)
+    assert all("private-prompt-arguments-and-result" not in str(s.attributes) for s in spans)
+
+
+def test_runtime_phase_record_waits_for_its_tool_span_instead_of_becoming_a_root(
+    monkeypatch, sqlite_resources
+):
+    from tests.core.test_runtime_phase_timing import _app, _run
+
+    from cayu import SQLiteSessionStore
+
+    exporter, sink = _make_sink()
+    held = []
+    deliver = otel._emit_opentelemetry_delivery
+
+    async def hold(target, delivery):
+        held.append((target, delivery))
+
+    # Simulate asynchronous fan-out that delivers the round's events after
+    # its timing record.
+    monkeypatch.setattr(otel, "_emit_opentelemetry_delivery", hold)
+
+    async def scenario():
+        async with sqlite_resources as resources:
+            store = resources.own(SQLiteSessionStore(resources.path("otel-buffer.sqlite")))
+            app = _app(store, sinks=[sink])
+            await _run(app)
+            assert held and exporter.get_finished_spans() == ()
+            for target, delivery in held:
+                await deliver(target, delivery)
+
+    asyncio.run(scenario())
+    spans = exporter.get_finished_spans()
+    tool = next(s for s in spans if s.name == "execute_tool timed_tool")
+    phases = next(s for s in spans if s.name == "cayu.tool.phases")
+    round_span = next(s for s in spans if s.name == "cayu.tool_round")
+    session = next(s for s in spans if s.name.startswith("cayu.session"))
+    assert phases.parent.span_id == tool.context.span_id
+    assert round_span.parent.span_id == session.context.span_id
+    assert [s.name for s in spans if s.parent is None] == [session.name]
+    assert len([s for s in spans if s.name == "cayu.model_step_preparation"]) == 2
+
+
+def test_close_runtime_timing_exports_records_still_waiting_for_their_spans(
+    monkeypatch, sqlite_resources
+):
+    from tests.core.test_runtime_phase_timing import _app, _run
+
+    from cayu import SQLiteSessionStore
+
+    exporter, sink = _make_sink()
+
+    async def hold(target, delivery):
+        del target, delivery
+
+    # The round's events never reach this sink, so its timing records wait.
+    monkeypatch.setattr(otel, "_emit_opentelemetry_delivery", hold)
+
+    async def scenario():
+        async with sqlite_resources as resources:
+            store = resources.own(SQLiteSessionStore(resources.path("otel-close.sqlite")))
+            app = _app(store, sinks=[sink])
+            await _run(app)
+            assert sink._pending_timing and exporter.get_finished_spans() == ()
+            await app.close_runtime_timing()
+            assert not sink._pending_timing
+
+    asyncio.run(scenario())
+    spans = exporter.get_finished_spans()
+    round_span = next(s for s in spans if s.name == "cayu.tool_round")
+    phases = next(s for s in spans if s.name == "cayu.tool.phases")
+    # Without the session and tool spans, calls stay under their round.
+    assert round_span.parent is None
+    assert phases.parent.span_id == round_span.context.span_id
+    assert len([s for s in spans if s.name == "cayu.model_step_preparation"]) == 2
+
+
 @pytest.mark.parametrize("mode", ["retry", "cancel"])
 def test_real_runtime_auxiliary_spans_are_children_of_the_tool(mode) -> None:
     exporter, sink = _make_sink()

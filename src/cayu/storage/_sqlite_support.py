@@ -107,6 +107,8 @@ def connect(
     read_only: bool = False,
     immutable: bool = False,
 ) -> sqlite3.Connection:
+    from cayu.storage._phase_timing import timed_sqlite_connection
+
     if type(read_only) is not bool:
         raise TypeError("read_only must be a bool.")
     if type(immutable) is not bool:
@@ -138,7 +140,7 @@ def connect(
         connection.execute("PRAGMA busy_timeout = 5000")
         connection.execute("PRAGMA query_only = ON")
         _register_sqlite_functions(connection)
-        return connection
+        return timed_sqlite_connection(connection)
     connection = sqlite3.connect(path, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
@@ -146,7 +148,7 @@ def connect(
     if str(path) != ":memory:":
         connection.execute("PRAGMA journal_mode = WAL")
     _register_sqlite_functions(connection)
-    return connection
+    return timed_sqlite_connection(connection)
 
 
 def _is_in_memory(connection: sqlite3.Connection) -> bool:

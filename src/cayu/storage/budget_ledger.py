@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import sqlite3
 from collections.abc import Callable
@@ -55,6 +54,7 @@ from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     copy_model_attempt_identity,
 )
+from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage.targets import require_sqlite_store_allowed
 
 from . import _sqlite_support as sqlite_support
@@ -91,7 +91,7 @@ class SQLiteBudgetLedger(BudgetLedger):
             raise TypeError("schema_mode must be a SchemaMode.")
 
         self.path = db_path
-        self._lock = asyncio.Lock()
+        self._lock = TimedStoreLock()
         self._clock = utc_clock(clock)
         self._reservation_ttl_seconds = _validate_reservation_ttl(reservation_ttl_seconds)
         self._connection = sqlite_support.connect(db_path)

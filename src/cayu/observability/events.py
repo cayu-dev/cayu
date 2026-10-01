@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 from cayu.events import Event, copy_event, validate_event_envelope
+from cayu.observability.timing import RuntimeTimingRecord
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,14 +58,26 @@ class EventSink(ABC):
     async def emit(self, event: Event) -> None:
         """Emit one event."""
 
+    async def emit_timing(self, record: RuntimeTimingRecord) -> None:
+        """Observe a best-effort timing record, outside durable event delivery."""
+        return None
+
+    def _accepts_runtime_timing(self) -> bool:
+        # Only sinks that implement emit_timing receive queued timing records.
+        return type(self).emit_timing is not EventSink.emit_timing
+
 
 class InMemoryEventSink(EventSink):
     def __init__(self) -> None:
         self.events: list[Event] = []
+        self.timings: list[RuntimeTimingRecord] = []
         self._events_by_id: dict[tuple[str, str], Event] = {}
 
     async def emit(self, event: Event) -> None:
         self._record(event, identity=(event.session_id, event.id))
+
+    async def emit_timing(self, record: RuntimeTimingRecord) -> None:
+        self.timings.append(record)
 
     def _record(
         self,

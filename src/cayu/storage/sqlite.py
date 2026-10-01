@@ -59,6 +59,7 @@ from cayu.sessions.base import (
 from cayu.storage import _creation_fence
 from cayu.storage._context_selection_fence import SQLiteContextSelectionFenceMixin
 from cayu.storage._creation_fence import SQLiteCreationFenceMixin
+from cayu.storage._phase_timing import TimedStoreLock, TimedStoreReadQueue
 from cayu.storage._session_execution import SQLiteSessionExecutionMixin
 from cayu.storage.targets import require_sqlite_store_allowed
 
@@ -1851,8 +1852,8 @@ class SQLiteSessionStore(
         self._read_only = read_only
         self._public_authority_alias_codec = public_authority_alias_codec
         self._ownership_clock = utc_clock(ownership_clock)
-        self._lock = asyncio.Lock()
-        self._participant_creation_lock = asyncio.Lock()
+        self._lock = TimedStoreLock()
+        self._participant_creation_lock = TimedStoreLock()
         self._detached_read_tasks: set[asyncio.Task[object]] = set()
         effective_db_path = Path(":memory:") if diagnostic_source_missing else db_path
         self._connection = (
@@ -1880,7 +1881,7 @@ class SQLiteSessionStore(
             else:
                 for _ in range(4):
                     connection = self._connect_read_only(effective_db_path)
-                    self._readers.append((asyncio.Lock(), connection))
+                    self._readers.append((TimedStoreLock(), connection))
             for _, connection in self._readers:
                 connection.execute("PRAGMA temp_store = FILE")
                 connection.execute("PRAGMA temp.cache_size = -2048")
@@ -1892,7 +1893,7 @@ class SQLiteSessionStore(
             raise
         self._read_lock, self._read_connection = self._readers[0]
         self._available_readers: asyncio.LifoQueue[tuple[asyncio.Lock, sqlite3.Connection]] = (
-            asyncio.LifoQueue()
+            TimedStoreReadQueue()
         )
         for reader in reversed(self._readers):
             self._available_readers.put_nowait(reader)

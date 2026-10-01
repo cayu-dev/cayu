@@ -43,6 +43,7 @@ from cayu.runtime.work_attempt_lifecycle import (
     work_attempt_preparation_hold_sha256,
 )
 from cayu.storage import _postgres_support as pg_support
+from cayu.storage._phase_timing import PostgresTimingScope, timed_postgres_connection
 from cayu.tasks.admission import (
     WORK_ATTEMPT_RENEWABLE_STATES,
     AdmittedCompletionProposalRequest,
@@ -418,10 +419,12 @@ class PostgresVerifiedWorkMixin:
 
         connection: Any | None = None
         try:
-            async with self._pool.connection() as checked_out_connection:
+            async with PostgresTimingScope(
+                self._pool.connection(), raw=True
+            ) as checked_out_connection:
                 connection = checked_out_connection
                 connection_owner.acquire(connection)
-                yield connection
+                yield timed_postgres_connection(connection)
         finally:
             if connection is not None:
                 connection_owner.release(connection)
@@ -1154,7 +1157,7 @@ class PostgresVerifiedWorkMixin:
         if copied is None:
             raise TypeError("reference must be a WorkContractRef.")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             contract = await self._load_work_contract_row(cur, copied)
             return None if contract is None else copy_work_contract(contract)
 
@@ -1164,7 +1167,7 @@ class PostgresVerifiedWorkMixin:
     ) -> Task | None:
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await cur.execute(
                 "SELECT authority_kind FROM cayu_task_session_execution_authority "
                 "WHERE session_id = %s",
@@ -1730,7 +1733,7 @@ class PostgresVerifiedWorkMixin:
     ) -> WorkAttemptAdmission | None:
         admission_id = require_clean_nonblank(admission_id, "admission_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             admission = await self._load_work_attempt_admission_row(cur, admission_id)
             return None if admission is None else admission.model_copy(deep=True)
 
@@ -1740,7 +1743,7 @@ class PostgresVerifiedWorkMixin:
     ) -> WorkAttemptExecutionClaim | None:
         claim_id = require_clean_nonblank(claim_id, "claim_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             claim = await self._load_work_attempt_execution_claim_row(cur, claim_id)
             return None if claim is None else claim.model_copy(deep=True)
 
@@ -1750,7 +1753,7 @@ class PostgresVerifiedWorkMixin:
     ) -> WorkAttemptAdmission | None:
         task_id = require_clean_nonblank(task_id, "task_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             return await self._load_latest_work_attempt_admission(cur, task_id)
 
     async def _load_latest_work_attempt_admission(
@@ -1805,7 +1808,7 @@ class PostgresVerifiedWorkMixin:
     ) -> WorkAttemptLifecycleReceipt | None:
         admission_id = require_clean_nonblank(admission_id, "admission_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             return await self._load_work_attempt_lifecycle_receipt(cur, admission_id)
 
     async def enter_work_attempt_execution(
@@ -1893,7 +1896,7 @@ class PostgresVerifiedWorkMixin:
     ) -> WorkAttemptPreparationHoldReceipt | None:
         hold_id = validate_work_completion_idempotency_key(hold_id)
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             return await self._load_work_attempt_preparation_hold(cur, hold_id)
 
     async def hold_work_attempt_preparation(
@@ -1960,7 +1963,7 @@ class PostgresVerifiedWorkMixin:
             params.append(after)
         params.append(limit)
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await cur.execute(
                 "SELECT admission.admission_id FROM cayu_work_attempt_admissions AS admission "
                 "JOIN (SELECT id FROM cayu_tasks WHERE "
@@ -2550,7 +2553,7 @@ class PostgresVerifiedWorkMixin:
     async def load_work_attempt(self, attempt_id: str) -> WorkAttempt | None:
         attempt_id = require_clean_nonblank(attempt_id, "attempt_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             attempt = await self._load_attempt_row(cur, attempt_id)
             return None if attempt is None else attempt.model_copy(deep=True)
 
@@ -2796,7 +2799,7 @@ class PostgresVerifiedWorkMixin:
     async def load_completion_proposal(self, proposal_id: str) -> CompletionProposal | None:
         proposal_id = require_clean_nonblank(proposal_id, "proposal_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             proposal = await self._load_proposal_row(cur, proposal_id)
             return None if proposal is None else proposal.model_copy(deep=True)
 
@@ -2805,7 +2808,7 @@ class PostgresVerifiedWorkMixin:
     ) -> CompletionProposal | None:
         attempt_id = require_clean_nonblank(attempt_id, "attempt_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             await cur.execute(
                 "SELECT proposal_id FROM cayu_completion_proposals WHERE attempt_id = %s",
                 (attempt_id,),
@@ -2920,7 +2923,7 @@ class PostgresVerifiedWorkMixin:
     ) -> CompletionVerifierProfileRecord | None:
         proposal_id = require_clean_nonblank(proposal_id, "proposal_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             profile = await self._load_verifier_profile_row(cur, proposal_id)
             return None if profile is None else copy_completion_verifier_profile_record(profile)
 
@@ -2930,7 +2933,7 @@ class PostgresVerifiedWorkMixin:
     ) -> CompletionVerifierProfileRecord | None:
         proposal_id = require_clean_nonblank(proposal_id, "proposal_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             proposal = await self._load_proposal_row(cur, proposal_id)
             if proposal is None:
                 raise KeyError(f"Completion proposal not found: {proposal_id}")
@@ -3090,7 +3093,7 @@ class PostgresVerifiedWorkMixin:
     ) -> CompletionVerificationClaim | None:
         proposal_id = require_clean_nonblank(proposal_id, "proposal_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             claim = await self._load_current_claim(cur, proposal_id)
             return None if claim is None else claim.model_copy(deep=True)
 
@@ -3323,7 +3326,7 @@ class PostgresVerifiedWorkMixin:
     ) -> CompletionDecision | None:
         decision_id = require_clean_nonblank(decision_id, "decision_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             decision = await self._load_decision_row(cur, decision_id)
             return None if decision is None else decision.model_copy(deep=True)
 
@@ -3333,7 +3336,7 @@ class PostgresVerifiedWorkMixin:
     ) -> CompletionDecision | None:
         proposal_id = require_clean_nonblank(proposal_id, "proposal_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             decision = await self._load_decision_for_proposal(cur, proposal_id)
             return None if decision is None else decision.model_copy(deep=True)
 
@@ -3483,7 +3486,7 @@ class PostgresVerifiedWorkMixin:
         task_id = require_clean_nonblank(task_id, "task_id")
         idempotency_key = validate_work_completion_idempotency_key(idempotency_key)
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             receipt = await self._load_application_receipt(
                 cur,
                 task_id,

@@ -89,6 +89,21 @@
   their storage module uses the helper. `CAYU_REQUIRE_POSTGRES=1` now makes every
   Cayu SQLite store refuse to open; the test suite's Postgres-tier flag is renamed
   `CAYU_REQUIRE_POSTGRES_TESTS`.
+- Add content-free runtime phase timing for tool rounds and model-step
+  preparation. `CayuApp` keeps a bounded recent view
+  (`inspect_recent_tool_round_timing`,
+  `inspect_recent_model_step_preparation_timing`) and can export records through
+  `timing_sinks`, `EventSink.emit_timing` or `OpenTelemetryEventSink`; configure
+  or disable it with `RuntimeTimingConfig`, and call `close_runtime_timing()` at
+  shutdown if you run the application outside the Cayu server. Records add no
+  durable writes. `LoggingEventSink` logs them only with
+  `log_runtime_timing=True`. **Telemetry change:** `OpenTelemetryEventSink` now
+  ends each `execute_tool` span at the tool's attested effect-completion time
+  instead of at the terminal event, so `execute_tool` durations get shorter by
+  the terminal staging and publication time. Dashboards or alerts on that span's
+  duration should be re-baselined; the staging and publication time is in the
+  new `cayu.tool.phases` child span, and the span's terminal-staged and
+  publication-started events are stamped after its end.
 
 ## v0.7.0
 

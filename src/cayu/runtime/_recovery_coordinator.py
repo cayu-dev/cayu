@@ -9678,42 +9678,46 @@ class RecoveryCoordinator:
                         "Pending user-input sibling has no executable policy authority."
                     )
 
-                async for event, outcome in self._tool_round_executor.execute_tool_call(
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    tool_call=tool_call,
-                    request_metadata=response.metadata,
-                    budget_limits=pending.budget_limits or (),
-                    task_id=pending.task_id,
-                    auxiliary_invocation_policy=AuxiliaryInvocationPolicy(
-                        limits=effective_limits,
-                        retry_policy=effective_retry_policy,
-                        accounting=continued_run_limit_accounting,
-                    ),
-                    execution_profile=execution_profile_snapshot.profile,
-                    invocation_context=invocation_context,
-                    check_policy=False,
-                    policy_result=policy_result,
-                    policy_output_secret_resolution_scope=pause_secret_resolution_scope,
-                    input_id=pending.input_id,
-                    tool_round_identity=tool_round_identity,
-                    model_step=pending.model_step,
-                    taint_labels=call_taint_labels,
-                    publish_arguments_as_unavailable=publish_arguments_as_unavailable,
-                    deferred_terminal_stager=(
-                        None if not round_owner.defers_terminals else round_owner.stage_terminal
-                    ),
-                    deferred_terminal_capture_recorder=(
-                        None
-                        if not round_owner.defers_terminals
-                        else round_owner.record_workspace_capture
-                    ),
-                    resolved_redactor_observer=(
-                        None if not round_owner.defers_terminals else round_owner.record_redactor
-                    ),
-                    publication_snapshot_observer=round_owner.record_publication_snapshot,
-                    rejoin_targeted_invocation=True,
+                async for event, outcome in round_owner.timed_continuation_dispatch(
+                    self._tool_round_executor.execute_tool_call(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        tool_call=tool_call,
+                        request_metadata=response.metadata,
+                        budget_limits=pending.budget_limits or (),
+                        task_id=pending.task_id,
+                        auxiliary_invocation_policy=AuxiliaryInvocationPolicy(
+                            limits=effective_limits,
+                            retry_policy=effective_retry_policy,
+                            accounting=continued_run_limit_accounting,
+                        ),
+                        execution_profile=execution_profile_snapshot.profile,
+                        invocation_context=invocation_context,
+                        check_policy=False,
+                        policy_result=policy_result,
+                        policy_output_secret_resolution_scope=pause_secret_resolution_scope,
+                        input_id=pending.input_id,
+                        tool_round_identity=tool_round_identity,
+                        model_step=pending.model_step,
+                        taint_labels=call_taint_labels,
+                        publish_arguments_as_unavailable=publish_arguments_as_unavailable,
+                        deferred_terminal_stager=(
+                            None if not round_owner.defers_terminals else round_owner.stage_terminal
+                        ),
+                        deferred_terminal_capture_recorder=(
+                            None
+                            if not round_owner.defers_terminals
+                            else round_owner.record_workspace_capture
+                        ),
+                        resolved_redactor_observer=(
+                            None
+                            if not round_owner.defers_terminals
+                            else round_owner.record_redactor
+                        ),
+                        publication_snapshot_observer=round_owner.record_publication_snapshot,
+                        rejoin_targeted_invocation=True,
+                    )
                 ):
                     yield event
                     if outcome is not None:
@@ -9903,8 +9907,8 @@ class RecoveryCoordinator:
             if len(prepared_events) != 1:
                 raise AssertionError("User-input closure must publish one checkpoint event.")
             close_event = prepared_events[0]
-            close_cancellation = (
-                await approval_publication.publish_pending_action_with_exact_replay(
+            close_cancellation = await round_owner.commit_continuation_close(
+                approval_publication.publish_pending_action_with_exact_replay(
                     prepared_close,
                     session_store=self._session_store,
                     event_writer=self._event_writer,
@@ -10091,6 +10095,7 @@ class RecoveryCoordinator:
         finally:
             if round_owner is not None:
                 round_owner.finish_dispatch()
+                round_owner.finish_continuation_timing()
 
     async def _emit_non_authoritative_policy_call(
         self,
@@ -11068,42 +11073,46 @@ class RecoveryCoordinator:
                 if policy_evidence is not ToolPolicyEvidence.AUTHORITATIVE:
                     raise RuntimeError("Pending tool call has no executable policy authority.")
 
-                async for event, outcome in self._tool_round_executor.execute_tool_call(
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    tool_call=tool_call,
-                    request_metadata=request.metadata,
-                    budget_limits=pending_approval.budget_limits or (),
-                    task_id=pending_approval.task_id,
-                    auxiliary_invocation_policy=AuxiliaryInvocationPolicy(
-                        limits=effective_limits,
-                        retry_policy=effective_retry_policy,
-                        accounting=continued_run_limit_accounting,
-                    ),
-                    execution_profile=execution_profile_snapshot.profile,
-                    invocation_context=invocation_context,
-                    check_policy=False,
-                    emit_started=True,
-                    policy_output_secret_resolution_scope=pause_secret_resolution_scope,
-                    approval_id=pending_approval.approval_id,
-                    tool_round_identity=tool_round_identity,
-                    model_step=publication_round.model_step,
-                    taint_labels=call_taint_labels,
-                    publish_arguments_as_unavailable=publish_arguments_as_unavailable,
-                    deferred_terminal_stager=(
-                        None if not round_owner.defers_terminals else round_owner.stage_terminal
-                    ),
-                    deferred_terminal_capture_recorder=(
-                        None
-                        if not round_owner.defers_terminals
-                        else round_owner.record_workspace_capture
-                    ),
-                    resolved_redactor_observer=(
-                        None if not round_owner.defers_terminals else round_owner.record_redactor
-                    ),
-                    publication_snapshot_observer=round_owner.record_publication_snapshot,
-                    rejoin_targeted_invocation=True,
+                async for event, outcome in round_owner.timed_continuation_dispatch(
+                    self._tool_round_executor.execute_tool_call(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        tool_call=tool_call,
+                        request_metadata=request.metadata,
+                        budget_limits=pending_approval.budget_limits or (),
+                        task_id=pending_approval.task_id,
+                        auxiliary_invocation_policy=AuxiliaryInvocationPolicy(
+                            limits=effective_limits,
+                            retry_policy=effective_retry_policy,
+                            accounting=continued_run_limit_accounting,
+                        ),
+                        execution_profile=execution_profile_snapshot.profile,
+                        invocation_context=invocation_context,
+                        check_policy=False,
+                        emit_started=True,
+                        policy_output_secret_resolution_scope=pause_secret_resolution_scope,
+                        approval_id=pending_approval.approval_id,
+                        tool_round_identity=tool_round_identity,
+                        model_step=publication_round.model_step,
+                        taint_labels=call_taint_labels,
+                        publish_arguments_as_unavailable=publish_arguments_as_unavailable,
+                        deferred_terminal_stager=(
+                            None if not round_owner.defers_terminals else round_owner.stage_terminal
+                        ),
+                        deferred_terminal_capture_recorder=(
+                            None
+                            if not round_owner.defers_terminals
+                            else round_owner.record_workspace_capture
+                        ),
+                        resolved_redactor_observer=(
+                            None
+                            if not round_owner.defers_terminals
+                            else round_owner.record_redactor
+                        ),
+                        publication_snapshot_observer=round_owner.record_publication_snapshot,
+                        rejoin_targeted_invocation=True,
+                    )
                 ):
                     yield event
                     if outcome is not None:
@@ -11265,11 +11274,13 @@ class RecoveryCoordinator:
             if len(prepared_events) != 1:
                 raise AssertionError("Approval closure must publish one checkpoint event.")
             clear_event = prepared_events[0]
-            close_cancellation = await approval_publication.publish_approval_with_exact_replay(
-                prepared_close,
-                session_store=self._session_store,
-                event_writer=self._event_writer,
-                fan_out=False,
+            close_cancellation = await round_owner.commit_continuation_close(
+                approval_publication.publish_approval_with_exact_replay(
+                    prepared_close,
+                    session_store=self._session_store,
+                    event_writer=self._event_writer,
+                    fan_out=False,
+                )
             )
             pending_approval_cleared = True
             materialized = await self.materialize_expected_deferred_input(
@@ -11478,6 +11489,7 @@ class RecoveryCoordinator:
         finally:
             if round_owner is not None:
                 round_owner.finish_dispatch()
+                round_owner.finish_continuation_timing()
 
     async def _load_exact_approval_close_event(
         self,
@@ -15140,6 +15152,7 @@ class RecoveryCoordinator:
                 expected_transcript_cursor=expected_transcript_cursor,
                 execution_profile=request.execution_profile,
                 invocation_context=request.invocation_context,
+                interrupted=True,
             ):
                 yield event
             return
@@ -15471,6 +15484,7 @@ class RecoveryCoordinator:
         expected_transcript_cursor: int,
         execution_profile: ExecutionProfileIdentity | None,
         invocation_context: InvocationContext | None = None,
+        interrupted: bool = False,
     ) -> AsyncGenerator[Event, None]:
         """Supply session recovery collaborators to the durable round owner."""
         owner = DurableToolRound(
@@ -15492,6 +15506,7 @@ class RecoveryCoordinator:
                 redactor=self._secret_redactor,
                 tool_redactor=self._tool_round_executor._secret_redactor,
                 materialize_expected_deferred_input=self.materialize_expected_deferred_input,
+                interrupted=interrupted,
             )
         ) as events:
             async for event in events:

@@ -5,6 +5,7 @@ from typing import Any
 
 from cayu.events import Event, EventType
 from cayu.observability.events import EventSink
+from cayu.observability.timing import RuntimeTimingRecord
 from cayu.tools.result_projection import (
     tool_result_projection_suppresses_result_content,
 )
@@ -77,6 +78,7 @@ class LoggingEventSink(EventSink):
         logger_name: str = DEFAULT_CAYU_LOGGER_NAME,
         error_summary_limit: int = DEFAULT_ERROR_SUMMARY_LIMIT,
         redactor: SecretRedactor | None = None,
+        log_runtime_timing: bool = False,
     ) -> None:
         if logger is not None and not isinstance(logger, logging.Logger):
             raise TypeError("LoggingEventSink logger must be a logging.Logger.")
@@ -91,6 +93,20 @@ class LoggingEventSink(EventSink):
         self.logger = logger if logger is not None else logging.getLogger(logger_name)
         self.error_summary_limit = error_summary_limit
         self.redactor = redactor if redactor is not None else SecretRedactor()
+        if type(log_runtime_timing) is not bool:
+            raise TypeError("LoggingEventSink log_runtime_timing must be a bool.")
+        self.log_runtime_timing = log_runtime_timing
+
+    def _accepts_runtime_timing(self) -> bool:
+        # The default application logger must not queue timing records or start
+        # a delivery worker unless the application asks for timing logs.
+        return self.log_runtime_timing
+
+    async def emit_timing(self, record: RuntimeTimingRecord) -> None:
+        if self.log_runtime_timing and self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(
+                "runtime.timing | %s", self.redactor.redact_text(record.model_dump_json())
+            )
 
     async def emit(self, event: Event) -> None:
         if type(event) is not Event:

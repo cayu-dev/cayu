@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import sqlite3
 from collections.abc import Callable
 from datetime import datetime
@@ -22,6 +21,7 @@ from cayu.server import (
 from cayu.storage import _product_operations as rules
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
+from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage._product_operation_schema import PRODUCT_OPERATIONS_TABLE
 from cayu.storage._sqlite_connection import _run_off_thread_with_connection_ownership
 from cayu.storage.targets import require_sqlite_store_allowed
@@ -76,7 +76,7 @@ class SQLiteProductOperationStore:
             else ServiceIdentityStoreKind.DURABLE
         )
         self._clock = utc_clock(clock)
-        self._lock = asyncio.Lock()
+        self._lock = TimedStoreLock()
         self._closed = False
         self._connection = sqlite_support.connect(db_path)
         try:

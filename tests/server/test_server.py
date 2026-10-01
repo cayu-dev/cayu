@@ -8694,12 +8694,18 @@ def test_mount_cayu_composes_background_interruption_drain() -> None:
         knowledge_drain_timeouts.append(timeout_s)
         return True
 
+    timing_closes = []
+
+    async def close_runtime_timing():
+        timing_closes.append(len(knowledge_drain_timeouts))
+
     cayu_app.drain_background_interruptions = drain_background_interruptions
     cayu_app.drain_recovery_cleanups = drain_recovery_cleanups
     cayu_app.drain_provider_operation_cancellations = drain_provider_operation_cancellations
     cayu_app.drain_environment_cleanups = drain_environment_cleanups
     cayu_app.seal_knowledge_publications = seal_knowledge_publications
     cayu_app.drain_knowledge_publications = drain_knowledge_publications
+    cayu_app.close_runtime_timing = close_runtime_timing
     cayu_app.resume_pending_interruption_cascades = resume_pending_interruption_cascades
     mount_cayu(
         server,
@@ -8720,6 +8726,8 @@ def test_mount_cayu_composes_background_interruption_drain() -> None:
     assert environment_drain_timeouts == [2.5]
     assert knowledge_seals == 1
     assert knowledge_drain_timeouts == [1.5]
+    # Timing delivery stops after the other shutdown owners have drained.
+    assert timing_closes == [1]
     assert len(resume_calls) == 1
     assert type(resume_calls[0]) is int
     assert resume_calls[0] >= 0

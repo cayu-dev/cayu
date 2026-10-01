@@ -36,6 +36,7 @@ from cayu.observability.watchers import (
 )
 from cayu.sessions.base import EventRecord
 from cayu.storage import migrations as schema
+from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage.targets import require_sqlite_store_allowed
 
 from . import _sqlite_support as sqlite_support
@@ -63,7 +64,7 @@ class SQLiteEventWatcherStore(EventWatcherStore):
         if not isinstance(schema_mode, schema.SchemaMode):
             raise TypeError("schema_mode must be a SchemaMode.")
         self.path = db_path
-        self._lock = asyncio.Lock()
+        self._lock = TimedStoreLock()
         self._clock = _clock_or_utc_now(clock)
         self._connection = sqlite_support.connect(db_path)
         sqlite_support.reconcile_schema(

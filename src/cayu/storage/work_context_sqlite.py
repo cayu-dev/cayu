@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +10,7 @@ from cayu._clock import utc_clock
 from cayu._validation import require_nonblank
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
+from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage.targets import require_sqlite_store_allowed
 from cayu.work_context import (
     AgentRecallCheckpoint,
@@ -226,7 +226,7 @@ class SQLiteAgentWorkContextStore(AgentWorkContextStore):
             raise TypeError("schema_mode must be a SchemaMode.")
         self.path = db_path
         self._clock = utc_clock(clock)
-        self._lock = asyncio.Lock()
+        self._lock = TimedStoreLock()
         self._connection = sqlite_support.connect(db_path)
         try:
             sqlite_support.reconcile_schema(

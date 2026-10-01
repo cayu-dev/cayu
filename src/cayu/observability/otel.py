@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import importlib
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass
+from datetime import datetime
 from types import ModuleType
 from typing import Any
 
 from cayu.events import Event, EventType, copy_event, event_durable_sequence
 from cayu.observability.events import EventSink, _EventSinkDelivery
+from cayu.observability.timing import RuntimeTimingRecord, ToolRoundTiming
 from cayu.runtime._event_projection import project_runtime_event, public_event_sequence
 from cayu.tools.result_projection import (
     tool_result_projection_suppresses_result_content,
@@ -69,6 +71,9 @@ _MAX_OPEN_SESSIONS = 10_000
 # At-least-once event fan-out can replay a span event after another sink fails.
 # Keep recent identities bounded while covering ordinary in-process retry bursts.
 _MAX_RECENT_EVENT_IDENTITIES = 100_000
+_MAX_RECENT_TIMING_CONTEXTS = 10_000
+# Timing records waiting for their session/tool span contexts.
+_MAX_PENDING_TIMING_RECORDS = 1_000
 
 _OPERATION_CHAT = "chat"
 _OPERATION_EXECUTE_TOOL = "execute_tool"
@@ -210,6 +215,8 @@ class OpenTelemetryEventSink(EventSink):
         self._propagator_instance: Any | None = None
         self._sessions: dict[str, _SessionSpans] = {}
         self._recent_event_identities: OrderedDict[tuple[str, str], None] = OrderedDict()
+        self._timing_contexts: OrderedDict[tuple[str, str | None], Any] = OrderedDict()
+        self._pending_timing: deque[tuple[RuntimeTimingRecord, str, tuple[str, ...]]] = deque()
         self._evicted_sessions = 0
 
     @property
@@ -262,6 +269,133 @@ class OpenTelemetryEventSink(EventSink):
             identity=(event.session_id, event.id),
             correlation=correlation,
         )
+
+    async def emit_timing(self, record: RuntimeTimingRecord) -> None:
+        self._emit_timing(record, private_session_id=record.session_id)
+
+    def _remember_timing_context(self, session_id: str, call_id: str | None, span: Any) -> None:
+        key = (session_id, call_id)
+        self._timing_contexts[key] = self._trace.set_span_in_context(
+            self._trace.NonRecordingSpan(span.get_span_context())
+        )
+        self._timing_contexts.move_to_end(key)
+        while len(self._timing_contexts) > _MAX_RECENT_TIMING_CONTEXTS:
+            self._timing_contexts.popitem(last=False)
+        if self._pending_timing:
+            self._flush_pending_timing(session_id)
+
+    def _timing_call_ids(self, record, private_call_ids) -> tuple[str, ...]:
+        if not isinstance(record, ToolRoundTiming):
+            return ()
+        return tuple(
+            private_call_ids[index] if index < len(private_call_ids) else call.tool_call_id
+            for index, call in enumerate(record.calls)
+        )
+
+    def _timing_ready(self, record, private_session_id, private_call_ids) -> bool:
+        if (private_session_id, None) not in self._timing_contexts:
+            return False
+        if private_session_id not in self._sessions:
+            # The session span has ended: no later tool span can arrive.
+            return True
+        return all(
+            (private_session_id, call_id) in self._timing_contexts
+            for call_id in self._timing_call_ids(record, private_call_ids)
+        )
+
+    def _emit_timing(self, record, *, private_session_id, private_call_ids=()) -> None:
+        # Fan-out can deliver tool events after the timing record. Hold the record
+        # (bounded) until its session and tool span contexts are known instead of
+        # exporting children as orphan roots.
+        pending = (record, private_session_id, tuple(private_call_ids))
+        if not self._timing_ready(*pending):
+            self._pending_timing.append(pending)
+            while len(self._pending_timing) > _MAX_PENDING_TIMING_RECORDS:
+                self._write_timing(*self._pending_timing.popleft())
+            return
+        self._write_timing(*pending)
+
+    def _flush_pending_timing(self, private_session_id: str) -> None:
+        retained = deque()
+        while self._pending_timing:
+            pending = self._pending_timing.popleft()
+            if pending[1] == private_session_id and self._timing_ready(*pending):
+                self._write_timing(*pending)
+            else:
+                retained.append(pending)
+        self._pending_timing = retained
+
+    def _flush_all_pending_timing(self) -> None:
+        """At shutdown, write held records under whatever parent context is known."""
+        pending, self._pending_timing = self._pending_timing, deque()
+        for item in pending:
+            self._write_timing(*item)
+
+    def _write_timing(self, record, private_session_id, private_call_ids) -> None:
+        # Ended spans cannot accept new events. Retain only bounded trace contexts
+        # so a non-durable timing delivery can create children after publication.
+        parent = self._timing_contexts.get((private_session_id, None), self._empty_context)
+        round_start = _datetime_ns(record.started_at)
+        span = self._tracer.start_span(
+            "cayu." + record.kind, context=parent, start_time=round_start
+        )
+        self._set_timing_attributes(span, record, record.phases, start_time=round_start)
+        if isinstance(record, ToolRoundTiming):
+            _set_str(span, "cayu.tool_round.id", self._redactor.redact_text(record.tool_round_id))
+            # A call whose tool span this sink never saw (for example after a
+            # restart) stays under the round instead of becoming a trace root.
+            round_context = self._trace.set_span_in_context(span)
+            call_ids = self._timing_call_ids(record, private_call_ids)
+            for call, private_call in zip(record.calls, call_ids, strict=True):
+                call_parent = self._timing_contexts.get(
+                    (private_session_id, private_call), round_context
+                )
+                started = [p.first_started_at for p in call.phases if p.first_started_at]
+                completed = [p.last_completed_at for p in call.phases if p.last_completed_at]
+                call_start = _datetime_ns(min(started)) if started else round_start
+                call_end = (
+                    _datetime_ns(max(completed)) if completed else _datetime_ns(record.completed_at)
+                )
+                child = self._tracer.start_span(
+                    "cayu.tool.phases", context=call_parent, start_time=call_start
+                )
+                self._set_timing_attributes(child, record, call.phases, start_time=call_start)
+                _set_str(child, GEN_AI_TOOL_CALL_ID, self._redactor.redact_text(call.tool_call_id))
+                _set_str(child, GEN_AI_TOOL_NAME, self._redactor.redact_text(call.tool_name))
+                child.end(end_time=max(call_start, call_end))
+        span.end(end_time=_datetime_ns(record.completed_at))
+
+    def _set_timing_attributes(self, span, record, phases, *, start_time: int) -> None:
+        _set_str(span, CAYU_SESSION_ID, self._redactor.redact_text(record.session_id))
+        for field_name in (
+            "tool_round_id",
+            "model_step_id",
+            "model_attempt_id",
+            "after_tool_round_id",
+        ):
+            value = getattr(record, field_name, None)
+            if value is not None:
+                _set_str(span, "cayu.timing." + field_name, self._redactor.redact_text(value))
+        span.set_attribute(CAYU_INCOMPLETE, record.incomplete)
+        span.set_attribute("cayu.timing.duration_seconds", record.duration_seconds)
+        for phase in phases:
+            attributes = {
+                "cayu.timing." + key: value
+                for key, value in phase.model_dump(
+                    exclude={"name", "first_started_at", "last_completed_at"}
+                ).items()
+            }
+            # Stamp each phase at its first observed entry; an unobserved phase
+            # carries zero values at the span start.
+            span.add_event(
+                "cayu.phase." + phase.name,
+                attributes=attributes,
+                timestamp=(
+                    start_time
+                    if phase.first_started_at is None
+                    else _datetime_ns(phase.first_started_at)
+                ),
+            )
 
     async def _emit_correlated(
         self,
@@ -352,6 +486,7 @@ class OpenTelemetryEventSink(EventSink):
         _set_str(span, CAYU_AGENT_NAME, event.agent_name)
         _set_str(span, CAYU_ENVIRONMENT_NAME, event.environment_name)
         self._sessions[session_id] = _SessionSpans(span, event_ns)
+        self._remember_timing_context(session_id, None, span)
         return True
 
     def _end_session_span(
@@ -365,6 +500,8 @@ class OpenTelemetryEventSink(EventSink):
         if state is None:
             return False
         self._close_session_state(state, error=error, end_time=_event_time_ns(event))
+        if self._pending_timing:
+            self._flush_pending_timing(correlation.private_session_id)
         return True
 
     def _close_session_state(
@@ -526,6 +663,9 @@ class OpenTelemetryEventSink(EventSink):
             event=event,
             start_time=event_ns,
         )
+        self._remember_timing_context(
+            correlation.private_session_id, tool_call_id, state.tools[tool_call_id]
+        )
         return True
 
     def _new_tool_span(
@@ -576,6 +716,7 @@ class OpenTelemetryEventSink(EventSink):
             # represent that authority decision as an instantaneous child span without
             # inventing a runtime TOOL_CALL_STARTED event that would affect accounting.
             span = self._new_tool_span(state=state, event=event, start_time=event_ns)
+            self._remember_timing_context(correlation.private_session_id, tool_call_id, span)
         if span is None:
             return False
         if event.type == EventType.TOOL_CALL_BLOCKED:
@@ -586,7 +727,22 @@ class OpenTelemetryEventSink(EventSink):
             event.payload,
             redactor=self._redactor,
         )
-        self._finish(span, error=error, end_time=event_ns)
+        effect_ns = None
+        for field in (
+            "tool_effect_completed_at",
+            "tool_terminal_staged_at",
+            "tool_terminal_publication_started_at",
+        ):
+            value = event.payload.get(field)
+            if type(value) is str:
+                try:
+                    timestamp = _datetime_ns(datetime.fromisoformat(value))
+                except ValueError:
+                    continue
+                span.add_event("cayu." + field, timestamp=timestamp)
+                if field == "tool_effect_completed_at":
+                    effect_ns = timestamp
+        self._finish(span, error=error, end_time=effect_ns or event_ns)
         return True
 
     def _resolve_parent_context(self, event: Event, *, correlation: _OtelCorrelation) -> Any:
@@ -655,6 +811,22 @@ async def _emit_opentelemetry_delivery(
         identity=(delivery.private_session_id, delivery.private_event_id),
         correlation=correlation,
     )
+
+
+async def _emit_opentelemetry_timing(sink: OpenTelemetryEventSink, delivery: Any) -> None:
+    from cayu.runtime._phase_timing import _TimingDelivery
+
+    if type(sink) is not OpenTelemetryEventSink or type(delivery) is not _TimingDelivery:
+        raise TypeError("OpenTelemetry private timing requires exact built-in types.")
+    sink._emit_timing(
+        delivery.record,
+        private_session_id=delivery.private_session_id,
+        private_call_ids=delivery.private_call_ids,
+    )
+
+
+def _datetime_ns(value: datetime) -> int:
+    return int(value.timestamp() * 1_000_000_000)
 
 
 def _event_time_ns(event: Event) -> int:

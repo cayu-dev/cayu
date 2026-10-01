@@ -167,6 +167,7 @@ from cayu.runtime._interruption_coordinator import (
     _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
 )
 from cayu.runtime._invocation_lifecycle import InvocationContext
+from cayu.runtime._phase_timing import timed_phase, timed_tool_round
 from cayu.runtime._run_limit_accounting import (
     RunLimitAccountingContext,
     pause_run_limit_accounting_context,
@@ -937,6 +938,7 @@ class ToolRoundExecutor:
             expected_run_epoch=session.run_epoch,
         )
 
+    @timed_phase("authorization")
     async def resolve_targeted_tool_calls(
         self,
         *,
@@ -1749,6 +1751,7 @@ class ToolRoundExecutor:
         delivered = await self._event_writer.fan_out_persisted([result.event])
         return tuple(delivered)
 
+    @timed_phase("authorization")
     async def policy_plan(
         self,
         *,
@@ -2014,6 +2017,7 @@ class ToolRoundExecutor:
             ),
         )
 
+    @timed_phase("authorization")
     async def authorize_tool_call(
         self,
         *,
@@ -2078,6 +2082,7 @@ class ToolRoundExecutor:
                     labels.update(taint_policy.labels_for_source_tool(record.event.tool_name))
         return labels
 
+    @timed_phase("round_commit", shared=True)
     async def checkpoint_pending_tool_approval(
         self,
         *,
@@ -2365,6 +2370,7 @@ class ToolRoundExecutor:
             raise cancellation
         return approval, events
 
+    @timed_phase("admission")
     async def checkpoint_tool_round_policy_plan(
         self,
         *,
@@ -2459,6 +2465,7 @@ class ToolRoundExecutor:
         await self._session_store.transform_checkpoint(session.id, publish_policy_plan)
         return planned_round
 
+    @timed_phase("round_commit", shared=True)
     async def checkpoint_pending_user_input(
         self,
         *,
@@ -2687,6 +2694,7 @@ class ToolRoundExecutor:
             raise cancellation
         return pending, list(prepared.request.events)
 
+    @timed_phase("admission")
     async def checkpoint_with_pending_tool_round(
         self,
         *,
@@ -2809,6 +2817,7 @@ class ToolRoundExecutor:
         copied[_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY] = interrupt_payload
         return copied
 
+    @timed_phase("unattributed")
     async def execute_tool_call(
         self,
         *,
@@ -6452,6 +6461,7 @@ class ToolRoundExecutor:
             )
         return failed_event, failure_result, True
 
+    @timed_phase("result_processing")
     async def emit_tool_call_result_with_hooks(
         self,
         *,
@@ -7376,6 +7386,7 @@ class ToolRoundRun:
             raise ValueError("Tool-round queued handoff lost frozen invocation authority.")
         self._invocation_context = invocation_context
 
+    @timed_tool_round
     async def run(
         self,
         *,

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import sqlite3
 from collections.abc import Callable
@@ -86,6 +85,7 @@ from cayu.runtime.work_attempt_lifecycle import (
 from cayu.sessions.invocation import SessionInvocationBinding, TaskInvocation
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
+from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage._sqlite_connection import _run_off_thread_with_connection_ownership
 from cayu.storage.targets import require_sqlite_store_allowed
 from cayu.tasks._scheduling import (
@@ -456,7 +456,7 @@ class SQLiteTaskStore(TaskStore):
         self._clock = utc_clock(clock)
         self._enable_task_admission_wakeups()
         self._ownership_clock = utc_clock(ownership_clock)
-        self._lock = asyncio.Lock()
+        self._lock = TimedStoreLock()
         effective_db_path = Path(":memory:") if diagnostic_source_missing else db_path
         self._connection = self._connect(effective_db_path)
         try:

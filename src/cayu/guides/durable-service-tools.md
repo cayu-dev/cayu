@@ -269,3 +269,169 @@ limits. A valid skip remains not executed; resume never fabricates a start or
 re-dispatches the skipped effect. Conflicting started or terminal evidence remains
 an explicit recovery error. See the runtime contract's run elapsed-time semantics
 for the exact interval and provenance rules.
+
+## Attributing runtime time around a tool
+
+`CayuApp` keeps a bounded, process-local timing view by default. It contains
+durations, counts, byte sizes, registered tool names and public identifiers.
+It never includes arguments, results, prompts, SQL, or exception messages.
+Read it after consuming the run; the newest records come first:
+
+```python
+async def print_timing(app, session_id):
+    rounds = await app.inspect_recent_tool_round_timing(session_id, limit=20)
+    preparation = await app.inspect_recent_model_step_preparation_timing(session_id, limit=20)
+    for record in (*rounds, *preparation):
+        print(record.model_dump_json())
+```
+
+The private session id or a public session reference already in the local
+buffer can select these observations. This read does not access the database
+or grant execution/recovery authority. The buffer is shared across sessions
+and defaults to 64 records, with at most 128 calls per round. Configure bounds
+with `RuntimeTimingConfig(recent_capacity=..., max_calls_per_round=...)` passed
+as `CayuApp(runtime_timing=...)`; `calls_truncated` reports omitted calls.
+`RuntimeTimingConfig(enabled=False)` disables collection and delivery.
+
+A `ToolRoundTiming` has aggregate `phases` plus `calls`, each with the same
+twelve phase names. Shared round work, such as planning the complete approval
+set and committing the transcript, belongs to the round rather than being
+charged repeatedly to each call. A zero per-call value therefore does not
+mean that the shared operation did not run.
+
+| Phase | Measured work |
+| --- | --- |
+| `authorization` | Tool policy, approval planning, exposure checks and final dispatch reauthorization. |
+| `admission` | Pending-round/policy checkpointing and capacity reservation, including reservation waits. |
+| `started_persistence` | Appending `tool.call.started` and delivering its durable side effects. |
+| `effect_state` | Durable tool-effect intent, transition and reconciliation records, including the intent written before dispatch and recovery's per-call reconciliation. |
+| `execution` | The application's tool invocation through effect completion; process isolation includes dispatch transport. |
+| `result_processing` | Terminal hooks, result validation/redaction and terminal event preparation. |
+| `staging` | Preparing, validating and durably staging a terminal checkpoint, sealing its secret snapshot, refreshing staged outcomes and recording hook completion on the stage. |
+| `sibling_wait` | From this call's stage until the last sibling call stages its terminal. Zero for a single-call round and for the last call to finish. |
+| `publication_queue_wait` | From the end of `sibling_wait` until this call's publication starts: the rest of dispatch, sealing the round, the pre-publication read and publication of earlier calls in model order. |
+| `publication` | Pinning publication timing, verifying that checkpoint, appending the terminal event and delivering its durable side effects. |
+| `round_commit` | The round's closing write: preparing and atomically publishing the transcript, checkpoint and round receipt, including exact replay after a lost acknowledgement and delivery of its events. For a paused attempt, the approval or user-input pause write; for an approved or answered continuation, its approval/input close. |
+| `unattributed` | Remaining round orchestration outside the named phases, such as interruption checks and pending-round reads. |
+
+Durations use a monotonic clock and exclude nested phase intervals. Generator
+consumer backpressure is excluded from the active round phases. The two waits
+are measured between runtime marks instead, so they can include time the
+consumer takes with the round's yielded events. Each phase also reports
+`first_started_at` and `last_completed_at`, the wall-clock bounds of its observed
+entries; a phase entered more than once can have a window longer than its
+duration. Parallel call durations and the two waits overlap other calls' work:
+do not sum them to infer elapsed round wall time. Use `duration_seconds` for
+observed round wall time. For a live round with serial dispatch, the active
+phases (all except the two waits) add up to it, apart from consumer time
+between yielded events. An approved or answered continuation does not charge
+its remaining dispatch orchestration to `unattributed`, and some continuation
+dispatch paths record only their staging, so its phases can add up to less
+than its duration. Each local round execution or recovery attempt emits one
+record: interrupted, cancelled and approval-paused attempts are `incomplete`,
+an approved or answered continuation emits its own record for the same round,
+and publication after process loss is `recovered`. Closing a round that was
+interrupted before its live runner started is neither. Missing phases are
+zero; Cayu does not reconstruct execution time from old receipts.
+
+A foreground subagent tool's `execution` includes the child session's elapsed
+time. The child's rounds and model steps report their own records under the
+child session, and their phases are not subtracted from the parent call.
+
+`ModelStepPreparationTiming` covers the gap from the last locally observed
+round commit to the next `model.started` in the same run epoch. `handoff` is
+the part before the model step starts preparing; it includes consumer
+backpressure on the round's final events and session-loop scheduling.
+`context_policy`, automatic `recall` and `counting` are then measured
+separately, and `preparation` is the remaining time inside the model step
+before the provider request starts. A commit is used once: a later step with
+no round in between, such as a structured-output repair, starts at its own
+preparation, as does the first model step. Database costs are measured only
+while an observed phase is active.
+
+Each phase reports `store_transaction_count`, `store_lock_wait_seconds`,
+`store_execution_seconds`, `store_commit_seconds` and `store_bytes_written`.
+These describe the maintained native store connection paths, including
+session, task, budget and knowledge work and context propagated into SQLite
+worker threads. Memory/custom stores have no
+native database cost measurements. SQLite counts explicit/implicit driver
+transactions and autocommit reads; PostgreSQL counts actual transaction
+starts, including reads. Commit time excludes no-op commits. Bytes are bound
+write payload sizes, including serialized JSON, rather than physical disk
+pages, WAL bytes or replication traffic. No SQL or parameter values leave
+the accumulator.
+
+Lock wait includes local lock/read-pool or PostgreSQL pool admission. SQLite
+`BEGIN IMMEDIATE` and PostgreSQL `FOR UPDATE` acquisition latency is also
+reported there and in SQL execution time. That database acquisition latency
+includes query/network work: it is not an exact database-engine lock-wait
+counter. Lock/SQL/commit counters describe components of elapsed phase time;
+they are not additional durations to add to it.
+
+To export observations, override `EventSink.emit_timing(record)` or supply
+`CayuApp(timing_sinks=[...])` with an async `emit_timing` method. Event sinks
+that do not override `emit_timing` receive nothing and start no delivery
+worker. `LoggingEventSink` emits the content-free JSON at DEBUG only when
+constructed with `log_runtime_timing=True`; the default application logger
+does not. Delivery is non-durable, best effort, outside invocation authority,
+and bounded by a 128-record queue plus a one-second timeout per sink by
+default. Slow/full queues drop observations; sink errors increment
+`app.runtime_timing_status().failed_deliveries`. They never fail the workload,
+append failure events, or retry durable sink receipts.
+`await app.flush_runtime_timing()` waits for queued observations, and
+`await app.close_runtime_timing()` stops delivery at shutdown after one flush
+bounded by the sink timeout; records it could not deliver count as dropped.
+The mounted and standalone Cayu servers close timing delivery on shutdown. An
+application can be used from successive `asyncio.run()` calls: queued records
+move to the running loop. The records and recent view do not survive restart.
+
+`OpenTelemetryEventSink` exports round and preparation spans with their
+observed start and end, and one `cayu.tool.phases` child per call under that
+call's `execute_tool` span. The per-call span starts at the call's first
+observed phase and ends at its last, normally the end of its publication; each
+phase event is stamped at the phase's first entry and carries its duration and
+store costs. Because the call's span includes authorization before
+`tool.call.started` and staging/publication after the effect, it can extend
+beyond its parent. The `execute_tool` span ends at the attested
+effect-completion timestamp and carries the effect-completed, terminal-staged
+and publication-started timestamps as events, so the latter two fall after
+its end. If a timing record arrives before the sink has seen the session or a
+call's tool span, the sink holds it (at most 1,000 records) until they appear
+or the session ends; `close_runtime_timing()` exports any still held under the
+best known parent. A call whose tool span never arrives stays under the round
+span rather than becoming a trace root.
+
+For example, suppose `execution` takes 50 ms, staging reports three commits
+and 300 ms commit time, publication reports two commits and 200 ms, and
+round commit reports one commit and 100 ms. Those 600 ms are runtime
+persistence cost. If the first of two serial calls also shows 2 s of
+`sibling_wait`, that is the second call running; it does not mean the first
+tool or its result append took 2 s. A large `publication_queue_wait` on a
+later call is the earlier calls' publication and the round's sealing, which
+their own `publication` and `unattributed` phases account for. Compare
+transaction counts and commit time before optimizing the application tool
+or changing the storage medium.
+
+Collection adds no durable event, checkpoint or receipt write per phase.
+When timing is disabled, or outside a measured phase, the SQLite connection
+returns the driver's own cursors, so rows are not iterated in Python. The
+provider-free benchmark can be rerun noninteractively. Pass another checkout's
+`src` directory, such as the merge base, as the no-timing baseline:
+
+```console
+uv run --no-sync python maintenance/benchmark_runtime_phase_timing.py --backend sqlite --iterations 20
+uv run --no-sync python maintenance/benchmark_runtime_phase_timing.py --backend sqlite --iterations 20 --rounds 5 --baseline-src ../cayu-main/src
+uv run --no-sync python maintenance/benchmark_runtime_phase_timing.py --backend memory --iterations 20 --rounds 5 --baseline-src ../cayu-main/src
+```
+
+The benchmark uses no timing/event/logging sink and a no-op tool; production
+provider/tool latency will change the relative overhead.
+
+One local macOS run on a shared, loaded machine compared 100 samples per
+configuration (5 fresh worker processes of 20 runs each) against the merge
+base on `main`, which has no timing collection. SQLite medians were 0.848 s on
+`main`, 0.838 s with timing disabled and 0.840 s enabled. Memory-store medians
+were 0.722 s, 0.724 s and 0.720 s. Every difference is within about 1.2% in
+either direction, below the run-to-run noise of this measurement, so it shows
+no measurable overhead rather than a speedup. These small local point
+estimates do not predict overhead on a different machine or storage mount.

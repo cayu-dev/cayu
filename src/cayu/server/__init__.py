@@ -1053,10 +1053,13 @@ async def _drain_server_owned_work(
             timeout_s=lifecycle.interruption_shutdown_grace_seconds,
         )
     finally:
-        await _drain_knowledge_publications(
-            app,
-            timeout_s=lifecycle.knowledge_publication_shutdown_grace_seconds,
-        )
+        try:
+            await _drain_knowledge_publications(
+                app,
+                timeout_s=lifecycle.knowledge_publication_shutdown_grace_seconds,
+            )
+        finally:
+            await app.close_runtime_timing()
 
 
 async def _recover_persisted_event_side_effects_until_idle(
@@ -1410,10 +1413,13 @@ def _compose_interruption_drain_lifespan(
                             )
                             await _drain_environment_cleanups(app, timeout_s=timeout_s)
                         finally:
-                            await _drain_knowledge_publications(
-                                app,
-                                timeout_s=knowledge_publication_timeout_s,
-                            )
+                            try:
+                                await _drain_knowledge_publications(
+                                    app,
+                                    timeout_s=knowledge_publication_timeout_s,
+                                )
+                            finally:
+                                await app.close_runtime_timing()
                 finally:
                     await _close_project_control_plane_context(project_context)
 

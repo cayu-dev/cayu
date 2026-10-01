@@ -148,6 +148,7 @@ from cayu.evals.suite_authoring import (
 )
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
+from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage._sqlite_connection import _run_off_thread_with_connection_ownership
 from cayu.storage.targets import require_sqlite_store_allowed
 
@@ -504,7 +505,7 @@ class SQLiteEvalStore(EvalStore):
         self.path = db_path
         self._diagnostic_source_missing = diagnostic_source_missing
         self.writer_contention_policy = writer_contention_policy
-        self._lock = asyncio.Lock()
+        self._lock = TimedStoreLock()
         effective_db_path = Path(":memory:") if diagnostic_source_missing else db_path
         self._connection = (
             sqlite_support.connect_read_only_inspection(effective_db_path)
@@ -541,7 +542,7 @@ class SQLiteEvalStore(EvalStore):
                     if read_only
                     else sqlite_support.connect(effective_db_path, read_only=True)
                 )
-                self._read_lock = asyncio.Lock()
+                self._read_lock = TimedStoreLock()
                 self._read_executor = ThreadPoolExecutor(
                     max_workers=1,
                     thread_name_prefix="cayu-evals-sqlite-read",

@@ -314,6 +314,13 @@ from cayu.observability.hooks import (
     RuntimeHook,
     RuntimeHookPhase,
 )
+from cayu.observability.timing import (
+    ModelStepPreparationTiming,
+    RuntimeTimingConfig,
+    RuntimeTimingSink,
+    RuntimeTimingStatus,
+    ToolRoundTiming,
+)
 from cayu.observability.watchers import (
     EVENT_WATCHER_QUERY_PAGE_LIMIT,
     EventWatcher,
@@ -1183,6 +1190,8 @@ class CayuApp:
         request_footprint: RequestFootprintConfig | None = None,
         event_sinks: Iterable[EventSink] | None = None,
         enable_logging: bool = True,
+        runtime_timing: RuntimeTimingConfig | None = None,
+        timing_sinks: Iterable[RuntimeTimingSink] | None = None,
         secret_redactor: SecretRedactor | None = None,
         public_authority_alias_keyring: PublicAuthorityAliasKeyring | None = None,
         session_closure_stores: Iterable[SessionClosureStore] | None = None,
@@ -1476,6 +1485,8 @@ class CayuApp:
             secret_redactor=self._secret_redactor,
             public_authority_alias_codec=self._public_authority_alias_codec,
             continue_foreground_parent=self._continue_foreground_parent,
+            runtime_timing=runtime_timing,
+            timing_sinks=() if timing_sinks is None else tuple(timing_sinks),
         )
         self._completion_result_resolver_coordinator = CompletionResultResolverCoordinator(
             application_coordinator=self._completion_decision_application_coordinator,
@@ -8852,6 +8863,36 @@ class CayuApp:
     async def get_persisted_event_side_effect_health(self) -> PersistedEventSideEffectHealth:
         """Read the store-wide durable fan-out snapshot; never emit or retry events."""
         return await self._runtime_session_store.get_persisted_event_side_effect_health()
+
+    async def inspect_recent_tool_round_timing(
+        self, session_id: str, *, limit: int = 20
+    ) -> tuple[ToolRoundTiming, ...]:
+        """Read the bounded, process-local recent round timings; never touch a store."""
+        session_id = require_clean_nonblank(session_id, "session_id")
+        return self._event_writer.timing.inspect(session_id, limit, ToolRoundTiming)
+
+    async def inspect_recent_model_step_preparation_timing(
+        self, session_id: str, *, limit: int = 20
+    ) -> tuple[ModelStepPreparationTiming, ...]:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        return self._event_writer.timing.inspect(session_id, limit, ModelStepPreparationTiming)
+
+    def runtime_timing_status(self) -> RuntimeTimingStatus:
+        return self._event_writer.timing.status()
+
+    async def flush_runtime_timing(self) -> None:
+        """Wait for bounded best-effort timing deliveries; adds no durable writes."""
+        await self._event_writer.timing.flush()
+
+    async def close_runtime_timing(self) -> None:
+        """Stop timing delivery at shutdown after one flush bounded by the sink timeout.
+
+        Undelivered records are counted as dropped. OpenTelemetry records still
+        waiting for their session or tool span are exported under the best
+        known parent. Later records start a new delivery worker on the running
+        event loop.
+        """
+        await self._event_writer.timing.aclose()
 
     async def query_persisted_event_side_effect_deliveries(
         self,
