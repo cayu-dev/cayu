@@ -308,11 +308,13 @@ def scaffold(directory: Path, cayu_source: Path) -> Path:
         raise RuntimeError(f"cayu new failed: {created.stdout.strip()} {created.stderr.strip()}")
     project = directory / "evalproj"
     pyproject = project / "pyproject.toml"
-    # Pin the project to the checkout under test, not a PyPI release with the same version.
-    pyproject.write_text(
-        pyproject.read_text()
-        + f'\n[tool.uv.sources]\ncayu = {{ path = "{cayu_source}", editable = true }}\n'
-    )
+    # `cayu new` run from a checkout already points the project at it; older
+    # generators wrote a PyPI pin, so add the checkout source only if it's missing.
+    if "[tool.uv.sources]" not in pyproject.read_text():
+        pyproject.write_text(
+            pyproject.read_text()
+            + f'\n[tool.uv.sources]\ncayu = {{ path = "{cayu_source}", editable = true }}\n'
+        )
     subprocess.run(["uv", "sync", "--extra", "dev", "--quiet"], cwd=project, check=True)
     subprocess.run(["git", "init", "-q"], cwd=project, check=True)
     subprocess.run(["git", "add", "-A"], cwd=project, check=True)

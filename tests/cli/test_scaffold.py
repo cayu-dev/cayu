@@ -13,6 +13,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -2759,3 +2760,92 @@ def test_agents_md_maps_user_requests_to_cayu_features(tmp_path: Path, capsys) -
     for reference in sorted(set(re.findall(r"`cayu guide ([a-z0-9-]+(?:#[a-z0-9-]+)?)`", table))):
         assert main(["guide", reference]) == 0, reference
         capsys.readouterr()
+
+
+def _fake_cayu_checkout(root: Path, *, version: str = "9.9.0") -> Path:
+    package = root / "src" / "cayu"
+    package.mkdir(parents=True)
+    (root / "pyproject.toml").write_text(
+        f'[project]\nname = "cayu"\nversion = "{version}"\n', encoding="utf-8"
+    )
+    return package
+
+
+def test_source_checkout_detection_uses_the_checkout_version(tmp_path: Path) -> None:
+    from cayu.cli import scaffold
+
+    package = _fake_cayu_checkout(tmp_path / "checkout", version="0.7.0")
+    detected = scaffold._cayu_source_checkout(package)
+    assert detected is not None
+    assert detected.root == (tmp_path / "checkout").resolve()
+    assert detected.version == "0.7.0"
+
+    release = tmp_path / "venv" / "lib" / "python3.13" / "site-packages" / "cayu"
+    release.mkdir(parents=True)
+    assert scaffold._cayu_source_checkout(release) is None
+
+    other = tmp_path / "other"
+    (other / "src" / "cayu").mkdir(parents=True)
+    (other / "pyproject.toml").write_text('[project]\nname = "app"\nversion = "1.0"\n')
+    assert scaffold._cayu_source_checkout(other / "src" / "cayu") is None
+
+
+@pytest.mark.parametrize("checkout_name", ["checkout", "checkout-🚀", "checkout-\x7f"])
+def test_scaffold_from_a_source_checkout_points_the_project_at_it(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    checkout_name: str,
+) -> None:
+    from cayu.cli import scaffold
+
+    checkout_root = (tmp_path / checkout_name).resolve()
+    package = _fake_cayu_checkout(checkout_root)
+    real_detection = scaffold._cayu_source_checkout
+    monkeypatch.setattr(scaffold, "_cayu_source_checkout", lambda: real_detection(package))
+    # Stale editable metadata must not decide the pin.
+    monkeypatch.setattr(scaffold, "_installed_cayu_version", lambda: "0.1.0")
+
+    assert main(["new", "fromsource", "--dir", str(tmp_path)]) == 0
+    receipt = capsys.readouterr().out
+
+    document = tomllib.loads((tmp_path / "fromsource" / "pyproject.toml").read_text())
+    assert document["project"]["dependencies"] == ["cayu[postgres]==9.9.0"]
+    assert document["tool"]["uv"]["sources"] == {
+        "cayu": {"path": str(checkout_root), "editable": True}
+    }
+    assert f"Cayu source: {checkout_root}" in receipt
+
+    # The coding Docker image cannot see the host checkout; it keeps its wheel seam.
+    coding = scaffold.project_files(
+        "coder",
+        application_plan=scaffold.normalize_application_plan(
+            name="coder", agent_name="coder", preset="coding", execution="docker"
+        ),
+    )
+    coding_document = tomllib.loads(coding["pyproject.toml"])
+    assert "sources" not in coding_document["tool"]["uv"]
+    assert coding_document["project"]["dependencies"][0] == "cayu[postgres]==9.9.0"
+
+
+def test_scaffold_from_a_release_install_keeps_the_pypi_pin(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cayu.cli import scaffold
+
+    monkeypatch.setattr(scaffold, "_cayu_source_checkout", lambda: None)
+    monkeypatch.setattr(scaffold, "_installed_cayu_version", lambda: "1.2.3")
+
+    assert main(["new", "fromrelease", "--dir", str(tmp_path)]) == 0
+    receipt = capsys.readouterr().out
+
+    document = tomllib.loads((tmp_path / "fromrelease" / "pyproject.toml").read_text())
+    assert document["project"]["dependencies"] == ["cayu[postgres]==1.2.3"]
+    assert document["project"]["optional-dependencies"]["dev"] == [
+        "cayu[postgres,server]==1.2.3",
+        "pytest",
+    ]
+    assert document["tool"]["uv"] == {"cache-dir": ".cayu/uv-cache"}
+    assert "Cayu source:" not in receipt

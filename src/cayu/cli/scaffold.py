@@ -12,7 +12,9 @@ import shutil
 import stat
 import sys
 import tempfile
+import tomllib
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from cayu._version import package_version
@@ -717,7 +719,7 @@ pythonpath = ["."]
 
 [tool.uv]
 cache-dir = ".cayu/uv-cache"
-"""
+__UV_SOURCES__"""
 
 _PROVIDER_GUIDE_POINTER = """OpenRouter is a first-class scaffold choice. Fireworks, Baseten, OpenCode Go,
 and other compatible endpoints work through Cayu's generic adapter. Run
@@ -2556,6 +2558,48 @@ def _installed_cayu_version() -> str:
     return package_version()
 
 
+@dataclass(frozen=True)
+class _CayuSourceCheckout:
+    root: Path
+    version: str
+
+
+def _cayu_source_checkout(package_dir: Path | None = None) -> _CayuSourceCheckout | None:
+    """Return the source checkout this Cayu runs from, or None for a release install.
+
+    An editable or ``PYTHONPATH`` install runs a checkout's code, and its installed
+    metadata can be stale. A ``cayu==<version>`` pin would then install a PyPI
+    release with different code, so projects point at the checkout instead. A
+    release install lives under site-packages and keeps the PyPI pin.
+    """
+
+    package = (
+        Path(__file__).resolve().parents[1] if package_dir is None else package_dir
+    ).resolve()
+    if any(part in {"site-packages", "dist-packages"} for part in package.parts):
+        return None
+    # Flat (``cayu/``) or src (``src/cayu/``) layout.
+    for root in (package.parent, package.parent.parent):
+        try:
+            document = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+            continue
+        project = document.get("project")
+        if (
+            isinstance(project, dict)
+            and project.get("name") == "cayu"
+            and isinstance(project.get("version"), str)
+        ):
+            return _CayuSourceCheckout(root=root, version=project["version"])
+    return None
+
+
+def _uses_cayu_source_checkout(plan: ApplicationPlan) -> bool:
+    # The coding Docker image runs `uv sync --frozen` without the host checkout;
+    # it installs unreleased Cayu through the reviewed `cayu_wheel` instead.
+    return not (plan.preset == "coding" and plan.execution == "docker")
+
+
 def project_files(
     name: str,
     *,
@@ -2593,7 +2637,19 @@ def project_files(
     ):
         raise ValueError("coding_command_authority conflicts with the normalized plan.")
     reviewer_name = f"{resolved_agent_name}-reviewer"
-    version = _installed_cayu_version()
+    source_checkout = _cayu_source_checkout()
+    # A checkout's own version, not its possibly stale installed metadata.
+    version = _installed_cayu_version() if source_checkout is None else source_checkout.version
+    source_path = (
+        json.dumps(str(source_checkout.root), ensure_ascii=False).replace("\x7f", r"\u007f")
+        if source_checkout is not None
+        else ""
+    )
+    uv_sources = (
+        f"\n[tool.uv.sources]\ncayu = {{ path = {source_path}, editable = true }}\n"
+        if source_checkout is not None and _uses_cayu_source_checkout(plan)
+        else ""
+    )
     # Every project can switch to PostgreSQL through CAYU_DATABASE_URL.
     runtime_extra = "[postgres,server]" if plan.preset == "service" else "[postgres]"
     dev_dependencies = ["pytest"]
@@ -2680,6 +2736,7 @@ def project_files(
             "__CAYU_VERSION__": version,
             "__RUNTIME_DEPENDENCIES__": json.dumps([f"cayu{runtime_extra}=={version}"]),
             "__DEV_DEPENDENCIES__": json.dumps(dev_dependencies),
+            "__UV_SOURCES__": uv_sources,
             "__SERVICE_FACTORY__": (
                 'service_factory = "service:build_service"\n' if plan.preset == "service" else ""
             ),
@@ -3026,6 +3083,9 @@ def _render_new_receipt(
         print("  Private runtime state: data/memory-evidence.key (ignored; mode 0600 on POSIX)")
     print("  Agent instructions: AGENTS.md (CLAUDE.md imports the same contract)")
     print("  Scaffold contract: pyproject.toml [tool.cayu.scaffold]")
+    source_checkout = _cayu_source_checkout()
+    if source_checkout is not None and _uses_cayu_source_checkout(plan):
+        print(f"  Cayu source: {source_checkout.root} (local checkout, editable)")
     print(f"  cd {target}")
     if plan.preset == "coding" and plan.execution == "docker":
         print(
