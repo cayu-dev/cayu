@@ -95,6 +95,13 @@ temporary artifact selection and checks readiness against the updated scenario.
 It returns the new scenario revision without saving it. Router composition
 retains scenario run admission, execution and the shared bounded/auth boundary.
 
+`server/_corpus_management_routes.py` owns corpus import, catalog, detail,
+download and suite/case browsing. It receives the bounded router, store, target
+registry and shared auth dependencies, and composes the existing corpus
+validation, serialization and storage operations. Catalog reads and run creation
+share one revision loader that enforces current target visibility and private
+storage errors. Run admission, execution and worker lifespan retain their owners.
+
 ## Runtime Shape
 
 ```text

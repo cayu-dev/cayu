@@ -104,14 +104,12 @@ from cayu.evals.corpus import (
     EvalCorpusDocument,
     ToolArgumentsContainAssertionSpec,
     ToolResultContainsAssertionSpec,
-    eval_corpus_to_json,
     eval_suite_trial_policy,
     pricing_profile_identity,
 )
 from cayu.evals.execution import (
     CompiledCorpusSuite,
     CorpusTarget,
-    _validate_corpus_target_compatibility,
     compile_corpus_suite,
     evaluation_target_identity,
 )
@@ -151,11 +149,6 @@ from cayu.evals.store import (
     EVAL_STORE_MAX_PAGE_BYTES,
     EVAL_STORE_MAX_PAGE_SIZE,
     EvalBaselineKey,
-    EvalCaseCatalogPage,
-    EvalCaseCatalogQuery,
-    EvalCatalogQuery,
-    EvalCorpusCatalogEntry,
-    EvalCorpusCatalogPage,
     EvalCorpusConflict,
     EvalResultConflict,
     EvalRunAdmissionConflict,
@@ -172,8 +165,6 @@ from cayu.evals.store import (
     EvalScenarioRunInvocation,
     EvalStorePublicationRejected,
     EvalStoreResultTooLarge,
-    EvalSuiteCatalogPage,
-    EvalSuiteCatalogQuery,
 )
 from cayu.evals.suite_authoring import (
     EvalScenarioStimulusV1,
@@ -261,6 +252,10 @@ from cayu.server._browser_client import (
 )
 from cayu.server._capabilities import inspect_control_plane_capabilities
 from cayu.server._captured_evaluation_routes import register_captured_evaluation_routes
+from cayu.server._corpus_management_routes import (
+    load_eval_corpus,
+    register_corpus_management_routes,
+)
 from cayu.server._diagnostics import SystemDiagnosticsSnapshot, inspect_system_diagnostics
 from cayu.server._evaluation_promotion_routes import (
     _promotion_error_detail,
@@ -5003,22 +4998,6 @@ def create_router(
                 ) from exc
             return effective_target, compiled, invocation
 
-        async def _load_eval_corpus(corpus_revision: str) -> EvalCorpusDocument:
-            try:
-                corpus = await eval_store.load_corpus(corpus_revision)
-            except EvalStoreResultTooLarge as exc:
-                raise HTTPException(
-                    status_code=413,
-                    detail="Eval corpus exceeds the server byte limit.",
-                ) from exc
-            except (TypeError, ValueError):
-                _eval_query_error()
-            if corpus is None:
-                raise HTTPException(status_code=404, detail="Eval corpus not found.")
-            if active_eval_registry.get(corpus.target_key) is None:
-                raise HTTPException(status_code=404, detail="Eval corpus not found.")
-            return corpus
-
         async def _load_eval_run(run_id: str):
             try:
                 run = await eval_store.load_run(run_id)
@@ -6108,212 +6087,12 @@ def create_router(
                 compiled=compiled,
             )
 
-        @bounded_evals_router.post(
-            "/evals/corpora",
-            response_model=EvalCorpusCatalogEntry,
-            status_code=201,
-            responses=EVALS_ENDPOINT_RESPONSES,
-            dependencies=protected,
-            openapi_extra=_json_request_openapi("EvalCorpusDocument"),
+        register_corpus_management_routes(
+            bounded_evals_router,
+            eval_store=eval_store,
+            active_eval_registry=active_eval_registry,
+            protected=protected,
         )
-        async def import_eval_corpus(request: Request):
-            corpus = await _validated_private_json_body(
-                request,
-                EvalCorpusDocument,
-                invalid_detail="Invalid Evals request.",
-            )
-            eval_target = active_eval_registry.get(corpus.target_key)
-            if eval_target is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Eval corpus is incompatible with the attached target.",
-                )
-            try:
-                await asyncio.to_thread(
-                    evaluation_target_identity,
-                    eval_target,
-                )
-                await asyncio.to_thread(
-                    _validate_corpus_target_compatibility,
-                    corpus,
-                    eval_target,
-                )
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Eval corpus is incompatible with the attached target.",
-                ) from exc
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Attached eval target is unavailable.",
-                ) from exc
-            try:
-                return await eval_store.save_corpus(
-                    corpus,
-                    redact_json=eval_target.app.redact_json,
-                )
-            except EvalCorpusConflict as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Eval corpus revision conflicts with stored content.",
-                ) from exc
-            except EvalStorePublicationRejected as exc:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Eval corpus contains unsafe public data.",
-                ) from exc
-            except EvalStoreResultTooLarge as exc:
-                raise HTTPException(
-                    status_code=413,
-                    detail="Eval corpus exceeds the server byte limit.",
-                ) from exc
-
-        @bounded_evals_router.get(
-            "/evals/corpora",
-            response_model=EvalCorpusCatalogPage,
-            responses=EVALS_ENDPOINT_RESPONSES,
-            dependencies=protected,
-        )
-        async def list_eval_corpora(
-            target_key: Annotated[
-                str | None,
-                Query(max_length=EVAL_STORE_MAX_IDENTIFIER_CHARS),
-            ] = None,
-            cursor: Annotated[str | None, Query(max_length=EVAL_STORE_MAX_CURSOR_BYTES)] = None,
-            limit: Annotated[
-                int,
-                Query(ge=1, le=EVAL_STORE_MAX_PAGE_SIZE),
-            ] = EVAL_STORE_DEFAULT_PAGE_SIZE,
-            max_result_bytes: Annotated[
-                int,
-                Query(ge=1_024, le=EVAL_STORE_MAX_PAGE_BYTES),
-            ] = EVAL_STORE_DEFAULT_PAGE_BYTES,
-        ):
-            eval_target = _eval_target(target_key)
-            try:
-                return await eval_store.list_corpora(
-                    EvalCatalogQuery(
-                        target_key=eval_target.key,
-                        cursor=cursor,
-                        limit=limit,
-                        max_result_bytes=max_result_bytes,
-                    )
-                )
-            except EvalStoreResultTooLarge as exc:
-                raise HTTPException(
-                    status_code=413,
-                    detail="Eval catalog page exceeds the requested byte limit.",
-                ) from exc
-            except (TypeError, ValueError):
-                _eval_query_error()
-
-        @bounded_evals_router.get(
-            "/evals/corpora/{corpus_revision}",
-            response_model=EvalCorpusDocument,
-            responses=EVALS_ENDPOINT_RESPONSES,
-            dependencies=protected,
-        )
-        async def get_eval_corpus(corpus_revision: str):
-            corpus = await _load_eval_corpus(corpus_revision)
-            return await _model_json_response(corpus, EvalCorpusDocument)
-
-        @bounded_evals_router.get(
-            "/evals/corpora/{corpus_revision}/download",
-            response_class=Response,
-            responses=EVALS_ENDPOINT_RESPONSES,
-            dependencies=protected,
-        )
-        async def download_eval_corpus(corpus_revision: str) -> Response:
-            corpus = await _load_eval_corpus(corpus_revision)
-            corpus_json = await asyncio.to_thread(_render_utf8, eval_corpus_to_json, corpus)
-            return Response(
-                content=corpus_json,
-                media_type="application/json",
-                headers={
-                    "Content-Disposition": (
-                        f'attachment; filename="{corpus.target_key}-{corpus.revision[7:19]}.eval.json"'
-                    )
-                },
-            )
-
-        @bounded_evals_router.get(
-            "/evals/corpora/{corpus_revision}/suites",
-            response_model=EvalSuiteCatalogPage,
-            responses=EVALS_ENDPOINT_RESPONSES,
-            dependencies=protected,
-        )
-        async def list_eval_suites(
-            corpus_revision: str,
-            cursor: Annotated[str | None, Query(max_length=EVAL_STORE_MAX_CURSOR_BYTES)] = None,
-            limit: Annotated[
-                int,
-                Query(ge=1, le=EVAL_STORE_MAX_PAGE_SIZE),
-            ] = EVAL_STORE_DEFAULT_PAGE_SIZE,
-            max_result_bytes: Annotated[
-                int,
-                Query(ge=1_024, le=EVAL_STORE_MAX_PAGE_BYTES),
-            ] = EVAL_STORE_DEFAULT_PAGE_BYTES,
-        ):
-            await _load_eval_corpus(corpus_revision)
-            try:
-                page = await eval_store.list_suites(
-                    EvalSuiteCatalogQuery(
-                        corpus_revision=corpus_revision,
-                        cursor=cursor,
-                        limit=limit,
-                        max_result_bytes=max_result_bytes,
-                    )
-                )
-            except EvalStoreResultTooLarge as exc:
-                raise HTTPException(
-                    status_code=413,
-                    detail="Eval suite page exceeds the requested byte limit.",
-                ) from exc
-            except (TypeError, ValueError):
-                _eval_query_error()
-            return await _model_json_response(page, EvalSuiteCatalogPage)
-
-        @bounded_evals_router.get(
-            "/evals/corpora/{corpus_revision}/suites/{suite_id}/cases",
-            response_model=EvalCaseCatalogPage,
-            responses=EVALS_ENDPOINT_RESPONSES,
-            dependencies=protected,
-        )
-        async def list_eval_cases(
-            corpus_revision: str,
-            suite_id: str,
-            cursor: Annotated[str | None, Query(max_length=EVAL_STORE_MAX_CURSOR_BYTES)] = None,
-            limit: Annotated[
-                int,
-                Query(ge=1, le=EVAL_STORE_MAX_PAGE_SIZE),
-            ] = EVAL_STORE_DEFAULT_PAGE_SIZE,
-            max_result_bytes: Annotated[
-                int,
-                Query(ge=1_024, le=EVAL_STORE_MAX_PAGE_BYTES),
-            ] = EVAL_STORE_DEFAULT_PAGE_BYTES,
-        ):
-            corpus = await _load_eval_corpus(corpus_revision)
-            if all(suite.id != suite_id for suite in corpus.suites):
-                raise HTTPException(status_code=404, detail="Eval suite not found.")
-            try:
-                page = await eval_store.list_cases(
-                    EvalCaseCatalogQuery(
-                        corpus_revision=corpus_revision,
-                        suite_id=suite_id,
-                        cursor=cursor,
-                        limit=limit,
-                        max_result_bytes=max_result_bytes,
-                    )
-                )
-            except EvalStoreResultTooLarge as exc:
-                raise HTTPException(
-                    status_code=413,
-                    detail="Eval case page exceeds the requested byte limit.",
-                ) from exc
-            except (TypeError, ValueError):
-                _eval_query_error()
-            return await _model_json_response(page, EvalCaseCatalogPage)
 
         @bounded_evals_router.post(
             "/evals/runs",
@@ -6335,7 +6114,11 @@ def create_router(
                 EvalRunCreateRequest,
                 invalid_detail="Invalid Evals request.",
             )
-            corpus = await _load_eval_corpus(body.corpus_revision)
+            corpus = await load_eval_corpus(
+                body.corpus_revision,
+                eval_store=eval_store,
+                active_eval_registry=active_eval_registry,
+            )
             invocation = _eval_run_invocation(
                 auth_context,
                 max_steps=body.max_steps,
