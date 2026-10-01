@@ -13,6 +13,7 @@ from typing import Any, Protocol
 from urllib.parse import urlencode, urlsplit
 
 from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu.budgets.pricing import PriceBook
 from cayu.providers._credential_boundary import (
     aclosing_provider_stream,
     detach_provider_call_traceback,
@@ -208,3 +209,16 @@ class GatewayProvider(ChatCompletionsProvider):
                 "Gateway model list is invalid.", provider=self.name, retryable=False
             )
         return data
+
+    @detach_provider_call_traceback
+    async def price_book(self) -> PriceBook:
+        """Fetch an optional local-budget snapshot, not financial authority.
+
+        Unsupported prices are omitted. An empty usable catalog raises ValueError.
+        Each call performs one catalog lookup; existing policies are never mutated.
+        """
+        from cayu.providers._gateway_pricing import catalog_price_book
+
+        return catalog_price_book(
+            await self.get_models(), url=f"{self.base_url.rstrip('/')}/models"
+        )

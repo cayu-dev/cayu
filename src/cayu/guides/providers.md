@@ -170,6 +170,59 @@ boundary omits untrusted error IDs, so an interrupted response may leave no ID
 available for lookup. The adapter disables automatic retries
 of failed inference requests because a new POST can create a new charge.
 
+### Optional catalog-priced local budgets
+
+Load a price snapshot at application startup, before accepting work:
+
+```python
+from decimal import Decimal
+from cayu import BudgetLimit, BudgetPolicy, BudgetReservation
+
+prices = await provider.price_book()
+app.budget_policy = BudgetPolicy(limits=(BudgetLimit(
+    scope="app",
+    max_estimated_cost=Decimal("1.00"),
+    pricing=prices,
+    reservation=BudgetReservation(max_input_tokens=8192, max_output_tokens=2048),
+),))
+```
+
+This uses ordinary Runtime reservations and estimate-based settlement. The helper
+is optional: inference does not fetch prices automatically. It makes one authenticated
+`/v1/models` lookup and returns an independently usable `PriceBook`; applications
+may compose its `prices` with other providers' entries in their own price book.
+It never reads generation receipts, sends a charge ceiling, or changes Cloud limits.
+
+Prices match exact model IDs under `cayu_gateway`. Nano-USD per unit is converted
+to USD per million tokens as `nano_usd / per_units / 1000`, using decimal arithmetic
+and rounding repeating fractions upward. Input, output, cache-read and cache-write
+components map to the corresponding `PriceTier` fields. Reasoning tokens already
+count as output in Runtime, so output uses the higher of the output and reasoning
+rates, without adding a second reasoning charge. Each schedule's `Provenance.source`
+records the exact Gateway `price_id`; its URL identifies the catalog and its `as_of`
+is `unspecified`, as is the book's `generated_at`: the catalog supplies no
+authoritative timestamp. Unchanged catalog pricing retains the same book and budget
+identity across refresh and restart. Applications may log fetch time separately;
+it is not a promised price-validity window or part of pricing identity.
+
+Models with nonzero request/tool-call charges, unknown dimensions, unsupported
+currency/version, malformed or duplicate components, or missing input/output rates
+are omitted. Absent cache rates remain absent. Explicit zero token rates remain valid
+zero prices. Duplicate/invalid model identities reject the catalog; an empty catalog
+or one with no usable prices raises `ValueError`. No zero-price placeholder or default
+catalog fallback is installed. An omitted model fails ordinary reserving-budget
+admission before dispatch. Keep those budgets configured; omitting a budget is not a
+substitute for handling a failed price lookup.
+
+To refresh, explicitly call `await provider.price_book()` again, then install a
+complete replacement `BudgetPolicy` as above (preserving your other limits).
+Fetching does not mutate the old book, existing reservations, or application policy.
+If fetching/validation fails, no replacement occurs; decide whether to retain the
+previous estimate or suspend new admissions. Existing sessions retain their recorded
+execution profile; changing their pricing follows normal explicit profile-adoption
+rules, not automatic migration. Catalog prices can change after loading: local
+estimates and reservations are not a guaranteed supplier-charge ceiling.
+
 ## Compatible Chat Completions
 
 Fireworks, Baseten Model APIs, OpenCode Go, and other compatible endpoints work
