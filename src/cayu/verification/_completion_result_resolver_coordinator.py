@@ -26,35 +26,16 @@ from cayu.events import (
     event_with_runtime_generated_id,
     event_with_runtime_payload_authority,
 )
-from cayu.runtime._completion_decision_application_coordinator import (
-    CompletionDecisionApplicationCoordinator,
-    _CompletionDecisionApplicationNotCommitted,
-)
 from cayu.runtime._diagnostics import (
     credential_safe_runtime_exception,
     credential_safe_runtime_exception_group,
     exception_diagnostic,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime._leased_adapter_heartbeat import run_leased_adapter_heartbeat
-from cayu.runtime._leased_adapter_runner import (
-    LeasedAdapterLease,
-    LeasedAdapterRunner,
-    LeasedAdapterSettlement,
-)
 from cayu.runtime._task_store_operation_boundary import (
     capture_sensitive_validation,
     capture_task_store_operation,
     raise_task_store_operation_failure,
-)
-from cayu.runtime.completion_result_resolvers import (
-    CompletionResultResolutionRequest,
-    CompletionResultResolver,
-    CompletionResultResolverExecutionError,
-    CompletionResultResolverRequest,
-    CompletionResultResolverUnavailable,
-    CompletionResultUnavailable,
-    copy_completion_result_resolution_request,
 )
 from cayu.sessions.base import (
     Session,
@@ -78,6 +59,25 @@ from cayu.tasks.contracts import (
 from cayu.tasks.groups import TaskGroupConflict
 from cayu.tasks.records import Task
 from cayu.vaults import SecretRedactor
+from cayu.verification._completion_decision_application_coordinator import (
+    CompletionDecisionApplicationCoordinator,
+    _CompletionDecisionApplicationNotCommitted,
+)
+from cayu.verification._leased_adapter_heartbeat import run_leased_adapter_heartbeat
+from cayu.verification._leased_adapter_runner import (
+    LeasedAdapterLease,
+    LeasedAdapterRunner,
+    LeasedAdapterSettlement,
+)
+from cayu.verification.completion_result_resolvers import (
+    CompletionResultResolutionRequest,
+    CompletionResultResolver,
+    CompletionResultResolverExecutionError,
+    CompletionResultResolverRequest,
+    CompletionResultResolverUnavailable,
+    CompletionResultUnavailable,
+    copy_completion_result_resolution_request,
+)
 from cayu.workspaces.observation_recovery import (
     retain_workspace_observation_pending_cancellation_requests,
 )

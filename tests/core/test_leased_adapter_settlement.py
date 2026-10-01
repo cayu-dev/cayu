@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from cayu._task_wait import CapturedAwaitableOutcome
-from cayu.runtime._leased_adapter_runner import LeasedAdapterRunner, LeasedAdapterSettlement
+from cayu.verification._leased_adapter_runner import LeasedAdapterRunner, LeasedAdapterSettlement
 
 
 def test_settlement_starts_once_and_retains_the_exact_task_until_completion() -> None:

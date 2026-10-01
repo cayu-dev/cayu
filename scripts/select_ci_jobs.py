@@ -41,6 +41,7 @@ _RELOCATED_CORE_PATHS = {
 _RUNTIME_CONCEPT_PREFIXES = tuple(
     sorted(
         {path.rsplit("/", 1)[0] + "/" for path in _RELOCATED_RUNTIME_PATHS if path.count("/") > 2}
+        | {"src/cayu/verification/"}
     )
 )
 _CORE_CONCEPT_PREFIXES = tuple(

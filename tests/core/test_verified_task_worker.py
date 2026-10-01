@@ -3411,7 +3411,7 @@ def test_worker_recovers_expired_completed_execution_without_redispatch(
 def test_worker_close_retains_exact_verifier_until_settlement(
     backend, signal, late_failure, context_exit, verified_worker_store_factory, monkeypatch
 ):
-    from cayu.runtime import verified_task_worker as worker_module
+    from cayu.verification import verified_task_worker as worker_module
 
     if signal == "timeout":
         monkeypatch.setattr(worker_module, "_VERIFIER_TIMEOUT_SECONDS", 0.05)
@@ -4643,7 +4643,7 @@ def test_worker_settles_expired_published_proposal(backend, fault, tmp_path, mon
         if fault == "preflight_expiry":
             monkeypatch.setattr(type(tasks), "renew_completion_verification_claim", delayed_renew)
         if fault == "publication_expiry":
-            from cayu.runtime import _completion_verifier_coordinator as verifier_owner
+            from cayu.verification import _completion_verifier_coordinator as verifier_owner
 
             capture_operation = verifier_owner.capture_task_store_operation
             record_decision = type(tasks).record_completion_decision

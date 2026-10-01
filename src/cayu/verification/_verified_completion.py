@@ -15,25 +15,12 @@ from typing import Protocol, TypeVar
 from cayu._validation import canonical_durable_json_bytes
 from cayu.deadlines import ExecutionDeadlineExceeded
 from cayu.messages import Message
-from cayu.runtime._completion_decision_application_coordinator import (
-    CompletionDecisionApplicationCoordinator,
-)
-from cayu.runtime._completion_result_resolver_coordinator import CompletionResultResolverCoordinator
-from cayu.runtime._completion_verifier_coordinator import (
-    CompletionVerifierCoordinator,
-    CompletionVerifierOwnedExecution,
-)
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._invocation_lifecycle import retire_released_invocation_context
 from cayu.runtime._task_store_operation_boundary import (
     capture_sensitive_result_validation,
     capture_task_store_operation,
     raise_task_store_operation_failure,
-)
-from cayu.runtime.completion_result_resolvers import CompletionResultResolutionRequest
-from cayu.runtime.completion_verifiers import (
-    CompletionVerifierExecutionRequest,
-    copy_completion_verifier_execution_request,
 )
 from cayu.runtime.invocation_release import InvocationReleaseEvidence
 from cayu.runtime.work_attempt_lifecycle import (
@@ -71,6 +58,21 @@ from cayu.tasks.contracts import (
 from cayu.tasks.groups import TaskGroupConflict
 from cayu.tasks.records import TaskStatus, copy_task
 from cayu.vaults.redaction import SecretRedactor
+from cayu.verification._completion_decision_application_coordinator import (
+    CompletionDecisionApplicationCoordinator,
+)
+from cayu.verification._completion_result_resolver_coordinator import (
+    CompletionResultResolverCoordinator,
+)
+from cayu.verification._completion_verifier_coordinator import (
+    CompletionVerifierCoordinator,
+    CompletionVerifierOwnedExecution,
+)
+from cayu.verification.completion_result_resolvers import CompletionResultResolutionRequest
+from cayu.verification.completion_verifiers import (
+    CompletionVerifierExecutionRequest,
+    copy_completion_verifier_execution_request,
+)
 
 _ResultT = TypeVar("_ResultT")
 

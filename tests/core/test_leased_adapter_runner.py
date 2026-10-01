@@ -5,7 +5,7 @@ from contextlib import suppress
 
 import pytest
 
-from cayu.runtime._leased_adapter_runner import LeasedAdapterLease, LeasedAdapterRunner
+from cayu.verification._leased_adapter_runner import LeasedAdapterLease, LeasedAdapterRunner
 
 
 def test_cancelled_single_flight_waiter_cannot_split_an_active_queue() -> None:

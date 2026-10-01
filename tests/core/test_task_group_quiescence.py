@@ -487,7 +487,7 @@ async def test_undispatched_verified_preparation_entry_is_settled(store, failure
     renewals_after_handoff = []
 
     if failure == "queued_heartbeat":
-        from cayu.runtime.verified_task_worker import _LeaseOwner
+        from cayu.verification.verified_task_worker import _LeaseOwner
 
         original_heartbeat = _LeaseOwner.heartbeat
         native_heartbeat = type(store).heartbeat
@@ -1511,7 +1511,7 @@ async def test_preparation_admission_loses_to_winner_without_stranding_barrier(
     hold_requests = []
     renewals_after_handoff = []
     if queued_heartbeat:
-        from cayu.runtime.verified_task_worker import _LeaseOwner
+        from cayu.verification.verified_task_worker import _LeaseOwner
 
         owner_heartbeat = _LeaseOwner.heartbeat
         store_heartbeat = type(store).heartbeat

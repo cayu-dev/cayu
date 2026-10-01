@@ -195,6 +195,7 @@ def test_public_export_and_layout_changes_select_all_contract_lanes(path: str) -
         "sessions",
         "tasks",
         "tools",
+        "verification",
         "workspaces",
     ],
 )

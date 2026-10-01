@@ -3285,40 +3285,6 @@ from cayu.runtime.checks import ProjectCheckReport as ProjectCheckReport
 from cayu.runtime.checks import ProjectDiagnostic as ProjectDiagnostic
 from cayu.runtime.checks import ServiceCheckEvidence as ServiceCheckEvidence
 from cayu.runtime.checks import check_manifest as check_manifest
-from cayu.runtime.completion_result_resolvers import (
-    COMPLETION_RESULT_RESOLUTION_MAX_SECONDS as COMPLETION_RESULT_RESOLUTION_MAX_SECONDS,
-)
-from cayu.runtime.completion_result_resolvers import (
-    CompletionResultResolutionRequest as CompletionResultResolutionRequest,
-)
-from cayu.runtime.completion_result_resolvers import (
-    CompletionResultResolver as CompletionResultResolver,
-)
-from cayu.runtime.completion_result_resolvers import (
-    CompletionResultResolverExecutionError as CompletionResultResolverExecutionError,
-)
-from cayu.runtime.completion_result_resolvers import (
-    CompletionResultResolverRequest as CompletionResultResolverRequest,
-)
-from cayu.runtime.completion_result_resolvers import (
-    CompletionResultResolverUnavailable as CompletionResultResolverUnavailable,
-)
-from cayu.runtime.completion_result_resolvers import (
-    CompletionResultUnavailable as CompletionResultUnavailable,
-)
-from cayu.runtime.completion_verifiers import (
-    CompletionVerifierExecutionError as CompletionVerifierExecutionError,
-)
-from cayu.runtime.completion_verifiers import (
-    CompletionVerifierExecutionRequest as CompletionVerifierExecutionRequest,
-)
-from cayu.runtime.completion_verifiers import CompletionVerifierRequest as CompletionVerifierRequest
-from cayu.runtime.completion_verifiers import (
-    CompletionVerifierUnavailable as CompletionVerifierUnavailable,
-)
-from cayu.runtime.completion_verifiers import (
-    DeterministicCompletionVerifier as DeterministicCompletionVerifier,
-)
 from cayu.runtime.config_inspection import (
     EffectiveConfigurationField as EffectiveConfigurationField,
 )
@@ -3717,18 +3683,6 @@ from cayu.runtime.tool_effects import (
 )
 from cayu.runtime.tool_effects import (
     ToolEffectReconciliationTarget as ToolEffectReconciliationTarget,
-)
-from cayu.runtime.verified_task_worker import VerifiedTaskHandler as VerifiedTaskHandler
-from cayu.runtime.verified_task_worker import VerifiedTaskHandlerReport as VerifiedTaskHandlerReport
-from cayu.runtime.verified_task_worker import (
-    VerifiedTaskPreparationContext as VerifiedTaskPreparationContext,
-)
-from cayu.runtime.verified_task_worker import (
-    VerifiedTaskProposalContext as VerifiedTaskProposalContext,
-)
-from cayu.runtime.verified_task_worker import VerifiedTaskWorker as VerifiedTaskWorker
-from cayu.runtime.verified_task_worker import (
-    VerifiedTaskWorkerDraining as VerifiedTaskWorkerDraining,
 )
 from cayu.sessions._participant_discovery import (
     ParticipantSessionCursor as ParticipantSessionCursor,
@@ -5083,6 +5037,56 @@ from cayu.vaults.redaction import REDACTED_SECRET as REDACTED_SECRET
 from cayu.vaults.redaction import SecretRedactionCapacityError as SecretRedactionCapacityError
 from cayu.vaults.redaction import SecretRedactor as SecretRedactor
 from cayu.vaults.static import StaticVault as StaticVault
+from cayu.verification.completion_result_resolvers import (
+    COMPLETION_RESULT_RESOLUTION_MAX_SECONDS as COMPLETION_RESULT_RESOLUTION_MAX_SECONDS,
+)
+from cayu.verification.completion_result_resolvers import (
+    CompletionResultResolutionRequest as CompletionResultResolutionRequest,
+)
+from cayu.verification.completion_result_resolvers import (
+    CompletionResultResolver as CompletionResultResolver,
+)
+from cayu.verification.completion_result_resolvers import (
+    CompletionResultResolverExecutionError as CompletionResultResolverExecutionError,
+)
+from cayu.verification.completion_result_resolvers import (
+    CompletionResultResolverRequest as CompletionResultResolverRequest,
+)
+from cayu.verification.completion_result_resolvers import (
+    CompletionResultResolverUnavailable as CompletionResultResolverUnavailable,
+)
+from cayu.verification.completion_result_resolvers import (
+    CompletionResultUnavailable as CompletionResultUnavailable,
+)
+from cayu.verification.completion_verifiers import (
+    CompletionVerifierExecutionError as CompletionVerifierExecutionError,
+)
+from cayu.verification.completion_verifiers import (
+    CompletionVerifierExecutionRequest as CompletionVerifierExecutionRequest,
+)
+from cayu.verification.completion_verifiers import (
+    CompletionVerifierRequest as CompletionVerifierRequest,
+)
+from cayu.verification.completion_verifiers import (
+    CompletionVerifierUnavailable as CompletionVerifierUnavailable,
+)
+from cayu.verification.completion_verifiers import (
+    DeterministicCompletionVerifier as DeterministicCompletionVerifier,
+)
+from cayu.verification.verified_task_worker import VerifiedTaskHandler as VerifiedTaskHandler
+from cayu.verification.verified_task_worker import (
+    VerifiedTaskHandlerReport as VerifiedTaskHandlerReport,
+)
+from cayu.verification.verified_task_worker import (
+    VerifiedTaskPreparationContext as VerifiedTaskPreparationContext,
+)
+from cayu.verification.verified_task_worker import (
+    VerifiedTaskProposalContext as VerifiedTaskProposalContext,
+)
+from cayu.verification.verified_task_worker import VerifiedTaskWorker as VerifiedTaskWorker
+from cayu.verification.verified_task_worker import (
+    VerifiedTaskWorkerDraining as VerifiedTaskWorkerDraining,
+)
 from cayu.webhooks import WebhookSignatureError as WebhookSignatureError
 from cayu.webhooks import verify_webhook_signature as verify_webhook_signature
 from cayu.webhooks import webhook_task_id as webhook_task_id

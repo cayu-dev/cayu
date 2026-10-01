@@ -8,8 +8,8 @@ from typing import NoReturn
 
 import pytest
 
-import cayu.runtime._leased_adapter_heartbeat as heartbeat_module
-from cayu.runtime._leased_adapter_heartbeat import run_leased_adapter_heartbeat
+import cayu.verification._leased_adapter_heartbeat as heartbeat_module
+from cayu.verification._leased_adapter_heartbeat import run_leased_adapter_heartbeat
 
 
 class _ControlledLease:

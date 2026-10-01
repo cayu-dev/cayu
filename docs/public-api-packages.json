@@ -25,6 +25,7 @@
   "cayu.testing",
   "cayu.tools",
   "cayu.vaults",
+  "cayu.verification",
   "cayu.workflows",
   "cayu.workspaces"
 ]

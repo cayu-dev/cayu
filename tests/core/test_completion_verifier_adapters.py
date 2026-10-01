@@ -17,7 +17,7 @@ from tests.core.completion_verifier_profile_fixtures import (
 from tests.core.task_invocation_fixtures import unattributed_session_invocation_binding
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
-import cayu.runtime._completion_verifier_coordinator as verifier_coordinator_module
+import cayu.verification._completion_verifier_coordinator as verifier_coordinator_module
 from cayu.applications import CayuApp
 from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
 from cayu.runtime._diagnostics import (

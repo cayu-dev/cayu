@@ -1180,7 +1180,7 @@ def test_restarted_completion_finalization_settles_attached_task(
                     if worker_cleanup:
                         # Start discovery at the actual missing-ack boundary,
                         # without manually completing the stopped cleanup first.
-                        from cayu.runtime import verified_task_worker as worker_module
+                        from cayu.verification import verified_task_worker as worker_module
 
                         class NoNewWork(VerifiedTaskHandler):
                             async def prepare(self, context):
@@ -1340,7 +1340,7 @@ def test_restarted_completion_finalization_settles_attached_task(
                 assert (
                     await recovery_session_store.load_checkpoint(admission.session_id) == checkpoint
                 )
-                from cayu.runtime import verified_task_worker as worker_module
+                from cayu.verification import verified_task_worker as worker_module
 
                 class NoNewWork(VerifiedTaskHandler):
                     async def prepare(self, context):

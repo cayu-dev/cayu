@@ -316,13 +316,28 @@ still use the execution-profile value types in `runtime/execution_identity.py`
 and `runtime/execution_profiles.py`; the completion coordinators remain separate
 orchestration owners.
 
-`runtime/_verified_completion.py` owns completion composition for one
+`verification/_verified_completion.py` owns completion composition for one
 application lifetime. Public completion methods and verified workers share
 its verifier, decision-application and result-resolver instances. Worker
 settlement calls those phases directly; admission and invocation-release
 evidence remain explicit session-execution dependencies. Prepared authority
 and exact verifier settlement handles belong to each operation, rather than
 being cached on the shared owner.
+
+`cayu.verification` contains the worker, verifier/resolver adapter contracts,
+completion phases and shared leased-adapter machinery. Its lazy public API
+exposes the individual adapters and worker; applications can still call verify,
+resolve and apply independently. The existing root/runtime exports and three
+public runtime submodules forward to the same canonical definitions. Stored
+pickle globals using those older public paths remain readable.
+
+Application, HTTP/CLI and coding-product composition may depend on verification.
+Runtime, storage, sessions and tasks do not import its implementation; package
+contract tests enforce that boundary, including imports through public aliases.
+The runtime forwarding modules and root/runtime export declarations are explicit
+compatibility exceptions. Verification may use existing runtime execution
+services; task contracts remain below both layers. The existing coding-product
+composition continues through supported compatibility imports.
 
 Completion verifier and result-resolver coordinators use one private
 `LeasedAdapterRunner` for process-local execution ownership. It holds

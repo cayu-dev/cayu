@@ -31,25 +31,11 @@ from cayu.runtime._diagnostics import (
 from cayu.runtime._execution_profile_identity_validation import (
     copy_secret_free_execution_profile_behavior_identity,
 )
-from cayu.runtime._leased_adapter_heartbeat import run_leased_adapter_heartbeat
-from cayu.runtime._leased_adapter_runner import (
-    LeasedAdapterLease,
-    LeasedAdapterRunner,
-    LeasedAdapterSettlement,
-)
 from cayu.runtime._task_store_operation_boundary import (
     TaskStoreOperationOutcome,
     capture_sensitive_validation,
     capture_task_store_operation,
     raise_task_store_operation_failure,
-)
-from cayu.runtime.completion_verifiers import (
-    CompletionVerifierExecutionError,
-    CompletionVerifierExecutionRequest,
-    CompletionVerifierRequest,
-    CompletionVerifierUnavailable,
-    DeterministicCompletionVerifier,
-    copy_completion_verifier_execution_request,
 )
 from cayu.runtime.execution_profiles import (
     EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS,
@@ -108,6 +94,20 @@ from cayu.tasks.contracts import (
     validate_completion_decision_contract,
 )
 from cayu.vaults.redaction import SecretRedactor
+from cayu.verification._leased_adapter_heartbeat import run_leased_adapter_heartbeat
+from cayu.verification._leased_adapter_runner import (
+    LeasedAdapterLease,
+    LeasedAdapterRunner,
+    LeasedAdapterSettlement,
+)
+from cayu.verification.completion_verifiers import (
+    CompletionVerifierExecutionError,
+    CompletionVerifierExecutionRequest,
+    CompletionVerifierRequest,
+    CompletionVerifierUnavailable,
+    DeterministicCompletionVerifier,
+    copy_completion_verifier_execution_request,
+)
 from cayu.workspaces.observation_recovery import (
     retain_workspace_observation_pending_cancellation_requests,
     workspace_observation_pending_cancellation_requests,

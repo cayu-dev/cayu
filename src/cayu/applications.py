@@ -484,7 +484,6 @@ from cayu.runtime._tool_round_executor import (
     ToolRoundLimitRequest,
 )
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot
-from cayu.runtime._verified_completion import VerifiedCompletionCoordinator
 from cayu.runtime._work_attempt_invocation import (
     WorkAttemptRecoveryOwnership,
     _acknowledged_work_attempt_recovery,
@@ -497,14 +496,6 @@ from cayu.runtime._work_attempt_session_mutation import (
     settle_work_attempt_session_mutation,
 )
 from cayu.runtime.build_provenance import current_runtime_build_provenance
-from cayu.runtime.completion_result_resolvers import (
-    CompletionResultResolutionRequest,
-    CompletionResultResolver,
-)
-from cayu.runtime.completion_verifiers import (
-    CompletionVerifierExecutionRequest,
-    DeterministicCompletionVerifier,
-)
 from cayu.runtime.config_inspection import EffectiveRunConfiguration
 from cayu.runtime.event_side_effect_health import (
     PersistedEventSideEffectHealth,
@@ -862,6 +853,15 @@ from cayu.tools.targeted_projection import (
 )
 from cayu.tools.terminal_publication import ToolTerminalPublicationMetricsSnapshot
 from cayu.vaults.redaction import SecretRedactionStream, SecretRedactor
+from cayu.verification._verified_completion import VerifiedCompletionCoordinator
+from cayu.verification.completion_result_resolvers import (
+    CompletionResultResolutionRequest,
+    CompletionResultResolver,
+)
+from cayu.verification.completion_verifiers import (
+    CompletionVerifierExecutionRequest,
+    DeterministicCompletionVerifier,
+)
 
 RegisteredAgent = runtime_records.RegisteredAgent
 RegisteredEnvironment = runtime_records.RegisteredEnvironment

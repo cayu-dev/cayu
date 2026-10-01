@@ -130,7 +130,7 @@ def test_worker_settles_expired_applied_rejection_without_successor(
                 max_repeated_gap_count=3,
             )
         )
-        from cayu.runtime._verified_completion import VerifiedCompletionCoordinator
+        from cayu.verification._verified_completion import VerifiedCompletionCoordinator
 
         original_continue = VerifiedCompletionCoordinator.continue_attempt
         original_settle = type(tasks).settle_work_attempt_lifecycle
@@ -151,7 +151,7 @@ def test_worker_settles_expired_applied_rejection_without_successor(
         async def delay_continuation(completion, admission_id, decision_id, **kwargs):
             nonlocal predecessor, application, successor, expected_stop
             predecessor = await tasks.load_work_attempt_admission(admission_id)
-            from cayu.runtime._verified_completion import verified_task_operation_id
+            from cayu.verification._verified_completion import verified_task_operation_id
 
             application = await tasks.load_completion_decision_application_receipt(
                 predecessor.task_id,

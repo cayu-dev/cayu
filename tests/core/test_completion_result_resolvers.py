@@ -26,7 +26,7 @@ from tests.core.test_completion_decision_application import (
     _running_task,
 )
 
-import cayu.runtime._completion_result_resolver_coordinator as resolver_coordinator_module
+import cayu.verification._completion_result_resolver_coordinator as resolver_coordinator_module
 from cayu import (
     CayuApp,
     CompletionDecisionApplicationRequest,

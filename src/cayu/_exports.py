@@ -1205,7 +1205,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "CODING_PRODUCT_RESULT_KIND": ("cayu.coding_products", "CODING_PRODUCT_RESULT_KIND"),
     "CODING_PRODUCT_SCHEMA_VERSION": ("cayu.coding_products", "CODING_PRODUCT_SCHEMA_VERSION"),
     "COMPLETION_RESULT_RESOLUTION_MAX_SECONDS": (
-        "cayu.runtime.completion_result_resolvers",
+        "cayu.verification.completion_result_resolvers",
         "COMPLETION_RESULT_RESOLUTION_MAX_SECONDS",
     ),
     "CONTEXT_EXPOSURE_VERSION": ("cayu.memory.evidence", "CONTEXT_EXPOSURE_VERSION"),
@@ -1408,28 +1408,28 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "CompletionRejectionAction": ("cayu.tasks.contracts", "CompletionRejectionAction"),
     "CompletionResultReference": ("cayu.tasks.contracts", "CompletionResultReference"),
     "CompletionResultResolutionRequest": (
-        "cayu.runtime.completion_result_resolvers",
+        "cayu.verification.completion_result_resolvers",
         "CompletionResultResolutionRequest",
     ),
     "CompletionResultResolver": (
-        "cayu.runtime.completion_result_resolvers",
+        "cayu.verification.completion_result_resolvers",
         "CompletionResultResolver",
     ),
     "CompletionResultResolverExecutionError": (
-        "cayu.runtime.completion_result_resolvers",
+        "cayu.verification.completion_result_resolvers",
         "CompletionResultResolverExecutionError",
     ),
     "CompletionResultResolverRef": ("cayu.tasks.contracts", "CompletionResultResolverRef"),
     "CompletionResultResolverRequest": (
-        "cayu.runtime.completion_result_resolvers",
+        "cayu.verification.completion_result_resolvers",
         "CompletionResultResolverRequest",
     ),
     "CompletionResultResolverUnavailable": (
-        "cayu.runtime.completion_result_resolvers",
+        "cayu.verification.completion_result_resolvers",
         "CompletionResultResolverUnavailable",
     ),
     "CompletionResultUnavailable": (
-        "cayu.runtime.completion_result_resolvers",
+        "cayu.verification.completion_result_resolvers",
         "CompletionResultUnavailable",
     ),
     "CompletionSatisfactionBasis": ("cayu.tasks.contracts", "CompletionSatisfactionBasis"),
@@ -1442,7 +1442,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "CompletionVerifierDecision": ("cayu.tasks.contracts", "CompletionVerifierDecision"),
     "CompletionVerifierExecutionError": (
-        "cayu.runtime.completion_verifiers",
+        "cayu.verification.completion_verifiers",
         "CompletionVerifierExecutionError",
     ),
     "CompletionVerifierExecutionProfile": (
@@ -1450,7 +1450,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "CompletionVerifierExecutionProfile",
     ),
     "CompletionVerifierExecutionRequest": (
-        "cayu.runtime.completion_verifiers",
+        "cayu.verification.completion_verifiers",
         "CompletionVerifierExecutionRequest",
     ),
     "CompletionVerifierKind": ("cayu.tasks.contracts", "CompletionVerifierKind"),
@@ -1483,9 +1483,12 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "CompletionVerifierProfileRecord",
     ),
     "CompletionVerifierRef": ("cayu.tasks.contracts", "CompletionVerifierRef"),
-    "CompletionVerifierRequest": ("cayu.runtime.completion_verifiers", "CompletionVerifierRequest"),
+    "CompletionVerifierRequest": (
+        "cayu.verification.completion_verifiers",
+        "CompletionVerifierRequest",
+    ),
     "CompletionVerifierUnavailable": (
-        "cayu.runtime.completion_verifiers",
+        "cayu.verification.completion_verifiers",
         "CompletionVerifierUnavailable",
     ),
     "ContextCompactor": ("cayu.context.base", "ContextCompactor"),
@@ -1815,7 +1818,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "DenyPatternRule": ("cayu.tools.policy", "DenyPatternRule"),
     "EnvironmentScopedToolPolicy": ("cayu.tools.policy", "EnvironmentScopedToolPolicy"),
     "DeterministicCompletionVerifier": (
-        "cayu.runtime.completion_verifiers",
+        "cayu.verification.completion_verifiers",
         "DeterministicCompletionVerifier",
     ),
     "DeterministicWorkspaceBinding": (
@@ -5320,19 +5323,22 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "Vault": ("cayu.vaults.base", "Vault"),
     "VaultError": ("cayu.vaults.base", "VaultError"),
     "VaultHandle": ("cayu.tools.base", "VaultHandle"),
-    "VerifiedTaskHandler": ("cayu.runtime.verified_task_worker", "VerifiedTaskHandler"),
-    "VerifiedTaskHandlerReport": ("cayu.runtime.verified_task_worker", "VerifiedTaskHandlerReport"),
+    "VerifiedTaskHandler": ("cayu.verification.verified_task_worker", "VerifiedTaskHandler"),
+    "VerifiedTaskHandlerReport": (
+        "cayu.verification.verified_task_worker",
+        "VerifiedTaskHandlerReport",
+    ),
     "VerifiedTaskPreparationContext": (
-        "cayu.runtime.verified_task_worker",
+        "cayu.verification.verified_task_worker",
         "VerifiedTaskPreparationContext",
     ),
     "VerifiedTaskProposalContext": (
-        "cayu.runtime.verified_task_worker",
+        "cayu.verification.verified_task_worker",
         "VerifiedTaskProposalContext",
     ),
-    "VerifiedTaskWorker": ("cayu.runtime.verified_task_worker", "VerifiedTaskWorker"),
+    "VerifiedTaskWorker": ("cayu.verification.verified_task_worker", "VerifiedTaskWorker"),
     "VerifiedTaskWorkerDraining": (
-        "cayu.runtime.verified_task_worker",
+        "cayu.verification.verified_task_worker",
         "VerifiedTaskWorkerDraining",
     ),
     "VertexProvider": ("cayu.providers.vertex", "VertexProvider"),
