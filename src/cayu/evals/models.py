@@ -484,11 +484,19 @@ class EvalTrialResult(BaseModel):
         if self.capture_diagnostic is not None and (
             self.execution_status != "completed"
             or self.evidence_complete
-            or self.score is not None
             or self.capture_bounds != self.capture_diagnostic.bounds
+            or (
+                self.score is not None
+                and (
+                    self.workflow_attempt is None
+                    or self.capture_diagnostic.stage != "child_capture"
+                )
+            )
         ):
             raise ValueError(
-                "Capture failure requires completed execution and unavailable scoring."
+                "Capture failure requires completed execution and incomplete evidence; "
+                "a score additionally requires a child-capture rejection and the "
+                "workflow attempt anchor."
             )
         if self.completed_at < self.started_at:
             raise ValueError("completed_at cannot precede started_at.")
@@ -533,7 +541,12 @@ class EvalTrialResult(BaseModel):
         elif self.unavailable_reason is not None:
             raise ValueError("Only unavailable trials can carry an unavailable_reason.")
         if self.status in (EvalStatus.PASSED, EvalStatus.FAILED, EvalStatus.SKIPPED):
-            if not self.evidence_complete:
+            # A workflow capture diagnostic is the only partial-evidence scoring path:
+            # its score comes from the anchored workflow output, never the child tree.
+            partial_workflow_score = (
+                self.capture_diagnostic is not None and self.status is not EvalStatus.SKIPPED
+            )
+            if not self.evidence_complete and not partial_workflow_score:
                 raise ValueError(f"{self.status.value} trials require complete evidence.")
             if self.session_id is None:
                 raise ValueError(f"{self.status.value} trials require a concrete session_id.")
@@ -587,7 +600,10 @@ class EvalTrialResult(BaseModel):
                 if self.trajectory.usage_summary is None
                 else session_usage_summary_payload(self.trajectory.usage_summary)
             )
-            if self.usage_summary != trajectory_usage:
+            # A partial workflow capture withholds the root-only usage sum.
+            if self.usage_summary != trajectory_usage and not (
+                self.capture_diagnostic is not None and self.usage_summary is None
+            ):
                 raise ValueError("usage_summary must match the retained trajectory.")
             attributed_sources = tuple(
                 (

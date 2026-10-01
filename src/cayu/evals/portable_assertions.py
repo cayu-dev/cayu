@@ -16,6 +16,8 @@ from cayu.evals.corpus import (
     ArtifactAssertionSpec,
     AssertionSpec,
     EvaluationEvidencePolicySpec,
+    FinalOutputContainsAssertionSpec,
+    FinalOutputEqualsAssertionSpec,
     JudgePrivacyPolicyV1,
     JudgeProfileIdentityV1,
     MaxEstimatedCostAssertionSpec,
@@ -398,6 +400,13 @@ class _CompiledPortableAssertion(EvalAssertion):
         if type(spec) is ProcessEventsInOrderAssertionSpec:
             return not _ROOT_TERMINAL_PROCESS_EVENTS.isdisjoint(spec.events)
         return False
+
+    @property
+    def reads_final_output_only(self) -> bool:
+        return type(self._spec) in (
+            FinalOutputContainsAssertionSpec,
+            FinalOutputEqualsAssertionSpec,
+        )
 
     def required_probes(self) -> ProbeRequirements:
         spec = self._spec

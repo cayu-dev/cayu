@@ -16773,7 +16773,22 @@ uses retained facts and never dispatches candidate or judge work. See
 ### Workflow evaluation capture and recovery
 
 Workflow eval targets own finite aggregate child capture bounds independently of
-execution budgets. Capture rejection preserves completed execution and blocks scoring.
+execution budgets, and `WorkflowEvalTarget.capture_bounds` can raise them per target.
+Capture rejection preserves completed execution. When a child exceeds those bounds or
+has an ineligible origin, the trial is still scored from the projector output bound to
+the root journal: `evidence_complete` is false, `capture_diagnostic` is retained,
+usage is unknown, and only assertions that declare `EvalAssertion.reads_final_output_only`
+(the built-in final-output assertions and specs, or an application assertion that
+overrides it to `True`) are evaluated. Every other assertion is unavailable, so such a trial is `passed` or
+`failed` only when all of its assertions are output-only. Other capture rejections,
+such as read failures, closure changes, or non-terminal children, block scoring and
+leave the trial `unavailable`. Readers that required complete evidence for every
+scored trial must accept this combination.
+Omitting child payloads does not waive lifecycle validation: bounded child identity
+and topology reads must prove a completed/failed, stable tree before and after
+scoring and after quiescence. Running, unverified interrupted, unreadable, or
+over-limit child lifecycle trees block scoring. Partial cases without assertions
+remain unavailable rather than constructing an invalid skipped trial.
 With output retention enabled, the private trial seals one bounded projected-output
 record and its attempt anchor before child capture. Saved recovery can consume it
 without projector replay; disabled/missing retention fails closed. This field shares

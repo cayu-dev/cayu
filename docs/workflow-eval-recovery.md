@@ -1,9 +1,10 @@
 # Workflow capture policy and saved-attempt recovery
 
 Workflow execution, evidence capture, and assertion scoring are distinct outcomes.
-A workflow that completes can have an unavailable score because its evidence exceeds
-capture limits. Increasing a capture bound does not grant more execution tokens,
-tool calls, time, or model budget.
+A workflow that completes can be scored from its projected output while its child
+evidence exceeds capture limits; the trial then reports incomplete evidence.
+Assertions that need the child tree stay unavailable. Increasing a capture bound
+does not grant more execution tokens, tool calls, time, or model budget.
 
 ## Configure capture before dispatch
 
@@ -49,7 +50,51 @@ corpus trials retain the policy too. Model and tool budgets remain independent.
 ## Capture failures and reports
 
 The direct trial records `execution_status="completed"` after validating the
-workflow completion. A typed child capture/revalidation rejection produces:
+workflow completion. The final output and structured output always come from the
+target's `result_projector`, bound to the current workflow attempt and completion
+event in the root journal, before any child evidence is read.
+
+When the child tree is rejected at `stage="child_capture"` because it exceeds the
+target's capture bounds or has an ineligible child origin, the trial is scored
+from that output with partial evidence. The qualifying rejections are
+`terminal_evidence_rejected` with an `event_limit_exceeded`,
+`transcript_limit_exceeded`, `record_bytes_exceeded`, `total_bytes_exceeded`, or
+`transport_bytes_exceeded` terminal code, and `origin_evidence_rejected`,
+`session_limit_exceeded`, or `depth_limit_exceeded`. Such a trial has:
+
+- `evidence_complete=false`, the `capture_diagnostic` below, and no `usage_summary`,
+  because descendant usage was not read;
+- scored outcomes for assertions whose `reads_final_output_only` property is `True`
+  (`FinalOutputContains`, `FinalOutputMatches`, the corpus `final_output_equals`
+  and `final_output_contains` specs, and any application assertion that declares
+  it, see [output-only assertions](evals.md#output-only-assertions));
+- `unavailable` outcomes, citing the diagnostic, for every other assertion,
+  including model judges and undeclared extensions, because they may read
+  descendant events, usage, routes, or probes;
+- `passed` or `failed` with a score when every assertion is output-only, and
+  otherwise `unavailable` with the public `workflow_capture_failed` code;
+- the anchored projected output in `final_output`; when scored, also the output
+  preview and a retained trajectory (if requested) holding only the workflow root
+  with `children_incomplete=true`. An unavailable trial keeps no preview or
+  trajectory.
+
+Root journal revalidation before publication and after target quiescence still
+applies. Partial capture also checks the child topology and bounded lifecycle
+identities before scoring, after scoring, and after target quiescence. Every
+included child must be completed or failed, and its identity, epoch, status,
+activity timestamps, and descendants must remain unchanged. Interrupted children
+whose exact terminal evidence was omitted remain unavailable. Unknown origins
+are included conservatively; descendants below the root are checked without a
+terminal cutoff because their terminal events were not captured. These checks
+read no event payloads and use the existing hard ceilings of 500 lineage candidates
+and 32 tree levels independently of the configured payload capture bounds. An
+unreadable or over-limit lifecycle tree cannot be scored.
+
+A case without assertions remains unavailable after partial capture, with no score;
+it does not become a skipped trial with incomplete evidence or abort the suite.
+
+Every other child capture/revalidation rejection, such as a read failure, a closure
+change, inconsistent evidence, or a child that was not terminal, produces:
 
 - `status="unavailable"`, `score=null`, incomplete evidence, and unavailable assertions;
 - `capture_diagnostic` with stage, trajectory code, terminal rejection code, affected
@@ -90,10 +135,17 @@ An already exhausted budget can be rejected before another read. Record-size,
 transcript, byte, depth, lineage, missing-record, and inconsistent-evidence reasons
 remain distinct. Diagnostics contain identifiers and counters, never event payloads.
 
-Public corpus/server reports use `workflow_capture_failed`, preserve the typed
-rejection, and present runtime completion separately from unavailable scoring.
-Direct HTML reports explicitly show workflow completion and the diagnostic.
-Assertions never run on an incomplete child tree.
+Public corpus/server reports use `workflow_capture_failed` for unavailable trials,
+preserve the typed rejection, and present runtime completion separately from
+scoring. A scored partial trial keeps its `passed` or `failed` code with
+`evidence_complete=false` and the same diagnostic. Direct HTML reports explicitly
+show workflow completion and the diagnostic. Assertions that read the child tree
+never run on an incomplete one.
+
+To capture the full tree for a workflow whose children legitimately produce large
+records, raise the relevant bound on that target, for example
+`capture_bounds=SessionTrajectoryBounds(max_record_bytes=8 * 1024 * 1024)`, or
+recapture a saved attempt as described below.
 
 These are additive optional fields in the current EvalRun v11 and published result
 contracts. Updated readers accept older documents without these fields; their

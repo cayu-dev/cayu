@@ -1576,6 +1576,43 @@ Current assertions cover:
 price, its outcome is `unavailable` and the retained cost summary reports both
 priced and unpriced coverage instead of treating the missing price as zero.
 
+### Output-only assertions
+
+An `EvalAssertion` can declare that it reads nothing but the run's final output by
+overriding the `reads_final_output_only` property to return `True`. The built-in
+`FinalOutputContains` and `FinalOutputMatches` assertions and the corpus
+`final_output_equals` and `final_output_contains` specs declare it. The default is
+`False`.
+
+The declaration matters when a completed workflow's child evidence exceeds its
+capture bounds: declared assertions are still scored from the workflow's projected
+output, and every undeclared assertion is `unavailable`. Declare it only when
+`evaluate` reads `context.final_output` (or the workflow's projected structured
+output) and no events, transcript, usage, children, probes, or memory evidence.
+On partial evidence those other fields describe only the workflow root, so an
+assertion that reads them under this declaration can report a wrong result.
+
+```python
+from cayu import EvalAssertion
+
+
+class ExactAnswer(EvalAssertion):
+    def __init__(self, expected: str) -> None:
+        self.expected = expected
+
+    @property
+    def reads_final_output_only(self) -> bool:
+        return True
+
+    async def evaluate(self, context):
+        if context.final_output.strip() == self.expected:
+            return self.passed("Answer matched.")
+        return self.failed("Answer did not match.")
+```
+
+See [workflow capture and saved-attempt recovery](workflow-eval-recovery.md) for the
+partial-evidence rules.
+
 ## Workspace isolation
 
 Cases in a suite run against the **same** `CayuApp`. Each case is a separate session, but it

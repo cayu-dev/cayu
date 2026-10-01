@@ -13,6 +13,7 @@ from tests.evals.test_workflow_capture_recovery import _setup
 from tests.evals.test_workflow_eval_target import _register_app, _suite, _target, _TwoChildWorkflow
 
 from cayu import (
+    ChildSessionCompleted,
     FinalOutputContains,
     ModelStreamEvent,
     SessionTrajectoryBounds,
@@ -126,9 +127,10 @@ def test_retained_projection_recovers_in_fresh_process(tmp_path, monkeypatch, fa
             target = _target(app, _TwoChildWorkflow, projector=_project).model_copy(
                 update={"capture_bounds": SessionTrajectoryBounds(max_events=1)}
             )
+            # The child-tree assertion keeps a capture-limited source unscored.
             run = await run_workflow_eval_suite(
                 target,
-                _suite(FinalOutputContains("x")),
+                _suite(FinalOutputContains("x"), ChildSessionCompleted()),
                 case_timeout_seconds=10 if failure == "timeout" else None,
             )
             trial = run.cases[0].trials[0]

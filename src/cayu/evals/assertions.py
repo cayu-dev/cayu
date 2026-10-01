@@ -65,6 +65,19 @@ class EvalAssertion(ABC):
 
         return False
 
+    @property
+    def reads_final_output_only(self) -> bool:
+        """Whether this assertion reads nothing but the run's final output.
+
+        Override to return ``True`` only when ``evaluate`` reads ``context.final_output``
+        (and, for workflows, the projected structured output) and no events,
+        transcript, usage, children, probes, or memory evidence. Such assertions
+        still score a completed workflow whose child evidence exceeded its capture
+        bounds; undeclared assertions are unavailable on that partial evidence.
+        """
+
+        return False
+
     @abstractmethod
     async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
         """Evaluate this assertion against a Cayu runtime context."""
@@ -273,6 +286,10 @@ class ChildSessionCompleted(EvalAssertion):
 
 
 class FinalOutputContains(EvalAssertion):
+    @property
+    def reads_final_output_only(self) -> bool:
+        return True
+
     def __init__(self, text: str) -> None:
         self.text = _require_text(text, "text")
 
@@ -296,6 +313,10 @@ class FinalOutputContains(EvalAssertion):
 
 
 class FinalOutputMatches(EvalAssertion):
+    @property
+    def reads_final_output_only(self) -> bool:
+        return True
+
     def __init__(self, pattern: str) -> None:
         self.pattern = _require_text(pattern, "pattern")
         self._compiled = re.compile(pattern)

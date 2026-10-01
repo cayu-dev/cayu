@@ -50,6 +50,10 @@ from cayu.evals._process_progress import (
     observe_eval_trial,
     observe_eval_trial_result,
 )
+from cayu.evals._workflow_child_lifecycle import (
+    _check_workflow_child_lifecycle,
+    _WorkflowChildLifecycle,
+)
 from cayu.evals.assertions import EvalAssertion
 from cayu.evals.capacity import EVAL_MAX_CONCURRENCY, EvalExecutionCapacity
 from cayu.evals.capture_policy import (
@@ -520,6 +524,7 @@ async def _owned_fresh_capture_revalidation(
     root_session_id: str,
     root_interrupted_observed_events: tuple[RunnerObservedEventIdentity, ...],
     lifecycle: _FreshMemoryAttributionReadLifecycle,
+    partial_workflow_lifecycle: _WorkflowChildLifecycle | None = None,
 ) -> None:
     """Revalidate one closure without letting opaque store reads defeat cancellation."""
 
@@ -530,12 +535,20 @@ async def _owned_fresh_capture_revalidation(
         lifecycle.retain_abandoned(retained)
 
     outcome = await await_invocation_operation(
-        lambda: _revalidate_fresh_capture(
-            app,
-            capture_state,
-            root_session_id=root_session_id,
-            root_interrupted_observed_events=root_interrupted_observed_events,
-            before_store_read=stop.require_read_allowed,
+        lambda: (
+            _check_workflow_child_lifecycle(
+                app,
+                partial_workflow_lifecycle,
+                before_store_read=stop.require_read_allowed,
+            )
+            if partial_workflow_lifecycle is not None
+            else _revalidate_fresh_capture(
+                app,
+                capture_state,
+                root_session_id=root_session_id,
+                root_interrupted_observed_events=root_interrupted_observed_events,
+                before_store_read=stop.require_read_allowed,
+            )
         ),
         request_child_cancellation=False,
         abandon_on_caller_cancellation=True,
@@ -2068,6 +2081,7 @@ async def _run_workflow_case_once_with_public_projection(
     public_output = EvalTrialOutputPreviewV1.unavailable()
     capture_state: _CaptureState | None = None
     capture_stage: WorkflowCaptureStage = "execution"
+    partial_workflow_lifecycle: _WorkflowChildLifecycle | None = None
     capture_diagnostic: WorkflowCaptureDiagnostic | None = None
     workflow_attempt: WorkflowAttemptAnchor | None = None
     retained_workflow_output: RetainedWorkflowEvalOutput | None = None
@@ -2345,21 +2359,38 @@ async def _run_workflow_case_once_with_public_projection(
                 raise SessionTrajectoryError(
                     SessionTrajectoryErrorCode.STORE_UNSUPPORTED, session_id=root_session_id
                 )
-            children = await _build_child_trajectories(
-                runtime_app,
-                root_session_id,
-                visited={root_session_id},
-                incomplete=children_incomplete,
-                parent_terminal_sequence=completion.sequence,
-                state=capture_state,
-            )
+            try:
+                children = await _build_child_trajectories(
+                    runtime_app,
+                    root_session_id,
+                    visited={root_session_id},
+                    incomplete=children_incomplete,
+                    parent_terminal_sequence=completion.sequence,
+                    state=capture_state,
+                )
+            except SessionTrajectoryError as exc:
+                # The scored output is the projector result already bound to the
+                # root journal above, not child evidence. A bounded or ineligible
+                # child tree therefore leaves that output scorable, while every
+                # assertion that needs the tree becomes unavailable below.
+                if not _child_rejection_admits_partial_evidence(exc):
+                    raise
+                capture_diagnostic = _workflow_capture_diagnostic(
+                    capture_stage, exc, capture_state, target.capture_bounds
+                )
+                children = ()
+                children_incomplete.value = True
+                partial_workflow_lifecycle = _WorkflowChildLifecycle(
+                    root_session_id, completion.sequence
+                )
             capture_stage = "probe_capture"
-            requirements = _collect_probe_requirements(case.assertions)
-            children = await _capture_workflow_child_probes(
-                runtime_app,
-                children,
-                requirements,
-            )
+            if capture_diagnostic is None:
+                requirements = _collect_probe_requirements(case.assertions)
+                children = await _capture_workflow_child_probes(
+                    runtime_app,
+                    children,
+                    requirements,
+                )
             trajectory = _workflow_trajectory_from_session(
                 workflow_session,
                 workflow_events=tuple(record.event for record in latest_records),
@@ -2370,7 +2401,7 @@ async def _run_workflow_case_once_with_public_projection(
                 children_incomplete=children_incomplete.value,
                 metadata=case.metadata,
             )
-            if children_incomplete.value:
+            if children_incomplete.value and capture_diagnostic is None:
                 raise SessionTrajectoryError(
                     SessionTrajectoryErrorCode.EVIDENCE_INCONSISTENT,
                     session_id=root_session_id,
@@ -2383,6 +2414,7 @@ async def _run_workflow_case_once_with_public_projection(
                 bounds=selected_memory_bounds,
                 lifecycle=memory_attribution_read_lifecycle,
             )
+            # Omitted payloads still require a settled, stable child lifecycle.
             if runtime_app.session_store.supports_session_lineage:
                 await _owned_fresh_capture_revalidation(
                     runtime_app,
@@ -2390,6 +2422,7 @@ async def _run_workflow_case_once_with_public_projection(
                     root_session_id=root_session_id,
                     root_interrupted_observed_events=(),
                     lifecycle=memory_attribution_read_lifecycle,
+                    partial_workflow_lifecycle=partial_workflow_lifecycle,
                 )
             revalidated_memory_projection = await _owned_fresh_memory_attribution_projection(
                 runtime_app,
@@ -2420,8 +2453,17 @@ async def _run_workflow_case_once_with_public_projection(
                 metadata=case.metadata,
                 root_evidence_available=True,
             )
+            scored_assertions = (
+                tuple(case.assertions)
+                if capture_diagnostic is None
+                else tuple(
+                    assertion
+                    for assertion in case.assertions
+                    if _assertion_reads_only_workflow_output(assertion)
+                )
+            )
             prepared, prepared_error = _prepare_portable_evidence(
-                case.assertions,
+                scored_assertions,
                 context,
                 runtime_app=runtime_app,
                 memory_attribution_evidence=memory_attribution,
@@ -2435,12 +2477,19 @@ async def _run_workflow_case_once_with_public_projection(
             capture_stage = "assertion"
             assertion_results = list(
                 await _evaluate_assertions_with_prepared_evidence(
-                    case.assertions,
+                    scored_assertions,
                     context,
                     portable_evidence=prepared,
                     portable_evidence_error=prepared_error,
                 )
             )
+            if capture_diagnostic is not None:
+                assertion_results = _merge_partial_evidence_results(
+                    case.assertions,
+                    assertion_results,
+                    capture_diagnostic=capture_diagnostic,
+                    memory_attribution_evidence=memory_attribution,
+                )
             capture_stage = "post_scoring_revalidation"
             assertion_error = _assertion_diagnostic(
                 assertion_results,
@@ -2457,6 +2506,7 @@ async def _run_workflow_case_once_with_public_projection(
                     root_session_id=root_session_id,
                     root_interrupted_observed_events=(),
                     lifecycle=memory_attribution_read_lifecycle,
+                    partial_workflow_lifecycle=partial_workflow_lifecycle,
                 )
             final_records = await _load_workflow_eval_records(
                 runtime_app,
@@ -2511,19 +2561,8 @@ async def _run_workflow_case_once_with_public_projection(
         final_output = ""
         structured_output = None
     except SessionTrajectoryError as exc:
-        capture_diagnostic = WorkflowCaptureDiagnostic(
-            stage=capture_stage,
-            code=exc.code,
-            session_id=exc.session_id,
-            terminal_code=exc.terminal_code,
-            limit=exc.limit,
-            observed_lower_bound=exc.observed,
-            bounds=target.capture_bounds,
-            consumed_events=0 if capture_state is None else capture_state.event_count,
-            consumed_transcript_records=0
-            if capture_state is None
-            else capture_state.transcript_count,
-            consumed_bytes=0 if capture_state is None else capture_state.total_bytes,
+        capture_diagnostic = _workflow_capture_diagnostic(
+            capture_stage, exc, capture_state, target.capture_bounds
         )
         run_error = "Workflow capture failed: " + capture_diagnostic.model_dump_json()
         diagnostic_code = EvalTrialDiagnosticCode.WORKFLOW_CAPTURE_FAILED
@@ -2631,6 +2670,7 @@ async def _run_workflow_case_once_with_public_projection(
                         root_session_id=root_session_id,
                         root_interrupted_observed_events=(),
                         lifecycle=memory_attribution_read_lifecycle,
+                        partial_workflow_lifecycle=partial_workflow_lifecycle,
                     )
             except WorkflowEvalFailure as exc:
                 run_error = str(exc)
@@ -2690,10 +2730,18 @@ async def _run_workflow_case_once_with_public_projection(
         if run_error is None
         else None
     )
+    if run_error is None and capture_diagnostic is not None and not case.assertions:
+        unavailable_reason = "Workflow child evidence was only partially captured."
     if diagnostic_code is EvalTrialDiagnosticCode.WORKFLOW_CAPTURE_FAILED:
         unavailable_reason = run_error
         run_error = None
     status = _trial_status(run_error, unavailable_reason, assertion_results)
+    if (
+        unavailable_reason is not None
+        and diagnostic_code is None
+        and capture_diagnostic is not None
+    ):
+        diagnostic_code = EvalTrialDiagnosticCode.WORKFLOW_CAPTURE_FAILED
     if (
         unavailable_reason is not None
         and diagnostic_code is not EvalTrialDiagnosticCode.WORKFLOW_CAPTURE_FAILED
@@ -2705,6 +2753,11 @@ async def _run_workflow_case_once_with_public_projection(
             if status is EvalStatus.PASSED
             else EvalTrialDiagnosticCode.ASSERTION_FAILED
         )
+    if capture_diagnostic is not None and status not in (EvalStatus.PASSED, EvalStatus.FAILED):
+        # Only a scored partial capture publishes a preview and root-only trajectory.
+        # final_output stays the anchored projection, matching the retained record.
+        public_output = EvalTrialOutputPreviewV1.unavailable()
+        trajectory = None
     public_data = (
         None
         if public_output_preview_bytes is None
@@ -2735,15 +2788,21 @@ async def _run_workflow_case_once_with_public_projection(
             else 0
             if trajectory is None
             else _workflow_event_count(trajectory),
+            # A partial capture read no descendant usage; its root-only sum is not a total.
             usage_summary=(
                 session_usage_summary_payload(failure_usage)
                 if failure_usage is not None
                 else None
                 if failure_capture is not None
                 else None
-                if trajectory is None or trajectory.usage_summary is None
+                if trajectory is None
+                or trajectory.usage_summary is None
+                or trajectory.children_incomplete
                 else session_usage_summary_payload(trajectory.usage_summary)
             ),
+            usage_evidence_state="unavailable"
+            if trajectory is not None and trajectory.children_incomplete
+            else None,
             operation_outcomes=trajectory_operation_outcomes(trajectory),
             memory_attribution=memory_attribution,
             started_at=started_at,
@@ -3611,6 +3670,100 @@ def _assertion_error_result(
                 "identity_error_type": type(identity_exc).__name__,
             },
         )
+
+
+_PARTIAL_EVIDENCE_TERMINAL_CODES = frozenset(
+    {
+        TerminalSessionEvidenceErrorCode.EVENT_LIMIT_EXCEEDED,
+        TerminalSessionEvidenceErrorCode.TRANSCRIPT_LIMIT_EXCEEDED,
+        TerminalSessionEvidenceErrorCode.RECORD_BYTES_EXCEEDED,
+        TerminalSessionEvidenceErrorCode.TOTAL_BYTES_EXCEEDED,
+        TerminalSessionEvidenceErrorCode.TRANSPORT_BYTES_EXCEEDED,
+    }
+)
+_PARTIAL_EVIDENCE_TRAJECTORY_CODES = frozenset(
+    {
+        SessionTrajectoryErrorCode.ORIGIN_EVIDENCE_REJECTED,
+        SessionTrajectoryErrorCode.SESSION_LIMIT_EXCEEDED,
+        SessionTrajectoryErrorCode.DEPTH_LIMIT_EXCEEDED,
+    }
+)
+
+
+def _child_rejection_admits_partial_evidence(error: SessionTrajectoryError) -> bool:
+    """Whether a child-tree rejection leaves the completed workflow output scorable.
+
+    Capture limits and ineligible child origins describe the retained evidence,
+    not the root result. Read failures, concurrent changes, and non-terminal
+    children stay unavailable because they may mean the workflow had not settled.
+    """
+
+    if error.code is SessionTrajectoryErrorCode.TERMINAL_EVIDENCE_REJECTED:
+        return error.terminal_code in _PARTIAL_EVIDENCE_TERMINAL_CODES
+    return error.code in _PARTIAL_EVIDENCE_TRAJECTORY_CODES
+
+
+def _workflow_capture_diagnostic(
+    stage: WorkflowCaptureStage,
+    error: SessionTrajectoryError,
+    capture_state: _CaptureState | None,
+    bounds: SessionTrajectoryBounds,
+) -> WorkflowCaptureDiagnostic:
+    return WorkflowCaptureDiagnostic(
+        stage=stage,
+        code=error.code,
+        session_id=error.session_id,
+        terminal_code=error.terminal_code,
+        limit=error.limit,
+        observed_lower_bound=error.observed,
+        bounds=bounds,
+        consumed_events=0 if capture_state is None else capture_state.event_count,
+        consumed_transcript_records=0 if capture_state is None else capture_state.transcript_count,
+        consumed_bytes=0 if capture_state is None else capture_state.total_bytes,
+    )
+
+
+def _assertion_reads_only_workflow_output(assertion: EvalAssertion) -> bool:
+    """Whether an assertion declared that it observes only the projected output.
+
+    Only these can score from a partial child capture. Undeclared assertions may
+    read descendant events, usage, routes, or probes and are not guaranteed to
+    report a missing subtree as unavailable, so they stay unavailable.
+    """
+
+    try:
+        return assertion.reads_final_output_only is True
+    except Exception:
+        return False
+
+
+def _merge_partial_evidence_results(
+    assertions: Sequence[EvalAssertion],
+    scored_results: Sequence[EvalAssertionResult],
+    *,
+    capture_diagnostic: WorkflowCaptureDiagnostic,
+    memory_attribution_evidence: EvalMemoryAttributionEvidenceV1,
+) -> list[EvalAssertionResult]:
+    """Keep case order: output-only results as scored, the rest unavailable."""
+
+    scored = iter(scored_results)
+    blocked = iter(
+        _blocked_assertion_results(
+            tuple(
+                assertion
+                for assertion in assertions
+                if not _assertion_reads_only_workflow_output(assertion)
+            ),
+            EvalOutcome.UNAVAILABLE,
+            "Workflow child evidence was only partially captured: "
+            + capture_diagnostic.model_dump_json(),
+            memory_attribution_evidence=memory_attribution_evidence,
+        )
+    )
+    return [
+        next(scored) if _assertion_reads_only_workflow_output(assertion) else next(blocked)
+        for assertion in assertions
+    ]
 
 
 def _blocked_assertion_results(

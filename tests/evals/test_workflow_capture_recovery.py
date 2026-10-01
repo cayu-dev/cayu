@@ -12,6 +12,7 @@ from tests.evals.test_workflow_eval_target import (
 )
 
 from cayu import (
+    EvalAssertion,
     FinalOutputContains,
     ModelStreamEvent,
     SessionTrajectoryBounds,
@@ -21,7 +22,7 @@ from cayu import (
 )
 from cayu.evals.corpus import FinalOutputEqualsAssertionSpec
 from cayu.evals.execution import _copy_corpus_target
-from cayu.evals.models import EvalStatus
+from cayu.evals.models import EvalOutcome, EvalStatus
 from cayu.evals.trajectory import SessionTrajectoryError
 from cayu.evals.workflow_target import WorkflowEvalResult
 
@@ -61,20 +62,17 @@ def test_aggregate_boundary_and_payload_free_diagnostic():
         trial = result.cases[0].trials[0]
         count = sum(len(child.events) for child in trial.trajectory.children)
         assert all(len(child.events) < count - 1 for child in trial.trajectory.children)
-        for bound, expected in (
-            (count, EvalStatus.PASSED),
-            (count - 1, EvalStatus.UNAVAILABLE),
-            (count + 1, EvalStatus.PASSED),
-        ):
+        for bound, partial in ((count, False), (count - 1, True), (count + 1, False)):
             _, configured, suite = _setup(SessionTrajectoryBounds(max_events=bound))
             run = await run_workflow_eval_suite(configured, suite)
             trial = run.cases[0].trials[0]
-            assert trial.status is expected, trial.error
+            # The output-only assertion scores either way; only evidence completeness differs.
+            assert trial.status is EvalStatus.PASSED, trial.error
             assert trial.execution_status == "completed"
             assert trial.capture_bounds.max_events == bound
-            if expected is EvalStatus.UNAVAILABLE:
-                assert trial.score is None
-                assert not trial.evidence_complete
+            assert trial.evidence_complete is not partial
+            if partial:
+                assert trial.score == 1.0
                 diagnostic = trial.capture_diagnostic
                 assert diagnostic.terminal_code == "event_limit_exceeded"
                 assert diagnostic.observed_lower_bound == diagnostic.limit + 1
@@ -102,7 +100,8 @@ def test_raising_events_does_not_disable_other_limits(limit):
         trial = run.cases[0].trials[0]
         assert trial.execution_status == "completed"
         assert trial.capture_diagnostic is not None
-        assert trial.score is None
+        assert trial.status is EvalStatus.PASSED
+        assert not trial.evidence_complete
 
     asyncio.run(exercise())
 
@@ -136,7 +135,8 @@ def test_recapture_and_score_do_not_dispatch_and_preserve_source(monkeypatch):
         assert score.assertion_revisions
         assert score.source_capture_id == capture.capture_id
         assert run.model_dump_json() == original
-        assert source.status is EvalStatus.UNAVAILABLE
+        assert source.status is EvalStatus.PASSED
+        assert not source.evidence_complete
         # Root identity and child-byte mutation must fail against the sealed capture.
         child = capture.trajectory.children[0].session
         await app.session_store.update_metadata(child.id, {"tampered": True})
@@ -286,10 +286,15 @@ def test_legacy_import_is_explicit_and_does_not_replace_existing_anchor():
     asyncio.run(exercise())
 
 
-def test_corpus_report_keeps_completed_runtime_and_unavailable_scoring():
+def test_corpus_report_scores_output_with_partial_capture_evidence():
     from tests.evals.test_workflow_eval_target import _corpus
 
-    from cayu import corpus_execution_result_from_json, corpus_execution_result_to_json
+    from cayu import (
+        corpus_execution_result_from_json,
+        corpus_execution_result_to_json,
+        render_corpus_execution_html,
+    )
+    from cayu.evals.corpus import ToolCalledAssertionSpec
     from cayu.evals.execution import run_corpus_suite
 
     async def exercise():
@@ -303,16 +308,246 @@ def test_corpus_report_keeps_completed_runtime_and_unavailable_scoring():
         assert "retained_workflow_output" not in public_json
         restored = corpus_execution_result_from_json(public_json)
         trial = restored.run.cases[0].trials[0]
-        assert trial.status == "unavailable"
-        assert trial.score is None
-        assert trial.code == "workflow_capture_failed"
+        assert trial.status == "passed"
+        assert trial.score == 1.0
+        assert trial.code == "passed"
+        assert not trial.evidence_complete
+        assert trial.usage is None
         assert trial.execution_status == "completed"
-        from cayu import render_corpus_execution_html
-
+        assert trial.output.evidence_state == "complete"
         assert "event_limit_exceeded" in render_corpus_execution_html(restored)
         assert trial.capture_diagnostic.terminal_code == "event_limit_exceeded"
         assert trial.capture_bounds.max_events == 1
-        assert all(assertion.outcome == "unavailable" for assertion in trial.assertions)
+        # Without the capture diagnostic, a scored trial must still have complete evidence.
+        document = trial.model_dump(mode="python")
+        document.pop("capture_diagnostic")
+        with pytest.raises(ValueError, match="require complete evidence"):
+            type(trial).model_validate(document)
+
+        # An assertion that reads the child tree keeps the trial unavailable.
+        _, target, _ = _setup(SessionTrajectoryBounds(max_events=1))
+        result = await run_corpus_suite(
+            target,
+            _corpus(
+                FinalOutputEqualsAssertionSpec(id="answer", expected="x"),
+                ToolCalledAssertionSpec(id="tool", tool_name="echo", min_count=0, max_count=0),
+            ),
+            "workflow-suite",
+        )
+        restored = corpus_execution_result_from_json(corpus_execution_result_to_json(result))
+        trial = restored.run.cases[0].trials[0]
+        assert trial.status == "unavailable"
+        assert trial.score is None
+        assert trial.code == "workflow_capture_failed"
+        assert [assertion.outcome for assertion in trial.assertions] == [
+            "passed",
+            "unavailable",
+        ]
+
+    asyncio.run(exercise())
+
+
+def _large_child_record_target(app, *, payload_bytes: int):
+    from tests.evals.test_session_trajectory import _create_running_session, _finish_session
+
+    from cayu import Event, WorkflowBase, WorkflowSpec
+
+    class LargeChildRecordWorkflow(WorkflowBase):
+        spec = WorkflowSpec(name="large-child-record")
+
+        async def run(self, session_id):
+            ctx = self.context(session_id)
+            yield await ctx.start()
+            child_id = f"{session_id}-child"
+            interaction = await _create_running_session(
+                app.session_store, child_id, parent_session_id=session_id
+            )
+            await app.session_store.append_event(
+                child_id,
+                Event(
+                    type="custom.page_text",
+                    session_id=child_id,
+                    payload={"text": "p" * payload_bytes},
+                ),
+            )
+            await _finish_session(app.session_store, child_id, interaction)
+            yield await ctx.completed({"answer": "done"})
+
+    return _target(app, LargeChildRecordWorkflow).model_copy(
+        update={"capture_bounds": SessionTrajectoryBounds(max_record_bytes=4096)}
+    )
+
+
+@pytest.mark.parametrize(
+    ("expected", "status", "score"),
+    [("done", EvalStatus.PASSED, 1.0), ("other", EvalStatus.FAILED, 0.0)],
+)
+def test_oversized_child_record_scores_output_with_partial_evidence(expected, status, score):
+    async def exercise():
+        target = _large_child_record_target(_register_app(), payload_bytes=8192)
+        run = await run_workflow_eval_suite(
+            target, _suite(FinalOutputContains(expected)), retain_trajectory=True
+        )
+        trial = run.cases[0].trials[0]
+        assert trial.execution_status == "completed"
+        assert trial.status is status, trial.unavailable_reason
+        assert trial.score == score
+        assert trial.final_output == "done"
+        assert not trial.evidence_complete
+        assert trial.usage_summary is None
+        assert trial.usage_evidence_state == "unavailable"
+        assert trial.unavailable_reason is None and trial.error is None
+        diagnostic = trial.capture_diagnostic
+        assert diagnostic.stage == "child_capture"
+        assert diagnostic.code == "terminal_evidence_rejected"
+        assert diagnostic.terminal_code == "record_bytes_exceeded"
+        assert diagnostic.limit == 4096
+        assert "ppp" not in diagnostic.model_dump_json()
+        assert trial.workflow_attempt is not None
+        assert trial.trajectory.children == ()
+        assert trial.trajectory.children_incomplete
+        # Default bounds capture the same tree completely and score it identically.
+        wide = _large_child_record_target(_register_app(), payload_bytes=8192).model_copy(
+            update={"capture_bounds": SessionTrajectoryBounds()}
+        )
+        complete = await run_workflow_eval_suite(wide, _suite(FinalOutputContains(expected)))
+        assert complete.cases[0].trials[0].evidence_complete
+        assert complete.cases[0].trials[0].status is status
+
+    asyncio.run(exercise())
+
+
+def test_partial_capture_leaves_child_tree_assertions_unavailable():
+    from cayu import ChildSessionCompleted, EventNotOccurred, ToolNotCalled
+
+    async def exercise():
+        target = _large_child_record_target(_register_app(), payload_bytes=8192)
+        run = await run_workflow_eval_suite(
+            target,
+            _suite(
+                FinalOutputContains("done"),
+                ChildSessionCompleted(),
+                EventNotOccurred("custom.page_text"),
+                ToolNotCalled("echo"),
+            ),
+            retain_trajectory=True,
+        )
+        trial = run.cases[0].trials[0]
+        assert trial.status is EvalStatus.UNAVAILABLE
+        assert trial.score is None
+        assert [assertion.outcome for assertion in trial.assertions] == [
+            EvalOutcome.PASSED,
+            EvalOutcome.UNAVAILABLE,
+            EvalOutcome.UNAVAILABLE,
+            EvalOutcome.UNAVAILABLE,
+        ]
+        assert "record_bytes_exceeded" in trial.assertions[1].message
+        assert trial.capture_diagnostic.terminal_code == "record_bytes_exceeded"
+        assert not trial.evidence_complete
+        # An unscored trial publishes no preview or trajectory; its output stays the
+        # anchored projection so it agrees with the retained record and anchor digest.
+        assert trial.final_output == trial.retained_workflow_output.output.final_output
+        assert trial.trajectory is None
+
+    asyncio.run(exercise())
+
+
+class _ExactAnswer(EvalAssertion):
+    """Application-style answer check that reads only the final output."""
+
+    def __init__(self, expected: str, *, declared: bool) -> None:
+        self.expected = expected
+        self.declared = declared
+
+    @property
+    def reads_final_output_only(self) -> bool:
+        return self.declared
+
+    async def evaluate(self, context):
+        if context.final_output.strip() == self.expected:
+            return self.passed("Answer matched.")
+        return self.failed("Answer did not match.")
+
+
+@pytest.mark.parametrize(
+    ("expected", "status", "score"),
+    [("done", EvalStatus.PASSED, 1.0), ("other", EvalStatus.FAILED, 0.0)],
+)
+def test_declared_custom_output_assertion_scores_on_partial_evidence(expected, status, score):
+    async def exercise():
+        target = _large_child_record_target(_register_app(), payload_bytes=8192)
+        run = await run_workflow_eval_suite(target, _suite(_ExactAnswer(expected, declared=True)))
+        trial = run.cases[0].trials[0]
+        assert trial.status is status, trial.unavailable_reason
+        assert trial.score == score
+        assert not trial.evidence_complete
+        assert trial.capture_diagnostic.terminal_code == "record_bytes_exceeded"
+
+    asyncio.run(exercise())
+
+
+def test_undeclared_custom_assertion_stays_unavailable_on_partial_evidence():
+    class _Undeclared(EvalAssertion):
+        # Same check as _ExactAnswer, but relying on the conservative default.
+        async def evaluate(self, context):
+            if context.final_output.strip() == "done":
+                return self.passed("Answer matched.")
+            return self.failed("Answer did not match.")
+
+    class _Raising(_ExactAnswer):
+        @property
+        def reads_final_output_only(self) -> bool:
+            raise RuntimeError("declaration unavailable")
+
+    async def exercise():
+        target = _large_child_record_target(_register_app(), payload_bytes=8192)
+        run = await run_workflow_eval_suite(
+            target,
+            _suite(
+                _ExactAnswer("done", declared=True),
+                _Undeclared(),
+                _Raising("done", declared=True),
+            ),
+        )
+        trial = run.cases[0].trials[0]
+        assert trial.status is EvalStatus.UNAVAILABLE
+        assert trial.score is None
+        assert [assertion.outcome for assertion in trial.assertions] == [
+            EvalOutcome.PASSED,
+            EvalOutcome.UNAVAILABLE,
+            EvalOutcome.UNAVAILABLE,
+        ]
+        assert "record_bytes_exceeded" in trial.assertions[1].message
+        # The same undeclared assertion scores normally once the bounds fit the tree.
+        complete_target = target.model_copy(update={"capture_bounds": SessionTrajectoryBounds()})
+        complete = await run_workflow_eval_suite(complete_target, _suite(_Undeclared()))
+        assert complete.cases[0].trials[0].status is EvalStatus.PASSED
+        assert complete.cases[0].trials[0].evidence_complete
+
+    asyncio.run(exercise())
+
+
+def test_unsettled_child_capture_rejection_stays_unavailable(monkeypatch):
+    import cayu.evals.runner as runner
+    from cayu.evals.trajectory import SessionTrajectoryErrorCode
+
+    async def exercise():
+        target = _large_child_record_target(_register_app(), payload_bytes=16)
+
+        async def unreadable(*args, **kwargs):
+            raise SessionTrajectoryError(
+                SessionTrajectoryErrorCode.EVIDENCE_READ_FAILED,
+                session_id="workflow-child",
+            )
+
+        monkeypatch.setattr(runner, "_build_child_trajectories", unreadable)
+        run = await run_workflow_eval_suite(target, _suite(FinalOutputContains("done")))
+        trial = run.cases[0].trials[0]
+        assert trial.execution_status == "completed"
+        assert trial.status is EvalStatus.UNAVAILABLE
+        assert trial.score is None
+        assert trial.capture_diagnostic.code == "evidence_read_failed"
+        assert all(assertion.outcome is EvalOutcome.UNAVAILABLE for assertion in trial.assertions)
 
     asyncio.run(exercise())
 

@@ -1375,8 +1375,19 @@ class PublishedEvalTrialResult(_PortableModel):
         expected_score = _published_score(assertion.score for assertion in self.assertions)
         if self.status != expected_status or self.score != expected_score:
             raise ValueError("Published trial aggregates do not match its assertions.")
-        if self.status in {"passed", "failed"} and not self.evidence_complete:
-            raise ValueError("Scored published trials require complete evidence.")
+        if (
+            self.status in {"passed", "failed"}
+            and not self.evidence_complete
+            and (
+                self.capture_diagnostic is None
+                or self.capture_diagnostic.stage != "child_capture"
+                or self.execution_status != "completed"
+            )
+        ):
+            raise ValueError(
+                "Scored published trials require complete evidence or a completed "
+                "workflow's child-capture diagnostic."
+            )
         if self.evidence_complete and self.usage is None:
             raise ValueError("Complete published trials require exact usage.")
         if self.code not in _TRIAL_CODES_BY_STATUS[self.status]:

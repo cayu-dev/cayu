@@ -61,6 +61,27 @@
   unavailable. Scored trials and trials that fail before projection are
   unchanged. Readers that treated a non-empty `final_output` as a scored answer
   must check `status`.
+- Keep partial workflow scoring fail-closed when an omitted descendant is still
+  running or its lifecycle changes during scoring or target close. Bounded topology
+  and identity checks run independently of event-payload capture limits. A partial
+  case without assertions returns unavailable instead of aborting the suite with
+  an invalid skipped trial.
+- Score completed workflow eval trials whose child evidence exceeds capture
+  bounds instead of making them `unavailable`. When child capture fails with a
+  capture-limit rejection (for example `record_bytes_exceeded`) or
+  `origin_evidence_rejected`, the trial is scored from the workflow's projected
+  output, reports `evidence_complete=false` and unknown usage, and keeps its
+  `capture_diagnostic`. Only assertions whose new
+  `EvalAssertion.reads_final_output_only` property is `True` are evaluated: the
+  built-in final-output assertions and corpus specs, plus any application
+  assertion that overrides it. Undeclared assertions, including model judges,
+  stay unavailable, so the trial is unavailable unless every assertion is
+  output-only. Read failures,
+  closure changes, and non-terminal children still make the trial unavailable.
+  `WorkflowEvalTarget.capture_bounds` can raise the limits per target. Readers
+  that assumed every scored trial has complete evidence must accept scored
+  trials that carry a capture diagnostic.
+
 - Decode compressed upstream responses in virtual egress instead of rejecting
   them. `HttpxUpstream` still requests identity encoding, but when an origin
   (such as the Internet Archive) returns a single `gzip`, `deflate`, `br`, or
