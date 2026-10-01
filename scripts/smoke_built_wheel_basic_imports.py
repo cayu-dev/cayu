@@ -68,6 +68,14 @@ for name, (module_name, symbol) in exports.items():
     assert actual is getattr(importlib.import_module(module_name), symbol), name
 """
         subprocess.run([sys.executable, "-I", "-c", script], check=True, timeout=60)
+    if args.installed_layout:
+        # The base release environment has no extras, so this is the real wildcard check.
+        for package_name in packages:
+            subprocess.run(
+                [sys.executable, "-I", "-c", f"from {package_name} import *"],
+                check=True,
+                timeout=60,
+            )
     if args.all_exports:
         subprocess.run(
             [sys.executable, "-I", "-c", "from cayu.storage import postgres; assert postgres"],
@@ -105,6 +113,22 @@ for name, (module_name, symbol) in exports.items():
         }
         assert declared == set(exports.EXPORTS), package_name
         assert set(package.__all__) <= declared, package_name
+        wildcard_declaration = next(
+            (
+                node.value
+                for node in stub.body
+                if isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name) and target.id == "__all__"
+                    for target in node.targets
+                )
+            ),
+            None,
+        )
+        if set(package.__all__) != set(exports.PUBLIC_NAMES):
+            assert wildcard_declaration is not None, package_name
+        if wildcard_declaration is not None:
+            assert set(package.__all__) == set(ast.literal_eval(wildcard_declaration)), package_name
     print("complete installed concept layout and lazy public imports passed")
 
 

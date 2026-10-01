@@ -28,6 +28,26 @@ provider. It needs no provider credentials. Run it from the repository root with
 `uv run python -m examples.public_concepts.app`. Its single-file layout illustrates
 API imports; use the generated project above as the application authoring example.
 
+## Optional dependencies and API discovery
+
+Wildcard imports such as `from cayu import *` work without optional extras. Each
+supported public package's `__all__` omits exports from modules that require an
+extra at import time, including the Postgres stores and
+`SQLiteProductOperationStore`. The wildcard surface stays the same even when
+those extras are installed.
+
+Those names remain supported explicit imports and retain their type information.
+For example, install `cayu[postgres]` to use
+`from cayu import PostgresSessionStore`. Product operation stores also require
+`cayu[server]`; the Postgres product operation store needs both extras. Without
+the required dependencies, explicit access reports the relevant installation
+hint.
+
+Use `dir(cayu)` or `dir()` on a public concept package to list its declared names
+without loading their implementations. `__all__` describes the smaller wildcard
+surface. Looking up an optional name, including through introspection that
+resolves attributes, still loads its implementation and can require an extra.
+
 ## Source map
 
 ```text

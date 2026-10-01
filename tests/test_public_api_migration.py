@@ -46,9 +46,67 @@ def test_public_manifests_resolve_and_match_static_declarations(package_name):
     assert declared == set(manifest.EXPORTS)
     assert set(package.__all__) <= declared
     assert len(package.__all__) == len(set(package.__all__))
+    wildcard_declaration = next(
+        (
+            node.value
+            for node in declarations.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets
+            )
+        ),
+        None,
+    )
+    if set(package.__all__) != set(manifest.PUBLIC_NAMES):
+        assert wildcard_declaration is not None, package_name
+    if wildcard_declaration is not None:
+        assert set(package.__all__) == set(ast.literal_eval(wildcard_declaration)), package_name
     for name, (module_name, symbol) in manifest.EXPORTS.items():
         assert module_name != package_name, "lazy exports must not resolve through themselves"
         assert getattr(package, name) is getattr(importlib.import_module(module_name), symbol)
+
+
+@pytest.mark.parametrize(
+    ("package_name", "core_name", "optional_name"),
+    [
+        ("cayu", "SQLiteSessionStore", "PostgresSessionStore"),
+        ("cayu.storage", "SQLiteSessionStore", "SQLiteProductOperationStore"),
+        ("cayu.collaboration", "SQLiteCollaborationStore", "PostgresCollaborationStore"),
+    ],
+)
+def test_optional_exports_have_matching_wildcard_and_explicit_types(
+    tmp_path, package_name, core_name, optional_name
+):
+    wildcard = tmp_path / "wildcard.py"
+    wildcard.write_text(f"from {package_name} import *\nprint({core_name}.__name__)\n")
+    explicit = tmp_path / "explicit.py"
+    explicit.write_text(
+        f"from {package_name} import {optional_name}\n"
+        f"from typing import assert_type\n"
+        f"assert_type({optional_name}.__name__, str)\n"
+    )
+    command = [
+        sys.executable,
+        "-m",
+        "ty",
+        "check",
+        "--project",
+        str(_ROOT),
+        "--python",
+        sys.executable,
+        "--output-format",
+        "concise",
+    ]
+    valid = subprocess.run(
+        [*command, str(wildcard), str(explicit)], capture_output=True, text=True, timeout=60
+    )
+    assert valid.returncode == 0, valid.stdout + valid.stderr
+
+    wildcard.write_text(f"from {package_name} import *\nprint({optional_name}.__name__)\n")
+    invalid = subprocess.run([*command, str(wildcard)], capture_output=True, text=True, timeout=60)
+    assert invalid.returncode != 0, invalid.stdout + invalid.stderr
+    assert "error[unresolved-reference]" in invalid.stdout, invalid.stdout
+    assert f"`{optional_name}`" in invalid.stdout, invalid.stdout
 
 
 def test_importing_agent_contracts_does_not_load_execution_or_optional_adapters():

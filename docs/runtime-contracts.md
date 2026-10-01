@@ -9,6 +9,18 @@ Unfinished sibling calls retain their interruption results. Interruption and
 ordinary recovery share staged-result validation, hook-state handling, and atomic
 round publication; unsafe or conflicting evidence remains fail-closed.
 
+## Public imports and optional dependencies
+
+The supported public packages resolve explicit imports lazily. Their `__all__`
+contains only exports whose modules load without optional dependencies, so
+wildcard imports work on a base installation. This wildcard surface stays the
+same when extras are installed. Optional-extra names remain discoverable through
+`dir(package)` and declared in the type stubs; explicit access resolves the name
+or reports the existing dependency installation guidance.
+
+See [public API discovery](public-concepts.md#optional-dependencies-and-api-discovery)
+for examples and the distinction between wildcard exports and explicit imports.
+
 ## Application Runtime Configuration
 
 `CayuConfig` is the immutable application tuning API. `CayuApp()` uses a

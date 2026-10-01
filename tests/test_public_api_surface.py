@@ -11,11 +11,13 @@ pins them to the top level so that gap cannot silently reopen.
 
 from __future__ import annotations
 
+import importlib
 import re
 from pathlib import Path
 
 import cayu
 import cayu.runtime as cayu_runtime
+from cayu._exports import EXPORTS
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _ROOT_IMPORT_PATTERN = re.compile(r"from cayu import (\(([^)]*)\)|([^\n(]+))", re.DOTALL)
@@ -183,10 +185,9 @@ def test_readme_recovery_snippet_imports_and_constructs() -> None:
 
 
 def test_every_documented_root_import_is_exported() -> None:
-    # Audit the export surface as a set: every `from cayu import X` a reader can
-    # copy out of the README, docs, or examples must resolve against
-    # ``cayu.__all__`` — a doc that documents a missing name is the exact
-    # papercut external consumers keep reporting one name at a time.
+    # Explicit imports include optional-extra names that are intentionally absent
+    # from __all__. Audit the complete declarations, then exercise lazy resolution
+    # with the dev dependencies installed.
     documented: dict[str, Path] = {}
     paths = [_REPO_ROOT / "README.md"]
     for root in ("docs", "examples"):
@@ -203,10 +204,14 @@ def test_every_documented_root_import_is_exported() -> None:
                     documented.setdefault(name, path)
 
     assert documented, "doc scan found no root imports — the scanner is broken"
-    exported = set(cayu.__all__)
+    exported = set(EXPORTS)
     missing = {
         name: str(path.relative_to(_REPO_ROOT))
         for name, path in sorted(documented.items())
         if name not in exported
     }
-    assert not missing, f"documented but not in cayu.__all__: {missing}"
+    assert not missing, f"documented but not declared as a cayu export: {missing}"
+    for name in documented:
+        module_name, symbol = EXPORTS[name]
+        assert name in dir(cayu), f"cayu.{name} is not discoverable"
+        assert getattr(cayu, name) is getattr(importlib.import_module(module_name), symbol), name
