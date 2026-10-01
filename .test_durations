@@ -41773,5 +41773,15 @@
     "tests/core/test_model_policy_storage.py::test_sqlite_cancel_keeps_connection_owned_until_publication_settles": 0.4323651660233736,
     "tests/qualification/test_model_policy_cloud.py::test_cloud_http_to_runtime_session_and_refusal[memory]": 1.994508124073036,
     "tests/qualification/test_model_policy_cloud.py::test_cloud_http_to_runtime_session_and_refusal[postgres]": 5.079507583053783,
-    "tests/qualification/test_model_policy_cloud.py::test_cloud_http_to_runtime_session_and_refusal[sqlite]": 2.192985126050189
+    "tests/qualification/test_model_policy_cloud.py::test_cloud_http_to_runtime_session_and_refusal[sqlite]": 2.192985126050189,
+    "tests/server/test_server_scenario_launch.py::test_scenario_launch_preserves_shared_auth_body_handling_and_bound_invocation[/api]": 1.038,
+    "tests/server/test_server_scenario_launch.py::test_scenario_launch_preserves_shared_auth_body_handling_and_bound_invocation[/custom/v2]": 0.552,
+    "tests/server/test_server_scenario_launch.py::test_scenario_launch_rejects_unreviewed_work_before_publication[binding]": 0.566,
+    "tests/server/test_server_scenario_launch.py::test_scenario_launch_rejects_unreviewed_work_before_publication[profile]": 0.547,
+    "tests/server/test_server_scenario_launch.py::test_scenario_launch_rejects_unreviewed_work_before_publication[unsupported]": 0.469,
+    "tests/server/test_server_scenario_launch.py::test_scenario_launch_publication_errors_remain_private_and_precede_admission[conflict]": 0.786,
+    "tests/server/test_server_scenario_launch.py::test_scenario_launch_publication_errors_remain_private_and_precede_admission[unsafe]": 0.507,
+    "tests/server/test_server_scenario_launch.py::test_scenario_launch_publication_errors_remain_private_and_precede_admission[oversized]": 0.538,
+    "tests/server/test_server_scenario_launch.py::test_scenario_launch_recovers_after_publication_and_replays_before_readiness": 0.599,
+    "tests/server/test_server_scenario_launch.py::test_scenario_launch_cancellation_before_publication_does_not_admit_work": 0.511
 }

@@ -103,14 +103,8 @@ from cayu.evals.memory_reporting import (
     MEMORY_EXPERIMENT_REPORT_MAX_BYTES,
     MemoryExperimentReportRequest,
 )
-from cayu.evals.scenario_execution import corpus_for_eval_scenario
 from cayu.evals.store import (
-    EvalCorpusConflict,
     EvalRunRecord,
-    EvalScenarioArtifactReference,
-    EvalScenarioRunInvocation,
-    EvalStorePublicationRejected,
-    EvalStoreResultTooLarge,
 )
 from cayu.events import (
     Event,
@@ -210,10 +204,9 @@ from cayu.server._http_json import (
 from cayu.server._judge_calibration_routes import register_judge_calibration_routes
 from cayu.server._memory_report_routes import register_memory_report_routes
 from cayu.server._request_timing import RequestTimingRecorder
-from cayu.server._scenario_authoring_routes import (
-    load_eval_scenario,
-    preflight_scenario,
+from cayu.server._scenario_routes import (
     register_scenario_authoring_routes,
+    register_scenario_launch_routes,
 )
 from cayu.server._suite_authoring_routes import register_suite_authoring_routes
 from cayu.server._suite_launch_routes import register_suite_launch_routes
@@ -268,7 +261,6 @@ from cayu.server.contracts import (
     ClientGenerationContract,
     EnvironmentsResponse,
     EvalRunCreateRequest,
-    EvalScenarioRunCreateRequest,
     HealthResponse,
     ListSessionEventsResponse,
     ListSessionInteractionsResponse,
@@ -297,7 +289,6 @@ from cayu.server.contracts import (
 from cayu.server.evals_registry import (
     generated_eval_target_registry,
     resolved_evals_runtime,
-    target_for_eval_invocation,
 )
 from cayu.server.evals_worker import EvalRunCoordinator
 from cayu.server.sse import (
@@ -4595,150 +4586,13 @@ def create_router(
             protected=protected,
         )
 
-        @bounded_evals_router.post(
-            "/evals/scenarios/{scenario_revision}/runs",
-            response_model=EvalRunRecord,
-            status_code=202,
-            responses=EVALS_ENDPOINT_RESPONSES,
-            dependencies=protected,
+        register_scenario_launch_routes(
+            bounded_evals_router,
+            eval_store=eval_store,
+            active_eval_registry=active_eval_registry,
+            protected=protected,
+            optional_auth_context=optional_auth_context,
         )
-        async def launch_eval_scenario(
-            scenario_revision: str,
-            body: EvalScenarioRunCreateRequest,
-            idempotency_key: Annotated[
-                str,
-                Header(alias="Idempotency-Key", min_length=1, max_length=512),
-            ],
-            auth_context: AuthContext | None = optional_auth_context,
-        ) -> EvalRunRecord:
-            if not eval_store.scenario_execution:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Durable scenario execution is not available.",
-                )
-            scenario = await load_eval_scenario(
-                scenario_revision, eval_store=eval_store, active_eval_registry=active_eval_registry
-            )
-            replay_probe = bind_eval_admission_request(
-                eval_run_invocation(
-                    auth_context,
-                    max_steps=None,
-                    limits=None,
-                    cost_budget=None,
-                ),
-                kind="scenario",
-                target_key=scenario.target_key,
-                resource_identity={"scenario_revision": scenario.revision},
-                body=body,
-            )
-            admission_request_revision = replay_probe.admission_request_revision
-            if admission_request_revision is None:
-                raise RuntimeError("Scenario eval launch lost its admission request revision.")
-            replayed = await replay_eval_run(
-                eval_store=eval_store,
-                target_key=scenario.target_key,
-                idempotency_key=idempotency_key,
-                admission_request_revision=admission_request_revision,
-            )
-            if replayed is not None:
-                return replayed
-            registration, preflight = await preflight_scenario(
-                scenario, body.settings, active_eval_registry=active_eval_registry
-            )
-            binding = preflight.binding
-            if not preflight.ready or binding is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Eval scenario launch requirements are not currently ready.",
-                )
-            if binding.revision != body.expected_binding_revision:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Eval scenario launch binding changed after review.",
-                )
-            scenario_invocation = EvalScenarioRunInvocation(
-                scenario_revision=scenario.revision,
-                binding_revision=binding.revision,
-                environment_name=binding.environment_name,
-                trials=binding.trials,
-                timeout_seconds=binding.timeout_seconds,
-                artifact_references=tuple(
-                    EvalScenarioArtifactReference(
-                        requirement_id=item.requirement_id,
-                        artifact_id=item.artifact_id,
-                    )
-                    for item in binding.artifacts
-                ),
-            )
-            invocation = eval_run_invocation(
-                auth_context,
-                max_steps=binding.max_steps,
-                limits=binding.operator_run_limits,
-                cost_budget=binding.cost_budget,
-                scenario=scenario_invocation,
-            )
-            invocation = bind_eval_admission_request(
-                invocation,
-                kind="scenario",
-                target_key=scenario.target_key,
-                resource_identity={"scenario_revision": scenario.revision},
-                body=body,
-            )
-            try:
-                effective_target = target_for_eval_invocation(
-                    registration.execution_target(),
-                    invocation,
-                )
-                corpus = await asyncio.to_thread(
-                    corpus_for_eval_scenario,
-                    scenario,
-                    binding,
-                    effective_target,
-                    project_root=registration.manifest_project_root,
-                )
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Eval scenario no longer matches its current target binding.",
-                ) from exc
-            eval_target, compiled, invocation = await prepare_eval_run(
-                active_eval_registry=active_eval_registry,
-                corpus=corpus,
-                suite_id="scenario",
-                max_concurrency=binding.max_concurrency,
-                invocation=invocation,
-                expected_execution_profile_revision=(body.expected_execution_profile_revision),
-                expect_exact_execution_profile=True,
-            )
-            try:
-                await eval_store.save_corpus(
-                    corpus,
-                    redact_json=eval_target.app.redact_json,
-                )
-            except EvalCorpusConflict as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Derived scenario result contract conflicts with stored content.",
-                ) from exc
-            except EvalStorePublicationRejected as exc:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Derived scenario result contract contains unsafe public data.",
-                ) from exc
-            except EvalStoreResultTooLarge as exc:
-                raise HTTPException(
-                    status_code=413,
-                    detail="Derived scenario result contract exceeds the server byte limit.",
-                ) from exc
-            return await admit_eval_run(
-                eval_store=eval_store,
-                corpus=corpus,
-                max_concurrency=binding.max_concurrency,
-                invocation=invocation,
-                idempotency_key=idempotency_key,
-                eval_target=eval_target,
-                compiled=compiled,
-            )
 
         register_corpus_management_routes(
             bounded_evals_router,

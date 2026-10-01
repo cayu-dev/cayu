@@ -103,14 +103,18 @@ retain the same request identity and require current launch readiness before
 continuing. Cost-budget narrowing remains with this workflow. Other launch
 families and the eval worker lifespan retain their current owners.
 
-`server/_scenario_authoring_routes.py` owns scenario preview, save, catalog,
-detail, download and artifact fixture preparation. Authoring and launch share
+`server/_scenario_routes.py` owns scenario preview, save, catalog,
+detail, download, artifact fixture preparation and launch. Authoring and launch share
 the scenario revision loader and preflight boundary with explicit store and
 target-registry inputs. Fixture preparation checks the reviewed revision,
 copies the selected retained bytes into an environment fixture, clears that
 temporary artifact selection and checks readiness against the updated scenario.
-It returns the new scenario revision without saving it. Router composition
-retains scenario launch orchestration and the shared bounded/auth boundary.
+It returns the new scenario revision without saving it. Separate authoring and
+launch registrars preserve route order and compose existing library functions.
+Launch preserves the reviewed binding, exact execution profile and execution
+bounds, publishes the derived corpus before admission, and replays accepted
+requests before renewed readiness checks. Router composition retains the shared
+bounded/auth boundary and the durable eval worker lifespan.
 
 `server/_corpus_management_routes.py` owns corpus import, catalog, detail,
 download and suite/case browsing. It receives the bounded router, store, target

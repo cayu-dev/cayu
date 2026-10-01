@@ -1,12 +1,12 @@
-"""Evaluation scenario authoring, artifact fixture preparation and catalog routes."""
+"""Evaluation scenario authoring, artifact fixture preparation, catalog and launch routes."""
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, cast
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.responses import Response
 
 from cayu.evals.scenario import EvalScenarioDocumentV2, eval_scenario_to_json
@@ -14,6 +14,7 @@ from cayu.evals.scenario_authoring import (
     compile_eval_scenario_draft,
     validate_expected_scenario_revision,
 )
+from cayu.evals.scenario_execution import corpus_for_eval_scenario
 from cayu.evals.scenario_preflight import (
     ScenarioArtifactMaterializationError,
     ScenarioLaunchBindingV2,
@@ -28,7 +29,9 @@ from cayu.evals.store import (
     EVAL_STORE_MAX_IDENTIFIER_CHARS,
     EVAL_STORE_MAX_PAGE_BYTES,
     EVAL_STORE_MAX_PAGE_SIZE,
+    EvalCorpusConflict,
     EvalRunInvocation,
+    EvalRunRecord,
     EvalScenarioArtifactReference,
     EvalScenarioCatalogPage,
     EvalScenarioCatalogQuery,
@@ -37,13 +40,22 @@ from cayu.evals.store import (
     EvalStorePublicationRejected,
     EvalStoreResultTooLarge,
 )
+from cayu.server._eval_run_admission import (
+    admit_eval_run,
+    bind_eval_admission_request,
+    eval_run_invocation,
+    prepare_eval_run,
+    replay_eval_run,
+)
 from cayu.server._http_json import _model_json_response, _render_utf8
+from cayu.server.auth import AuthContext
 from cayu.server.contracts import (
     EVALS_ENDPOINT_RESPONSES,
     EvalScenarioArtifactMaterializationRequest,
     EvalScenarioArtifactMaterializationResponse,
     EvalScenarioPreviewRequest,
     EvalScenarioPreviewResponse,
+    EvalScenarioRunCreateRequest,
     EvalScenarioSaveRequest,
     EvalScenarioSaveResponse,
 )
@@ -436,4 +448,163 @@ def register_scenario_authoring_routes(
                     f'{scenario.revision[7:19]}.scenario.json"'
                 )
             },
+        )
+
+
+def register_scenario_launch_routes(
+    bounded_evals_router: APIRouter,
+    *,
+    eval_store: EvalStore,
+    active_eval_registry: EvalTargetRegistry,
+    protected: Sequence[Depends],
+    optional_auth_context: Depends,
+) -> None:
+    """Register saved-scenario launch with shared validation and admission boundaries."""
+
+    # Preserve FastAPI's shared dependency object as the typed auth-context default.
+    launch_auth_context = cast("AuthContext | None", optional_auth_context)
+
+    @bounded_evals_router.post(
+        "/evals/scenarios/{scenario_revision}/runs",
+        response_model=EvalRunRecord,
+        status_code=202,
+        responses=EVALS_ENDPOINT_RESPONSES,
+        dependencies=protected,
+    )
+    async def launch_eval_scenario(
+        scenario_revision: str,
+        body: EvalScenarioRunCreateRequest,
+        idempotency_key: Annotated[
+            str,
+            Header(alias="Idempotency-Key", min_length=1, max_length=512),
+        ],
+        auth_context: AuthContext | None = launch_auth_context,
+    ) -> EvalRunRecord:
+        if not eval_store.scenario_execution:
+            raise HTTPException(
+                status_code=409,
+                detail="Durable scenario execution is not available.",
+            )
+        scenario = await load_eval_scenario(
+            scenario_revision, eval_store=eval_store, active_eval_registry=active_eval_registry
+        )
+        replay_probe = bind_eval_admission_request(
+            eval_run_invocation(
+                auth_context,
+                max_steps=None,
+                limits=None,
+                cost_budget=None,
+            ),
+            kind="scenario",
+            target_key=scenario.target_key,
+            resource_identity={"scenario_revision": scenario.revision},
+            body=body,
+        )
+        admission_request_revision = replay_probe.admission_request_revision
+        if admission_request_revision is None:
+            raise RuntimeError("Scenario eval launch lost its admission request revision.")
+        replayed = await replay_eval_run(
+            eval_store=eval_store,
+            target_key=scenario.target_key,
+            idempotency_key=idempotency_key,
+            admission_request_revision=admission_request_revision,
+        )
+        if replayed is not None:
+            return replayed
+        registration, preflight = await preflight_scenario(
+            scenario, body.settings, active_eval_registry=active_eval_registry
+        )
+        binding = preflight.binding
+        if not preflight.ready or binding is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Eval scenario launch requirements are not currently ready.",
+            )
+        if binding.revision != body.expected_binding_revision:
+            raise HTTPException(
+                status_code=409,
+                detail="Eval scenario launch binding changed after review.",
+            )
+        scenario_invocation = EvalScenarioRunInvocation(
+            scenario_revision=scenario.revision,
+            binding_revision=binding.revision,
+            environment_name=binding.environment_name,
+            trials=binding.trials,
+            timeout_seconds=binding.timeout_seconds,
+            artifact_references=tuple(
+                EvalScenarioArtifactReference(
+                    requirement_id=item.requirement_id,
+                    artifact_id=item.artifact_id,
+                )
+                for item in binding.artifacts
+            ),
+        )
+        invocation = eval_run_invocation(
+            auth_context,
+            max_steps=binding.max_steps,
+            limits=binding.operator_run_limits,
+            cost_budget=binding.cost_budget,
+            scenario=scenario_invocation,
+        )
+        invocation = bind_eval_admission_request(
+            invocation,
+            kind="scenario",
+            target_key=scenario.target_key,
+            resource_identity={"scenario_revision": scenario.revision},
+            body=body,
+        )
+        try:
+            effective_target = target_for_eval_invocation(
+                registration.execution_target(),
+                invocation,
+            )
+            corpus = await asyncio.to_thread(
+                corpus_for_eval_scenario,
+                scenario,
+                binding,
+                effective_target,
+                project_root=registration.manifest_project_root,
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="Eval scenario no longer matches its current target binding.",
+            ) from exc
+        eval_target, compiled, invocation = await prepare_eval_run(
+            active_eval_registry=active_eval_registry,
+            corpus=corpus,
+            suite_id="scenario",
+            max_concurrency=binding.max_concurrency,
+            invocation=invocation,
+            expected_execution_profile_revision=(body.expected_execution_profile_revision),
+            expect_exact_execution_profile=True,
+        )
+        try:
+            await eval_store.save_corpus(
+                corpus,
+                redact_json=eval_target.app.redact_json,
+            )
+        except EvalCorpusConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="Derived scenario result contract conflicts with stored content.",
+            ) from exc
+        except EvalStorePublicationRejected as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="Derived scenario result contract contains unsafe public data.",
+            ) from exc
+        except EvalStoreResultTooLarge as exc:
+            raise HTTPException(
+                status_code=413,
+                detail="Derived scenario result contract exceeds the server byte limit.",
+            ) from exc
+        return await admit_eval_run(
+            eval_store=eval_store,
+            corpus=corpus,
+            max_concurrency=binding.max_concurrency,
+            invocation=invocation,
+            idempotency_key=idempotency_key,
+            eval_target=eval_target,
+            compiled=compiled,
         )
