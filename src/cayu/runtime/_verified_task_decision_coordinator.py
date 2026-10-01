@@ -22,7 +22,6 @@ from cayu.runtime._task_store_operation_boundary import (
     capture_task_store_operation,
     raise_task_store_operation_failure,
 )
-from cayu.runtime._verified_work_authority import require_completion_proposal_integrity
 from cayu.runtime.completion_result_resolvers import CompletionResultResolutionRequest
 from cayu.runtime.completion_verifiers import (
     CompletionVerifierExecutionRequest,
@@ -35,6 +34,7 @@ from cayu.runtime.work_attempt_lifecycle import (
     work_attempt_lifecycle_settlement_sha256,
 )
 from cayu.sessions.base import ResumeRequest
+from cayu.tasks._verified_work_authority import require_completion_proposal_integrity
 from cayu.tasks.admission import (
     WORK_ATTEMPT_ADMISSION_LEASE_MAX_SECONDS,
     WorkAttemptAdmission,

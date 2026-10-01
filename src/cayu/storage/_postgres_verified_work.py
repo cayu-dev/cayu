@@ -17,22 +17,11 @@ from psycopg_pool import AsyncConnectionPool
 
 from cayu._clock import normalize_utc_datetime
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
-from cayu.runtime import _verified_work_policy as verified_work_support
 from cayu.runtime._work_attempt_lifecycle_policy import (
     plan_work_attempt_execution_entry,
     plan_work_attempt_execution_stop,
     plan_work_attempt_lifecycle_settlement,
     plan_work_attempt_preparation_hold,
-)
-from cayu.runtime.completion_verifier_profiles import (
-    CompletionVerifierProfilePreparationRequest,
-    CompletionVerifierProfileRecord,
-    completion_verifier_profile_preparation_request_sha256,
-    completion_verifier_profile_record_from_document,
-    completion_verifier_profile_record_from_preparation,
-    copy_completion_verifier_profile_preparation_request,
-    copy_completion_verifier_profile_record,
-    require_completion_verifier_profile_transition,
 )
 from cayu.runtime.work_attempt_lifecycle import (
     WorkAttemptLifecycleSettlement,
@@ -44,6 +33,7 @@ from cayu.runtime.work_attempt_lifecycle import (
 )
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage._phase_timing import PostgresTimingScope, timed_postgres_connection
+from cayu.tasks import _verified_work_policy as verified_work_support
 from cayu.tasks.admission import (
     WORK_ATTEMPT_RENEWABLE_STATES,
     AdmittedCompletionProposalRequest,
@@ -84,6 +74,16 @@ from cayu.tasks.base import (
     _task_invocation_for_attachment,
     _task_session_instance_for_attachment,
     _work_attempt_discovery_query,
+)
+from cayu.tasks.completion_verifier_profiles import (
+    CompletionVerifierProfilePreparationRequest,
+    CompletionVerifierProfileRecord,
+    completion_verifier_profile_preparation_request_sha256,
+    completion_verifier_profile_record_from_document,
+    completion_verifier_profile_record_from_preparation,
+    copy_completion_verifier_profile_preparation_request,
+    copy_completion_verifier_profile_record,
+    require_completion_verifier_profile_transition,
 )
 from cayu.tasks.contracts import (
     CompletionDecision,

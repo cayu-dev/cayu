@@ -43,27 +43,6 @@ from cayu.runtime._task_store_operation_boundary import (
     capture_task_store_operation,
     raise_task_store_operation_failure,
 )
-from cayu.runtime._verified_work_authority import (
-    completion_decision_claim_authority_matches,
-    completion_decision_request_from_record,
-    require_completion_decision_integrity,
-    require_completion_proposal_integrity,
-    require_completion_verifier_profile_integrity,
-)
-from cayu.runtime.completion_verifier_profiles import (
-    CompletionVerifierExecutionProfile,
-    CompletionVerifierProfileAdoptionDecision,
-    CompletionVerifierProfileComponentDeclaration,
-    CompletionVerifierProfilePolicy,
-    CompletionVerifierProfilePolicyRequest,
-    CompletionVerifierProfilePreparationRequest,
-    CompletionVerifierProfileRecord,
-    build_completion_verifier_execution_profile,
-    changed_completion_verifier_profile_components,
-    completion_verifier_profile_adoption_request_sha256,
-    completion_verifier_profile_preparation_request_sha256,
-    copy_completion_verifier_profile_record,
-)
 from cayu.runtime.completion_verifiers import (
     CompletionVerifierExecutionError,
     CompletionVerifierExecutionRequest,
@@ -80,7 +59,28 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyResult,
     copy_execution_profile_policy_result,
 )
+from cayu.tasks._verified_work_authority import (
+    completion_decision_claim_authority_matches,
+    completion_decision_request_from_record,
+    require_completion_decision_integrity,
+    require_completion_proposal_integrity,
+    require_completion_verifier_profile_integrity,
+)
 from cayu.tasks.base import TaskClaimLost, TaskStore
+from cayu.tasks.completion_verifier_profiles import (
+    CompletionVerifierExecutionProfile,
+    CompletionVerifierProfileAdoptionDecision,
+    CompletionVerifierProfileComponentDeclaration,
+    CompletionVerifierProfilePolicy,
+    CompletionVerifierProfilePolicyRequest,
+    CompletionVerifierProfilePreparationRequest,
+    CompletionVerifierProfileRecord,
+    build_completion_verifier_execution_profile,
+    changed_completion_verifier_profile_components,
+    completion_verifier_profile_adoption_request_sha256,
+    completion_verifier_profile_preparation_request_sha256,
+    copy_completion_verifier_profile_record,
+)
 from cayu.tasks.contracts import (
     CompletionDecision,
     CompletionDecisionCreate,

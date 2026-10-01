@@ -41382,5 +41382,13 @@
     "tests/evals/test_workflow_partial_lifecycle.py::test_partial_capture_without_assertions_returns_an_unavailable_trial": 0.131805543001974,
     "tests/test_benchmark_tool_round.py::test_allocation_pass_measures_live_and_released_batch_memory": 7.609,
     "tests/test_benchmark_tool_round.py::test_allocation_trace_is_released_when_the_workload_fails": 0.08,
-    "tests/test_benchmark_tool_round.py::test_allocation_trace_cannot_contaminate_latency_or_replace_an_existing_trace": 0.001
+    "tests/test_benchmark_tool_round.py::test_allocation_trace_cannot_contaminate_latency_or_replace_an_existing_trace": 0.001,
+    "tests/core/test_verified_work_package_layout.py::test_task_and_storage_contracts_use_canonical_verified_work_imports": 1.1440084592904896,
+    "tests/core/test_verified_work_package_layout.py::test_verified_work_contract_import_order_does_not_load_orchestration[cayu.storage._postgres_verified_work]": 0.7617297910619527,
+    "tests/core/test_verified_work_package_layout.py::test_verified_work_contract_import_order_does_not_load_orchestration[cayu.storage.tasks_sqlite]": 0.7519135826732963,
+    "tests/core/test_verified_work_package_layout.py::test_verified_work_contract_import_order_does_not_load_orchestration[cayu.tasks._verified_work_authority]": 0.4485121248289943,
+    "tests/core/test_verified_work_package_layout.py::test_verified_work_contract_import_order_does_not_load_orchestration[cayu.tasks._verified_work_policy]": 0.5057719161268324,
+    "tests/core/test_verified_work_package_layout.py::test_verified_work_contract_import_order_does_not_load_orchestration[cayu.tasks.completion_verifier_profiles]": 0.49402054212987423,
+    "tests/core/test_verified_work_package_layout.py::test_verifier_profile_values_keep_fingerprints_when_pickled": 0.0009628329426050186,
+    "tests/core/test_verified_work_package_layout.py::test_verifier_profiles_preserve_public_imports_and_legacy_pickle_names": 0.2606537500396371
 }

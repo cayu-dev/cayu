@@ -88,7 +88,7 @@ async def create_graph(
 
             def validate_task(request: TaskCreate) -> None:
                 if request.work_contract is not None:
-                    from cayu.runtime import _verified_work_policy as verified
+                    from cayu.tasks import _verified_work_policy as verified
 
                     verified.require_contract_reference(
                         store._load_work_contract_unlocked(request.work_contract),

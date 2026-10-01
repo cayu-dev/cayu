@@ -8,9 +8,9 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, LiteralString
 
 from cayu._validation import MAX_PORTABLE_JSON_INTEGER
-from cayu.runtime import _verified_work_policy as verified
 from cayu.storage import _postgres_support as pg
 from cayu.storage import _postgres_task_groups as groups
+from cayu.tasks import _verified_work_policy as verified
 from cayu.tasks._graph_admission import prepare_graph_admission
 from cayu.tasks._graphs import (
     GRAPH_TERMINAL_STATUSES,

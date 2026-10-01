@@ -3303,30 +3303,6 @@ from cayu.runtime.completion_result_resolvers import (
 from cayu.runtime.completion_result_resolvers import (
     CompletionResultUnavailable as CompletionResultUnavailable,
 )
-from cayu.runtime.completion_verifier_profiles import (
-    CompletionVerifierExecutionProfile as CompletionVerifierExecutionProfile,
-)
-from cayu.runtime.completion_verifier_profiles import (
-    CompletionVerifierProfileAdoptionDecision as CompletionVerifierProfileAdoptionDecision,
-)
-from cayu.runtime.completion_verifier_profiles import (
-    CompletionVerifierProfileComponentDeclaration as CompletionVerifierProfileComponentDeclaration,
-)
-from cayu.runtime.completion_verifier_profiles import (
-    CompletionVerifierProfileComponentIdentity as CompletionVerifierProfileComponentIdentity,
-)
-from cayu.runtime.completion_verifier_profiles import (
-    CompletionVerifierProfilePolicy as CompletionVerifierProfilePolicy,
-)
-from cayu.runtime.completion_verifier_profiles import (
-    CompletionVerifierProfilePolicyRequest as CompletionVerifierProfilePolicyRequest,
-)
-from cayu.runtime.completion_verifier_profiles import (
-    CompletionVerifierProfilePreparationRequest as CompletionVerifierProfilePreparationRequest,
-)
-from cayu.runtime.completion_verifier_profiles import (
-    CompletionVerifierProfileRecord as CompletionVerifierProfileRecord,
-)
 from cayu.runtime.completion_verifiers import (
     CompletionVerifierExecutionError as CompletionVerifierExecutionError,
 )
@@ -4563,6 +4539,30 @@ from cayu.tasks.base import (
 from cayu.tasks.base import task_create_with_execution_source as task_create_with_execution_source
 from cayu.tasks.base import task_invocation_for_create as task_invocation_for_create
 from cayu.tasks.base import terminalize_task_with_retry as terminalize_task_with_retry
+from cayu.tasks.completion_verifier_profiles import (
+    CompletionVerifierExecutionProfile as CompletionVerifierExecutionProfile,
+)
+from cayu.tasks.completion_verifier_profiles import (
+    CompletionVerifierProfileAdoptionDecision as CompletionVerifierProfileAdoptionDecision,
+)
+from cayu.tasks.completion_verifier_profiles import (
+    CompletionVerifierProfileComponentDeclaration as CompletionVerifierProfileComponentDeclaration,
+)
+from cayu.tasks.completion_verifier_profiles import (
+    CompletionVerifierProfileComponentIdentity as CompletionVerifierProfileComponentIdentity,
+)
+from cayu.tasks.completion_verifier_profiles import (
+    CompletionVerifierProfilePolicy as CompletionVerifierProfilePolicy,
+)
+from cayu.tasks.completion_verifier_profiles import (
+    CompletionVerifierProfilePolicyRequest as CompletionVerifierProfilePolicyRequest,
+)
+from cayu.tasks.completion_verifier_profiles import (
+    CompletionVerifierProfilePreparationRequest as CompletionVerifierProfilePreparationRequest,
+)
+from cayu.tasks.completion_verifier_profiles import (
+    CompletionVerifierProfileRecord as CompletionVerifierProfileRecord,
+)
 from cayu.tasks.contracts import CompletionConstraintOutcome as CompletionConstraintOutcome
 from cayu.tasks.contracts import CompletionContinuationPolicy as CompletionContinuationPolicy
 from cayu.tasks.contracts import CompletionCriterionOutcome as CompletionCriterionOutcome

@@ -28,20 +28,20 @@ from cayu.runtime._task_store_operation_boundary import (
     capture_task_store_operation,
     raise_task_store_operation_failure,
 )
-from cayu.runtime._verified_work_authority import (
+from cayu.tasks._verified_work_authority import (
     completion_decision_claim_authority_matches,
     invocation_contains_secret_public_identity,
     require_completion_decision_integrity,
     require_completion_verifier_profile_integrity,
 )
-from cayu.runtime.completion_verifier_profiles import (
+from cayu.tasks.base import CompletionDecisionApplicationReceipt, TaskStore
+from cayu.tasks.completion_verifier_profiles import (
     CompletionVerifierProfilePreparationRequest,
     CompletionVerifierProfileRecord,
     changed_completion_verifier_profile_components,
     completion_verifier_profile_preparation_request_sha256,
     copy_completion_verifier_profile_record,
 )
-from cayu.tasks.base import CompletionDecisionApplicationReceipt, TaskStore
 from cayu.tasks.contracts import (
     CompletionDecision,
     CompletionDecisionApplicationRequest,

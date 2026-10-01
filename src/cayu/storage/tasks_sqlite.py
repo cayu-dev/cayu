@@ -35,23 +35,12 @@ from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
 from cayu.budgets.aggregates import EXACT_AGGREGATE
-from cayu.runtime import _verified_work_policy as verified_work_support
 from cayu.runtime._task_lease_authority import managed_task_lease_mutation
 from cayu.runtime._work_attempt_lifecycle_policy import (
     plan_work_attempt_execution_entry,
     plan_work_attempt_execution_stop,
     plan_work_attempt_lifecycle_settlement,
     plan_work_attempt_preparation_hold,
-)
-from cayu.runtime.completion_verifier_profiles import (
-    CompletionVerifierProfilePreparationRequest,
-    CompletionVerifierProfileRecord,
-    completion_verifier_profile_preparation_request_sha256,
-    completion_verifier_profile_record_from_document,
-    completion_verifier_profile_record_from_preparation,
-    copy_completion_verifier_profile_preparation_request,
-    copy_completion_verifier_profile_record,
-    require_completion_verifier_profile_transition,
 )
 from cayu.runtime.local_execution_attempts import (
     LocalExecutionAttemptAuthority,
@@ -88,6 +77,7 @@ from cayu.storage import migrations as schema
 from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage._sqlite_connection import _run_off_thread_with_connection_ownership
 from cayu.storage.targets import require_sqlite_store_allowed
+from cayu.tasks import _verified_work_policy as verified_work_support
 from cayu.tasks._scheduling import (
     admitted_schedule,
     require_schedule_mutation,
@@ -233,6 +223,16 @@ from cayu.tasks.base import (
     prepare_task_terminalization,
     prepare_task_terminalization_receipt_lookup,
     task_query_from_aggregate_filter,
+)
+from cayu.tasks.completion_verifier_profiles import (
+    CompletionVerifierProfilePreparationRequest,
+    CompletionVerifierProfileRecord,
+    completion_verifier_profile_preparation_request_sha256,
+    completion_verifier_profile_record_from_document,
+    completion_verifier_profile_record_from_preparation,
+    copy_completion_verifier_profile_preparation_request,
+    copy_completion_verifier_profile_record,
+    require_completion_verifier_profile_transition,
 )
 from cayu.tasks.contracts import (
     CompletionDecision,

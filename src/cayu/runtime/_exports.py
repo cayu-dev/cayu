@@ -278,7 +278,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "CompletionVerifierExecutionError",
     ),
     "CompletionVerifierExecutionProfile": (
-        "cayu.runtime.completion_verifier_profiles",
+        "cayu.tasks.completion_verifier_profiles",
         "CompletionVerifierExecutionProfile",
     ),
     "CompletionVerifierExecutionRequest": (
@@ -287,31 +287,31 @@ EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "CompletionVerifierKind": ("cayu.tasks.contracts", "CompletionVerifierKind"),
     "CompletionVerifierProfileAdoptionDecision": (
-        "cayu.runtime.completion_verifier_profiles",
+        "cayu.tasks.completion_verifier_profiles",
         "CompletionVerifierProfileAdoptionDecision",
     ),
     "CompletionVerifierProfileComponentDeclaration": (
-        "cayu.runtime.completion_verifier_profiles",
+        "cayu.tasks.completion_verifier_profiles",
         "CompletionVerifierProfileComponentDeclaration",
     ),
     "CompletionVerifierProfileComponentIdentity": (
-        "cayu.runtime.completion_verifier_profiles",
+        "cayu.tasks.completion_verifier_profiles",
         "CompletionVerifierProfileComponentIdentity",
     ),
     "CompletionVerifierProfilePolicy": (
-        "cayu.runtime.completion_verifier_profiles",
+        "cayu.tasks.completion_verifier_profiles",
         "CompletionVerifierProfilePolicy",
     ),
     "CompletionVerifierProfilePolicyRequest": (
-        "cayu.runtime.completion_verifier_profiles",
+        "cayu.tasks.completion_verifier_profiles",
         "CompletionVerifierProfilePolicyRequest",
     ),
     "CompletionVerifierProfilePreparationRequest": (
-        "cayu.runtime.completion_verifier_profiles",
+        "cayu.tasks.completion_verifier_profiles",
         "CompletionVerifierProfilePreparationRequest",
     ),
     "CompletionVerifierProfileRecord": (
-        "cayu.runtime.completion_verifier_profiles",
+        "cayu.tasks.completion_verifier_profiles",
         "CompletionVerifierProfileRecord",
     ),
     "CompletionVerifierRef": ("cayu.tasks.contracts", "CompletionVerifierRef"),

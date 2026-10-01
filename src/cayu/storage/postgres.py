@@ -260,7 +260,6 @@ from cayu.observability.watchers import (
 from cayu.observability.watchers import (
     _validate_max_attempts as validate_watcher_max_attempts,
 )
-from cayu.runtime import _verified_work_policy as verified_work_support
 from cayu.runtime._child_session_notifications import (
     ChildSessionLifecycleOccurrence,
     ChildSessionLifecycleOccurrenceSource,
@@ -873,6 +872,7 @@ from cayu.storage.memory import (
     prepare_knowledge_publication,
     prepare_knowledge_relations,
 )
+from cayu.tasks import _verified_work_policy as verified_work_support
 from cayu.tasks._scheduling import (
     admitted_schedule,
     require_schedule_mutation,

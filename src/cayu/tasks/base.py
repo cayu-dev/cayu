@@ -84,15 +84,6 @@ from cayu.runtime._task_admission_wakeup import (
     TaskAdmissionWakeupBroker,
 )
 from cayu.runtime._task_lease_authority import managed_task_lease_mutation
-from cayu.runtime.completion_verifier_profiles import (
-    CompletionVerifierProfilePreparationRequest,
-    CompletionVerifierProfileRecord,
-    completion_verifier_profile_preparation_request_sha256,
-    completion_verifier_profile_record_from_preparation,
-    copy_completion_verifier_profile_preparation_request,
-    copy_completion_verifier_profile_record,
-    require_completion_verifier_profile_transition,
-)
 from cayu.runtime.local_execution_attempts import (
     LocalExecutionAttemptAuthority,
     LocalExecutionAttemptConflict,
@@ -175,6 +166,15 @@ from cayu.tasks.admission import (
     work_attempt_admission_prepare_matches_sha256,
     work_attempt_admission_prepare_sha256,
     work_attempt_execution_claim_request_sha256,
+)
+from cayu.tasks.completion_verifier_profiles import (
+    CompletionVerifierProfilePreparationRequest,
+    CompletionVerifierProfileRecord,
+    completion_verifier_profile_preparation_request_sha256,
+    completion_verifier_profile_record_from_preparation,
+    copy_completion_verifier_profile_preparation_request,
+    copy_completion_verifier_profile_record,
+    require_completion_verifier_profile_transition,
 )
 from cayu.tasks.contracts import (
     WORK_COMPLETION_APPLICATION_RECEIPT_MAX_BYTES,
@@ -5367,7 +5367,7 @@ class InMemoryTaskStore(TaskStore):
                 raise WorkCompletionConflict(
                     "Completion decision has no exact verifier-profile authority."
                 )
-            from cayu.runtime._verified_work_policy import plan_decision_application
+            from cayu.tasks._verified_work_policy import plan_decision_application
 
             updated, receipt = plan_decision_application(
                 request,

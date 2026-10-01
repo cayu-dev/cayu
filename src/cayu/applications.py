@@ -497,9 +497,6 @@ from cayu.runtime._verified_task_decision_coordinator import (
     VerifiedTaskDecisionExecution,
     VerifiedTaskDecisionResult,
 )
-from cayu.runtime._verified_work_authority import (
-    invocation_contains_secret_public_identity,
-)
 from cayu.runtime._work_attempt_invocation import (
     WorkAttemptRecoveryOwnership,
     _acknowledged_work_attempt_recovery,
@@ -516,7 +513,6 @@ from cayu.runtime.completion_result_resolvers import (
     CompletionResultResolutionRequest,
     CompletionResultResolver,
 )
-from cayu.runtime.completion_verifier_profiles import CompletionVerifierProfilePolicy
 from cayu.runtime.completion_verifiers import (
     CompletionVerifierExecutionRequest,
     DeterministicCompletionVerifier,
@@ -726,6 +722,9 @@ from cayu.storage.memory import (
     KnowledgeStore,
 )
 from cayu.tasks._scheduling import schedule_creation_digest
+from cayu.tasks._verified_work_authority import (
+    invocation_contains_secret_public_identity,
+)
 from cayu.tasks.admission import (
     WORK_ATTEMPT_RECOVERY_CHECKPOINT_KEY,
     WORK_ATTEMPT_RENEWABLE_STATES,
@@ -763,6 +762,7 @@ from cayu.tasks.base import (
     require_contract_bound_task_creation_snapshot,
     task_create_with_runtime_invocation,
 )
+from cayu.tasks.completion_verifier_profiles import CompletionVerifierProfilePolicy
 from cayu.tasks.contracts import (
     CompletionDecision,
     CompletionDecisionApplicationRequest,
