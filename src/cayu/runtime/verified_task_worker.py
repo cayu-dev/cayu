@@ -39,7 +39,7 @@ from cayu.runtime._task_store_operation_boundary import (
     raise_task_store_operation_failure,
     task_store_verified_task_worker_capability_is_complete,
 )
-from cayu.runtime._verified_task_decision_coordinator import verified_task_operation_id
+from cayu.runtime._verified_completion import verified_task_operation_id
 from cayu.runtime.completion_verifiers import CompletionVerifierExecutionRequest
 from cayu.runtime.work_attempt_lifecycle import (
     WorkAttemptLifecycleSettlement,
@@ -288,6 +288,7 @@ class VerifiedTaskWorker:
         ):
             raise ValueError("VerifiedTaskWorker accepts queue scope filters, not display filters.")
         self.app = app
+        self._completion = app._verified_completion
         self.store = app.task_store
         self.handler = handler
         self.worker_id = worker_id
@@ -1147,7 +1148,7 @@ class VerifiedTaskWorker:
                 ):
                     return DurableWorkerStep(idle=True)
                 if decision is not None:
-                    await self.app._reconcile_completion_result_group_settlement(
+                    await self._completion.resolver.reconcile_group_settlement(
                         admission.task_id, decision.decision_id
                     )
                 try:
@@ -1181,9 +1182,7 @@ class VerifiedTaskWorker:
             if verification is None:
                 return DurableWorkerStep(idle=True)
             try:
-                started = await self.app._start_verified_task_decision(
-                    admission.admission_id, verification
-                )
+                started = await self._completion.start(admission.admission_id, verification)
                 self._verification = _RetainedVerifier(started.verification)
                 result = await started.result()
             except _GroupVerificationAdmissionRefused:
@@ -1258,7 +1257,7 @@ class VerifiedTaskWorker:
         # local fence context must not be stranded in the scheduler's task.
         try:
             async with owner.lock:
-                owner.state = await self.app._continue_verified_task(
+                owner.state = await self._completion.continue_attempt(
                     predecessor,
                     decision_id,
                     worker_id=self.worker_id,

@@ -130,7 +130,9 @@ def test_worker_settles_expired_applied_rejection_without_successor(
                 max_repeated_gap_count=3,
             )
         )
-        original_continue = CayuApp._continue_verified_task
+        from cayu.runtime._verified_completion import VerifiedCompletionCoordinator
+
+        original_continue = VerifiedCompletionCoordinator.continue_attempt
         original_settle = type(tasks).settle_work_attempt_lifecycle
         predecessor = None
         application = None
@@ -146,10 +148,10 @@ def test_worker_settles_expired_applied_rejection_without_successor(
             app.register_completion_verifier(contract.verifier, verifier)
             return app
 
-        async def delay_continuation(app, admission_id, decision_id, **kwargs):
+        async def delay_continuation(completion, admission_id, decision_id, **kwargs):
             nonlocal predecessor, application, successor, expected_stop
             predecessor = await tasks.load_work_attempt_admission(admission_id)
-            from cayu.runtime._verified_task_decision_coordinator import verified_task_operation_id
+            from cayu.runtime._verified_completion import verified_task_operation_id
 
             application = await tasks.load_completion_decision_application_receipt(
                 predecessor.task_id,
@@ -162,9 +164,7 @@ def test_worker_settles_expired_applied_rejection_without_successor(
                 task_id=predecessor.task_id,
                 admission_id=admission_id,
                 expected_admission_sha256=work_attempt_admission_authority_sha256(predecessor),
-                release_evidence=await app._session_engine.load_work_attempt_release_evidence(
-                    predecessor
-                ),
+                release_evidence=await completion._release(predecessor),
                 kind="continuation_deadline_stop",
                 proposal_id=proposal.proposal_id,
                 proposal_request_sha256=proposal.request_sha256,
@@ -200,11 +200,11 @@ def test_worker_settles_expired_applied_rejection_without_successor(
             if restart:
                 raise ConnectionError("restart before successor admission")
             if boundary == "successor_ack_loss":
-                successor = await original_continue(app, admission_id, decision_id, **kwargs)
+                successor = await original_continue(completion, admission_id, decision_id, **kwargs)
             await _wait_past(predecessor.run_semantics.deadline_expires_at)
             if boundary in {"successor_ack_loss", "other_failure"}:
                 raise ConnectionError("continuation acknowledgement unavailable")
-            return await original_continue(app, admission_id, decision_id, **kwargs)
+            return await original_continue(completion, admission_id, decision_id, **kwargs)
 
         async def lose_stop_reply(store, request):
             nonlocal lost_reply
@@ -238,7 +238,7 @@ def test_worker_settles_expired_applied_rejection_without_successor(
             handler = _StaticHandler()
             monkeypatch.setattr(type(tasks), "settle_work_attempt_lifecycle", lose_stop_reply)
             with monkeypatch.context() as patch:
-                patch.setattr(CayuApp, "_continue_verified_task", delay_continuation)
+                patch.setattr(VerifiedCompletionCoordinator, "continue_attempt", delay_continuation)
                 async with VerifiedTaskWorker(
                     # Setup must reach the pre-expiry conflict assertion even
                     # on a loaded persistent backend. _wait_past still crosses

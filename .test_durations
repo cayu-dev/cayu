@@ -41431,5 +41431,8 @@
     "tests/core/test_tool_round_continuation_backends.py::test_continuation_retry_keeps_denied_sibling_unexecuted[sqlite-answer]": 3.585,
     "tests/core/test_tool_round_continuation_backends.py::test_continuation_retry_keeps_denied_sibling_unexecuted[postgres-approve]": 5.196,
     "tests/core/test_tool_round_continuation_backends.py::test_continuation_retry_keeps_denied_sibling_unexecuted[postgres-deny]": 5.024,
-    "tests/core/test_tool_round_continuation_backends.py::test_continuation_retry_keeps_denied_sibling_unexecuted[postgres-answer]": 5.567
+    "tests/core/test_tool_round_continuation_backends.py::test_continuation_retry_keeps_denied_sibling_unexecuted[postgres-answer]": 5.567,
+    "tests/core/test_verified_completion.py::test_concurrent_worker_settlements_share_registration_and_preserve_public_replay[memory]": 1.6551682488061488,
+    "tests/core/test_verified_completion.py::test_concurrent_worker_settlements_share_registration_and_preserve_public_replay[postgres]": 9.67632370791398,
+    "tests/core/test_verified_completion.py::test_concurrent_worker_settlements_share_registration_and_preserve_public_replay[sqlite]": 2.2794527921359986
 }

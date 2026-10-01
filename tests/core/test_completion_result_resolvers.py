@@ -1417,7 +1417,7 @@ def test_ownership_loss_releases_publication_after_positive_application_noncommi
             session_store=session_store,
         )
         monkeypatch.setattr(
-            app._completion_result_resolver_coordinator._application_coordinator,
+            app._verified_completion.resolver._application_coordinator,
             "apply",
             positively_noncommitting_application,
         )

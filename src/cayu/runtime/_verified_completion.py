@@ -1,4 +1,4 @@
-"""Compose verified-worker decision phases through their existing owners.
+"""Own verified completion and worker settlement for one application lifetime.
 
 This private phase does not claim queue work, run handlers, or elect verifier
 retries. Those remain with the worker. No new terminalization algorithm or
@@ -13,9 +13,17 @@ from hashlib import sha256
 from typing import Protocol, TypeVar
 
 from cayu._validation import canonical_durable_json_bytes
-from cayu.deadlines import ExecutionDeadline, ExecutionDeadlineExceeded
+from cayu.deadlines import ExecutionDeadlineExceeded
 from cayu.messages import Message
-from cayu.runtime._completion_verifier_coordinator import CompletionVerifierOwnedExecution
+from cayu.runtime._completion_decision_application_coordinator import (
+    CompletionDecisionApplicationCoordinator,
+)
+from cayu.runtime._completion_result_resolver_coordinator import CompletionResultResolverCoordinator
+from cayu.runtime._completion_verifier_coordinator import (
+    CompletionVerifierCoordinator,
+    CompletionVerifierOwnedExecution,
+)
+from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._invocation_lifecycle import retire_released_invocation_context
 from cayu.runtime._task_store_operation_boundary import (
     capture_sensitive_result_validation,
@@ -33,7 +41,7 @@ from cayu.runtime.work_attempt_lifecycle import (
     work_attempt_admission_authority_sha256,
     work_attempt_lifecycle_settlement_sha256,
 )
-from cayu.sessions.base import ResumeRequest
+from cayu.sessions.base import ResumeRequest, SessionStore
 from cayu.tasks._verified_work_authority import require_completion_proposal_integrity
 from cayu.tasks.admission import (
     WORK_ATTEMPT_ADMISSION_LEASE_MAX_SECONDS,
@@ -48,6 +56,7 @@ from cayu.tasks.base import (
     TaskStore,
     WorkAttemptLifecycleReceipt,
 )
+from cayu.tasks.completion_verifier_profiles import CompletionVerifierProfilePolicy
 from cayu.tasks.contracts import (
     CompletionDecision,
     CompletionDecisionApplicationRequest,
@@ -60,7 +69,7 @@ from cayu.tasks.contracts import (
     validate_work_completion_linked_id,
 )
 from cayu.tasks.groups import TaskGroupConflict
-from cayu.tasks.records import Task, TaskStatus, copy_task
+from cayu.tasks.records import TaskStatus, copy_task
 from cayu.vaults.redaction import SecretRedactor
 
 _ResultT = TypeVar("_ResultT")
@@ -70,22 +79,6 @@ class VerifiedTaskAdmissionCallback(Protocol):
     async def __call__(
         self, request: ResumeRequest, *, execution: WorkAttemptExecutionRequest
     ) -> WorkAttemptAdmission: ...
-
-
-@dataclass(frozen=True, slots=True)
-class VerifiedTaskDecisionDependencies:
-    store: TaskStore
-    redactor: SecretRedactor
-    verify: Callable[
-        [CompletionVerifierExecutionRequest, ExecutionDeadline], Awaitable[CompletionDecision]
-    ]
-    start_verify: Callable[
-        [CompletionVerifierExecutionRequest, ExecutionDeadline], CompletionVerifierOwnedExecution
-    ]
-    resolve: Callable[[CompletionResultResolutionRequest], Awaitable[Task]]
-    apply: Callable[[CompletionDecisionApplicationRequest], Awaitable[Task]]
-    release: Callable[[WorkAttemptAdmission], Awaitable[InvocationReleaseEvidence]]
-    admit: VerifiedTaskAdmissionCallback
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,7 +110,7 @@ class VerifiedTaskDecisionExecution:
 
     verification: CompletionVerifierOwnedExecution = field(repr=False)
     _prepared: _PreparedDecision = field(repr=False)
-    _coordinator: VerifiedTaskDecisionCoordinator = field(repr=False)
+    _coordinator: VerifiedCompletionCoordinator = field(repr=False)
 
     async def result(self) -> VerifiedTaskDecisionResult:
         outcome = await self.verification.operation
@@ -152,9 +145,50 @@ def verified_task_operation_id(kind: str, *identities: str) -> str:
     return f"verified-worker:{kind}:{digest}"
 
 
-class VerifiedTaskDecisionCoordinator:
-    def __init__(self, dependencies: VerifiedTaskDecisionDependencies) -> None:
-        self._dependencies = dependencies
+class VerifiedCompletionCoordinator:
+    """Share phase owners while keeping each settlement's authority operation-local.
+
+    Admission and released-invocation evidence belong to session execution.
+    Completion phases call each other directly and never cache durable snapshots
+    across operations.
+    """
+
+    def __init__(
+        self,
+        *,
+        task_store: TaskStore | None,
+        session_store: SessionStore,
+        event_writer: RuntimeEventWriter,
+        secret_redactor: SecretRedactor,
+        profile_policy: CompletionVerifierProfilePolicy | None,
+        release: Callable[[WorkAttemptAdmission], Awaitable[InvocationReleaseEvidence]],
+        admit: VerifiedTaskAdmissionCallback,
+    ) -> None:
+        self._task_store = task_store
+        self._redactor = secret_redactor
+        self._release = release
+        self._admit = admit
+        self.verifier = CompletionVerifierCoordinator(
+            task_store=task_store,
+            secret_redactor=secret_redactor,
+            profile_policy=profile_policy,
+        )
+        self.application = CompletionDecisionApplicationCoordinator(
+            task_store=task_store,
+            secret_redactor=secret_redactor,
+        )
+        self.resolver = CompletionResultResolverCoordinator(
+            application_coordinator=self.application,
+            task_store=task_store,
+            session_store=session_store,
+            event_writer=event_writer,
+            secret_redactor=secret_redactor,
+        )
+
+    def _require_store(self) -> TaskStore:
+        if self._task_store is None:
+            raise RuntimeError("task_store is required for verified task decisions.")
+        return self._task_store
 
     async def _read(
         self,
@@ -163,14 +197,14 @@ class VerifiedTaskDecisionCoordinator:
         name: str,
     ) -> _ResultT:
         outcome = await capture_task_store_operation(
-            operation, operation_name=name, redactor=self._dependencies.redactor
+            operation, operation_name=name, redactor=self._redactor
         )
         if outcome.failure is not None:
             raise_task_store_operation_failure(outcome.failure)
         validation = capture_sensitive_result_validation(
             lambda value=outcome.result: (validate(value),),
             operation_name=f"{name} validation",
-            redactor=self._dependencies.redactor,
+            redactor=self._redactor,
         )
         del outcome
         if validation.failure is not None:
@@ -188,8 +222,7 @@ class VerifiedTaskDecisionCoordinator:
         lease_seconds: int,
     ) -> WorkAttemptAdmission:
         """Schedule one exact successor using the existing admission transaction."""
-        dependencies = self._dependencies
-        store = dependencies.store
+        store = self._require_store()
 
         def prepare_input(
             admission_id=admission_id,
@@ -211,14 +244,14 @@ class VerifiedTaskDecisionCoordinator:
             ):
                 raise ValueError("Worker continuation lease is outside its supported bounds.")
             document = list(identities)
-            if dependencies.redactor.redact_json(document) != document:
+            if self._redactor.redact_json(document) != document:
                 raise ValueError("Worker continuation identity contains a workload secret.")
             return (*identities, lease_seconds)
 
         validation = capture_sensitive_result_validation(
             prepare_input,
             operation_name="Worker continuation request",
-            redactor=dependencies.redactor,
+            redactor=self._redactor,
         )
         del prepare_input, admission_id, decision_id, worker_id, lease_seconds
         if validation.failure is not None:
@@ -349,7 +382,7 @@ class VerifiedTaskDecisionCoordinator:
 
         async def admit_or_expired() -> WorkAttemptAdmission | _ContinuationDeadlineExpired:
             try:
-                return await dependencies.admit(
+                return await self._admit(
                     ResumeRequest(
                         session_id=previous.session_id, messages=[Message.text("user", message)]
                     ),
@@ -382,7 +415,7 @@ class VerifiedTaskDecisionCoordinator:
         del admission_id, verification
         prepared = await preparation
         assert prepared.admission.run_semantics is not None
-        decision = await self._dependencies.verify(
+        decision = await self.verifier.verify(
             prepared.verification, prepared.admission.run_semantics.deadline
         )
         return await self._complete(prepared, decision)
@@ -394,7 +427,7 @@ class VerifiedTaskDecisionCoordinator:
         del admission_id, verification
         prepared = await preparation
         assert prepared.admission.run_semantics is not None
-        execution = self._dependencies.start_verify(
+        execution = self.verifier.start_owned_verification(
             prepared.verification, prepared.admission.run_semantics.deadline
         )
         # No suspension between scheduling verification and handing ownership
@@ -404,8 +437,7 @@ class VerifiedTaskDecisionCoordinator:
     async def _prepare(
         self, admission_id: str, verification: CompletionVerifierExecutionRequest
     ) -> _PreparedDecision:
-        dependencies = self._dependencies
-        store = dependencies.store
+        store = self._require_store()
 
         def prepare_input(
             admission_id=admission_id, verification=verification
@@ -413,14 +445,14 @@ class VerifiedTaskDecisionCoordinator:
             identity = validate_work_completion_linked_id(admission_id, "admission_id")
             request = copy_completion_verifier_execution_request(verification)
             document = {"admission_id": identity, "verification": request.model_dump(mode="json")}
-            if dependencies.redactor.redact_json(document) != document:
+            if self._redactor.redact_json(document) != document:
                 raise ValueError("Verified worker decision request contains a workload secret.")
             return identity, request
 
         validation = capture_sensitive_result_validation(
             prepare_input,
             operation_name="Verified worker decision request",
-            redactor=dependencies.redactor,
+            redactor=self._redactor,
         )
         del prepare_input, admission_id, verification
         if validation.failure is not None:
@@ -476,9 +508,7 @@ class VerifiedTaskDecisionCoordinator:
             "Verified worker settlement lookup",
         )
         release = (
-            prior.request.release_evidence
-            if prior is not None
-            else await dependencies.release(admission)
+            prior.request.release_evidence if prior is not None else await self._release(admission)
         )
         if not isinstance(release, InvocationReleaseEvidence):
             raise WorkCompletionConflict("A pre-entry cancellation cannot settle a decision.")
@@ -517,8 +547,7 @@ class VerifiedTaskDecisionCoordinator:
     async def _complete(
         self, prepared: _PreparedDecision, raw_decision: CompletionDecision
     ) -> VerifiedTaskDecisionResult:
-        dependencies = self._dependencies
-        store = dependencies.store
+        store = self._require_store()
         admission = prepared.admission
         verification = prepared.verification
         proposal = prepared.proposal
@@ -530,7 +559,7 @@ class VerifiedTaskDecisionCoordinator:
         decision_validation = capture_sensitive_result_validation(
             lambda value=raw_decision: copy_completion_decision(value),
             operation_name="Verified worker decision result validation",
-            redactor=dependencies.redactor,
+            redactor=self._redactor,
         )
         del raw_decision
         if decision_validation.failure is not None:
@@ -551,7 +580,7 @@ class VerifiedTaskDecisionCoordinator:
             return VerifiedTaskDecisionResult(decision, None, cancelled)
         try:
             if decision.verdict is CompletionVerdict.ACCEPTED:
-                raw_task = await dependencies.resolve(
+                raw_task = await self.resolver.resolve(
                     CompletionResultResolutionRequest(
                         task_id=admission.task_id,
                         decision_id=decision.decision_id,
@@ -559,7 +588,7 @@ class VerifiedTaskDecisionCoordinator:
                     )
                 )
             else:
-                raw_task = await dependencies.apply(
+                raw_task = await self.application.apply(
                     CompletionDecisionApplicationRequest(
                         task_id=admission.task_id,
                         decision_id=decision.decision_id,
@@ -574,7 +603,7 @@ class VerifiedTaskDecisionCoordinator:
         task_validation = capture_sensitive_result_validation(
             lambda value=raw_task: copy_task(value),
             operation_name="Verified worker application result validation",
-            redactor=dependencies.redactor,
+            redactor=self._redactor,
         )
         del raw_task
         if task_validation.failure is not None:
@@ -626,7 +655,7 @@ class VerifiedTaskDecisionCoordinator:
         outcome = await capture_task_store_operation(
             lambda: store.settle_work_attempt_lifecycle(settlement_request),
             operation_name="Verified worker lifecycle settlement",
-            redactor=dependencies.redactor,
+            redactor=self._redactor,
             mutation_store=store,
             mutation_method_name="settle_work_attempt_lifecycle",
         )
@@ -650,7 +679,7 @@ class VerifiedTaskDecisionCoordinator:
         validation = capture_sensitive_result_validation(
             lambda value=outcome.result: require_settlement(value),
             operation_name="Verified worker lifecycle receipt validation",
-            redactor=dependencies.redactor,
+            redactor=self._redactor,
         )
         del outcome
         if validation.failure is not None:
@@ -663,7 +692,7 @@ class VerifiedTaskDecisionCoordinator:
         self, prepared: _PreparedDecision, decision: CompletionDecision
     ) -> WorkAttemptLifecycleReceipt | None:
         """Keep a completed verifier's evidence without applying a losing result."""
-        store = self._dependencies.store
+        store = self._require_store()
         admission = prepared.admission
 
         def require_boolean(value):
@@ -706,7 +735,7 @@ class VerifiedTaskDecisionCoordinator:
         outcome = await capture_task_store_operation(
             lambda: store.settle_work_attempt_lifecycle(request),
             operation_name="Verified loser lifecycle cancellation",
-            redactor=self._dependencies.redactor,
+            redactor=self._redactor,
             mutation_store=store,
             mutation_method_name="settle_work_attempt_lifecycle",
         )
@@ -722,7 +751,7 @@ class VerifiedTaskDecisionCoordinator:
         checked = capture_sensitive_result_validation(
             lambda: require_receipt(outcome.result),
             operation_name="Verified group cancellation receipt",
-            redactor=self._dependencies.redactor,
+            redactor=self._redactor,
         )
         if checked.failure is not None:
             raise_task_store_operation_failure(checked.failure)

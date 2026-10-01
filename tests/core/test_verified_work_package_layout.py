@@ -49,7 +49,7 @@ assert not {
     "cayu.runtime._completion_verifier_coordinator",
     "cayu.runtime._completion_result_resolver_coordinator",
     "cayu.runtime._completion_decision_application_coordinator",
-    "cayu.runtime._verified_task_decision_coordinator",
+    "cayu.runtime._verified_completion",
 }.intersection(sys.modules)
 """,
             first_module,

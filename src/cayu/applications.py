@@ -349,13 +349,6 @@ from cayu.runtime._checkpoint_store import (
     load_runtime_session_checkpoint_snapshot,
     runtime_checkpoint_session_store,
 )
-from cayu.runtime._completion_decision_application_coordinator import (
-    CompletionDecisionApplicationCoordinator,
-)
-from cayu.runtime._completion_result_resolver_coordinator import (
-    CompletionResultResolverCoordinator,
-)
-from cayu.runtime._completion_verifier_coordinator import CompletionVerifierCoordinator
 from cayu.runtime._continuation_task_failure import ApprovalTaskFailureIdentity
 from cayu.runtime._delegated_event_stream import (
     _close_delegated_event_stream as _close_delegated_event_stream,
@@ -491,12 +484,7 @@ from cayu.runtime._tool_round_executor import (
     ToolRoundLimitRequest,
 )
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot
-from cayu.runtime._verified_task_decision_coordinator import (
-    VerifiedTaskDecisionCoordinator,
-    VerifiedTaskDecisionDependencies,
-    VerifiedTaskDecisionExecution,
-    VerifiedTaskDecisionResult,
-)
+from cayu.runtime._verified_completion import VerifiedCompletionCoordinator
 from cayu.runtime._work_attempt_invocation import (
     WorkAttemptRecoveryOwnership,
     _acknowledged_work_attempt_recovery,
@@ -1459,17 +1447,6 @@ class CayuApp:
                 clock=self._clock,
             )
         )
-        self._completion_verifier_coordinator = CompletionVerifierCoordinator(
-            task_store=self.task_store,
-            secret_redactor=self._secret_redactor,
-            profile_policy=completion_verifier_profile_policy,
-        )
-        self._completion_decision_application_coordinator = (
-            CompletionDecisionApplicationCoordinator(
-                task_store=self.task_store,
-                secret_redactor=self._secret_redactor,
-            )
-        )
         self._runtime_hooks = tuple(hooks)
         self._loop_policies = tuple(policies)
         self._loop_policy_execution_profile_identities = policy_execution_profile_identities
@@ -1491,12 +1468,18 @@ class CayuApp:
             runtime_timing=runtime_timing,
             timing_sinks=() if timing_sinks is None else tuple(timing_sinks),
         )
-        self._completion_result_resolver_coordinator = CompletionResultResolverCoordinator(
-            application_coordinator=self._completion_decision_application_coordinator,
+        self._verified_completion = VerifiedCompletionCoordinator(
             task_store=self.task_store,
             session_store=self._runtime_session_store,
             event_writer=self._event_writer,
             secret_redactor=self._secret_redactor,
+            profile_policy=completion_verifier_profile_policy,
+            release=lambda admission: self._session_engine.load_work_attempt_release_evidence(
+                admission
+            ),
+            admit=lambda request, *, execution: self.admit_work_attempt(
+                request, execution=execution
+            ),
         )
         self._environment_lifecycle = EnvironmentLifecycle(
             session_store=self._runtime_session_store,
@@ -5897,7 +5880,7 @@ class CayuApp:
         """Register one deterministic verifier under its complete durable identity."""
 
         try:
-            registered = self._completion_verifier_coordinator.register(reference, verifier)
+            registered = self._verified_completion.verifier.register(reference, verifier)
         except BaseException:
             del reference, verifier
             raise
@@ -5912,7 +5895,7 @@ class CayuApp:
         """Register one result resolver under its complete durable identity."""
 
         try:
-            registered = self._completion_result_resolver_coordinator.register(
+            registered = self._verified_completion.resolver.register(
                 reference,
                 resolver,
             )
@@ -9783,7 +9766,7 @@ class CayuApp:
     ) -> CompletionDecision:
         """Run the registered deterministic verifier and persist its decision."""
 
-        operation = self._completion_verifier_coordinator.verify(request)
+        operation = self._verified_completion.verifier.verify(request)
         del request
         return await operation
 
@@ -9793,58 +9776,9 @@ class CayuApp:
     ) -> Task:
         """Apply or exactly replay one durable verifier decision."""
 
-        operation = self._completion_decision_application_coordinator.apply(request)
+        operation = self._verified_completion.application.apply(request)
         del request
         return await operation
-
-    def _verified_task_decision_owner(self) -> VerifiedTaskDecisionCoordinator:
-        if self.task_store is None:
-            raise RuntimeError("task_store is required for verified task decisions.")
-        return VerifiedTaskDecisionCoordinator(
-            VerifiedTaskDecisionDependencies(
-                store=self.task_store,
-                redactor=self._secret_redactor,
-                verify=self._completion_verifier_coordinator.verify,
-                start_verify=self._completion_verifier_coordinator.start_owned_verification,
-                resolve=self.resolve_completion_result,
-                apply=self.apply_completion_decision,
-                release=self._session_engine.load_work_attempt_release_evidence,
-                admit=self.admit_work_attempt,
-            )
-        )
-
-    async def _settle_verified_task_decision(
-        self, admission_id: str, verification: CompletionVerifierExecutionRequest
-    ) -> VerifiedTaskDecisionResult:
-        """Private worker composition; queue/handler authority is not public yet."""
-        operation = self._verified_task_decision_owner().settle(admission_id, verification)
-        del admission_id, verification
-        return await operation
-
-    async def _start_verified_task_decision(
-        self, admission_id: str, verification: CompletionVerifierExecutionRequest
-    ) -> VerifiedTaskDecisionExecution:
-        """Validate released authority before returning the owned verifier phase."""
-        operation = self._verified_task_decision_owner().start(admission_id, verification)
-        del admission_id, verification
-        return await operation
-
-    async def _continue_verified_task(
-        self, admission_id: str, decision_id: str, *, worker_id: str, lease_seconds: int
-    ) -> WorkAttemptAdmission:
-        """Private worker successor scheduling through exact admission ownership."""
-        operation = self._verified_task_decision_owner().continue_attempt(
-            admission_id, decision_id, worker_id=worker_id, lease_seconds=lease_seconds
-        )
-        del admission_id, decision_id, worker_id, lease_seconds
-        return await operation
-
-    async def _reconcile_completion_result_group_settlement(
-        self, task_id: str, decision_id: str
-    ) -> None:
-        await self._completion_result_resolver_coordinator.reconcile_group_settlement(
-            task_id, decision_id
-        )
 
     async def resolve_completion_result(
         self,
@@ -9852,7 +9786,7 @@ class CayuApp:
     ) -> Task:
         """Resolve and exactly apply the accepted result for one durable decision."""
 
-        operation = self._completion_result_resolver_coordinator.resolve(request)
+        operation = self._verified_completion.resolver.resolve(request)
         del request
         return await operation
 

@@ -1375,7 +1375,7 @@ def test_inherited_active_verifier_state_fails_before_store_mutation() -> None:
             contract.verifier,
             RecordingVerifier(_accepted_decision()),
         )
-        coordinator = app._completion_verifier_coordinator
+        coordinator = app._verified_completion.verifier
         coordinator._adapter_runner._process_id = -1
         coordinator._reserve_adapter_capacity()
 
@@ -1536,7 +1536,7 @@ def test_retry_cannot_steal_a_completed_adapter_drain_before_its_callback() -> N
         verifier = ResistantVerifier()
         app = CayuApp(task_store=store, enable_logging=False)
         app.register_completion_verifier(contract.verifier, verifier)
-        coordinator = app._completion_verifier_coordinator
+        coordinator = app._verified_completion.verifier
         original_release = coordinator._release_adapter_task
         callback_started = asyncio.Event()
         callback_release = asyncio.Event()
@@ -2336,7 +2336,7 @@ def test_owned_verification_retains_its_exact_drain_after_retry(trigger, late_fa
         app = CayuApp(task_store=store, enable_logging=False)
         verifier = RetainedVerifier()
         app.register_completion_verifier(contract.verifier, verifier)
-        coordinator = app._completion_verifier_coordinator
+        coordinator = app._verified_completion.verifier
         request = _execution_request(
             proposal_id, timeout_seconds=0.05 if trigger == "timeout" else 5
         )
@@ -2419,7 +2419,7 @@ def test_owned_verification_without_adapter_drain_settles(cancel_before_start) -
         proposal_id = await _proposal(store, contract)
         app = CayuApp(task_store=store, enable_logging=False)
         app.register_completion_verifier(contract.verifier, ImmediateVerifier())
-        owned = app._completion_verifier_coordinator.start_owned_verification(
+        owned = app._verified_completion.verifier.start_owned_verification(
             _execution_request(proposal_id)
         )
         if cancel_before_start:
@@ -2463,7 +2463,7 @@ def test_old_verifier_settlement_acknowledgement_cannot_remove_retried_drain() -
         verifier = RetriedVerifier()
         app = CayuApp(task_store=store, enable_logging=False)
         app.register_completion_verifier(contract.verifier, verifier)
-        coordinator = app._completion_verifier_coordinator
+        coordinator = app._verified_completion.verifier
         request = _execution_request(proposal_id, timeout_seconds=0.05)
         handles = []
         try:
@@ -2567,7 +2567,7 @@ def test_background_drain_observes_late_adapter_cleanup_once(trigger, cleanup) -
                 ):
                     await invocation
             await asyncio.wait_for(verifier.cancelled.wait(), 5)
-            coordinator = app._completion_verifier_coordinator
+            coordinator = app._verified_completion.verifier
             draining = coordinator._adapter_runner.draining(proposal_id)
             assert not draining.task.done()
             with pytest.raises(CompletionVerifierExecutionError, match="still draining"):
@@ -2676,7 +2676,7 @@ def test_background_drain_replays_late_claim_renewal_failure_once(late_adapter_f
         with pytest.raises(CompletionVerifierExecutionError, match="bounded execution timeout"):
             await app.verify_completion_proposal(request)
 
-        coordinator = app._completion_verifier_coordinator
+        coordinator = app._verified_completion.verifier
         draining = coordinator._adapter_runner.draining(proposal_id)
         while not draining.heartbeat.ownership_lost.done():
             await asyncio.sleep(0)

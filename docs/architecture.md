@@ -301,6 +301,14 @@ still use the execution-profile value types in `runtime/execution_identity.py`
 and `runtime/execution_profiles.py`; the completion coordinators remain separate
 orchestration owners.
 
+`runtime/_verified_completion.py` owns completion composition for one
+application lifetime. Public completion methods and verified workers share
+its verifier, decision-application and result-resolver instances. Worker
+settlement calls those phases directly; admission and invocation-release
+evidence remain explicit session-execution dependencies. Prepared authority
+and exact verifier settlement handles belong to each operation, rather than
+being cached on the shared owner.
+
 Completion verifier and result-resolver coordinators use one private
 `LeasedAdapterRunner` for process-local execution ownership. It holds
 single-flight lock lifetimes, admission capacity, captured callback tasks,

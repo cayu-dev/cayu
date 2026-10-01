@@ -3575,9 +3575,9 @@ def test_worker_close_retains_exact_verifier_until_settlement(
                 == before_cleanup
             )
             assert (await tasks.load_task(task.id)).status is expected_status
-            assert not app._completion_verifier_coordinator._adapter_runner.active_adapter_count
-            assert not app._completion_verifier_coordinator._adapter_runner._capacity_reservations
-            assert not app._completion_verifier_coordinator._adapter_runner._drains
+            assert not app._verified_completion.verifier._adapter_runner.active_adapter_count
+            assert not app._verified_completion.verifier._adapter_runner._capacity_reservations
+            assert not app._verified_completion.verifier._adapter_runner._drains
         finally:
             release.set()
             if not run.done():
@@ -3775,7 +3775,7 @@ def test_worker_restart_discovers_published_work_without_redispatch(
             resolver = _Resolver(_task_result())
             app.register_completion_verifier(contract.verifier, verifier)
             app.register_completion_result_resolver(contract.result_resolver, resolver)
-            owner = app if fault == "proposal" else app._completion_verifier_coordinator
+            owner = app if fault == "proposal" else app._verified_completion.verifier
             method = "submit_work_attempt_proposal" if fault == "proposal" else "_verify"
             original = getattr(owner, method)
 
@@ -4205,7 +4205,7 @@ def test_worker_preserves_priced_causal_budget_across_attempts(
                 async def stop_before_continuation(*args, **kwargs):
                     raise ConnectionError("restart before priced continuation")
 
-                app._continue_verified_task = stop_before_continuation
+                app._verified_completion.continue_attempt = stop_before_continuation
             async with VerifiedTaskWorker(app, handler, worker_id="priced-worker") as worker:
                 if restart:
                     with pytest.raises(Exception) as failure:
@@ -4562,7 +4562,7 @@ def test_worker_settles_expired_published_proposal(backend, fault, tmp_path, mon
                 return proposal
             admission = await store.load_work_attempt_admission(request.admission_id)
             if fault == "decision_first":
-                await app._settle_verified_task_decision(
+                await app._verified_completion.settle(
                     admission.admission_id,
                     CompletionVerifierExecutionRequest(
                         proposal_id=proposal.proposal_id,
@@ -4764,7 +4764,7 @@ def test_worker_settles_expired_published_proposal(backend, fault, tmp_path, mon
                         assert decision_writes == []
                     if fault == "live_verifier":
                         await asyncio.wait_for(verifier_settled.wait(), 5)
-                    coordinator = app._completion_verifier_coordinator
+                    coordinator = app._verified_completion.verifier
                     if coordinator._adapter_runner._adapter_tasks:
                         _, pending = await asyncio.wait(
                             coordinator._adapter_runner._adapter_tasks, timeout=5
@@ -5378,7 +5378,7 @@ def test_worker_decision_phase_composes_real_execution_and_existing_owners(
             )
             if fault == "owned_start":
                 with pytest.raises(WorkAttemptRecoveryRequired, match="released proposed attempt"):
-                    await app._start_verified_task_decision(
+                    await app._verified_completion.start(
                         admission.admission_id,
                         CompletionVerifierExecutionRequest(
                             proposal_id="verified-worker-proposal",
@@ -5388,7 +5388,7 @@ def test_worker_decision_phase_composes_real_execution_and_existing_owners(
                         ),
                     )
                 assert verifier.requests == []
-                assert not app._completion_verifier_coordinator._adapter_runner.active_adapter_count
+                assert not app._verified_completion.verifier._adapter_runner.active_adapter_count
             async for _ in app._execute_work_attempt(
                 WorkAttemptRunRequest(
                     admission_id=admission.admission_id,
@@ -5573,9 +5573,7 @@ def test_worker_decision_phase_composes_real_execution_and_existing_owners(
                     verification = verification.model_copy(
                         update={"execution_timeout_seconds": 0.05}
                     )
-                started = await app._start_verified_task_decision(
-                    admission.admission_id, verification
-                )
+                started = await app._verified_completion.start(admission.admission_id, verification)
                 waiting = asyncio.create_task(started.result())
                 try:
                     await asyncio.wait_for(verifier_started.wait(), 5)
@@ -5621,7 +5619,7 @@ def test_worker_decision_phase_composes_real_execution_and_existing_owners(
                 committed = asyncio.Event()
                 with monkeypatch.context() as patch:
                     if fault in {"application", "cancel_application"}:
-                        resolve = app.resolve_completion_result
+                        resolve = app._verified_completion.resolver.resolve
 
                         async def lose_application_reply(request):
                             await resolve(request)
@@ -5630,7 +5628,9 @@ def test_worker_decision_phase_composes_real_execution_and_existing_owners(
                                 await asyncio.Event().wait()
                             raise ConnectionError("worker application reply lost")
 
-                        patch.setattr(app, "resolve_completion_result", lose_application_reply)
+                        patch.setattr(
+                            app._verified_completion.resolver, "resolve", lose_application_reply
+                        )
                     else:
                         settle = type(tasks).settle_work_attempt_lifecycle
 
@@ -5643,7 +5643,7 @@ def test_worker_decision_phase_composes_real_execution_and_existing_owners(
                             type(tasks), "settle_work_attempt_lifecycle", lose_retirement_reply
                         )
                     operation = asyncio.create_task(
-                        app._settle_verified_task_decision(admission.admission_id, verification)
+                        app._verified_completion.settle(admission.admission_id, verification)
                     )
                     if fault == "cancel_application":
                         await asyncio.wait_for(committed.wait(), 10)
@@ -5663,18 +5663,14 @@ def test_worker_decision_phase_composes_real_execution_and_existing_owners(
                 # the vanished original collaborator registrations.
                 app = CayuApp(session_store=sessions, task_store=tasks, enable_logging=False)
             if fault == "owned_start":
-                started = await app._start_verified_task_decision(
-                    admission.admission_id, verification
-                )
+                started = await app._verified_completion.start(admission.admission_id, verification)
                 try:
                     result = await started.result()
                 finally:
                     settled = await asyncio.wait_for(started.verification.settlement(), 5)
                     assert settled.failure is None
             else:
-                result = await app._settle_verified_task_decision(
-                    admission.admission_id, verification
-                )
+                result = await app._verified_completion.settle(admission.admission_id, verification)
             expected_status = {
                 "accepted": TaskStatus.COMPLETED,
                 "continue": TaskStatus.RUNNING,
@@ -5699,7 +5695,7 @@ def test_worker_decision_phase_composes_real_execution_and_existing_owners(
             # Fresh app has no registered collaborators. Existing verifier,
             # application and lifecycle receipts must carry the exact replay.
             restarted = CayuApp(session_store=sessions, task_store=tasks, enable_logging=False)
-            replay = await restarted._settle_verified_task_decision(
+            replay = await restarted._verified_completion.settle(
                 admission.admission_id, verification
             )
             assert replay == result
@@ -5709,7 +5705,7 @@ def test_worker_decision_phase_composes_real_execution_and_existing_owners(
             if outcome == "continue":
 
                 async def schedule():
-                    return await app._continue_verified_task(
+                    return await app._verified_completion.continue_attempt(
                         admission.admission_id,
                         result.decision.decision_id,
                         worker_id="verified-worker",
@@ -5744,7 +5740,7 @@ def test_worker_decision_phase_composes_real_execution_and_existing_owners(
                 successor = await schedule()
                 assert await schedule() == successor
                 with pytest.raises(WorkAttemptRecoveryRequired, match="dedicated recovery"):
-                    await app._continue_verified_task(
+                    await app._verified_completion.continue_attempt(
                         admission.admission_id,
                         result.decision.decision_id,
                         worker_id="competing-worker",
@@ -5789,7 +5785,7 @@ def test_worker_decision_phase_composes_real_execution_and_existing_owners(
                         ),
                     )
                 )
-                completed = await app._settle_verified_task_decision(
+                completed = await app._verified_completion.settle(
                     successor.admission_id,
                     CompletionVerifierExecutionRequest(
                         proposal_id="verified-worker-proposal-2",
@@ -5809,7 +5805,7 @@ def test_worker_decision_phase_composes_real_execution_and_existing_owners(
             else:
                 before = await tasks.load_task(admission.task_id)
                 with pytest.raises(WorkCompletionConflict):
-                    await app._continue_verified_task(
+                    await app._verified_completion.continue_attempt(
                         admission.admission_id,
                         result.decision.decision_id,
                         worker_id="verified-worker",
