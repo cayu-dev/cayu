@@ -41,11 +41,9 @@ if TYPE_CHECKING:
 
 import cayu.sessions.pending_actions as pending_actions
 from cayu._exception_groups import (
+    _attach_exception_cause_preserving_graph,
     add_exception_note_safely,
     exception_cause,
-    exception_context,
-    exception_group_children,
-    exception_suppresses_context,
     failure_control_cause,
     iter_exception_tree,
     set_exception_cause,
@@ -282,6 +280,13 @@ from cayu.runtime._model_step_executor import (
 from cayu.runtime._provider_operation_cancellation_claim import (
     active_provider_operation_cancellation_claim_from_checkpoint,
 )
+from cayu.runtime._recovery_claims import (
+    _IncompleteRecoveryClaim,
+    _IncompleteRecoveryClaimAuthority,
+    _IncompleteRecoveryClaimLost,
+    _RecoveryWorkerSettlement,
+    _require_live_incomplete_recovery_claim_acknowledgement,
+)
 from cayu.runtime._run_limit_accounting import (
     RunLimitAccountingContext,
     rebase_run_limit_accounting_context,
@@ -304,6 +309,11 @@ from cayu.runtime._terminal_evidence import (
     classify_current_terminal_evidence,
     interruption_request_id_from_payload,
     require_interruption_event_matches_pending_marker,
+)
+from cayu.runtime._terminal_evidence_finalization import (
+    TerminalEvidenceFinalization,
+    _terminal_finalization_failure_without_identity,
+    _terminal_finalization_process_control,
 )
 from cayu.runtime._tool_completion import (
     load_recorded_tool_completion_policy,
@@ -446,7 +456,6 @@ from cayu.sessions.base import (
     _model_completion_stage_promotion_statuses,
     _queued_dispatch_session_instance_fingerprint,
     _session_run_operation_from_checkpoint,
-    _SessionRunFenceOwnership,
     _SessionRunOperation,
     _workspace_observation_authority_mutation_scope,
     copy_interaction_transition_spec,
@@ -538,11 +547,6 @@ _ABANDONED_UNREPLAYABLE_TOOL_ROUND_CHECKPOINT_KEY = "abandoned_unreplayable_tool
 _INCOMPLETE_RECOVERY_CLAIM_LEASE = timedelta(minutes=5)
 _INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS = 30.0
 _INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_RETRY_SECONDS = 5.0
-_TERMINAL_FINALIZATION_PROCESS_CONTROL_SIGNALS = (
-    GeneratorExit,
-    KeyboardInterrupt,
-    SystemExit,
-)
 _MANUAL_RECOVERY_INTERRUPT_POLL_INTERVAL_SECONDS = 0.25
 _TERMINAL_EVIDENCE_REPAIR_NAMESPACE = UUID("bd021bef-ec8f-4e1e-950d-734e2c9ac513")
 _COMPLETION_FINALIZATION_TASK_EVENT_NAMESPACE = UUID("ae86f400-31e6-4cd2-95f3-7d6f115c21a1")
@@ -1012,72 +1016,6 @@ def _recovery_abandonment_signal(
     return None
 
 
-def _terminal_finalization_process_control(
-    error: BaseException | None,
-) -> BaseException | None:
-    """Return the first scalar process-control signal in transfer evidence."""
-
-    if error is None:
-        return None
-    return next(
-        (
-            candidate
-            for candidate in iter_exception_tree(error)
-            if not isinstance(candidate, BaseExceptionGroup)
-            and isinstance(candidate, _TERMINAL_FINALIZATION_PROCESS_CONTROL_SIGNALS)
-        ),
-        None,
-    )
-
-
-def _terminal_finalization_failure_without_identity(
-    error: BaseException,
-    excluded: BaseException,
-    *,
-    remaining_nodes: list[int] | None = None,
-    visited: set[int] | None = None,
-) -> BaseException | None:
-    """Retain ordered transfer evidence without duplicating its public signal."""
-
-    if error is excluded:
-        return None
-    if remaining_nodes is None:
-        remaining_nodes = [128]
-    if visited is None:
-        visited = set()
-    if remaining_nodes[0] < 1:
-        return RuntimeError("Additional terminal finalization failures were omitted.")
-    remaining_nodes[0] -= 1
-    if not isinstance(error, BaseExceptionGroup):
-        return error
-    error_id = id(error)
-    if error_id in visited:
-        return RuntimeError("Cyclic terminal finalization failure evidence was omitted.")
-    visited.add(error_id)
-    children = exception_group_children(error)
-    if children is None:
-        return RuntimeError("Invalid terminal finalization failure evidence was omitted.")
-    retained = [
-        child_without_signal
-        for child in children
-        if (
-            child_without_signal := _terminal_finalization_failure_without_identity(
-                child,
-                excluded,
-                remaining_nodes=remaining_nodes,
-                visited=visited,
-            )
-        )
-        is not None
-    ]
-    if not retained:
-        return None
-    return BaseExceptionGroup(
-        "Terminal finalization claim transfer retained additional failures.",
-        retained,
-    )
-
-
 def _task_cancellation_count() -> int:
     """Return the current task's cancellation generation for boundary tracking."""
     task = asyncio.current_task()
@@ -1088,58 +1026,6 @@ def _prepend_exception_cause(error: BaseException, cause: BaseException) -> None
     """Preserve a new structured cause without discarding an existing chain."""
     set_exception_cause(cause, exception_cause(error))
     set_exception_cause(error, cause)
-
-
-def _exception_graph_contains_identity(
-    error: BaseException,
-    target: BaseException,
-) -> bool:
-    """Inspect one base-owned exception graph without invoking extension accessors."""
-
-    pending = [error]
-    visited: set[int] = set()
-    while pending:
-        candidate = pending.pop()
-        if candidate is target:
-            return True
-        candidate_id = id(candidate)
-        if candidate_id in visited:
-            continue
-        visited.add(candidate_id)
-        if isinstance(candidate, BaseExceptionGroup):
-            children = exception_group_children(candidate)
-            if children is not None:
-                pending.extend(children)
-        cause = exception_cause(candidate)
-        if cause is not None:
-            pending.append(cause)
-        elif not exception_suppresses_context(candidate):
-            context = exception_context(candidate)
-            if context is not None:
-                pending.append(context)
-    return False
-
-
-def _attach_exception_cause_preserving_graph(
-    error: BaseException,
-    cause: BaseException,
-) -> bool:
-    """Attach one cause without mutating it or discarding either existing graph."""
-
-    if _exception_graph_contains_identity(error, cause):
-        return True
-    existing = exception_cause(error)
-    if existing is None and not exception_suppresses_context(error):
-        existing = exception_context(error)
-    if existing is None:
-        return set_exception_cause(error, cause)
-    if _exception_graph_contains_identity(cause, existing):
-        return set_exception_cause(error, cause)
-    combined = BaseExceptionGroup(
-        "Continuation recovery retained prior and concurrent failure evidence",
-        [cause, existing],
-    )
-    return set_exception_cause(error, combined)
 
 
 def _authoritative_expired_recovery_claim_failure(
@@ -1522,144 +1408,6 @@ class RecoveryAbandonedSessionRequest:
     retain_terminal_publication_repair: bool = False
 
 
-class _RecoveryWorkerSettlement:
-    """Process-local work lifetime, never authority to acquire an invocation."""
-
-    __slots__ = ("_workers",)
-
-    def __init__(self) -> None:
-        self._workers: tuple[asyncio.Task[Any], ...] = ()
-
-    @property
-    def settled(self) -> bool:
-        return all(task.done() for task in self._workers)
-
-    def owns_current_worker(self) -> bool:
-        return bool(self._workers) and self._workers[0] is asyncio.current_task()
-
-    def own_workers(self, *workers: asyncio.Task[Any]) -> None:
-        if not self.settled:
-            raise RuntimeError("Recovery claim already owns unsettled workers.")
-        self._workers = workers
-
-    async def await_worker_settlement(self) -> None:
-        """Quiescence dependency; the worker supervisor owns failure propagation."""
-        if any(task is asyncio.current_task() for task in self._workers):
-            raise RuntimeError("A recovery worker cannot release its own live claim.")
-        pending = {task for task in self._workers if not task.done()}
-        while pending:
-            try:
-                _, pending = await asyncio.wait(pending)
-            except asyncio.CancelledError:
-                # Only supervised cleanup waits here. Its cancellation probe
-                # cannot establish worker quiescence or authorize claim release.
-                continue
-
-
-class _IncompleteRecoveryClaimAuthority(_RecoveryWorkerSettlement):
-    """Exact durable claim and transferable process-local fence authority."""
-
-    __slots__ = (
-        "_finalization_lock",
-        "_finalized",
-        "claim_id",
-        "run_fence",
-        "session_id",
-    )
-
-    def __init__(
-        self,
-        *,
-        session_id: str,
-        claim_id: str,
-        run_fence: _SessionRunFenceOwnership,
-    ) -> None:
-        super().__init__()
-        if run_fence.session_id != session_id:
-            raise ValueError("Recovery claim and run-fence session identities differ.")
-        self.session_id = session_id
-        self.claim_id = claim_id
-        self.run_fence = run_fence
-        self._finalization_lock = asyncio.Lock()
-        self._finalized = False
-
-    def own_workers(self, *workers: asyncio.Task[Any]) -> None:
-        """Keep the exact recovery work and heartbeat ahead of claim release."""
-        if self._finalized:
-            raise RuntimeError("Recovery claim already owns unsettled workers.")
-        super().own_workers(*workers)
-
-    @property
-    def run_epoch(self) -> int:
-        return self.run_fence.run_epoch
-
-    def retire(self) -> bool:
-        """Idempotently invalidate this exact process-local owner in all tasks."""
-
-        return self.run_fence.retire()
-
-    async def begin_finalization(self) -> bool:
-        """Elect one finalizer; waiters retry an abort and ignore a finished owner."""
-
-        await self._finalization_lock.acquire()
-        if self._finalized:
-            self._finalization_lock.release()
-            return False
-        return True
-
-    def finish_finalization(self) -> None:
-        """Publish finalization and release every waiter after local retirement."""
-
-        if not self._finalization_lock.locked():
-            raise RuntimeError("Recovery claim finalization was not acquired.")
-        self._finalized = True
-        self.retire()
-        self._finalization_lock.release()
-
-    def abort_finalization(self) -> None:
-        """Release the finalizer election while retaining retryable authority."""
-
-        if not self._finalization_lock.locked():
-            raise RuntimeError("Recovery claim finalization was not acquired.")
-        self._finalization_lock.release()
-
-
-@dataclass(frozen=True)
-class _IncompleteRecoveryClaim:
-    claim_id: str
-    claim_expires_at: datetime
-    local_lease_deadline: float
-    session_before_fence: Session
-    session: Session
-    run_operation: _SessionRunOperation | None = None
-    invocation_context: InvocationContext | None = None
-    authority: _IncompleteRecoveryClaimAuthority | None = None
-
-    def __post_init__(self) -> None:
-        if self.authority is None:
-            return
-        if (
-            self.authority.claim_id != self.claim_id
-            or self.authority.session_id != self.session.id
-            or self.authority.run_epoch != self.session.run_epoch
-        ):
-            raise ValueError("Recovery claim authority does not match the claimed session.")
-
-    def require_authority(self) -> _IncompleteRecoveryClaimAuthority:
-        if self.authority is None:
-            raise RuntimeError("Recovery claim has no run-fence authority.")
-        return self.authority
-
-
-@dataclass(frozen=True)
-class _TerminalFinalizationClaimAcquisition:
-    claim_id: str
-    claim_expires_at: datetime
-    cancellation: asyncio.CancelledError | None = None
-    transfer_failure: BaseException | None = None
-    process_control: BaseException | None = None
-
-
 @dataclass(frozen=True)
 class _TerminalEvidenceInspection:
     event: Event | None
@@ -1667,24 +1415,6 @@ class _TerminalEvidenceInspection:
     pending_action_interrupt_payload: dict[str, Any] | None
     run_operation: _SessionRunOperation | None
     terminal_event_required: bool
-
-
-class _IncompleteRecoveryClaimLost(RuntimeError):
-    """The durable incomplete-session recovery lease is no longer owned."""
-
-
-def _require_live_incomplete_recovery_claim_acknowledgement(
-    *,
-    session_id: str,
-    local_lease_deadline: float,
-) -> None:
-    """Reject an acknowledgement that consumed its complete local lease budget."""
-
-    if time.monotonic() >= local_lease_deadline:
-        raise _IncompleteRecoveryClaimLost(
-            "Incomplete-session recovery claim acknowledgement consumed its lease "
-            f"before work could start for session {session_id}."
-        )
 
 
 def _consume_incomplete_recovery_store_task(task: asyncio.Task[Any]) -> None:
@@ -2105,6 +1835,11 @@ class RecoveryCoordinator:
             raise TypeError("recovery_cleanup_supervisor must be a RecoveryCleanupSupervisor.")
         self._recovery_cleanup_supervisor = recovery_cleanup_supervisor
         self._recovery_claim_workers: dict[tuple[str, str], _RecoveryWorkerSettlement] = {}
+        self.terminal_finalization = TerminalEvidenceFinalization(
+            session_store=session_store,
+            session_control=session_control,
+            recovery=self,
+        )
         self._runtime_hooks = runtime_hooks
         self._loop_policies = loop_policies
         self._committed_runtime_task_failure_recovery: (
@@ -2344,6 +2079,11 @@ class RecoveryCoordinator:
         if self._committed_runtime_task_failure_recovery is not None:
             raise RuntimeError("Committed runtime task failure recovery is already bound.")
         self._committed_runtime_task_failure_recovery = recovery
+
+    @property
+    def claim_lease_duration(self) -> timedelta:
+        """Share the current store-time lease policy with live finalization."""
+        return _INCOMPLETE_RECOVERY_CLAIM_LEASE
 
     async def _run_cleanup_steps(
         self,
@@ -19452,539 +19192,6 @@ class RecoveryCoordinator:
 
         await self._session_store.transform_checkpoint_with_store_time(session_id, inspect)
         return owned
-
-    def _new_terminal_evidence_finalization_claim(
-        self,
-    ) -> str:
-        """Create an identity whose lease is installed only by authoritative store time."""
-
-        return str(uuid4())
-
-    async def _claim_pending_terminal_evidence_finalization(
-        self,
-        *,
-        session: Session,
-        expected_payload: dict[str, Any],
-    ) -> _TerminalFinalizationClaimAcquisition | Event | None:
-        """Claim pending publication, or return its exact already-settled event."""
-
-        expected_payload = copy_json_value(
-            expected_payload,
-            "expected_pending_session_interrupt",
-        )
-        claim_id = self._new_terminal_evidence_finalization_claim()
-        claim_expires_at: datetime | None = None
-        claim_installed = False
-
-        def require_exact_pending_authority(
-            current_session: Session,
-            checkpoint: dict[str, Any] | None,
-        ) -> None:
-            if (
-                current_session.id != session.id
-                or current_session.instance_id != session.instance_id
-                or current_session.status is not session.status
-                or current_session.run_epoch != session.run_epoch
-            ):
-                raise SessionRuntimePublicationConflict(
-                    "Terminal finalization session authority changed before ownership transfer."
-                )
-            current_payload = (
-                None
-                if checkpoint is None
-                else checkpoint.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
-            )
-            if current_payload != expected_payload:
-                raise SessionRuntimePublicationConflict(
-                    "Terminal finalization interrupt identity changed before ownership transfer."
-                )
-
-        def claim_pending_finalization(
-            current_session: Session,
-            checkpoint: dict[str, Any] | None,
-            store_now: datetime,
-        ) -> dict[str, Any] | None:
-            nonlocal claim_expires_at, claim_installed
-            require_exact_pending_authority(current_session, checkpoint)
-            existing_claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
-            if existing_claim is not None and existing_claim[1] > store_now:
-                return None
-            assert checkpoint is not None
-            updated = copy_durable_record(checkpoint, "checkpoint")
-            claim_expires_at = store_now + _INCOMPLETE_RECOVERY_CLAIM_LEASE
-            updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = copy_json_value(
-                {
-                    "version": 1,
-                    "claim_id": claim_id,
-                    "claimed_at": store_now.isoformat(),
-                    "claim_expires_at": claim_expires_at.isoformat(),
-                },
-                "terminal_finalization_claim",
-            )
-            claim_installed = True
-            return updated
-
-        claim_task = asyncio.create_task(
-            capture_awaitable_outcome(
-                lambda: self._session_store.transform_checkpoint_with_store_time(
-                    session.id,
-                    claim_pending_finalization,
-                )
-            )
-        )
-        outcome = await await_shielded_task_outcome(claim_task)
-        error = outcome.error
-        if error is None:
-            captured = outcome.result
-            if type(captured) is not CapturedAwaitableOutcome:
-                error = RuntimeError(
-                    "Terminal evidence finalization claim transfer returned an invalid outcome."
-                )
-            else:
-                error = captured.error
-        if isinstance(error, asyncio.CancelledError) and outcome.cancellation is None:
-            error = unexpected_child_cancellation_error(
-                error,
-                operation="Terminal evidence finalization claim transfer",
-            )
-        cancellation = outcome.cancellation
-        if isinstance(error, SessionRuntimePublicationConflict):
-            if cancellation is not None:
-                raise cancellation from error
-            # The live owner can finish between the caller's pending-state
-            # read and this atomic claim. Never relax the mutation comparison:
-            # only exact, already-published evidence permits joining instead.
-            # Finalization may advance the epoch; this result grants no claim
-            # and must be returned without attempting another repair mutation.
-            current = await self._session_store.load(session.id)
-            request_id = interruption_request_id_from_payload(expected_payload)
-            if (
-                current is not None
-                and current.instance_id == session.instance_id
-                and current.run_epoch >= session.run_epoch
-                and current.status is SessionStatus.INTERRUPTED
-                and request_id is not None
-            ):
-                event = await self._session_control.latest_interrupted_event(
-                    session.id, interruption_request_id=request_id
-                )
-                if event is not None:
-                    require_interruption_event_matches_pending_marker(event, expected_payload)
-                    return event
-            raise error
-
-        async def reconcile_claim() -> bool:
-            claim_matches = False
-
-            def inspect_claim(
-                current_session: Session,
-                checkpoint: dict[str, Any] | None,
-                store_now: datetime,
-            ) -> None:
-                nonlocal claim_expires_at, claim_matches
-                require_exact_pending_authority(current_session, checkpoint)
-                current_claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
-                claim_matches = (
-                    current_claim is not None
-                    and current_claim[0] == claim_id
-                    and current_claim[1] > store_now
-                )
-                if claim_matches:
-                    assert current_claim is not None
-                    claim_expires_at = current_claim[1]
-                return None
-
-            await self._session_store.transform_checkpoint_with_store_time(
-                session.id, inspect_claim
-            )
-            return claim_matches
-
-        if error is not None or cancellation is not None:
-            reconciliation = await await_shielded_task_outcome(
-                asyncio.create_task(reconcile_claim()),
-                cancellation=cancellation,
-            )
-            cancellation = reconciliation.cancellation or cancellation
-            reconciliation_error = reconciliation.error
-            if isinstance(reconciliation_error, asyncio.CancelledError) and (
-                reconciliation.cancellation is None
-            ):
-                reconciliation_error = unexpected_child_cancellation_error(
-                    reconciliation_error,
-                    operation="Terminal evidence finalization claim reconciliation",
-                )
-            if reconciliation_error is not None:
-                if cancellation is not None:
-                    cancellation.add_note(
-                        "Terminal finalization claim reconciliation also failed: "
-                        f"{type(reconciliation_error).__name__}."
-                    )
-                    if error is not None:
-                        raise cancellation from BaseExceptionGroup(
-                            "Terminal finalization claim transfer failures",
-                            [error, reconciliation_error],
-                        )
-                    raise cancellation from reconciliation_error
-                if error is not None:
-                    raise BaseExceptionGroup(
-                        "Terminal finalization claim transfer and reconciliation failed.",
-                        [error, reconciliation_error],
-                    ) from None
-                raise reconciliation_error from error
-            claim_installed = reconciliation.result is True
-
-        if cancellation is not None:
-            if claim_installed:
-                assert claim_expires_at is not None
-                process_control = _terminal_finalization_process_control(error)
-                return _TerminalFinalizationClaimAcquisition(
-                    claim_id=claim_id,
-                    claim_expires_at=claim_expires_at,
-                    cancellation=cancellation,
-                    transfer_failure=(
-                        error
-                        if process_control is None or error is None
-                        else _terminal_finalization_failure_without_identity(
-                            error,
-                            process_control,
-                        )
-                    ),
-                    process_control=process_control,
-                )
-            if error is not None:
-                raise cancellation from error
-            raise cancellation
-        if error is not None and not claim_installed:
-            raise error
-        if not claim_installed:
-            return None
-        assert claim_expires_at is not None
-        process_control = _terminal_finalization_process_control(error)
-        return _TerminalFinalizationClaimAcquisition(
-            claim_id=claim_id,
-            claim_expires_at=claim_expires_at,
-            transfer_failure=(
-                None
-                if process_control is None or error is None
-                else _terminal_finalization_failure_without_identity(
-                    error,
-                    process_control,
-                )
-            ),
-            process_control=process_control,
-        )
-
-    def _start_preclaimed_terminal_evidence_heartbeat(
-        self,
-        *,
-        session_id: str,
-        claim_id: str,
-        local_lease_deadline: float,
-    ) -> tuple[asyncio.Event, asyncio.Task[None]]:
-        """Retain a live claim from atomic interrupt until its run handler owns it."""
-
-        stop = asyncio.Event()
-        heartbeat = asyncio.create_task(
-            self._heartbeat_incomplete_recovery_claim(
-                session_id=session_id,
-                claim_id=claim_id,
-                local_lease_deadline=local_lease_deadline,
-                stop=stop,
-            ),
-            name=f"cayu-terminal-finalization-heartbeat:{session_id}",
-        )
-        return stop, heartbeat
-
-    async def _await_preclaimed_terminal_evidence_operation(
-        self,
-        *,
-        heartbeat_task: asyncio.Task[None],
-        operation: Callable[[], Awaitable[_RecoveryResultT]],
-        operation_name: str,
-    ) -> _RecoveryResultT:
-        """Run one pre-finalization operation only while its keeper is live."""
-
-        operation_task = asyncio.create_task(capture_awaitable_outcome(operation))
-        try:
-            done, _pending = await asyncio.wait(
-                {operation_task, heartbeat_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-        except BaseException as caller_control:
-            if not operation_task.done():
-                operation_task.cancel()
-            await asyncio.gather(operation_task, return_exceptions=True)
-            operation_failure: BaseException | None = None
-            if not operation_task.cancelled():
-                captured = operation_task.result()
-                if not isinstance(captured.error, asyncio.CancelledError):
-                    operation_failure = captured.error
-            if (
-                operation_failure is not None
-                and operation_failure is not caller_control
-                and not _attach_exception_cause_preserving_graph(
-                    caller_control,
-                    operation_failure,
-                )
-            ):
-                raise BaseExceptionGroup(
-                    f"{operation_name} and caller control failed concurrently.",
-                    [caller_control, operation_failure],
-                ) from None
-            raise
-        if heartbeat_task in done:
-            try:
-                heartbeat_failure = heartbeat_task.exception()
-            except asyncio.CancelledError as cancellation:
-                heartbeat_failure = unexpected_child_cancellation_error(
-                    cancellation,
-                    operation="Terminal finalization claim heartbeat",
-                )
-            if heartbeat_failure is None:
-                heartbeat_failure = RuntimeError(
-                    "Terminal finalization claim heartbeat stopped unexpectedly."
-                )
-            if not operation_task.done():
-                operation_task.cancel()
-            await asyncio.gather(operation_task, return_exceptions=True)
-            operation_failure: BaseException | None = None
-            if not operation_task.cancelled():
-                captured = operation_task.result()
-                if not isinstance(captured.error, asyncio.CancelledError):
-                    operation_failure = captured.error
-            if operation_failure is not None and operation_failure is not heartbeat_failure:
-                raise heartbeat_failure from operation_failure
-            raise heartbeat_failure
-        captured = operation_task.result()
-        if captured.error is not None:
-            raise captured.error
-        return cast("_RecoveryResultT", captured.result)
-
-    async def _renew_terminal_evidence_finalization_claim(
-        self,
-        *,
-        session: Session,
-        claim_id: str,
-        expected_payload: dict[str, Any],
-    ) -> tuple[Session, datetime, float] | None:
-        """Atomically re-prove and renew the complete terminal owner tuple."""
-
-        expected_payload = copy_json_value(
-            expected_payload,
-            "expected_pending_session_interrupt",
-        )
-        renewed: tuple[Session, datetime] | None = None
-
-        def renew_exact_claim(
-            current_session: Session,
-            checkpoint: dict[str, Any] | None,
-            store_now: datetime,
-        ) -> dict[str, Any] | None:
-            nonlocal renewed
-            if (
-                current_session.id != session.id
-                or current_session.instance_id != session.instance_id
-                or current_session.status is not session.status
-                or current_session.run_epoch != session.run_epoch
-            ):
-                raise SessionRuntimePublicationConflict(
-                    "Terminal finalization session authority changed before lease renewal."
-                )
-            current_payload = (
-                None
-                if checkpoint is None
-                else checkpoint.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
-            )
-            if current_payload != expected_payload:
-                raise SessionRuntimePublicationConflict(
-                    "Terminal finalization interrupt identity changed before lease renewal."
-                )
-            existing = _incomplete_recovery_claim_from_checkpoint(checkpoint)
-            if existing is None or existing[0] != claim_id or existing[1] <= store_now:
-                return None
-            assert checkpoint is not None
-            updated = copy_durable_record(checkpoint, "checkpoint")
-            marker = copy_json_value(
-                updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY],
-                "terminal_finalization_claim",
-            )
-            renewed_until = store_now + _INCOMPLETE_RECOVERY_CLAIM_LEASE
-            marker["claim_expires_at"] = renewed_until.isoformat()
-            marker["renewed_at"] = store_now.isoformat()
-            updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = marker
-            renewed = (current_session.model_copy(deep=True), renewed_until)
-            return updated
-
-        renewal_started = time.monotonic()
-        await self._session_store.transform_checkpoint_with_store_time(
-            session.id, renew_exact_claim
-        )
-        if renewed is None:
-            return None
-        local_lease_deadline = renewal_started + _INCOMPLETE_RECOVERY_CLAIM_LEASE.total_seconds()
-        _require_live_incomplete_recovery_claim_acknowledgement(
-            session_id=session.id,
-            local_lease_deadline=local_lease_deadline,
-        )
-        return renewed[0], renewed[1], local_lease_deadline
-
-    async def _run_preclaimed_terminal_evidence_finalization(
-        self,
-        *,
-        session: Session,
-        claim_id: str,
-        expected_payload: dict[str, Any],
-        finalization: Callable[[], Awaitable[_RecoveryResultT]],
-    ) -> _RecoveryResultT:
-        """Run the live finalizer under the same lease used by crash recovery."""
-
-        owned_claim = await self._renew_terminal_evidence_finalization_claim(
-            session=session,
-            claim_id=claim_id,
-            expected_payload=expected_payload,
-        )
-        if owned_claim is None:
-            raise _IncompleteRecoveryClaimLost(
-                "Terminal evidence finalization ownership changed before execution."
-            )
-        owned_session, current_claim_expires_at, local_lease_deadline = owned_claim
-        claim = _IncompleteRecoveryClaim(
-            claim_id=claim_id,
-            claim_expires_at=current_claim_expires_at,
-            local_lease_deadline=local_lease_deadline,
-            session_before_fence=owned_session,
-            session=owned_session,
-        )
-        authoritative_failure: BaseException | None = None
-        try:
-            return await self._recover_incomplete_session_with_heartbeat(
-                claim=claim,
-                recovery=finalization,
-            )
-        except BaseException as exc:
-            authoritative_failure = exc
-            raise
-        finally:
-            await self._run_cleanup_steps(
-                authoritative_failure=authoritative_failure,
-                steps=(
-                    (
-                        "terminal evidence finalization claim release",
-                        lambda: self._release_incomplete_recovery_claim(
-                            session.id,
-                            claim_id,
-                        ),
-                    ),
-                ),
-            )
-
-    async def _stream_preclaimed_terminal_evidence_finalization(
-        self,
-        *,
-        session: Session,
-        claim_id: str,
-        expected_payload: dict[str, Any],
-        finalization: AsyncIterator[_RecoveryResultT],
-    ) -> AsyncGenerator[_RecoveryResultT, None]:
-        """Stream a live finalizer while retaining its durable lease."""
-
-        events: asyncio.Queue[_RecoveryResultT] = asyncio.Queue(maxsize=1)
-        observer_closed = False
-
-        async def collect_finalization() -> bool:
-            try:
-                async for item in finalization:
-                    if not observer_closed:
-                        await events.put(item)
-                return True
-            finally:
-                close = getattr(finalization, "aclose", None)
-                if close is not None:
-                    await close()
-
-        async def run_owned_finalization() -> CapturedAwaitableOutcome[bool]:
-            return await capture_awaitable_outcome(
-                lambda: self._run_preclaimed_terminal_evidence_finalization(
-                    session=session,
-                    claim_id=claim_id,
-                    expected_payload=expected_payload,
-                    finalization=collect_finalization,
-                )
-            )
-
-        owner = asyncio.create_task(run_owned_finalization())
-        owner_outcome_observed = False
-        pending_get: asyncio.Task[_RecoveryResultT] | None = None
-
-        def require_owner_outcome() -> None:
-            nonlocal owner_outcome_observed
-            captured = owner.result()
-            owner_outcome_observed = True
-            if captured.error is not None:
-                raise captured.error
-            if captured.result is not True:
-                raise RuntimeError("Owned terminal stream returned no completion result.")
-
-        async def stop_owner() -> None:
-            if pending_get is not None and not pending_get.done():
-                pending_get.cancel()
-            if not owner.done():
-                owner.cancel()
-            await asyncio.gather(
-                *(task for task in (pending_get, owner) if task is not None),
-                return_exceptions=True,
-            )
-            if owner_outcome_observed or owner.cancelled():
-                return
-            captured = owner.result()
-            if captured.error is None:
-                return
-            if isinstance(captured.error, asyncio.CancelledError):
-                secondary = exception_cause(captured.error)
-                if secondary is not None:
-                    raise secondary
-                return
-            raise captured.error
-
-        authoritative_failure: BaseException | None = None
-        try:
-            while True:
-                if not events.empty():
-                    yield events.get_nowait()
-                    continue
-                if owner.done():
-                    require_owner_outcome()
-                    return
-                pending_get = asyncio.create_task(events.get())
-                done, _pending = await asyncio.wait(
-                    {pending_get, owner},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if pending_get in done:
-                    item = pending_get.result()
-                    pending_get = None
-                    yield item
-                    continue
-                pending_get.cancel()
-                await asyncio.gather(pending_get, return_exceptions=True)
-                pending_get = None
-                require_owner_outcome()
-        except BaseException as exc:
-            authoritative_failure = exc
-            raise
-        finally:
-            # Delivery backpressure belongs to the observer, not the durable
-            # finalizer. Once abandoned, drain the one bounded slot to unblock
-            # an already-waiting put; later items must not queue for a consumer
-            # that no longer exists. Native publication/cleanup still runs under
-            # the retained worker and claim until positive settlement.
-            observer_closed = True
-            while not events.empty():
-                events.get_nowait()
-            await self._run_cleanup_steps(
-                authoritative_failure=authoritative_failure,
-                steps=(("terminal evidence stream owner shutdown", stop_owner),),
-            )
 
     async def _claim_incomplete_recovery(
         self,

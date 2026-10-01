@@ -1,4 +1,6 @@
 {
+    "tests/core/test_recovery_coordinator.py::test_live_finalization_shares_recovery_claim_until_work_settles[cancel]": 0.003357917070388794,
+    "tests/core/test_recovery_coordinator.py::test_live_finalization_shares_recovery_claim_until_work_settles[close]": 0.341721624834463,
     "tests/core/test_session_execution_presence.py::test_execution_config_rejects_unbounded_intervals_and_secret_labels": 0.0029574170475825667,
     "tests/core/test_session_execution_presence.py::test_expired_owner_cannot_renew_or_block_existing_fenced_recovery[memory]": 0.40555329190101475,
     "tests/core/test_session_execution_presence.py::test_expired_owner_cannot_renew_or_block_existing_fenced_recovery[postgres]": 5.586364167043939,

@@ -8556,7 +8556,7 @@ def test_session_store_conformance_settles_replacement_claim_when_terminal_event
             assert "incomplete_session_recovery_claim" not in checkpoint
 
             recovery = engine._recovery_coordinator
-            original_renewal = recovery._renew_terminal_evidence_finalization_claim
+            original_renewal = recovery.terminal_finalization.renew_claim
             persisted_event: Event | None = None
 
             async def publish_terminal_after_replacement_renewal(*args, **kwargs):
@@ -8581,7 +8581,7 @@ def test_session_store_conformance_settles_replacement_claim_when_terminal_event
                 return renewal
 
             original_cancel_active_runs = engine._session_control.cancel_active_runs
-            recovery._renew_terminal_evidence_finalization_claim = (  # type: ignore[method-assign]
+            recovery.terminal_finalization.renew_claim = (  # type: ignore[method-assign]
                 publish_terminal_after_replacement_renewal
             )
             engine._session_control.cancel_active_runs = (  # type: ignore[method-assign]
@@ -8591,7 +8591,7 @@ def test_session_store_conformance_settles_replacement_claim_when_terminal_event
                 with session_engine_module.suppress_interruption_cascade():
                     replayed = await _collect_events(app.interrupt_session(request))
             finally:
-                recovery._renew_terminal_evidence_finalization_claim = (  # type: ignore[method-assign]
+                recovery.terminal_finalization.renew_claim = (  # type: ignore[method-assign]
                     original_renewal
                 )
                 engine._session_control.cancel_active_runs = (  # type: ignore[method-assign]
@@ -9315,7 +9315,7 @@ def test_session_store_conformance_reconstructs_active_user_input_supersession(
                 )
                 claim_entered = asyncio.Event()
                 original_transfer = (
-                    peer_app._recovery_coordinator._claim_pending_terminal_evidence_finalization
+                    peer_app._recovery_coordinator.terminal_finalization.claim_pending
                 )
 
                 async def transfer_after_live_settlement(**kwargs):
@@ -9378,8 +9378,8 @@ def test_session_store_conformance_reconstructs_active_user_input_supersession(
                     return result
 
                 monkeypatch.setattr(
-                    peer_app._recovery_coordinator,
-                    "_claim_pending_terminal_evidence_finalization",
+                    peer_app._recovery_coordinator.terminal_finalization,
+                    "claim_pending",
                     transfer_after_live_settlement,
                 )
                 retrying = asyncio.create_task(_collect_events(peer_app.interrupt_session(request)))

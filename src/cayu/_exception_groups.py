@@ -309,3 +309,55 @@ def add_exception_note_safely(error: BaseException, note: str) -> bool:
     except BaseException:
         return False
     return True
+
+
+def _exception_graph_contains_identity(
+    error: BaseException,
+    target: BaseException,
+) -> bool:
+    """Inspect one base-owned exception graph without invoking extension accessors."""
+
+    pending = [error]
+    visited: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        if candidate is target:
+            return True
+        candidate_id = id(candidate)
+        if candidate_id in visited:
+            continue
+        visited.add(candidate_id)
+        if isinstance(candidate, BaseExceptionGroup):
+            children = exception_group_children(candidate)
+            if children is not None:
+                pending.extend(children)
+        cause = exception_cause(candidate)
+        if cause is not None:
+            pending.append(cause)
+        elif not exception_suppresses_context(candidate):
+            context = exception_context(candidate)
+            if context is not None:
+                pending.append(context)
+    return False
+
+
+def _attach_exception_cause_preserving_graph(
+    error: BaseException,
+    cause: BaseException,
+) -> bool:
+    """Attach one cause without mutating it or discarding either existing graph."""
+
+    if _exception_graph_contains_identity(error, cause):
+        return True
+    existing = exception_cause(error)
+    if existing is None and not exception_suppresses_context(error):
+        existing = exception_context(error)
+    if existing is None:
+        return set_exception_cause(error, cause)
+    if _exception_graph_contains_identity(cause, existing):
+        return set_exception_cause(error, cause)
+    combined = BaseExceptionGroup(
+        "Continuation recovery retained prior and concurrent failure evidence",
+        [cause, existing],
+    )
+    return set_exception_cause(error, combined)

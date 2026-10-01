@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 import cayu.sessions.base as sessions_module
+from cayu._exception_groups import _exception_graph_contains_identity
 from cayu.applications import CayuApp
 from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
 from cayu.budgets.base import BudgetLimit
@@ -1105,7 +1106,7 @@ def test_terminal_finalization_claim_uses_store_time_under_worker_clock_skew() -
             clock=lambda: worker_time["value"],
             enable_logging=False,
         )
-        claim = await app._recovery_coordinator._claim_pending_terminal_evidence_finalization(
+        claim = await app._recovery_coordinator.terminal_finalization.claim_pending(
             session=session,
             expected_payload=payload,
         )
@@ -1115,7 +1116,7 @@ def test_terminal_finalization_claim_uses_store_time_under_worker_clock_skew() -
         worker_time["value"] = datetime(2000, 1, 1, tzinfo=UTC)
         store_time["value"] += timedelta(minutes=6)
         assert (
-            await app._recovery_coordinator._renew_terminal_evidence_finalization_claim(
+            await app._recovery_coordinator.terminal_finalization.renew_claim(
                 session=session,
                 claim_id=claim.claim_id,
                 expected_payload=payload,
@@ -1597,7 +1598,7 @@ def test_incomplete_recovery_fatal_settlement_wins_over_lease_loss(
         with pytest.raises(GeneratorExit) as raised:
             await owner
         assert raised.value is fatal
-        assert recovery_coordinator._exception_graph_contains_identity(fatal, lease_failure)
+        assert _exception_graph_contains_identity(fatal, lease_failure)
         return fatal, lease_failure
 
     fatal, lease_failure = asyncio.run(scenario())
@@ -1767,7 +1768,7 @@ def test_preclaimed_terminal_operation_cancellation_drains_opaque_work() -> None
             return "settled"
 
         owner = asyncio.create_task(
-            app._recovery_coordinator._await_preclaimed_terminal_evidence_operation(
+            app._recovery_coordinator.terminal_finalization.await_operation(
                 heartbeat_task=heartbeat,
                 operation=lambda: asyncio.to_thread(opaque_work),
                 operation_name="terminal opaque work",
@@ -1785,5 +1786,103 @@ def test_preclaimed_terminal_operation_cancellation_drains_opaque_work() -> None
         assert owner.cancelling() == 1
         heartbeat.cancel()
         await asyncio.gather(heartbeat, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("observer_exit", ["close", "cancel"])
+def test_live_finalization_shares_recovery_claim_until_work_settles(observer_exit):
+    async def scenario():
+        store = InMemorySessionStore()
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="shared-terminal-finalization",
+                messages=[Message.text("user", "interrupt")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        session = await store.update_status(session.id, SessionStatus.INTERRUPTED)
+        payload = {
+            "reason": "operator",
+            "interruption_type": "operator_requested",
+            "interruption_request_id": "shared-finalization-request",
+        }
+        await store.checkpoint(session.id, {"pending_session_interrupt": payload})
+        app = CayuApp(session_store=store, enable_logging=False)
+        recovery = app._recovery_coordinator
+        owner = recovery.terminal_finalization
+        acquisition = await owner.claim_pending(session=session, expected_payload=payload)
+        assert acquisition is not None and not isinstance(acquisition, Event)
+        finish = asyncio.Event()
+        work_settled = asyncio.Event()
+        competing_work_dispatched = False
+
+        async def finalization():
+            yield "first"
+            await finish.wait()
+            yield "last"
+            work_settled.set()
+
+        async def competing_work():
+            nonlocal competing_work_dispatched
+            competing_work_dispatched = True
+            return True
+
+        stream = owner.stream(
+            session=session,
+            claim_id=acquisition.claim_id,
+            expected_payload=payload,
+            finalization=finalization(),
+        )
+        release = None
+        observer = None
+        try:
+            assert await asyncio.wait_for(anext(stream), timeout=5) == "first"
+            with pytest.raises(RuntimeError, match="already has active workers"):
+                await recovery._recover_incomplete_session_with_heartbeat(
+                    claim=recovery_coordinator._IncompleteRecoveryClaim(
+                        claim_id=acquisition.claim_id,
+                        claim_expires_at=acquisition.claim_expires_at,
+                        local_lease_deadline=time.monotonic() + 30,
+                        session_before_fence=session,
+                        session=session,
+                    ),
+                    recovery=competing_work,
+                )
+            assert not competing_work_dispatched
+            release = asyncio.create_task(
+                recovery._release_incomplete_recovery_claim(session.id, acquisition.claim_id)
+            )
+            if observer_exit == "close":
+                observer = asyncio.create_task(stream.aclose())
+            else:
+                observer = asyncio.create_task(anext(stream))
+                await asyncio.sleep(0)
+                observer.cancel("stop observing terminal finalization")
+            await asyncio.sleep(0)
+            assert not release.done() and not work_settled.is_set()
+            checkpoint = await store.load_checkpoint(session.id)
+            assert checkpoint["incomplete_session_recovery_claim"]["claim_id"] == (
+                acquisition.claim_id
+            )
+            finish.set()
+            if observer_exit == "cancel":
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(observer, timeout=5)
+            else:
+                await asyncio.wait_for(observer, timeout=5)
+            await asyncio.wait_for(release, timeout=5)
+            assert work_settled.is_set()
+            checkpoint = await store.load_checkpoint(session.id)
+            assert "incomplete_session_recovery_claim" not in checkpoint
+            assert checkpoint["pending_session_interrupt"] == payload
+        finally:
+            finish.set()
+            await asyncio.gather(
+                *(task for task in (observer, release) if task is not None),
+                return_exceptions=True,
+            )
+            await stream.aclose()
 
     asyncio.run(scenario())

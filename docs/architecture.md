@@ -173,6 +173,13 @@ continuations, manual outcome reconciliation, incomplete-session repair, and
 abandoned-run finalization. Model, tool, environment, limit, control, and event
 modules own their complete lower-level behavior slices.
 
+`TerminalEvidenceFinalization` owns live terminal claim transfer, exact renewal,
+heartbeat-monitored preparation and streamed completion. Recovery and the engine
+share one instance. It borrows recovery's existing claim supervisor, cleanup
+supervisor and worker registry, so closing an observer cannot release a claim
+while its work is still active. Shared claim records live in `_recovery_claims.py`;
+crash-repair inspection and approval/user-input authority remain with recovery.
+
 `ToolRoundExecutor` delegates ordinary tool-round publication to
 `DurableToolRound`. The owner reserves capacity for private terminal stages before
 dispatch, retains the round's lifecycle evidence, and publishes staged results in

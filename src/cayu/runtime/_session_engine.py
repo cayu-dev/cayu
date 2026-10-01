@@ -5187,6 +5187,7 @@ class SessionEngine:
         self._request_footprint = copy_request_footprint_config(request_footprint)
         self._tool_round_executor = tool_round_executor
         self._recovery_coordinator = recovery_coordinator
+        self._terminal_finalization = recovery_coordinator.terminal_finalization
         self._startup_recovery_result = StartupRecoveryResult()
         if type(recovery_cleanup_supervisor) is not RecoveryCleanupSupervisor:
             raise TypeError("recovery_cleanup_supervisor must be a RecoveryCleanupSupervisor.")
@@ -19333,9 +19334,7 @@ class SessionEngine:
         terminal_finalization_heartbeat_task: asyncio.Task[None] | None = None
         terminal_finalization_claim_retained_for_recovery = False
         if adopted_user_input_interrupt_payload is None:
-            terminal_finalization_claim_id = (
-                self._recovery_coordinator._new_terminal_evidence_finalization_claim()
-            )
+            terminal_finalization_claim_id = self._terminal_finalization.new_claim_id()
         interruption_request_id = interruption_request_id_from_payload(interrupt_payload)
         if interruption_request_id is None:
             raise SessionRuntimePublicationConflict(
@@ -19529,7 +19528,7 @@ class SessionEngine:
             heartbeat_task = terminal_finalization_heartbeat_task
             if heartbeat_task is None:
                 return await operation()
-            return await self._recovery_coordinator._await_preclaimed_terminal_evidence_operation(
+            return await self._terminal_finalization.await_operation(
                 heartbeat_task=heartbeat_task,
                 operation=operation,
                 operation_name=operation_name,
@@ -19787,11 +19786,9 @@ class SessionEngine:
                             raise
             else:
                 session = loaded_session
-                transferred_claim = await (
-                    self._recovery_coordinator._claim_pending_terminal_evidence_finalization(
-                        session=session,
-                        expected_payload=interrupt_payload,
-                    )
+                transferred_claim = await self._terminal_finalization.claim_pending(
+                    session=session,
+                    expected_payload=interrupt_payload,
                 )
                 if transferred_claim is None or isinstance(transferred_claim, Event):
                     if isinstance(transferred_claim, Event):
@@ -19852,12 +19849,10 @@ class SessionEngine:
                 )
                 if claim_owns_user_input_supersession:
                     assert type(persisted_payload) is dict
-                    renewed_claim = await (
-                        self._recovery_coordinator._renew_terminal_evidence_finalization_claim(
-                            session=session,
-                            claim_id=terminal_finalization_claim_id,
-                            expected_payload=persisted_payload,
-                        )
+                    renewed_claim = await self._terminal_finalization.renew_claim(
+                        session=session,
+                        claim_id=terminal_finalization_claim_id,
+                        expected_payload=persisted_payload,
                     )
                     if renewed_claim is None:
                         terminal_finalization_claim_retained_for_recovery = True
@@ -19872,7 +19867,7 @@ class SessionEngine:
                     (
                         terminal_finalization_heartbeat_stop,
                         terminal_finalization_heartbeat_task,
-                    ) = self._recovery_coordinator._start_preclaimed_terminal_evidence_heartbeat(
+                    ) = self._terminal_finalization.start_heartbeat(
                         session_id=session.id,
                         claim_id=terminal_finalization_claim_id,
                         local_lease_deadline=terminal_finalization_local_lease_deadline,
@@ -20366,11 +20361,9 @@ class SessionEngine:
                     terminal_finalization_claim_id is None
                     or terminal_finalization_claim_expires_at is None
                 ):
-                    transferred_claim = await (
-                        self._recovery_coordinator._claim_pending_terminal_evidence_finalization(
-                            session=session,
-                            expected_payload=payload,
-                        )
+                    transferred_claim = await self._terminal_finalization.claim_pending(
+                        session=session,
+                        expected_payload=payload,
                     )
                     if isinstance(transferred_claim, Event):
                         yield transferred_claim
@@ -20405,12 +20398,10 @@ class SessionEngine:
                     terminal_finalization_claim_id is not None
                     and terminal_finalization_claim_expires_at is not None
                 ):
-                    renewed_claim = await (
-                        self._recovery_coordinator._renew_terminal_evidence_finalization_claim(
-                            session=session,
-                            claim_id=terminal_finalization_claim_id,
-                            expected_payload=payload,
-                        )
+                    renewed_claim = await self._terminal_finalization.renew_claim(
+                        session=session,
+                        claim_id=terminal_finalization_claim_id,
+                        expected_payload=payload,
                     )
                     if renewed_claim is None:
                         terminal_finalization_claim_retained_for_recovery = True
@@ -20431,7 +20422,7 @@ class SessionEngine:
                         # would misclassify its successful release as lease loss.
                         owned_finalization = finalize_terminal_interruption()
                     else:
-                        owned_finalization = self._recovery_coordinator._stream_preclaimed_terminal_evidence_finalization(
+                        owned_finalization = self._terminal_finalization.stream(
                             session=session,
                             claim_id=terminal_finalization_claim_id,
                             expected_payload=payload,
@@ -31382,7 +31373,7 @@ class SessionEngine:
         ) -> _OperationResultT:
             if terminal_finalization_handoff is None:
                 return await operation()
-            return await self._recovery_coordinator._await_preclaimed_terminal_evidence_operation(
+            return await self._terminal_finalization.await_operation(
                 heartbeat_task=terminal_finalization_handoff.heartbeat_task,
                 operation=operation,
                 operation_name=operation_name,
@@ -31465,12 +31456,10 @@ class SessionEngine:
                     shared_claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
                     joined_claim = None
                     if shared_claim is not None:
-                        joined_claim = await (
-                            self._recovery_coordinator._renew_terminal_evidence_finalization_claim(
-                                session=loaded_interrupted,
-                                claim_id=shared_claim[0],
-                                expected_payload=authenticated_payload,
-                            )
+                        joined_claim = await self._terminal_finalization.renew_claim(
+                            session=loaded_interrupted,
+                            claim_id=shared_claim[0],
+                            expected_payload=authenticated_payload,
                         )
                     if joined_claim is not None:
                         assert current_task is not None
@@ -31481,7 +31470,7 @@ class SessionEngine:
                             joined_local_lease_deadline,
                         ) = joined_claim
                         heartbeat_stop, heartbeat_task = (
-                            self._recovery_coordinator._start_preclaimed_terminal_evidence_heartbeat(
+                            self._terminal_finalization.start_heartbeat(
                                 session_id=session.id,
                                 claim_id=shared_claim[0],
                                 local_lease_deadline=joined_local_lease_deadline,
@@ -31543,12 +31532,10 @@ class SessionEngine:
                     raise SessionRuntimePublicationConflict(
                         "User-input supersession changed after its live finalization handoff."
                     )
-                renewed_claim = await (
-                    self._recovery_coordinator._renew_terminal_evidence_finalization_claim(
-                        session=loaded_interrupted,
-                        claim_id=terminal_finalization_handoff.claim_id,
-                        expected_payload=terminal_finalization_handoff.expected_interrupt_payload,
-                    )
+                renewed_claim = await self._terminal_finalization.renew_claim(
+                    session=loaded_interrupted,
+                    claim_id=terminal_finalization_handoff.claim_id,
+                    expected_payload=terminal_finalization_handoff.expected_interrupt_payload,
                 )
                 if renewed_claim is None:
                     raise _IncompleteRecoveryClaimLost(
@@ -32009,12 +31996,10 @@ class SessionEngine:
                     raise RuntimeError(
                         "User-input supersession finalization lost its durable owner."
                     )
-                renewed_claim = await (
-                    self._recovery_coordinator._renew_terminal_evidence_finalization_claim(
-                        session=loaded_interrupted,
-                        claim_id=terminal_finalization_claim_id,
-                        expected_payload=payload,
-                    )
+                renewed_claim = await self._terminal_finalization.renew_claim(
+                    session=loaded_interrupted,
+                    claim_id=terminal_finalization_claim_id,
+                    expected_payload=payload,
                 )
                 if renewed_claim is None:
                     raise _IncompleteRecoveryClaimLost(
@@ -32030,7 +32015,7 @@ class SessionEngine:
                 owned_finalization = (
                     finalize_interrupted_session()
                     if borrowed_terminal_finalization
-                    else self._recovery_coordinator._stream_preclaimed_terminal_evidence_finalization(
+                    else self._terminal_finalization.stream(
                         session=loaded_interrupted,
                         claim_id=terminal_finalization_claim_id,
                         expected_payload=payload,
