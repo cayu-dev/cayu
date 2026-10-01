@@ -71,12 +71,16 @@ class Noop(Tool):
 
 async def run_once(configuration, backend, path):
     store = SQLiteSessionStore(path) if backend == "sqlite" else InMemorySessionStore()
-    options = {}
-    if configuration != "baseline":
+    if configuration == "baseline":
+        app = CayuApp(session_store=store, enable_logging=False)
+    else:
         from cayu import RuntimeTimingConfig
 
-        options["runtime_timing"] = RuntimeTimingConfig(enabled=configuration == "enabled")
-    app = CayuApp(session_store=store, enable_logging=False, **options)
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            runtime_timing=RuntimeTimingConfig(enabled=configuration == "enabled"),
+        )
     app.register_provider(Provider(), default=True)
     app.register_agent(AgentSpec(name="benchmark", model="local"), tools=[Noop()])
     started = perf_counter()

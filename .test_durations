@@ -41250,5 +41250,12 @@
     "tests/core/test_runtime_phase_timing.py::test_timing_adds_no_durable_writes_and_disabled_path_has_no_records": 2.049506625000504,
     "tests/core/test_runtime_phase_timing.py::test_timing_sink_failure_cannot_change_work_or_inherit_runtime_context[cancel]": 1.0065307910008414,
     "tests/core/test_runtime_phase_timing.py::test_timing_sink_failure_cannot_change_work_or_inherit_runtime_context[exception]": 1.0067064569957438,
-    "tests/core/test_runtime_phase_timing.py::test_timing_sink_failure_cannot_change_work_or_inherit_runtime_context[timeout]": 1.092829958000948
+    "tests/core/test_runtime_phase_timing.py::test_timing_sink_failure_cannot_change_work_or_inherit_runtime_context[timeout]": 1.092829958000948,
+    "tests/core/test_execution_owner_context.py::test_execution_cancellation_restores_the_caller_context_after_cleanup[coroutine]": 0.0005816660050186329,
+    "tests/core/test_execution_owner_context.py::test_execution_cancellation_restores_the_caller_context_after_cleanup[stream]": 0.0004718749987659976,
+    "tests/core/test_execution_owner_context.py::test_execution_stream_forwards_send_and_throw_under_its_owner_context": 0.0004892500001005828,
+    "tests/core/test_execution_owner_context.py::test_rejected_execution_does_not_keep_the_original_request[keyword-coroutine]": 0.11918983299983665,
+    "tests/core/test_execution_owner_context.py::test_rejected_execution_does_not_keep_the_original_request[keyword-stream]": 0.1218670829985058,
+    "tests/core/test_execution_owner_context.py::test_rejected_execution_does_not_keep_the_original_request[positional-coroutine]": 0.10983129100350197,
+    "tests/core/test_execution_owner_context.py::test_rejected_execution_does_not_keep_the_original_request[positional-stream]": 0.12679475199547596
 }

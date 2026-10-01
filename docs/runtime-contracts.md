@@ -8910,8 +8910,7 @@ with matching pause, round, call, tool, idempotency key, limit and result identi
 A start event, duplicate terminal, conflicting identity or non-skip result still
 rejects reconciliation. The retained transcript must match the terminal results.
 The same public `resume` path reconciles these histories without rewriting events,
-creating a start event, or executing the skipped effect. The separate policy-denied
-sibling acknowledgement-loss case is tracked in [#1900](https://github.com/cayu-tech/cayu/issues/1900).
+creating a start event, or executing the skipped effect.
 
 Budget limits are estimates, not billing records. They use normalized usage
 metrics and the app's pricing table. By default, a request-scoped interrupt

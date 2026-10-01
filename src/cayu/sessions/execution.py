@@ -191,25 +191,55 @@ def execution_owned_by(kind: ExecutionOwnerKind):
 
             @wraps(function)
             async def stream(*args, **kwargs):
-                iterator = function(*args, **kwargs)
                 try:
+                    iterator = function(*args, **kwargs)
+                finally:
+                    # The entry point owns request lifetime and sanitization.
+                    # Do not retain another copy in this wrapper's traceback.
+                    del args, kwargs
+                try:
+                    step = anext(iterator)
                     while True:
                         with execution_owner_kind(kind):
                             try:
-                                event = await anext(iterator)
+                                event = await step
                             except StopAsyncIteration:
-                                break
-                        yield event
+                                return
+                            finally:
+                                del step
+                        try:
+                            sent = yield event
+                        except GeneratorExit:
+                            raise
+                        except BaseException as error:
+                            # Let the delegated stream preserve the consumer's
+                            # failure together with any cleanup failure.
+                            step = iterator.athrow(error)
+                        else:
+                            step = iterator.asend(sent)
+                            del sent
+                        finally:
+                            del event
                 finally:
-                    with execution_owner_kind(kind):
-                        await iterator.aclose()
+                    try:
+                        with execution_owner_kind(kind):
+                            await iterator.aclose()
+                    finally:
+                        del iterator
 
             return stream
 
         @wraps(function)
         async def call(*args, **kwargs):
-            with execution_owner_kind(kind):
-                return await function(*args, **kwargs)
+            try:
+                operation = function(*args, **kwargs)
+            finally:
+                del args, kwargs
+            try:
+                with execution_owner_kind(kind):
+                    return await operation
+            finally:
+                del operation
 
         return call
 
