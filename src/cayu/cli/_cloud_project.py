@@ -13,7 +13,7 @@ import stat
 import subprocess
 import tarfile
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
@@ -57,6 +57,8 @@ def is_application_slug(value: str) -> bool:
 @dataclass(frozen=True)
 class CloudProcess:
     command: str
+    cpu_millis: int | None = field(default=None, kw_only=True)
+    memory_mb: int | None = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,19 @@ class CloudSchedule:
     name: str
     command: str
     expression: str
+    cpu_millis: int | None = None
+    memory_mb: int | None = None
+
+
+def _process_resources(payload: dict[str, object]) -> dict[str, int]:
+    resources = {}
+    for name, minimum, maximum in (("cpu_millis", 100, 16_000), ("memory_mb", 128, 131_072)):
+        value = payload.get(name)
+        if value is not None:
+            if type(value) is not int or not minimum <= value <= maximum:
+                raise CloudApiError("manifest_invalid", f"Runtime process {name} is invalid.")
+            resources[name] = value
+    return resources
 
 
 @dataclass(frozen=True)
@@ -162,15 +177,37 @@ class CloudProjectManifest:
                 for key, value in runtime_environment.items()
             ):
                 raise TypeError("env must be a string table")
+            schedule_tables = [item for item in schedules if isinstance(item, dict)]
+            for table_name, table, model in (
+                ("web", web, CloudWebProcess),
+                ("worker", worker, CloudProcess),
+                *(
+                    (
+                        f'schedule "{item["name"]}"'
+                        if type(item.get("name")) is str and item["name"]
+                        else f"schedules[{index}]",
+                        item,
+                        CloudSchedule,
+                    )
+                    for index, item in enumerate(schedule_tables)
+                ),
+            ):
+                if table is not None:
+                    unknown = set(table) - {item.name for item in fields(model)}
+                    if unknown:
+                        raise CloudApiError(
+                            "manifest_invalid",
+                            f"{table_name} contains unsupported fields: {', '.join(sorted(unknown))}.",
+                        )
             manifest = cls(
                 application=application,
                 name=str(payload["name"]),
                 version=str(payload["version"]),
                 entrypoint=str(payload["entrypoint"]),
                 capabilities=tuple(payload["capabilities"]),
-                cpu_millis=int(payload["cpu_millis"]),
-                memory_mb=int(payload["memory_mb"]),
-                timeout_seconds=int(payload["timeout_seconds"]),
+                cpu_millis=payload["cpu_millis"],
+                memory_mb=payload["memory_mb"],
+                timeout_seconds=payload["timeout_seconds"],
                 environment=str(payload["environment"]),
                 compatibility=str(payload["compatibility"]),
                 policy_version=str(payload["policy_version"]),
@@ -179,20 +216,26 @@ class CloudProjectManifest:
                     if web is None
                     else CloudWebProcess(
                         command=str(web["command"]),
-                        port=int(web["port"]),
+                        **_process_resources(web),
+                        port=web["port"],
                         idle_timeout_seconds=(
                             None
                             if web.get("idle_timeout_seconds") is None
-                            else int(web["idle_timeout_seconds"])
+                            else web["idle_timeout_seconds"]
                         ),
                     )
                 ),
-                worker=(None if worker is None else CloudProcess(command=str(worker["command"]))),
+                worker=(
+                    None
+                    if worker is None
+                    else CloudProcess(command=str(worker["command"]), **_process_resources(worker))
+                ),
                 schedules=tuple(
                     CloudSchedule(
                         name=str(item["name"]),
                         command=str(item["command"]),
                         expression=str(item["expression"]),
+                        **_process_resources(item),
                     )
                     for item in schedules
                 ),
@@ -229,11 +272,11 @@ class CloudProjectManifest:
             )
         ):
             raise CloudApiError("manifest_invalid", "Manifest capabilities are invalid.")
-        if not 100 <= self.cpu_millis <= 16_000:
+        if type(self.cpu_millis) is not int or not 100 <= self.cpu_millis <= 16_000:
             raise CloudApiError("manifest_invalid", "Manifest cpu_millis is invalid.")
-        if not 128 <= self.memory_mb <= 131_072:
+        if type(self.memory_mb) is not int or not 128 <= self.memory_mb <= 131_072:
             raise CloudApiError("manifest_invalid", "Manifest memory_mb is invalid.")
-        if not 1 <= self.timeout_seconds <= 86_400:
+        if type(self.timeout_seconds) is not int or not 1 <= self.timeout_seconds <= 86_400:
             raise CloudApiError("manifest_invalid", "Manifest timeout_seconds is invalid.")
         if not self.environment or len(self.environment) > 128:
             raise CloudApiError("manifest_invalid", "Manifest environment is invalid.")
@@ -242,16 +285,25 @@ class CloudProjectManifest:
         if _POLICY_VERSION.fullmatch(self.policy_version) is None:
             raise CloudApiError("manifest_invalid", "Manifest policy_version is invalid.")
         for process in (self.web, self.worker):
+            if process is not None:
+                _process_resources(
+                    {"cpu_millis": process.cpu_millis, "memory_mb": process.memory_mb}
+                )
             if process is not None and (
                 not process.command or len(process.command) > 2048 or "\x00" in process.command
             ):
                 raise CloudApiError("manifest_invalid", "Runtime process command is invalid.")
-        if self.web is not None and not 1 <= self.web.port <= 65_535:
+        if self.web is not None and (
+            type(self.web.port) is not int or not 1 <= self.web.port <= 65_535
+        ):
             raise CloudApiError("manifest_invalid", "Runtime web port is invalid.")
         if (
             self.web is not None
             and self.web.idle_timeout_seconds is not None
-            and not 60 <= self.web.idle_timeout_seconds <= 86_400
+            and (
+                type(self.web.idle_timeout_seconds) is not int
+                or not 60 <= self.web.idle_timeout_seconds <= 86_400
+            )
         ):
             raise CloudApiError(
                 "manifest_invalid",
@@ -260,6 +312,7 @@ class CloudProjectManifest:
         if len(self.schedules) > 20:
             raise CloudApiError("manifest_invalid", "Too many runtime schedules.")
         for schedule in self.schedules:
+            _process_resources({"cpu_millis": schedule.cpu_millis, "memory_mb": schedule.memory_mb})
             if (
                 _PROCESS_NAME.fullmatch(schedule.name) is None
                 or not schedule.command
@@ -301,6 +354,9 @@ class CloudProjectManifest:
                     "command": item.command,
                     "expression": item.expression,
                     "name": item.name,
+                    **_process_resources(
+                        {"cpu_millis": item.cpu_millis, "memory_mb": item.memory_mb}
+                    ),
                 }
                 for item in self.schedules
             ],
@@ -310,6 +366,9 @@ class CloudProjectManifest:
                 else {
                     "command": self.web.command,
                     "port": self.web.port,
+                    **_process_resources(
+                        {"cpu_millis": self.web.cpu_millis, "memory_mb": self.web.memory_mb}
+                    ),
                     **(
                         {}
                         if self.web.idle_timeout_seconds is None
@@ -317,7 +376,16 @@ class CloudProjectManifest:
                     ),
                 }
             ),
-            "worker": (None if self.worker is None else {"command": self.worker.command}),
+            "worker": (
+                None
+                if self.worker is None
+                else {
+                    "command": self.worker.command,
+                    **_process_resources(
+                        {"cpu_millis": self.worker.cpu_millis, "memory_mb": self.worker.memory_mb}
+                    ),
+                }
+            ),
         }
 
 

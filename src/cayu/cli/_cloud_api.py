@@ -31,6 +31,7 @@ _SAFE_API_ERROR_DETAILS = {
     (422, "agent_slug_invalid"): (
         "Agent application slugs must be 8-63 lowercase letters, digits, or interior hyphens."
     ),
+    (422, "manifest_invalid"): "Cayu Cloud rejected the manifest resources.",
 }
 
 
@@ -254,6 +255,26 @@ def _safe_api_error_detail(response: httpx.Response) -> str | None:
     code = detail.get("code")
     if type(code) is not str:
         return None
+    if response.status_code == 422 and code == "manifest_invalid":
+        pairs = detail.get("valid_pairs")
+        if (
+            isinstance(pairs, list)
+            and 1 <= len(pairs) <= 3
+            and all(
+                isinstance(pair, dict)
+                and set(pair) == {"cpu_millis", "memory_mb"}
+                and type(pair["cpu_millis"]) is int
+                and type(pair["memory_mb"]) is int
+                and pair["cpu_millis"] in {250, 500, 1000, 2000, 4000, 8000, 16000}
+                and 512 <= pair["memory_mb"] <= 122880
+                for pair in pairs
+            )
+        ):
+            options = "; ".join(
+                f"cpu_millis = {pair['cpu_millis']}, memory_mb = {pair['memory_mb']}"
+                for pair in pairs
+            )
+            return "Agent resources exceed supported sizes. Valid manifest pairs: " + options + "."
     return _SAFE_API_ERROR_DETAILS.get((response.status_code, code))
 
 

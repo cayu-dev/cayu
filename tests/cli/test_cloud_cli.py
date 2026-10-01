@@ -1441,6 +1441,12 @@ def test_cloud_deploy_starts_the_complete_application_after_promotion(
                     "cayu_url": "https://agent.example.test/cayu",
                     "deployment_id": "dep_two",
                     "schedules": ["every-minute"],
+                    "resources": {
+                        "web": {
+                            "requested": {"cpu_millis": 4000, "memory_mb": 8192},
+                            "effective": {"cpu_units": 4096, "memory_mb": 8192},
+                        }
+                    },
                     "status": "running",
                     "web_service": "agent-web",
                     "worker_service": "agent-worker",
@@ -1557,6 +1563,10 @@ EOF
         )
     )
     assert service_request[2] is None
+    assert output["result"]["service"]["resources"]["web"]["effective"] == {
+        "cpu_units": 4096,
+        "memory_mb": 8192,
+    }
     deployment_request = next(
         item
         for item in requests

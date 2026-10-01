@@ -237,3 +237,55 @@ If submission loses its response, the CLI reports `deployment_id` and
 `retry_idempotency_key` for `cayu cloud deployment retry DEPLOYMENT_ID
 --idempotency-key KEY`. Agent process health failures, on either smoke provider, and
 other nonretryable failures require repairing the source.
+
+## Fixed process resources
+
+`cpu_millis` and `memory_mb` at the top of `cayu-cloud.toml` apply to all Agent
+processes. Optional overrides belong under `[web]`, `[worker]`, or each
+`[[schedules]]` entry. For example:
+
+```toml
+[web]
+command = "python -m agent.web"
+port = 8000
+cpu_millis = 4000
+memory_mb = 8192
+
+[worker]
+command = "python -m agent.worker"
+cpu_millis = 250
+memory_mb = 512
+```
+
+Cloud rounds these to supported static process sizes. `4000`/`8192` becomes
+4096 ECS CPU units (4 vCPU) / 8192 MiB; `1000`/`2048` becomes 1 vCPU / 2 GiB.
+Memory can require rounding CPU up as well. Deployment creation rejects requests
+above the environment's configured ceiling and names valid sizes.
+
+The deploy result and `cayu cloud service status --application AGENT_SLUG` retain
+`service.resources`, with requested millis/MiB and effective ECS CPU units/MiB for
+each web, worker and schedule. Omitted overrides inherit the top-level values.
+Sizing is fixed for a release. Existing manifests are honored on their next deploy,
+so an Agent previously using the hardcoded 0.5 vCPU / 1 GiB may incur a higher
+running cost; the 1000/2048 example approximately doubles its compute allocation.
+
+Resource values at both the top level and per-process level, along with
+`timeout_seconds`, `port`, and `idle_timeout_seconds`, must be TOML integers; quoted
+numbers and floats are rejected rather than converted. Unknown keys in `[web]`,
+`[worker]`, and `[[schedules]]` are rejected so a misspelled override cannot silently
+fall back to the default; a schedule error names the schedule, or its position when
+it has no name.
+
+When a declared size is above the environment ceiling or the largest supported
+size, Cloud returns HTTP 422 with `detail.code = "manifest_invalid"` and
+`detail.valid_pairs`: one to three `{"cpu_millis": ..., "memory_mb": ...}` pairs in
+manifest units, within the ceiling, that are accepted as written. The CLI prints
+these as copyable values, for example:
+
+```text
+Cayu Cloud API returned HTTP 422: Agent resources exceed supported sizes. Valid manifest pairs: cpu_millis = 4000, memory_mb = 8192; cpu_millis = 4000, memory_mb = 9216; cpu_millis = 4000, memory_mb = 10240.
+```
+
+The CLI never prints Cloud's free-text `detail.message`. If a `manifest_invalid`
+rejection carries no usable `valid_pairs` (for example from an older Cayu Cloud
+release), it prints `Cayu Cloud rejected the manifest resources.` instead.
