@@ -43,12 +43,12 @@ def test_trial_policy_is_content_addressed_and_bounded() -> None:
         EvalSuiteTrialPolicyV1.model_validate(forged)
 
 
-def test_trial_policy_supports_one_hundred_way_execution() -> None:
-    policy = EvalSuiteTrialPolicyV1.create(max_concurrency=100)
+def test_trial_policy_supports_thousand_way_execution() -> None:
+    policy = EvalSuiteTrialPolicyV1.create(max_concurrency=1_000)
 
-    assert policy.max_concurrency == 100
-    with pytest.raises(ValidationError, match="less than or equal to 100"):
-        EvalSuiteTrialPolicyV1.create(max_concurrency=101)
+    assert policy.max_concurrency == 1_000
+    with pytest.raises(ValidationError, match="less than or equal to 1000"):
+        EvalSuiteTrialPolicyV1.create(max_concurrency=1_001)
 
 
 def test_maximum_cost_and_work_exposure_require_canonical_pricing_identity() -> None:

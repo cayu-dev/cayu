@@ -181,7 +181,7 @@ def test_named_check_is_public_immutable_and_snapshots_process_argv() -> None:
         ({"description": ""}, ValueError, "cannot be blank"),
         ({"command": ExecCommand.bash("pytest -q")}, ValueError, "process-form"),
         ({"timeout_s": 0}, ValueError, "greater than zero"),
-        ({"timeout_s": 601}, ValueError, "at most 600"),
+        ({"timeout_s": 3_601}, ValueError, "at most 3600"),
         ({"max_output_bytes": 0}, ValueError, "greater than zero"),
         ({"max_output_bytes": 200_001}, ValueError, "at most 200000"),
         ({"execution_profile_identity": None}, TypeError, "ExecutionProfileBehaviorIdentity"),

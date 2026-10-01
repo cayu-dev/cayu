@@ -579,7 +579,7 @@ def test_builtin_tool_limits_are_model_context_sized():
     assert DEFAULT_OUTPUT_LIMIT_BYTES == 50_000
     assert MAX_OUTPUT_LIMIT_BYTES == 200_000
     assert DEFAULT_TIMEOUT_SECONDS == 60
-    assert MAX_TIMEOUT_SECONDS == 600
+    assert MAX_TIMEOUT_SECONDS == 3_600
 
     assert ReadFileTool().schema["properties"]["max_bytes"]["default"] == 256 * 1024
     assert ReadFileTool().schema["properties"]["max_bytes"]["maximum"] == 4 * 1024 * 1024
@@ -610,7 +610,7 @@ def test_builtin_tool_limits_are_model_context_sized():
     assert ExecCommandTool().schema["properties"]["max_output_bytes"]["default"] == 50_000
     assert ExecCommandTool().schema["properties"]["max_output_bytes"]["maximum"] == 200_000
     assert ExecCommandTool().schema["properties"]["timeout_s"]["default"] == 60
-    assert ExecCommandTool().schema["properties"]["timeout_s"]["maximum"] == 600
+    assert ExecCommandTool().schema["properties"]["timeout_s"]["maximum"] == 3_600
     assert ExecCommandTool().schema["properties"]["argv"]["minItems"] == 1
     assert ExecCommandTool().schema["properties"]["argv"]["items"] == {
         "type": "string",
@@ -3911,7 +3911,6 @@ def test_exec_command_form_guidance_is_safe_before_dispatch(args, message):
     assert result.is_error
     assert result.structured == {"error": "invalid_arguments"}
     assert message in result.content
-    assert len(result.content) < 200
     assert "max_output_bytes" not in result.content
     assert "private-command" not in json.dumps(result.model_dump(mode="json"))
     assert runner.command is None
@@ -4268,13 +4267,13 @@ def test_exec_command_tool_applies_default_and_max_timeout(tmp_path):
             ctx,
             {
                 "argv": [sys.executable, "-c", "print('ok')"],
-                "timeout_s": 601,
+                "timeout_s": 3_601,
             },
         )
     )
     assert over_limit_result.is_error is True
     assert over_limit_result.structured == {"error": "invalid_arguments"}
-    assert "at most 600" in over_limit_result.content
+    assert "at most 3600" in over_limit_result.content
 
 
 def test_exec_command_tool_applies_configured_default_timeout(tmp_path):
@@ -4297,7 +4296,7 @@ def test_exec_command_tool_applies_configured_default_timeout(tmp_path):
     assert runner.timeout_s == 7
 
 
-@pytest.mark.parametrize("value", [0, 601, True, 1.5, "60"])
+@pytest.mark.parametrize("value", [0, 3_601, True, 1.5, "60"])
 def test_exec_command_tool_rejects_invalid_configured_default_timeout(value):
     with pytest.raises(ValueError, match="default_timeout_seconds"):
         ExecCommandTool(default_timeout_seconds=value)

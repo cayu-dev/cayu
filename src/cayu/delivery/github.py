@@ -3718,10 +3718,16 @@ class GitHubPullRequestConnector:
                 )
             bounded_feedback: list[GitHubFeedbackObservation] = []
             remaining_feedback_bytes = request.limits.max_feedback_bytes
+            # Only feedback missing from the provider response makes the review
+            # state incomplete; trimming bodies to the byte budget does not.
+            provider_feedback_truncated = review_bundle.truncated
             feedback_truncated = review_bundle.truncated
             for item in review_bundle.feedback:
                 if remaining_feedback_bytes <= 0:
-                    feedback_truncated = True
+                    # Keep the item without its body: review state is computed
+                    # from every review, not only the ones whose text fit.
+                    feedback_truncated = feedback_truncated or bool(item.body)
+                    bounded_feedback.append(item.model_copy(update={"body": ""}))
                     continue
                 feedback_truncated = (
                     feedback_truncated or len(item.body.encode()) > remaining_feedback_bytes
@@ -3774,7 +3780,7 @@ class GitHubPullRequestConnector:
                 and state == GitHubDeliveryState.CHECKS_PASSED
             ):
                 state = GitHubDeliveryState.CHECKS_PENDING
-            if check_bundle.truncated or review_bundle.truncated:
+            if check_bundle.truncated or provider_feedback_truncated:
                 state = GitHubDeliveryState.PARTIAL
             return await self.repository.publish(
                 request,

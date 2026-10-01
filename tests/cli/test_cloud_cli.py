@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -84,8 +85,9 @@ def test_cloud_help_exposes_first_party_customer_commands(
     ):
         assert command in help_text
     assert "--api-url" not in help_text
-    assert " run " not in f" {help_text} "
-    assert " runs " not in f" {help_text} "
+    subcommands = re.search(r"\{([a-z,-]+)\}", help_text)
+    assert subcommands is not None
+    assert not {"run", "runs"} & set(subcommands.group(1).split(","))
 
     with pytest.raises(SystemExit) as deploy_help:
         main(["cloud", "deploy", "--help"])

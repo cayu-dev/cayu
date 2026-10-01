@@ -197,7 +197,7 @@ def _require_loopback_dev_host(host: str) -> None:
     try:
         is_loopback = ip_address(host).is_loopback
     except ValueError:
-        is_loopback = False
+        is_loopback = host.casefold() == "localhost"
     if not is_loopback:
         raise ServeError(
             "Refusing to expose an unauthenticated control plane on a non-loopback host. "

@@ -14,6 +14,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
+from cayu._eval_limits import EVAL_SUITE_MAX_CONCURRENCY
 from cayu.build_provenance import RuntimeBuildProvenance
 from cayu.evals._admission import LaunchScheduling, TrialAdmission
 from cayu.evals._inspection_documents import ProcessDocuments, decode_document, read_regular_file
@@ -103,7 +104,7 @@ class _Launch(_Model):
     launch_id: str = Field(min_length=1, max_length=512)
     target: str = Field(min_length=1, max_length=4096)
     processes: StrictInt = Field(ge=1, le=256)
-    max_concurrency: StrictInt = Field(ge=1, le=100)
+    max_concurrency: StrictInt = Field(ge=1, le=EVAL_SUITE_MAX_CONCURRENCY)
     stagger_seconds: float = Field(default=0, ge=0, allow_inf_nan=False)
     case_timeout_seconds: float | None
     startup_timeout_seconds: float

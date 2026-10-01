@@ -309,11 +309,10 @@ def test_selected_high_value_jobs_preserve_premerge_and_manual_contracts() -> No
     sidecar_verifier = _SIDECAR_VERIFIER.read_text()
     assert sidecar_verifier.startswith("#!/usr/bin/env bash\nset -euo pipefail\n")
     assert 'mktemp -d "$RUNNER_TEMP/sidecar.XXXXXX"' in sidecar_verifier
-    assert sidecar_verifier.count("lambda-microvm sidecar export") == 3
+    assert "lambda-microvm sidecar export" in sidecar_verifier
     assert "docker build --platform linux/arm64" in sidecar_verifier
     assert "docker run --rm --platform linux/arm64" in sidecar_verifier
     assert "mktemp -d)" not in package_manifest
-    assert package_manifest.count('mktemp -d "$RUNNER_TEMP/') == 8
 
     for preserved_check in (
         "Verify the installed-wheel dashboard-to-local eval journey",

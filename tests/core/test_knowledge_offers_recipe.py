@@ -176,8 +176,8 @@ def test_documented_offers_bound_previews_and_support_scoped_tools(
         }
         document = Path(__file__).resolve().parents[2] / "docs/knowledge-offers.md"
         blocks = re.findall(r"```python\n(.*?)\n```", document.read_text(), flags=re.DOTALL)
-        assert len(blocks) == 1
-        exec(compile(blocks[0], str(document), "exec"), bindings)
+        assert blocks
+        exec(compile("\n\n".join(blocks), str(document), "exec"), bindings)
         assert bindings["recall_policy"].admission_policy.relevance_policy == "rank_only.v1"
         assert bindings["recall_policy"].delta_policy is None
         events = [event async for event in bindings["app"].run(bindings["request"])]

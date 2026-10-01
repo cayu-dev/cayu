@@ -633,9 +633,9 @@ def test_web_fetch_denies_redirects_beyond_the_configured_limit() -> None:
     ("keyword", "value"),
     [
         ("max_response_bytes", 0),
-        ("max_response_bytes", 8 * 1024 * 1024 + 1),
+        ("max_response_bytes", 32 * 1024 * 1024 + 1),
         ("max_content_bytes", 0),
-        ("max_content_bytes", 256 * 1024 + 1),
+        ("max_content_bytes", 1024 * 1024 + 1),
         ("timeout_seconds", 0),
         ("timeout_seconds", 121),
         ("max_redirects", -1),
@@ -673,6 +673,40 @@ def test_web_fetch_rejects_a_response_over_the_byte_limit() -> None:
     assert result.is_error is True
     assert result.structured == {"error": "oversized_response"}
     assert "123456" not in result.content
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        "application/json",
+        "application/problem+json",
+        "text/markdown; charset=utf-8",
+        "text/csv",
+        "application/xml",
+        "application/rss+xml",
+    ],
+)
+def test_web_fetch_returns_structured_text_formats_as_text(content_type: str) -> None:
+    resolver = _FakeResolver({"example.com": ("93.184.216.34",)})
+    transport = _FakeTransport(
+        [
+            WebFetchHttpResponse(
+                status_code=200,
+                headers={"content-type": content_type},
+                body=b'{"name": "cayu"}',
+            )
+        ]
+    )
+
+    result = asyncio.run(
+        WebFetchTool(resolver=resolver, transport=transport).run(
+            ToolContext(session_id="sess_text_formats"),
+            {"url": "https://example.com/data"},
+        )
+    )
+
+    assert result.is_error is False
+    assert '"name": "cayu"' in result.content
 
 
 def test_web_fetch_rejects_unsupported_content_without_returning_the_body() -> None:

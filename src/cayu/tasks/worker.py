@@ -163,7 +163,10 @@ RecoveredInterruptedTaskHandler = Callable[
     ["CayuApp", Task, str],
     Awaitable[TaskHandlerOutcome | None],
 ]
-_MAX_TASK_FAILURE_MESSAGE_BYTES = 500
+# Matches the runtime's diagnostic bound so long validation errors and command
+# output stay readable; truncation is marked instead of silent.
+_MAX_TASK_FAILURE_MESSAGE_BYTES = 4 * 1024
+_TASK_FAILURE_TRUNCATION_MARKER = "\u2026[truncated]"
 _INTERRUPTED_HANDOFF_MAX_ATTEMPTS = 3
 _INTERRUPTED_HANDOFF_INITIAL_BACKOFF_SECONDS = 0.05
 _INTERRUPTED_HANDOFF_MAX_BACKOFF_SECONDS = 1.0
@@ -3597,7 +3600,8 @@ def _redact_and_bound_task_failure_text(app: CayuApp, value: str) -> str:
     encoded_value = redacted_value.encode("utf-8", "replace")
     if len(encoded_value) <= _MAX_TASK_FAILURE_MESSAGE_BYTES:
         return redacted_value
-    return encoded_value[:_MAX_TASK_FAILURE_MESSAGE_BYTES].decode("utf-8", "ignore")
+    keep = _MAX_TASK_FAILURE_MESSAGE_BYTES - len(_TASK_FAILURE_TRUNCATION_MARKER.encode())
+    return encoded_value[:keep].decode("utf-8", "ignore") + _TASK_FAILURE_TRUNCATION_MARKER
 
 
 async def _safe_fail_payload(

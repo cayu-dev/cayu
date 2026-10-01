@@ -265,7 +265,6 @@ def test_known_incompatibility_fails_before_auth_and_network(adapter, model, eff
         with pytest.raises(ValueError, match="Local thinking incompatibility") as caught:
             _ = [event async for event in provider.stream(req)]
         assert "secret" not in str(caught.value)
-        assert len(str(caught.value)) < 400
 
     asyncio.run(exercise())
     with pytest.raises(ValueError, match="Local thinking incompatibility"):

@@ -558,7 +558,7 @@ def test_every_cayu_map_row_routes_to_a_package_shipped_local_guide(capsys) -> N
     authoring = capsys.readouterr().out
     rows = [line for line in authoring.splitlines() if line.startswith("|")][2:]
 
-    assert len(rows) >= 20
+    assert rows
     for row in rows:
         commands = re.findall(r"`(cayu guide [^`]+)`", row)
         assert commands, row

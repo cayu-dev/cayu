@@ -14040,7 +14040,7 @@
           "authored_suite_launch_lane": {
             "anyOf": [
               {
-                "maximum": 99.0,
+                "maximum": 999.0,
                 "minimum": 0.0,
                 "type": "integer"
               },
@@ -16361,7 +16361,7 @@
             "type": "array"
           },
           "max_concurrency": {
-            "maximum": 100.0,
+            "maximum": 1000.0,
             "minimum": 1.0,
             "title": "Max Concurrency",
             "type": "integer"
@@ -16617,7 +16617,7 @@
         "description": "Immutable decision rule for the complete retained trial set of each case.",
         "properties": {
           "max_concurrency": {
-            "maximum": 100.0,
+            "maximum": 1000.0,
             "minimum": 1.0,
             "title": "Max Concurrency",
             "type": "integer"
@@ -16678,7 +16678,7 @@
         "properties": {
           "max_concurrency": {
             "default": 1,
-            "maximum": 100.0,
+            "maximum": 1000.0,
             "minimum": 1.0,
             "title": "Max Concurrency",
             "type": "integer"

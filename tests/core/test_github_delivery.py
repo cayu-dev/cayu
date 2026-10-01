@@ -1225,6 +1225,42 @@ def test_feedback_is_deduplicated_bounded_redacted_and_follow_up_is_provenanced(
         )
 
 
+def test_feedback_budget_never_hides_a_later_review_decision(tmp_path):
+    request = _request()
+    request = request.model_copy(
+        update={"limits": request.limits.model_copy(update={"max_feedback_bytes": 256})}
+    )
+    transport = FakeTransport(request)
+    transport.pull_request = _pr(request)
+
+    def review(provider_id: str, state: str, created_at: str, body: str):
+        return GitHubFeedbackObservation(
+            provider_id=provider_id,
+            kind="review",
+            head_commit=request.repository.head_commit,
+            author_login="reviewer",
+            author_type="User",
+            state=state,
+            created_at=created_at,
+            body=body,
+        )
+
+    transport.review_bundle = GitHubReviewBundle(
+        feedback=(
+            review("review-1", "approved", "2026-08-30T12:00:30Z", "Looks good. " * 40),
+            review("review-2", "changes_requested", "2026-08-30T12:05:00Z", "Found a bug."),
+        )
+    )
+    connector, _ = _connector(tmp_path, request, transport)
+
+    result = asyncio.run(connector.run(request, object(), object()))
+
+    assert result.result.state == GitHubDeliveryState.CHANGES_REQUESTED
+    assert [item.provider_id for item in result.result.feedback] == ["review-1", "review-2"]
+    assert result.result.feedback[1].body == ""
+    assert result.result.feedback_truncated is True
+
+
 def test_unapproved_reviewer_cannot_settle_application_review_policy(tmp_path):
     request = _request()
     transport = FakeTransport(request)

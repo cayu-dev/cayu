@@ -42,12 +42,16 @@ from cayu.tools.base import (
     ToolSpec,
     _bound_policy_denial_result,
 )
-from cayu.tools.process_diagnostics import ProcessCommandCapabilities, ProcessCommandDiagnostic
+from cayu.tools.process_diagnostics import (
+    MAX_COMMAND_TIMEOUT_SECONDS,
+    ProcessCommandCapabilities,
+    ProcessCommandDiagnostic,
+)
 
 DEFAULT_OUTPUT_LIMIT_BYTES = 50_000
 MAX_OUTPUT_LIMIT_BYTES = 200_000
 DEFAULT_TIMEOUT_SECONDS = 60
-MAX_TIMEOUT_SECONDS = 600
+MAX_TIMEOUT_SECONDS = MAX_COMMAND_TIMEOUT_SECONDS
 
 
 def _safe_env_name(value: object) -> bool:

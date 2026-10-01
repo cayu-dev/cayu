@@ -5,6 +5,10 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# One hour covers real test suites and builds; CommandPolicy(max_timeout_s=...)
+# narrows what a model may request. Re-exported as tools.commands.MAX_TIMEOUT_SECONDS.
+MAX_COMMAND_TIMEOUT_SECONDS = 3_600
+
 
 class ProcessCommandDenialCode(StrEnum):
     EXECUTABLE = "executable"
@@ -55,7 +59,7 @@ class ProcessCommandCapabilities(BaseModel):
     max_env_value_bytes: int = Field(ge=0)
     allow_stdin: bool
     max_stdin_bytes: int = Field(ge=0)
-    max_timeout_s: int = Field(ge=1, le=600)
+    max_timeout_s: int = Field(ge=1, le=MAX_COMMAND_TIMEOUT_SECONDS)
     shell_decision: Literal["allow", "deny", "require_command_approval"]
 
 

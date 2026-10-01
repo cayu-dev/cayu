@@ -376,6 +376,50 @@ def test_native_eval_processes_preserve_complete_ordered_results(tmp_path, stagg
     _assert_dead([w["pid"] for w in provenance])
 
 
+@pytest.mark.parametrize("max_concurrency", [101, 1_000])
+def test_high_concurrency_process_eval_receipts_can_be_inspected_and_exported(
+    tmp_path, max_concurrency
+):
+    import asyncio
+    import zipfile
+
+    from cayu import export_process_eval_run, inspect_process_eval_run
+
+    _project(tmp_path)
+    process = _start(
+        tmp_path,
+        "eval",
+        "run",
+        "--processes",
+        "2",
+        "--max-concurrency",
+        str(max_concurrency),
+        "--process-directory",
+        "workers",
+        "--output",
+        "result.json",
+    )
+    stdout, stderr = _finished(process, 60)
+    assert process.returncode == 0, (stdout, stderr)
+    run = json.loads((tmp_path / "result.json").read_text())
+    assert run["status"] == "passed"
+    assert len(run["cases"]) == 4
+
+    snapshot = asyncio.run(inspect_process_eval_run(tmp_path / "workers"))
+    assert snapshot.phase == "completed"
+    assert snapshot.max_concurrency == max_concurrency
+    assert len(snapshot.workers) == 2
+    assert [case.case_id for case in snapshot.cases] == [f"case-{i}" for i in range(4)]
+    assert snapshot.result_status == "passed"
+    exported = export_process_eval_run(tmp_path / "workers", tmp_path / "receipts.zip")
+    assert exported.phase == "completed"
+    assert exported.max_concurrency == max_concurrency
+    with zipfile.ZipFile(tmp_path / "receipts.zip") as archive:
+        launch = json.loads(archive.read("launch.json"))
+        assert launch["max_concurrency"] == max_concurrency
+    _assert_dead([worker.pid for worker in snapshot.workers])
+
+
 def test_eval_plan_drift_fails_before_dispatch(tmp_path):
     _project(
         tmp_path,

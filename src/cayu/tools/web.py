@@ -40,8 +40,8 @@ DEFAULT_WEB_FETCH_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 DEFAULT_WEB_FETCH_MAX_CONTENT_BYTES = 64 * 1024
 DEFAULT_WEB_FETCH_TIMEOUT_SECONDS = 20.0
 DEFAULT_WEB_FETCH_MAX_REDIRECTS = 5
-MAX_WEB_FETCH_RESPONSE_BYTES = 8 * 1024 * 1024
-MAX_WEB_FETCH_CONTENT_BYTES = 256 * 1024
+MAX_WEB_FETCH_RESPONSE_BYTES = 32 * 1024 * 1024
+MAX_WEB_FETCH_CONTENT_BYTES = 1024 * 1024
 MAX_WEB_FETCH_TIMEOUT_SECONDS = 120.0
 MAX_WEB_FETCH_REDIRECTS = 10
 MAX_WEB_FETCH_TITLE_BYTES = 512
@@ -62,7 +62,33 @@ _UNTRUSTED_WEB_CONTENT_CLOSE = "\n</untrusted_web_content>"
 
 _REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
 _HTML_CONTENT_TYPES = frozenset({"text/html", "application/xhtml+xml"})
-_TEXT_CONTENT_TYPES = frozenset({"text/plain"})
+_TEXT_CONTENT_TYPES = frozenset(
+    {
+        "application/json",
+        "application/ld+json",
+        "application/x-ndjson",
+        "application/xml",
+        "application/yaml",
+        "application/toml",
+        "application/javascript",
+    }
+)
+
+
+def _is_text_content_type(content_type: str) -> bool:
+    """Media types decoded as plain text: text/*, JSON, XML and similar formats."""
+
+    return (
+        content_type.startswith("text/")
+        or content_type in _TEXT_CONTENT_TYPES
+        or content_type.endswith(("+json", "+xml"))
+    )
+
+
+def _is_supported_content_type(content_type: str) -> bool:
+    return content_type in _HTML_CONTENT_TYPES or _is_text_content_type(content_type)
+
+
 _SKIPPED_HTML_ELEMENTS = frozenset({"script", "style", "noscript", "svg", "template"})
 _BLOCK_HTML_ELEMENTS = frozenset(
     {
@@ -292,7 +318,7 @@ class HttpxWebFetchTransport:
             if _unsupported_content_encoding(response.headers):
                 raise _WebFetchUnsupportedContentError
             content_type, _ = _parse_content_type(_header(response.headers, "content-type"))
-            if content_type not in _HTML_CONTENT_TYPES | _TEXT_CONTENT_TYPES:
+            if not _is_supported_content_type(content_type):
                 raise _WebFetchUnsupportedContentError
             content_length = response.headers.get("content-length")
             if content_length is not None:
@@ -1314,7 +1340,7 @@ async def _extract_response_text(
 ) -> tuple[str | None, str, tuple[str, ...]] | None:
     content_type_header = _header(response.headers, "content-type")
     content_type, charset = _parse_content_type(content_type_header)
-    if content_type not in _HTML_CONTENT_TYPES | _TEXT_CONTENT_TYPES:
+    if not _is_supported_content_type(content_type):
         return None
     decoder = _incremental_text_decoder(charset)
 

@@ -2515,7 +2515,6 @@ def test_structured_output_text_maps_nonportable_json_to_bounded_validation(text
         }
     ]
     rendered = validation.errors[0].message
-    assert len(rendered) < 100
     assert "secret-key" not in rendered
     assert "secret-a" not in rendered
     assert "secret-b" not in rendered

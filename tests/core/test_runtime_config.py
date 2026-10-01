@@ -248,7 +248,7 @@ def test_effective_run_configuration_reports_application_role_and_request_source
     assert explicit.thinking.source == "explicit"
 
 
-@pytest.mark.parametrize("value", [0, 101, True, 1.5, "2"])
+@pytest.mark.parametrize("value", [0, 1_001, True, 1.5, "2"])
 def test_eval_config_rejects_invalid_concurrency(value) -> None:
     with pytest.raises(ValidationError):
         EvalConfig(max_concurrency=value)
