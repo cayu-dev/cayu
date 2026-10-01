@@ -41691,5 +41691,12 @@
     "tests/server/test_server_eval_suite_launch.py::test_suite_launch_rejects_corpus_publication_before_admitting_any_part[oversized]": 0.765,
     "tests/server/test_server_eval_suite_launch.py::test_suite_launch_recovers_partial_admission_and_replays_completed_parts": 1.2,
     "tests/server/test_server_eval_suite_launch.py::test_suite_launch_preview_bounds_scenario_preparation_and_cleans_up_cancellation[False]": 1.685,
-    "tests/server/test_server_eval_suite_launch.py::test_suite_launch_preview_bounds_scenario_preparation_and_cleans_up_cancellation[True]": 0.907
+    "tests/server/test_server_eval_suite_launch.py::test_suite_launch_preview_bounds_scenario_preparation_and_cleans_up_cancellation[True]": 0.907,
+    "tests/server/test_server_captured_launch.py::test_captured_launch_preserves_shared_auth_body_handling_and_provenance[/api]": 1.364,
+    "tests/server/test_server_captured_launch.py::test_captured_launch_preserves_shared_auth_body_handling_and_provenance[/custom/v2]": 1.198,
+    "tests/server/test_server_captured_launch.py::test_captured_launch_publication_errors_remain_private_and_precede_admission[corpus-conflict]": 1.028,
+    "tests/server/test_server_captured_launch.py::test_captured_launch_publication_errors_remain_private_and_precede_admission[result-conflict]": 1.034,
+    "tests/server/test_server_captured_launch.py::test_captured_launch_publication_errors_remain_private_and_precede_admission[unsafe]": 1.211,
+    "tests/server/test_server_captured_launch.py::test_captured_launch_publication_errors_remain_private_and_precede_admission[oversized]": 1.054,
+    "tests/server/test_server_captured_launch.py::test_captured_launch_retries_after_publication_and_replays_before_readiness": 1.665
 }

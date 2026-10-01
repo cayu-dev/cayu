@@ -103,21 +103,9 @@ from cayu.evals.memory_reporting import (
     MEMORY_EXPERIMENT_REPORT_MAX_BYTES,
     MemoryExperimentReportRequest,
 )
-from cayu.evals.promotion import (
-    SessionPromotionError,
-    build_promotion_candidate,
-    corpus_from_promotion_candidate,
-    runnable_promotion_candidate,
-    score_promotion_candidate,
-)
-from cayu.evals.results import (
-    CapturedEvaluationResultV1,
-    EvalResultTargetIdentityV1,
-)
 from cayu.evals.scenario_execution import corpus_for_eval_scenario
 from cayu.evals.store import (
     EvalCorpusConflict,
-    EvalResultConflict,
     EvalRunRecord,
     EvalScenarioArtifactReference,
     EvalScenarioRunInvocation,
@@ -192,7 +180,10 @@ from cayu.server._browser_client import (
     browser_client_url,
 )
 from cayu.server._capabilities import inspect_control_plane_capabilities
-from cayu.server._captured_evaluation_routes import register_captured_evaluation_routes
+from cayu.server._captured_evaluation_routes import (
+    register_captured_evaluation_launch_routes,
+    register_captured_evaluation_routes,
+)
 from cayu.server._corpus_management_routes import (
     load_eval_corpus,
     register_corpus_management_routes,
@@ -205,10 +196,7 @@ from cayu.server._eval_run_admission import (
     prepare_eval_run,
     replay_eval_run,
 )
-from cayu.server._evaluation_promotion_routes import (
-    _promotion_error_detail,
-    register_evaluation_promotion_routes,
-)
+from cayu.server._evaluation_promotion_routes import register_evaluation_promotion_routes
 from cayu.server._evaluation_result_routes import register_evaluation_result_routes
 from cayu.server._evaluation_run_routes import register_evaluation_run_routes
 from cayu.server._event_side_effect_health import EventSideEffectHealthResponse
@@ -236,7 +224,6 @@ from cayu.server.contracts import (
     ARTIFACT_CONTENT_ENDPOINT_RESPONSES,
     ARTIFACT_ENDPOINT_ERROR_RESPONSES,
     BOUNDED_STREAMING_ENDPOINT_RESPONSES,
-    CAPTURED_EVALUATION_ENDPOINT_RESPONSES,
     CAUSAL_BUDGET_SUMMARY_ENDPOINT_RESPONSES,
     EVALS_ENDPOINT_RESPONSES,
     MAX_CAPTURED_EVALUATION_REQUEST_BYTES,
@@ -277,9 +264,6 @@ from cayu.server.contracts import (
     ArtifactReadResponse,
     ArtifactsResponse,
     BrowserClientContract,
-    CapturedEvaluationLaunchRequest,
-    CapturedEvaluationLaunchResponse,
-    CapturedEvaluationSaveResponse,
     CausalBudgetSummaryResponse,
     ClientGenerationContract,
     EnvironmentsResponse,
@@ -4572,164 +4556,15 @@ def create_router(
         eval_store = eval_runtime.store
         active_eval_registry = eval_runtime.registry
 
-        @bounded_captured_evaluation_router.post(
-            "/evals/sessions/{session_id}/evaluation/launch",
-            response_model=CapturedEvaluationLaunchResponse,
-            status_code=202,
-            responses=CAPTURED_EVALUATION_ENDPOINT_RESPONSES,
-            dependencies=protected,
+        register_captured_evaluation_launch_routes(
+            bounded_captured_evaluation_router,
+            cayu_app=cayu_app,
+            eval_store=eval_store,
+            active_eval_registry=active_eval_registry,
+            require_current_captured_candidate=_require_current_captured_candidate,
+            protected=protected,
+            optional_auth_context=optional_auth_context,
         )
-        async def launch_captured_evaluation(
-            session_id: str,
-            body: CapturedEvaluationLaunchRequest,
-            idempotency_key: Annotated[
-                str,
-                Header(alias="Idempotency-Key", min_length=1, max_length=512),
-            ],
-            auth_context: AuthContext | None = optional_auth_context,
-        ) -> CapturedEvaluationLaunchResponse:
-            if not eval_store.captured_results:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Durable captured-result persistence is not available.",
-                )
-            trajectory, registration, _ = await _require_current_captured_candidate(
-                session_id,
-                body.candidate,
-                body.expected_candidate_revision,
-            )
-            target = registration.target
-            try:
-                runnable_baseline = build_promotion_candidate(
-                    cayu_app,
-                    trajectory,
-                    target_key=target.key,
-                    source_agent_name=target.request_base.agent_name,
-                    application_release_id=target.application_release_id,
-                    evidence_policy=target.evidence_policy,
-                    pricing=target.price_book,
-                    project_root=registration.manifest_project_root,
-                )
-            except SessionPromotionError as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail=_promotion_error_detail(
-                        "source_ineligible",
-                        str(exc),
-                        reason=exc.code.value,
-                    ),
-                ) from exc
-            try:
-                runnable_candidate = runnable_promotion_candidate(
-                    body.candidate,
-                    runnable_baseline,
-                    trial_request=body.trial_request,
-                )
-                score = score_promotion_candidate(
-                    cayu_app,
-                    trajectory,
-                    runnable_candidate,
-                    target_key=target.key,
-                    source_agent_name=target.request_base.agent_name,
-                    application_release_id=target.application_release_id,
-                    pricing=target.price_book,
-                    project_root=registration.manifest_project_root,
-                )
-                corpus = corpus_from_promotion_candidate(runnable_candidate)
-                result = CapturedEvaluationResultV1.create(
-                    corpus=corpus,
-                    target=EvalResultTargetIdentityV1(
-                        target_key=runnable_candidate.target_key,
-                        application_release_id=(runnable_candidate.source.application_release_id),
-                        app_manifest_schema_version=(
-                            runnable_candidate.source.app_manifest_schema_version
-                        ),
-                        app_manifest_fingerprint=(
-                            runnable_candidate.source.app_manifest_fingerprint
-                        ),
-                    ),
-                    score=score,
-                )
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(
-                    status_code=400,
-                    detail=_promotion_error_detail(
-                        "candidate_rejected",
-                        "The reviewed evaluation cannot be converted to runnable work.",
-                    ),
-                ) from exc
-            invocation = eval_run_invocation(
-                auth_context,
-                max_steps=body.max_steps,
-                limits=body.limits,
-                cost_budget=body.cost_budget,
-            )
-            invocation = bind_eval_admission_request(
-                invocation,
-                kind="captured",
-                target_key=target.key,
-                resource_identity={"session_id": session_id},
-                body=body,
-            )
-            admission_request_revision = invocation.admission_request_revision
-            if admission_request_revision is None:
-                raise RuntimeError("Captured eval launch lost its admission request revision.")
-            replayed = await replay_eval_run(
-                eval_store=eval_store,
-                target_key=target.key,
-                idempotency_key=idempotency_key,
-                admission_request_revision=admission_request_revision,
-            )
-            if replayed is not None:
-                record = await eval_store.load_result_record(result.revision)
-                if record is None:
-                    raise RuntimeError("Replayed captured eval result is unavailable.")
-                return CapturedEvaluationLaunchResponse(
-                    captured=CapturedEvaluationSaveResponse(record=record, result=result),
-                    run=replayed,
-                )
-            eval_target, compiled, invocation = await prepare_eval_run(
-                active_eval_registry=active_eval_registry,
-                corpus=corpus,
-                suite_id=runnable_candidate.suite.id,
-                max_concurrency=body.max_concurrency,
-                invocation=invocation,
-                expected_execution_profile_revision=(body.expected_execution_profile_revision),
-            )
-            try:
-                record = await eval_store.save_captured_result(
-                    corpus,
-                    result,
-                    redact_json=target.app.redact_json,
-                )
-            except (EvalCorpusConflict, EvalResultConflict) as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail="The immutable runnable evaluation conflicts with stored content.",
-                ) from exc
-            except EvalStorePublicationRejected as exc:
-                raise HTTPException(
-                    status_code=422,
-                    detail="The runnable evaluation contains unsafe public data.",
-                ) from exc
-            except EvalStoreResultTooLarge as exc:
-                raise HTTPException(
-                    status_code=413,
-                    detail="The runnable evaluation exceeds the server byte limit.",
-                ) from exc
-            run = await admit_eval_run(
-                eval_store=eval_store,
-                corpus=corpus,
-                max_concurrency=body.max_concurrency,
-                invocation=invocation,
-                idempotency_key=idempotency_key,
-                eval_target=eval_target,
-                compiled=compiled,
-            )
-            return CapturedEvaluationLaunchResponse(
-                captured=CapturedEvaluationSaveResponse(record=record, result=result),
-                run=run,
-            )
 
         register_judge_calibration_routes(
             bounded_evals_router,

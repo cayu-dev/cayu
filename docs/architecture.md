@@ -55,7 +55,15 @@ core
 ## HTTP route ownership
 
 `server/routes.py` composes the HTTP routers and owns the durable eval worker
-lifespan. `server/_memory_report_routes.py` owns memory experiment report
+lifespan. `server/_captured_evaluation_routes.py` owns target catalog and captured
+evaluation preview, save, export and launch. Its separate launch registrar keeps
+durable launch conditional on an eval runtime and preserves route order. Launch
+reuses the current-candidate validator shared with save/export and composes the
+existing promotion, scoring and run-admission functions. Reviewed captured
+evidence is published before a fresh run is admitted; accepted retries reuse
+the stored run and result record before renewed execution-profile checks.
+
+`server/_memory_report_routes.py` owns memory experiment report
 readback, exact stored-result and execution-profile validation, construction,
 and JSON/HTML responses. Its registrar receives the bounded report router,
 eval store, runtime target registry, and shared authentication dependency.
