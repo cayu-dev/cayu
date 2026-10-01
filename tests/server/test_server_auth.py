@@ -1416,3 +1416,76 @@ def test_authenticated_interruption_rejects_body_requested_by() -> None:
         "cannot be supplied in the request body."
     )
     assert captured == []
+
+
+def _trusted_local_server() -> FastAPI:
+    from cayu.server import OpenAccess, mount_cayu
+
+    server = FastAPI()
+    mount_cayu(server, CayuApp(), access=OpenAccess(trusted_local_development=True))
+    return server
+
+
+@pytest.mark.parametrize(
+    ("base_url", "client"),
+    [
+        ("http://127.0.0.1:8000", ("127.0.0.1", 50000)),
+        ("http://localhost:8000", ("127.0.0.1", 50000)),
+    ],
+)
+def test_trusted_local_access_admits_loopback_requests(
+    base_url: str, client: tuple[str, int]
+) -> None:
+    response = TestClient(_trusted_local_server(), base_url=base_url, client=client).get(
+        "/cayu/api/agents"
+    )
+
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("base_url", "client"),
+    [
+        # A remote client, even when it addresses the server as localhost.
+        ("http://127.0.0.1:8000", ("203.0.113.7", 50000)),
+        # A loopback client using a public name: DNS rebinding or a local proxy.
+        ("http://attacker.example", ("127.0.0.1", 50000)),
+        ("http://0.0.0.0:8000", ("127.0.0.1", 50000)),
+    ],
+)
+def test_trusted_local_access_rejects_non_loopback_requests(
+    base_url: str, client: tuple[str, int]
+) -> None:
+    http = TestClient(_trusted_local_server(), base_url=base_url, client=client)
+
+    assert http.get("/cayu/api/agents").status_code == 403
+    assert http.get("/cayu/").status_code == 403
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        ("127.0.0.1", True),
+        ("::1", True),
+        ("[::1]", True),
+        ("LOCALHOST", True),
+        ("0.0.0.0", False),
+        ("10.0.0.5", False),
+        ("localhost.example.com", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_trusted_local_host_check(host: str | None, expected: bool) -> None:
+    from cayu.server.auth import _is_loopback_host
+
+    assert _is_loopback_host(host) is expected
+
+
+def test_plain_open_access_is_unchanged() -> None:
+    from cayu.server import OpenAccess, mount_cayu
+
+    server = FastAPI()
+    mount_cayu(server, CayuApp(), access=OpenAccess())
+
+    assert TestClient(server).get("/cayu/api/agents").status_code == 200

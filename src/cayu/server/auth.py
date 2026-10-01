@@ -7,6 +7,7 @@ import inspect
 import secrets
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from ipaddress import ip_address
 from typing import Any, cast
 
 from fastapi import Request  # noqa: TC002 - FastAPI inspects this annotation at runtime.
@@ -186,6 +187,40 @@ class BasicAuth:
             detail="Missing or invalid credentials.",
             headers={"WWW-Authenticate": f'Basic realm="{_quote_http_string(self.realm)}"'},
         )
+
+
+class TrustedLocalAuth:
+    """Admit only loopback clients that address the server by a loopback name.
+
+    Used by ``OpenAccess(trusted_local_development=True)``. Both the client
+    address and the ``Host`` header must be loopback, so a remote client, a
+    same-host reverse proxy forwarding remote traffic (with proxy headers
+    trusted), and DNS-rebinding pages are all rejected.
+    """
+
+    subject = "local-developer"
+
+    def __call__(self, request: Request) -> AuthContext:
+        client = request.client.host if request.client is not None else None
+        if not (_is_loopback_host(client) and _is_loopback_host(request.url.hostname)):
+            from fastapi import HTTPException
+
+            raise HTTPException(
+                status_code=403,
+                detail="This local development surface accepts only loopback requests.",
+            )
+        return AuthContext(subject=self.subject)
+
+
+def _is_loopback_host(host: str | None) -> bool:
+    if not host:
+        return False
+    if host.casefold() == "localhost":
+        return True
+    try:
+        return ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
 
 
 def _require_basic_auth_text(value: str, field_name: str) -> str:

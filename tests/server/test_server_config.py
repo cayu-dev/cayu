@@ -775,6 +775,25 @@ def test_dashboard_mount_owns_runtime_config_before_browser_injection() -> None:
     assert injected_config["features"] == ["tasks"]
 
 
+def test_dashboard_page_declares_the_policy_it_needs() -> None:
+    import base64
+    import hashlib
+
+    from fastapi import FastAPI
+
+    server = FastAPI()
+    assert mount_dashboard(server) is True
+    response = TestClient(server).get("/cayu/sessions/some-session")
+
+    assert response.status_code == 200
+    policy = response.headers["content-security-policy"]
+    script = response.text.split("<script>", 1)[1].split("</script>", 1)[0]
+    digest = base64.b64encode(hashlib.sha256(script.encode()).digest()).decode()
+    assert f"script-src 'self' 'sha256-{digest}'" in policy
+    assert "base-uri 'self'" in policy
+    assert "'unsafe-inline'" not in policy.split("script-src", 1)[1].split(";", 1)[0]
+
+
 @pytest.mark.parametrize(
     "dashboard_path",
     ["https://example.com/control", " /control", "/control "],

@@ -41268,5 +41268,12 @@
     "tests/cli/test_stable_entrypoint.py::test_entrypoint_redacts_workload_secrets_before_bounding_provider_errors[0]": 0.550379250998958,
     "tests/cli/test_stable_entrypoint.py::test_entrypoint_redacts_workload_secrets_before_bounding_provider_errors[4070]": 0.321177624995471,
     "tests/cli/test_process_execution.py::test_high_concurrency_process_eval_receipts_can_be_inspected_and_exported[1000]": 6.996777207001287,
-    "tests/cli/test_process_execution.py::test_high_concurrency_process_eval_receipts_can_be_inspected_and_exported[101]": 9.10557299899665
+    "tests/cli/test_process_execution.py::test_high_concurrency_process_eval_receipts_can_be_inspected_and_exported[101]": 9.10557299899665,
+    "tests/server/test_dashboard_content_security.py::test_dashboard_csp_allows_cross_origin_browser_resources[control-socket]": 2.2733546660092543,
+    "tests/server/test_dashboard_content_security.py::test_dashboard_csp_allows_cross_origin_browser_resources[recording]": 1.0377237499997136,
+    "tests/server/test_dashboard_content_security.py::test_dashboard_csp_scopes_connections_to_the_configured_api[/api-sources0]": 0.0004670009948313236,
+    "tests/server/test_dashboard_content_security.py::test_dashboard_csp_scopes_connections_to_the_configured_api[http://localhost:8000/api-sources3]": 0.00020162500004516914,
+    "tests/server/test_dashboard_content_security.py::test_dashboard_csp_scopes_connections_to_the_configured_api[https://api.example/api-sources1]": 0.00024620800832053646,
+    "tests/server/test_dashboard_content_security.py::test_dashboard_csp_scopes_connections_to_the_configured_api[https://api.example:8443/api-sources2]": 0.00021462400036398321,
+    "tests/server/test_dashboard_content_security.py::test_no_pricebook_browser_fixture_retains_a_matching_script_hash": 0.3382702499948209
 }

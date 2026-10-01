@@ -226,6 +226,12 @@ def test_evals_configuration_is_default_off_durable_and_private(tmp_path) -> Non
                 dashboard=DashboardConfig(enabled=False),
                 evals=config,
             )
+        trusted_local = ServerConfig(
+            access=OpenAccess(trusted_local_development=True),
+            dashboard=DashboardConfig(enabled=False),
+            evals=config,
+        )
+        assert trusted_local.evals == config
         with pytest.raises(ValidationError, match="store must be durable"):
             EvalsConfig(target=target, store=InMemoryEvalStore())
         with pytest.raises(ValidationError, match="evals requires api.enabled"):

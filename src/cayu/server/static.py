@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 from html import escape
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 from fastapi import Request
 from fastapi.staticfiles import StaticFiles
@@ -123,18 +126,30 @@ class DashboardStaticFiles(StaticFiles):
             return Response(media_type="text/html")
         text = index.read_text(encoding="utf-8")
         effective_base_path = _effective_base_path(self._base_path, scope)
+        api_base_url = _effective_api_base_url(
+            configured_api_base_url=self._api_base_url,
+            configured_base_path=self._base_path,
+            effective_base_path=effective_base_path,
+        )
+        script = _dashboard_config_script(
+            base_path=effective_base_path,
+            api_base_url=api_base_url,
+            dashboard_config=self._dashboard_config,
+        )
         return Response(
             _inject_dashboard_config(
                 text,
                 base_path=effective_base_path,
-                api_base_url=_effective_api_base_url(
-                    configured_api_base_url=self._api_base_url,
-                    configured_base_path=self._base_path,
-                    effective_base_path=effective_base_path,
-                ),
+                api_base_url=api_base_url,
                 dashboard_config=self._dashboard_config,
             ),
             media_type="text/html",
+            headers={
+                "Content-Security-Policy": dashboard_content_security_policy(
+                    config_script=script,
+                    api_base_url=api_base_url,
+                )
+            },
         )
 
 
@@ -156,8 +171,7 @@ def _is_index_path(path: str, scope: Scope) -> bool:
     return path in {"", ".", "./", "index.html"}
 
 
-def _inject_dashboard_config(
-    html: str,
+def _dashboard_config_script(
     *,
     base_path: str,
     api_base_url: str,
@@ -169,7 +183,58 @@ def _inject_dashboard_config(
         config,
         separators=(",", ":"),
     ).replace("<", "\\u003c")
-    script = f"<script>window.__CAYU_DASHBOARD_CONFIG__={config_json};</script>"
+    return f"window.__CAYU_DASHBOARD_CONFIG__={config_json};"
+
+
+def dashboard_content_security_policy(*, config_script: str, api_base_url: str) -> str:
+    """Return the policy the bundled dashboard page needs, and nothing broader.
+
+    The page runs one generated inline config script (allowed by its hash), uses
+    inline styles, relies on ``<base href>`` for nested routes, renders artifacts
+    from ``blob:``/``data:`` URLs, and talks to the control-plane API, which may
+    be on another origin. A host that applies its own policy to the mount path
+    must allow at least these directives.
+    """
+
+    digest = base64.b64encode(hashlib.sha256(config_script.encode("utf-8")).digest()).decode()
+    connect = ["'self'"]
+    media = ["'self'", "blob:"]
+    if "://" in api_base_url:
+        parsed = urlsplit(api_base_url)
+        connect.append(f"{parsed.scheme}://{parsed.netloc}")
+        if parsed.scheme in {"http", "https"}:
+            media.append(f"{parsed.scheme}://{parsed.netloc}")
+        if parsed.scheme == "https":
+            connect.append(f"wss://{parsed.netloc}")
+    return "; ".join(
+        (
+            "default-src 'self'",
+            f"script-src 'self' 'sha256-{digest}'",
+            "style-src 'self' 'unsafe-inline'",
+            "img-src 'self' data: blob:",
+            f"media-src {' '.join(media)}",
+            "font-src 'self' data:",
+            f"connect-src {' '.join(connect)}",
+            "base-uri 'self'",
+            "form-action 'self'",
+            "object-src 'none'",
+        )
+    )
+
+
+def _inject_dashboard_config(
+    html: str,
+    *,
+    base_path: str,
+    api_base_url: str,
+    dashboard_config: dict[str, Any] | None = None,
+) -> str:
+    script_body = _dashboard_config_script(
+        base_path=base_path,
+        api_base_url=api_base_url,
+        dashboard_config=dashboard_config,
+    )
+    script = f"<script>{script_body}</script>"
     base_href = "/" if base_path == "/" else f"{base_path}/"
     base = f'<base href="{escape(base_href, quote=True)}" />'
     parser = _document_open_parser(html)

@@ -83,6 +83,7 @@ from cayu.server import (
     ServerConfig,
     create_server,
 )
+from cayu.server.static import dashboard_content_security_policy
 from cayu.sessions.base import EventQuery, InMemorySessionStore, SessionIdentity, SessionStatus
 
 if TYPE_CHECKING:
@@ -3496,6 +3497,13 @@ async def _serve_dashboard_without_pricebook(route) -> None:
     await route.fulfill(
         response=response,
         body=f"{html[:config_start]}{config_json}{html[config_end:]}",
+        headers={
+            **response.headers,
+            "content-security-policy": dashboard_content_security_policy(
+                config_script=f"{marker}{config_json};",
+                api_base_url=config["apiBaseUrl"],
+            ),
+        },
     )
 
 

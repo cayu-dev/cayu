@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import re
 import sys
@@ -104,6 +105,30 @@ _RELATED = {
 }
 
 
+def _guide_topic_for(requested: str) -> str | None:
+    """Resolve a topic name, or the file name a guide is published under."""
+
+    if requested in _GUIDES:
+        return requested
+    for topic, (filename, _) in _GUIDES.items():
+        if filename.removesuffix(".md") == requested.removesuffix(".md"):
+            return topic
+    return None
+
+
+def _unknown_topic_message(requested: str) -> tuple[str, list[str]]:
+    suggestions = difflib.get_close_matches(requested, list(_GUIDES), n=3, cutoff=0.5)
+    parts = [f"unknown guide topic {requested!r}."]
+    if suggestions:
+        parts.append(f"Did you mean: {', '.join(suggestions)}?")
+    parts.append(f"Topics: {', '.join(_GUIDES)}.")
+    parts.append(
+        f"Repository documents such as docs/{requested.removesuffix('.md')}.md are not "
+        "shipped with the package; read them in the Cayu source repository."
+    )
+    return " ".join(parts), suggestions
+
+
 def _render_includes(content: str) -> str:
     for placeholder, (resource_name, start_marker, end_marker) in _INCLUDES.items():
         count = content.count(placeholder)
@@ -168,9 +193,10 @@ def run_guide(args: argparse.Namespace) -> int:
             print(f"  {name:<18} {description}")
         print("Run `cayu guide TOPIC` or `cayu guide TOPIC#SECTION`.")
         return 0
-    name, separator, anchor = args.name.partition("#")
-    guide_record = _GUIDES.get(name)
-    if guide_record is None:
+    requested, separator, anchor = args.name.partition("#")
+    name = _guide_topic_for(requested)
+    if name is None:
+        message, suggestions = _unknown_topic_message(requested)
         if args.json:
             print(
                 json.dumps(
@@ -178,20 +204,17 @@ def run_guide(args: argparse.Namespace) -> int:
                         "schema_version": 1,
                         "error": {
                             "code": "UNKNOWN_GUIDE_TOPIC",
-                            "message": (
-                                f"unknown guide topic {name!r}; choose from: {', '.join(_GUIDES)}"
-                            ),
+                            "message": message,
+                            "suggestions": suggestions,
                         },
                     },
                     sort_keys=True,
                 )
             )
             return 2
-        print(
-            f"error: unknown guide topic {name!r}; choose from: {', '.join(_GUIDES)}",
-            file=sys.stderr,
-        )
+        print(f"error: {message}", file=sys.stderr)
         return 2
+    guide_record = _GUIDES[name]
     if separator and not anchor:
         if args.json:
             print(

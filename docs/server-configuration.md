@@ -492,6 +492,38 @@ The host continues to own its documentation and CORS configuration.
 `mount_dashboard()` remains a lower-level helper and does not protect a
 separately mounted API automatically.
 
+### Local single-developer apps
+
+`OpenAccess(trusted_local_development=True)` is the embedded equivalent of
+`cayu serve --dev`. Every mounted route rejects a request unless both the client
+address and the `Host` header are loopback, which also blocks DNS-rebinding
+pages and remote traffic through a same-host proxy that forwards client
+addresses. In exchange, durable `evals` and `evaluation_promotion` work without
+an auth dependency:
+
+```python
+from cayu.server import OpenAccess, mount_cayu
+
+mount_cayu(
+    server,
+    cayu_app,
+    access=OpenAccess(trusted_local_development=True),
+    evals=resolved_evals_config,
+)
+```
+
+Plain `OpenAccess()` keeps its existing behavior and still cannot enable Evals.
+
+### Content-Security-Policy
+
+The dashboard page sends its own `Content-Security-Policy`. It allows the one
+generated inline configuration script by hash, inline styles, `base-uri 'self'`
+(the page uses `<base href>` for nested routes), `blob:` and `data:` images and
+media, and `connect-src` for the API origin. A host middleware that sets a policy
+on every response replaces or narrows it; on the mount path, such a policy must
+allow at least what `cayu.server.static.dashboard_content_security_policy()`
+returns, or direct links such as `/cayu/sessions/<id>` render blank.
+
 ## Construction contract
 
 `create_server()` requires a resolved `ServerConfig`; access, exposure, CORS,

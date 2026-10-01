@@ -102,6 +102,7 @@ from configuration.settings import (
     configured_model as configured_model,
     configured_provider_choice as configured_provider_choice,
     configured_provider_name as configured_provider_name,
+    resolve_configured_agent as resolve_configured_agent,
 )
 
 __all__ = [
@@ -109,6 +110,7 @@ __all__ = [
     "configured_provider",
     "configured_provider_choice",
     "configured_provider_name",
+    "resolve_configured_agent",
     "validate_run_configuration",
 ]
 '''
@@ -231,6 +233,7 @@ import os
 from pathlib import Path
 
 from cayu import (
+    AgentSpec,
     PublicAuthorityAliasCodec,
     public_authority_alias_codec_from_environment,
 )
@@ -279,6 +282,27 @@ def configured_model() -> str:
     if selected is None:
         return "provider-model-unconfigured"
     return _DEFAULT_MODELS[selected]
+
+
+_UNCONFIGURED_MODELS = ("provider-model-unconfigured", "openrouter-model-unconfigured")
+
+
+def resolve_configured_agent(agent: AgentSpec) -> AgentSpec:
+    """Apply provider and model settings that were set after the agent was imported.
+
+    Agent modules are imported before the application is built. An agent declared
+    while no provider was selected carries a placeholder model; resolving it again
+    at build time makes CAYU_PROVIDER and CAYU_MODEL set before build_app() apply.
+    """
+
+    if agent.model not in _UNCONFIGURED_MODELS:
+        return agent
+    return agent.model_copy(
+        update={
+            "model": configured_model(),
+            "provider_name": configured_provider_name(),
+        }
+    )
 
 
 def configured_model_override() -> str:
@@ -637,6 +661,7 @@ from cayu import AgentSpec, CayuApp, ModelProvider
 from cayu import ContextPolicy
 
 from agents.agent import AGENT
+from configuration import resolve_configured_agent
 from policies.tools import build_tool_exposure_policy, build_tool_policy
 from tools.registration import build_agent_tools, external_effect_tool_names
 
@@ -648,6 +673,7 @@ from tools.registration import build_agent_tools, external_effect_tool_names
 def _agent_for_provider_override(
     agent: AgentSpec, provider: ModelProvider | None
 ) -> AgentSpec:
+    agent = resolve_configured_agent(agent)
     if provider is None:
         return agent
     return agent.model_copy(update={"provider_name": provider.name})

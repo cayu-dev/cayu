@@ -1226,6 +1226,24 @@ def _coding_app_wiring_precondition(root: Path) -> GeneratorPrecondition | None:
     return _file_precondition(root, relative)
 
 
+def _is_configured_agent_resolution(statement: ast.stmt) -> bool:
+    """Match ``agent = resolve_configured_agent(agent)`` from current scaffolds."""
+
+    return (
+        isinstance(statement, ast.Assign)
+        and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name)
+        and statement.targets[0].id == "agent"
+        and isinstance(statement.value, ast.Call)
+        and isinstance(statement.value.func, ast.Name)
+        and statement.value.func.id == "resolve_configured_agent"
+        and len(statement.value.args) == 1
+        and isinstance(statement.value.args[0], ast.Name)
+        and statement.value.args[0].id == "agent"
+        and not statement.value.keywords
+    )
+
+
 def _coding_registration_helper_is_canonical(root: Path) -> bool:
     relative = "agents/registration.py"
     path = _generated_path(root, relative)
@@ -1262,6 +1280,8 @@ def _coding_registration_helper_is_canonical(root: Path) -> bool:
         and isinstance(body[0].value, ast.Constant)
         and isinstance(body[0].value.value, str)
     ):
+        body = body[1:]
+    if body and _is_configured_agent_resolution(body[0]):
         body = body[1:]
     if len(body) != 2 or not isinstance(body[0], ast.If) or not isinstance(body[1], ast.Return):
         return False

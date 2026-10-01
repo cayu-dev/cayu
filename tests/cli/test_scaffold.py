@@ -1740,6 +1740,49 @@ def test_scaffold_subscription_mode_selects_a_compatible_model(
     assert provider.requests[0].model == "gpt-6-luna"
 
 
+def test_scaffold_applies_provider_settings_made_after_import(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    assert main(["new", "lateproj", "--dir", str(tmp_path)]) == 0
+    project = tmp_path / "lateproj"
+    monkeypatch.delenv("CAYU_PROVIDER", raising=False)
+    monkeypatch.delenv("CAYU_MODEL", raising=False)
+    provider = ScriptedModelProvider(
+        [
+            ModelStreamEvent.text_delta("Late result."),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ],
+        name="openai_subscription",
+    )
+    monkeypatch.setattr("cayu.OpenAISubscriptionProvider", lambda: provider)
+
+    spec = importlib.util.spec_from_file_location("late_provider_scaffold_app", project / "app.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    with project_context(project):
+        # A host entrypoint imports the application before choosing a provider.
+        spec.loader.exec_module(module)
+        monkeypatch.setenv("CAYU_PROVIDER", "openai-subscription")
+        monkeypatch.setenv("CAYU_MODEL", "gpt-6.1-sol")
+        app = module.build_app(
+            session_store=InMemorySessionStore(),
+            task_store=InMemoryTaskStore(),
+        )
+        outcome = asyncio.run(
+            run_to_completion(
+                app,
+                RunRequest(
+                    agent_name="lateproj",
+                    messages=[Message.text("user", "Run after late configuration")],
+                ),
+            )
+        )
+
+    assert outcome.ok
+    assert provider.requests[0].model == "gpt-6.1-sol"
+
+
 def test_scaffold_does_not_infer_provider_from_credentials(
     tmp_path: Path,
     monkeypatch,

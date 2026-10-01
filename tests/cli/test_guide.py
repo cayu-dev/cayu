@@ -715,3 +715,24 @@ def test_package_shipped_app_ui_guide_states_the_request_rules(capsys) -> None:
     control_plane = (root / "docs/control-plane.md").read_text()
     bring_your_own_ui = control_plane.split("## Bring your own UI", 1)[1].split("\n## ", 1)[0]
     assert "../src/cayu/guides/app-ui.md" in bring_your_own_ui
+
+
+def test_guide_accepts_the_file_name_a_topic_is_published_under(capsys) -> None:
+    assert main(["guide", "application-anatomy"]) == 0
+    by_file = capsys.readouterr().out
+    assert main(["guide", "anatomy"]) == 0
+
+    assert by_file == capsys.readouterr().out
+
+
+def test_unknown_guide_topic_suggests_topics_and_explains_repository_docs(capsys) -> None:
+    assert main(["guide", "evals"]) == 2
+    error = capsys.readouterr().err
+    assert "Did you mean:" in error
+    assert "evals-first" in error
+
+    assert main(["guide", "project-server", "--json"]) == 2
+    report = json.loads(capsys.readouterr().out)["error"]
+    assert report["code"] == "UNKNOWN_GUIDE_TOPIC"
+    assert "docs/project-server.md are not shipped with the package" in report["message"]
+    assert isinstance(report["suggestions"], list)

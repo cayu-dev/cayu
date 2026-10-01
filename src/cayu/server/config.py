@@ -38,6 +38,7 @@ from cayu.evals.execution import CorpusTarget, WorkflowEvalTarget
 from cayu.evals.execution_profiles import EvalExecutionProfilePolicyV1
 from cayu.evals.store import EVAL_STORE_MAX_LEASE_SECONDS, EvalStore
 from cayu.server._browser_control_config import BrowserControlServerConfig
+from cayu.server.auth import TrustedLocalAuth
 from cayu.server.contracts import (
     DEFAULT_REPLAY_IDLE_TIMEOUT_SECONDS,
     DEFAULT_SESSION_FOLLOW_HEARTBEAT_SECONDS,
@@ -154,11 +155,18 @@ def _validate_with_redacted_errors(
 
 
 class OpenAccess(BaseModel):
-    """Deliberate unauthenticated access to the configured server surface."""
+    """Deliberate unauthenticated access to the configured server surface.
+
+    ``trusted_local_development=True`` restricts the surface to loopback
+    requests (client address and ``Host`` header) and, in exchange, enables the
+    features ``cayu serve --dev`` enables locally: durable Evals execution and
+    evaluation promotion. Use it for a single-developer app bound to loopback.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     kind: Literal["open"] = "open"
+    trusted_local_development: bool = False
 
     @model_validator(mode="wrap")
     @classmethod
@@ -664,13 +672,19 @@ class ServerConfig(BaseModel):
         if self.evaluation_promotion is not None:
             if not self.api.enabled:
                 raise ValueError("evaluation_promotion requires api.enabled.")
-            if not isinstance(self.access, AuthenticatedAccess):
-                raise ValueError("evaluation_promotion requires authenticated API access.")
+            if not _access_identifies_callers(self.access):
+                raise ValueError(
+                    "evaluation_promotion requires authenticated API access "
+                    "or OpenAccess(trusted_local_development=True)."
+                )
         if self.evals is not None:
             if not self.api.enabled:
                 raise ValueError("evals requires api.enabled.")
-            if not isinstance(self.access, AuthenticatedAccess):
-                raise ValueError("evals requires authenticated API access.")
+            if not _access_identifies_callers(self.access):
+                raise ValueError(
+                    "evals requires authenticated API access "
+                    "or OpenAccess(trusted_local_development=True)."
+                )
         if (
             self.dashboard.enabled
             and self.docs.enabled
@@ -793,11 +807,17 @@ class ServerConfig(BaseModel):
         }
 
 
+def _access_identifies_callers(access: ServerAccessConfig) -> bool:
+    return isinstance(access, AuthenticatedAccess) or (
+        isinstance(access, OpenAccess) and access.trusted_local_development
+    )
+
+
 def auth_dependency_for(access: ServerAccessConfig) -> Any | None:
     """Resolve an access policy into the existing server auth dependency contract."""
 
     if isinstance(access, OpenAccess):
-        return None
+        return TrustedLocalAuth() if access.trusted_local_development else None
     if isinstance(access, AuthenticatedAccess):
         return access.dependency
     raise TypeError("access must be OpenAccess or AuthenticatedAccess.")

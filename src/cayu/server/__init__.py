@@ -606,11 +606,23 @@ def mount_cayu(
     operator surface unless the host application enforces end-to-end tenant
     authorization and storage isolation.
 
+    ``OpenAccess(trusted_local_development=True)`` is the embedded equivalent of
+    ``cayu serve --dev``: every mounted route rejects requests unless both the
+    client address and the ``Host`` header are loopback, and in exchange durable
+    ``evals`` and ``evaluation_promotion`` are available without an auth
+    dependency.
+
+    The dashboard page sends its own ``Content-Security-Policy``. A host that
+    applies a policy to the mount path must allow at least what
+    ``cayu.server.static.dashboard_content_security_policy`` returns: the hashed
+    inline config script, inline styles, ``base-uri 'self'``, ``blob:``/``data:``
+    images and media, and ``connect-src`` for the API origin.
+
     ``dashboard_config`` must be a JSON object. Cayu validates and copies it
     before modifying the host application. ``evaluation_promotion`` remains
     disabled unless a complete configuration is supplied and requires
-    authenticated ``access``. Durable eval execution likewise remains disabled
-    unless complete ``evals`` wiring is supplied.
+    authenticated or trusted-local ``access``. Durable eval execution likewise
+    remains disabled unless complete ``evals`` wiring is supplied.
     ``continuation_loop_policy_provider`` lets an embedding boundary attach
     trusted in-process policies to control-plane continuations; HTTP callers
     cannot supply or serialize those policies.
@@ -630,7 +642,7 @@ def mount_cayu(
     resolved_request_timing = _resolve_mount_request_timing(
         request_timing,
         observe_host_requests=observe_host_requests,
-        open_access=auth is None,
+        open_access=isinstance(access, OpenAccess),
         cayu_serve=resolved_project_context is not None,
     )
     prepared_dashboard: tuple[str, DashboardStaticFiles] | None = None

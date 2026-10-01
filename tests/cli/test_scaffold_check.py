@@ -968,3 +968,68 @@ def test_coding_projects_keep_local_tooling_on_the_protected_state_database(
         "backend": "sqlite",
         "path": ".cayu/runtime/cayu.db",
     }
+
+
+_ORDINARY_MODULES = {
+    "module_logger": "import logging\n\nlogger = logging.getLogger(__name__)\n",
+    "method_named_list": ("class Store:\n    def list(self) -> list[dict]:\n        return []\n"),
+    "list_annotation_before_list_method": (
+        "class Store:\n"
+        "    def items(self) -> list[dict]:\n"
+        "        return []\n\n"
+        "    def list(self) -> None:\n"
+        "        return None\n"
+    ),
+    "postponed_annotation_after_list_method": (
+        "from __future__ import annotations\n\n\n"
+        "class Store:\n"
+        "    def list(self) -> None:\n"
+        "        return None\n\n"
+        "    def later(self) -> list[int]:\n"
+        "        return []\n"
+    ),
+}
+_IMPORT_TIME_MODULES = {
+    # Evaluated eagerly on Python 3.11-3.13, where ``list`` is now the method.
+    "annotation_after_list_method": (
+        "class Store:\n"
+        "    def list(self) -> None:\n"
+        "        return None\n\n"
+        "    def later(self) -> list[int]:\n"
+        "        return []\n"
+    ),
+    "logger_named_from_environment": (
+        'import logging\nimport os\n\nlogger = logging.getLogger(os.environ["NAME"])\n'
+    ),
+    "environment_read": 'import os\n\nNAME = os.environ.get("NAME")\n',
+}
+
+
+def _import_side_effects(project: Path, source: str) -> list[dict]:
+    (project / "domain/probe.py").write_text(source, encoding="utf-8")
+    return [
+        diagnostic.model_dump(mode="json")
+        for diagnostic in check_declared_scaffold_source(project)
+        if diagnostic.code == "SCAFFOLD_IMPORT_SIDE_EFFECT"
+    ]
+
+
+@pytest.mark.parametrize("case", sorted(_ORDINARY_MODULES))
+def test_import_checker_accepts_ordinary_module_code(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], case: str
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+
+    assert _import_side_effects(tmp_path / "project", _ORDINARY_MODULES[case]) == []
+
+
+@pytest.mark.parametrize("case", sorted(_IMPORT_TIME_MODULES))
+def test_import_checker_still_rejects_real_import_time_work(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], case: str
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+
+    findings = _import_side_effects(tmp_path / "project", _IMPORT_TIME_MODULES[case])
+    assert [finding["path"].split(":")[0] for finding in findings] == ["domain/probe.py"]

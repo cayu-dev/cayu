@@ -752,7 +752,7 @@ def _check_import_inertness(root: Path) -> tuple[ProjectDiagnostic, ...]:
             continue
         try:
             source = path.read_text(encoding="utf-8")
-            tree = ast.parse(source, filename=relative)
+            tree = _without_postponed_annotations(ast.parse(source, filename=relative))
         except (OSError, UnicodeError, SyntaxError) as exc:
             diagnostics.append(
                 _diagnostic(
@@ -2147,6 +2147,8 @@ def _project_declaration_proofs(root: Path) -> _DeclarationGraph:
         # A namespace directory contributes no executable source, but its
         # explicit children and regular parent initializers still enter the graph.
         tree = ast.Module(body=[], type_ignores=[]) if path.is_dir() else _parsed_module(path)
+        if tree is not None:
+            tree = _without_postponed_annotations(tree)
         if tree is None:
             invalid.add(path)
             continue
@@ -2659,8 +2661,8 @@ def _import_time_decorator_uses(
         uses.extend((decorator, class_rebound_names) for decorator in node.decorator_list)
     elif isinstance(node, ast.ClassDef):
         uses.extend((decorator, class_rebound_names) for decorator in node.decorator_list)
-        class_scope = _scope_rebound_names(node.body, include_imports=True)
-        add_suite(node.body, class_scope)
+        for statement, scope in zip(node.body, _ordered_class_scopes(node.body), strict=True):
+            add_suite([statement], scope)
     elif isinstance(node, ast.If):
         add_suite(
             node.orelse if _is_main_guard(node.test) else node.body + node.orelse,
@@ -2710,7 +2712,8 @@ def _import_time_class_base_uses(
 
     if isinstance(node, ast.ClassDef):
         uses.extend((base, class_rebound_names) for base in node.bases)
-        add_suite(node.body, _scope_rebound_names(node.body, include_imports=True))
+        for statement, scope in zip(node.body, _ordered_class_scopes(node.body), strict=True):
+            add_suite([statement], scope)
     elif isinstance(node, ast.If):
         add_suite(
             node.orelse if _is_main_guard(node.test) else node.body + node.orelse,
@@ -2813,6 +2816,72 @@ def _nested_import_names(statements: list[ast.stmt]) -> frozenset[str]:
             for case in statement.cases:
                 add_suite(case.body)
     return frozenset(names)
+
+
+_SEQUENTIAL_CLASS_STATEMENTS = (
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.ClassDef,
+    ast.Assign,
+    ast.AnnAssign,
+    ast.AugAssign,
+    ast.Import,
+    ast.ImportFrom,
+    ast.Pass,
+)
+
+
+def _ordered_class_scopes(body: list[ast.stmt]) -> tuple[frozenset[str], ...]:
+    """Class-body names each statement can observe while it is evaluated.
+
+    A class body runs top to bottom, and a def, class or assignment evaluates its
+    decorators, defaults, annotations and value before binding its own names, so
+    it sees only earlier bindings. Loops, conditionals, other compound statements
+    and walrus expressions may observe later bindings; they get the whole scope.
+    """
+
+    whole = _scope_rebound_names(body, include_imports=True)
+    scopes: list[frozenset[str]] = []
+    bound: set[str] = set()
+    for statement in body:
+        sequential = isinstance(statement, _SEQUENTIAL_CLASS_STATEMENTS) and not any(
+            isinstance(child, ast.NamedExpr) for child in ast.walk(statement)
+        )
+        scopes.append(frozenset(bound) if sequential else whole)
+        bound |= _scope_rebound_names([statement], include_imports=True)
+    return tuple(scopes)
+
+
+def _without_postponed_annotations(tree: ast.Module) -> ast.Module:
+    """Drop signature annotations that Python does not evaluate at import.
+
+    Under ``from __future__ import annotations`` an undecorated function's
+    parameter and return annotations stay strings until something introspects
+    them. Decorated functions keep theirs because decorators such as
+    ``functools.singledispatch`` or Pydantic validators can evaluate them.
+    """
+
+    if not any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "__future__"
+        and any(alias.name == "annotations" for alias in node.names)
+        for node in tree.body
+    ):
+        return tree
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not node.decorator_list:
+            node.returns = None
+            arguments = node.args
+            for argument in (
+                *arguments.posonlyargs,
+                *arguments.args,
+                *arguments.kwonlyargs,
+                arguments.vararg,
+                arguments.kwarg,
+            ):
+                if argument is not None:
+                    argument.annotation = None
+    return tree
 
 
 def _scope_rebound_names(
@@ -2999,8 +3068,7 @@ def _import_time_expression_uses(
             add(expression)
         for keyword in node.keywords:
             add(keyword.value)
-        class_scope = _scope_rebound_names(node.body, include_imports=True)
-        for statement in node.body:
+        for statement, class_scope in zip(node.body, _ordered_class_scopes(node.body), strict=True):
             expressions.extend(
                 _import_time_expression_uses(
                     statement,
@@ -3220,6 +3288,23 @@ def _import_call_is_declarative(
         )
     if call.func.attr == "join":
         return isinstance(call.func.value, ast.Constant) and isinstance(call.func.value.value, str)
+    if (
+        call.func.attr == "getLogger"
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "logging"
+    ):
+        # Registers a named logger in-process; no I/O or handler configuration.
+        return (
+            import_bindings.get("logging") == ("logging", None)
+            and "logging" not in rebound_names
+            and not call.keywords
+            and len(call.args) <= 1
+            and all(
+                (isinstance(argument, ast.Name) and argument.id == "__name__")
+                or (isinstance(argument, ast.Constant) and isinstance(argument.value, str))
+                for argument in call.args
+            )
+        )
     if call.func.attr == "model_dump":
         return (
             isinstance(call.func.value, ast.Name) and call.func.value.id in declarative_identities

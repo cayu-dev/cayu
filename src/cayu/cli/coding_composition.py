@@ -1486,6 +1486,8 @@ from cayu import (
     ToolPolicy,
 )
 
+from configuration import resolve_configured_agent
+
 # Generated tool-backed slices add imports only inside this owned region.
 # <cayu:generated-imports>
 # </cayu:generated-imports>
@@ -1496,6 +1498,7 @@ def _agent_for_provider_override(
 ) -> AgentSpec:
     """Preserve the public injected-provider test seam for generated agents."""
 
+    agent = resolve_configured_agent(agent)
     if provider is None:
         return agent
     return agent.model_copy(update={"provider_name": provider.name})
