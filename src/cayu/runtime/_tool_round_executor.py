@@ -7742,9 +7742,13 @@ class ToolRoundRun:
                     )
                     set_exception_cause(cancellation, interrupt_cause)
                 interrupt = cancellation
+            # Persist the bounded round's entire closure before exposing outcomes.
+            # GeneratorExit at an outward yield is consumer abandonment, not a
+            # failure of durable tool cleanup; the session owner must handle it.
+            interruption_events: list[Event] = []
             try:
                 async for event in round_owner.publish_before_interrupt():
-                    yield event
+                    interruption_events.append(event)
                 stream = self.close_after_interrupt(
                     interrupt,
                     messages=messages,
@@ -7754,7 +7758,7 @@ class ToolRoundRun:
                 )
                 async with aclosing(stream) as owned_stream:
                     async for event in owned_stream:
-                        yield event
+                        interruption_events.append(event)
             except BaseException as closure_error:
                 restore_cancellation_requests = (
                     _consume_current_task_cancellation_requests(closure_error)
@@ -7767,6 +7771,8 @@ class ToolRoundRun:
                     restore_cancellation_requests=restore_cancellation_requests,
                     minimum_cancellation_requests=minimum_cancellation_requests,
                 )
+            for event in interruption_events:
+                yield event
             if isinstance(interrupt, asyncio.CancelledError):
                 invocation_secrets.sanitize_external_cancellation(interrupt)
                 _restore_current_task_cancellation_requests(
@@ -7779,9 +7785,13 @@ class ToolRoundRun:
             await _receive_restored_post_tool_cancellation()
             current_task = asyncio.current_task()
             minimum_cancellation_requests = 0 if current_task is None else current_task.cancelling()
+            # Persist the bounded round's entire closure before exposing outcomes.
+            # GeneratorExit at an outward yield is consumer abandonment, not a
+            # failure of durable tool cleanup; the session owner must handle it.
+            interruption_events: list[Event] = []
             try:
                 async for event in round_owner.publish_before_interrupt():
-                    yield event
+                    interruption_events.append(event)
                 stream = self.close_after_interrupt(
                     exc,
                     messages=messages,
@@ -7791,7 +7801,7 @@ class ToolRoundRun:
                 )
                 async with aclosing(stream) as owned_stream:
                     async for event in owned_stream:
-                        yield event
+                        interruption_events.append(event)
             except BaseException as closure_error:
                 restore_cancellation_requests = (
                     _consume_current_task_cancellation_requests(closure_error)
@@ -7804,6 +7814,8 @@ class ToolRoundRun:
                     restore_cancellation_requests=restore_cancellation_requests,
                     minimum_cancellation_requests=minimum_cancellation_requests,
                 )
+            for event in interruption_events:
+                yield event
             invocation_secrets.sanitize_external_cancellation(exc)
             _restore_current_task_cancellation_requests(
                 minimum_requests=minimum_cancellation_requests,
@@ -7811,8 +7823,7 @@ class ToolRoundRun:
             raise
         except SessionInterruptedByRequest as exc:
             round_owner.finish_dispatch()
-            async for event in round_owner.publish_before_interrupt():
-                yield event
+            interruption_events = [event async for event in round_owner.publish_before_interrupt()]
             stream = self.close_after_interrupt(
                 exc,
                 messages=messages,
@@ -7822,7 +7833,9 @@ class ToolRoundRun:
             )
             async with aclosing(stream) as owned_stream:
                 async for event in owned_stream:
-                    yield event
+                    interruption_events.append(event)
+            for event in interruption_events:
+                yield event
             raise
         except Exception:
             round_owner.finish_dispatch()

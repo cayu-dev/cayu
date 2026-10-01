@@ -27688,6 +27688,26 @@ class SessionEngine:
                 # not rewrite the completed/paused interaction decision.
                 raise
             await materialize_deferred_messages_after_failure()
+            if await self._session_control.interrupt_requested(session.id):
+                # A consumer may close while receiving interrupted tool outcomes.
+                # Preserve the accepted interruption identity, so its requester
+                # observes the same terminal receipt instead of timing out on an
+                # unrelated abandonment receipt. Cleanup cannot yield here.
+                _, propagated_failure = await self._handle_session_interrupted_preserving_failure(
+                    authoritative_failure=abandonment,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=environment_name,
+                    execution_profile=execution_profile,
+                    invocation_context=invocation_context,
+                    run_started_at=run_started_at,
+                    turn_usage_tracker=turn_usage_tracker,
+                    active_run=active_run,
+                )
+                if propagated_failure is not abandonment:
+                    raise propagated_failure from None
+                raise
             try:
                 await self._recovery_coordinator.finalize_abandoned_session_run(
                     RecoveryAbandonedSessionRequest(
@@ -31225,7 +31245,8 @@ class SessionEngine:
             persisted_session = await self.session_store.load(session.id)
             if (
                 persisted_session is None
-                or persisted_session.status not in _INTERRUPTIBLE_SESSION_STATUSES
+                or persisted_session.status
+                not in _INTERRUPTIBLE_SESSION_STATUSES | {SessionStatus.INTERRUPTING}
             ):
                 return
             if prepare_interruption is not None:

@@ -42002,5 +42002,18 @@
     "tests/core/test_provider_error_redaction.py::test_runtime_redacts_workload_secrets_before_and_after_formatting[normalization-join-background-sse-openai]": 0.33696595900983084,
     "tests/core/test_provider_error_redaction.py::test_runtime_redacts_workload_secrets_before_and_after_formatting[normalization-join-final-json-openai]": 0.29707050099386834,
     "tests/core/test_provider_error_redaction.py::test_runtime_redacts_workload_secrets_before_and_after_formatting[overlapping-credentials-background-sse-openai]": 0.32552554200810846,
-    "tests/core/test_provider_error_redaction.py::test_runtime_redacts_workload_secrets_before_and_after_formatting[overlapping-credentials-final-json-openai]": 0.315043583032093
+    "tests/core/test_provider_error_redaction.py::test_runtime_redacts_workload_secrets_before_and_after_formatting[overlapping-credentials-final-json-openai]": 0.315043583032093,
+    "tests/core/test_interrupted_tool_stream_close.py::test_close_during_interrupted_tool_outcomes_settles_original_request[1]": 0.885177707998082,
+    "tests/core/test_interrupted_tool_stream_close.py::test_close_during_interrupted_tool_outcomes_settles_original_request[2]": 0.8765095000126166,
+    "tests/core/test_interrupted_tool_stream_close.py::test_close_during_interrupted_tool_outcomes_settles_original_request[None]": 1.1328992919879965,
+    "tests/cli/test_auth.py::test_auth_openai_login_device_code_is_an_alias_for_headless": 0.027025750983739272,
+    "tests/cli/test_auth.py::test_device_login_flushes_the_code_before_polling": 0.00023504199634771794,
+    "tests/core/test_runtime_event_writer.py::test_private_candidate_does_not_grant_publication_admission": 0.2654878340108553,
+    "tests/core/test_runtime_reply_admission_contract.py::test_reply_admission_requires_successful_invocation_not_nonempty_text[1-memory]": 0.6132006250118138,
+    "tests/core/test_runtime_reply_admission_contract.py::test_reply_admission_requires_successful_invocation_not_nonempty_text[1-sqlite]": 0.5752312510012416,
+    "tests/core/test_runtime_reply_admission_contract.py::test_reply_admission_requires_successful_invocation_not_nonempty_text[2-memory]": 0.5027169999812031,
+    "tests/core/test_runtime_reply_admission_contract.py::test_reply_admission_requires_successful_invocation_not_nonempty_text[2-sqlite]": 0.7793907919985941,
+    "tests/core/test_runtime_reply_admission_contract.py::test_structured_output_owns_completion_instead_of_generic_before_stop_gate": 0.4311821259907447,
+    "tests/core/test_deferred_session_finalization.py::test_deferred_cancelled_session_finalization[asyncio-sqlite]": 1.7198981659894343,
+    "tests/core/test_runtime.py::test_tool_approval_resolution_retains_round_authority_for_unknown_secret_scope": 1.6677612070052419
 }

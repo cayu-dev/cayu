@@ -1517,12 +1517,10 @@ def test_closing_interrupted_round_observes_nested_stream_teardown(
         async def consume():
             async for event in stream:
                 if event.type == EventType.TOOL_CALL_FAILED:
-                    with pytest.raises((BaseExceptionGroup, asyncio.CancelledError)) as failure:
-                        await stream.aclose()
-                    leaves = list(iter_exception_tree(failure.value))
-                    assert any(isinstance(e, asyncio.CancelledError) for e in leaves)
-                    if not repeated_cancel:
-                        assert any(isinstance(e, GeneratorExit) for e in leaves)
+                    # The bounded interruption drain has already closed its nested
+                    # stream. Consumer abandonment is not a cleanup failure.
+                    assert not repeated_cancel
+                    await stream.aclose()
                     assert closed == ["calls", "interruption"]
                     return
             raise AssertionError("No interruption event was published.")
