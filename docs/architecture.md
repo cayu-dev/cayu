@@ -77,6 +77,15 @@ trials and saves the report while holding its lock. Repeated requests reuse
 the stored report, and conflicting definitions retain their existing rejection.
 The eval worker lifespan remains in router composition.
 
+`server/_suite_authoring_routes.py` owns authored suite preview, save, catalog,
+detail and download. Its registrar receives the bounded eval router, runtime
+store, target registry and shared auth dependencies. Authoring diagnostics check
+current judge authority, public material and exact scenario references; repeated
+scenario revisions share one read, with at most 16 reads in flight. Authoring
+reads and run launch use the same suite revision loader to enforce persistence
+support, private storage errors and current target visibility. Run admission,
+execution and worker lifespan remain in router composition.
+
 ## Runtime Shape
 
 ```text

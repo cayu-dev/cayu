@@ -4,6 +4,7 @@ import asyncio
 import time
 from decimal import Decimal
 
+import httpx
 import pytest
 from tests.server.test_server_eval_scenarios import (
     _AUTH_HEADERS,
@@ -16,6 +17,8 @@ from tests.server.test_server_eval_scenarios import (
 pytest.importorskip("fastapi")
 pytest.importorskip("sse_starlette")
 
+from fastapi import HTTPException, Request
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from cayu.budgets.pricing import ModelPrice, PriceBook
@@ -32,6 +35,8 @@ from cayu.evals.corpus import (
     ToolResultContainsAssertionSpec,
 )
 from cayu.evals.execution_profiles import EvalExecutionProfilePolicyV1
+from cayu.evals.scenario import EvalScenarioDocumentV2
+from cayu.evals.store import EvalStoreResultTooLarge
 from cayu.evals.suite_authoring import (
     EvalCaseDraftV1,
     EvalCaseDraftV2,
@@ -42,10 +47,12 @@ from cayu.evals.suite_authoring import (
     EvalSuiteDraftV1,
     EvalSuiteDraftV3,
     EvalSuiteTrialRequestDraftV3,
+    compile_eval_suite_authoring_draft,
 )
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.providers.base import ModelStreamEvent
-from cayu.server import DashboardConfig, EvalsConfig, ServerConfig, create_server
+from cayu.server import DashboardConfig, EvalsConfig, ServerApiConfig, ServerConfig, create_server
+from cayu.server import routes as routes_module
 from cayu.storage.evals_sqlite import SQLiteEvalStore
 
 
@@ -947,3 +954,294 @@ def test_authored_suite_full_and_subset_launch_use_existing_durable_runners(
             ] == [item["run"]["spec"]["run_id"] for item in body["runs"]]
     finally:
         asyncio.run(store.close())
+
+
+@pytest.mark.parametrize("prefix", ["/api", "/custom/v2"])
+def test_suite_authoring_preserves_auth_and_private_http_boundary(sqlite_resources, prefix):
+    async def scenario():
+        async with sqlite_resources as resources:
+            target, _, provider = _target(resources.path("target"))
+            store = resources.own(SQLiteEvalStore(resources.path()))
+            calls = []
+
+            def authenticate(request: Request):
+                calls.append(request.url.path)
+                return _authenticate(request)
+
+            server = create_server(
+                target.app,
+                config=ServerConfig.protected(
+                    authenticate,
+                    api=ServerApiConfig(path=prefix),
+                    dashboard=DashboardConfig(enabled=False),
+                    evals=EvalsConfig(target=target, store=store),
+                ),
+            )
+            root = f"{prefix}/evals/suites"
+            paths = [
+                f"{root}/preview",
+                root,
+                root,
+                f"{root}/{{suite_revision}}",
+                f"{root}/{{suite_revision}}/download",
+            ]
+            routes = [r for r in server.routes if isinstance(r, APIRoute)]
+            authoring = [r for r in routes if r.path in paths]
+            assert [r.path for r in authoring] == paths
+            dependency = (
+                next(r for r in routes if r.path == f"{prefix}/sessions").dependencies[0].dependency
+            )
+            for route in authoring:
+                assert route.dependencies[0].dependency is dependency
+                assert isinstance(route, routes_module._BoundedEvalsRoute)
+                assert type(route).preparse_auth is authenticate
+            suite = compile_eval_suite_authoring_draft(_draft())
+            requests = [
+                ("POST", f"{root}/preview", {"draft": _draft().model_dump(mode="json")}, 200),
+                (
+                    "POST",
+                    root,
+                    {
+                        "suite": suite.model_dump(mode="json"),
+                        "expected_suite_revision": suite.revision,
+                    },
+                    201,
+                ),
+                ("GET", root, None, 200),
+                ("GET", f"{root}/{suite.revision}", None, 200),
+                ("GET", f"{root}/{suite.revision}/download", None, 200),
+            ]
+            async with (
+                server.router.lifespan_context(server),
+                httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=server), base_url="http://test"
+                ) as client,
+            ):
+                for method, path, payload, status in requests:
+                    calls.clear()
+                    denied = await client.request(
+                        method,
+                        path,
+                        content=b"private invalid input",
+                        headers={"Content-Length": str(authoring[0].max_request_bytes + 1)},
+                    )
+                    assert denied.status_code == 401
+                    assert denied.json() == {"detail": "unauthorized"}
+                    assert denied.headers["cache-control"] == "private, no-store"
+                    assert calls == [path]
+                    calls.clear()
+                    response = await client.request(
+                        method, path, headers=_AUTH_HEADERS, json=payload
+                    )
+                    assert response.status_code == status
+                    assert response.headers["cache-control"] == "private, no-store"
+                    assert calls == [path]
+                for path in (f"{root}/preview", root):
+                    for content, extra_headers, status, detail in (
+                        (
+                            b"{}",
+                            {"Content-Length": str(authoring[0].max_request_bytes + 1)},
+                            413,
+                            "Evals request exceeds the server byte limit.",
+                        ),
+                        (
+                            b'{"private":"secret","private":"other"}',
+                            {},
+                            422,
+                            "Invalid Evals request.",
+                        ),
+                        (b"NaN", {}, 422, "Invalid Evals request."),
+                    ):
+                        calls.clear()
+                        response = await client.post(
+                            path,
+                            content=content,
+                            headers={
+                                **_AUTH_HEADERS,
+                                "Content-Type": "application/json",
+                                **extra_headers,
+                            },
+                        )
+                        assert response.status_code == status
+                        assert response.json() == {"detail": detail}
+                        assert response.headers["cache-control"] == "private, no-store"
+                        assert calls == [path]
+
+                def deny_access():
+                    raise HTTPException(status_code=403, detail="suite access revoked")
+
+                server.dependency_overrides[dependency] = deny_access
+                for method, path, payload, _ in requests:
+                    response = await client.request(
+                        method, path, headers=_AUTH_HEADERS, json=payload
+                    )
+                    assert response.status_code == 403
+                    assert response.json() == {"detail": "suite access revoked"}
+                    assert response.headers["cache-control"] == "private, no-store"
+            assert provider.requests == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", ["invalid", "oversized", "unsupported", "hidden", "missing"])
+def test_suite_revision_reads_preserve_private_errors_for_authoring_and_launch(
+    sqlite_resources, monkeypatch, failure
+):
+    async def scenario():
+        async with sqlite_resources as resources:
+            target, _, provider = _target(resources.path("target"))
+            store = resources.own(SQLiteEvalStore(resources.path()))
+            reads = []
+            hidden = compile_eval_suite_authoring_draft(
+                _draft().model_copy(update={"target_key": "assistant.unpublished"})
+            )
+
+            async def load(revision):
+                reads.append(revision)
+                if failure == "invalid":
+                    raise ValueError("private store input")
+                if failure == "oversized":
+                    raise EvalStoreResultTooLarge(1024)
+                return hidden if failure == "hidden" else None
+
+            monkeypatch.setattr(store, "load_authored_suite", load)
+            if failure == "unsupported":
+                monkeypatch.setattr(store, "suite_authoring", False)
+            server = _server(target, store)
+            revision = "sha256:" + "0" * 64
+            root = f"/api/evals/suites/{revision}"
+            launch_body = {
+                "expected_exposure_revision": revision,
+                "expected_execution_profiles": [
+                    {
+                        "case_ids": ["refund-request"],
+                        "execution_profile_revision": revision,
+                    }
+                ],
+            }
+            expected = {
+                "invalid": (422, "Invalid Evals query."),
+                "oversized": (413, "Authored eval suite exceeds the server byte limit."),
+                "unsupported": (409, "Durable authored-suite persistence is not available."),
+                "hidden": (404, "Authored eval suite not found."),
+                "missing": (404, "Authored eval suite not found."),
+            }[failure]
+            async with (
+                server.router.lifespan_context(server),
+                httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=server), base_url="http://test"
+                ) as client,
+            ):
+                for method, path, payload in (
+                    ("GET", root, None),
+                    ("GET", f"{root}/download", None),
+                    ("POST", f"{root}/runs/preview", {}),
+                    ("POST", f"{root}/runs", launch_body),
+                ):
+                    response = await client.request(
+                        method,
+                        path,
+                        json=payload,
+                        headers={
+                            **_AUTH_HEADERS,
+                            "Idempotency-Key": "suite-private-read",
+                        },
+                    )
+                    assert response.status_code == expected[0]
+                    assert response.json() == {"detail": expected[1]}
+                    assert response.headers["cache-control"] == "private, no-store"
+            assert reads == ([] if failure == "unsupported" else [revision] * 4)
+            assert provider.requests == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_suite_preview_deduplicates_and_bounds_scenario_reads(
+    sqlite_resources, monkeypatch, cancel
+):
+    async def scenario():
+        async with sqlite_resources as resources:
+            target, _, provider = _target(resources.path("target"))
+            store = resources.own(SQLiteEvalStore(resources.path()))
+            template = _scenario()
+            scenarios = [
+                EvalScenarioDocumentV2.create(
+                    id=f"scenario-{index}",
+                    target_key=template.target_key,
+                    name=f"Scenario {index}",
+                    events=template.events,
+                )
+                for index in range(17)
+            ]
+            by_revision = {item.revision: item for item in scenarios}
+            cases = tuple(
+                EvalCaseDraftV1(
+                    id=f"case-{index}",
+                    name=f"Case {index}",
+                    stimulus=EvalScenarioStimulusV1(
+                        scenario_id=item.id, scenario_revision=item.revision
+                    ),
+                    assertions=(RootStatusAssertionSpec(id="completed", expected="completed"),),
+                )
+                for index, item in enumerate([*scenarios, scenarios[0]])
+            )
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            reads = []
+            active = 0
+            peak = 0
+
+            async def load(revision):
+                nonlocal active, peak
+                reads.append(revision)
+                active += 1
+                peak = max(peak, active)
+                if active == 16:
+                    entered.set()
+                try:
+                    await release.wait()
+                    return by_revision[revision]
+                finally:
+                    active -= 1
+
+            monkeypatch.setattr(store, "load_scenario", load)
+            server = _server(target, store)
+            async with (
+                server.router.lifespan_context(server),
+                httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=server), base_url="http://test"
+                ) as client,
+            ):
+                request = resources.task(
+                    client.post(
+                        "/api/evals/suites/preview",
+                        headers=_AUTH_HEADERS,
+                        json={"draft": _draft(*cases).model_dump(mode="json")},
+                    )
+                )
+                try:
+                    await asyncio.wait_for(entered.wait(), 5)
+                    assert reads == sorted(by_revision)[:16]
+                    assert active == 16
+                    assert not request.done()
+                    if cancel:
+                        request.cancel()
+                        with pytest.raises(asyncio.CancelledError):
+                            await request
+                        assert len(reads) == 16
+                    else:
+                        release.set()
+                        response = await asyncio.wait_for(request, 5)
+                        assert response.status_code == 200
+                        assert response.json()["ready"] is True
+                        assert response.json()["diagnostics"] == []
+                        assert reads == sorted(by_revision)
+                    assert peak == 16
+                    assert active == 0
+                finally:
+                    release.set()
+                    await asyncio.gather(request, return_exceptions=True)
+            assert provider.requests == []
+
+    asyncio.run(scenario())
