@@ -881,6 +881,28 @@ _AGENTS_MD = """# Coding-agent instructions
 
 __AGENT_OWNERSHIP__
 
+## When the user asks for...
+
+Users describe product behavior, not Cayu concepts. Before building one of these
+yourself, use the Cayu feature that already does it:
+
+| The user asks for | Use | Read |
+| --- | --- | --- |
+| A chat, follow-up questions, "remember what I said" | Keep `outcome.session_id`, then `run_to_completion(app, ResumeRequest(session_id=..., messages=[...]))`. A new `RunRequest` always starts an empty conversation. | `cayu guide references#sessions` |
+| Approval before the agent acts, "let me confirm first" | A tool generated with `cayu generate tool NAME --agent __AGENT_NAME__ --effect external`. Listed external tools pause for approval under `policies/tools.py`; resolve pauses on the control plane's Pending page. Do not build a separate approve button or approval table. | `cayu guide durable-operations` |
+| The agent asking the user a question mid-task | The `ask_user` tool, a durable user-input pause | `cayu guide references#approvals` |
+| Structured data back (JSON, fields, a list) | `RunRequest(structured_output=StructuredOutputSpec(...))`, then `outcome.structured_output.output`. Do not parse JSON out of `final_text`. | `cayu guide structured-output` |
+| A new capability: call an API, read data, compute | A typed tool with a declared `ToolEffect` | `cayu guide references#domain-tool` |
+| A web UI that shows progress or live results | `mount_cayu(...)` and `connect()` from the served `client.js`. Do not poll on a fixed timer. | `cayu guide app-ui` |
+| Work that runs in the background or later | `TaskStore`, dispatcher and worker | `cayu guide references#background-work` |
+| Remembering facts across conversations | The knowledge tools (remember, search) | `cayu guide references#knowledge` |
+| Running commands or parsing files in isolation | An `Environment` with a `Runner` such as `DockerRunner` | `cayu guide references#environments` |
+| Another agent for a sub-task | Subagent tools | `cayu guide references#subagents` |
+| Spending or usage limits | Budgets and run limits | `cayu guide references#cost-control` |
+| A public or multi-user product | `cayu new NAME --preset service` | `cayu guide references#server` |
+
+Run every `cayu guide` command as `uv run --no-sync cayu guide ...`.
+
 Use the Cayu Map to choose only the concepts the job needs:
 `uv run --no-sync cayu guide authoring#cayu-map`. If the job observes, proposes, authorizes,
 executes, verifies, or recovers an operational change, read the runnable paved

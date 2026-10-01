@@ -2579,7 +2579,12 @@ _DOCKER_IMAGE_CONFIG = """{
 """
 
 
-_DOCKER_BUILD_IMAGE_PY = r'''"""Trusted operator entrypoint for the generated coding image."""
+_DOCKER_BUILD_IMAGE_PY = r'''"""Trusted operator entrypoint for the generated coding image.
+
+First run: ``python build_coding_image.py --resolve-pins`` fills any null pins in
+docker-coding-build.json with current values, without building. Review them, then
+run ``python build_coding_image.py`` to build and record the immutable image.
+"""
 
 from __future__ import annotations
 
@@ -2590,7 +2595,9 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 from pathlib import PurePosixPath
 
@@ -2601,6 +2608,11 @@ _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _VERSION = re.compile(r"[0-9]+(?:\.[0-9]+)+(?:[-+._a-zA-Z0-9]*)?\Z")
 _DEBIAN_SNAPSHOT = re.compile(r"[0-9]{8}T[0-9]{6}Z\Z")
 _DEBIAN_SUITE = re.compile(r"[a-z0-9][a-z0-9-]*\Z")
+_DEFAULT_BASE_TAG = "python:3.13-slim-bookworm"
+_RESOLVE_HINT = (
+    "run `uv run --no-sync python build_coding_image.py --resolve-pins`, review "
+    "docker-coding-build.json, then build again"
+)
 _BUILD_CONTEXT_INPUT_LIMITS = {
     ".dockerignore": 1024 * 1024,
     "Dockerfile.coding": 1024 * 1024,
@@ -2708,7 +2720,9 @@ def _configuration(raw: bytes) -> dict[str, str]:
             or not item.strip()
             or any(c in item for c in "\x00\r\n")
         ):
-            raise RuntimeError(f"docker-coding-build.json requires a nonblank {key}")
+            raise RuntimeError(
+                f"docker-coding-build.json requires a nonblank {key}; {_RESOLVE_HINT}"
+            )
     base_image = value["base_image"]
     if "@sha256:" not in base_image or not _DIGEST.fullmatch(
         base_image.rsplit("@", 1)[1]
@@ -2829,7 +2843,112 @@ def _require_project_inputs_unchanged(snapshot: dict[str, bytes]) -> None:
             )
 
 
+def _docker_output(docker: str, *arguments: str) -> str:
+    completed = subprocess.run(
+        [docker, *arguments], capture_output=True, text=True, check=False
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"docker {arguments[0]} failed: {completed.stderr.strip()[-500:]}"
+        )
+    return completed.stdout
+
+
+def resolve_pins() -> int:
+    """Fill null pins with current values for review; never overwrite set pins."""
+
+    docker = shutil.which("docker")
+    if docker is None:
+        raise RuntimeError("Docker CLI is unavailable")
+    configuration = json.loads(_BUILD_CONFIG.read_text(encoding="utf-8"))
+    resolved: dict[str, str] = {}
+    if configuration.get("base_image") is None:
+        _docker_output(docker, "pull", "--quiet", _DEFAULT_BASE_TAG)
+        digests = json.loads(
+            _docker_output(
+                docker,
+                "image",
+                "inspect",
+                "--format",
+                "{{json .RepoDigests}}",
+                _DEFAULT_BASE_TAG,
+            )
+        )
+        if not digests:
+            raise RuntimeError(f"{_DEFAULT_BASE_TAG} has no registry digest")
+        resolved["base_image"] = digests[0]
+    base_image = resolved.get("base_image", configuration.get("base_image"))
+    if configuration.get("debian_suite") is None:
+        release = _docker_output(
+            docker,
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            base_image,
+            "sh",
+            "-c",
+            '. /etc/os-release && printf %s "$VERSION_CODENAME"',
+        ).strip()
+        resolved["debian_suite"] = release
+    suite = resolved.get("debian_suite", configuration.get("debian_suite"))
+    if configuration.get("debian_snapshot") is None:
+        resolved["debian_snapshot"] = datetime.now(UTC).strftime("%Y%m%dT000000Z")
+    snapshot = resolved.get("debian_snapshot", configuration.get("debian_snapshot"))
+    wanted = [
+        package
+        for key, package in (("git_package", "git"), ("ripgrep_package", "ripgrep"))
+        if configuration.get(key) is None
+    ]
+    if wanted:
+        listing = _docker_output(
+            docker,
+            "run",
+            "--rm",
+            base_image,
+            "sh",
+            "-c",
+            "rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources"
+            " && printf 'deb [check-valid-until=no] "
+            f"https://snapshot.debian.org/archive/debian/{snapshot} {suite} main\\n'"
+            " > /etc/apt/sources.list && apt-get update -qq >/dev/null"
+            f" && apt-cache madison {' '.join(wanted)}",
+        )
+        for package in wanted:
+            versions = [
+                line.split("|")[1].strip()
+                for line in listing.splitlines()
+                if line.split("|")[0].strip() == package
+            ]
+            if not versions:
+                raise RuntimeError(
+                    f"no {package} version in snapshot {snapshot} {suite}"
+                )
+            resolved[f"{package}_package"] = versions[0]
+    if configuration.get("uv_version") is None:
+        uv = shutil.which("uv")
+        if uv is None:
+            raise RuntimeError("uv is unavailable; set uv_version to an exact version")
+        version = subprocess.run(
+            [uv, "--version"], capture_output=True, text=True, check=True
+        ).stdout.split()[1]
+        resolved["uv_version"] = version
+    configuration.update(resolved)
+    _BUILD_CONFIG.write_text(
+        json.dumps(configuration, indent=2) + "\n", encoding="utf-8"
+    )
+    for key, value in sorted(resolved.items()):
+        print(f"pinned {key} = {value}")
+    print(
+        "Review docker-coding-build.json, then run "
+        "`uv run --no-sync python build_coding_image.py` to build."
+    )
+    return 0
+
+
 def main() -> int:
+    if sys.argv[1:] == ["--resolve-pins"]:
+        return resolve_pins()
     build_context_snapshot = _trusted_build_context_snapshot()
     configuration = _configuration(
         build_context_snapshot["docker-coding-build.json"]
@@ -3363,7 +3482,9 @@ def _read_docker_toolchain_profile() -> DockerCodingToolchainProfile:
         raise RuntimeError("docker-coding-image.json requires an image reference")
     if digest is None:
         raise RuntimeError(
-            "docker-coding-image.json has no immutable image ID; run build_coding_image.py"
+            "docker-coding-image.json has no immutable image ID; run "
+            "build_coding_image.py --resolve-pins (first time, then review the pins) "
+            "and build_coding_image.py"
         )
     if type(digest) is not str or _DOCKER_IMAGE_ID_PATTERN.fullmatch(digest) is None:
         raise RuntimeError(
@@ -3813,18 +3934,23 @@ no raw workload credentials or ambient host environment enter the guest. Use
 the separate P3 Microsandbox follow-up #1191 for untrusted-code execution.
 
 Image build authority and runtime execution authority are separate. First run
-`uv lock` and review `uv.lock`. Then fill the required null pins in
-`docker-coding-build.json`: `base_image` must contain `@sha256:`, while the uv,
-git, and ripgrep values must be exact versions. `debian_snapshot` is an immutable
-`YYYYMMDDTHHMMSSZ` snapshot and `debian_suite` is its exact suite (the generated
-Python slim image uses `bookworm`); together they also freeze transitive apt
-inputs rather than consulting the moving Debian index.
+`uv lock` and review `uv.lock`. Then pin the image inputs in
+`docker-coding-build.json`: `uv run --no-sync python build_coding_image.py
+--resolve-pins` fills every null pin with a current value and builds nothing.
+It records the `python:3.13-slim-bookworm` digest as `base_image`, today's
+Debian snapshot and its suite, the exact git and ripgrep versions in that
+snapshot, and your uv version. Review the values (or set any pin yourself
+beforehand; set pins are never changed). `base_image` must contain `@sha256:`,
+the uv, git, and ripgrep values must be exact versions, and `debian_snapshot`
+plus `debian_suite` freeze transitive apt inputs rather than consulting the
+moving Debian index.
 The optional `cayu_wheel` and `cayu_wheel_sha256` pair can select a reviewed
 project-relative wheel (for example under protected `.cayu/`) for release or CI
 proof; leave both null to use the Cayu artifact in the frozen lock. Review
 `Dockerfile.coding`, then run:
 
 ```bash
+uv run --no-sync python build_coding_image.py --resolve-pins
 uv run --no-sync python build_coding_image.py
 uv run --no-sync cayu check --json
 uv run --no-sync pytest -q tests/test_coding_composition.py

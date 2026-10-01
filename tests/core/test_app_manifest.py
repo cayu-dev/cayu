@@ -23,6 +23,7 @@ from cayu import (
     EnvironmentLifecyclePhase,
     EnvironmentLifecyclePolicy,
     EnvironmentSpec,
+    EveryCallRule,
     ExecCommandTool,
     ExecutionRequirements,
     LocalWorkspace,
@@ -115,6 +116,29 @@ def test_manifest_catch_all_coverage_requires_actual_pattern_and_required_argume
     if required and catch_all:
         expected = "denied" if decision == ToolPolicyDecision.DENY else "approval_required"
     assert manifest.agents[0].tools[0].policy_coverage == expected
+
+
+@pytest.mark.parametrize(
+    ("decision", "expected"),
+    (
+        (ToolPolicyDecision.REQUIRE_APPROVAL, "approval_required"),
+        (ToolPolicyDecision.DENY, "denied"),
+    ),
+)
+def test_manifest_recognizes_every_call_rule_without_required_arguments(decision, expected):
+    tool = _SchemaTool(
+        ToolSpec(name="schema_tool", input_schema={"type": "object", "properties": {}})
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_agent(
+        AgentSpec(name="assistant", model="schema-only"),
+        tools=[tool],
+        tool_policy=ParameterConstrainedToolPolicy(
+            {"schema_tool": (EveryCallRule(),)}, decision=decision
+        ),
+    )
+
+    assert app.describe().agents[0].tools[0].policy_coverage == expected
 
 
 @pytest.mark.parametrize("before", (False, True))
@@ -989,3 +1013,30 @@ def test_manifest_rejects_non_json_schema_payloads() -> None:
                 "capabilities": [],
             }
         )
+
+
+@pytest.mark.parametrize(
+    ("base", "tool_name", "expected"),
+    (
+        (None, "read_file", "allowed"),
+        (None, "run_command", "conditional"),
+        ("approve_write", "write_file", "approval_required"),
+        ("approve_write", "read_file", "allowed"),
+        ("approve_write", "run_command", "conditional"),
+        ("deny_delete", "delete_file", "denied"),
+    ),
+)
+def test_manifest_derives_structured_command_policy_coverage(base, tool_name, expected):
+    from cayu import AlwaysRequireApprovalToolPolicy, StaticToolPolicy
+    from cayu.runtime.manifest import _tool_policy_coverage
+    from cayu.tools.structured_commands import StructuredCommandToolPolicy
+
+    # Coverage reads only the policy type and its base policy, not the toolchain profile.
+    policy = object.__new__(StructuredCommandToolPolicy)
+    policy._base_policy = {
+        None: None,
+        "approve_write": AlwaysRequireApprovalToolPolicy(tools=["write_file"]),
+        "deny_delete": StaticToolPolicy(deny=["delete_file"]),
+    }[base]
+
+    assert _tool_policy_coverage(policy, tool_name, {}) == expected

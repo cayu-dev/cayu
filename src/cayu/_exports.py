@@ -1817,6 +1817,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "DeleteFileTool": ("cayu.tools.files", "DeleteFileTool"),
     "DenyPatternRule": ("cayu.tools.policy", "DenyPatternRule"),
     "EnvironmentScopedToolPolicy": ("cayu.tools.policy", "EnvironmentScopedToolPolicy"),
+    "EveryCallRule": ("cayu.tools.policy", "EveryCallRule"),
     "DeterministicCompletionVerifier": (
         "cayu.verification.completion_verifiers",
         "DeterministicCompletionVerifier",
@@ -7332,6 +7333,7 @@ PUBLIC_NAMES = [
     "DeleteFileTool",
     "DenyPatternRule",
     "EnvironmentScopedToolPolicy",
+    "EveryCallRule",
     "DeterministicCompletionVerifier",
     "DeterministicWorkspaceBinding",
     "DiagnosticSeverity",

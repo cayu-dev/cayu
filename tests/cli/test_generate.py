@@ -688,6 +688,33 @@ def test_generate_slice_json_selects_format_while_dry_run_controls_writes(
     assert (project / "tools" / "analyze_document.py").is_file()
 
 
+def test_generated_external_starter_tool_pauses_for_approval(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    monkeypatch.chdir(tmp_path / "project")
+    command = ["generate", "tool", "send_notice", "--agent", "project", "--effect", "external"]
+    assert main([*command, "--json"]) == 0
+    capsys.readouterr()
+    _clear_generated_project_modules()
+
+    assert main(["inspect", "--json"]) == 0
+    manifest = json.loads(capsys.readouterr().out)
+    coverage = {
+        tool["name"]: tool["policy_coverage"]
+        for agent in manifest["agents"]
+        for tool in agent["tools"]
+    }
+    assert coverage["send_notice"] == "approval_required"
+
+    main(["check", "--json"])
+    codes = [item["code"] for item in json.loads(capsys.readouterr().out)["diagnostics"]]
+    assert "EXTERNAL_TOOL_UNGUARDED" not in codes
+
+
 def test_generate_slice_applies_once_and_passes_public_verification(
     tmp_path: Path,
     monkeypatch,

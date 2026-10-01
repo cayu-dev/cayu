@@ -548,6 +548,26 @@ class DenyPatternRule(ParameterRule):
         return value is not _MISSING and type(value) is not str
 
 
+class EveryCallRule(ParameterRule):
+    """Match every call so the policy's decision applies to the whole tool.
+
+    With ``ParameterConstrainedToolPolicy(..., decision=REQUIRE_APPROVAL)`` each
+    call to the tool pauses for human approval; with ``DENY`` it is blocked. Use
+    it for tools whose every invocation is consequential, such as sending a
+    message or writing an external record.
+    """
+
+    @property
+    def parameter(self) -> str:
+        return "*"
+
+    def _execution_profile_material(self) -> dict[str, object]:
+        return {"component": "cayu.tools.policy:EveryCallRule"}
+
+    def check(self, arguments: dict[str, Any]) -> str | None:
+        return "Every call to this tool is subject to the policy decision."
+
+
 class ParameterConstrainedToolPolicy(ToolPolicy):
     """Validate tool-call arguments with per-tool parameter rules.
 
@@ -591,6 +611,7 @@ class ParameterConstrainedToolPolicy(ToolPolicy):
             Callable[[Any], dict[str, object] | None],
         ] = {
             RequiredFieldRule: RequiredFieldRule._execution_profile_material,
+            EveryCallRule: EveryCallRule._execution_profile_material,
             AllowlistRule: AllowlistRule._execution_profile_material,
             RequiredAllowlistRule: RequiredAllowlistRule._execution_profile_material,
             DenyPatternRule: DenyPatternRule._execution_profile_material,

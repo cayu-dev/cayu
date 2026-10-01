@@ -8,6 +8,7 @@ import importlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -883,6 +884,61 @@ def test_generated_docker_builder_uses_one_immutable_input_snapshot(
         builder.main()
     assert image_configuration_path.read_bytes() == empty_image_configuration
     assert captured_build_contexts[-1]["uv.lock"] == original_lock
+
+
+def test_generated_docker_builder_resolves_only_null_pins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _bypass_coding_dependency_preflight(monkeypatch)
+    assert (
+        main(["new", "pins", "--preset", "coding", "--execution", "docker", "--dir", str(tmp_path)])
+        == 0
+    )
+    project = tmp_path / "pins"
+    configuration_path = project / "docker-coding-build.json"
+    configuration = json.loads(configuration_path.read_text(encoding="utf-8"))
+    # A pin the operator already reviewed must survive resolution.
+    configuration["git_package"] = "1:2.39.5-0+deb12u2"
+    configuration_path.write_text(json.dumps(configuration), encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("pins_builder", project / "build_coding_image.py")
+    assert spec is not None and spec.loader is not None
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+    monkeypatch.setattr(builder.shutil, "which", lambda name: f"/usr/bin/{name}")
+    calls: list[tuple[str, ...]] = []
+
+    def docker_output(docker: str, *arguments: str) -> str:
+        calls.append(arguments)
+        if arguments[:2] == ("image", "inspect"):
+            return json.dumps(["python@sha256:" + "c" * 64])
+        if arguments[0] == "run" and "--network" in arguments:
+            return "bookworm"
+        if arguments[0] == "run":
+            assert "madison ripgrep" in arguments[-1]
+            return "   ripgrep | 13.0.0-4+b2 | https://snapshot.debian.org bookworm/main\n"
+        return ""
+
+    monkeypatch.setattr(builder, "_docker_output", docker_output)
+    monkeypatch.setattr(
+        builder.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 0, "uv 0.9.5\n", ""),
+    )
+
+    assert builder.resolve_pins() == 0
+
+    resolved = json.loads(configuration_path.read_text(encoding="utf-8"))
+    assert resolved["base_image"] == "python@sha256:" + "c" * 64
+    assert resolved["debian_suite"] == "bookworm"
+    assert re.fullmatch(r"[0-9]{8}T000000Z", resolved["debian_snapshot"])
+    assert resolved["git_package"] == "1:2.39.5-0+deb12u2"
+    assert resolved["ripgrep_package"] == "13.0.0-4+b2"
+    assert resolved["uv_version"] == "0.9.5"
+    assert resolved["cayu_wheel"] is None
+    assert ("pull", "--quiet", "python:3.13-slim-bookworm") in calls
+    # The result satisfies the builder's own pin validation.
+    builder._configuration(configuration_path.read_bytes())
 
 
 def test_coding_execution_requires_the_coding_composition(
@@ -2582,3 +2638,19 @@ def test_generated_presets_apply_runtime_configuration(tmp_path, monkeypatch, pr
         app = module.build_app(provider=ScriptedModelProvider([]))
         assert app.config.run.max_steps == 96
         assert app.describe().runtime.configuration.values["run"]["max_steps"] == 96
+
+
+def test_agents_md_maps_user_requests_to_cayu_features(tmp_path: Path, capsys) -> None:
+    assert main(["new", "intentproj", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    instructions = (tmp_path / "intentproj" / "AGENTS.md").read_text(encoding="utf-8")
+    table = instructions.split("## When the user asks for...", 1)[1].split("\n## ", 1)[0]
+
+    # The rows coding agents missed in practice name the exact API to use.
+    assert "ResumeRequest(session_id=" in table
+    assert "--effect external" in table
+    assert "StructuredOutputSpec" in table
+    assert "client.js" in table
+    for reference in sorted(set(re.findall(r"`cayu guide ([a-z0-9-]+(?:#[a-z0-9-]+)?)`", table))):
+        assert main(["guide", reference]) == 0, reference
+        capsys.readouterr()

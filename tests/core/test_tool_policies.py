@@ -11,6 +11,7 @@ from cayu import (
     AgentSpec,
     AllowlistRule,
     DenyPatternRule,
+    EveryCallRule,
     ExecutionProfileBehaviorIdentity,
     ParameterConstrainedToolPolicy,
     RequiredAllowlistRule,
@@ -256,6 +257,21 @@ def test_parameter_constrained_policy_can_require_approval_on_violation() -> Non
     assert result.decision == ToolPolicyDecision.REQUIRE_APPROVAL
     assert result.reason == "Parameter 'url' matches a denied pattern."
     assert result.metadata["policy"] == "parameter_constrained"
+
+
+@pytest.mark.parametrize("decision", (ToolPolicyDecision.REQUIRE_APPROVAL, ToolPolicyDecision.DENY))
+def test_every_call_rule_applies_the_decision_to_every_call(decision) -> None:
+    policy = ParameterConstrainedToolPolicy({"send_notice": (EveryCallRule(),)}, decision=decision)
+
+    for arguments in ({}, {"to": "ops@example.test", "body": "Deploy finished."}):
+        result = asyncio.run(
+            policy.authorize(_request(tool_name="send_notice", arguments=arguments))
+        )
+        assert result.decision == decision
+    unrelated = asyncio.run(policy.authorize(_request(tool_name="read_status")))
+    assert unrelated.decision == ToolPolicyDecision.ALLOW
+    # The rule carries execution-profile material, so durable resume can rebuild it.
+    assert policy._execution_profile_material() is not None
 
 
 def test_parameter_constrained_policy_copies_execution_profile_identity() -> None:

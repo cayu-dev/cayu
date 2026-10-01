@@ -41,6 +41,7 @@ from cayu.tools.policy import (
     AlwaysRequireApprovalToolPolicy,
     DenyPatternRule,
     EnvironmentScopedToolPolicy,
+    EveryCallRule,
     GuardedToolPolicy,
     ParameterConstrainedToolPolicy,
     RequiredAllowlistRule,
@@ -995,10 +996,18 @@ def _tool_policy_coverage(
             AllowlistRule,
             RequiredAllowlistRule,
             DenyPatternRule,
+            EveryCallRule,
         )
         if type(rules) is not tuple or any(type(rule) not in known_rule_types for rule in rules):
             return "conditional" if tool_name in policy.rules else "allowed"
         for rule in rules:
+            if type(rule) is EveryCallRule:
+                decision = _parameter_policy_decision(policy, tool_name)
+                if decision == "require_approval":
+                    return "approval_required"
+                if decision == "deny":
+                    return "denied"
+                continue
             if type(rule) is not DenyPatternRule:
                 continue
             path = rule._path
@@ -1024,6 +1033,18 @@ def _tool_policy_coverage(
         return "conditional" if tool_name in policy.rules else "allowed"
     if type(policy) is TaintAwareToolPolicy:
         return "conditional" if policy.protected_labels_for_tool(tool_name) else "allowed"
+    from cayu.tools.structured_commands import StructuredCommandToolPolicy
+
+    if type(policy) is StructuredCommandToolPolicy:
+        # The base policy decides first; when it allows, only run_command is further
+        # resolved against the admitted command selectors.
+        base = policy._base_policy
+        base_coverage = (
+            "allowed" if base is None else _tool_policy_coverage(base, tool_name, schema)
+        )
+        if base_coverage != "allowed":
+            return base_coverage
+        return "conditional" if tool_name == "run_command" else "allowed"
     return "unknown"
 
 

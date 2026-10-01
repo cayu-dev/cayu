@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 from cayu._validation import copy_json_value
 from cayu.events import Event, EventType, copy_event
 from cayu.runtime.tool_completion import ToolCompletionResult
-from cayu.sessions.base import SessionStatus
+from cayu.sessions.base import ResumeRequest, SessionStatus
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp
@@ -99,12 +99,15 @@ class RunOutcome:
         return self.status is SessionStatus.COMPLETED
 
 
-async def run_to_completion(app: CayuApp, request: RunRequest) -> RunOutcome:
+async def run_to_completion(app: CayuApp, request: RunRequest | ResumeRequest) -> RunOutcome:
     """Run an agent to a terminal state and return a :class:`RunOutcome`.
 
-    Consumes ``app.run(request)`` and returns the final text, terminal status, and
+    Consumes ``app.run(request)``, or ``app.resume(request)`` for a
+    :class:`ResumeRequest`, and returns the final text, terminal status, and
     error (if any), so you branch on ``outcome.ok`` / ``outcome.status`` instead of
-    hand-inspecting events. A model/tool failure surfaces as
+    hand-inspecting events. To continue a conversation, pass
+    ``ResumeRequest(session_id=outcome.session_id, messages=[...])``; a new
+    ``RunRequest`` always starts an empty session. A model/tool failure surfaces as
     ``status == SessionStatus.FAILED`` with ``error`` set. Setup-time exceptions
     before a terminal session event are also converted into a failed outcome.
     """
@@ -119,7 +122,8 @@ async def run_to_completion(app: CayuApp, request: RunRequest) -> RunOutcome:
     session_id = request.session_id or ""
 
     try:
-        async for event in app.run(request):
+        stream = app.resume(request) if isinstance(request, ResumeRequest) else app.run(request)
+        async for event in stream:
             events.append(event)
             session_id = event.session_id
             if event.interaction_id is not None:

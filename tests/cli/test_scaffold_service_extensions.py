@@ -179,9 +179,9 @@ def test_explicit_service_extension_strict_cli(tmp_path, monkeypatch, capsys, ca
         tool = next(
             tool for agent in manifest["agents"] for tool in agent["tools"] if tool["name"] == name
         )
-        assert tool["policy_coverage"] == (
-            "approval_required" if capability == "knowledge" else "denied"
-        )
+        # Listed external tools pause for approval under the selected approvals
+        # capability, whether or not other tools carry parameter rules.
+        assert tool["policy_coverage"] == "approval_required"
     for name, source in protected.items():
         assert (project / name).read_bytes() == source
     # Exercise the generated authentication and tenant-isolation suite against

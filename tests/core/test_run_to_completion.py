@@ -13,6 +13,7 @@ from cayu import (
     EventType,
     Message,
     ModelStreamEvent,
+    ResumeRequest,
     RunOutcome,
     RunRequest,
     ScriptedModelProvider,
@@ -285,3 +286,44 @@ def test_run_to_completion_detects_failure_when_event_type_is_plain_str() -> Non
     assert outcome.status is SessionStatus.FAILED
     assert outcome.status == "failed"
     assert outcome.error == "boom"
+
+
+def test_run_to_completion_continues_a_conversation_with_resume_request() -> None:
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("The file has 4 rows."),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("Row 3 has the empty cell."),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="scripted-model"))
+
+    first = asyncio.run(run_to_completion(app, _request()))
+    second = asyncio.run(
+        run_to_completion(
+            app,
+            ResumeRequest(
+                session_id=first.session_id,
+                messages=[Message.text("user", "Which row is empty?")],
+            ),
+        )
+    )
+
+    assert first.ok and second.ok
+    assert second.session_id == first.session_id
+    assert second.final_text == "Row 3 has the empty cell."
+    history = [
+        part.text
+        for message in provider.requests[1].messages
+        for part in message.content
+        if getattr(part, "text", None)
+    ]
+    # The follow-up reaches the model with the earlier turn, not as a new chat.
+    assert history[-3:] == ["hi", "The file has 4 rows.", "Which row is empty?"]

@@ -4840,6 +4840,7 @@ from cayu.tools.policy import AllowlistRule as AllowlistRule
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy as AlwaysRequireApprovalToolPolicy
 from cayu.tools.policy import DenyPatternRule as DenyPatternRule
 from cayu.tools.policy import EnvironmentScopedToolPolicy as EnvironmentScopedToolPolicy
+from cayu.tools.policy import EveryCallRule as EveryCallRule
 from cayu.tools.policy import GuardedToolPolicy as GuardedToolPolicy
 from cayu.tools.policy import ParameterConstrainedToolPolicy as ParameterConstrainedToolPolicy
 from cayu.tools.policy import ParameterRule as ParameterRule
@@ -6672,6 +6673,7 @@ __all__ = [
     "EventWatcherRunResult",
     "EventWatcherState",
     "EventWatcherStore",
+    "EveryCallRule",
     "EvidenceSpool",
     "ExaWebAdapter",
     "ExecCommand",

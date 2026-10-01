@@ -679,7 +679,9 @@ def _check_composition_root(root: Path) -> tuple[ProjectDiagnostic, ...]:
                 severity=DiagnosticSeverity.ERROR,
             )
         )
-    unexpected_functions = [name for name in functions if name != "build_app"]
+    # Construction factories such as build_app or the coding preset's
+    # build_coding_product_application belong in the composition root.
+    unexpected_functions = [name for name in functions if not name.startswith("build_")]
     if classes or unexpected_functions:
         diagnostics.append(
             _diagnostic(
@@ -697,6 +699,8 @@ def _check_composition_root(root: Path) -> tuple[ProjectDiagnostic, ...]:
                     "classes": classes,
                     "unexpected_functions": unexpected_functions,
                 },
+                # A layout preference: reported, but never fails --fail-on warning.
+                severity=DiagnosticSeverity.INFO,
             )
         )
     return tuple(diagnostics)

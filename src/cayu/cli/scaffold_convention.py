@@ -596,7 +596,11 @@ def build_agent_tools() -> tuple[Tool, ...]:
 
 
 def external_effect_tool_names() -> tuple[str, ...]:
-    """Return tools that require the generated approval policy."""
+    """Return tools whose calls pause for approval under policies/tools.py.
+
+    To make a tool ask a person before it acts, add its name here (or generate it
+    with ``cayu generate tool NAME --effect external``, which does this for you).
+    """
 
     return ("remember_knowledge",) if __KNOWLEDGE_ENABLED__ else ()
 '''
@@ -605,6 +609,7 @@ _TOOL_POLICY_PY = '''"""Tool exposure and authorization policy for registered ag
 
 from cayu import (
     DenyPatternRule,
+    EveryCallRule,
     ExecutionProfileBehaviorIdentity,
     ParameterConstrainedToolPolicy,
     RequiredFieldRule,
@@ -639,6 +644,10 @@ def build_tool_policy(external_tool_names: tuple[str, ...]) -> ToolPolicy:
         # Every schema-valid knowledge proposal matches this rule and therefore
         # requires approval. The knowledge store still writes it as pending.
         rules["remember_knowledge"] = (DenyPatternRule("text", patterns=(r"(?s).*",)),)
+    for name in external_tool_names:
+        # Every other listed external tool pauses for approval on every call
+        # (or is denied when the approvals capability is not selected).
+        rules.setdefault(name, (EveryCallRule(),))
     if rules:
         return ParameterConstrainedToolPolicy(
             rules,
@@ -729,6 +738,9 @@ def register_agents(
     """Register every agent and its explicitly constructed capabilities."""
 
     starter_tools = list(build_agent_tools())
+    # Every tool named here pauses for human approval before each call, or is
+    # denied without the approvals capability (see policies/tools.py). Resolve
+    # pauses on the control plane's Pending page.
     starter_external_tool_names = list(external_effect_tool_names())
     # <cayu:generated-starter-tools>
     # </cayu:generated-starter-tools>

@@ -1,0 +1,21 @@
+{
+  "name": "csv-auditor",
+  "description": "A user's real Copilot session building a Docker-sandboxed CSV auditor on Cayu, replayed turn by turn. Answers the user gave to the agent's mid-turn questions are appended to the turn that asked them; ~/Desktop and the Cayu GitHub link are replaced by the replay directory and the checkout under test. Greetings, mode switches, and an off-topic question are omitted. The user's 'start it' / 'done' device-login turns need a person at a browser; a note on 'run it' says sign-in was completed, so 'run it' keeps its original meaning.",
+  "turns": [
+    "Can you create a new agent in {WORKDIR} using cayu?\n\n(If you need to ask: the agent uses a docker sandbox to parse large CSVs and report issues. For cayu, use the Cayu source at {CAYU_SOURCE}; its `cayu` CLI is already on PATH.)",
+    "create a md file named LEARNINGS and document your journey with Cayu, and keep documenting any issues you see with it there.",
+    "document your mistakes too, like why you expected something to be there and it wasn't. tooling blockers as well",
+    "continue developing your agent",
+    "Why don't you just use the latest Cayu code from {CAYU_SOURCE}?",
+    "make it possible to sign in with openai subscription using device mode",
+    "(I started the device sign-in you set up and completed it in my browser.)\n\nrun it",
+    "what model were you using?",
+    "Use gpt-6.1-sol",
+    "Now make it a proper web app\n\n(If you need to ask: it's a local-only app for me. Workflow: upload CSVs, run audits, view and download reports.)",
+    "add operator control plane",
+    "give me a test file i can use",
+    "so it finds stuff for review, then what?",
+    "can we add a chat to control the agent? like if we could just talk to the agent, and also preview the csv in the same window\n\n(If you need to ask: chat may propose CSV edits with a preview and explicit approval, and may see preview rows only when I explicitly select them to share.)",
+    "why does the page keep flickering?"
+  ]
+}
