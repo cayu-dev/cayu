@@ -116,20 +116,24 @@ bounds, publishes the derived corpus before admission, and replays accepted
 requests before renewed readiness checks. Router composition retains the shared
 bounded/auth boundary and the durable eval worker lifespan.
 
-`server/_corpus_management_routes.py` owns corpus import, catalog, detail,
-download and suite/case browsing. It receives the bounded router, store, target
-registry and shared auth dependencies, and composes the existing corpus
+`server/_corpus_routes.py` owns corpus import, catalog, detail, download,
+suite/case browsing and launch. Its registrars receive the bounded router, store,
+target registry and shared auth dependencies, and compose the existing corpus
 validation, serialization and storage operations. Catalog reads and run creation
 share one revision loader that enforces current target visibility and private
-storage errors. Run admission, execution and worker lifespan retain their owners.
+storage errors. Separate management and launch registrars preserve route order.
+Launch uses the shared JSON, invocation, request binding, retry, execution-profile
+and admission functions. Accepted retries return before renewed readiness checks;
+fresh runs validate profiles and execution bounds before admission.
+Router composition retains the shared bounded/auth boundary and worker lifespan.
 
 `server/_evaluation_run_routes.py` owns durable run listing, detail, scenario
 approval, cancellation, results, report downloads and comparisons. It receives
 the bounded router, store, target registry, optional result catalog and shared
 auth dependencies. Run visibility is checked before result loading, and the run
 is reloaded after publication becomes visible. Reporting and comparison compose
-the existing library functions. Router composition retains the remaining
-launch handlers and the worker lifespan.
+the existing library functions. Router composition registers the evaluation
+route families and retains the worker lifespan.
 
 `server/_eval_run_admission.py` owns the shared HTTP invocation, request identity,
 retry lookup, execution-profile preparation and durable admission functions.

@@ -1,12 +1,12 @@
-"""Evaluation corpus import, catalog and download HTTP routes."""
+"""Evaluation corpus import, catalog, download and launch HTTP routes."""
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, cast
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import Response
 
 from cayu.evals.corpus import EvalCorpusDocument, eval_corpus_to_json
@@ -24,10 +24,18 @@ from cayu.evals.store import (
     EvalCorpusCatalogEntry,
     EvalCorpusCatalogPage,
     EvalCorpusConflict,
+    EvalRunRecord,
     EvalStorePublicationRejected,
     EvalStoreResultTooLarge,
     EvalSuiteCatalogPage,
     EvalSuiteCatalogQuery,
+)
+from cayu.server._eval_run_admission import (
+    admit_eval_run,
+    bind_eval_admission_request,
+    eval_run_invocation,
+    prepare_eval_run,
+    replay_eval_run,
 )
 from cayu.server._http_json import (
     _json_request_openapi,
@@ -35,7 +43,8 @@ from cayu.server._http_json import (
     _render_utf8,
     _validated_private_json_body,
 )
-from cayu.server.contracts import EVALS_ENDPOINT_RESPONSES
+from cayu.server.auth import AuthContext
+from cayu.server.contracts import EVALS_ENDPOINT_RESPONSES, EvalRunCreateRequest
 
 if TYPE_CHECKING:
     from fastapi.params import Depends
@@ -293,3 +302,83 @@ def register_corpus_management_routes(
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail="Invalid Evals query.") from exc
         return await _model_json_response(page, EvalCaseCatalogPage)
+
+
+def register_corpus_launch_routes(
+    bounded_evals_router: APIRouter,
+    *,
+    eval_store: EvalStore,
+    active_eval_registry: EvalTargetRegistry,
+    optional_auth_context: Depends,
+) -> None:
+    """Register saved-corpus launch with shared loading and admission boundaries."""
+
+    # Preserve FastAPI's shared dependency object as the typed auth-context default.
+    launch_auth_context = cast("AuthContext | None", optional_auth_context)
+
+    @bounded_evals_router.post(
+        "/evals/runs",
+        response_model=EvalRunRecord,
+        status_code=202,
+        responses=EVALS_ENDPOINT_RESPONSES,
+        openapi_extra=_json_request_openapi(EvalRunCreateRequest),
+    )
+    async def create_eval_run(
+        request: Request,
+        idempotency_key: Annotated[
+            str,
+            Header(alias="Idempotency-Key", min_length=1, max_length=512),
+        ],
+        auth_context: AuthContext | None = launch_auth_context,
+    ):
+        body = await _validated_private_json_body(
+            request,
+            EvalRunCreateRequest,
+            invalid_detail="Invalid Evals request.",
+        )
+        corpus = await load_eval_corpus(
+            body.corpus_revision,
+            eval_store=eval_store,
+            active_eval_registry=active_eval_registry,
+        )
+        invocation = eval_run_invocation(
+            auth_context,
+            max_steps=body.max_steps,
+            limits=body.limits,
+            cost_budget=body.cost_budget,
+        )
+        invocation = bind_eval_admission_request(
+            invocation,
+            kind="corpus",
+            target_key=corpus.target_key,
+            resource_identity={"corpus_revision": corpus.revision},
+            body=body,
+        )
+        admission_request_revision = invocation.admission_request_revision
+        if admission_request_revision is None:
+            raise RuntimeError("Corpus eval launch lost its admission request revision.")
+        replayed = await replay_eval_run(
+            eval_store=eval_store,
+            target_key=corpus.target_key,
+            idempotency_key=idempotency_key,
+            admission_request_revision=admission_request_revision,
+        )
+        if replayed is not None:
+            return replayed
+        eval_target, compiled, invocation = await prepare_eval_run(
+            active_eval_registry=active_eval_registry,
+            corpus=corpus,
+            suite_id=body.suite_id,
+            max_concurrency=body.max_concurrency,
+            invocation=invocation,
+            expected_execution_profile_revision=(body.expected_execution_profile_revision),
+        )
+        return await admit_eval_run(
+            eval_store=eval_store,
+            corpus=corpus,
+            max_concurrency=body.max_concurrency,
+            invocation=invocation,
+            idempotency_key=idempotency_key,
+            eval_target=eval_target,
+            compiled=compiled,
+        )

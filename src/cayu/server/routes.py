@@ -103,9 +103,6 @@ from cayu.evals.memory_reporting import (
     MEMORY_EXPERIMENT_REPORT_MAX_BYTES,
     MemoryExperimentReportRequest,
 )
-from cayu.evals.store import (
-    EvalRunRecord,
-)
 from cayu.events import (
     Event,
     EventType,
@@ -178,28 +175,19 @@ from cayu.server._captured_evaluation_routes import (
     register_captured_evaluation_launch_routes,
     register_captured_evaluation_routes,
 )
-from cayu.server._corpus_management_routes import (
-    load_eval_corpus,
+from cayu.server._corpus_routes import (
+    register_corpus_launch_routes,
     register_corpus_management_routes,
 )
 from cayu.server._diagnostics import SystemDiagnosticsSnapshot, inspect_system_diagnostics
-from cayu.server._eval_run_admission import (
-    admit_eval_run,
-    bind_eval_admission_request,
-    eval_run_invocation,
-    prepare_eval_run,
-    replay_eval_run,
-)
 from cayu.server._evaluation_promotion_routes import register_evaluation_promotion_routes
 from cayu.server._evaluation_result_routes import register_evaluation_result_routes
 from cayu.server._evaluation_run_routes import register_evaluation_run_routes
 from cayu.server._event_side_effect_health import EventSideEffectHealthResponse
 from cayu.server._http_json import (
     _PREPARSED_PRIVATE_JSON_SCOPE_KEY,
-    _json_request_openapi,
     _parse_json_without_duplicate_keys,
     _PreparsedPrivateJsonBody,
-    _validated_private_json_body,
 )
 from cayu.server._judge_calibration_routes import register_judge_calibration_routes
 from cayu.server._memory_report_routes import register_memory_report_routes
@@ -218,7 +206,6 @@ from cayu.server.contracts import (
     ARTIFACT_ENDPOINT_ERROR_RESPONSES,
     BOUNDED_STREAMING_ENDPOINT_RESPONSES,
     CAUSAL_BUDGET_SUMMARY_ENDPOINT_RESPONSES,
-    EVALS_ENDPOINT_RESPONSES,
     MAX_CAPTURED_EVALUATION_REQUEST_BYTES,
     MAX_CONTROL_PLANE_METADATA_BYTES,
     MAX_CONTROL_PLANE_METADATA_MEMBERS,
@@ -260,7 +247,6 @@ from cayu.server.contracts import (
     CausalBudgetSummaryResponse,
     ClientGenerationContract,
     EnvironmentsResponse,
-    EvalRunCreateRequest,
     HealthResponse,
     ListSessionEventsResponse,
     ListSessionInteractionsResponse,
@@ -4601,72 +4587,12 @@ def create_router(
             protected=protected,
         )
 
-        @bounded_evals_router.post(
-            "/evals/runs",
-            response_model=EvalRunRecord,
-            status_code=202,
-            responses=EVALS_ENDPOINT_RESPONSES,
-            openapi_extra=_json_request_openapi(EvalRunCreateRequest),
+        register_corpus_launch_routes(
+            bounded_evals_router,
+            eval_store=eval_store,
+            active_eval_registry=active_eval_registry,
+            optional_auth_context=optional_auth_context,
         )
-        async def create_eval_run(
-            request: Request,
-            idempotency_key: Annotated[
-                str,
-                Header(alias="Idempotency-Key", min_length=1, max_length=512),
-            ],
-            auth_context: AuthContext | None = optional_auth_context,
-        ):
-            body = await _validated_private_json_body(
-                request,
-                EvalRunCreateRequest,
-                invalid_detail="Invalid Evals request.",
-            )
-            corpus = await load_eval_corpus(
-                body.corpus_revision,
-                eval_store=eval_store,
-                active_eval_registry=active_eval_registry,
-            )
-            invocation = eval_run_invocation(
-                auth_context,
-                max_steps=body.max_steps,
-                limits=body.limits,
-                cost_budget=body.cost_budget,
-            )
-            invocation = bind_eval_admission_request(
-                invocation,
-                kind="corpus",
-                target_key=corpus.target_key,
-                resource_identity={"corpus_revision": corpus.revision},
-                body=body,
-            )
-            admission_request_revision = invocation.admission_request_revision
-            if admission_request_revision is None:
-                raise RuntimeError("Corpus eval launch lost its admission request revision.")
-            replayed = await replay_eval_run(
-                eval_store=eval_store,
-                target_key=corpus.target_key,
-                idempotency_key=idempotency_key,
-                admission_request_revision=admission_request_revision,
-            )
-            if replayed is not None:
-                return replayed
-            eval_target, compiled, invocation = await prepare_eval_run(
-                active_eval_registry=active_eval_registry,
-                corpus=corpus,
-                suite_id=body.suite_id,
-                max_concurrency=body.max_concurrency,
-                invocation=invocation,
-                expected_execution_profile_revision=(body.expected_execution_profile_revision),
-            )
-            return await admit_eval_run(
-                eval_store=eval_store,
-                corpus=corpus,
-                max_concurrency=body.max_concurrency,
-                invocation=invocation,
-                idempotency_key=idempotency_key,
-                eval_target=eval_target,
-                compiled=compiled,
-            )
 
         register_evaluation_run_routes(
             bounded_evals_router,

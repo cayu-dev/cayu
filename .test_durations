@@ -42015,5 +42015,9 @@
     "tests/core/test_runtime_reply_admission_contract.py::test_reply_admission_requires_successful_invocation_not_nonempty_text[2-sqlite]": 0.7793907919985941,
     "tests/core/test_runtime_reply_admission_contract.py::test_structured_output_owns_completion_instead_of_generic_before_stop_gate": 0.4311821259907447,
     "tests/core/test_deferred_session_finalization.py::test_deferred_cancelled_session_finalization[asyncio-sqlite]": 1.7198981659894343,
-    "tests/core/test_runtime.py::test_tool_approval_resolution_retains_round_authority_for_unknown_secret_scope": 1.6677612070052419
+    "tests/core/test_runtime.py::test_tool_approval_resolution_retains_round_authority_for_unknown_secret_scope": 1.6677612070052419,
+    "tests/server/test_server_corpus_launch.py::test_corpus_launch_preserves_shared_auth_and_private_json_boundary[/api]": 1.856,
+    "tests/server/test_server_corpus_launch.py::test_corpus_launch_preserves_shared_auth_and_private_json_boundary[/custom/v2]": 0.726,
+    "tests/server/test_server_corpus_launch.py::test_corpus_launch_cancellation_before_admission_does_not_persist_work[corpus_read]": 0.516,
+    "tests/server/test_server_corpus_launch.py::test_corpus_launch_cancellation_before_admission_does_not_persist_work[profile_preparation]": 0.443
 }
