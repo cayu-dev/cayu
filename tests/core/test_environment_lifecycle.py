@@ -3783,3 +3783,46 @@ def test_disposal_retirement_preserves_successor_authority(stale: bool) -> None:
             }
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("outcome", "level", "message"),
+    [
+        ("cancelled", "INFO", "Session left fenced with pending environment cleanup"),
+        ("failed", "WARNING", "Deferred environment run-fence release failed"),
+    ],
+)
+def test_deferred_run_fence_release_logs_shutdown_apart_from_failure(
+    caplog: pytest.LogCaptureFixture,
+    outcome: str,
+    level: str,
+    message: str,
+) -> None:
+    async def scenario() -> None:
+        lifecycle = environment_lifecycle_module.EnvironmentLifecycle.__new__(
+            environment_lifecycle_module.EnvironmentLifecycle
+        )
+        lifecycle._secret_redactor = None
+
+        async def release() -> None:
+            if outcome == "failed":
+                raise RuntimeError("store unavailable")
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(release())
+        key = ("fenced-session", 3)
+        lifecycle._deferred_run_fence_release_tasks = {key: task}
+        if outcome == "cancelled":
+            await asyncio.sleep(0)
+            task.cancel()
+        with pytest.raises((asyncio.CancelledError, RuntimeError)):
+            await task
+        with caplog.at_level("INFO", logger=environment_lifecycle_module.__name__):
+            lifecycle._harvest_deferred_run_fence_release(key, task)
+        # Either way the release task is retained so recovery owns the fenced epoch.
+        assert lifecycle._deferred_run_fence_release_tasks == {key: task}
+
+    asyncio.run(scenario())
+    records = [record for record in caplog.records if message in record.getMessage()]
+    assert [record.levelname for record in records] == [level]
+    assert "session_id=fenced-session run_epoch=3" in records[0].getMessage()

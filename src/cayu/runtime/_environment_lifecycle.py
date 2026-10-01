@@ -1831,9 +1831,21 @@ class EnvironmentLifecycle:
         session_id, run_epoch = key
         try:
             task.result()
+        except asyncio.CancelledError:
+            # The process or loop stopped while environment cleanup was still
+            # retained. That is an expected outcome, not a failure: the durable
+            # epoch stays fenced and recovery finishes the cleanup.
+            logger.info(
+                "Session left fenced with pending environment cleanup; "
+                "recover_incomplete_session or worker-startup recovery will finish it: "
+                "session_id=%s run_epoch=%s",
+                session_id,
+                run_epoch,
+            )
+            return
         except BaseException as error:
-            # Failure or loop-shutdown cancellation leaves the durable epoch
-            # fenced for explicit worker-startup recovery.
+            # A failed release also leaves the durable epoch fenced for explicit
+            # worker-startup recovery.
             diagnostic = exception_diagnostic(
                 error,
                 empty_message="run fence release failed",

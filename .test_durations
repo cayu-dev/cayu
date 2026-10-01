@@ -41783,5 +41783,18 @@
     "tests/server/test_server_scenario_launch.py::test_scenario_launch_publication_errors_remain_private_and_precede_admission[unsafe]": 0.507,
     "tests/server/test_server_scenario_launch.py::test_scenario_launch_publication_errors_remain_private_and_precede_admission[oversized]": 0.538,
     "tests/server/test_server_scenario_launch.py::test_scenario_launch_recovers_after_publication_and_replays_before_readiness": 0.599,
-    "tests/server/test_server_scenario_launch.py::test_scenario_launch_cancellation_before_publication_does_not_admit_work": 0.511
+    "tests/server/test_server_scenario_launch.py::test_scenario_launch_cancellation_before_publication_does_not_admit_work": 0.511,
+    "tests/core/test_authoring_evals.py::test_approval_grader_reads_policy_coverage[allowed-False]": 0.0007920419739093632,
+    "tests/core/test_authoring_evals.py::test_approval_grader_reads_policy_coverage[approval_required-True]": 0.000805000017862767,
+    "tests/core/test_authoring_evals.py::test_approval_grader_separates_attempt_from_platform_gating": 0.0007235000084619969,
+    "tests/core/test_authoring_evals.py::test_changed_files_counts_work_the_agent_committed": 0.1716588330018567,
+    "tests/core/test_authoring_evals.py::test_chat_grader_credits_session_resume": 0.0011567900073714554,
+    "tests/core/test_authoring_evals.py::test_chat_grader_flags_a_new_run_per_message": 0.0013707489997614175,
+    "tests/core/test_authoring_evals.py::test_every_task_is_phrased_without_cayu_vocabulary": 0.00012437498662620783,
+    "tests/core/test_authoring_evals.py::test_graders_ignore_files_the_agent_did_not_touch": 0.000900416009244509,
+    "tests/core/test_authoring_evals.py::test_live_ui_grader_credits_client_js_in_inline_html": 0.0019636250071926042,
+    "tests/core/test_authoring_evals.py::test_live_ui_grader_flags_timer_polling_and_credits_client_js": 0.0018535420094849542,
+    "tests/core/test_authoring_evals.py::test_structured_output_grader_flags_json_extraction": 0.0010186669969698414,
+    "tests/core/test_environment_lifecycle.py::test_deferred_run_fence_release_logs_shutdown_apart_from_failure[cancelled-INFO-Session left fenced with pending environment cleanup]": 0.0007016659947112203,
+    "tests/core/test_environment_lifecycle.py::test_deferred_run_fence_release_logs_shutdown_apart_from_failure[failed-WARNING-Deferred environment run-fence release failed]": 0.000571833981666714
 }
