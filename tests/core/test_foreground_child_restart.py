@@ -32,6 +32,7 @@ from cayu.sessions.base import (
     SessionQuery,
     SessionStatus,
 )
+from cayu.sessions.execution import SessionExecutionConfig
 from cayu.sessions.recovery import RecoveryPlanRequest, RecoveryPlanSelection
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
@@ -47,6 +48,19 @@ class _RestartRecordingTool(_RecordingTool):
     spec = _RecordingTool.spec.model_copy(
         update={"execution_profile_identity": _identity("restart-record")}
     )
+
+
+async def _recover_after_owner_expiry(app, request):
+    from cayu.sessions.base import IncompleteSessionRecoveryAction
+
+    deadline = asyncio.get_running_loop().time() + 15
+    while True:
+        result = await app.recover_incomplete_session(request)
+        if result.actions != (IncompleteSessionRecoveryAction.SKIPPED_EXECUTION_OWNER,):
+            return result
+        assert result.execution_lease_expires_at is not None
+        assert asyncio.get_running_loop().time() < deadline, "Abandoned owner lease did not expire"
+        await asyncio.sleep(0.1)
 
 
 async def _worker(path: str, action: str, phase: str) -> None:
@@ -147,6 +161,7 @@ async def _worker(path: str, action: str, phase: str) -> None:
         app = CayuApp(
             session_store=store,
             enable_logging=False,
+            session_execution=SessionExecutionConfig(heartbeat_interval_seconds=1, lease_seconds=5),
             secret_redactor=SecretRedactor("cayu-child") if redacted_ids else None,
         )
         app.register_provider(provider, default=True)
@@ -359,10 +374,11 @@ async def _worker(path: str, action: str, phase: str) -> None:
         children = await store.list_sessions(SessionQuery(parent_session_id="parent"))
         assert len(children.sessions) == 1
         child = children.sessions[0]
-        recovery = await app.recover_incomplete_session(
+        recovery = await _recover_after_owner_expiry(
+            app,
             IncompleteSessionRecoveryRequest(
                 session_id=app.project_session_id_for_exposure(child.id), inactive_for_seconds=0
-            )
+            ),
         )
         await app.recover_persisted_event_side_effects()
         assert (await store.load(child.id)).status is SessionStatus.INTERRUPTED, recovery
@@ -400,17 +416,18 @@ async def _worker(path: str, action: str, phase: str) -> None:
         parent_events = await store.load_events("parent")
         if any(event.type == "interaction.interrupted" for event in parent_events):
             with pytest.raises(RuntimeError, match="no authoritative open interaction"):
-                await app.recover_incomplete_session(
-                    IncompleteSessionRecoveryRequest(session_id="parent", inactive_for_seconds=0)
+                await _recover_after_owner_expiry(
+                    app,
+                    IncompleteSessionRecoveryRequest(session_id="parent", inactive_for_seconds=0),
                 )
         else:
-            await app.recover_incomplete_session(
-                IncompleteSessionRecoveryRequest(session_id="parent", inactive_for_seconds=0)
+            await _recover_after_owner_expiry(
+                app, IncompleteSessionRecoveryRequest(session_id="parent", inactive_for_seconds=0)
             )
         assert provider.requests == []
     if phase in {"reconstruct-pause", "reconstruct-running"}:
-        await app.recover_incomplete_session(
-            IncompleteSessionRecoveryRequest(session_id="parent", inactive_for_seconds=0)
+        await _recover_after_owner_expiry(
+            app, IncompleteSessionRecoveryRequest(session_id="parent", inactive_for_seconds=0)
         )
         reconstructed = await store.load_checkpoint("parent")
         assert reconstructed is not None and "foreground_child_wait" in reconstructed
@@ -436,8 +453,8 @@ async def _worker(path: str, action: str, phase: str) -> None:
         checkpoint = await store.load_checkpoint(child.id)
         assert "foreground_child_post_action_continuation" in checkpoint
         with pytest.raises(ModelCompletionManualRecoveryRequired):
-            await app.recover_incomplete_session(
-                IncompleteSessionRecoveryRequest(session_id=child.id, inactive_for_seconds=0)
+            await _recover_after_owner_expiry(
+                app, IncompleteSessionRecoveryRequest(session_id=child.id, inactive_for_seconds=0)
             )
         assert provider.requests == [] and tool.values == []
         assert await store.load_active_model_completion_stage(child.id) is not None
@@ -536,7 +553,7 @@ async def _worker(path: str, action: str, phase: str) -> None:
                 app._runtime_session_store.apply_invocation_lifecycle_command = (
                     stop_after_recovery_fence
                 )
-            await app.recover_incomplete_session(request)
+            await _recover_after_owner_expiry(app, request)
             pytest.fail("Recovery did not reach its process-loss barrier")
 
         peer_store = SQLiteSessionStore(path, public_authority_alias_codec=codec)
@@ -600,10 +617,11 @@ async def _worker(path: str, action: str, phase: str) -> None:
         assert len(children.sessions) == 1
         child = children.sessions[0]
         if phase == "replay-resolution":
-            await app.recover_incomplete_session(
+            await _recover_after_owner_expiry(
+                app,
                 IncompleteSessionRecoveryRequest(
                     session_id=app.project_session_id_for_exposure(child.id), inactive_for_seconds=0
-                )
+                ),
             )
             assert provider.requests == []
             assert tool.values == []

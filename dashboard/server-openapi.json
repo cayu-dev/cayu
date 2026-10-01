@@ -29030,6 +29030,7 @@
           "registration_unavailable",
           "registration_incompatible",
           "active_recovery_claim",
+          "active_execution_owner",
           "active_task_claim",
           "model_effect_outcome_unknown",
           "tool_effect_outcome_unknown",
@@ -31211,7 +31212,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "46",
+            "default": "47",
             "title": "Contract Version",
             "type": "string"
           },
@@ -31478,6 +31479,167 @@
         ],
         "title": "SessionExecutionSource",
         "type": "string"
+      },
+      "SessionExecutionState": {
+        "additionalProperties": false,
+        "description": "Content-free liveness evaluated by the store clock; reading never renews it.",
+        "properties": {
+          "claimed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Claimed At"
+          },
+          "heartbeat_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Heartbeat At"
+          },
+          "last_progress_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Progress At"
+          },
+          "last_progress_kind": {
+            "anyOf": [
+              {
+                "enum": [
+                  "model_stream",
+                  "tool_call",
+                  "waiting_for_input",
+                  "publishing"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Progress Kind"
+          },
+          "lease_expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lease Expires At"
+          },
+          "local_owner": {
+            "default": false,
+            "title": "Local Owner",
+            "type": "boolean"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Id"
+          },
+          "owner_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Id"
+          },
+          "owner_kind": {
+            "anyOf": [
+              {
+                "enum": [
+                  "in_process_runner",
+                  "server_stream",
+                  "task_worker",
+                  "recovery",
+                  "foreground_child_delivery"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Kind"
+          },
+          "owner_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Label"
+          },
+          "run_epoch": {
+            "minimum": 0.0,
+            "title": "Run Epoch",
+            "type": "integer"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "executing",
+              "idle",
+              "waiting",
+              "owner_lost",
+              "terminal",
+              "unknown"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "state",
+          "run_epoch"
+        ],
+        "title": "SessionExecutionState",
+        "type": "object"
       },
       "SessionFollowContract": {
         "additionalProperties": false,
@@ -32161,6 +32323,9 @@
       "SessionStateResponse": {
         "additionalProperties": false,
         "properties": {
+          "execution": {
+            "$ref": "#/components/schemas/SessionExecutionState"
+          },
           "interruption_cascade": {
             "enum": [
               "none",
@@ -32204,7 +32369,8 @@
           "updated_at",
           "last_activity_at",
           "interruption_cascade",
-          "provider_operation"
+          "provider_operation",
+          "execution"
         ],
         "title": "SessionStateResponse",
         "type": "object"
@@ -37381,7 +37547,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "46",
+            "default": "47",
             "title": "Contract Version",
             "type": "string"
           }

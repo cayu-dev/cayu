@@ -58,7 +58,9 @@ from cayu.runtime.event_side_effect_health import (
     PersistedEventSideEffectQuery,
 )
 from cayu.sessions import creation_fence
+from cayu.sessions.execution import SessionExecutionState
 from cayu.storage._creation_fence import MemoryCreationFenceMixin
+from cayu.storage._session_execution import MemorySessionExecutionMixin
 
 if TYPE_CHECKING:
     from cayu.collaboration._contracts import ExactLookup
@@ -1108,7 +1110,13 @@ class _SessionRunFenceContext:
 class _SessionRunFenceOwnership:
     """One transferable, exactly retired process-local run-fence owner."""
 
-    __slots__ = ("_retired", "run_epoch", "session_id", "session_instance_id")
+    __slots__ = (
+        "_retired",
+        "_retirement_callbacks",
+        "run_epoch",
+        "session_id",
+        "session_instance_id",
+    )
 
     def __init__(
         self, *, session_id: str, run_epoch: int, session_instance_id: str | None = None
@@ -1117,6 +1125,13 @@ class _SessionRunFenceOwnership:
         self.session_id = session_id
         self.run_epoch = run_epoch
         self._retired = False
+        self._retirement_callbacks: list[Callable[[], None]] = []
+
+    def on_retire(self, callback: Callable[[], None]) -> None:
+        if self._retired:
+            callback()
+        else:
+            self._retirement_callbacks.append(callback)
 
     @property
     def retired(self) -> bool:
@@ -1159,6 +1174,9 @@ class _SessionRunFenceOwnership:
         if self._retired:
             return False
         self._retired = True
+        callbacks, self._retirement_callbacks = self._retirement_callbacks, []
+        for callback in callbacks:
+            callback()
         owners = _SESSION_RUN_FENCE_OWNERS.get()
         fences = _SESSION_RUN_FENCES.get()
         if owners is not None and owners.get(self.session_id) is self:
@@ -8196,6 +8214,7 @@ class SessionOutcome(BaseModel):
 class IncompleteSessionRecoveryAction(StrEnum):
     TERMINALIZED_ZERO_WORK = "terminalized_zero_work"
     SKIPPED_ACTIVE = "skipped_active"
+    SKIPPED_EXECUTION_OWNER = "skipped_execution_owner"
     SKIPPED_TERMINAL = "skipped_terminal"
     SKIPPED_UNREGISTERED_AGENT = "skipped_unregistered_agent"
     REPAIRED_TERMINAL_OWNERSHIP = "repaired_terminal_ownership"
@@ -8324,6 +8343,7 @@ class IncompleteSessionRecoveryResult(BaseModel):
     pending_user_input_id: str | None = None
     pending_subagent_session_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=1000)
     message: str
+    execution_lease_expires_at: datetime | None = None
 
     @field_validator("pending_subagent_session_ids")
     @classmethod
@@ -10861,6 +10881,22 @@ class SessionStore(ABC):
     @abstractmethod
     async def load(self, session_id: str) -> Session | None:
         """Load a session by id."""
+
+    supports_session_execution = False
+
+    async def inspect_session_execution(self, session_id: str) -> SessionExecutionState:
+        """Read observational liveness; custom stores without leases return unknown."""
+        session = await self.load(session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {session_id}")
+        return SessionExecutionState(
+            session_id=session.id,
+            run_epoch=session.run_epoch,
+            state="terminal"
+            if session.status
+            in {SessionStatus.COMPLETED, SessionStatus.FAILED, SessionStatus.INTERRUPTED}
+            else "unknown",
+        )
 
     @abstractmethod
     async def load_state(self, session_id: str) -> SessionStateSnapshot | None:
@@ -15383,7 +15419,7 @@ def runtime_session_query(operation):
 
 
 @model_store_surface("sessions")
-class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
+class InMemorySessionStore(MemorySessionExecutionMixin, MemoryCreationFenceMixin, SessionStore):
     """In-process session store for tests, local development, and examples."""
 
     session_access_version: ClassVar[int | None] = 1
@@ -15803,6 +15839,7 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
         self._lock = asyncio.Lock()
         self._participant_creation_lock = asyncio.Lock()
         self._session_creation_decisions = {}
+        self._execution_owners = {}
         self._producer_cleanup_receipts = {}
         self._producer_cleanup_index = {}
         self._producer_cleanup_retirements = {}
@@ -19085,6 +19122,7 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
                 if key[0] != session_id and binding.grant_id not in targeted_grant_ids
             }
             self._sessions.pop(session_id, None)
+            self._execution_owners.pop(session_id, None)
             if any(
                 receipt.status == "appended"
                 and receipt.target_session_id == session.id
@@ -20280,6 +20318,8 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
             session = self._sessions.get(session_id)
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
+            if self._has_live_execution_owner_unlocked(session, now):
+                return None
             current_checkpoint = self._checkpoints.get(session_id)
             if (
                 active_provider_operation_cancellation_claim_from_checkpoint(
@@ -20326,6 +20366,10 @@ class InMemorySessionStore(MemoryCreationFenceMixin, SessionStore):
             session = self._sessions.get(session_id)
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
+            if inactive_for_seconds is not None and self._has_live_execution_owner_unlocked(
+                session, now
+            ):
+                return None
             current = self._checkpoints.get(session_id)
             inactive_before = (
                 None

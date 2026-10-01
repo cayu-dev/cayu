@@ -746,6 +746,10 @@ class RecoveryPlanCoordinator:
                 )
             )
 
+        execution = await self._session_store.inspect_session_execution(session.id)
+        if execution.state == "executing":
+            blockers.append(RecoveryPlanBlocker(code=RecoveryBlockerCode.ACTIVE_EXECUTION_OWNER))
+
         claim_evidence: RecoveryClaimEvidence | None = None
         try:
             claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)

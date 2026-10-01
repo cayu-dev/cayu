@@ -461,6 +461,7 @@ from cayu.runtime._session_engine import (
     _WorkAttemptRecoveryAlreadyActive,
     _WorkAttemptRuntimeAuthority,
 )
+from cayu.runtime._session_execution_presence import process_owner_id
 from cayu.runtime._session_message_coordinator import SessionMessageCoordinator
 from cayu.runtime._session_queries import query_all_sessions
 from cayu.runtime._structured_output_tool_round import _has_structured_output_tool_call
@@ -691,6 +692,11 @@ from cayu.sessions.context_views import (
     json_commitment,
     project_context_view_extensions,
     require_independent_context_view_material,
+)
+from cayu.sessions.execution import (
+    SessionExecutionConfig,
+    SessionExecutionState,
+    execution_owned_by,
 )
 from cayu.sessions.invocation import (
     InvocationOrigin,
@@ -1181,6 +1187,7 @@ class CayuApp:
         public_authority_alias_keyring: PublicAuthorityAliasKeyring | None = None,
         session_closure_stores: Iterable[SessionClosureStore] | None = None,
         clock: Callable[[], datetime] | None = None,
+        session_execution: SessionExecutionConfig | None = None,
     ) -> None:
         # Resolve once at application startup. Strict deployments fail here,
         # before any session or provider authority can be admitted.
@@ -1484,6 +1491,9 @@ class CayuApp:
             secret_redactor=self._secret_redactor,
             max_environment_lifecycle_owners=self._max_environment_lifecycle_owners,
             egress_authority_adoption_handler=egress_authority_adoption_handler,
+            execution_presence_stopped=lambda session_id, run_epoch: (
+                self._session_control.execution_presence.stop(session_id, run_epoch=run_epoch)
+            ),
         )
         self._run_limit_controller = RunLimitController(
             session_store=self._runtime_session_store,
@@ -1505,8 +1515,13 @@ class CayuApp:
         self._artifact_store_registrations_by_id: dict[str, _ArtifactStoreRegistration] = {}
         self._default_provider_name: str | None = None
         self._default_environment_name: str | None = None
+        if session_execution is not None:
+            if type(session_execution) is not SessionExecutionConfig:
+                raise TypeError("session_execution must be SessionExecutionConfig.")
+            if self.redact_json(session_execution.owner_label) != session_execution.owner_label:
+                raise ValueError("Execution owner label must not contain a workload secret.")
         self._session_control = SessionControl[SessionUsageTracker](
-            session_store=self._runtime_session_store
+            session_store=self._runtime_session_store, execution_config=session_execution
         )
         self._provider_operation_cancellation_lifecycle = ProviderOperationCancellationLifecycle()
         self._model_step_executor = ModelStepExecutor(
@@ -8659,6 +8674,7 @@ class CayuApp:
             async for item in owned_stream:
                 yield item
 
+    @execution_owned_by("recovery")
     async def recover_incomplete_session(
         self,
         request: IncompleteSessionRecoveryRequest,
@@ -8708,6 +8724,7 @@ class CayuApp:
             raise TypeError("Recovery execution requires a RecoveryExecutionRequest.")
         return await self._recovery_plan_coordinator.execute_recovery(request)
 
+    @execution_owned_by("recovery")
     async def recover_model_completion_stage(
         self,
         request: ModelCompletionManualRecoveryRequest,
@@ -8760,6 +8777,7 @@ class CayuApp:
         del request
         return await recovery
 
+    @execution_owned_by("foreground_child_delivery")
     async def _continue_foreground_parent(self, claim: PersistedEventSideEffectClaim) -> bool:
         from cayu.runtime._foreground_child_continuation import deliver_foreground_child_terminal
 
@@ -8819,6 +8837,18 @@ class CayuApp:
             settle=settle,
         )
 
+    async def inspect_session_execution(self, session_id: str) -> SessionExecutionState:
+        """Inspect durable execution presence without renewing or claiming any authority."""
+        state = await self._runtime_session_store.inspect_session_execution(session_id)
+        return state.model_copy(
+            update={
+                "session_id": self.project_session_id_for_exposure(state.session_id),
+                "local_owner": state.state == "executing"
+                and state.owner_id == process_owner_id()
+                and self._session_control.has_active_tasks(session_id),
+            }
+        )
+
     async def get_persisted_event_side_effect_health(self) -> PersistedEventSideEffectHealth:
         """Read the store-wide durable fan-out snapshot; never emit or retry events."""
         return await self._runtime_session_store.get_persisted_event_side_effect_health()
@@ -8839,6 +8869,7 @@ class CayuApp:
         """
         return await self._event_writer.recover_persisted_side_effects(limit=limit)
 
+    @execution_owned_by("recovery")
     async def recover_incomplete_sessions(
         self,
         request: IncompleteSessionsRecoveryRequest,
@@ -11371,6 +11402,7 @@ class CayuApp:
                 yield event
         await self._event_writer.recover_persisted_side_effects()
 
+    @execution_owned_by("recovery")
     async def recover_user_input(
         self,
         request: UserInputRecoveryRequest,
@@ -11652,6 +11684,7 @@ class CayuApp:
                 yield event
         await self._event_writer.recover_persisted_side_effects()
 
+    @execution_owned_by("recovery")
     async def recover_tool_approval(
         self,
         request: ToolApprovalRecoveryRequest,
@@ -11878,6 +11911,7 @@ class CayuApp:
             async for event in owned_stream:
                 yield await self._project_emitted_event_for_public_api(event)
 
+    @execution_owned_by("recovery")
     async def recover_tool_round(
         self,
         request: ToolRoundRecoveryRequest,

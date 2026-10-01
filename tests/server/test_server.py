@@ -6638,6 +6638,7 @@ def test_server_exposes_bounded_session_state_without_heavy_loaders() -> None:
     assert body["updated_at"]
     assert body["last_activity_at"]
     assert set(body) == {
+        "execution",
         "session_id",
         "status",
         "updated_at",

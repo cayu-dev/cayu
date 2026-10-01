@@ -65,6 +65,7 @@ from cayu.sessions.base import (
 from cayu.storage import _creation_fence
 from cayu.storage._context_selection_fence import PostgresContextSelectionFenceMixin
 from cayu.storage._creation_fence import PostgresCreationFenceMixin
+from cayu.storage._session_execution import POSTGRES_EXECUTION_DDL, PostgresSessionExecutionMixin
 
 if TYPE_CHECKING:
     from cayu.knowledge.maintenance_governance import (
@@ -1139,7 +1140,7 @@ _MAINTENANCE_REJECTED_REPLACEMENT_RETIREMENT_TRANSITIONS = frozenset(
     }
 )
 _POSTGRES_MIN_REQUIRED_REVISION = 18
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 110
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 113
 _POSTGRES_TASK_MIN_REQUIRED_REVISION = 96
 _INTERRUPTED_HANDOFF_MIGRATION_BATCH_SIZE = 256
 
@@ -1539,6 +1540,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     107: POSTGRES_COLLABORATION_PLANNING_DDL,
     111: POSTGRES_COLLABORATION_WAIT_DDL,
     112: POSTGRES_PRODUCT_OPERATION_DDL,
+    113: POSTGRES_EXECUTION_DDL,
     106: (),  # Contract-only writer fence; existing typed request records own storage.
     105: POSTGRES_COLLABORATION_CLARIFICATION_DDL,
     104: (
@@ -25722,7 +25724,11 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
 
 @model_store_surface("sessions")
 class PostgresSessionStore(
-    PostgresContextSelectionFenceMixin, PostgresCreationFenceMixin, _PostgresStoreBase, SessionStore
+    PostgresSessionExecutionMixin,
+    PostgresContextSelectionFenceMixin,
+    PostgresCreationFenceMixin,
+    _PostgresStoreBase,
+    SessionStore,
 ):
     """Postgres-backed session store for shared durable runtime state."""
 
@@ -32287,6 +32293,9 @@ class PostgresSessionStore(
                         raise KeyError(f"Session not found: {session_id}")
                     checkpoint = await self._load_checkpoint(cur, session_id)
                     now = await self._session_store_now(cur)
+                    if await self._has_live_execution_owner(cur, loaded, now):
+                        await conn.commit()
+                        return None
                     if (
                         active_provider_operation_cancellation_claim_from_checkpoint(
                             checkpoint,
@@ -32345,6 +32354,11 @@ class PostgresSessionStore(
                         raise KeyError(f"Session not found: {session_id}")
                     current = await self._load_checkpoint(cur, session_id)
                     now = await self._session_store_now(cur)
+                    if inactive_for_seconds is not None and await self._has_live_execution_owner(
+                        cur, loaded, now
+                    ):
+                        await conn.commit()
+                        return None
                     inactive_before = (
                         None
                         if inactive_for_seconds is None

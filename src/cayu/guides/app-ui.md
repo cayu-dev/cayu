@@ -100,6 +100,105 @@ history on every call. Its
 cost grows with every run the app has ever made, and every open tab pays it on
 every refresh.
 
+## Ask Cayu whether a session is executing
+
+Use `await app.inspect_session_execution(session_id)` instead of a local worker
+dictionary or an age threshold on `last_activity_at`. A console answer may resume
+the session in the Cayu server process while an application worker has no local
+task for it. A model stream or tool may also run silently for minutes.
+
+```python
+from cayu import SessionExecutionConfig
+
+# Optional when constructing CayuApp; these are the defaults.
+execution_config = SessionExecutionConfig(
+    heartbeat_interval_seconds=15,
+    lease_seconds=60,
+    owner_label="review-worker",  # optional application label; never include secrets
+)
+
+execution = await app.inspect_session_execution(session_id)
+if execution.state == "executing":
+    label = "Running here" if execution.local_owner else "Running in another worker"
+elif execution.state == "owner_lost":
+    label = "Execution owner lost; inspect recovery"
+else:
+    label = execution.state
+```
+
+Pass `session_execution=execution_config` to `CayuApp` to change the interval or
+label. The lease must cover at least three heartbeat intervals. The default
+heartbeat writes one bounded owner row every 15 seconds per active session epoch,
+independently of model deltas and tool progress. Claim and release each add one
+small write. It does not update `last_activity_at`, rewrite the checkpoint, or
+load the transcript. Coarse model/tool/publishing boundaries update
+`last_progress_at` and `last_progress_kind` on the next heartbeat.
+
+`SessionExecutionState` includes an opaque process-instance `owner_id`,
+`owner_kind`, `run_epoch`, a hashed `operation_id` reference, `claimed_at`,
+`heartbeat_at`, and `lease_expires_at`. Owner kinds cover application runners,
+Cayu server streams, task workers, recovery, and foreground child delivery.
+No hostname, PID, prompt, tool argument, or provider payload is included.
+SQLite and PostgreSQL make the same projection visible to other processes;
+in-memory stores work only inside their process.
+
+`GET /api/sessions/{id}/state` exposes it under `execution`. Its ETag changes
+on heartbeat renewal and when the lease expires. Polls themselves never renew
+the lease or change the epoch:
+
+```bash
+curl --fail --silent --show-error "$CAYU_URL/api/sessions/$SESSION_ID/state"
+curl --silent --show-error -H 'If-None-Match: W/"previous-etag"' \
+  "$CAYU_URL/api/sessions/$SESSION_ID/state"
+```
+
+`waiting` means a retained human input, approval, or foreground child wait; it exposes no live owner.
+`idle` means work has not started, and `terminal` means it has settled.
+`owner_lost` means nonterminal work has no living owner for the current epoch,
+including a lease that expired after a process died. PostgreSQL uses the database
+clock; SQLite and memory use the host clock, so shared SQLite deployments require
+synchronized host clocks. `unknown` covers
+older writers and custom stores that cannot attest execution presence. Treat it
+as uncertain rather than declaring a run dead. Maintained durable stores need
+the additive schema migration 113 before a new binary starts writing leases.
+
+This projection grants no execution authority. A live owner blocks stale-run
+fencing and appears as `active_execution_owner` in recovery planning. The
+inactivity-gated recovery calls honor it too: a `recover_incomplete_session(...)`
+or `recover_incomplete_sessions(...)` request that sets `inactive_for_seconds`
+and runs before expiry returns `skipped_execution_owner` with
+`execution_lease_expires_at`, and batch recovery includes that result too. A
+request that leaves `inactive_for_seconds` at its default `None` is an explicit
+recover-now call: it does not consult the execution lease and is not skipped.
+Only send it when you know the owner is gone.
+
+Your own startup recovery loop must retry skipped entries after the reported
+time rather than run a single sweep and discard them. The Cayu server's
+`startup_recovery_statuses` sweep does this already: sessions it skipped for a
+live lease, typically left by a process that crashed just before the restart,
+are re-planned in the background after the lease expires, with the same
+`recovery_inactive_after_seconds` threshold. It retries up to three times, then
+logs the sessions whose owners are still alive and leaves them to explicit
+recovery. A process crash can leave up to 60 seconds of the default lease.
+Explicit operator interruption retains its existing cancellation contract;
+execution presence does not authorize forced takeover.
+
+Transient renewal errors do not release the row, and the heartbeat keeps retrying
+for as long as the run is active, even after a store outage outlasts the lease.
+Once the store answers again, the expired lease cannot be renewed, so the same
+process reclaims observation for its run. That reclaim succeeds only while the
+transaction still matches that process's run epoch; a successor fence wins and
+the stale heartbeat stops.
+Retiring a local recovery owner stops its heartbeat even when the durable
+invocation must remain for a later recovery attempt. A live but hung operation
+continues to heartbeat: lack of progress alone is not proof of death. Use the
+application's operation deadline or explicit interruption to stop it.
+
+After an owner is lost, use the existing recovery plan and fenced claim; inspecting or
+showing the state never reserves recovery. An expired token cannot renew or
+replace a successor's owner row. During orderly completion, retained cleanup
+keeps its heartbeat until physical cleanup finishes.
+
 ## Keep GET handlers read-only
 
 A GET handler in your app must not reconcile decisions, migrate data, backfill

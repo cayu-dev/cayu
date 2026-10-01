@@ -10,8 +10,10 @@ from typing import Any, Generic, TypeVar
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.events import Event, EventType, copy_event
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime._session_execution_presence import SessionExecutionPresence
 from cayu.runtime._terminal_evidence import interruption_request_id_from_payload
 from cayu.sessions.base import EventOrder, EventQuery, SessionStatus, SessionStore
+from cayu.sessions.execution import SessionExecutionConfig
 
 INTERRUPT_REQUESTED_SESSION_STATUSES = {
     SessionStatus.INTERRUPTING,
@@ -116,8 +118,13 @@ class SessionControl(Generic[UsageTrackerT]):
     terminal interruption event.
     """
 
-    def __init__(self, *, session_store: SessionStore) -> None:
+    def __init__(
+        self, *, session_store: SessionStore, execution_config: SessionExecutionConfig | None = None
+    ) -> None:
         self._session_store = session_store
+        self.execution_presence = SessionExecutionPresence(
+            session_store, execution_config or SessionExecutionConfig()
+        )
         self._active_runs: dict[str, dict[asyncio.Task[Any], ActiveSessionRun[UsageTrackerT]]] = {}
         self._active_control_tasks: dict[str, set[asyncio.Task[Any]]] = {}
         self._sessions_emitting_interrupted: set[str] = set()
@@ -255,6 +262,8 @@ class SessionControl(Generic[UsageTrackerT]):
             turn_usage_tracker=turn_usage_tracker,
         )
         self._active_runs.setdefault(session_id, {})[task] = active_run
+        if self._session_store.supports_session_execution:
+            self.execution_presence.bind(session_id)
         return active_run
 
     def unregister_active_task(self, session_id: str, task: asyncio.Task[Any]) -> None:
@@ -264,6 +273,7 @@ class SessionControl(Generic[UsageTrackerT]):
         active_runs.pop(task, None)
         if not active_runs:
             self._active_runs.pop(session_id, None)
+            self.execution_presence.discard_unused_progress(session_id)
 
     def active_runs(self, session_id: str) -> tuple[ActiveSessionRun[UsageTrackerT], ...]:
         return tuple(self._active_runs.get(session_id, {}).values())

@@ -29,6 +29,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from inspect import Parameter, signature
 from math import isfinite
@@ -46,14 +47,22 @@ from cayu.project_control_plane import (
 from cayu.runtime.event_side_effect_health import safe_error
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.server._event_side_effect_health import EventSideEffectRecoveryLoop
+from cayu.sessions.base import SessionStatus
 from cayu.sessions.recovery import (
+    RecoveryBlockerCode,
     RecoveryExecutionRequest,
     RecoveryPlan,
+    RecoveryPlanBounds,
     RecoveryPlanRequest,
     RecoveryPlanSelection,
 )
 
 _STARTUP_RECOVERY_MAX_CONCURRENCY = 8
+# Sessions skipped because another process still held a live execution lease are
+# retried after that lease expires, a bounded number of times.
+_STARTUP_EXECUTION_OWNER_RETRY_PASSES = 3
+_STARTUP_EXECUTION_OWNER_RETRY_MARGIN_SECONDS = 1.0
+_STARTUP_EXECUTION_OWNER_RETRY_MAX_DELAY_SECONDS = 1200.0
 
 try:
     from fastapi import Request  # noqa: TC002 - FastAPI resolves endpoint annotations at runtime
@@ -296,13 +305,13 @@ def create_server(
         batch_limit=_PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_BATCH_SIZE,
     )
 
-    async def recover_startup_state() -> RecoveryPlanRequest | None:
+    async def recover_startup_state() -> _StartupRecoveryFollowUp | None:
         await _recover_persisted_event_side_effects_during_startup(
             app,
             timeout_s=lifecycle.event_side_effect_startup_timeout_seconds,
             status=side_effect_health,
         )
-        continuation_request: RecoveryPlanRequest | None = None
+        follow_up: _StartupRecoveryFollowUp | None = None
         if recovery_statuses is not None:
             request = RecoveryPlanRequest(
                 selection=RecoveryPlanSelection(
@@ -311,6 +320,7 @@ def create_server(
                 )
             )
             plan = await _execute_incomplete_session_startup_recovery_page(app, request)
+            continuation_request: RecoveryPlanRequest | None = None
             if plan.next_cursor is not None:
                 continuation_request = request.model_copy(
                     update={
@@ -319,10 +329,17 @@ def create_server(
                         )
                     }
                 )
+            deferred_session_ids = _execution_owner_deferred_session_ids(plan)
+            if continuation_request is not None or deferred_session_ids:
+                follow_up = _StartupRecoveryFollowUp(
+                    request=request,
+                    continuation=continuation_request,
+                    deferred_session_ids=tuple(deferred_session_ids),
+                )
         await app.resume_pending_interruption_cascades(
             interrupting_inactive_for_seconds=(lifecycle.recovery_inactive_after_seconds)
         )
-        return continuation_request
+        return follow_up
 
     @asynccontextmanager
     async def cayu_lifespan(server):
@@ -332,10 +349,10 @@ def create_server(
         incomplete_session_recovery_task: asyncio.Task[None] | None = None
         if user_lifespan is None:
             try:
-                continuation_request = await recover_startup_state()
+                follow_up = await recover_startup_state()
                 incomplete_session_recovery_task = _start_incomplete_session_startup_recovery(
                     app,
-                    continuation_request,
+                    follow_up,
                 )
                 side_effect_recovery_task = _start_persisted_event_side_effect_recovery(
                     app, side_effect_health
@@ -356,10 +373,10 @@ def create_server(
             return
         async with user_lifespan(server) as state:
             try:
-                continuation_request = await recover_startup_state()
+                follow_up = await recover_startup_state()
                 incomplete_session_recovery_task = _start_incomplete_session_startup_recovery(
                     app,
-                    continuation_request,
+                    follow_up,
                 )
                 side_effect_recovery_task = _start_persisted_event_side_effect_recovery(
                     app, side_effect_health
@@ -1147,13 +1164,35 @@ async def _recover_persisted_event_side_effects_forever(
             status.state = "stopped"
 
 
+@dataclass(frozen=True)
+class _StartupRecoveryFollowUp:
+    """Background startup recovery left after the first, readiness-blocking page."""
+
+    request: RecoveryPlanRequest
+    continuation: RecoveryPlanRequest | None
+    deferred_session_ids: tuple[str, ...]
+
+
+def _execution_owner_deferred_session_ids(plan: RecoveryPlan) -> list[str]:
+    return [
+        item.session_id
+        for item in plan.items
+        if any(
+            blocker.code is RecoveryBlockerCode.ACTIVE_EXECUTION_OWNER for blocker in item.blockers
+        )
+    ]
+
+
 async def _continue_incomplete_session_startup_recovery(
     app: CayuApp,
     request: RecoveryPlanRequest,
+    deferred_session_ids: list[str] | None = None,
 ) -> None:
     seen_cursors = {request.selection.cursor}
     while True:
         plan = await _execute_incomplete_session_startup_recovery_page(app, request)
+        if deferred_session_ids is not None:
+            deferred_session_ids.extend(_execution_owner_deferred_session_ids(plan))
         if plan.next_cursor is None:
             return
         if plan.next_cursor in seen_cursors:
@@ -1183,26 +1222,111 @@ async def _execute_incomplete_session_startup_recovery_page(
     return plan
 
 
-async def _run_incomplete_session_startup_recovery(
+async def _startup_execution_owner_retry_delay(
+    app: CayuApp,
+    session_ids: list[str],
+    statuses: frozenset[SessionStatus],
+) -> tuple[list[str], float]:
+    """Keep sessions still in the startup selection and wait out their live leases."""
+
+    retained: list[str] = []
+    latest_expiry: datetime | None = None
+    for session_id in session_ids:
+        private_session_id = await app._resolve_public_session_id(session_id)
+        session = await app.session_store.load(private_session_id)
+        if session is None or session.status not in statuses:
+            continue
+        retained.append(session_id)
+        execution = await app.inspect_session_execution(private_session_id)
+        if execution.state == "executing" and execution.lease_expires_at is not None:
+            expiry = execution.lease_expires_at
+            latest_expiry = expiry if latest_expiry is None else max(latest_expiry, expiry)
+    delay = 0.0
+    if latest_expiry is not None:
+        delay = max(0.0, (latest_expiry - datetime.now(UTC)).total_seconds())
+    return retained, min(
+        delay + _STARTUP_EXECUTION_OWNER_RETRY_MARGIN_SECONDS,
+        _STARTUP_EXECUTION_OWNER_RETRY_MAX_DELAY_SECONDS,
+    )
+
+
+async def _retry_execution_owner_deferred_startup_recovery(
     app: CayuApp,
     request: RecoveryPlanRequest,
+    deferred_session_ids: list[str],
 ) -> None:
+    """Re-plan sessions skipped for a live execution lease once the lease expires.
+
+    A restart inside the lease window sees the crashed process's lease as live.
+    The retried plan keeps the startup inactivity threshold, so a run that
+    renewed its lease or made progress in the meantime is still left alone.
+    """
+
+    statuses = request.selection.statuses
+    item_limit = RecoveryPlanBounds().item_limit
+    for _ in range(_STARTUP_EXECUTION_OWNER_RETRY_PASSES):
+        deferred_session_ids, delay = await _startup_execution_owner_retry_delay(
+            app, deferred_session_ids, statuses
+        )
+        if not deferred_session_ids:
+            return
+        await asyncio.sleep(delay)
+        still_deferred: list[str] = []
+        for start in range(0, len(deferred_session_ids), item_limit):
+            plan = await _execute_incomplete_session_startup_recovery_page(
+                app,
+                RecoveryPlanRequest(
+                    selection=RecoveryPlanSelection(
+                        session_ids=tuple(deferred_session_ids[start : start + item_limit]),
+                        inactive_for_seconds=request.selection.inactive_for_seconds,
+                    )
+                ),
+            )
+            still_deferred.extend(_execution_owner_deferred_session_ids(plan))
+        deferred_session_ids = still_deferred
+    if deferred_session_ids:
+        logger.warning(
+            "Incomplete-session startup recovery left %d session(s) with live execution "
+            "owners after %d retries; recover them explicitly once their owners stop.",
+            len(deferred_session_ids),
+            _STARTUP_EXECUTION_OWNER_RETRY_PASSES,
+        )
+
+
+async def _run_incomplete_session_startup_recovery(
+    app: CayuApp,
+    follow_up: _StartupRecoveryFollowUp,
+) -> None:
+    deferred_session_ids = list(follow_up.deferred_session_ids)
+    if follow_up.continuation is not None:
+        try:
+            await _continue_incomplete_session_startup_recovery(
+                app, follow_up.continuation, deferred_session_ids
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Failed to continue incomplete-session startup recovery.")
+    if not deferred_session_ids:
+        return
     try:
-        await _continue_incomplete_session_startup_recovery(app, request)
+        await _retry_execution_owner_deferred_startup_recovery(
+            app, follow_up.request, deferred_session_ids
+        )
     except asyncio.CancelledError:
         raise
     except Exception:
-        logger.exception("Failed to continue incomplete-session startup recovery.")
+        logger.exception("Failed to retry incomplete-session startup recovery after lease expiry.")
 
 
 def _start_incomplete_session_startup_recovery(
     app: CayuApp,
-    request: RecoveryPlanRequest | None,
+    follow_up: _StartupRecoveryFollowUp | None,
 ) -> asyncio.Task[None] | None:
-    if request is None:
+    if follow_up is None:
         return None
     return asyncio.create_task(
-        _run_incomplete_session_startup_recovery(app, request),
+        _run_incomplete_session_startup_recovery(app, follow_up),
         name="cayu-incomplete-session-startup-recovery",
     )
 

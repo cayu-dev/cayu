@@ -1730,7 +1730,10 @@ def _start_detached_event_stream_response(
         else:
             await enqueue("done", None, terminal=True)
 
-    pump_task = asyncio.create_task(pump())
+    from cayu.sessions.execution import execution_owner_kind
+
+    with execution_owner_kind("server_stream"):
+        pump_task = asyncio.create_task(pump())
     _detached_event_pumps.add(pump_task)
     pump_task.add_done_callback(_detached_event_pumps.discard)
 
@@ -10294,6 +10297,7 @@ def create_router(
             raise HTTPException(status_code=404, detail="Session not found")
         interruption_cascade = await cayu_app.interruption_cascade_status(session_id)
         provider_operation = await inspect_provider_operation(session_store, session_id)
+        execution = await cayu_app.inspect_session_execution(session_id)
         body = {
             "session_id": cayu_app.project_session_id_for_exposure(state.id),
             "status": state.status,
@@ -10301,6 +10305,7 @@ def create_router(
             "last_activity_at": state.last_activity_at.isoformat(),
             "interruption_cascade": interruption_cascade,
             "provider_operation": provider_operation.model_dump(mode="json"),
+            "execution": execution.model_dump(mode="json"),
         }
         etag = _session_state_etag(body)
         # `no-cache` lets a browser store the body but revalidate every read,

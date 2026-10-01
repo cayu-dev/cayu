@@ -199,6 +199,7 @@ from cayu.sessions.base import (
     SessionAggregateFilter,
     SessionOperationalSnapshot,
 )
+from cayu.sessions.execution import SessionExecutionState
 from cayu.sessions.interactions import InteractionSummaryEvidence
 from cayu.sessions.invocation import (
     InvocationOriginTrust,
@@ -2635,6 +2636,7 @@ class SessionStateResponse(ApiBaseModel):
     last_activity_at: str
     interruption_cascade: Literal["none", "pending", "failed"]
     provider_operation: ApiProviderOperationInspection
+    execution: SessionExecutionState
 
 
 class CausalBudgetSummaryResponse(ApiBaseModel):

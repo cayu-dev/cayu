@@ -74,6 +74,7 @@ from cayu.storage._product_operation_schema import (
     SQLITE_PRODUCT_OPERATION_DDL,
     validate_sqlite_product_operation_schema,
 )
+from cayu.storage._session_execution import SQLITE_EXECUTION_DDL
 from cayu.storage._task_graph_schema import SQLITE_TASK_GRAPH_DDL
 from cayu.storage._task_group_schema import (
     SQLITE_TASK_GROUP_DDL,
@@ -1040,6 +1041,7 @@ _MIGRATION_STEPS: dict[int, str] = {
     107: SQLITE_COLLABORATION_PLANNING_DDL,
     111: SQLITE_COLLABORATION_WAIT_DDL,
     112: SQLITE_PRODUCT_OPERATION_DDL,
+    113: SQLITE_EXECUTION_DDL,
     110: """
         CREATE TABLE IF NOT EXISTS cayu_producer_cleanup_receipts (
             operation_key TEXT PRIMARY KEY NOT NULL,

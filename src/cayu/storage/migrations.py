@@ -507,6 +507,9 @@ REVISIONS: tuple[Revision, ...] = (
     # Older writers never read or write it, so the revision is additive; product
     # stores require it explicitly.
     Revision(revision=112, kind=RevisionKind.ADDITIVE, compatible_from=111),
+    # Liveness is observational: older writers remain compatible and have an
+    # unknown owner until an instrumented run publishes execution presence.
+    Revision(revision=113, kind=RevisionKind.ADDITIVE, compatible_from=111),
 )
 
 #: The revision an empty database is initialized to.

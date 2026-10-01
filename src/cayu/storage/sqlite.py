@@ -59,6 +59,7 @@ from cayu.sessions.base import (
 from cayu.storage import _creation_fence
 from cayu.storage._context_selection_fence import SQLiteContextSelectionFenceMixin
 from cayu.storage._creation_fence import SQLiteCreationFenceMixin
+from cayu.storage._session_execution import SQLiteSessionExecutionMixin
 from cayu.storage.targets import require_sqlite_store_allowed
 
 if TYPE_CHECKING:
@@ -541,7 +542,7 @@ from cayu.workflows.base import WORKFLOW_ATTEMPT_EVENT_TYPE
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 110
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 113
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -1679,7 +1680,12 @@ def _queued_session_message_from_row(row: sqlite3.Row | dict[str, Any]) -> Sessi
 
 
 @model_store_surface("sessions")
-class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMixin, SessionStore):
+class SQLiteSessionStore(
+    SQLiteSessionExecutionMixin,
+    SQLiteContextSelectionFenceMixin,
+    SQLiteCreationFenceMixin,
+    SessionStore,
+):
     """SQLite-backed session store for durable local runtime state."""
 
     session_access_version: ClassVar[int | None] = 1
@@ -7406,6 +7412,10 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
                 )
                 if not self._session_exists_unlocked(session_id):
                     raise KeyError(f"Session not found: {session_id}")
+                lease_identity = self._execution_identity(session_id)
+                if self._has_live_execution_owner_unlocked(lease_identity, now):
+                    self._connection.commit()
+                    return None
                 current_checkpoint = self._load_checkpoint_unlocked(session_id)
                 if (
                     active_provider_operation_cancellation_claim_from_checkpoint(
@@ -7465,6 +7475,11 @@ class SQLiteSessionStore(SQLiteContextSelectionFenceMixin, SQLiteCreationFenceMi
                 loaded = self._load_unlocked(session_id)
                 if loaded is None:
                     raise KeyError(f"Session not found: {session_id}")
+                if inactive_for_seconds is not None and self._has_live_execution_owner_unlocked(
+                    loaded, now
+                ):
+                    self._connection.commit()
+                    return None
                 current = self._load_checkpoint_unlocked(session_id)
                 inactive_before = (
                     None

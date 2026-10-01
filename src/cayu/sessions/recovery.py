@@ -242,6 +242,7 @@ class RecoveryBlockerCode(StrEnum):
     REGISTRATION_UNAVAILABLE = "registration_unavailable"
     REGISTRATION_INCOMPATIBLE = "registration_incompatible"
     ACTIVE_RECOVERY_CLAIM = "active_recovery_claim"
+    ACTIVE_EXECUTION_OWNER = "active_execution_owner"
     ACTIVE_TASK_CLAIM = "active_task_claim"
     MODEL_EFFECT_OUTCOME_UNKNOWN = "model_effect_outcome_unknown"
     TOOL_EFFECT_OUTCOME_UNKNOWN = "tool_effect_outcome_unknown"

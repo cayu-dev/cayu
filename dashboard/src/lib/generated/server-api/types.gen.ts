@@ -14454,7 +14454,7 @@ export type RecallItemSelectionReason = 'calibrated_strong_match' | 'calibrated_
 /**
  * RecoveryBlockerCode
  */
-export type RecoveryBlockerCode = 'registration_unavailable' | 'registration_incompatible' | 'active_recovery_claim' | 'active_task_claim' | 'model_effect_outcome_unknown' | 'tool_effect_outcome_unknown' | 'tool_effect_continuation_required' | 'tool_approval_required' | 'user_input_required' | 'invalid_durable_state';
+export type RecoveryBlockerCode = 'registration_unavailable' | 'registration_incompatible' | 'active_recovery_claim' | 'active_execution_owner' | 'active_task_claim' | 'model_effect_outcome_unknown' | 'tool_effect_outcome_unknown' | 'tool_effect_continuation_required' | 'tool_approval_required' | 'user_input_required' | 'invalid_durable_state';
 
 /**
  * RecoveryCleanupPolicyManifest
@@ -15795,6 +15795,70 @@ export type SessionDebugState = 'needs_attention' | 'session_failure' | 'tool_is
 export type SessionExecutionSource = 'http_run' | 'sdk_run' | 'fork' | 'subagent' | 'task' | 'workflow_step';
 
 /**
+ * SessionExecutionState
+ *
+ * Content-free liveness evaluated by the store clock; reading never renews it.
+ */
+export type SessionExecutionState = {
+    /**
+     * Claimed At
+     */
+    claimed_at?: string | null;
+    /**
+     * Heartbeat At
+     */
+    heartbeat_at?: string | null;
+    /**
+     * Last Progress At
+     */
+    last_progress_at?: string | null;
+    /**
+     * Last Progress Kind
+     */
+    last_progress_kind?: 'model_stream' | 'tool_call' | 'waiting_for_input' | 'publishing' | null;
+    /**
+     * Lease Expires At
+     */
+    lease_expires_at?: string | null;
+    /**
+     * Local Owner
+     */
+    local_owner?: boolean;
+    /**
+     * Operation Id
+     */
+    operation_id?: string | null;
+    /**
+     * Owner Id
+     */
+    owner_id?: string | null;
+    /**
+     * Owner Kind
+     */
+    owner_kind?: 'in_process_runner' | 'server_stream' | 'task_worker' | 'recovery' | 'foreground_child_delivery' | null;
+    /**
+     * Owner Label
+     */
+    owner_label?: string | null;
+    /**
+     * Run Epoch
+     */
+    run_epoch: number;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * State
+     */
+    state: 'executing' | 'idle' | 'waiting' | 'owner_lost' | 'terminal' | 'unknown';
+};
+
+/**
  * SessionFollowContract
  *
  * Read-only SSE stream that follows one session's durable events.
@@ -16176,6 +16240,7 @@ export type SessionQueuedMessage = {
  * SessionStateResponse
  */
 export type SessionStateResponse = {
+    execution: SessionExecutionState;
     /**
      * Interruption Cascade
      */

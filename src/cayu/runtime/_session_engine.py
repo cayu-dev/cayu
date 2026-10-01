@@ -13717,6 +13717,7 @@ class SessionEngine:
         messages: list[Message] | None = None
         prompt_contribution_manifest: PromptContributionManifest | None = None
         try:
+            await self._session_control.execution_presence.ensure(session, task_id=request.task_id)
             await _require_tool_discovery_view(
                 self.session_store,
                 session,
@@ -25189,6 +25190,7 @@ class SessionEngine:
                     turn_started_at=run_started_at,
                     turn_usage_tracker=turn_usage_tracker,
                 )
+                await self._session_control.execution_presence.ensure(session, task_id=task_id)
             await turn_usage_tracker.mark_current_position()
             if execution_to_wait is not None:
                 await execution_to_wait.prepare(invocation_context)

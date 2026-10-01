@@ -98,6 +98,7 @@ import {
   optionalString,
   summarizeFailureEvent,
 } from "../lib/session-debug"
+import { sessionExecutionLabel } from "../lib/session-execution"
 import {
   CoalescedAsyncRunner,
   durationDetail,
@@ -2973,6 +2974,14 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <Badge variant={statusVariant(session.status)}>{session.status}</Badge>
+            {state?.execution && (
+              <Badge
+                variant={state.execution.state === "owner_lost" ? "destructive" : "outline"}
+                title={state.execution.owner_label ?? undefined}
+              >
+                {sessionExecutionLabel(state.execution)}
+              </Badge>
+            )}
             <span className="text-sm font-medium text-muted-foreground">{session.agent_name}</span>
             {durationText && <span className="text-sm text-muted-foreground">{durationText}</span>}
           </div>

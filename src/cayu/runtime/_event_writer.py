@@ -45,6 +45,7 @@ from cayu.sessions.base import (
     attribute_events_to_current_interaction,
     portable_persisted_event_side_effect_error,
 )
+from cayu.sessions.execution import note_execution_progress
 from cayu.vaults.redaction import SecretRedactor
 
 _PERSISTED_SIDE_EFFECT_RETRY_DELAY_SECONDS = 30.0
@@ -165,6 +166,7 @@ class RuntimeEventWriter:
             raise TypeError("Prepared runtime event authority is invalid.")
         event = prepared.event
         await self._session_store.append_event(event.session_id, event)
+        note_execution_progress(event)
         if persisted_observer is not None:
             persisted_observer(event)
         self._retain_terminal_event_authority(event)

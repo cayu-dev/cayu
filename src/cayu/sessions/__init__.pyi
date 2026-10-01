@@ -356,6 +356,8 @@ from cayu.sessions.context_views import (
 from cayu.sessions.context_views import (
     RecipientSessionCreationRequest as RecipientSessionCreationRequest,
 )
+from cayu.sessions.execution import SessionExecutionConfig as SessionExecutionConfig
+from cayu.sessions.execution import SessionExecutionState as SessionExecutionState
 from cayu.sessions.exports import SessionExportBoundary as SessionExportBoundary
 from cayu.sessions.exports import SessionExportLimits as SessionExportLimits
 from cayu.sessions.exports import SessionExportSnapshot as SessionExportSnapshot

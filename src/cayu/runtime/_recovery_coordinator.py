@@ -13427,6 +13427,7 @@ class RecoveryCoordinator:
         # The durable transition ran in a shielded child task. Bind its epoch to
         # the caller that will perform recovery writes and eventual cleanup.
         run_fence = _activate_owned_session_run_fence(claimed_session)
+        await self._session_control.execution_presence.ensure(claimed_session)
         authority = _IncompleteRecoveryClaimAuthority(
             session_id=claimed_session.id,
             claim_id=claim_id,
@@ -17582,6 +17583,23 @@ class RecoveryCoordinator:
                 message="Session has active work in this CayuApp process; recovery skipped.",
             )
 
+        if inactive_for_seconds is not None and self._session_store.supports_session_execution:
+            execution = await self._session_store.inspect_session_execution(session.id)
+            if execution.state == "executing":
+                if execution.lease_expires_at is None:
+                    raise RuntimeError("Executing session presence lacks its lease expiry.")
+                return IncompleteSessionRecoveryResult(
+                    session_id=session.id,
+                    previous_status=previous_status,
+                    status=session.status,
+                    actions=(IncompleteSessionRecoveryAction.SKIPPED_EXECUTION_OWNER,),
+                    execution_lease_expires_at=execution.lease_expires_at,
+                    message=(
+                        "Session execution owner lease is active until "
+                        f"{execution.lease_expires_at.isoformat()}; retry recovery after expiry."
+                    ),
+                )
+
         return await self._recover_incomplete_session_owned(
             _work_attempt=_work_attempt,
             preserve_interaction_id=preserve_interaction_id,
@@ -20192,6 +20210,7 @@ class RecoveryCoordinator:
                 session_id=session.id,
                 local_lease_deadline=claim.local_lease_deadline,
             )
+            await self._session_control.execution_presence.ensure(fenced)
             return claim
         except BaseException as exc:
             if authority is not None:

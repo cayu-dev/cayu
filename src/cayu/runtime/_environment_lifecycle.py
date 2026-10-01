@@ -778,6 +778,7 @@ class EnvironmentLifecycle:
         secret_redactor: SecretRedactor | None = None,
         max_environment_lifecycle_owners: int = DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS,
         egress_authority_adoption_handler: EgressAuthorityAdoptionHandler | None = None,
+        execution_presence_stopped: Callable[[str, int], None] | None = None,
     ) -> None:
         self._session_store = session_store
         self._event_writer = event_writer
@@ -795,6 +796,7 @@ class EnvironmentLifecycle:
             raise ValueError("max_environment_lifecycle_owners must be a positive integer.")
         self._max_environment_lifecycle_owners = max_environment_lifecycle_owners
         self._egress_authority_adoption_handler = egress_authority_adoption_handler
+        self._execution_presence_stopped = execution_presence_stopped
         # Factory results and bound workspaces contain process-local handles
         # that cannot be reconstructed from durable session state. Retain the
         # authoritative owner across async-generator yield boundaries until the
@@ -1976,6 +1978,28 @@ class EnvironmentLifecycle:
         )
 
     async def _release_quiescent_invocation_fence(
+        self,
+        session_id: str,
+        *,
+        invocation_context: InvocationContext | None,
+        terminal_event: Event | None,
+    ) -> None:
+        run_epoch = (
+            invocation_context.binding.run_epoch
+            if invocation_context is not None
+            else _current_session_run_epoch(session_id)
+        )
+        try:
+            await self._settle_quiescent_invocation_fence(
+                session_id, invocation_context=invocation_context, terminal_event=terminal_event
+            )
+        finally:
+            # Physical execution has ended, including retained cleanup. An
+            # ambiguous fence write must not advertise a living executor forever.
+            if self._execution_presence_stopped is not None and run_epoch is not None:
+                self._execution_presence_stopped(session_id, run_epoch)
+
+    async def _settle_quiescent_invocation_fence(
         self,
         session_id: str,
         *,
