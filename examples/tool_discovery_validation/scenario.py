@@ -823,10 +823,13 @@ def _ranking_evidence() -> ToolDiscoveryRankingEvidence:
 
 
 def _target_error_result(event: Event) -> bool:
-    if event.tool_name != _TARGET_NAME or event.type not in {
-        EventType.TOOL_CALL_COMPLETED,
-        EventType.TOOL_CALL_FAILED,
-    }:
+    if event.tool_name != _TARGET_NAME:
+        return False
+    if event.type is EventType.TOOL_CALL_BLOCKED:
+        # Schema-invalid arguments are denied before policy and execution.
+        metadata = event.payload.get("metadata")
+        return isinstance(metadata, dict) and metadata.get("reason") == "invalid_arguments"
+    if event.type not in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}:
         return False
     result = event.payload.get("result")
     return isinstance(result, dict) and result.get("is_error") is True

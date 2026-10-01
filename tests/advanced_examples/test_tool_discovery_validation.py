@@ -54,8 +54,7 @@ def test_tool_discovery_validation_proves_lifecycle_and_bounded_evaluation() -> 
     assert direct.unnecessary_searches == discovery.unnecessary_searches == 0
     assert direct.invalid_argument_attempts == discovery.invalid_argument_attempts == 1
     assert direct.invalid_argument_rejections == discovery.invalid_argument_rejections == 1
-    assert direct.target_invocations_started == 2
-    assert discovery.target_invocations_started == 1
+    assert direct.target_invocations_started == discovery.target_invocations_started == 1
     assert direct.target_effects == discovery.target_effects == 1
     assert direct.approval_requests == discovery.approval_requests == 0
     assert set(direct.provider_tool_counts) == {36}

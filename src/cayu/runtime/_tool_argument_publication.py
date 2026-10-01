@@ -218,3 +218,32 @@ def terminal_argument_projection(
     if state == "unavailable" and ARGUMENTS_FIELD not in payload:
         return unavailable_argument_projection()
     raise ValueError("Terminal event has an invalid tool-argument publication state.")
+
+
+def argument_presence_fields(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Bound key-only observations independently of application policy metadata."""
+
+    return {
+        "argument_presence": {
+            "keys": [key[:64] for key in sorted(arguments)[:64]],
+            "key_count": len(arguments),
+        }
+    }
+
+
+def publish_argument_presence(
+    observation: dict[str, Any], schema: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Publish only schema-declared names: model-authored keys can be secrets."""
+
+    presence = observation["argument_presence"]
+    properties = (schema or {}).get("properties", {})
+    declared = {key[:64] for key in properties} if isinstance(properties, dict) else set()
+    keys = [key for key in presence["keys"] if key in declared]
+    return {
+        "argument_presence": {
+            "keys": keys,
+            "key_count": presence["key_count"],
+            "unlisted_key_count": presence["key_count"] - len(keys),
+        }
+    }

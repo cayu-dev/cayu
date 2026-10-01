@@ -14,6 +14,7 @@ from cayu.runtime.service_manifest import (
     RuntimeStoreDurability,
     ServiceMode,
 )
+from cayu.tools.gateway import tool_input_schema_supported
 
 CHECK_REPORT_SCHEMA_VERSION = "2"
 AVAILABLE_CHECK_TAGS = frozenset({"authoring", "configuration", "deploy", "providers", "security"})
@@ -39,6 +40,8 @@ BUILTIN_DIAGNOSTIC_CODES = (
     "PUBLIC_SERVICE_TASK_STORE_NOT_DURABLE",
     "PUBLIC_SERVICE_TASK_STORE_REQUIRED",
     "TOOL_INPUT_SCHEMA_UNCONSTRAINED",
+    "TOOL_INPUT_SCHEMA_RUNTIME_UNSUPPORTED",
+    "TOOL_APPROVAL_VALIDITY_RULE",
 )
 _WORKSPACE_TOOL_NAMES = frozenset(
     {
@@ -354,6 +357,38 @@ def check_manifest(
             )
 
         for tool in agent.tools:
+            if not tool_input_schema_supported(tool.model_dump(mode="json")["input_schema"]):
+                diagnostics.append(
+                    ProjectDiagnostic(
+                        code="TOOL_INPUT_SCHEMA_RUNTIME_UNSUPPORTED",
+                        severity=DiagnosticSeverity.WARNING,
+                        subject=f"tool:{agent.name}/{tool.name}",
+                        path=f"agents.{agent.name}.tools.{tool.name}.input_schema",
+                        message="Runtime argument validation requires a locally resolvable Draft 2020-12 schema.",
+                        hint="Update the schema; until then the tool retains responsibility for argument validation.",
+                        tags=("authoring", "configuration"),
+                        documentation_anchor="cayu guide diagnostics#tool-input-schema-runtime-unsupported",
+                        verification_command="cayu check --json",
+                    )
+                )
+            if tool.approval_validity_rules:
+                diagnostics.append(
+                    ProjectDiagnostic(
+                        code="TOOL_APPROVAL_VALIDITY_RULE",
+                        severity=DiagnosticSeverity.INFO,
+                        subject=f"tool:{agent.name}/{tool.name}",
+                        path=f"agents.{agent.name}.tools.{tool.name}.approval_validity_rules",
+                        message=(
+                            f"Tool '{tool.name}' has validity rules under REQUIRE_APPROVAL: "
+                            + ", ".join(tool.approval_validity_rules)
+                            + ". Invalid arguments are always denied."
+                        ),
+                        hint="Correct invalid calls; approval applies only to authority violations.",
+                        tags=("authoring", "security"),
+                        documentation_anchor="cayu guide diagnostics#tool-approval-validity-rule",
+                        verification_command="cayu check --json",
+                    )
+                )
             if not tool.input_schema:
                 diagnostics.append(
                     ProjectDiagnostic(

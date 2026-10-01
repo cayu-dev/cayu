@@ -296,6 +296,10 @@ class ParameterRule(ABC):
         """
         return {}
 
+    def is_validity_violation(self, arguments: dict[str, Any]) -> bool:
+        """Whether approval cannot repair this violation; custom rules default to authority."""
+        return False
+
 
 class RequiredFieldRule(ParameterRule):
     """Require an argument path to be present and non-empty."""
@@ -321,6 +325,9 @@ class RequiredFieldRule(ParameterRule):
         if _is_empty_parameter_value(value):
             return f"Required parameter '{self.parameter}' is empty."
         return None
+
+    def is_validity_violation(self, arguments: dict[str, Any]) -> bool:
+        return type(self) is RequiredFieldRule
 
 
 class AllowlistRule(ParameterRule):
@@ -356,6 +363,10 @@ class AllowlistRule(ParameterRule):
             return f"Parameter '{self.parameter}' value is not allowed."
         return None
 
+    def is_validity_violation(self, arguments: dict[str, Any]) -> bool:
+        value = _get_argument_path(arguments, self._path)
+        return value is not _MISSING and type(value) is not str
+
 
 class RequiredAllowlistRule(ParameterRule):
     """Require a non-empty string argument that matches an explicit allowlist."""
@@ -381,6 +392,10 @@ class RequiredAllowlistRule(ParameterRule):
     def violation_metadata(self, arguments: dict[str, Any]) -> dict[str, Any]:
         violation = self._violation(arguments)
         return {} if violation is None else {"violation": violation[1]}
+
+    def is_validity_violation(self, arguments: dict[str, Any]) -> bool:
+        violation = self._violation(arguments)
+        return violation is not None and violation[1] != "disallowed_value"
 
     def _violation(self, arguments: dict[str, Any]) -> tuple[str, str] | None:
         value = _get_argument_path(arguments, self._path)
@@ -437,14 +452,19 @@ class DenyPatternRule(ParameterRule):
                 return f"Parameter '{self.parameter}' matches a denied pattern."
         return None
 
+    def is_validity_violation(self, arguments: dict[str, Any]) -> bool:
+        value = _get_argument_path(arguments, self._path)
+        return value is not _MISSING and type(value) is not str
+
 
 class ParameterConstrainedToolPolicy(ToolPolicy):
     """Validate tool-call arguments with per-tool parameter rules.
 
     Tools not present in ``rules`` are allowed. For constrained tools, the first
-    violated rule returns ``decision`` with a structured metadata payload. Deny
-    is the default because argument constraints are most often used as a hard
-    safety boundary, but requiring approval is also supported.
+    validity violation always denies: approval cannot repair missing, empty or
+    wrongly typed arguments. Authority violations return ``decision`` with a
+    structured metadata payload. Validity checks take precedence over authority
+    violations, even when an authority rule appears first.
     """
 
     def __init__(
@@ -496,15 +516,19 @@ class ParameterConstrainedToolPolicy(ToolPolicy):
                     return None
                 material.append(rule_material)
             rules[tool_name] = material
-        return {
+        result: dict[str, Any] = {
             "decision": self.decision.value,
             "rules": rules,
         }
+        if self.decision == ToolPolicyDecision.REQUIRE_APPROVAL and any(self.rules.values()):
+            result["validity_denials_version"] = 1
+        return result
 
     async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
         rules = self.rules.get(request.tool_name)
         if rules is None:
             return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
+        authority_result: ToolPolicyResult | None = None
         for index, rule in enumerate(rules):
             violation = rule.check(request.arguments)
             if violation is not None:
@@ -521,12 +545,21 @@ class ParameterConstrainedToolPolicy(ToolPolicy):
                         "violation_metadata",
                     )
                 )
-                return ToolPolicyResult(
-                    decision=self.decision,
-                    reason=violation,
+                invalid = rule.is_validity_violation(request.arguments)
+                result = ToolPolicyResult(
+                    decision=ToolPolicyDecision.DENY if invalid else self.decision,
+                    reason=(
+                        f"{violation} Correct the call; approval cannot repair invalid arguments."
+                        if invalid and self.decision == ToolPolicyDecision.REQUIRE_APPROVAL
+                        else violation
+                    ),
                     metadata=metadata,
                 )
-        return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
+                if invalid or self.decision == ToolPolicyDecision.DENY:
+                    return result
+                if authority_result is None:
+                    authority_result = result
+        return authority_result or ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
 
 
 class TaintAwareToolPolicy(ToolPolicy):

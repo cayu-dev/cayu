@@ -71,7 +71,9 @@ class ToolCallPart(BaseModel):
                     "Original arguments are unavailable; this is not a submitted argument object. "
                     "Do not replay this placeholder. Read the tool result before choosing a new call. "
                     "For a policy denial, choose a permitted capability or ask the application "
-                    "operator to authorize the required capability."
+                    "operator to authorize the required capability when authorization is needed. "
+                    "Reconstruct all required arguments from the current task and tool schema; "
+                    "approval cannot supply missing arguments."
                 )
             }
         return copy_durable_json_value(self.arguments, "arguments")

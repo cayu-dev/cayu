@@ -56,14 +56,18 @@ class UserInputTool(Tool):
         return {}
 
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
-        # Reached only when the runtime did not intercept the call as a pause: either the question
-        # was blank/missing, or another tool in the same round required approval (approval takes
-        # precedence, so the question is not asked that round). run() cannot tell which, so cover
-        # both and tell the model what to do rather than implying the tool was misused.
+        question = args.get("question")
+        if not isinstance(question, str) or not question.strip():
+            return ToolResult(
+                content="Invalid ask_user arguments: 'question' must be a non-blank string.",
+                is_error=True,
+            )
+        # A valid question can reach direct execution after another tool's approval
+        # took precedence over the user-input pause in this round.
         return ToolResult(
             content=(
-                "ask_user did not pause this round: it needs a non-blank 'question', or another "
-                "tool in the round required approval first (approval takes precedence). If you "
+                "ask_user did not pause this round: another tool in the round required "
+                "approval first (approval takes precedence). If you "
                 "still need the user's input, call ask_user again in a later round."
             ),
             is_error=True,

@@ -67,6 +67,17 @@ class _UnconstrainedTool(Tool):
         return ToolResult(content="found")
 
 
+class _RemoteSchemaTool(Tool):
+    spec = ToolSpec(
+        name="fetch",
+        effect=ToolEffect.NONE,
+        input_schema={"$ref": "https://schemas.example/fetch.json"},
+    )
+
+    async def run(self, ctx, args):
+        return ToolResult(content="fetched")
+
+
 class _PermissiveApprovalPolicy(AlwaysRequireApprovalToolPolicy):
     async def authorize(self, request):
         return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
@@ -105,6 +116,8 @@ def test_builtin_diagnostic_codes_are_unique_and_compatibility_pinned() -> None:
         "PUBLIC_SERVICE_TASK_STORE_NOT_DURABLE",
         "PUBLIC_SERVICE_TASK_STORE_REQUIRED",
         "TOOL_INPUT_SCHEMA_UNCONSTRAINED",
+        "TOOL_INPUT_SCHEMA_RUNTIME_UNSUPPORTED",
+        "TOOL_APPROVAL_VALIDITY_RULE",
     )
     assert len(BUILTIN_DIAGNOSTIC_CODES) == len(set(BUILTIN_DIAGNOSTIC_CODES))
 
@@ -412,6 +425,26 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
     )
     unknown_codes = {item.code for item in check_manifest(unknown.describe()).diagnostics}
 
+    validity = CayuApp(enable_logging=False)
+    validity.register_agent(
+        AgentSpec(name="validity", model="model"),
+        tools=[_ExternalTool()],
+        tool_policy=ParameterConstrainedToolPolicy(
+            {"send": [RequiredFieldRule("to")]},
+            decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+        ),
+    )
+    validity_codes = {item.code for item in check_manifest(validity.describe()).diagnostics}
+
+    remote_schema = CayuApp(enable_logging=False)
+    remote_schema.register_agent(
+        AgentSpec(name="remote_schema", model="model"),
+        tools=[_RemoteSchemaTool()],
+    )
+    remote_schema_codes = {
+        item.code for item in check_manifest(remote_schema.describe()).diagnostics
+    }
+
     misaligned = CayuApp(enable_logging=False)
     misaligned.register_agent(
         AgentSpec(
@@ -500,6 +533,8 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
 
     assert (
         empty_codes
+        | validity_codes
+        | remote_schema_codes
         | missing_codes
         | ambiguous_codes
         | unsafe_codes

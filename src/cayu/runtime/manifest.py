@@ -257,6 +257,7 @@ class ToolManifest(_ManifestModel):
     policy_environment_names: tuple[str, ...] | None = None
     # Static configured decision, not a claim that every argument violates a rule.
     parameter_policy_decision: Literal["deny", "require_approval"] | None = None
+    approval_validity_rules: tuple[str, ...] = Field(default=(), exclude_if=lambda value: not value)
     command_policy: str | None = None
     named_checks: tuple[NamedCheckManifest, ...] = ()
     registration_provenance: RegistrationProvenance
@@ -740,6 +741,24 @@ def _describe_tool(
             else None
         ),
         parameter_policy_decision=_parameter_policy_decision(tool_policy, tool_name),
+        approval_validity_rules=(
+            tuple(
+                f"{type(rule).__name__}({rule.parameter})"
+                for rule in tool_policy.rules.get(tool_name, ())
+                if type(rule) in {RequiredFieldRule, RequiredAllowlistRule}
+                and not (
+                    type(rule) is RequiredFieldRule
+                    and rule.parameter in tool.schema.get("required", ())
+                    and tool.schema.get("properties", {}).get(rule.parameter, {}).get("type")
+                    == "string"
+                    and tool.schema.get("properties", {}).get(rule.parameter, {}).get("pattern")
+                    == r"\S"
+                )
+            )
+            if type(tool_policy) is ParameterConstrainedToolPolicy
+            and tool_policy.decision == ToolPolicyDecision.REQUIRE_APPROVAL
+            else ()
+        ),
         command_policy=_command_policy_name(tool.tool),
         named_checks=_named_check_manifests(tool.tool),
         registration_provenance=registration_provenance,

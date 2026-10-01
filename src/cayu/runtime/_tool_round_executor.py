@@ -338,6 +338,7 @@ from cayu.tools.catalogue import (
     SEARCH_TOOLS_NAME,
     ToolExecutionContract,
 )
+from cayu.tools.commands import ExecCommandTool
 from cayu.tools.discovery import (
     TOOL_DISCOVERY_REFERENCE_PREFIX,
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,
@@ -364,6 +365,7 @@ from cayu.tools.gateway import (
     rejected_targeted_tool_invocation,
     resolved_targeted_tool_invocation,
     targeted_tool_rejection_content,
+    tool_argument_validation_error,
     unresolved_gateway_rejection_event,
     validate_effective_tool_arguments,
 )
@@ -379,6 +381,7 @@ from cayu.tools.grants import (
     targeted_tool_use_rejection_reason,
     targeted_tool_view_generation_id,
 )
+from cayu.tools.patches import ApplyPatchTool
 from cayu.tools.policy import (
     TAINT_LABELS_METADATA_KEY,
     TOOL_POLICY_REAUTHORIZATION_METADATA_KEY,
@@ -399,6 +402,7 @@ from cayu.tools.result_projection import (
     safe_projection_failure_type,
     validate_tool_result_projection,
 )
+from cayu.tools.structured_commands import RunCommandTool
 from cayu.tools.terminal_publication import (
     TOOL_TERMINAL_PUBLICATION_SLICE_BYTES,
     ToolTerminalPublicationGovernor,
@@ -2016,6 +2020,14 @@ class ToolRoundExecutor:
         request_metadata: dict[str, Any],
         taint_labels: Iterable[str] | None = None,
     ) -> ToolPolicyResult:
+        registered_tool = registered_agent.executable_tool(tool_call.name)
+        error = _registered_tool_argument_error(registered_tool, tool_call.arguments)
+        if error is not None:
+            return ToolPolicyResult(
+                decision=ToolPolicyDecision.DENY,
+                reason=error,
+                metadata={"reason": "invalid_arguments"},
+            )
         policy_metadata = request_metadata
         if taint_labels:
             policy_metadata = metadata_with_taint_labels(request_metadata, taint_labels)
@@ -2276,6 +2288,9 @@ class ToolRoundExecutor:
             redactor=redactor,
         )
         requested_payload = {
+            **_published_argument_presence(
+                tool_call, registered_agent.executable_tool(tool_call.name)
+            ),
             **tool_round_identity.payload(),
             "approval_id": approval.approval_id,
             "tool_call_id": approval.tool_call_id,
@@ -3217,12 +3232,16 @@ class ToolRoundExecutor:
             approval_id=approval_id,
             pause_id=input_id,
         )
-        if emit_started:
+        argument_error = _registered_tool_argument_error(registered_tool, tool_call.arguments)
+        if emit_started and argument_error is None:
             payload: dict[str, Any] = {
                 "tool_call_id": tool_call.id,
                 "idempotency_key": idempotency_key,
                 **_targeted_tool_invocation_payload(tool_call),
                 **tool_argument_publication.quarantined_argument_fields(),
+                **_published_argument_presence(
+                    tool_call, registered_agent.executable_tool(tool_call.name)
+                ),
                 **identity_payload,
             }
             if registered_tool is not None:
@@ -3296,6 +3315,14 @@ class ToolRoundExecutor:
                 yield event
             return
 
+        if argument_error is not None:
+            # Approval of an older malformed call cannot bypass current input validation.
+            check_policy = True
+            policy_result = ToolPolicyResult(
+                decision=ToolPolicyDecision.DENY,
+                reason=argument_error,
+                metadata={"reason": "invalid_arguments"},
+            )
         if check_policy:
             if policy_result is None:
                 resolved_policy_result = await self.authorize_tool_call(
@@ -3310,10 +3337,14 @@ class ToolRoundExecutor:
                 resolved_policy_result = tool_execution.validate_tool_policy_result(policy_result)
             if resolved_policy_result.decision == ToolPolicyDecision.DENY:
                 publication_snapshot = await record_static_publication_scope()
-                public_policy_result = approval_support.public_policy_denial_result(
-                    secret_resolution_scope=policy_output_secret_resolution_scope,
-                    policy_result=resolved_policy_result,
-                    publish_arguments=registered_tool.publish_arguments,
+                public_policy_result = (
+                    resolved_policy_result
+                    if argument_error is not None
+                    else approval_support.public_policy_denial_result(
+                        secret_resolution_scope=policy_output_secret_resolution_scope,
+                        policy_result=resolved_policy_result,
+                        publish_arguments=registered_tool.publish_arguments,
+                    )
                 )
                 reason = tool_execution.policy_denial_reason(public_policy_result)
                 result = tool_execution.blocked_tool_result(public_policy_result, reason=reason)
@@ -3354,6 +3385,17 @@ class ToolRoundExecutor:
                     redactor=invocation_redactor,
                     output_redactor=provisional_output_redactor,
                     deferred_terminal_stager=deferred_terminal_stager,
+                    argument_projection=(
+                        tool_argument_publication.finalized_argument_projection(
+                            tool_call.arguments,
+                            redactor=invocation_redactor,
+                            scope_finalized=True,
+                        )
+                        if argument_error is not None
+                        and policy_output_secret_resolution_scope == "static"
+                        and registered_tool.publish_arguments
+                        else None
+                    ),
                     publication_snapshot=publication_snapshot,
                 ):
                     yield event
@@ -3510,10 +3552,17 @@ class ToolRoundExecutor:
             if reauthorization.decision != ToolPolicyDecision.ALLOW:
                 publication_snapshot = await record_static_publication_scope()
                 if reauthorization.decision == ToolPolicyDecision.DENY:
-                    public_reauthorization = approval_support.public_policy_denial_result(
-                        secret_resolution_scope=policy_output_secret_resolution_scope,
-                        policy_result=reauthorization,
-                        publish_arguments=registered_tool.publish_arguments,
+                    public_reauthorization = (
+                        reauthorization
+                        if _registered_tool_argument_error(
+                            registered_tool, effective_tool_call.arguments
+                        )
+                        is not None
+                        else approval_support.public_policy_denial_result(
+                            secret_resolution_scope=policy_output_secret_resolution_scope,
+                            policy_result=reauthorization,
+                            publish_arguments=registered_tool.publish_arguments,
+                        )
                     )
                     reason = tool_execution.policy_denial_reason(public_reauthorization)
                     metadata = public_reauthorization.metadata
@@ -6477,6 +6526,7 @@ class ToolRoundExecutor:
             redactor=resolved_redactor,
         )
         event_payload = dict(event.payload)
+        event_payload.update(_published_argument_presence(tool_call, registered_tool))
         event_payload.pop(tool_argument_publication.ARGUMENTS_FIELD, None)
         event_payload.pop(tool_argument_publication.ARGUMENTS_STATE_FIELD, None)
         if resolved_argument_projection.state == "unavailable":
@@ -10909,3 +10959,21 @@ def policy_denial_payload_fields(
         "reason": require_nonblank(reason, "reason"),
         "metadata": copy_durable_metadata(metadata),
     }
+
+
+def _registered_tool_argument_error(registered_tool, arguments):
+    if registered_tool is None:
+        return None
+    if isinstance(registered_tool.tool, (ExecCommandTool, RunCommandTool, ApplyPatchTool)):
+        # These built-ins own content-free command validation before effects.
+        # Their schemas are provider hints; replacing the preflight would lose
+        # selector/process denial codes and their repair instructions.
+        return None
+    return tool_argument_validation_error(arguments, registered_tool.schema)
+
+
+def _published_argument_presence(tool_call, registered_tool):
+    return tool_argument_publication.publish_argument_presence(
+        tool_call.argument_presence,
+        None if registered_tool is None else registered_tool.schema,
+    )

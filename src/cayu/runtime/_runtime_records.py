@@ -20,6 +20,7 @@ from cayu.runners.base import RunnerExecutionAdmissionObserver
 from cayu.runtime._child_session_identity import ChildSessionRecoveryMatcher
 from cayu.runtime._environment_exposure import _EnvironmentExposure
 from cayu.runtime._policy_evidence import ToolPolicyEvidence
+from cayu.runtime._tool_argument_publication import argument_presence_fields
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.tools.base import (
     DurableToolRecovery,
@@ -225,8 +226,10 @@ class ToolCallRequest:
     model_tool_name: str | None = None
     targeted_tool_invocation: ResolvedTargetedToolInvocation | None = None
     targeted_tool_rejection: RejectedTargetedToolInvocation | None = None
+    argument_presence: dict[str, Any] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "argument_presence", argument_presence_fields(self.arguments))
         if self.targeted_tool_grant_id is not None:
             validate_targeted_tool_digest(
                 self.targeted_tool_grant_id,

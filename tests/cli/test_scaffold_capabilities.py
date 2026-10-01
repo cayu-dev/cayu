@@ -292,7 +292,10 @@ def test_agent_service_capability_matrix(tmp_path, capsys, monkeypatch, preset, 
     assert main(["inspect", "--json"]) == 0
     capsys.readouterr()
     assert main(["check", "--fail-on", "warning", "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["diagnostics"] == []
+    assert all(
+        item["code"] == "TOOL_APPROVAL_VALIDITY_RULE"
+        for item in json.loads(capsys.readouterr().out)["diagnostics"]
+    )
 
 
 @pytest.mark.parametrize("command", ("inspect", "check"))
@@ -320,7 +323,9 @@ def test_cli_preserves_starter_coverage_with_additional_validation(
         check_args.extend(("--fail-on", "warning"))
     assert main(check_args) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload.get("diagnostics", []) == []
+    assert all(
+        item["code"] == "TOOL_APPROVAL_VALIDITY_RULE" for item in payload.get("diagnostics", [])
+    )
     if command == "inspect":
         proposal = next(
             tool for tool in payload["agents"][0]["tools"] if tool["name"] == "remember_knowledge"

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Invalid arguments can no longer be approved through built-in parameter validity
+  rules. `ParameterConstrainedToolPolicy(REQUIRE_APPROVAL)` without an explicit
+  application identity changes its execution-profile fingerprint. Resolve paused
+  sessions on the prior build before upgrading, or explicitly reconcile their
+  profile; do not silently rebind them. DENY fingerprints remain stable.
+  Runtime schema checks apply to locally resolvable Draft 2020-12 schemas;
+  `cayu check` warns on unsupported schemas, whose validation stays tool-owned.
+  Built-in command and patch tools retain their structured preflight diagnostics
+  and patch-input evidence. Schema denials retain finalized, redacted arguments
+  when the tool has static secret scope and publishes arguments.
+
 - Decode compressed upstream responses in virtual egress instead of rejecting
   them. `HttpxUpstream` still requests identity encoding, but when an origin
   (such as the Internet Archive) returns a single `gzip`, `deflate`, `br`, or

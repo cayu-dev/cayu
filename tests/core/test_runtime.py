@@ -28491,6 +28491,7 @@ def test_cayu_app_executes_tool_call_and_records_result():
         "idempotency_key": private_events[3].payload["idempotency_key"],
         "effect": "external",
         "arguments_state": "quarantined",
+        "argument_presence": {"keys": ["text"], "key_count": 1, "unlisted_key_count": 0},
         EXECUTION_PROFILE_FINGERPRINT_FIELD: private_events[3].payload[
             EXECUTION_PROFILE_FINGERPRINT_FIELD
         ],
@@ -37233,6 +37234,7 @@ def test_cayu_app_blocks_tool_call_before_execution_with_tool_policy():
         "decision": "deny",
         "reason": "Tool denied by policy: side_effect",
         "metadata": {},
+        "argument_presence": {"keys": [], "key_count": 1, "unlisted_key_count": 1},
         "arguments_state": "unavailable",
         "arguments_exact": False,
         EXECUTION_PROFILE_FINGERPRINT_FIELD: private_blocked.payload[
@@ -37420,7 +37422,9 @@ def test_cayu_app_required_allowlist_can_request_durable_approval():
     tool = SideEffectTool()
     provider = FakeProvider(
         [
-            ModelStreamEvent.tool_call(id="call_1", name="side_effect", arguments={}),
+            ModelStreamEvent.tool_call(
+                id="call_1", name="side_effect", arguments={"value": "external"}
+            ),
             ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
         ]
     )
@@ -37451,14 +37455,14 @@ def test_cayu_app_required_allowlist_can_request_durable_approval():
         event for event in events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
     )
     approval = approval_event.payload["approval"]
-    assert approval["reason"] == "Required allowlisted parameter 'value' is missing."
+    assert approval["reason"] == "Required allowlisted parameter 'value' value is not allowed."
     assert approval["metadata"] == {
         "policy": "parameter_constrained",
         "tool_name": "side_effect",
         "parameter": "value",
         "rule": "RequiredAllowlistRule",
         "rule_index": 0,
-        "violation": "missing",
+        "violation": "disallowed_value",
     }
     assert events[-1].type == EventType.SESSION_INTERRUPTED
     assert events[-1].payload["interruption_type"] == "tool_approval_required"

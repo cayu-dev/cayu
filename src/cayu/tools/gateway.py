@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable
 from datetime import UTC, datetime
+from functools import lru_cache
 from hashlib import sha256
 from typing import Any, Literal, cast
 
@@ -349,17 +350,115 @@ def targeted_tool_gateway_projection(
 def validate_effective_tool_arguments(arguments: dict[str, Any], schema: dict[str, Any]) -> bool:
     """Return whether arguments satisfy a valid authoritative Draft 2020-12 schema."""
 
-    copied_arguments = copy_durable_json_object(arguments, "call_tool.arguments")
-    copied_schema = copy_durable_json_object(schema, "tool.input_schema")
     try:
-        Draft202012Validator.check_schema(copied_schema)
-        Draft202012Validator(
-            copied_schema,
-            registry=_LOCAL_JSON_SCHEMA_REGISTRY,
-        ).validate(copied_arguments)
+        Draft202012Validator.check_schema(schema)
+        Draft202012Validator(schema, registry=_LOCAL_JSON_SCHEMA_REGISTRY).validate(arguments)
     except (SchemaError, ValidationError, Unresolvable):
         return False
     return True
+
+
+_DRAFT_2020_12_SCHEMA_URIS = frozenset(
+    {
+        "https://json-schema.org/draft/2020-12/schema",
+        "https://json-schema.org/draft/2020-12/schema#",
+    }
+)
+
+
+@lru_cache(maxsize=256)
+def _argument_validator(schema_json: bytes):
+    schema = json.loads(schema_json)
+    try:
+        Draft202012Validator.check_schema(schema)
+    except SchemaError:
+        return None
+
+    # Runtime never retrieves application-supplied remote references. Legacy
+    # schemas remain tool-owned and are reported by cayu check.
+    def has_external_reference(value):
+        if isinstance(value, dict):
+            return any(
+                (
+                    key in {"$ref", "$dynamicRef"}
+                    and isinstance(item, str)
+                    and not item.startswith("#")
+                )
+                or has_external_reference(item)
+                for key, item in value.items()
+            )
+        return isinstance(value, list) and any(has_external_reference(item) for item in value)
+
+    # Validating another dialect with Draft 2020-12 rules would silently change
+    # keyword meaning, so any other declared $schema stays tool-owned too.
+    def declares_other_dialect(value):
+        if isinstance(value, dict):
+            return any(
+                (
+                    key == "$schema"
+                    and isinstance(item, str)
+                    and item not in _DRAFT_2020_12_SCHEMA_URIS
+                )
+                or declares_other_dialect(item)
+                for key, item in value.items()
+            )
+        return isinstance(value, list) and any(declares_other_dialect(item) for item in value)
+
+    if has_external_reference(schema) or declares_other_dialect(schema):
+        return None
+    return Draft202012Validator(schema, registry=_LOCAL_JSON_SCHEMA_REGISTRY)
+
+
+def tool_input_schema_supported(schema: dict[str, Any]) -> bool:
+    return (
+        _argument_validator(canonical_durable_json_bytes(schema, "tool.input_schema")) is not None
+    )
+
+
+def tool_argument_validation_error(arguments: dict[str, Any], schema: dict[str, Any]) -> str | None:
+    """Describe supported-schema violations; legacy schemas keep tool validation."""
+
+    copied_arguments = copy_durable_json_object(arguments, "call_tool.arguments")
+    validator = _argument_validator(canonical_durable_json_bytes(schema, "tool.input_schema"))
+    if validator is None:
+        return None
+    try:
+        validator.validate(copied_arguments)
+    except ValidationError as exc:
+        # Keys accepted through additionalProperties or patternProperties are
+        # model-authored and may carry secrets; name only schema-declared keys.
+        declared = _declared_property_names(schema)
+        path = [
+            str(part)[:64] if isinstance(part, int) or part in declared else "<key>"
+            for part in exc.absolute_path
+        ][:8]
+        if exc.validator == "required" and isinstance(exc.instance, dict):
+            path.extend(str(name)[:64] for name in exc.validator_value if name not in exc.instance)
+        elif exc.validator == "additionalProperties" and isinstance(exc.instance, dict):
+            # Name only the container: additional keys are model-controlled.
+            path.append("additional properties")
+        field = ".".join(path[:8]) or "arguments"
+        return (
+            f"Invalid arguments: {field} fails {exc.validator}. "
+            "Correct the call; approval cannot repair invalid arguments."
+        )
+    except Unresolvable:
+        return None
+    return None
+
+
+def _declared_property_names(schema: Any) -> set[str]:
+    names: set[str] = set()
+    if isinstance(schema, dict):
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            names.update(properties)
+        for value in schema.values():
+            names |= _declared_property_names(value)
+    elif isinstance(schema, list):
+        for value in schema:
+            names |= _declared_property_names(value)
+    return names
 
 
 def arguments_sha256(arguments: dict[str, Any]) -> str:

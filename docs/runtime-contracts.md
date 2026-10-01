@@ -1304,13 +1304,43 @@ inference, or recovery lifecycle. Do not hide an agent loop inside the handle.
 
 Authorizes registered tool calls immediately before execution.
 
+Before policy evaluation, ordinary registered tool arguments must satisfy the
+supported frozen input schema (locally resolvable JSON Schema Draft 2020-12).
+Invalid calls produce `tool.call.blocked` with a field/constraint repair message;
+they never request approval or execute. Reauthorization after argument-changing
+hooks and dispatch of retained approved calls enforce the same check.
+
+Parameter validity violations take precedence over authority rules regardless of
+rule order. Custom parameter rules retain authority semantics unless they override
+`is_validity_violation(arguments)`. Schema validation does not grant authorization.
+`ask_user` with a valid question still uses its durable input pause.
+
+Tool lifecycle payloads carry a separate `argument_presence` object with `keys`
+(up to 64 schema-declared keys, each capped at 64 characters), `key_count`, and
+`unlisted_key_count`. Unknown model-authored keys can contain secrets and are
+counted without publishing their names. The observation is
+captured when the model call is materialized, before policy runs, and accompanies
+start, approval, and terminal events without changing application policy metadata.
+It contains no values. Static-scope schema denials preserve finalized redacted
+arguments for model repair; dynamic or unknown secret scopes remain unavailable.
+Unsupported/remote-reference schemas are reported by `cayu check` and fall back to
+tool-owned validation. Built-in process, structured command, and patch tools retain
+their existing preflight validation and structured evidence before effects.
+
+Built-in parameter policies configured with `DENY` keep their profile material.
+Approval-configured policies with portable validity rules deliberately include
+`validity_denials_version=1`; changed custom/nonportable policy behavior needs a new
+application behavior identity. New scaffold policies use behavior/implementation
+version 2. Retained invocations still require exact recovery reuse; this guard does
+not authorize profile adoption.
+
 Tool policy is Cayu's first scoped-authority primitive. It is separate from provider formatting and runner isolation:
 
 - providers decide what the model requested
 - tool policy decides whether a registered tool call may execute
 - tools and runners perform the work only after authorization
 
-`AllowAllToolPolicy` is the default so existing simple agents continue to run without extra configuration. `StaticToolPolicy` provides a small allow/deny scope for common cases. Deny rules win over allow rules. `ParameterConstrainedToolPolicy` validates selected tool arguments with per-tool rules before the tool implementation runs. Built-in rules include `RequiredFieldRule`, `AllowlistRule`, `RequiredAllowlistRule`, and `DenyPatternRule`; they cover required fields, optional string allowlists, required string allowlists, and denied regex patterns over dotted JSON argument paths such as `request.url`. Use `RequiredAllowlistRule` for a security-sensitive field that must be present and allowed; it rejects missing, empty, non-string, and disallowed values atomically. `AllowlistRule` preserves the optional-field contract and does not reject a missing path. Violations return either `DENY` or `REQUIRE_APPROVAL`; they never silently rewrite tool arguments, and required-allowlist denials identify the failure as `missing`, `empty`, `wrong_type`, or `disallowed_value` in policy metadata. `TaintAwareToolPolicy` protects sensitive tools after configured untrusted source tools have produced output in the same session. It is origin-based, not a prompt-injection scanner: apps label source tools such as `read_email`, `fetch_url`, or `read_pdf` with taint labels, then protect outbound tools such as `send_email`, `make_payment`, or `execute_sql` from those labels. Cayu derives prior taint from durable terminal tool events and also applies taint within one model tool-call round before any tool implementation runs. A generic `ForkSessionRequest` derives the source session's active labels before creating the child, unions them with any explicitly supplied child labels, and persists the effective set in child metadata. The `session.forked` event reports only the source-derived set as `inherited_taint_labels`; a fork cannot clear source taint merely by omitting request metadata or changing agents. Resume and tool execution seed policy state from that durable session metadata, so the boundary remains enforced after restart. Custom policies implement `authorize(ToolPolicyRequest) -> ToolPolicyResult`.
+`AllowAllToolPolicy` is the default so existing simple agents continue to run without extra configuration. `StaticToolPolicy` provides a small allow/deny scope for common cases. Deny rules win over allow rules. `ParameterConstrainedToolPolicy` validates selected tool arguments with per-tool rules before the tool implementation runs. Built-in rules include `RequiredFieldRule`, `AllowlistRule`, `RequiredAllowlistRule`, and `DenyPatternRule`; they cover required fields, optional string allowlists, required string allowlists, and denied regex patterns over dotted JSON argument paths such as `request.url`. Use `RequiredAllowlistRule` for a security-sensitive field that must be present and allowed; it rejects missing, empty, non-string, and disallowed values atomically. `AllowlistRule` preserves the optional-field contract and does not reject a missing path. Validity violations always return `DENY`; authority violations return the configured `DENY` or `REQUIRE_APPROVAL`. They never silently rewrite tool arguments, and required-allowlist denials identify the failure as `missing`, `empty`, `wrong_type`, or `disallowed_value` in policy metadata. `TaintAwareToolPolicy` protects sensitive tools after configured untrusted source tools have produced output in the same session. It is origin-based, not a prompt-injection scanner: apps label source tools such as `read_email`, `fetch_url`, or `read_pdf` with taint labels, then protect outbound tools such as `send_email`, `make_payment`, or `execute_sql` from those labels. Cayu derives prior taint from durable terminal tool events and also applies taint within one model tool-call round before any tool implementation runs. A generic `ForkSessionRequest` derives the source session's active labels before creating the child, unions them with any explicitly supplied child labels, and persists the effective set in child metadata. The `session.forked` event reports only the source-derived set as `inherited_taint_labels`; a fork cannot clear source taint merely by omitting request metadata or changing agents. Resume and tool execution seed policy state from that durable session metadata, so the boundary remains enforced after restart. Custom policies implement `authorize(ToolPolicyRequest) -> ToolPolicyResult`.
 
 For unattended, pre-authorized execution, use `EnvironmentScopedToolPolicy` with
 explicit tool-to-environment scopes:

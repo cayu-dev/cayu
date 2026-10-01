@@ -17892,6 +17892,10 @@ export type ToolManifest = {
         [key: string]: unknown;
     } | null;
     /**
+     * Approval Validity Rules
+     */
+    approval_validity_rules?: Array<string>;
+    /**
      * Command Policy
      */
     command_policy?: string | null;

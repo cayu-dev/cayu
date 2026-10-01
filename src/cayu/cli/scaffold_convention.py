@@ -553,8 +553,8 @@ from cayu import (
 _TOOL_POLICY_IDENTITY = (
     ExecutionProfileBehaviorIdentity(
         name="__PROJECT_NAME__.standard.tool_policy",
-        behavior_version="1",
-        implementation_version="1",
+        behavior_version="2",
+        implementation_version="2",
     )
     if __RECOVERY_ENABLED__
     else None
@@ -567,7 +567,8 @@ def build_tool_policy(external_tool_names: tuple[str, ...]) -> ToolPolicy:
     rules = {}
     if __HUMAN_INPUT_ENABLED__:
         # Valid questions remain allowed so Cayu's durable user-input pause can
-        # intercept them. The explicit rule makes that boundary inspectable.
+        # intercept them. Validity rules always deny malformed input, including
+        # when the external-effect decision below requires approval.
         rules["ask_user"] = (RequiredFieldRule("question"),)
     if "remember_knowledge" in external_tool_names:
         # Every schema-valid knowledge proposal matches this rule and therefore
@@ -1044,6 +1045,43 @@ def test_human_input_and_approval_pause_with_recoverable_durable_state() -> None
         assert (
             IncompleteSessionRecoveryAction.PENDING_USER_INPUT in input_recovery.actions
         )
+
+        invalid_app = build_app(
+            provider=ScriptedModelProvider(
+                [
+                    [
+                        ModelStreamEvent.tool_call(
+                            id="invalid-question", name="ask_user", arguments={}
+                        ),
+                        ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                    ],
+                    [
+                        ModelStreamEvent.text_delta("Correct the question."),
+                        ModelStreamEvent.completed(),
+                    ],
+                ]
+            ),
+            session_store=InMemorySessionStore(),
+            task_store=InMemoryTaskStore() if __TASKS_ENABLED__ else None,
+            knowledge_store=InMemoryKnowledgeStore(),
+        )
+        invalid_events = [
+            event
+            async for event in invalid_app.run(
+                RunRequest(
+                    agent_name="__AGENT_NAME__",
+                    session_id="invalid-input",
+                    messages=[Message.text("user", "Ask a question")],
+                )
+            )
+        ]
+        assert EventType.TOOL_CALL_BLOCKED in {event.type for event in invalid_events}
+        assert EventType.TOOL_CALL_APPROVAL_REQUESTED not in {
+            event.type for event in invalid_events
+        }
+        assert EventType.SESSION_AWAITING_USER_INPUT not in {
+            event.type for event in invalid_events
+        }
 
         approval_provider = ScriptedModelProvider(
             [

@@ -90,6 +90,15 @@ This remains an error rather than an acknowledgment-based bypass: use a
 statically describable enforcing policy until Cayu provides a trusted custom
 coverage contract.
 
+## tool-approval-validity-rule
+
+`TOOL_APPROVAL_VALIDITY_RULE` is informational. It names each required-field or
+required-allowlist rule configured under `REQUIRE_APPROVAL`. Missing, empty or
+wrongly typed arguments are always denied, including when an earlier rule would
+request approval. Approval applies to authority violations of well-formed calls.
+Correct the arguments and submit a new call; an approver cannot supply them.
+Inspect these rules with `cayu check --json` and `cayu inspect --json`.
+
 ## tool-input-schema-unconstrained
 
 `TOOL_INPUT_SCHEMA_UNCONSTRAINED` means a registered tool exposes `{}` as its
@@ -99,6 +108,15 @@ properties, required fields, and `additionalProperties` behavior in
 `ToolSpec.input_schema`. If a tool derives its schema dynamically, override the
 public `Tool.schema` property; Cayu treats that property as authoritative when
 the tool is registered.
+
+## tool-input-schema-runtime-unsupported
+
+`TOOL_INPUT_SCHEMA_RUNTIME_UNSUPPORTED` means the registered schema is not a
+locally resolvable Draft 2020-12 schema, or it declares a different `$schema`
+dialect. Runtime keeps the prior tool-owned argument validation instead of
+denying every call. Update the schema to Draft 2020-12 and inline external
+references to enable runtime validation. No remote schema URLs are fetched. Run
+`cayu check --json` to verify the repair.
 
 ## public-service-development-mode
 

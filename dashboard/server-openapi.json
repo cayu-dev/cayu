@@ -35210,6 +35210,14 @@
             ],
             "title": "Adapter Identity"
           },
+          "approval_validity_rules": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Approval Validity Rules",
+            "type": "array"
+          },
           "command_policy": {
             "anyOf": [
               {

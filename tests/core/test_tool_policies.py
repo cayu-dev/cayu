@@ -218,7 +218,7 @@ def test_parameter_constrained_policy_allows_required_allowlisted_value() -> Non
     assert result.metadata == {}
 
 
-def test_required_allowlist_policy_can_require_approval_with_failure_metadata() -> None:
+def test_required_allowlist_policy_denies_invalid_input_even_with_approval() -> None:
     policy = ParameterConstrainedToolPolicy(
         {"send_email": [RequiredAllowlistRule("to", values=["ops@example.com"])]},
         decision=ToolPolicyDecision.REQUIRE_APPROVAL,
@@ -226,8 +226,11 @@ def test_required_allowlist_policy_can_require_approval_with_failure_metadata() 
 
     result = asyncio.run(policy.authorize(_request(arguments={})))
 
-    assert result.decision == ToolPolicyDecision.REQUIRE_APPROVAL
-    assert result.reason == "Required allowlisted parameter 'to' is missing."
+    assert result.decision == ToolPolicyDecision.DENY
+    assert result.reason == (
+        "Required allowlisted parameter 'to' is missing. "
+        "Correct the call; approval cannot repair invalid arguments."
+    )
     assert result.metadata == {
         "policy": "parameter_constrained",
         "tool_name": "send_email",
