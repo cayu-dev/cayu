@@ -57,7 +57,31 @@ workflow completion. A typed child capture/revalidation rejection produces:
   the rejecting read's limit and observed lower-bound witness;
 - an exact `workflow_attempt` anchor binding the original run/suite/case/trial,
   target and projector revisions, input/output digests, root session, attempt,
-  completion event and sequence, and complete root-record digest.
+  completion event and sequence, and complete root-record digest;
+- the anchored projection in `final_output` and `structured_output`, identical to
+  `retained_workflow_output.output` when output retention is enabled.
+
+### One output per trial
+
+A saved trial never contradicts itself about its output. Once the attempt anchor
+exists, `final_output`, `structured_output`, `retained_workflow_output.output` and
+the anchor's `final_output_sha256`/`structured_output_sha256` all describe the same
+projection. This holds for scored trials and for trials that become `error` or
+`unavailable` afterwards: capture limits, case timeouts during capture, evidence
+preparation errors, target quiescence (close) failures, post-quiescence execution
+profile or evidence revalidation failures. Those trials carry `score=null`,
+incomplete evidence, blocked assertions and a diagnostic; `status` says the output
+was not scored, and the public preview stays unavailable. A consumer can check
+`retained_workflow_output.anchor == workflow_attempt` and
+`retained_workflow_output.output.final_output == final_output`.
+
+Trials that fail before an anchor exists (target construction, execution failure,
+missing completion, projector failure or invalid projection) have empty output, no
+anchor and no retained record. With `retain_final_output=False` the trial output and
+retained record are omitted, and the anchor still carries the projection's digests.
+Reports saved by earlier releases may hold an empty `final_output` beside a retained
+record for such unscored trials; the retained record and anchor remain the
+authoritative projection for recovery.
 
 For an event rejection, the rejecting read's `limit` is generally the remaining
 allowance: `bounds.max_events - consumed_events`. An `observed_lower_bound` of

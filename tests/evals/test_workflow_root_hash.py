@@ -272,6 +272,8 @@ def test_large_history_changed_during_scoring_cannot_publish(monkeypatch):
         assert trial.score is None
         assert not trial.evidence_complete
         assert "continues after completion" in trial.error
-        assert trial.final_output == ""
+        # The anchored projection stays consistent with its retained record; the
+        # error status, not a blanked output, is what blocks publication.
+        assert trial.final_output == trial.retained_workflow_output.output.final_output
 
     asyncio.run(exercise())

@@ -136,8 +136,12 @@ def test_retained_projection_recovers_in_fresh_process(tmp_path, monkeypatch, fa
                 assert entered and trial.capture_diagnostic.code == "deadline_exceeded"
             else:
                 assert trial.status == "unavailable"
-            assert trial.final_output == "" and trial.structured_output is None
+            assert trial.score is None and not trial.evidence_complete
             assert trial.workflow_output_retention == "retained"
+            retained = trial.retained_workflow_output
+            assert retained.anchor == trial.workflow_attempt
+            assert trial.final_output == retained.output.final_output == "transformed:x"
+            assert trial.structured_output == retained.output.structured_output
             (tmp_path / "report.json").write_text(run.model_dump_json())
         finally:
             await store.close()

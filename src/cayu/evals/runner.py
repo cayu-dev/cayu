@@ -2071,6 +2071,7 @@ async def _run_workflow_case_once_with_public_projection(
     capture_diagnostic: WorkflowCaptureDiagnostic | None = None
     workflow_attempt: WorkflowAttemptAnchor | None = None
     retained_workflow_output: RetainedWorkflowEvalOutput | None = None
+    anchored_output: WorkflowEvalResult | None = None
     workflow_output_retention = None
     execution_status = None
     case_timed_out = False
@@ -2323,6 +2324,7 @@ async def _run_workflow_case_once_with_public_projection(
                 final_output_sha256=output_evidence.final_output_sha256,
                 structured_output_sha256=_workflow_structured_sha256(structured_output),
             )
+            anchored_output = projected
             # Seal a detached private value before any descendant read can fail.
             # This record has no storage lifecycle beyond its owning saved report.
             workflow_output_retention = "disabled"
@@ -2662,6 +2664,12 @@ async def _run_workflow_case_once_with_public_projection(
                 final_output = ""
                 structured_output = None
 
+    if workflow_attempt is not None and anchored_output is not None:
+        # The anchor, retained record, and trial must describe one projection. Once an
+        # attempt is anchored, later capture, quiescence, or revalidation failures
+        # block scoring through status and assertions; they do not rewrite the output.
+        final_output = anchored_output.final_output
+        structured_output = anchored_output.structured_output
     if run_error is not None:
         assertion_results = list(
             _blocked_assertion_results(

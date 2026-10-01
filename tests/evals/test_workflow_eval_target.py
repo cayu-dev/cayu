@@ -41,7 +41,7 @@ from cayu.evals.execution_reporting import (
     corpus_execution_result_to_json,
     render_corpus_execution_html,
 )
-from cayu.evals.models import EvalStatus
+from cayu.evals.models import EvalRun, EvalStatus
 from cayu.evals.reporting import (
     load_eval_run,
     load_trajectory,
@@ -63,6 +63,7 @@ from cayu.evals.workflow_target import (
     WorkflowEvalExecution,
     WorkflowEvalInstanceScope,
     WorkflowEvalResult,
+    workflow_eval_output_sha256,
     workflow_eval_trial_session_id,
 )
 from cayu.messages import Message, MessageRole
@@ -1104,6 +1105,130 @@ def test_workflow_eval_rejects_evidence_that_changes_during_quiescence() -> None
     assert result.run.status == "error"
     assert trial.code is EvalTrialDiagnosticCode.WORKFLOW_COMPLETION_CONFLICT
     assert trial.output.evidence_state == "unavailable"
+
+
+def _assert_single_anchored_output(trial) -> None:
+    anchor = trial.workflow_attempt
+    retained = trial.retained_workflow_output
+    assert anchor is not None and retained is not None
+    assert trial.workflow_output_retention == "retained"
+    assert retained.anchor == anchor
+    assert retained.output.final_output == trial.final_output
+    assert retained.output.structured_output == trial.structured_output
+    assert anchor.final_output_sha256 == workflow_eval_output_sha256(trial.final_output)
+
+
+@pytest.mark.parametrize("close_failure", ["raises", "times_out"])
+def test_quiescence_failure_after_output_keeps_one_consistent_output(close_failure) -> None:
+    async def run() -> None:
+        app = _register_app()
+
+        async def close() -> None:
+            if close_failure == "raises":
+                raise RuntimeError("private close detail")
+            await asyncio.Event().wait()
+
+        target = _target(
+            app,
+            _NoChildWorkflow,
+            factory=lambda invocation: WorkflowEvalExecution(
+                app=app,
+                workflow=_NoChildWorkflow(app),
+                close=close,
+            ),
+        ).model_copy(update={"close_timeout_seconds": 0.05})
+        run = await run_workflow_eval_suite(target, _suite(FinalOutputContains("done")))
+
+        trial = run.cases[0].trials[0]
+        assert trial.status is EvalStatus.ERROR
+        assert trial.error == (
+            "Workflow target quiescence failed "
+            f"({'RuntimeError' if close_failure == 'raises' else 'TimeoutError'})."
+        )
+        assert trial.score is None and not trial.evidence_complete
+        assert all(assertion.outcome == "error" for assertion in trial.assertions)
+        assert trial.final_output == "done"
+        assert trial.structured_output == {"answer": "done"}
+        _assert_single_anchored_output(trial)
+        _assert_single_anchored_output(
+            EvalRun.model_validate_json(run.model_dump_json()).cases[0].trials[0]
+        )
+
+    asyncio.run(run())
+
+
+def test_profile_revalidation_failure_after_output_keeps_one_consistent_output(
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        app = _register_app()
+        closed = False
+
+        async def close() -> None:
+            nonlocal closed
+            closed = True
+
+        def factory(invocation) -> WorkflowEvalExecution:
+            # Only the per-trial runtime app changes, so the suite-level check passes.
+            runtime_app = _register_app()
+            inspect_profile = runtime_app.inspect_run_execution_profile
+
+            async def changed_profile(request):
+                if closed:
+                    raise RuntimeError("private profile detail")
+                return await inspect_profile(request)
+
+            monkeypatch.setattr(runtime_app, "inspect_run_execution_profile", changed_profile)
+            return WorkflowEvalExecution(
+                app=runtime_app, workflow=_NoChildWorkflow(runtime_app), close=close
+            )
+
+        target = _target(
+            app,
+            _NoChildWorkflow,
+            factory=factory,
+            instance_scope=WorkflowEvalInstanceScope.PER_TRIAL,
+        )
+        run = await run_workflow_eval_suite(target, _suite(FinalOutputContains("done")))
+
+        trial = run.cases[0].trials[0]
+        assert closed
+        assert trial.status is EvalStatus.ERROR
+        assert trial.error == (
+            "Workflow target execution profile could not be revalidated (RuntimeError)."
+        )
+        assert trial.score is None
+        assert trial.final_output == "done"
+        _assert_single_anchored_output(trial)
+
+    asyncio.run(run())
+
+
+def test_scored_workflow_trial_output_matches_its_anchor() -> None:
+    app = _register_app()
+    run = asyncio.run(
+        run_workflow_eval_suite(_target(app, _NoChildWorkflow), _suite(FinalOutputContains("done")))
+    )
+
+    trial = run.cases[0].trials[0]
+    assert trial.status is EvalStatus.PASSED and trial.score == 1.0
+    assert trial.final_output == "done"
+    _assert_single_anchored_output(trial)
+
+
+def test_unanchored_workflow_error_has_no_output() -> None:
+    app = _register_app()
+    run = asyncio.run(
+        run_workflow_eval_suite(
+            _target(app, _NoChildWorkflow, projector=lambda evidence: "not a result"),
+            _suite(FinalOutputContains("done")),
+        )
+    )
+
+    trial = run.cases[0].trials[0]
+    assert trial.status is EvalStatus.ERROR
+    assert trial.final_output == "" and trial.structured_output is None
+    assert trial.workflow_attempt is None and trial.retained_workflow_output is None
 
 
 def test_workflow_eval_rejects_factory_runtime_profile_mismatch() -> None:

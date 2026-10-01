@@ -35,6 +35,19 @@
   Built-in command and patch tools retain their structured preflight diagnostics
   and patch-input evidence. Schema denials retain finalized, redacted arguments
   when the tool has static secret scope and publishes arguments.
+- Keep unscored workflow eval trials internally consistent. A workflow trial that
+  produced and anchored its output but then became `error` or `unavailable`
+  (capture limits, a case timeout during capture, an evidence preparation error,
+  a target `close` failure or timeout, or a post-quiescence profile or evidence
+  revalidation failure) used to report `final_output=""` while its
+  `retained_workflow_output` and `workflow_attempt` digests described the real
+  output, so consumers that check report consistency rejected the whole report.
+  Such trials now report the anchored projection in `final_output` and
+  `structured_output`; `status`, `score=null`, the blocked assertions and the
+  diagnostic still mark them unscored, and the public output preview stays
+  unavailable. Scored trials and trials that fail before projection are
+  unchanged. Readers that treated a non-empty `final_output` as a scored answer
+  must check `status`.
 - Decode compressed upstream responses in virtual egress instead of rejecting
   them. `HttpxUpstream` still requests identity encoding, but when an origin
   (such as the Internet Archive) returns a single `gzip`, `deflate`, `br`, or

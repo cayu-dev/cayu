@@ -16775,6 +16775,14 @@ With output retention enabled, the private trial seals one bounded projected-out
 record and its attempt anchor before child capture. Saved recovery can consume it
 without projector replay; disabled/missing retention fails closed. This field shares
 the private report's persistence/cleanup lifecycle and is absent from public previews.
+A trial describes at most one projected output. Once a completed attempt is anchored,
+`final_output`, `structured_output`, the retained record's output, and the anchor's
+output digests all describe that projection, whatever the trial status. Later capture,
+quiescence, revalidation, evidence or timeout failures make the trial `error` or
+`unavailable` with a null score and blocked assertions; they do not blank the output.
+A trial that fails before projection has empty output, no anchor and no retained record.
+With `retain_final_output=False`, output and retained record are omitted while the
+anchor keeps the projection's digests.
 Saved-attempt recovery validates exact root/attempt/input/projector identity and
 fresh terminal lineage without dispatching workflows, tools, providers, or judges.
 See [workflow capture and saved-attempt recovery](workflow-eval-recovery.md) for
