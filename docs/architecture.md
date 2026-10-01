@@ -83,8 +83,17 @@ store, target registry and shared auth dependencies. Authoring diagnostics check
 current judge authority, public material and exact scenario references; repeated
 scenario revisions share one read, with at most 16 reads in flight. Authoring
 reads and run launch use the same suite revision loader to enforce persistence
-support, private storage errors and current target visibility. Launch
-orchestration and worker lifespan remain in router composition.
+support, private storage errors and current target visibility.
+
+`server/_suite_launch_routes.py` owns authored-suite launch preview and start,
+with explicit store, registry and shared authentication inputs. It composes
+the existing selection, scenario preflight, execution-profile, exposure and
+admission functions. Preview prepares at most 16 scenario cases concurrently.
+Fresh launches prepare every part and publish all derived corpora before
+ordered admission. Complete retries reuse the admitted runs; partial retries
+retain the same request identity and require current launch readiness before
+continuing. Cost-budget narrowing remains with this workflow. Other launch
+families and the eval worker lifespan retain their current owners.
 
 `server/_scenario_authoring_routes.py` owns scenario preview, save, catalog,
 detail, download and artifact fixture preparation. Authoring and launch share
@@ -107,8 +116,8 @@ approval, cancellation, results, report downloads and comparisons. It receives
 the bounded router, store, target registry, optional result catalog and shared
 auth dependencies. Run visibility is checked before result loading, and the run
 is reloaded after publication becomes visible. Reporting and comparison compose
-the existing library functions. Launch handlers and the worker lifespan remain
-in router composition.
+the existing library functions. Router composition retains the remaining
+launch handlers and the worker lifespan.
 
 `server/_eval_run_admission.py` owns the shared HTTP invocation, request identity,
 retry lookup, execution-profile preparation and durable admission functions.

@@ -41680,5 +41680,14 @@
     "tests/core/test_gateway_price_book.py::test_unsupported_charges_are_not_free[asyncio-0-provider_tool_calls]": 0.0017338801408186555,
     "tests/core/test_gateway_price_book.py::test_unsupported_charges_are_not_free[asyncio-0-requests]": 0.0019963810918852687,
     "tests/core/test_gateway_price_book.py::test_unsupported_charges_are_not_free[asyncio-1-provider_tool_calls]": 0.0016382300527766347,
-    "tests/core/test_gateway_price_book.py::test_unsupported_charges_are_not_free[asyncio-1-requests]": 0.0016361899906769395
+    "tests/core/test_gateway_price_book.py::test_unsupported_charges_are_not_free[asyncio-1-requests]": 0.0016361899906769395,
+    "tests/server/test_server_eval_suite_launch.py::test_suite_launch_preserves_shared_auth_body_handling_and_provenance[/api]": 1.742,
+    "tests/server/test_server_eval_suite_launch.py::test_suite_launch_preserves_shared_auth_body_handling_and_provenance[/custom/v2]": 1.166,
+    "tests/server/test_server_eval_suite_launch.py::test_suite_launch_prepares_and_publishes_all_parts_before_ordered_admission": 1.112,
+    "tests/server/test_server_eval_suite_launch.py::test_suite_launch_rejects_corpus_publication_before_admitting_any_part[conflict]": 0.763,
+    "tests/server/test_server_eval_suite_launch.py::test_suite_launch_rejects_corpus_publication_before_admitting_any_part[unsafe]": 1.239,
+    "tests/server/test_server_eval_suite_launch.py::test_suite_launch_rejects_corpus_publication_before_admitting_any_part[oversized]": 0.765,
+    "tests/server/test_server_eval_suite_launch.py::test_suite_launch_recovers_partial_admission_and_replays_completed_parts": 1.2,
+    "tests/server/test_server_eval_suite_launch.py::test_suite_launch_preview_bounds_scenario_preparation_and_cleans_up_cancellation[False]": 1.685,
+    "tests/server/test_server_eval_suite_launch.py::test_suite_launch_preview_bounds_scenario_preparation_and_cleans_up_cancellation[True]": 0.907
 }
