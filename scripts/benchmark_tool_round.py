@@ -8,8 +8,11 @@ Each case uses fresh stores and one two-step round per session. Latency samples
 have no instrumentation. A separate run counts public async store calls
 (including backend-internal calls) and counts full checkpoint admissions at the
 existing durable-JSON walker. The public governor supplies peak staged payload
-bytes; that is not total heap. Optional --trace-python-allocations measures peak
-Python allocations in that separate run and can be substantially slower.
+bytes; that is not total heap. Optional --trace-python-allocations measures
+Python allocations from batch construction through completion, including the
+bytes retained after garbage collection with the application/stores alive and
+after releasing them. It excludes native allocations and can be substantially
+slower. Allocation tracing never runs during latency samples.
 Results describe this scripted workload, not provider or database performance.
 """
 
@@ -127,6 +130,36 @@ def observe_store(store):
 async def run_batch(
     call_count, history_count, session_count, *, instrumented, trace_python_allocations=False
 ):
+    if trace_python_allocations and not instrumented:
+        raise ValueError("Allocation tracing requires a separate instrumented pass.")
+    if tracemalloc.is_tracing():
+        raise RuntimeError("The benchmark requires its own allocation trace.")
+    if not trace_python_allocations:
+        return await _run_batch(call_count, history_count, session_count, instrumented=instrumented)
+
+    gc.collect()
+    tracemalloc.start()
+    try:
+        result = await _run_batch(
+            call_count,
+            history_count,
+            session_count,
+            instrumented=True,
+            trace_python_allocations=True,
+        )
+        # Let completed task callbacks release their arguments before measuring
+        # what survives the fresh application's entire lifetime.
+        await asyncio.sleep(0)
+        gc.collect()
+        result["post_release_traced_python_bytes"] = tracemalloc.get_traced_memory()[0]
+        return result
+    finally:
+        tracemalloc.stop()
+
+
+async def _run_batch(
+    call_count, history_count, session_count, *, instrumented, trace_python_allocations=False
+):
     store = InMemorySessionStore()
     tool = FixedResultTool()
 
@@ -182,18 +215,13 @@ async def run_batch(
     gc.collect()
     if instrumented:
         with observe_store(store) as (calls, admissions):
-            if trace_python_allocations:
-                tracemalloc.start()
-            try:
-                await asyncio.gather(*(run_one(request) for request in requests))
-                peak = tracemalloc.get_traced_memory()[1] if trace_python_allocations else None
-            finally:
-                if trace_python_allocations:
-                    tracemalloc.stop()
+            await asyncio.gather(*(run_one(request) for request in requests))
         result = {
             "store_calls": dict(sorted(calls.items())),
             "full_checkpoint_admissions": admissions["checkpoint"],
-            "peak_traced_python_bytes": peak,
+            "peak_traced_python_bytes": None,
+            "retained_traced_python_bytes": None,
+            "post_release_traced_python_bytes": None,
             "peak_staged_payload_bytes": app.tool_terminal_publication_status().maximum_staged_bytes,
         }
     else:
@@ -211,6 +239,10 @@ async def run_batch(
     )
     metrics = app.tool_terminal_publication_status()
     assert metrics.active_round_reservations == metrics.staged_count == 0
+    if trace_python_allocations:
+        gc.collect()
+        retained, peak = tracemalloc.get_traced_memory()
+        result.update(peak_traced_python_bytes=peak, retained_traced_python_bytes=retained)
     return result
 
 
@@ -376,7 +408,7 @@ async def main():
     if git("status", "--porcelain", "--", "src/cayu"):
         parser.error("commit runtime changes before measuring an exact revision")
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "revision": git("rev-parse", "HEAD"),
         "source_tree": git("rev-parse", "HEAD:src/cayu"),
         "workload_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -384,6 +416,12 @@ async def main():
         "platform": platform.platform(),
         "packages": {name: version(name) for name in ("cayu", "pydantic", "pydantic-core")},
         "backend": "memory",
+        "allocation_scope": (
+            "Fresh batch construction and execution; retained after GC with app/stores alive; "
+            "released after returning from the batch and GC. Python-traced allocations only."
+            if args.trace_python_allocations
+            else None
+        ),
         "configuration": {
             key: value for key, value in vars(args).items() if key not in {"output", "worker"}
         },

@@ -2,6 +2,7 @@
 
 import asyncio
 import subprocess
+import tracemalloc
 from pathlib import Path
 
 import pytest
@@ -55,6 +56,42 @@ def test_instrumented_batch_completes_each_concurrent_round_once():
     assert observed["full_checkpoint_admissions"] > 0
     assert observed["peak_staged_payload_bytes"] > 0
     assert observed["peak_traced_python_bytes"] is None
+    assert observed["retained_traced_python_bytes"] is None
+    assert observed["post_release_traced_python_bytes"] is None
+
+
+def test_allocation_pass_measures_live_and_released_batch_memory():
+    observed = asyncio.run(run_batch(1, 0, 1, instrumented=True, trace_python_allocations=True))
+    assert observed["peak_traced_python_bytes"] >= observed["retained_traced_python_bytes"] > 0
+    assert (
+        0 <= observed["post_release_traced_python_bytes"] < observed["retained_traced_python_bytes"]
+    )
+    assert not tracemalloc.is_tracing()
+
+
+def test_allocation_trace_is_released_when_the_workload_fails(monkeypatch):
+    async def failed_batch(*args, **kwargs):
+        assert tracemalloc.is_tracing()
+        raise RuntimeError("workload failed")
+
+    monkeypatch.setattr(benchmark_tool_round, "_run_batch", failed_batch)
+    with pytest.raises(RuntimeError, match="workload failed"):
+        asyncio.run(run_batch(1, 0, 1, instrumented=True, trace_python_allocations=True))
+    assert not tracemalloc.is_tracing()
+
+
+def test_allocation_trace_cannot_contaminate_latency_or_replace_an_existing_trace():
+    with pytest.raises(ValueError, match="separate instrumented pass"):
+        asyncio.run(run_batch(1, 0, 1, instrumented=False, trace_python_allocations=True))
+    tracemalloc.start()
+    try:
+        with pytest.raises(RuntimeError, match="own allocation trace"):
+            asyncio.run(run_batch(1, 0, 1, instrumented=True, trace_python_allocations=True))
+        with pytest.raises(RuntimeError, match="own allocation trace"):
+            asyncio.run(run_batch(1, 0, 1, instrumented=False))
+        assert tracemalloc.is_tracing()
+    finally:
+        tracemalloc.stop()
 
 
 def test_case_timeout_retains_finished_samples_without_reporting_completion(monkeypatch):

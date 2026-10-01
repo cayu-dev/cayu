@@ -115,8 +115,20 @@ A separate pass counts public async store calls, including calls within backend
 methods, and checkpoint admissions through the durable-JSON walker. It records
 peak staged payload bytes from the public publication metrics. This measures
 staged payloads, not total retained memory. Optional `--trace-python-allocations`
-also records peak traced Python allocations during that pass; tracing can be
-expensive. Provider and database I/O are outside this workload.
+starts tracing before the fresh batch is constructed and reports:
+
+- `peak_traced_python_bytes`: peak Python allocations through completion.
+- `retained_traced_python_bytes`: allocations remaining after garbage collection,
+  while the application, stores and scripted provider still hold the completed workload.
+- `post_release_traced_python_bytes`: allocations remaining after the batch returns,
+  completed task callbacks settle and garbage collection runs again. These can
+  include process caches; they are not automatically leaked application state.
+
+These metrics exclude native allocations and process RSS. Tracing runs only in
+the separate observation pass and can be expensive. Reports use schema version 2
+and record the allocation scope; version 1 traced only execution, so its peak
+values are not directly comparable. Use the same script revision for both sides.
+Provider and database I/O are outside this workload.
 
 Use `--calls-per-round 2 --history-messages 0 --sessions 1 --samples 1` for a
 small smoke run. Compare matching cases under comparable machine load; the script

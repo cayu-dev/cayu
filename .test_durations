@@ -41379,5 +41379,8 @@
     "tests/evals/test_workflow_partial_lifecycle.py::test_partial_capture_revalidates_child_lifecycle_before_publication[new_descendant-close]": 0.17684479099989403,
     "tests/evals/test_workflow_partial_lifecycle.py::test_partial_capture_revalidates_child_lifecycle_before_publication[resume-assertion]": 0.1157683330020518,
     "tests/evals/test_workflow_partial_lifecycle.py::test_partial_capture_revalidates_child_lifecycle_before_publication[resume-close]": 0.14234175000092364,
-    "tests/evals/test_workflow_partial_lifecycle.py::test_partial_capture_without_assertions_returns_an_unavailable_trial": 0.131805543001974
+    "tests/evals/test_workflow_partial_lifecycle.py::test_partial_capture_without_assertions_returns_an_unavailable_trial": 0.131805543001974,
+    "tests/test_benchmark_tool_round.py::test_allocation_pass_measures_live_and_released_batch_memory": 7.609,
+    "tests/test_benchmark_tool_round.py::test_allocation_trace_is_released_when_the_workload_fails": 0.08,
+    "tests/test_benchmark_tool_round.py::test_allocation_trace_cannot_contaminate_latency_or_replace_an_existing_trace": 0.001
 }
