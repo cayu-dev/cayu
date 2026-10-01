@@ -16781,6 +16781,20 @@ See [workflow capture and saved-attempt recovery](workflow-eval-recovery.md) for
 policy identities, bounds, diagnostic semantics, immutable capture/score revisions,
 and the explicit historical limits of importing pre-anchor reports.
 
+After the target closes, the runner revalidates the application manifest, the exact
+execution profile fingerprint, and the published workflow evidence before scoring.
+Profile inspection that raises `WorkspaceMutationSettlementError` means the
+environment fence could not yet prove an earlier mutation stopped, not that the
+profile changed. The runner retries that inspection with bounded backoff inside the
+remaining `close_timeout_seconds` budget, measured from the start of target close.
+The first inspection shares this deadline: a fence that waits inside inspection
+cannot extend the close budget. Caller cancellation propagates unchanged.
+Once inspection succeeds, the settled fingerprint must equal the trial's declared
+fingerprint exactly. If settlement is still unproven when the budget runs out, the
+trial is an error with `workflow_quiescence_failed`. A changed profile or any other
+inspection failure is not retried and remains `workflow_target_failed`. Every one
+of these outcomes voids the completed trial's output and blocks scoring.
+
 Failed workflow execution remains an error with unavailable, unexecuted assertions.
 A bounded `failure_capture` may retain exact durable-record references, observed
 activity and partial usage before target closure, alongside existing `FailureEvidence`.

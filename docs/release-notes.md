@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Apply the workflow target's remaining close deadline to the first post-close
+  profile inspection as well as retries, including a workspace fence that waits
+  inside inspection. An expired budget reports quiescence failure; caller
+  cancellation and inspection-owned errors preserve their original meaning.
+- Stop turning completed workflow eval trials into errors when post-close
+  execution-profile revalidation races a workspace mutation that has not
+  settled yet. The runner now retries inspection after
+  `WorkspaceMutationSettlementError` within the remaining target close budget
+  and scores the trial once the settled profile matches exactly. If
+  settlement is still unproven at the deadline, the trial fails with
+  `workflow_quiescence_failed` instead of `workflow_target_failed`, so it is
+  distinguishable from a profile that changed. A changed profile still fails
+  as `workflow_target_failed`.
+
 - Exclude human approval and user-input waits from run-scoped
   `RunLimits.max_elapsed_seconds`. The pause records its start when it is
   published and its end at the first resolution claim, so retries and restarts

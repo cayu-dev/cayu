@@ -5,6 +5,7 @@ from collections.abc import Callable
 
 import pytest
 
+from cayu._workspace_mutation import WorkspaceMutationSettlementError
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.cli import main
@@ -58,6 +59,7 @@ from cayu.evals.runner import (
 )
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.evals.workflow_target import (
+    WORKFLOW_EVAL_DEFAULT_CLOSE_TIMEOUT_SECONDS,
     WorkflowEvalExecution,
     WorkflowEvalInstanceScope,
     WorkflowEvalResult,
@@ -261,10 +263,12 @@ def _target(
     instance_scope: WorkflowEvalInstanceScope = WorkflowEvalInstanceScope.SHARED,
     application_context: dict | None = None,
     implementation_revision: str = _REVISION,
+    close_timeout_seconds: float = WORKFLOW_EVAL_DEFAULT_CLOSE_TIMEOUT_SECONDS,
 ) -> WorkflowEvalTarget:
     return WorkflowEvalTarget(
         key="workflow-target",
         app=app,
+        close_timeout_seconds=close_timeout_seconds,
         request_base=RunRequest(agent_name="first", messages=[]),
         application_release_id="workflow-release",
         evidence_policy=EvaluationEvidencePolicySpec.standard(),
@@ -885,6 +889,156 @@ def test_workflow_eval_requires_quiescence_before_publishing_output() -> None:
     assert trial.code is EvalTrialDiagnosticCode.WORKFLOW_QUIESCENCE_FAILED
     assert trial.output.evidence_state == "unavailable"
     assert "private close detail" not in trial.message
+
+
+def _run_with_post_quiescence_profile_inspection(
+    monkeypatch: pytest.MonkeyPatch,
+    inspect_after_close: Callable[[str, int], str],
+    *,
+    close_timeout_seconds: float = WORKFLOW_EVAL_DEFAULT_CLOSE_TIMEOUT_SECONDS,
+):
+    """Run one corpus and one direct trial; inspection is patched after target close."""
+
+    closed = False
+    post_close_calls = 0
+    trial_post_close_calls = 0
+
+    async def close() -> None:
+        nonlocal closed
+        closed = True
+
+    def new_execution(invocation) -> WorkflowEvalExecution:
+        nonlocal closed, trial_post_close_calls
+        del invocation
+        closed = False
+        trial_post_close_calls = 0
+        runtime_app = _register_app()
+        original_inspect = runtime_app.inspect_run_execution_profile
+
+        async def inspect(request: RunRequest) -> str:
+            nonlocal post_close_calls, trial_post_close_calls
+            fingerprint = await original_inspect(request)
+            if not closed:
+                return fingerprint
+            post_close_calls += 1
+            trial_post_close_calls += 1
+            return inspect_after_close(fingerprint, trial_post_close_calls)
+
+        monkeypatch.setattr(runtime_app, "inspect_run_execution_profile", inspect)
+        return WorkflowEvalExecution(
+            app=runtime_app,
+            workflow=_NoChildWorkflow(runtime_app),
+            close=close,
+        )
+
+    def build_target() -> WorkflowEvalTarget:
+        return _target(
+            _register_app(),
+            _NoChildWorkflow,
+            factory=new_execution,
+            close_timeout_seconds=close_timeout_seconds,
+        )
+
+    published = (
+        asyncio.run(
+            run_corpus_suite(
+                build_target(),
+                _corpus(FinalOutputEqualsAssertionSpec(id="output", expected="done")),
+                "workflow-suite",
+                max_concurrency=1,
+            )
+        )
+        .run.cases[0]
+        .trials[0]
+    )
+    published_calls = post_close_calls
+    direct = (
+        asyncio.run(run_workflow_eval_suite(build_target(), _suite(FinalOutputContains("done"))))
+        .cases[0]
+        .trials[0]
+    )
+    return published, direct, published_calls
+
+
+def _unsettled() -> WorkspaceMutationSettlementError:
+    return WorkspaceMutationSettlementError("Workspace mutation settlement could not be proven.")
+
+
+def test_workflow_eval_revalidates_profile_after_workspace_mutation_settles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def settle_after_retries(fingerprint: str, attempt: int) -> str:
+        if attempt < 3:
+            raise _unsettled()
+        return fingerprint
+
+    published, direct, post_close_calls = _run_with_post_quiescence_profile_inspection(
+        monkeypatch, settle_after_retries
+    )
+
+    assert post_close_calls == 3
+    assert published.code is EvalTrialDiagnosticCode.PASSED
+    assert published.output.evidence_state == "complete"
+    assert direct.status is EvalStatus.PASSED
+    assert direct.error is None
+
+
+def test_workflow_eval_reports_unsettled_profile_revalidation_distinctly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def never_settles(fingerprint: str, attempt: int) -> str:
+        del fingerprint, attempt
+        raise WorkspaceMutationSettlementError("private settlement detail")
+
+    published, direct, post_close_calls = _run_with_post_quiescence_profile_inspection(
+        monkeypatch, never_settles, close_timeout_seconds=0.2
+    )
+
+    assert post_close_calls > 1
+    assert published.code is EvalTrialDiagnosticCode.WORKFLOW_QUIESCENCE_FAILED
+    assert published.output.evidence_state == "unavailable"
+    assert direct.status is EvalStatus.ERROR
+    assert direct.error is not None
+    assert "workspace mutation settlement was not proven" in direct.error
+    assert "changed during quiescence" not in direct.error
+    assert "private settlement detail" not in direct.error
+
+
+def test_workflow_eval_does_not_retry_other_profile_revalidation_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fails(fingerprint: str, attempt: int) -> str:
+        del fingerprint, attempt
+        raise RuntimeError("private inspection failure")
+
+    published, direct, post_close_calls = _run_with_post_quiescence_profile_inspection(
+        monkeypatch, fails
+    )
+
+    assert post_close_calls == 1
+    assert published.code is EvalTrialDiagnosticCode.WORKFLOW_TARGET_FAILED
+    assert direct.error == (
+        "Workflow target execution profile could not be revalidated (RuntimeError)."
+    )
+
+
+@pytest.mark.parametrize("unsettled_first", [False, True])
+def test_workflow_eval_rejects_profile_changed_during_quiescence(
+    monkeypatch: pytest.MonkeyPatch,
+    unsettled_first: bool,
+) -> None:
+    def changed(fingerprint: str, attempt: int) -> str:
+        del fingerprint
+        if unsettled_first and attempt == 1:
+            raise _unsettled()
+        return "sha256:" + "f" * 64
+
+    published, direct, _ = _run_with_post_quiescence_profile_inspection(monkeypatch, changed)
+
+    assert published.code is EvalTrialDiagnosticCode.WORKFLOW_TARGET_FAILED
+    assert published.output.evidence_state == "unavailable"
+    assert direct.status is EvalStatus.ERROR
+    assert direct.error == "Workflow target execution profile changed during quiescence."
 
 
 def test_workflow_eval_rejects_evidence_that_changes_during_quiescence() -> None:

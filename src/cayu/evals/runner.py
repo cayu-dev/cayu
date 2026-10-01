@@ -26,6 +26,7 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_durable_text,
 )
+from cayu._workspace_mutation import WorkspaceMutationSettlementError
 from cayu.applications import CayuApp
 from cayu.artifacts.base import (
     ArtifactListResult,
@@ -1954,6 +1955,53 @@ def _workflow_event_count(trajectory: Trajectory) -> int:
     )
 
 
+_PROFILE_REVALIDATION_SETTLEMENT_INITIAL_DELAY_SECONDS = 0.01
+_PROFILE_REVALIDATION_SETTLEMENT_MAX_DELAY_SECONDS = 0.25
+
+
+class _ProfileRevalidationSettlementUnproven(Exception):
+    """Post-quiescence profile inspection stayed blocked by mutation settlement."""
+
+
+async def _inspect_settled_execution_profile(
+    runtime_app: CayuApp,
+    request_base: RunRequest,
+    *,
+    deadline: float,
+) -> str:
+    """Inspect the target profile once workspace mutation settlement is proven.
+
+    ``WorkspaceMutationSettlementError`` means the environment fence could not yet
+    prove that an earlier mutation stopped; it says nothing about the profile. The
+    inspection is retried with bounded backoff until ``deadline`` (the remaining
+    target close budget). Every other failure propagates unchanged, and a
+    successful inspection returns the exact fingerprint for strict comparison.
+    """
+
+    loop = asyncio.get_running_loop()
+    delay = _PROFILE_REVALIDATION_SETTLEMENT_INITIAL_DELAY_SECONDS
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise _ProfileRevalidationSettlementUnproven
+        attempt_deadline = asyncio.timeout_at(deadline)
+        try:
+            async with attempt_deadline:
+                return await runtime_app.inspect_run_execution_profile(
+                    copy_run_request(request_base)
+                )
+        except WorkspaceMutationSettlementError:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise _ProfileRevalidationSettlementUnproven from None
+            await asyncio.sleep(min(delay, remaining))
+            delay = min(delay * 2, _PROFILE_REVALIDATION_SETTLEMENT_MAX_DELAY_SECONDS)
+        except TimeoutError:
+            if not attempt_deadline.expired():
+                raise
+            raise _ProfileRevalidationSettlementUnproven from None
+
+
 _WORKFLOW_FAILURE_DIAGNOSTICS = {
     WorkflowEvalFailureCode.TARGET_FAILED: EvalTrialDiagnosticCode.WORKFLOW_TARGET_FAILED,
     WorkflowEvalFailureCode.EXECUTION_FAILED: (EvalTrialDiagnosticCode.WORKFLOW_EXECUTION_FAILED),
@@ -2501,6 +2549,7 @@ async def _run_workflow_case_once_with_public_projection(
         final_output = ""
         structured_output = None
     finally:
+        quiescence_deadline = asyncio.get_running_loop().time() + target.close_timeout_seconds
         quiescence_succeeded = True
         if execution is not None and execution.close is not None:
             try:
@@ -2530,10 +2579,19 @@ async def _run_workflow_case_once_with_public_projection(
                     )
                 try:
                     settled_execution_profile_fingerprint = (
-                        await runtime_app.inspect_run_execution_profile(
-                            copy_run_request(target.request_base)
+                        await _inspect_settled_execution_profile(
+                            runtime_app,
+                            target.request_base,
+                            deadline=quiescence_deadline,
                         )
                     )
+                except _ProfileRevalidationSettlementUnproven:
+                    raise WorkflowEvalFailure(
+                        WorkflowEvalFailureCode.QUIESCENCE_FAILED,
+                        "Workflow target execution profile could not be revalidated: "
+                        "workspace mutation settlement was not proven within the "
+                        "target close budget (WorkspaceMutationSettlementError).",
+                    ) from None
                 except Exception as exc:
                     raise WorkflowEvalFailure(
                         WorkflowEvalFailureCode.TARGET_FAILED,
