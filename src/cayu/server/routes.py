@@ -137,17 +137,10 @@ from cayu.evals.results import (
     CapturedEvaluationResultV1,
     EvalResultTargetIdentityV1,
 )
-from cayu.evals.scenario import EvalScenarioDocumentV2, eval_scenario_to_json
-from cayu.evals.scenario_authoring import (
-    compile_eval_scenario_draft,
-    validate_expected_scenario_revision,
-)
+from cayu.evals.scenario import EvalScenarioDocumentV2
 from cayu.evals.scenario_execution import corpus_for_eval_scenario
 from cayu.evals.scenario_preflight import (
-    ScenarioArtifactMaterializationError,
     ScenarioLaunchBindingV2,
-    ScenarioLaunchSettingsV2,
-    materialize_eval_scenario_artifact_fixture,
     preflight_eval_scenario,
 )
 from cayu.evals.store import (
@@ -176,9 +169,6 @@ from cayu.evals.store import (
     EvalRunStatus,
     EvalScenarioApprovalSubmission,
     EvalScenarioArtifactReference,
-    EvalScenarioCatalogPage,
-    EvalScenarioCatalogQuery,
-    EvalScenarioConflict,
     EvalScenarioRunInvocation,
     EvalStorePublicationRejected,
     EvalStoreResultTooLarge,
@@ -290,6 +280,11 @@ from cayu.server._http_json import (
 from cayu.server._judge_calibration_routes import register_judge_calibration_routes
 from cayu.server._memory_report_routes import register_memory_report_routes
 from cayu.server._request_timing import RequestTimingRecorder
+from cayu.server._scenario_authoring_routes import (
+    load_eval_scenario,
+    preflight_scenario,
+    register_scenario_authoring_routes,
+)
 from cayu.server._suite_authoring_routes import load_authored_suite, register_suite_authoring_routes
 from cayu.server.auth import AuthContext, AuthDependency, server_auth_dependency
 from cayu.server.config import EvalsConfig, EvaluationPromotionConfig, normalize_api_path
@@ -357,13 +352,7 @@ from cayu.server.contracts import (
     EvalResultResponse,
     EvalRunCreateRequest,
     EvalScenarioApprovalRequest,
-    EvalScenarioArtifactMaterializationRequest,
-    EvalScenarioArtifactMaterializationResponse,
-    EvalScenarioPreviewRequest,
-    EvalScenarioPreviewResponse,
     EvalScenarioRunCreateRequest,
-    EvalScenarioSaveRequest,
-    EvalScenarioSaveResponse,
     HealthResponse,
     ListSessionEventsResponse,
     ListSessionInteractionsResponse,
@@ -390,7 +379,6 @@ from cayu.server.contracts import (
     UsageRollupResponse,
 )
 from cayu.server.evals_registry import (
-    EvalTargetRegistration,
     generated_eval_target_registry,
     resolved_evals_runtime,
     target_for_eval_invocation,
@@ -5031,92 +5019,6 @@ def create_router(
                 raise HTTPException(status_code=404, detail="Eval corpus not found.")
             return corpus
 
-        async def _load_eval_scenario(
-            scenario_revision: str,
-        ) -> EvalScenarioDocumentV2:
-            if not eval_store.scenarios:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Durable scenario persistence is not available.",
-                )
-            try:
-                scenario = await eval_store.load_scenario(scenario_revision)
-            except EvalStoreResultTooLarge as exc:
-                raise HTTPException(
-                    status_code=413,
-                    detail="Eval scenario exceeds the server byte limit.",
-                ) from exc
-            except (TypeError, ValueError):
-                _eval_query_error()
-            if scenario is None or active_eval_registry.get(scenario.target_key) is None:
-                raise HTTPException(status_code=404, detail="Eval scenario not found.")
-            return scenario
-
-        async def _preflight_scenario(
-            scenario: EvalScenarioDocumentV2,
-            settings: ScenarioLaunchSettingsV2,
-        ):
-            registration = active_eval_registry.registration(scenario.target_key)
-            if registration is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Eval scenario is incompatible with the attached targets.",
-                )
-            try:
-                execution_target = registration.execution_target()
-                result = await preflight_eval_scenario(
-                    scenario,
-                    execution_target,
-                    settings,
-                    actor_authorized=True,
-                    project_root=registration.manifest_project_root,
-                )
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Eval scenario or its launch selections are invalid.",
-                ) from exc
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Attached eval target is unavailable for scenario preflight.",
-                ) from exc
-            return registration, result
-
-        async def _scenario_execution_profile(
-            registration: EvalTargetRegistration,
-            scenario: EvalScenarioDocumentV2,
-            binding: ScenarioLaunchBindingV2,
-        ):
-            scenario_invocation = EvalScenarioRunInvocation(
-                scenario_revision=scenario.revision,
-                binding_revision=binding.revision,
-                environment_name=binding.environment_name,
-                trials=binding.trials,
-                timeout_seconds=binding.timeout_seconds,
-                artifact_references=tuple(
-                    EvalScenarioArtifactReference(
-                        requirement_id=item.requirement_id,
-                        artifact_id=item.artifact_id,
-                    )
-                    for item in binding.artifacts
-                ),
-            )
-            invocation = EvalRunInvocation(
-                max_steps=binding.max_steps,
-                limits=binding.operator_run_limits,
-                cost_budget=binding.cost_budget,
-                scenario=scenario_invocation,
-            )
-            effective_target = target_for_eval_invocation(
-                registration.execution_target(),
-                invocation,
-            )
-            return await active_eval_registry.prepare_execution_profile(
-                registration.target.key,
-                effective_target=effective_target,
-            )
-
         async def _load_eval_run(run_id: str):
             try:
                 run = await eval_store.load_run(run_id)
@@ -6057,271 +5959,12 @@ def create_router(
                 runs=tuple(admitted),
             )
 
-        @bounded_evals_router.post(
-            "/evals/scenarios/preview",
-            response_model=EvalScenarioPreviewResponse,
-            responses=EVALS_ENDPOINT_RESPONSES,
-            dependencies=protected,
+        register_scenario_authoring_routes(
+            bounded_evals_router,
+            eval_store=eval_store,
+            active_eval_registry=active_eval_registry,
+            protected=protected,
         )
-        async def preview_eval_scenario(
-            body: EvalScenarioPreviewRequest,
-        ) -> EvalScenarioPreviewResponse:
-            try:
-                scenario = compile_eval_scenario_draft(body.draft)
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Eval scenario draft is invalid.",
-                ) from exc
-            registration, preflight = await _preflight_scenario(scenario, body.settings)
-            profile_revision = None
-            if preflight.ready and preflight.binding is not None:
-                try:
-                    prepared_profile = await _scenario_execution_profile(
-                        registration,
-                        scenario,
-                        preflight.binding,
-                    )
-                except Exception as exc:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="The current scenario execution profile is unavailable.",
-                    ) from exc
-                profile_revision = prepared_profile.snapshot.revision
-            return EvalScenarioPreviewResponse(
-                scenario=scenario,
-                preflight=preflight,
-                execution_profile_revision=profile_revision,
-            )
-
-        @bounded_evals_router.post(
-            "/evals/scenarios",
-            response_model=EvalScenarioSaveResponse,
-            status_code=201,
-            responses=EVALS_ENDPOINT_RESPONSES,
-            dependencies=protected,
-        )
-        async def save_eval_scenario(
-            body: EvalScenarioSaveRequest,
-        ) -> EvalScenarioSaveResponse:
-            if not eval_store.scenarios:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Durable scenario persistence is not available.",
-                )
-            try:
-                scenario = validate_expected_scenario_revision(
-                    body.scenario,
-                    body.expected_scenario_revision,
-                )
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Eval scenario changed after the reviewed revision.",
-                ) from exc
-            registration, preflight = await _preflight_scenario(scenario, body.settings)
-            profile_revision = None
-            if preflight.ready and preflight.binding is not None:
-                try:
-                    prepared_profile = await _scenario_execution_profile(
-                        registration,
-                        scenario,
-                        preflight.binding,
-                    )
-                except Exception as exc:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="The current scenario execution profile is unavailable.",
-                    ) from exc
-                profile_revision = prepared_profile.snapshot.revision
-            try:
-                entry = await eval_store.save_scenario(
-                    scenario,
-                    redact_json=registration.target.app.redact_json,
-                )
-            except EvalScenarioConflict as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Eval scenario revision conflicts with stored content.",
-                ) from exc
-            except EvalStorePublicationRejected as exc:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Eval scenario contains unsafe public data.",
-                ) from exc
-            except EvalStoreResultTooLarge as exc:
-                raise HTTPException(
-                    status_code=413,
-                    detail="Eval scenario exceeds the server byte limit.",
-                ) from exc
-            return EvalScenarioSaveResponse(
-                entry=entry,
-                scenario=scenario,
-                preflight=preflight,
-                execution_profile_revision=profile_revision,
-            )
-
-        @bounded_evals_router.post(
-            "/evals/scenarios/artifacts/{requirement_id}/materialize",
-            response_model=EvalScenarioArtifactMaterializationResponse,
-            responses=EVALS_ENDPOINT_RESPONSES,
-            dependencies=protected,
-        )
-        async def materialize_eval_scenario_artifact(
-            requirement_id: str,
-            body: EvalScenarioArtifactMaterializationRequest,
-        ) -> EvalScenarioArtifactMaterializationResponse:
-            try:
-                scenario = validate_expected_scenario_revision(
-                    body.scenario,
-                    body.expected_scenario_revision,
-                )
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Eval scenario changed after the reviewed revision.",
-                ) from exc
-            registration = active_eval_registry.registration(scenario.target_key)
-            if registration is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Eval scenario is incompatible with the attached targets.",
-                )
-            try:
-                materialization = await materialize_eval_scenario_artifact_fixture(
-                    scenario,
-                    registration.execution_target(),
-                    requirement_id,
-                    environment_name=body.settings.environment_name,
-                    source_artifact_id=body.settings.artifact_references.get(requirement_id),
-                    project_root=registration.manifest_project_root,
-                )
-            except KeyError as exc:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Eval scenario artifact requirement not found.",
-                ) from exc
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Eval scenario artifact selection is invalid.",
-                ) from exc
-            except ScenarioArtifactMaterializationError as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
-            references = dict(body.settings.artifact_references)
-            references.pop(requirement_id, None)
-            settings = ScenarioLaunchSettingsV2.model_validate(
-                {
-                    **body.settings.model_dump(mode="python"),
-                    "artifact_references": references,
-                }
-            )
-            registration, preflight = await _preflight_scenario(
-                materialization.scenario,
-                settings,
-            )
-            profile_revision = None
-            if preflight.ready and preflight.binding is not None:
-                try:
-                    prepared_profile = await _scenario_execution_profile(
-                        registration,
-                        materialization.scenario,
-                        preflight.binding,
-                    )
-                except Exception as exc:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="The current scenario execution profile is unavailable.",
-                    ) from exc
-                profile_revision = prepared_profile.snapshot.revision
-            return EvalScenarioArtifactMaterializationResponse(
-                materialization=materialization,
-                preflight=preflight,
-                execution_profile_revision=profile_revision,
-            )
-
-        @bounded_evals_router.get(
-            "/evals/scenarios",
-            response_model=EvalScenarioCatalogPage,
-            responses=EVALS_ENDPOINT_RESPONSES,
-            dependencies=protected,
-        )
-        async def list_eval_scenarios(
-            target_key: Annotated[
-                str | None,
-                Query(max_length=EVAL_STORE_MAX_IDENTIFIER_CHARS),
-            ] = None,
-            scenario_id: Annotated[
-                str | None,
-                Query(max_length=EVAL_STORE_MAX_IDENTIFIER_CHARS),
-            ] = None,
-            cursor: Annotated[str | None, Query(max_length=EVAL_STORE_MAX_CURSOR_BYTES)] = None,
-            limit: Annotated[
-                int,
-                Query(ge=1, le=EVAL_STORE_MAX_PAGE_SIZE),
-            ] = EVAL_STORE_DEFAULT_PAGE_SIZE,
-            max_result_bytes: Annotated[
-                int,
-                Query(ge=1_024, le=EVAL_STORE_MAX_PAGE_BYTES),
-            ] = EVAL_STORE_DEFAULT_PAGE_BYTES,
-        ):
-            if not eval_store.scenarios:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Durable scenario persistence is not available.",
-                )
-            eval_target = _eval_target(target_key)
-            try:
-                return await eval_store.list_scenarios(
-                    EvalScenarioCatalogQuery(
-                        target_key=eval_target.key,
-                        scenario_id=scenario_id,
-                        cursor=cursor,
-                        limit=limit,
-                        max_result_bytes=max_result_bytes,
-                    )
-                )
-            except EvalStoreResultTooLarge as exc:
-                raise HTTPException(
-                    status_code=413,
-                    detail="Eval scenario catalog page exceeds the requested byte limit.",
-                ) from exc
-            except (TypeError, ValueError):
-                _eval_query_error()
-
-        @bounded_evals_router.get(
-            "/evals/scenarios/{scenario_revision}",
-            response_model=EvalScenarioDocumentV2,
-            responses=EVALS_ENDPOINT_RESPONSES,
-            dependencies=protected,
-        )
-        async def get_eval_scenario(scenario_revision: str):
-            scenario = await _load_eval_scenario(scenario_revision)
-            return await _model_json_response(scenario, EvalScenarioDocumentV2)
-
-        @bounded_evals_router.get(
-            "/evals/scenarios/{scenario_revision}/download",
-            response_class=Response,
-            responses=EVALS_ENDPOINT_RESPONSES,
-            dependencies=protected,
-        )
-        async def download_eval_scenario(scenario_revision: str) -> Response:
-            scenario = await _load_eval_scenario(scenario_revision)
-            scenario_json = await asyncio.to_thread(
-                _render_utf8,
-                eval_scenario_to_json,
-                scenario,
-            )
-            return Response(
-                content=scenario_json,
-                media_type="application/json",
-                headers={
-                    "Content-Disposition": (
-                        f'attachment; filename="{scenario.target_key}-'
-                        f'{scenario.revision[7:19]}.scenario.json"'
-                    )
-                },
-            )
 
         @bounded_evals_router.post(
             "/evals/scenarios/{scenario_revision}/runs",
@@ -6344,7 +5987,9 @@ def create_router(
                     status_code=409,
                     detail="Durable scenario execution is not available.",
                 )
-            scenario = await _load_eval_scenario(scenario_revision)
+            scenario = await load_eval_scenario(
+                scenario_revision, eval_store=eval_store, active_eval_registry=active_eval_registry
+            )
             replay_probe = _bind_eval_admission_request(
                 _eval_run_invocation(
                     auth_context,
@@ -6367,7 +6012,9 @@ def create_router(
             )
             if replayed is not None:
                 return replayed
-            registration, preflight = await _preflight_scenario(scenario, body.settings)
+            registration, preflight = await preflight_scenario(
+                scenario, body.settings, active_eval_registry=active_eval_registry
+            )
             binding = preflight.binding
             if not preflight.ready or binding is None:
                 raise HTTPException(

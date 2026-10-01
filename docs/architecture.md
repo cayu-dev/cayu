@@ -86,6 +86,15 @@ reads and run launch use the same suite revision loader to enforce persistence
 support, private storage errors and current target visibility. Run admission,
 execution and worker lifespan remain in router composition.
 
+`server/_scenario_authoring_routes.py` owns scenario preview, save, catalog,
+detail, download and artifact fixture preparation. Authoring and launch share
+the scenario revision loader and preflight boundary with explicit store and
+target-registry inputs. Fixture preparation checks the reviewed revision,
+copies the selected retained bytes into an environment fixture, clears that
+temporary artifact selection and checks readiness against the updated scenario.
+It returns the new scenario revision without saving it. Router composition
+retains scenario run admission, execution and the shared bounded/auth boundary.
+
 ## Runtime Shape
 
 ```text

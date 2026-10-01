@@ -5,12 +5,14 @@ import hashlib
 import time
 from collections.abc import AsyncIterator
 
+import httpx
 import pytest
 
 pytest.importorskip("fastapi")
 pytest.importorskip("sse_starlette")
 
 from fastapi import HTTPException, Request
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from cayu.agents import AgentSpec
@@ -30,12 +32,21 @@ from cayu.evals.scenario import (
     ScenarioUserMessageV2,
 )
 from cayu.evals.scenario_authoring import EvalScenarioDraftV2
-from cayu.evals.store import EvalScenarioTrialPhase
+from cayu.evals.store import EvalScenarioTrialPhase, EvalStoreResultTooLarge
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.events import EventType
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.server import AuthContext, DashboardConfig, EvalsConfig, ServerConfig, create_server
+from cayu.server import (
+    AuthContext,
+    DashboardConfig,
+    EvalsConfig,
+    ServerApiConfig,
+    ServerConfig,
+    create_server,
+)
+from cayu.server import routes as routes_module
+from cayu.server.evals_registry import EvalTargetRegistration
 from cayu.sessions.base import RunRequest
 from cayu.storage.evals_sqlite import SQLiteEvalStore
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
@@ -962,3 +973,392 @@ def test_scenario_artifact_preparation_returns_a_ready_unsaved_revision(tmp_path
         assert provider.requests == []
     finally:
         asyncio.run(store.close())
+
+
+@pytest.mark.parametrize("prefix", ["/api", "/custom/v2"])
+def test_scenario_authoring_preserves_auth_and_private_http_boundary(sqlite_resources, prefix):
+    async def exercise():
+        async with sqlite_resources as resources:
+            target, _, provider = _target(resources.path("target"))
+            store = resources.own(SQLiteEvalStore(resources.path()))
+            calls = []
+
+            def authenticate(request: Request):
+                calls.append(request.url.path)
+                return _authenticate(request)
+
+            server = create_server(
+                target.app,
+                config=ServerConfig.protected(
+                    authenticate,
+                    api=ServerApiConfig(path=prefix),
+                    dashboard=DashboardConfig(enabled=False),
+                    evals=EvalsConfig(target=target, store=store),
+                ),
+            )
+            root = f"{prefix}/evals/scenarios"
+            paths = [
+                f"{root}/preview",
+                root,
+                f"{root}/artifacts/{{requirement_id}}/materialize",
+                root,
+                f"{root}/{{scenario_revision}}",
+                f"{root}/{{scenario_revision}}/download",
+            ]
+            routes = [r for r in server.routes if isinstance(r, APIRoute)]
+            authoring = [r for r in routes if r.path in paths]
+            assert [r.path for r in authoring] == paths
+            dependency = (
+                next(r for r in routes if r.path == f"{prefix}/sessions").dependencies[0].dependency
+            )
+            for route in authoring:
+                assert route.dependencies[0].dependency is dependency
+                assert isinstance(route, routes_module._BoundedEvalsRoute)
+                assert type(route).preparse_auth is authenticate
+            scenario = _scenario()
+            save_body = {
+                "scenario": scenario.model_dump(mode="json"),
+                "expected_scenario_revision": scenario.revision,
+            }
+            requests = [
+                (
+                    "POST",
+                    f"{root}/preview",
+                    {"draft": EvalScenarioDraftV2.from_scenario(scenario).model_dump(mode="json")},
+                    200,
+                ),
+                ("POST", root, save_body, 201),
+                ("POST", f"{root}/artifacts/missing/materialize", save_body, 404),
+                ("GET", root, None, 200),
+                ("GET", f"{root}/{scenario.revision}", None, 200),
+                ("GET", f"{root}/{scenario.revision}/download", None, 200),
+            ]
+            async with (
+                server.router.lifespan_context(server),
+                httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=server), base_url="http://test"
+                ) as client,
+            ):
+                for method, path, payload, status in requests:
+                    calls.clear()
+                    denied = await client.request(
+                        method,
+                        path,
+                        content=b"private invalid input",
+                        headers={"Content-Length": str(authoring[0].max_request_bytes + 1)},
+                    )
+                    assert denied.status_code == 401
+                    assert denied.json() == {"detail": "unauthorized"}
+                    assert denied.headers["cache-control"] == "private, no-store"
+                    assert calls == [path]
+                    calls.clear()
+                    response = await client.request(
+                        method, path, headers=_AUTH_HEADERS, json=payload
+                    )
+                    assert response.status_code == status
+                    assert response.headers["cache-control"] == "private, no-store"
+                    assert calls == [path]
+                for _, path, _, _ in requests[:3]:
+                    for content, headers, status, detail in (
+                        (
+                            b"{}",
+                            {"Content-Length": str(authoring[0].max_request_bytes + 1)},
+                            413,
+                            "Evals request exceeds the server byte limit.",
+                        ),
+                        (
+                            b'{"private":"secret","private":"other"}',
+                            {},
+                            422,
+                            "Invalid Evals request.",
+                        ),
+                        (b"NaN", {}, 422, "Invalid Evals request."),
+                    ):
+                        calls.clear()
+                        response = await client.post(
+                            path,
+                            content=content,
+                            headers={
+                                **_AUTH_HEADERS,
+                                "Content-Type": "application/json",
+                                **headers,
+                            },
+                        )
+                        assert response.status_code == status
+                        assert response.json() == {"detail": detail}
+                        assert response.headers["cache-control"] == "private, no-store"
+                        assert calls == [path]
+
+                def deny_access():
+                    raise HTTPException(status_code=403, detail="scenario access revoked")
+
+                server.dependency_overrides[dependency] = deny_access
+                for method, path, payload, _ in requests:
+                    response = await client.request(
+                        method, path, headers=_AUTH_HEADERS, json=payload
+                    )
+                    assert response.status_code == 403
+                    assert response.json() == {"detail": "scenario access revoked"}
+                    assert response.headers["cache-control"] == "private, no-store"
+            assert provider.requests == []
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("failure", ["invalid", "oversized", "unsupported", "hidden", "missing"])
+def test_scenario_revision_reads_preserve_private_errors_for_authoring_and_launch(
+    sqlite_resources, monkeypatch, failure
+):
+    async def exercise():
+        async with sqlite_resources as resources:
+            target, _, provider = _target(resources.path("target"))
+            store = resources.own(SQLiteEvalStore(resources.path()))
+            reads = []
+            template = _scenario()
+            hidden = EvalScenarioDocumentV2.create(
+                id=template.id,
+                name=template.name,
+                target_key="assistant.unpublished",
+                events=template.events,
+            )
+
+            async def load(revision):
+                reads.append(revision)
+                if failure == "invalid":
+                    raise ValueError("private storage input")
+                if failure == "oversized":
+                    raise EvalStoreResultTooLarge(1024)
+                return hidden if failure == "hidden" else None
+
+            monkeypatch.setattr(store, "load_scenario", load)
+            if failure == "unsupported":
+                monkeypatch.setattr(store, "scenarios", False)
+            server = _server(target, store)
+            revision = "sha256:" + "0" * 64
+            root = f"/api/evals/scenarios/{revision}"
+            expected = {
+                "invalid": (422, "Invalid Evals query."),
+                "oversized": (413, "Eval scenario exceeds the server byte limit."),
+                "unsupported": (409, "Durable scenario persistence is not available."),
+                "hidden": (404, "Eval scenario not found."),
+                "missing": (404, "Eval scenario not found."),
+            }[failure]
+            async with (
+                server.router.lifespan_context(server),
+                httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=server), base_url="http://test"
+                ) as client,
+            ):
+                for method, path, payload in (
+                    ("GET", root, None),
+                    ("GET", f"{root}/download", None),
+                    (
+                        "POST",
+                        f"{root}/runs",
+                        {
+                            "expected_binding_revision": revision,
+                            "expected_execution_profile_revision": revision,
+                        },
+                    ),
+                ):
+                    response = await client.request(
+                        method,
+                        path,
+                        json=payload,
+                        headers={**_AUTH_HEADERS, "Idempotency-Key": "scenario-private-read"},
+                    )
+                    assert response.status_code == expected[0]
+                    assert response.json() == {"detail": expected[1]}
+                    assert response.headers["cache-control"] == "private, no-store"
+            assert reads == ([] if failure == "unsupported" else [revision] * 3)
+            assert provider.requests == []
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("failure", ["invalid", "unavailable"])
+def test_scenario_preflight_preserves_private_errors_before_save_or_launch(
+    sqlite_resources, monkeypatch, failure
+):
+    async def exercise():
+        async with sqlite_resources as resources:
+            target, _, provider = _target(resources.path("target"))
+            store = resources.own(SQLiteEvalStore(resources.path()))
+            server = _server(target, store)
+            scenario = _scenario()
+            await store.save_scenario(scenario, redact_json=target.app.redact_json)
+            calls = []
+
+            def rejected_target(self):
+                calls.append(self.target.key)
+                error = ValueError if failure == "invalid" else RuntimeError
+                raise error("private target details")
+
+            async def unexpected_save(*args, **kwargs):
+                pytest.fail("Failed preflight must not save a scenario or admit a run.")
+
+            monkeypatch.setattr(EvalTargetRegistration, "execution_target", rejected_target)
+            monkeypatch.setattr(store, "save_scenario", unexpected_save)
+            monkeypatch.setattr(store, "admit_run", unexpected_save)
+            expected = (
+                (400, "Eval scenario or its launch selections are invalid.")
+                if failure == "invalid"
+                else (409, "Attached eval target is unavailable for scenario preflight.")
+            )
+            root = "/api/evals/scenarios"
+            revision = "sha256:" + "0" * 64
+            async with (
+                server.router.lifespan_context(server),
+                httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=server), base_url="http://test"
+                ) as client,
+            ):
+                for path, payload in (
+                    (
+                        f"{root}/preview",
+                        {
+                            "draft": EvalScenarioDraftV2.from_scenario(scenario).model_dump(
+                                mode="json"
+                            )
+                        },
+                    ),
+                    (
+                        root,
+                        {
+                            "scenario": scenario.model_dump(mode="json"),
+                            "expected_scenario_revision": scenario.revision,
+                        },
+                    ),
+                    (
+                        f"{root}/{scenario.revision}/runs",
+                        {
+                            "expected_binding_revision": revision,
+                            "expected_execution_profile_revision": revision,
+                        },
+                    ),
+                ):
+                    response = await client.post(
+                        path,
+                        json=payload,
+                        headers={**_AUTH_HEADERS, "Idempotency-Key": "scenario-preflight-failure"},
+                    )
+                    assert response.status_code == expected[0]
+                    assert response.json() == {"detail": expected[1]}
+                    assert response.headers["cache-control"] == "private, no-store"
+            assert calls == [target.key] * 3
+            assert provider.requests == []
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_scenario_materialization_rebinds_artifacts_and_cancels_before_publication(
+    sqlite_resources, monkeypatch, cancel
+):
+    async def exercise():
+        async with sqlite_resources as resources:
+            target, artifacts, provider = _target(resources.path("target"))
+            store = resources.own(SQLiteEvalStore(resources.path()))
+            content = b"retained request attachment"
+            sources = [
+                await artifacts.put_bytes(
+                    content,
+                    filename="request.txt",
+                    content_type="text/plain",
+                    scope=ArtifactScope.SESSION,
+                    session_id=f"source-{i}",
+                    environment_name="files",
+                )
+                for i in range(2)
+            ]
+            requirement = ScenarioArtifactRequirementV2(
+                id="request-file",
+                source="artifact_reference",
+                reference=sources[0].id,
+                content_sha256=hashlib.sha256(content).hexdigest(),
+                filename="request.txt",
+                content_type="text/plain",
+                size_bytes=len(content),
+            )
+            scenario = _scenario(requirement)
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            events = []
+            original_read = artifacts.read_bytes
+            original_put = artifacts.put_bytes
+
+            async def read(artifact_id, **kwargs):
+                events.append(("read", artifact_id))
+                if artifact_id == sources[1].id:
+                    entered.set()
+                    await release.wait()
+                return await original_read(artifact_id, **kwargs)
+
+            async def put(data, **kwargs):
+                events.append(("put", kwargs["artifact_id"]))
+                return await original_put(data, **kwargs)
+
+            monkeypatch.setattr(artifacts, "read_bytes", read)
+            monkeypatch.setattr(artifacts, "put_bytes", put)
+            server = _server(target, store)
+            path = f"/api/evals/scenarios/artifacts/{requirement.id}/materialize"
+            body = {
+                "scenario": scenario.model_dump(mode="json"),
+                "expected_scenario_revision": scenario.revision,
+                "settings": {"artifact_references": {requirement.id: sources[1].id}},
+            }
+            async with (
+                server.router.lifespan_context(server),
+                httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=server), base_url="http://test"
+                ) as client,
+            ):
+                stale = await client.post(
+                    path,
+                    headers=_AUTH_HEADERS,
+                    json={**body, "expected_scenario_revision": "sha256:" + "0" * 64},
+                )
+                assert stale.status_code == 409
+                assert stale.json() == {
+                    "detail": "Eval scenario changed after the reviewed revision."
+                }
+                assert events == []
+                request = resources.task(client.post(path, headers=_AUTH_HEADERS, json=body))
+                try:
+                    await asyncio.wait_for(entered.wait(), 5)
+                    assert events == [("read", sources[1].id)]
+                    assert not request.done()
+                    if cancel:
+                        request.cancel()
+                        with pytest.raises(asyncio.CancelledError):
+                            await request
+                        assert events == [("read", sources[1].id)]
+                    else:
+                        release.set()
+                        response = await asyncio.wait_for(request, 10)
+                        assert response.status_code == 200
+                        result = response.json()
+                        fixture_id = result["materialization"]["artifact_id"]
+                        updated = EvalScenarioDocumentV2.model_validate(
+                            result["materialization"]["scenario"]
+                        )
+                        assert updated.revision != scenario.revision
+                        assert updated.artifact_requirements[0].reference == fixture_id
+                        assert result["preflight"]["ready"] is True
+                        assert result["execution_profile_revision"] is not None
+                        assert events == [
+                            ("read", sources[1].id),
+                            ("put", fixture_id),
+                            ("read", fixture_id),
+                        ]
+                        fixture = await original_read(fixture_id)
+                        assert fixture.content == content
+                        assert fixture.metadata.scope is ArtifactScope.ENVIRONMENT
+                        assert await store.load_scenario(updated.revision) is None
+                    assert await store.load_scenario(scenario.revision) is None
+                finally:
+                    release.set()
+                    await asyncio.gather(request, return_exceptions=True)
+            assert provider.requests == []
+
+    asyncio.run(exercise())
