@@ -77,6 +77,8 @@ SYSTEM = (
     "Quote each reported price verbatim in evidence. Supply a future rate's published ISO date "
     "in pricing_effective_from. Verify model facts independently from a visited official model "
     "page and quote model_evidence with model_source_url; leave both null for pricing-only work. "
+    "When the model page lists supported tools, report hosted_web_search from that list and "
+    "quote the list in model_evidence; otherwise leave hosted_web_search null. "
     "Never guess. Set confirmed=false when authoritative evidence is insufficient. "
     "\n\n[Pricing-page maintenance guidance]\n" + WORKSPACE_GUIDANCE
 )
@@ -154,6 +156,7 @@ def _prompt(model: ModelInfo, price: ModelPrice, *, effective_on: date) -> str:
         f"{(p.batch.cache_read_input_per_million if p.batch else None)} / "
         f"{(p.batch.output_per_million if p.batch else None)}\n"
         f"  current context_window: {model.context_window}\n"
+        f"  current hosted_web_search: {model.hosted_web_search}\n"
         f"  current context tiers: {tiers}\n"
         f"  committed pricing source: {pricing_source_url}\n"
         f"  committed model source: {model_source_url}\n"

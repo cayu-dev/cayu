@@ -112,6 +112,52 @@ prices = PriceBook(
 `fixed()` creates one application-owned schedule without a start or end date. It is
 appropriate only when the application deliberately owns an indefinite rate.
 
+## Hosted web search
+
+`ModelInfo.hosted_web_search` records that the provider's own hosted web-search tool is
+established for the model on that provider's native API. It defaults to `False`, which
+means unsupported or not established, so catalogs written before the field existed load
+unchanged. Bundled records carry it only under the `openai` provider key, where it means
+the Responses `web_search` tool appears in the model page's supported-tools list; the
+record's `provenance` is that model page.
+
+`OpenAIProvider` and `OpenAISubscriptionProvider` admit `OpenAIWebSearch` only for a
+model that resolves, through the exact/alias/prefix matching above, to an `openai` record
+with `hosted_web_search=True`. The bundled catalog is used by default. Pass
+`model_catalog=` to use one complete application-owned catalog instead; it is not merged
+with the bundled snapshot, so it must declare every model the application searches with:
+
+```python
+from cayu import ModelCatalog, ModelInfo, OpenAIProvider, Provenance
+
+catalog = ModelCatalog(
+    catalog_version="app-2026-09-30",
+    generated_at="2026-09-30",
+    models=(
+        ModelInfo(
+            provider_name="openai",
+            model="gpt-6.1-sol",
+            match="exact",
+            tool_calling=True,
+            reasoning=True,
+            hosted_web_search=True,
+            provenance=Provenance(
+                source="application",
+                url="https://developers.openai.com/api/docs/models/gpt-6.1-sol",
+                as_of="2026-09-30",
+            ),
+        ),
+    ),
+)
+provider = OpenAIProvider(model_catalog=catalog)
+```
+
+`chat-latest` is not a catalog record: OpenAI documents it as a moving pointer to the
+latest ChatGPT Instant model, so there is no stable identity, price, or capability
+snapshot to record. Its model page lists `web_search`, and preflight admits it whenever
+the active catalog has no record for it. A catalog that does define `chat-latest`
+decides for it like any other model.
+
 ## Amazon Bedrock billing identity
 
 Bedrock pricing resolves from the exact `modelId` sent to `ConverseStream`, the source
@@ -205,6 +251,17 @@ any gateway or negotiated billing identity. Every bundled routable model keeps a
 canonical price so the maintenance verifier can re-check it; that repository invariant
 does not couple application-owned `ModelCatalog` and `PriceBook` values.
 
+Hosted web search is maintained as a model fact. When the verifier independently
+verifies a model page, it reports `hosted_web_search` from that page's supported-tools
+list and quotes the list in its model evidence; a null answer or a pricing-only
+verification keeps the committed value. Only providers with a Cayu hosted-search adapter
+(`HOSTED_WEB_SEARCH_PROVIDERS`, currently `openai`) carry the fact, and catalog policy
+rejects it elsewhere. Newly established support appears in the refresh PR's diff like
+any other capability; an automated `True -> False` change is rejected and flagged,
+because it would make upgraded applications fail preflight. A recommended model that is
+missing from the bundled catalog is still flagged by the recommendation audit and added
+in a reviewed change, after which the verifier maintains its hosted-search fact.
+
 Model-fact freshness and price freshness are evaluated independently. Pricing evidence
 updates only schedule provenance; capability or lifecycle facts require their own
 official model-page URL and quote. When an official page publishes a future rate and
@@ -247,7 +304,9 @@ uv run python -m maintenance.model_catalog.refresh --openai-subscription --all -
 ```
 
 The `local_refresh` bootstrap above deliberately uses the latest published package; it does
-not include an unreleased fix merely because the checkout contains that fix.
+not include an unreleased fix merely because the checkout contains that fix. The same applies
+to catalog schema additions such as `hosted_web_search`: until a release containing the field
+is published, the public package rejects the checkout's catalog, so use the checkout command.
 
 ## Pre-v0.1 migration
 

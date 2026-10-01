@@ -9841,8 +9841,11 @@ configuration participates in agent registration, execution-profile identity,
 request footprints and fingerprints, reconstruction, resume/fork identity, and
 provider-target preflight. OpenAI adapters project it as the native Responses
 `web_search` tool and merge source inclusion with encrypted-reasoning inclusion.
-Preflight admits only model families whose native web-search support Cayu has
-established; unknown models and unverified custom endpoints fail closed.
+Preflight admits only models whose active model catalog (the bundled
+`default_model_catalog()` or the provider's `model_catalog=`) resolves an
+`openai` record with `hosted_web_search=True`, plus the moving `chat-latest`
+pointer when that catalog has no record for it. Unknown models, records without
+the fact, and unverified custom endpoints fail closed.
 Every search lifecycle record binds the provider/model, model step and attempt,
 runtime-owned `provider_operation_id`, and provider call ID. The operation ID is
 derived from the admitted model attempt, so retries receive distinct operation

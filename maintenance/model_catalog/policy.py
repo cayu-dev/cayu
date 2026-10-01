@@ -23,6 +23,9 @@ MAX_AUTOMATED_PRICE_CHANGE_FACTOR = Decimal("4")
 MAX_CATALOG_CONTEXT_WINDOW_TOKENS = 10_000_000
 MAX_AUTOMATED_CONTEXT_WINDOW_CHANGE_FACTOR = Decimal("4")
 REQUIRED_PROVIDERS = frozenset({"openai", "anthropic", "google", "vertex", "azure", "bedrock"})
+# Providers whose ``ModelInfo.hosted_web_search`` fact is consumed by a Cayu hosted-search
+# adapter and therefore verified by the maintenance job. Elsewhere the fact stays False.
+HOSTED_WEB_SEARCH_PROVIDERS = frozenset({"openai"})
 # A bundled billing identity that is deliberately not a routable model must be named here
 # and documented in docs/model-catalog.md. Application-owned books do not use this policy.
 BUNDLED_PRICE_ONLY_IDENTITIES: frozenset[tuple[str, str]] = frozenset()
@@ -89,6 +92,11 @@ def model_policy_errors(
         errors.append(f"{identity}: provenance source must be 'official'")
     if model.match != "exact":
         errors.append(f"{identity}: bundled canonical model match must be 'exact'")
+    if model.hosted_web_search and model.provider_name not in HOSTED_WEB_SEARCH_PROVIDERS:
+        errors.append(
+            f"{identity}: hosted_web_search is only maintained for providers with a Cayu "
+            "hosted-search adapter"
+        )
     for prefix in model.match_prefixes:
         suffix = prefix[len(model.model) :] if prefix.startswith(model.model) else ""
         if len(suffix) < 2 or suffix[0] not in _MATCH_PREFIX_DELIMITERS:
@@ -242,6 +250,10 @@ def suspicious_price_changes(
         low, high = sorted((Decimal(before_context), Decimal(after_context)))
         if high / low > MAX_AUTOMATED_CONTEXT_WINDOW_CHANGE_FACTOR:
             warnings.append(f"context_window changed from {before_context} to {after_context}")
+    # Withdrawing hosted web search makes upgraded applications fail preflight, so a removal
+    # always needs human review. Newly established support is an ordinary reviewed update.
+    if before.hosted_web_search and not after.hosted_web_search:
+        warnings.append("hosted_web_search removed: True -> False")
 
     old = _price_points(before_price)
     new = _price_points(after_price)

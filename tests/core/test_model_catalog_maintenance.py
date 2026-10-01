@@ -1279,6 +1279,99 @@ def test_verified_boolean_context_window_does_not_replace_curated_value() -> Non
     assert outcome.model.context_window == original.context_window
 
 
+_MODEL_PAGE = "https://developers.openai.com/api/docs/models/gpt-6-sol"
+
+
+def _parse_model_facts(original: ModelInfo, **updates):
+    return parse_verified(
+        _verified_payload(
+            model_source_url=_MODEL_PAGE,
+            model_evidence="Supported tools: web_search, file_search",
+            **updates,
+        ),
+        original,
+        _provider_price(original.provider_name),
+        as_of="2026-09-30",
+        browsed_urls={"https://openai.com/api/pricing/", _MODEL_PAGE},
+        browsed_pricing_modes={"https://openai.com/api/pricing/": {"standard"}},
+    )
+
+
+def test_verifier_schema_reports_hosted_web_search_as_nullable_model_fact() -> None:
+    field = VERIFIED_SCHEMA["properties"]["hosted_web_search"]
+
+    assert field["type"] == ["boolean", "null"]
+    assert "hosted_web_search" in VERIFIED_SCHEMA["required"]
+
+
+def test_verified_model_facts_establish_hosted_web_search() -> None:
+    original = _provider_model("openai").model_copy(update={"hosted_web_search": False})
+
+    established = _parse_model_facts(original, hosted_web_search=True)
+    unknown = _parse_model_facts(original, hosted_web_search=None)
+
+    assert established.verified and established.model is not None
+    assert established.model.hosted_web_search is True
+    assert established.model.provenance.url == _MODEL_PAGE
+    assert established.model.provenance.as_of == "2026-09-30"
+    assert unknown.model is not None and unknown.model.hosted_web_search is False
+
+
+def test_pricing_only_verification_cannot_change_hosted_web_search() -> None:
+    original = _provider_model("openai").model_copy(update={"hosted_web_search": False})
+
+    outcome = parse_verified(
+        _verified_payload(hosted_web_search=True),
+        original,
+        _provider_price("openai"),
+        as_of="2026-09-30",
+        browsed_urls={"https://openai.com/api/pricing/"},
+        browsed_pricing_modes={"https://openai.com/api/pricing/": {"standard"}},
+    )
+
+    assert outcome.verified and outcome.model is not None
+    assert outcome.model.hosted_web_search is False
+
+
+def test_hosted_web_search_is_ignored_and_rejected_outside_adapter_providers() -> None:
+    original = _provider_model("anthropic")
+    outcome = parse_verified(
+        _verified_payload(
+            hosted_web_search=True,
+            source_url="https://platform.claude.com/docs/pricing",
+            model_source_url="https://platform.claude.com/docs/pricing",
+            model_evidence="Server tools: web search",
+        ),
+        original,
+        _provider_price("anthropic"),
+        as_of="2026-09-30",
+        browsed_urls={"https://platform.claude.com/docs/pricing"},
+        browsed_pricing_modes={"https://platform.claude.com/docs/pricing": {"standard"}},
+    )
+
+    assert outcome.verified and outcome.model is not None
+    assert outcome.model.hosted_web_search is False
+    assert any(
+        "hosted_web_search is only maintained" in error
+        for error in model_policy_errors(
+            original.model_copy(update={"hosted_web_search": True}),
+            today=date(2026, 9, 30),
+            max_age_days=None,
+        )
+    )
+
+
+def test_automated_hosted_web_search_removal_requires_review() -> None:
+    model = _provider_model("openai").model_copy(update={"hosted_web_search": True})
+    removed = model.model_copy(update={"hosted_web_search": False})
+    price = _provider_price("openai")
+
+    assert "hosted_web_search removed: True -> False" in suspicious_price_changes(
+        model, removed, price, price
+    )
+    assert suspicious_price_changes(removed, model, price, price) == []
+
+
 def test_browser_verifier_supplies_pricing_guidance_without_environment(monkeypatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     verifier = BrowserVerifier(as_of="2026-07-13", max_cost_usd=None)

@@ -25,6 +25,19 @@
   recorded without a `tool.call.started` event can now be resumed through
   `resume` instead of failing reconciliation.
 
+- OpenAI hosted web search support now comes from the model catalog instead of a
+  hardcoded model list. `ModelInfo` has a new `hosted_web_search` capability
+  (default `False`, so catalogs written without it still load and mean "not
+  established"). The bundled catalog sets it for `gpt-5.6-luna`, `gpt-5.6-sol`
+  (and its `gpt-5.6` alias), and `gpt-5.6-terra`; `chat-latest` stays admitted as
+  OpenAI's moving ChatGPT pointer unless the active catalog has a record for it.
+  `OpenAIProvider` and `OpenAISubscriptionProvider` accept `model_catalog=` to
+  replace the bundled catalog for this decision (no merge), so an application can
+  declare a newer model before a Cayu release adds it. The model-catalog
+  maintenance job now verifies the fact from each OpenAI model page's supported
+  tools, and an automated removal is held for human review.
+  `return_token_budget="unlimited"` now accepts GPT-5 and later families
+  (previously it matched only `gpt-5`).
 - Invalid arguments can no longer be approved through built-in parameter validity
   rules. `ParameterConstrainedToolPolicy(REQUIRE_APPROVAL)` without an explicit
   application identity changes its execution-profile fingerprint. Resolve paused

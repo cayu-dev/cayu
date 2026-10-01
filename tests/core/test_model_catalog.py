@@ -271,6 +271,47 @@ def test_model_catalog_dump_is_deterministic_and_round_trips(tmp_path) -> None:
     assert load_model_catalog(path) == sorted_catalog
 
 
+def test_hosted_web_search_is_optional_strict_and_round_trips(tmp_path) -> None:
+    legacy = _opus().model_dump(mode="json")
+    del legacy["hosted_web_search"]
+    legacy_path = tmp_path / "legacy.json"
+    legacy_path.write_text(
+        ModelCatalog.model_validate(
+            {"catalog_version": "old", "generated_at": "2026-07-14", "models": [legacy]}
+        ).model_dump_json()
+    )
+
+    # Catalogs written before the field existed load as "not established".
+    assert ModelInfo.model_validate(legacy).hosted_web_search is False
+    assert load_model_catalog(legacy_path).models[0].hosted_web_search is False
+
+    supported = _catalog(_opus(hosted_web_search=True))
+    path = tmp_path / "models.json"
+    path.write_text(dump_model_catalog(supported))
+    assert '"hosted_web_search": true' in path.read_text()
+    assert load_model_catalog(path) == supported
+
+    for invalid in ("yes", 1, None):
+        with pytest.raises(ValidationError, match="hosted_web_search"):
+            _opus(hosted_web_search=invalid)
+
+
+def test_bundled_hosted_web_search_facts_are_openai_only() -> None:
+    catalog = default_model_catalog()
+    supported = {
+        (model.provider_name, model.model) for model in catalog.models if model.hosted_web_search
+    }
+
+    assert {provider for provider, _ in supported} == {"openai"}
+    assert {
+        ("openai", "gpt-5.6-luna"),
+        ("openai", "gpt-5.6-sol"),
+        ("openai", "gpt-5.6-terra"),
+    } <= supported
+    alias = catalog.resolve(provider_name="openai", model="gpt-5.6")
+    assert alias is not None and alias.hosted_web_search is True
+
+
 def test_fixed_model_price_is_an_indefinite_application_owned_schedule() -> None:
     price = ModelPrice.fixed(
         provider_name="gateway",

@@ -18,6 +18,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from cayu import ModelInfo, ModelPrice, PriceSchedule, PriceTier, Provenance
+from maintenance.model_catalog.policy import HOSTED_WEB_SEARCH_PROVIDERS
 from maintenance.model_catalog.verify import VerifyOutcome
 
 _PRICE = {"type": ["string", "number", "null"]}
@@ -96,6 +97,14 @@ VERIFIED_SCHEMA: dict[str, Any] = {
         "deprecated": {
             "type": "boolean",
             "description": "true if the page marks the model deprecated/retired/legacy.",
+        },
+        "hosted_web_search": {
+            "type": ["boolean", "null"],
+            "description": "Model fact read from the official model page's supported-tools list "
+            "(OpenAI: 'Supported tools' for the Responses API). true ONLY if web search "
+            "(web_search) is listed as supported for this exact model; false if the page lists "
+            "supported tools and web search is absent or marked unsupported; null if the page "
+            "has no supported-tools information. Quote the tools line in model_evidence.",
         },
         "source_url": {"type": "string", "description": "URL of the official page you read."},
         "pricing_effective_from": {
@@ -444,6 +453,14 @@ def parse_verified(
             model_updates["context_window"] = data["context_window"]
         if "deprecated" in data:
             model_updates["deprecated"] = bool(data["deprecated"])
+        # Only a definite boolean from an independently verified model page changes the
+        # committed fact; null/malformed output retains it. Providers without a Cayu
+        # hosted-search adapter never carry the fact (see policy.HOSTED_WEB_SEARCH_PROVIDERS).
+        if (
+            type(data.get("hosted_web_search")) is bool
+            and original.provider_name in HOSTED_WEB_SEARCH_PROVIDERS
+        ):
+            model_updates["hosted_web_search"] = data["hosted_web_search"]
 
     corrected = ModelInfo.model_validate(
         original.model_copy(update=model_updates).model_dump(mode="json")

@@ -12,7 +12,7 @@ from tests.provider_traceback_assertions import is_cayu_source_filename
 from cayu._version import __version__
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
-from cayu.budgets.pricing import default_price_book
+from cayu.budgets.pricing import ModelCatalog, ModelInfo, Provenance, default_price_book
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers._openai_protocol import SearchSourceDiagnostic
@@ -267,6 +267,48 @@ def test_subscription_provider_projects_native_hosted_web_search() -> None:
         "reasoning.encrypted_content",
         "web_search_call.action.sources",
     ]
+
+
+def test_subscription_provider_hosted_web_search_preflight_uses_model_catalog() -> None:
+    def catalog(model: str) -> ModelCatalog:
+        return ModelCatalog(
+            catalog_version="app",
+            generated_at="2026-09-30",
+            models=(
+                ModelInfo(
+                    provider_name="openai",
+                    model=model,
+                    match="exact",
+                    tool_calling=True,
+                    hosted_web_search=True,
+                    provenance=Provenance(
+                        source="application",
+                        url="https://example.test/models",
+                        as_of="2026-09-30",
+                    ),
+                ),
+            ),
+        )
+
+    bundled = OpenAISubscriptionProvider(auth=StaticSubscriptionAuth())
+    bundled.preflight_hosted_tools(
+        model="gpt-5.6-luna", hosted_tools=(OpenAIWebSearch(),), options={}
+    )
+    with pytest.raises(HostedToolCapabilityError, match="not established for model"):
+        bundled.preflight_hosted_tools(
+            model="gpt-6.1-sol", hosted_tools=(OpenAIWebSearch(),), options={}
+        )
+
+    custom = OpenAISubscriptionProvider(
+        auth=StaticSubscriptionAuth(), model_catalog=catalog("gpt-6.1-sol")
+    )
+    custom.preflight_hosted_tools(
+        model="gpt-6.1-sol", hosted_tools=(OpenAIWebSearch(),), options={}
+    )
+    with pytest.raises(HostedToolCapabilityError, match="not established for model"):
+        custom.preflight_hosted_tools(
+            model="gpt-5.6-luna", hosted_tools=(OpenAIWebSearch(),), options={}
+        )
 
 
 def test_subscription_provider_maps_backend_hosted_tool_rejection_to_capability_error() -> None:

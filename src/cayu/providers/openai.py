@@ -5,6 +5,7 @@ import json
 import re
 from collections.abc import AsyncIterator, Iterable, Mapping
 from dataclasses import replace
+from functools import cache
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Protocol, cast
 from urllib.parse import quote, urlencode
@@ -22,6 +23,7 @@ from cayu.artifacts.attachments import (
     file_attachment_from_payload,
     resolved_file_attachments_from_options,
 )
+from cayu.budgets.pricing import ModelCatalog, default_model_catalog
 from cayu.context.thinking import ThinkingConfig
 from cayu.embeddings import (
     TextEmbedding,
@@ -207,15 +209,12 @@ _OPENAI_TOKEN_COUNT_FIELDS = frozenset(
         "parallel_tool_calls",
     }
 )
-_OPENAI_HOSTED_WEB_SEARCH_MODELS = frozenset(
-    {
-        "chat-latest",
-        "gpt-5.6",
-        "gpt-5.6-luna",
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-    }
-)
+# Hosted web search support is a model-catalog fact (``ModelInfo.hosted_web_search``),
+# maintained with the catalog's other verified facts. ``chat-latest`` is the one exception:
+# OpenAI documents it as a moving pointer to the latest ChatGPT Instant model, so it has no
+# stable identity, price, or capability snapshot to record in a catalog. Its official model
+# page lists ``web_search``; it is admitted only when the active catalog has no record for it.
+_OPENAI_HOSTED_WEB_SEARCH_POINTER_MODELS = frozenset({"chat-latest"})
 _PROTECTED_HEADER_NAMES = {
     "authorization",
     "content-type",
@@ -231,6 +230,31 @@ _OPENAI_POINTER_INDEX_RE = re.compile(r"0|[1-9][0-9]*")
 _OPENAI_SCHEMA_PREFLIGHT_MAX_DEPTH = 128
 _OPENAI_NATIVE_CAPABILITY_MAX_MODELS = 256
 _OPENAI_NATIVE_CAPABILITY_MODEL_MAX_BYTES = 1024
+
+
+@cache
+def _bundled_model_catalog() -> ModelCatalog:
+    # Private, never-exposed copy: ``default_model_catalog()`` reparses on every call.
+    return default_model_catalog()
+
+
+def _copy_model_catalog(value: ModelCatalog | None) -> ModelCatalog | None:
+    if value is None:
+        return None
+    if type(value) is not ModelCatalog:
+        raise TypeError("model_catalog must be a ModelCatalog instance or None.")
+    return ModelCatalog.model_validate(value.model_dump(mode="python"))
+
+
+def _openai_hosted_web_search_established(
+    model: str,
+    model_catalog: ModelCatalog | None,
+) -> bool:
+    catalog = _bundled_model_catalog() if model_catalog is None else model_catalog
+    info = catalog.resolve(provider_name="openai", model=model)
+    if info is not None:
+        return info.hosted_web_search
+    return model in _OPENAI_HOSTED_WEB_SEARCH_POINTER_MODELS
 
 
 def _copy_exact_model_allowlist(
@@ -1114,6 +1138,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             hosted_tools=hosted_tools,
             options=options,
             endpoint_supported=self.hosted_web_search_supported,
+            model_catalog=self.model_catalog,
         )
 
     def supports_targeted_tool_projection(self, *, model: str, protocol: str) -> bool:
@@ -1248,6 +1273,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         extra_headers: Mapping[str, str] | None = None,
         reasoning_state: str = "inline",
         hosted_web_search_supported: bool | None = None,
+        model_catalog: ModelCatalog | None = None,
         additional_tools_models: Iterable[str] | None = None,
         client_tool_search_models: Iterable[str] | None = None,
         hosted_tool_search_models: Iterable[str] | None = None,
@@ -1275,6 +1301,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             if hosted_web_search_supported is None
             else hosted_web_search_supported
         )
+        self.model_catalog = _copy_model_catalog(model_catalog)
         self.additional_tools_models = _copy_exact_model_allowlist(
             additional_tools_models,
             field_name="additional_tools_models",
@@ -7337,6 +7364,7 @@ def _preflight_openai_hosted_tools(
     hosted_tools: tuple[OpenAIWebSearch, ...],
     options: dict[str, Any],
     endpoint_supported: bool = True,
+    model_catalog: ModelCatalog | None = None,
 ) -> None:
     require_clean_nonblank(model, "model")
     if type(hosted_tools) is not tuple or any(
@@ -7352,7 +7380,7 @@ def _preflight_openai_hosted_tools(
             "OpenAI hosted web search is not established for this custom endpoint; "
             "set hosted_web_search_supported=True only after verifying its Responses contract."
         )
-    if model not in _OPENAI_HOSTED_WEB_SEARCH_MODELS:
+    if not _openai_hosted_web_search_established(model, model_catalog):
         raise HostedToolCapabilityError(
             f"OpenAI hosted web search support is not established for model {model!r}."
         )
@@ -7363,7 +7391,7 @@ def _preflight_openai_hosted_tools(
             "OpenAI hosted web search does not support minimal reasoning effort."
         )
     if any(tool.return_token_budget == "unlimited" for tool in hosted_tools) and not re.match(
-        r"^gpt-5(?:[.-]|$)", model
+        r"^gpt-(?:[5-9]|[1-9]\d+)(?:[.-]|$)", model
     ):
         raise HostedToolCapabilityError(
             "OpenAI return_token_budget='unlimited' requires a GPT-5+ reasoning model."

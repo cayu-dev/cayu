@@ -30,6 +30,7 @@ import httpx
 from cayu._validation import require_clean_nonblank
 from cayu._version import package_version
 from cayu.budgets.billing import BillingIdentity
+from cayu.budgets.pricing import ModelCatalog
 from cayu.context.thinking import ThinkingConfig
 from cayu.messages import Message
 from cayu.providers._api_error_diagnostics import api_error_diagnostic_fields
@@ -80,6 +81,7 @@ from cayu.providers.openai import (
     OpenAIProtocolError,
     OpenAITransport,
     OpenAIUnsupportedSearchSourceError,
+    _copy_model_catalog,
     _effective_openai_request_options,
     _openai_tool,
     _preflight_openai_hosted_tools,
@@ -702,6 +704,7 @@ class OpenAISubscriptionProvider(ModelProvider):
             hosted_tools=hosted_tools,
             options=options,
             endpoint_supported=self.hosted_web_search_supported,
+            model_catalog=self.model_catalog,
         )
 
     def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
@@ -735,6 +738,7 @@ class OpenAISubscriptionProvider(ModelProvider):
         transport: OpenAITransport | None = None,
         extra_headers: Mapping[str, str] | None = None,
         hosted_web_search_supported: bool | None = None,
+        model_catalog: ModelCatalog | None = None,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
         self.auth = auth if auth is not None else OpenAISubscriptionAuth()
@@ -753,6 +757,7 @@ class OpenAISubscriptionProvider(ModelProvider):
             if hosted_web_search_supported is None
             else hosted_web_search_supported
         )
+        self.model_catalog = _copy_model_catalog(model_catalog)
         self.timeout_s = positive_finite_seconds(timeout_s, "timeout_s")
         self._stream_deadlines = _resolve_provider_stream_deadlines(
             stream_deadlines=stream_deadlines,

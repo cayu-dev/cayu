@@ -637,6 +637,9 @@ class ModelInfo(BaseModel):
     reasoning: StrictBool = False
     structured_output: StrictBool = False
     prompt_caching: StrictBool = False
+    # Provider-hosted web search on this provider's native API is established for this model
+    # (OpenAI: the Responses ``web_search`` tool). False means unsupported or not established.
+    hosted_web_search: StrictBool = False
     # lifecycle
     release_date: date | None = None
     knowledge_cutoff: date | None = None

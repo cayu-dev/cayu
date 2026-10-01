@@ -21,7 +21,7 @@ from cayu.artifacts.attachments import (
     file_attachment,
 )
 from cayu.budgets.base import BudgetLimit
-from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.budgets.pricing import ModelCatalog, ModelInfo, ModelPrice, PriceBook, Provenance
 from cayu.configuration import CayuConfig, RunDefaults
 from cayu.context.base import RecentTurnsContextPolicy
 from cayu.embeddings import TextEmbeddingRequest
@@ -358,6 +358,95 @@ def test_openai_hosted_web_search_unlimited_budget_requires_gpt5_reasoning() -> 
             model="chat-latest",
             hosted_tools=(OpenAIWebSearch(return_token_budget="unlimited"),),
             options={},
+        )
+
+
+def _hosted_search_catalog(*records: tuple[str, bool]) -> ModelCatalog:
+    return ModelCatalog(
+        catalog_version="app",
+        generated_at="2026-09-30",
+        models=tuple(
+            ModelInfo(
+                provider_name="openai",
+                model=model,
+                match="exact",
+                tool_calling=True,
+                reasoning=True,
+                hosted_web_search=supported,
+                provenance=Provenance(
+                    source="application",
+                    url="https://example.test/models",
+                    as_of="2026-09-30",
+                ),
+            )
+            for model, supported in records
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra", "chat-latest"],
+)
+def test_openai_hosted_web_search_accepts_bundled_catalog_models(model: str) -> None:
+    from cayu.providers.hosted import OpenAIWebSearch
+
+    provider = OpenAIProvider(api_key="test-key", transport=RecordingTransport())
+
+    provider.preflight_hosted_tools(model=model, hosted_tools=(OpenAIWebSearch(),), options={})
+
+
+def test_openai_hosted_web_search_accepts_application_catalog_declaration() -> None:
+    from cayu.providers.hosted import HostedToolCapabilityError, OpenAIWebSearch
+
+    default_provider = OpenAIProvider(api_key="test-key", transport=RecordingTransport())
+    with pytest.raises(HostedToolCapabilityError, match="not established for model 'gpt-6.1-sol'"):
+        default_provider.preflight_hosted_tools(
+            model="gpt-6.1-sol",
+            hosted_tools=(OpenAIWebSearch(),),
+            options={},
+        )
+
+    catalog = _hosted_search_catalog(("gpt-6.1-sol", True))
+    provider = OpenAIProvider(
+        api_key="test-key",
+        transport=RecordingTransport(),
+        model_catalog=catalog,
+    )
+    for tool in (OpenAIWebSearch(), OpenAIWebSearch(return_token_budget="unlimited")):
+        provider.preflight_hosted_tools(model="gpt-6.1-sol", hosted_tools=(tool,), options={})
+
+    # The provider keeps its own validated copy of the application catalog.
+    assert provider.model_catalog == catalog
+    assert provider.model_catalog is not catalog
+
+
+def test_openai_hosted_web_search_application_catalog_replaces_bundled_facts() -> None:
+    from cayu.providers.hosted import HostedToolCapabilityError, OpenAIWebSearch
+
+    provider = OpenAIProvider(
+        api_key="test-key",
+        transport=RecordingTransport(),
+        model_catalog=_hosted_search_catalog(("gpt-5.6-sol", False), ("chat-latest", False)),
+    )
+
+    # No merge with the bundled catalog: a declared False record and an absent model both
+    # fail closed, and a catalog record overrides the chat-latest pointer fallback.
+    for model in ("gpt-5.6-sol", "gpt-5.6-luna", "chat-latest"):
+        with pytest.raises(HostedToolCapabilityError, match=f"not established for model {model!r}"):
+            provider.preflight_hosted_tools(
+                model=model,
+                hosted_tools=(OpenAIWebSearch(),),
+                options={},
+            )
+
+
+def test_openai_provider_rejects_non_catalog_model_catalog() -> None:
+    with pytest.raises(TypeError, match="model_catalog must be a ModelCatalog"):
+        OpenAIProvider(
+            api_key="test-key",
+            transport=RecordingTransport(),
+            model_catalog={"models": []},  # ty: ignore[invalid-argument-type]
         )
 
 
