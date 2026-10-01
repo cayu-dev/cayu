@@ -265,6 +265,70 @@ def test_continuation_close_replays_without_repeating_tools(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("entrance", ["approve", "deny", "answer"])
+def test_continuation_retry_keeps_denied_sibling_unexecuted(continuation_store_factory, entrance):
+    async def scenario():
+        async with continuation_store_factory(fault="terminal-ack") as store:
+            app, provider, tool = _runtime(store, entrance, dynamic=True)
+            request = await _pause(app, entrance, f"denied-terminal-ack-{entrance}")
+            first = await _drain(_resolve(app, request))
+            assert store.lost_terminal_ack
+            assert first[-1].type is EventType.SESSION_INTERRUPTED
+            calls = list(tool.calls)
+            assert calls == (
+                []
+                if entrance == "deny"
+                else ([{"value": "first"}] if entrance == "approve" else []) + [{"value": "second"}]
+            )
+
+            retry = await _drain(_resolve(app, request))
+            assert retry[-1].type is EventType.SESSION_COMPLETED, retry[-1].payload
+            assert tool.calls == calls and len(provider.requests) == 2
+            events = await store.load_events(request.session_id)
+            terminals = [event for event in events if event.type in _TERMINALS]
+            assert [event.payload["tool_call_id"] for event in terminals] == [
+                "pause",
+                "allowed",
+                "denied",
+            ]
+            [denied] = [event for event in terminals if event.payload["tool_call_id"] == "denied"]
+            assert denied.type is EventType.TOOL_CALL_BLOCKED
+            assert denied.payload["result"]["structured"]["executed"] is False
+            assert denied.payload["result"]["structured"]["outcome_unknown"] is False
+            assert not any(
+                event.type is EventType.TOOL_CALL_STARTED
+                and event.payload.get("tool_call_id") == "denied"
+                for event in events
+            )
+            if entrance == "deny":
+                assert not any(event.type is EventType.TOOL_CALL_STARTED for event in events)
+                assert terminals[0].type is EventType.TOOL_CALL_APPROVAL_DENIED
+                assert terminals[1].type is EventType.TOOL_CALL_APPROVAL_DENIED
+                assert terminals[1].payload["result"]["structured"]["executed"] is False
+                assert terminals[1].payload["result"]["structured"]["outcome_unknown"] is False
+
+            transcript = await store.load_transcript(request.session_id)
+            close = store.close_requests[0]
+            receipt = await store.load_runtime_publication_receipt(
+                request.session_id, close.publication_id
+            )
+            assert receipt is not None
+            assert {event.id for event in terminals} <= {
+                reference.event_id for reference in receipt.referenced_events
+            }
+            await _drain(_resolve(app, request))
+            assert tool.calls == calls and len(provider.requests) == 2
+            assert await store.load_transcript(request.session_id) == transcript
+            assert [
+                event
+                for event in await store.load_events(request.session_id)
+                if event.type in _TERMINALS
+            ] == terminals
+            assert await app.drain_background_interruptions()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("entrance", ["approve", "answer"])
 def test_continuation_retry_preserves_partial_terminal_publication(
     continuation_store_factory, entrance

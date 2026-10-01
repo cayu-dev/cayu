@@ -88,6 +88,9 @@ _TOOL_ROUND_TERMINAL_EVENT_TYPES = frozenset(
         EventType.TOOL_CALL_APPROVAL_DENIED,
     }
 )
+_NONEXECUTED_TERMINAL_EVENT_TYPES = frozenset(
+    {EventType.TOOL_CALL_BLOCKED, EventType.TOOL_CALL_APPROVAL_DENIED}
+)
 
 
 class UnsafeToolRoundContinuationError(RuntimeError):
@@ -1495,12 +1498,14 @@ def _recovery_safe_staged_terminals(
             safe.append(StagedToolCallTerminal.model_validate(item.model_dump(mode="json")))
             continue
         terminal_controls = tool_results.runtime_terminal_controls(item.event.payload)
+        never_executed = item.event.type in _NONEXECUTED_TERMINAL_EVENT_TYPES
         fixed_result = ToolResult(
             content="Tool result unavailable because invocation secret scope was incomplete.",
             structured={
-                "error": "invalid_tool_output",
+                **({} if never_executed else {"error": "invalid_tool_output"}),
                 "outcome_unknown": True,
                 **terminal_controls,
+                **({"executed": False, "outcome_unknown": False} if never_executed else {}),
             },
             is_error=True,
         )
@@ -1513,7 +1518,10 @@ def _recovery_safe_staged_terminals(
         payload["recovered"] = True
         payload["secret_scope_incomplete"] = True
         event = item.event.model_copy(
-            update={"type": EventType.TOOL_CALL_FAILED, "payload": payload},
+            update={
+                "type": item.event.type if never_executed else EventType.TOOL_CALL_FAILED,
+                "payload": payload,
+            },
             deep=True,
         )
         safe.append(
@@ -1649,14 +1657,19 @@ def hook_scope_unavailable_recovery_event(event: Event) -> Event:
 
     if type(event) is not Event or event.type not in _TOOL_ROUND_TERMINAL_EVENT_TYPES:
         raise TypeError("Recovered hook quarantine requires a terminal tool event.")
+    # Quarantine removes unsafe output, not the durable fact that a denied call
+    # never executed. Reclassifying it as failed would invent an executed outcome
+    # without a started event and make continuation reconciliation reject it.
+    never_executed = event.type in _NONEXECUTED_TERMINAL_EVENT_TYPES
     result = ToolResult(
         content=(
             "Tool result unavailable because its invocation-secret scope could not "
             "be reconstructed before recovery hooks."
         ),
         structured={
-            "error": "invalid_tool_output",
-            "outcome_unknown": True,
+            **({} if never_executed else {"error": "invalid_tool_output"}),
+            "outcome_unknown": not never_executed,
+            **({"executed": False} if never_executed else {}),
             "recovered": True,
             "reason": "recovery_hook_secret_scope_unavailable",
         },
@@ -1670,7 +1683,7 @@ def hook_scope_unavailable_recovery_event(event: Event) -> Event:
     return copy_event(
         event.model_copy(
             update={
-                "type": EventType.TOOL_CALL_FAILED,
+                "type": event.type if never_executed else EventType.TOOL_CALL_FAILED,
                 "payload": payload,
             }
         )
