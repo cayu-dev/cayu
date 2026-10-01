@@ -896,7 +896,7 @@ yourself, use the Cayu feature that already does it:
 | A web UI that shows progress or live results | `mount_cayu(...)` and `connect()` from the served `client.js`. Do not poll on a fixed timer. | `cayu guide app-ui` |
 | Work that runs in the background or later | `TaskStore`, dispatcher and worker | `cayu guide references#background-work` |
 | Remembering facts across conversations | The knowledge tools (remember, search) | `cayu guide references#knowledge` |
-| Running commands or parsing files in isolation | An `Environment` with a `Runner` such as `DockerRunner` | `cayu guide references#environments` |
+| Running a fixed command or parsing files in isolation | `cayu new NAME --execution docker` on the agent preset: a hardened per-session sandbox your tools reach with `require_sandbox_runner(ctx)`. Don't switch to the coding preset for this. | `cayu guide references#environments` |
 | Another agent for a sub-task | Subagent tools | `cayu guide references#subagents` |
 | Spending or usage limits | Budgets and run limits | `cayu guide references#cost-control` |
 | A public or multi-user product | `cayu new NAME --preset service` | `cayu guide references#server` |
@@ -2599,7 +2599,7 @@ def project_files(
     dev_dependencies = ["pytest"]
     if plan.preset != "service":
         dev_dependencies.insert(0, f"cayu[postgres,server]=={version}")
-    if plan.preset == "service" or plan.execution == "docker":
+    if plan.preset == "service" or (plan.preset == "coding" and plan.execution == "docker"):
         dev_dependencies.append("ruff>=0.15.15,<0.16")
 
     def render(
@@ -3028,7 +3028,15 @@ def _render_new_receipt(
     print("  Scaffold contract: pyproject.toml [tool.cayu.scaffold]")
     print(f"  cd {target}")
     if plan.preset == "coding" and plan.execution == "docker":
-        print("  Before proof: review and fill the null pins in docker-coding-build.json")
+        print(
+            "  Before proof: uv run --no-sync python build_coding_image.py --resolve-pins, "
+            "then review docker-coding-build.json"
+        )
+    if plan.preset == "agent" and plan.execution == "docker":
+        print(
+            "  Execution: hardened Docker sandbox for the agent's own tools "
+            "(network disabled; data/sandbox is synced to /workspace)"
+        )
     for command in plan.verification_commands():
         label = (
             "Build and record image: "

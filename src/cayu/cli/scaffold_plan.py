@@ -129,6 +129,7 @@ PRESETS: tuple[PresetSpec, ...] = (
             "recovery",
             "tasks",
         ),
+        supported_executions=("none", "docker"),
     ),
     PresetSpec(
         name="service",
@@ -201,8 +202,11 @@ ADAPTERS: tuple[AdapterSpec, ...] = (
     AdapterSpec(
         name="docker",
         kind="execution",
-        summary="Admitted no-network Docker execution for trusted repositories.",
-        supported_presets=("coding",),
+        summary=(
+            "No-network Docker execution: admitted repository commands for the coding "
+            "preset, a hardened sandbox for the agent preset's own tools."
+        ),
+        supported_presets=("agent", "coding"),
         dependencies=("docker",),
     ),
 )
@@ -370,15 +374,19 @@ class ApplicationPlan:
             "service": "uv run --no-sync pytest -q tests/test_public_service_security.py",
             "coding": "uv run --no-sync pytest -q tests/test_coding_composition.py",
         }[self.preset]
-        setup = (
-            (
+        if self.execution == "docker" and self.preset == "agent":
+            setup: tuple[str, ...] = (
+                "uv sync --extra dev",
+                "uv run --no-sync python sandbox_image.py --resolve",
+            )
+        elif self.execution == "docker":
+            setup = (
                 "uv lock",
                 "uv sync --extra dev",
                 "uv run --no-sync python build_coding_image.py",
             )
-            if self.execution == "docker"
-            else ("uv sync --extra dev",)
-        )
+        else:
+            setup = ("uv sync --extra dev",)
         commands = (
             *setup,
             "uv run --no-sync cayu inspect --json",

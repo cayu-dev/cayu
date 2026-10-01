@@ -435,6 +435,23 @@ def test_docker_plan_puts_image_construction_before_runtime_verification() -> No
     )
 
 
+def test_agent_docker_plan_pins_the_sandbox_image_before_verification() -> None:
+    plan = normalize_application_plan(
+        name="auditor",
+        agent_name="auditor",
+        preset="agent",
+        execution="docker",
+    )
+
+    commands = plan.verification_commands()
+    assert commands[:2] == (
+        "uv sync --extra dev",
+        "uv run --no-sync python sandbox_image.py --resolve",
+    )
+    assert plan.coding_toolchain is None
+    assert plan.coding_command_authority is None
+
+
 def test_docker_coding_plan_records_explicit_toolchain_and_command_authority() -> None:
     plan = normalize_application_plan(
         name="coder",

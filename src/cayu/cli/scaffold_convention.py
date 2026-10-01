@@ -37,7 +37,7 @@ from configuration.providers import (
 )
 from configuration.runtime import build_runtime_options
 from configuration.storage import build_stores
-from environments.local import build_local_environment
+__ENVIRONMENT_IMPORTS__
 from knowledge.retrieval import build_knowledge_scope
 from memory.context import build_context_policy
 
@@ -86,9 +86,7 @@ def build_app(
         knowledge_store=stores.knowledge_store,
         knowledge_scope=knowledge_scope,
     )
-    if environment is not None:
-        app.register_environment(environment, default=True)
-    register_agents(
+__ENVIRONMENT_REGISTRATION__    register_agents(
         app,
         provider_override=provider,
         context_policy=build_context_policy(),
@@ -891,6 +889,316 @@ def build_local_environment(
     )
 '''
 
+_SANDBOX_ENVIRONMENT_PY = """\"\"\"Hardened Docker sandbox for the agent's own tools; the model gets no shell.
+
+The sandbox is Cayu's ``DockerCodingEnvironmentFactory`` without its Git
+baseline: one container per session with ``data/sandbox`` synced to /workspace,
+no network, a read-only root filesystem, a non-root user and bounded CPU, memory
+and processes. Cayu records each container before creating it, reconnects to the
+same container on resume, keeps it when copy-back fails so recovery can retry,
+and removes it once its output is safely back on the host.
+\"\"\"
+
+import json
+import shutil
+from pathlib import Path
+
+from cayu import (
+    ArtifactStore,
+    DockerCodingEnvironmentFactory,
+    DockerCodingToolchainProfile,
+    DockerImageIdentity,
+    Environment,
+    EnvironmentSpec,
+    ExecutionProfileBehaviorIdentity,
+    KnowledgeAccessScope,
+    KnowledgeStore,
+    LocalWorkspace,
+    Runner,
+    ToolContext,
+)
+
+_PROJECT_ROOT = Path(__file__).parents[1]
+# Hermetic tests set this to False (tests/conftest.py) so no container starts.
+START_CONTAINERS = True
+
+
+def require_sandbox_runner(ctx: ToolContext) -> Runner:
+    \"\"\"Return the session's sandbox runner, or explain why the sandbox is unavailable.\"\"\"
+
+    if ctx.runner is None:
+        raise RuntimeError(
+            "The Docker sandbox is unavailable: pin its image with "
+            "`uv run --no-sync python sandbox_image.py --resolve` and make sure Docker "
+            "is running"
+        )
+    return ctx.runner
+
+
+def sandbox_root() -> Path:
+    \"\"\"Host folder synced into the container at /workspace for every session.\"\"\"
+
+    return _PROJECT_ROOT / "data" / "sandbox"
+
+
+def _configuration() -> dict:
+    return json.loads(
+        (_PROJECT_ROOT / "docker-sandbox.json").read_text(encoding="utf-8")
+    )
+
+
+def configured_sandbox_image() -> str | None:
+    \"\"\"Return the digest-pinned image from docker-sandbox.json, or None if unpinned.\"\"\"
+
+    image = _configuration().get("image")
+    if image is None:
+        return None
+    if type(image) is not str or "@sha256:" not in image:
+        raise RuntimeError(
+            "docker-sandbox.json image must be a digest-pinned reference"
+        )
+    return image
+
+
+def sandbox_toolchain_profile(image: str) -> DockerCodingToolchainProfile:
+    \"\"\"Describe the pinned image: no commands, probes or dependency inputs.\"\"\"
+
+    architecture = _configuration().get("platform_architecture")
+    if architecture not in {"amd64", "arm64"}:
+        raise RuntimeError(
+            "docker-sandbox.json needs platform_architecture; rerun "
+            "`uv run --no-sync python sandbox_image.py --resolve`"
+        )
+    return DockerCodingToolchainProfile(
+        profile_id="__PROJECT_NAME__-sandbox",
+        revision="1",
+        image_identity=DockerImageIdentity(reference=image),
+        platform_architecture=architecture,
+    )
+
+
+def build_sandbox_factory(
+    *,
+    artifact_store: ArtifactStore | None,
+    knowledge_store: KnowledgeStore | None,
+    knowledge_scope: KnowledgeAccessScope | None,
+) -> DockerCodingEnvironmentFactory | None:
+    \"\"\"Return the Docker sandbox factory, or None when the image is not pinned.\"\"\"
+
+    image = configured_sandbox_image()
+    if image is None or not START_CONTAINERS:
+        return None
+    root = sandbox_root()
+    root.mkdir(parents=True, exist_ok=True)
+    return DockerCodingEnvironmentFactory(
+        source_workspace=LocalWorkspace(root, workspace_id="sandbox"),
+        toolchain_profile=sandbox_toolchain_profile(image),
+        artifact_store=artifact_store,
+        knowledge_store=knowledge_store,
+        knowledge_access_scope=knowledge_scope,
+        docker_path=shutil.which("docker"),
+        git_baseline=False,
+    )
+
+
+def build_unsandboxed_environment(collaborators: Environment | None) -> Environment:
+    \"\"\"Same workspace and stores without a runner, so sandboxed tools fail closed.\"\"\"
+
+    root = sandbox_root()
+    root.mkdir(parents=True, exist_ok=True)
+    return Environment(
+        sandbox_environment_spec(),
+        workspace=LocalWorkspace(root, workspace_id="sandbox"),
+        artifact_store=None if collaborators is None else collaborators.artifact_store,
+        knowledge_store=None if collaborators is None else collaborators.knowledge_store,
+        knowledge_access_scope=(
+            None if collaborators is None else collaborators.knowledge_access_scope
+        ),
+    )
+
+
+def sandbox_environment_spec() -> EnvironmentSpec:
+    return EnvironmentSpec(
+        name="sandbox",
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="__PROJECT_NAME__.sandbox_environment_spec",
+            behavior_version="2",
+            implementation_version="1",
+        ),
+        metadata={
+            "runner": "docker",
+            "network": "none",
+            "image": configured_sandbox_image(),
+        },
+    )
+"""
+
+_SANDBOX_IMAGE_PY = """\"\"\"Pin the agent sandbox image by digest.
+
+    uv run --no-sync python sandbox_image.py --resolve
+
+pulls the configured tag and records its registry digest and CPU architecture in
+docker-sandbox.json for review. An image that is already pinned is left unchanged.
+\"\"\"
+
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+_CONFIGURATION = Path(__file__).resolve().parent / "docker-sandbox.json"
+
+
+def main() -> int:
+    configuration = json.loads(_CONFIGURATION.read_text(encoding="utf-8"))
+    if sys.argv[1:] != ["--resolve"]:
+        print(f"image: {configuration.get('image') or 'not pinned'}")
+        print("Run with --resolve to pin the configured image_tag by digest.")
+        return 0
+    if configuration.get("image") and configuration.get("platform_architecture"):
+        print(f"Already pinned: {configuration['image']}")
+        return 0
+    docker = shutil.which("docker")
+    if docker is None:
+        raise SystemExit("Docker CLI is unavailable")
+    image = configuration.get("image") or configuration["image_tag"]
+    subprocess.run(
+        [docker, "pull", "--quiet", image], check=True, stdout=subprocess.DEVNULL
+    )
+    inspected = subprocess.run(
+        [
+            docker,
+            "image",
+            "inspect",
+            "--format",
+            '{"digests": {{json .RepoDigests}}, "architecture": {{json .Architecture}}}',
+            image,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    details = json.loads(inspected.stdout)
+    if not configuration.get("image"):
+        if not details["digests"]:
+            raise SystemExit(f"{image} has no registry digest")
+        configuration["image"] = details["digests"][0]
+    if details["architecture"] not in {"amd64", "arm64"}:
+        raise SystemExit(f"Unsupported image architecture: {details['architecture']}")
+    configuration["platform_architecture"] = details["architecture"]
+    _CONFIGURATION.write_text(
+        json.dumps(configuration, indent=2) + "\\n", encoding="utf-8"
+    )
+    print(
+        f"Pinned {configuration['image']} ({details['architecture']}). "
+        "Review docker-sandbox.json and commit it."
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"""
+
+_SANDBOX_TEST_CONFTEST_PY = """\"\"\"Hermetic tests never start the Docker sandbox container.
+
+Sessions then get the sandbox workspace without a runner. The live check in
+tests/test_sandbox_live.py turns containers back on.
+\"\"\"
+
+import pytest
+
+from environments import sandbox
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sandbox, "START_CONTAINERS", False)
+"""
+
+_SANDBOX_LIVE_TEST_PY = """\"\"\"Opt-in check that the Docker sandbox is really isolated.
+
+uv run --no-sync python sandbox_image.py --resolve
+CAYU_SANDBOX_LIVE=1 uv run --no-sync pytest -q tests/test_sandbox_live.py
+\"\"\"
+
+import asyncio
+import os
+
+import pytest
+from cayu import (
+    EnvironmentFactoryReleaseAction,
+    EnvironmentFactoryRequest,
+    ExecCommand,
+)
+
+from environments import sandbox
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("CAYU_SANDBOX_LIVE") != "1",
+    reason="Live Docker sandbox check; set CAYU_SANDBOX_LIVE=1",
+)
+
+_PROBE = \"\"\"
+import os, socket
+try:
+    socket.create_connection(("1.1.1.1", 53), timeout=2)
+    network = "open"
+except OSError:
+    network = "blocked"
+try:
+    open("/etc/cayu-probe", "w")
+    root_fs = "writable"
+except OSError:
+    root_fs = "readonly"
+print(network, "root" if os.getuid() == 0 else "nonroot", root_fs)
+\"\"\"
+
+
+def test_sandbox_has_no_network_root_or_writable_root_filesystem(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox, "START_CONTAINERS", True)
+    assert sandbox.configured_sandbox_image(), (
+        "Pin the image first: uv run --no-sync python sandbox_image.py --resolve"
+    )
+
+    async def exercise() -> None:
+        factory = sandbox.build_sandbox_factory(
+            artifact_store=None, knowledge_store=None, knowledge_scope=None
+        )
+        assert factory is not None
+        created = await factory.create(
+            EnvironmentFactoryRequest(
+                session_id="sandbox-live-check",
+                agent_name="sandbox-probe",
+                environment_name="sandbox",
+            )
+        )
+        try:
+            runner = created.environment.runner
+            assert runner is not None
+            result = await runner.exec(
+                ExecCommand(argv=["python3", "-c", _PROBE]), timeout_s=60
+            )
+            assert result.exit_code == 0, result.stderr
+            assert result.stdout.split() == ["blocked", "nonroot", "readonly"]
+        finally:
+            assert created.release is not None
+            await created.release(EnvironmentFactoryReleaseAction.DISCARD)
+
+    asyncio.run(exercise())
+"""
+
+_SANDBOX_IMAGE_CONFIG = """{
+  "schema_version": "1",
+  "image_tag": "python:3.13-slim-bookworm",
+  "image": null,
+  "platform_architecture": null
+}
+"""
+
 _TEST_APPLICATION_PY = '''"""Composition-root contract tests."""
 
 from cayu import (
@@ -1442,6 +1750,7 @@ def convention_files(
     """Return the complete architecture overlay for one normalized plan."""
 
     selected = set(plan.capabilities)
+    agent_sandbox = plan.preset == "agent" and plan.execution == "docker"
     public_app_factories = (
         '["build_app", "build_coding_product_application"]'
         if plan.preset == "coding" and plan.execution == "docker"
@@ -1506,6 +1815,37 @@ def convention_files(
                 if "approvals" in selected
                 else "ToolPolicyDecision.DENY"
             ),
+            "__ENVIRONMENT_IMPORTS__": (
+                "from environments.local import build_local_environment\n"
+                "from environments.sandbox import (\n"
+                "    build_sandbox_factory,\n"
+                "    build_unsandboxed_environment,\n"
+                "    sandbox_environment_spec,\n"
+                ")"
+                if agent_sandbox
+                else "from environments.local import build_local_environment"
+            ),
+            "__ENVIRONMENT_REGISTRATION__": (
+                "    sandbox = build_sandbox_factory(\n"
+                "        artifact_store=None if environment is None else environment.artifact_store,\n"
+                "        knowledge_store=stores.knowledge_store,\n"
+                "        knowledge_scope=knowledge_scope,\n"
+                "    )\n"
+                "    if sandbox is None:\n"
+                "        app.register_environment(\n"
+                "            build_unsandboxed_environment(environment), default=True\n"
+                "        )\n"
+                "    else:\n"
+                "        app.register_environment_factory(\n"
+                "            sandbox_environment_spec(),\n"
+                "            sandbox,\n"
+                "            artifact_store=sandbox.configured_artifact_store,\n"
+                "            default=True,\n"
+                "        )\n"
+                if agent_sandbox
+                else "    if environment is not None:\n"
+                "        app.register_environment(environment, default=True)\n"
+            ),
         }
         return render(template, replacements)
 
@@ -1532,6 +1872,12 @@ def convention_files(
             "CLAUDE.md": _CLAUDE_MD,
         }
     )
+    if agent_sandbox:
+        files["environments/sandbox.py"] = configured(_SANDBOX_ENVIRONMENT_PY)
+        files["sandbox_image.py"] = _SANDBOX_IMAGE_PY
+        files["docker-sandbox.json"] = _SANDBOX_IMAGE_CONFIG
+        files["tests/conftest.py"] = _SANDBOX_TEST_CONFTEST_PY
+        files["tests/test_sandbox_live.py"] = _SANDBOX_LIVE_TEST_PY
     if "memory" in selected:
         files["tests/test_memory.py"] = configured(_TEST_MEMORY_PY)
     if {
@@ -1613,6 +1959,49 @@ def local_database_path(plan: ApplicationPlan) -> str:
     return ".cayu/runtime/cayu.db" if plan.preset == "coding" else "data/cayu.db"
 
 
+_AGENT_SANDBOX_GUIDANCE = """
+## Docker sandbox
+
+This project runs its own tools' commands in a hardened Docker sandbox
+(`environments/sandbox.py`): one container per session, no network, a read-only root
+filesystem, a non-root user and bounded CPU, memory and processes. Files in
+`data/sandbox/` are synced to `/workspace` before a run and back afterwards. The
+model has no shell; tools decide exactly which command runs.
+
+Pin the image once and review it: `uv run --no-sync python sandbox_image.py --resolve`
+records the `python:3.13-slim-bookworm` digest and architecture in `docker-sandbox.json` (edit
+`image_tag` first to use another image). Until it is pinned, sessions run without
+a runner and sandboxed tools fail closed.
+
+A tool runs a fixed command like this:
+
+```python
+from cayu import ExecCommand, ToolResult
+
+from environments.sandbox import require_sandbox_runner
+
+
+async def run(self, ctx, args):
+    result = await require_sandbox_runner(ctx).exec(
+        ExecCommand(argv=["python3", "scripts/scan.py", args["path"]]),
+        timeout_s=120,
+    )
+    return ToolResult(content=result.stdout, structured={"exit_code": result.exit_code})
+```
+
+Put the scripts a tool runs under `data/sandbox/` so they are synced too. Hermetic
+tests never start containers (`tests/conftest.py`); check the real sandbox with
+`CAYU_SANDBOX_LIVE=1 uv run --no-sync pytest -q tests/test_sandbox_live.py`.
+
+The sandbox is Cayu's `DockerCodingEnvironmentFactory` with `git_baseline=False`,
+so crash recovery is Cayu's: a resumed session reconnects to its own container, a
+failed copy-back keeps the container so recovery can retry it, and
+`recover_incomplete_session` removes containers a crashed process left behind.
+To use another image, workspace folder or limits, change `build_sandbox_factory`.
+Use the coding preset only for agents that edit and test a code repository.
+"""
+
+
 def application_guidance(plan: ApplicationPlan) -> str:
     """Return shared concise ownership and working-contract guidance."""
 
@@ -1635,6 +2024,8 @@ def application_guidance(plan: ApplicationPlan) -> str:
     ).replace("__LOCAL_DATABASE__", local_database_path(plan))
     if "memory" in plan.capabilities:
         storage += _MEMORY_KEY_GUIDANCE
+    if plan.preset == "agent" and plan.execution == "docker":
+        storage += _AGENT_SANDBOX_GUIDANCE.replace("__PROJECT_NAME__", plan.name)
     return _capability_summary(plan) + guidance + storage
 
 

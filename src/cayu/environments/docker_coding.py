@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -87,6 +87,10 @@ from cayu.workspaces.revisions import (
 )
 from cayu.workspaces.runner import RunnerWorkspace
 
+if TYPE_CHECKING:
+    from cayu.knowledge.scopes import KnowledgeAccessScope
+    from cayu.storage.memory import KnowledgeStore
+
 DOCKER_CODING_PROTECTED_DIRECTORY_NAMES = (".cayu", ".git", ".runtime")
 _DOCKER_CODING_RUNTIME_EXECUTABLES = ("git", "python3", "rm", "sh", "sleep")
 _GIT_HASH_PATH_CHUNK_BYTES = 24 * 1024
@@ -120,7 +124,7 @@ class _DockerCodingBindAuthority:
     session_id: str
     source: CodingProductSourceCopyAuthority | None
     workspace_baseline: WorkspaceRevisionObservation | None
-    git: _EphemeralGitBaseline
+    git: _EphemeralGitBaseline | None
     git_transformed_baseline_paths: frozenset[str]
 
 
@@ -296,7 +300,12 @@ async def _release_immutable_input_attachments(
 
 
 class DockerCodingWorkspaceBinding(SyncBinding):
-    """Sync a projected host tree and establish an ephemeral guest Git baseline."""
+    """Sync a projected host tree, optionally with an ephemeral guest Git baseline.
+
+    With ``git_baseline=False`` the guest needs no ``git`` executable: copy-in,
+    copy-back, recovery and disposal are unchanged, but no Git evidence is
+    captured and coding-product source-copy authority is unavailable.
+    """
 
     def __init__(
         self,
@@ -307,7 +316,10 @@ class DockerCodingWorkspaceBinding(SyncBinding):
         immutable_input_store: ImmutableInputStore | None = None,
         immutable_input_attachments: Sequence[ImmutableInputAttachment] = (),
         path: str = "/workspace",
+        git_baseline: bool = True,
     ) -> None:
+        if type(git_baseline) is not bool:
+            raise TypeError("git_baseline must be a bool.")
         if not isinstance(target_workspace, RunnerWorkspace):
             raise TypeError("Docker coding target_workspace must be a RunnerWorkspace.")
         if not isinstance(limits, DockerWorkspaceTransferLimits):
@@ -325,12 +337,17 @@ class DockerCodingWorkspaceBinding(SyncBinding):
             )
         if attachments and not isinstance(immutable_input_store, ImmutableInputStore):
             raise ValueError("immutable_input_store is required with immutable input attachments.")
+        if source_copy_authority is not None and not git_baseline:
+            raise ValueError(
+                "Coding product source-copy authority requires the guest Git baseline."
+            )
         expected_exclusions = frozenset(DOCKER_CODING_PROTECTED_DIRECTORY_NAMES)
         if not expected_exclusions.issubset(target_workspace.excluded_directory_names):
             raise ValueError(
                 "Docker coding target workspace must exclude .cayu, .git, and .runtime."
             )
         self._docker_target = target_workspace
+        self._git_baseline = git_baseline
         self._source_copy_authority = source_copy_authority
         self._immutable_input_store = immutable_input_store
         self._immutable_input_attachments = attachments
@@ -429,7 +446,9 @@ class DockerCodingWorkspaceBinding(SyncBinding):
                     raise RuntimeError(
                         "Docker coding copy-in conflicts with the admitted source revision."
                     )
-            git_baseline = await _initialize_ephemeral_git_baseline(runner)
+            git_baseline = (
+                await _initialize_ephemeral_git_baseline(runner) if self._git_baseline else None
+            )
             transformed_baseline_paths = frozenset()
             if copied is not None:
                 transformed = await _git_paths_with_transformed_bytes(
@@ -484,12 +503,16 @@ class DockerCodingWorkspaceBinding(SyncBinding):
                         if authority.workspace_baseline is None
                         else authority.workspace_baseline.model_dump(mode="json")
                     ),
-                    "git": {
-                        "head_revision": authority.git.head_revision,
-                        "staged_entries_sha256": authority.git.staged_entries_sha256,
-                        "tracked_flags_sha256": authority.git.tracked_flags_sha256,
-                        "configuration_sha256": authority.git.configuration_sha256,
-                    },
+                    "git": (
+                        None
+                        if authority.git is None
+                        else {
+                            "head_revision": authority.git.head_revision,
+                            "staged_entries_sha256": authority.git.staged_entries_sha256,
+                            "tracked_flags_sha256": authority.git.tracked_flags_sha256,
+                            "configuration_sha256": authority.git.configuration_sha256,
+                        }
+                    ),
                     "git_transformed_baseline_paths": sorted(
                         authority.git_transformed_baseline_paths
                     ),
@@ -585,31 +608,36 @@ class DockerCodingWorkspaceBinding(SyncBinding):
             ):
                 raise RuntimeError("Docker coding recovery baseline conflicts with its authority.")
         raw_git = authority_state.get("git")
-        if type(raw_git) is not dict or set(raw_git) != {
+        git: _EphemeralGitBaseline | None = None
+        if not self._git_baseline:
+            if raw_git is not None:
+                raise ValueError("Docker coding recovery has Git authority without a baseline.")
+        elif type(raw_git) is not dict or set(raw_git) != {
             "head_revision",
             "staged_entries_sha256",
             "tracked_flags_sha256",
             "configuration_sha256",
         }:
             raise ValueError("Docker coding recovery Git authority is malformed.")
-        git = _EphemeralGitBaseline(
-            head_revision=require_durable_clean_nonblank(
-                raw_git.get("head_revision"),
-                "Docker coding recovery Git head",
-            ),
-            staged_entries_sha256=require_durable_clean_nonblank(
-                raw_git.get("staged_entries_sha256"),
-                "Docker coding recovery staged-entry identity",
-            ),
-            tracked_flags_sha256=require_durable_clean_nonblank(
-                raw_git.get("tracked_flags_sha256"),
-                "Docker coding recovery tracked-flag identity",
-            ),
-            configuration_sha256=require_durable_clean_nonblank(
-                raw_git.get("configuration_sha256"),
-                "Docker coding recovery Git configuration identity",
-            ),
-        )
+        else:
+            git = _EphemeralGitBaseline(
+                head_revision=require_durable_clean_nonblank(
+                    raw_git.get("head_revision"),
+                    "Docker coding recovery Git head",
+                ),
+                staged_entries_sha256=require_durable_clean_nonblank(
+                    raw_git.get("staged_entries_sha256"),
+                    "Docker coding recovery staged-entry identity",
+                ),
+                tracked_flags_sha256=require_durable_clean_nonblank(
+                    raw_git.get("tracked_flags_sha256"),
+                    "Docker coding recovery tracked-flag identity",
+                ),
+                configuration_sha256=require_durable_clean_nonblank(
+                    raw_git.get("configuration_sha256"),
+                    "Docker coding recovery Git configuration identity",
+                ),
+            )
         raw_transformed_paths = authority_state.get("git_transformed_baseline_paths")
         if type(raw_transformed_paths) is not list or len(raw_transformed_paths) > self.max_files:
             raise ValueError("Docker coding transformed-path authority must be bounded.")
@@ -697,8 +725,9 @@ class DockerCodingWorkspaceBinding(SyncBinding):
                 else await _capture_final_git_evidence(bound, authority)
             )
             # Ignored scratch is valid when this outcome does not publish source.
-            # Keep the decision identical to SyncBinding copy-back.
-            if _should_sync_back(self.sync_back, outcome):
+            # Keep the decision identical to SyncBinding copy-back. Without a
+            # guest Git baseline nothing is Git-ignored, so nothing can hide.
+            if self._git_baseline and _should_sync_back(self.sync_back, outcome):
                 await _require_no_publishable_ignored_paths(bound)
             snapshot = await super().finalize(bound, outcome=outcome, metadata=metadata)
             final_snapshot = (
@@ -801,7 +830,12 @@ class DockerCodingWorkspaceBinding(SyncBinding):
 
 
 class DockerCodingEnvironmentFactory(EnvironmentFactory):
-    """Create exact, non-networked Docker environments for explicitly trusted code."""
+    """Create exact, non-networked Docker environments for explicitly trusted code.
+
+    ``git_baseline=False`` drops the ephemeral guest Git baseline, so the image
+    needs no ``git``. Use it for sandboxes that only sync files in and out; keep
+    the default for coding products that publish Git changes.
+    """
 
     @property
     def secret_resolution_scope(self) -> Literal["static"]:
@@ -822,15 +856,26 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         immutable_inputs: Sequence[LocalImmutableInput] = (),
         immutable_input_store: ImmutableInputStore | None = None,
         immutable_input_runtime_compatibility_fingerprint: str | None = None,
+        git_baseline: bool = True,
+        knowledge_store: KnowledgeStore | None = None,
+        knowledge_access_scope: KnowledgeAccessScope | None = None,
     ) -> None:
         if not isinstance(source_workspace, LocalWorkspace):
             raise TypeError("source_workspace must be LocalWorkspace.")
+        if type(git_baseline) is not bool:
+            raise TypeError("git_baseline must be a bool.")
         if type(toolchain_profile) is not DockerCodingToolchainProfile:
             raise TypeError("toolchain_profile must be an exact DockerCodingToolchainProfile.")
         # Reuse the concrete environment's validation before any allocation.
-        self._artifact_store = Environment(
-            EnvironmentSpec(name="coding"), artifact_store=artifact_store
-        ).artifact_store
+        validated = Environment(
+            EnvironmentSpec(name="coding"),
+            artifact_store=artifact_store,
+            knowledge_store=knowledge_store,
+            knowledge_access_scope=knowledge_access_scope,
+        )
+        self._artifact_store = validated.artifact_store
+        self._knowledge_store = validated.knowledge_store
+        self._knowledge_access_scope = validated.knowledge_access_scope
         if transfer_limits is not None and not isinstance(
             transfer_limits, DockerWorkspaceTransferLimits
         ):
@@ -841,11 +886,17 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         )
         self.restrictions = self.toolchain_profile.restrictions
         self.image_identity = self.toolchain_profile.image_identity
+        self.git_baseline = git_baseline
+        runtime_executables = (
+            _DOCKER_CODING_RUNTIME_EXECUTABLES
+            if git_baseline
+            else tuple(name for name in _DOCKER_CODING_RUNTIME_EXECUTABLES if name != "git")
+        )
         self.required_executables = tuple(
             sorted(
                 {
                     *self.toolchain_profile.required_executables,
-                    *_DOCKER_CODING_RUNTIME_EXECUTABLES,
+                    *runtime_executables,
                 }
             )
         )
@@ -884,6 +935,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             immutable_input_runtime_compatibility_fingerprint=(
                 self.immutable_input_runtime_compatibility_fingerprint
             ),
+            git_baseline=git_baseline,
         )
         self._profile_identity = ExecutionProfileBehaviorIdentity(
             name="cayu.docker_coding_environment",
@@ -952,6 +1004,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             source_copy_authority=source_copy_authority,
             immutable_input_store=self.immutable_input_store,
             immutable_input_attachments=immutable_input_attachments,
+            git_baseline=self.git_baseline,
         )
 
     def allocation_scope(
@@ -1147,6 +1200,29 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             if outcome.cancellation is not None:
                 raise outcome.cancellation
         await allocation.mark_reaped()
+
+    async def is_allocation_disposed(self, request: EnvironmentFactoryRequest) -> bool:
+        """Prove that a finished session's exact container is gone.
+
+        Full Docker container IDs are never reused, so absence after a
+        successful daemon lookup proves disposal and lets the next invocation
+        of a completed session start a fresh container. A failed lookup raises
+        instead of answering. Configuration is not compared: an image re-pin
+        must not strand completed sessions. Factories with immutable inputs keep
+        exact reconnect, since their attachments have their own disposal state.
+        """
+
+        if not isinstance(request, EnvironmentFactoryRequest):
+            raise TypeError("Docker disposal verification requires EnvironmentFactoryRequest.")
+        if request.operation is not EnvironmentFactoryOperation.RECONNECT:
+            raise ValueError("Docker disposal verification requires reconnect metadata.")
+        if self.immutable_inputs:
+            return False
+        metadata = request.reconnect_metadata
+        container_id = metadata.get("container_id")
+        if metadata.get("kind") != "docker_coding" or type(container_id) is not str:
+            return False
+        return not await DockerRunner.container_exists(container_id, docker_path=self.docker_path)
 
     async def recover_finalization_disposal(
         self,
@@ -1387,6 +1463,8 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 ),
                 workspace=self.source_workspace,
                 artifact_store=self.configured_artifact_store,
+                knowledge_store=self._knowledge_store,
+                knowledge_access_scope=self._knowledge_access_scope,
                 runner=runner,
                 binding=binding,
             )
@@ -2298,6 +2376,7 @@ def _docker_coding_configuration_fingerprint(
     source_excluded_path_patterns: tuple[str, ...],
     immutable_input_projection_fingerprints: tuple[str, ...],
     immutable_input_runtime_compatibility_fingerprint: str | None,
+    git_baseline: bool = True,
 ) -> str:
     material = {
         "schema": "cayu.docker_coding_environment.v3",
@@ -2325,7 +2404,7 @@ def _docker_coding_configuration_fingerprint(
         "source_excluded_directory_names": list(source_excluded_directory_names),
         "source_excluded_path_patterns": list(source_excluded_path_patterns),
         "sync_back": "revision_aware",
-        "guest_git_baseline": "ephemeral",
+        "guest_git_baseline": "ephemeral" if git_baseline else "none",
     }
     return (
         "sha256:"

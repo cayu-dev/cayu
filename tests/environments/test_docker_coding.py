@@ -59,6 +59,7 @@ from cayu.immutable_inputs import (
     ImmutableInputStore,
     inspect_local_immutable_input,
 )
+from cayu.knowledge.scopes import KnowledgeAccessScope
 from cayu.messages import Message
 from cayu.providers.base import ModelProvider, ModelRequest
 from cayu.runners.base import ExecCommand, ExecResult
@@ -70,6 +71,7 @@ from cayu.runners.docker import (
 from cayu.runners.docker_workload import DockerImageIdentity, DockerWorkloadRestrictions
 from cayu.runners.local import LocalRunner
 from cayu.sessions.base import RunRequest
+from cayu.storage.memory import InMemoryKnowledgeStore
 from cayu.tools.base import ToolExecutableRequirement, ToolExecutionRequirement
 from cayu.tools.search import SearchTextTool
 from cayu.workspaces.base import WorkspaceMutationResult
@@ -3200,3 +3202,189 @@ def test_docker_recoverable_allocation_rejects_foreign_authority(
     )
     with pytest.raises(ValueError, match="allocation authority conflicts"):
         asyncio.run(factory.create_recoverable(request, _TestAllocationContext(intent)))
+
+
+class _NoGitLocalDockerRunner(_LocalDockerRunner):
+    """Fail any guest Git command, proving a binding never needs Git."""
+
+    async def exec(self, command, **kwargs: Any):
+        if command.argv and command.argv[0] == "git":
+            raise AssertionError("git must not run without a guest Git baseline")
+        return await super().exec(command, **kwargs)
+
+    async def exec_system(self, command, **kwargs: Any):
+        if command.argv and command.argv[0] == "git":
+            raise AssertionError("git must not run without a guest Git baseline")
+        return await super().exec_system(command, **kwargs)
+
+
+def _no_git_binding(runner: DockerRunner) -> DockerCodingWorkspaceBinding:
+    return DockerCodingWorkspaceBinding(
+        target_workspace=RunnerWorkspace(
+            runner,
+            workspace_id="no-git-target",
+            python_executable=sys.executable,
+            excluded_directory_names=(".cayu", ".git", ".runtime"),
+        ),
+        limits=DockerWorkspaceTransferLimits(
+            max_file_bytes=1024,
+            max_total_bytes=4096,
+            max_archive_bytes=64 * 1024,
+        ),
+        git_baseline=False,
+    )
+
+
+def test_docker_coding_factory_can_omit_the_guest_git_baseline(tmp_path: Path) -> None:
+    source = LocalWorkspace(tmp_path, workspace_id="no-git-source")
+    profile = docker_toolchain_profile(image_identity=_image_identity())
+    knowledge = InMemoryKnowledgeStore()
+
+    with_git = DockerCodingEnvironmentFactory(source_workspace=source, toolchain_profile=profile)
+    without_git = DockerCodingEnvironmentFactory(
+        source_workspace=source,
+        toolchain_profile=profile,
+        git_baseline=False,
+        knowledge_store=knowledge,
+        knowledge_access_scope=KnowledgeAccessScope(allowed_namespaces=["project:app"]),
+    )
+
+    assert "git" in with_git.required_executables
+    assert "git" not in without_git.required_executables
+    assert (
+        with_git.execution_profile_identity.implementation_version
+        != without_git.execution_profile_identity.implementation_version
+    )
+    assert without_git._knowledge_store is knowledge
+    with pytest.raises(ValueError, match="requires the guest Git baseline"):
+        DockerCodingWorkspaceBinding(
+            target_workspace=RunnerWorkspace(
+                _LocalDockerRunner(tmp_path),
+                workspace_id="no-git-target",
+                excluded_directory_names=(".cayu", ".git", ".runtime"),
+            ),
+            limits=DockerWorkspaceTransferLimits(),
+            source_copy_authority=CodingProductSourceCopyAuthority(
+                request_fingerprint="sha256:" + ("a" * 64),
+                source_workspace_id=source.id,
+                baseline_revision="sha256:" + ("b" * 64),
+                observation_limits=WorkspaceRevisionObservationLimits(),
+            ),
+            git_baseline=False,
+        )
+
+
+def test_binding_without_git_recovers_completion_from_the_same_container(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "input.csv").write_text("a,b\n", encoding="utf-8")
+    runner = _NoGitLocalDockerRunner(target_root)
+    source = LocalWorkspace(
+        source_root,
+        workspace_id="no-git-source",
+        excluded_directory_names=(".cayu", ".git", ".runtime"),
+    )
+
+    async def run() -> None:
+        original = _no_git_binding(runner)
+        bound = await original.bind(source, runner, session_id="no-git-session")
+        assert bound.workspace is not None
+        await bound.workspace.write_bytes("report.csv", b"rows,1\n")
+        recovery_state = original._completion_finalization_recovery_state(bound)
+        assert recovery_state is not None
+        assert recovery_state["authority"]["git"] is None
+        original.abandon(bound)
+
+        recovered_binding = _no_git_binding(runner)
+        recovered = await recovered_binding._recover_completion_finalization(
+            source,
+            runner,
+            session_id="no-git-session",
+            agent_name="agent",
+            environment_name="sandbox",
+            recovery_state=recovery_state,
+        )
+        await recovered_binding.finalize(recovered, outcome="completed")
+
+    asyncio.run(run())
+    assert (source_root / "input.csv").read_text(encoding="utf-8") == "a,b\n"
+    assert (source_root / "report.csv").read_text(encoding="utf-8") == "rows,1\n"
+
+
+def test_binding_without_git_keeps_the_container_when_copy_back_fails(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "input.csv").write_text("a,b\n", encoding="utf-8")
+    runner = _NoGitLocalDockerRunner(target_root)
+    source = LocalWorkspace(
+        source_root,
+        workspace_id="no-git-source",
+        excluded_directory_names=(".cayu", ".git", ".runtime"),
+    )
+    binding = _no_git_binding(runner)
+
+    async def run() -> None:
+        bound = await binding.bind(source, runner, session_id="no-git-failure")
+        assert bound.workspace is not None
+        await bound.workspace.write_bytes("report.csv", b"rows,1\n")
+        source_root.chmod(0o555)
+        try:
+            with pytest.raises(Exception):
+                await binding.finalize(bound, outcome="completed")
+        finally:
+            source_root.chmod(0o755)
+        # The only copy of the output is still in the container.
+        assert not runner.is_closed
+        assert (target_root / "report.csv").read_bytes() == b"rows,1\n"
+
+        await binding.finalize(bound, outcome="completed")
+        assert runner.is_closed
+
+    asyncio.run(run())
+    assert (source_root / "report.csv").read_text(encoding="utf-8") == "rows,1\n"
+
+
+def test_docker_coding_factory_proves_disposal_only_from_a_successful_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory = DockerCodingEnvironmentFactory(
+        source_workspace=LocalWorkspace(tmp_path, workspace_id="disposal-source"),
+        toolchain_profile=docker_toolchain_profile(image_identity=_image_identity()),
+        docker_path="/usr/bin/docker",
+    )
+    request = EnvironmentFactoryRequest(
+        session_id="finished",
+        agent_name="agent",
+        environment_name="coding",
+        operation=EnvironmentFactoryOperation.RECONNECT,
+        reconnect_metadata={"kind": "docker_coding", "container_id": _CONTAINER_ID},
+    )
+    present: list[bool | Exception] = []
+
+    async def container_exists(container_id: str, *, docker_path: str | None = None) -> bool:
+        assert container_id == _CONTAINER_ID
+        observed = present.pop()
+        if isinstance(observed, Exception):
+            raise observed
+        return observed
+
+    monkeypatch.setattr(DockerRunner, "container_exists", container_exists)
+
+    present.append(True)
+    assert asyncio.run(factory.is_allocation_disposed(request)) is False
+    present.append(False)
+    assert asyncio.run(factory.is_allocation_disposed(request)) is True
+    present.append(RuntimeError("daemon unavailable"))
+    with pytest.raises(RuntimeError, match="daemon unavailable"):
+        asyncio.run(factory.is_allocation_disposed(request))
+    other = replace(request, reconnect_metadata={"kind": "other", "container_id": _CONTAINER_ID})
+    assert asyncio.run(factory.is_allocation_disposed(other)) is False

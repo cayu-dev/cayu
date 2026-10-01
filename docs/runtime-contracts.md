@@ -11896,7 +11896,11 @@ Repository input reaches the container only through
 `DockerCodingWorkspaceBinding`. The host `.git`, `.cayu`, and `.runtime`
 directories are excluded before traversal and never enter copy limits or the
 guest. The guest initializes its own ephemeral Git baseline after bounded
-copy-in. Copy-back stages bounded output, preflights the original host file
+copy-in. `DockerCodingEnvironmentFactory(git_baseline=False)` skips that
+baseline, so the image needs no `git`; copy-in, copy-back, recovery and
+disposal are unchanged, but no Git evidence is captured and coding-product
+source-copy authority is refused. The agent preset's Docker sandbox uses this
+mode. Copy-back stages bounded output, preflights the original host file
 revisions, and publishes with conditional create/replace/delete operations.
 A pre-existing host conflict performs no writes. A race during publication is
 reported as `SyncBindingSourceConflictError` with the exact already-applied
@@ -11931,6 +11935,13 @@ removal is replay-safe and never repeats source publication. Factory wrappers
 around Docker coding must forward `recover_finalization_disposal` as well as
 creation; Runtime refuses container removal when that recovery hook is missing.
 Disposal recovery does not perform a new guest revision observation.
+
+A new invocation of a completed or failed session asks
+`is_allocation_disposed`. The Docker factory answers true only when a
+successful daemon lookup finds no container with the recorded full ID, so the
+session continues in a fresh container; lookup failures raise. It does not
+compare configuration, so re-pinning the image does not strand completed
+sessions. Factories with immutable inputs keep exact reconnect.
 
 ### Maintained coding-product settlement
 

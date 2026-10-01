@@ -530,17 +530,29 @@ def _check_selected_plan_source(
         )
         drift("preset", "register_agents", observed_factory, "app.py")
 
-    docker_files = (
+    coding_docker_files = (
         "Dockerfile.coding",
         "docker-coding-build.json",
         "docker-coding-image.json",
         "build_coding_image.py",
-        "tests/test_project.py",
     )
-    selected_docker_files = docker_files if plan.execution == "docker" else docker_files[:-1]
-    for relative in selected_docker_files:
-        expected = "present" if plan.execution == "docker" else "absent"
-        drift("execution", expected, _path_state(root / relative), relative)
+    agent_sandbox_files = ("environments/sandbox.py", "sandbox_image.py", "docker-sandbox.json")
+    expected_files = {
+        relative: plan.execution == "docker" and plan.preset == "coding"
+        for relative in coding_docker_files
+    }
+    expected_files.update(
+        {
+            relative: plan.execution == "docker" and plan.preset == "agent"
+            for relative in agent_sandbox_files
+        }
+    )
+    if plan.execution == "docker" and plan.preset == "coding":
+        expected_files["tests/test_project.py"] = True
+    for relative, present in expected_files.items():
+        drift(
+            "execution", "present" if present else "absent", _path_state(root / relative), relative
+        )
     return tuple(diagnostics)
 
 

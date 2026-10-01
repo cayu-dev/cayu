@@ -22,6 +22,7 @@ from cayu.applications import CayuApp
 from cayu.cli import main
 from cayu.cli._bounded_command import BoundedCommandResult
 from cayu.cli.project import project_context
+from cayu.cli.scaffold_check import check_declared_scaffold_source
 from cayu.environments.docker_coding import DockerCodingEnvironmentFactory
 from cayu.evals.models import EvalStatus
 from cayu.evals.reporting import load_eval_run
@@ -941,7 +942,7 @@ def test_generated_docker_builder_resolves_only_null_pins(
     builder._configuration(configuration_path.read_bytes())
 
 
-def test_coding_execution_requires_the_coding_composition(
+def test_service_preset_rejects_docker_execution(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -950,6 +951,8 @@ def test_coding_execution_requires_the_coding_composition(
             [
                 "new",
                 "invalid-docker",
+                "--preset",
+                "service",
                 "--execution",
                 "docker",
                 "--dir",
@@ -960,6 +963,108 @@ def test_coding_execution_requires_the_coding_composition(
     )
     assert not (tmp_path / "invalid-docker").exists()
     assert "execution" in capsys.readouterr().err
+
+
+def test_agent_preset_docker_execution_scaffolds_a_hardened_sandbox(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["new", "sandboxed", "--execution", "docker", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "sandboxed"
+
+    for relative in (
+        "environments/sandbox.py",
+        "sandbox_image.py",
+        "docker-sandbox.json",
+        "tests/conftest.py",
+        "tests/test_sandbox_live.py",
+    ):
+        assert (project / relative).is_file(), relative
+    assert json.loads((project / "docker-sandbox.json").read_text())["image"] is None
+    sandbox = (project / "environments/sandbox.py").read_text(encoding="utf-8")
+    # The sandbox composes Cayu's hardened Docker factory instead of reimplementing it.
+    assert "DockerCodingEnvironmentFactory(" in sandbox
+    assert "git_baseline=False" in sandbox
+    assert "DockerRunner" not in sandbox
+    assert "build_sandbox_factory(" in (project / "app.py").read_text(encoding="utf-8")
+    instructions = (project / "AGENTS.md").read_text(encoding="utf-8")
+    assert "## Docker sandbox" in instructions
+    assert "recover_incomplete_session" in instructions
+    assert check_declared_scaffold_source(project) == ()
+
+    with project_context(project):
+        app_module = importlib.import_module("app")
+        sandbox_module = importlib.import_module("environments.sandbox")
+        app = app_module.build_app(
+            provider=ScriptedModelProvider(
+                [
+                    ModelStreamEvent.text_delta("Sandboxed result."),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ]
+            ),
+            session_store=InMemorySessionStore(),
+            task_store=InMemoryTaskStore(),
+        )
+        environment = app.describe().environments[0]
+        assert environment.name == "sandbox"
+        # Unpinned image: a plain environment without a runner, so sandboxed
+        # tools fail closed.
+        assert environment.is_default and not environment.factory_backed
+        assert environment.runner is None
+        outcome = asyncio.run(
+            run_to_completion(
+                app,
+                RunRequest(agent_name="sandboxed", messages=[Message.text("user", "Hi")]),
+            )
+        )
+        assert outcome.ok
+        assert sandbox_module.START_CONTAINERS is True
+
+
+def test_pinned_sandbox_registers_the_docker_factory_without_git(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["new", "pinned", "--execution", "docker", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "pinned"
+    configuration = json.loads((project / "docker-sandbox.json").read_text())
+    configuration["image"] = "python@sha256:" + "a" * 64
+    configuration["platform_architecture"] = "arm64"
+    (project / "docker-sandbox.json").write_text(json.dumps(configuration))
+
+    with project_context(project):
+        app_module = importlib.import_module("app")
+        app = app_module.build_app(
+            provider=ScriptedModelProvider([]),
+            session_store=InMemorySessionStore(),
+            task_store=InMemoryTaskStore(),
+        )
+        factory = app._environments["sandbox"].factory
+
+    assert isinstance(factory, DockerCodingEnvironmentFactory)
+    assert factory.git_baseline is False
+    assert "git" not in factory.required_executables
+    assert factory.toolchain_profile.platform_architecture == "arm64"
+    assert app.describe().environments[0].factory_backed
+
+
+def test_scaffold_check_reports_a_missing_sandbox_file(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["new", "sandboxed", "--execution", "docker", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "sandboxed"
+    (project / "sandbox_image.py").unlink()
+
+    findings = check_declared_scaffold_source(project)
+
+    assert any(
+        finding.code == "SCAFFOLD_PLAN_DRIFT" and finding.path == "sandbox_image.py"
+        for finding in findings
+    )
 
 
 def test_coding_toolchain_requires_docker_execution(
