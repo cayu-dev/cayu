@@ -41450,5 +41450,7 @@
     "tests/core/test_tool_round_continuation_backends.py::test_continuation_retry_keeps_denied_sibling_unexecuted[postgres-answer]": 5.567,
     "tests/core/test_verified_completion.py::test_concurrent_worker_settlements_share_registration_and_preserve_public_replay[memory]": 1.6551682488061488,
     "tests/core/test_verified_completion.py::test_concurrent_worker_settlements_share_registration_and_preserve_public_replay[postgres]": 9.67632370791398,
-    "tests/core/test_verified_completion.py::test_concurrent_worker_settlements_share_registration_and_preserve_public_replay[sqlite]": 2.2794527921359986
+    "tests/core/test_verified_completion.py::test_concurrent_worker_settlements_share_registration_and_preserve_public_replay[sqlite]": 2.2794527921359986,
+    "tests/recovery/test_sigkill_recovery.py::test_coding_recovery_uses_database_time_despite_host_clock_skew[host-behind]": 16.345,
+    "tests/recovery/test_sigkill_recovery.py::test_coding_recovery_uses_database_time_despite_host_clock_skew[host-ahead]": 17.617
 }

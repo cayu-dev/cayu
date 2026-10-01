@@ -108,22 +108,12 @@ def test_worker_failure_reports_durable_state_and_cleans_control_artifacts(tmp_p
     assert list(tmp_path.iterdir()) == []
 
 
-@pytest.mark.parametrize(
-    ("publication_phase", "managed_task"),
-    [
-        ("compile", False),
-        ("ready", False),
-        ("publish", False),
-        ("model", False),
-        pytest.param("compile", True, id="managed-compile"),
-        pytest.param("model", True, id="managed-model"),
-    ],
-)
-def test_sigkill_after_coding_session_settlement_recovers_product_without_redispatch(
+def _assert_coding_product_recovery(
     tmp_path: Path,
     recovery_backend: BackendConfig,
     publication_phase: str,
     managed_task: bool,
+    host_clock_offset_seconds: int = 0,
 ) -> None:
     source = tmp_path / "coding-source"
     source.mkdir()
@@ -142,6 +132,7 @@ def test_sigkill_after_coding_session_settlement_recovers_product_without_redisp
         "publication_phase": publication_phase,
         "managed_task": managed_task,
         "task_id": task_id,
+        "host_clock_offset_seconds": host_clock_offset_seconds,
     }
     with RecoveryHarness(controls, recovery_backend) as harness:
         original = harness.launch(
@@ -196,6 +187,41 @@ def test_sigkill_after_coding_session_settlement_recovers_product_without_redisp
     assert list(controls.iterdir()) == []
     assert (source / "example.py").read_text(encoding="utf-8") == "value = 1\n"
     assert artifacts.is_dir()  # Durable product evidence is retained, not a leaked worker.
+
+
+@pytest.mark.parametrize(
+    ("publication_phase", "managed_task"),
+    [
+        ("compile", False),
+        ("ready", False),
+        ("publish", False),
+        ("model", False),
+        pytest.param("compile", True, id="managed-compile"),
+        pytest.param("model", True, id="managed-model"),
+    ],
+)
+def test_sigkill_after_coding_session_settlement_recovers_product_without_redispatch(
+    tmp_path: Path,
+    recovery_backend: BackendConfig,
+    publication_phase: str,
+    managed_task: bool,
+) -> None:
+    _assert_coding_product_recovery(tmp_path, recovery_backend, publication_phase, managed_task)
+
+
+@pytest.mark.postgres
+@pytest.mark.postgres_recovery
+@pytest.mark.parametrize("host_clock_offset_seconds", [-30, 30], ids=["host-behind", "host-ahead"])
+def test_coding_recovery_uses_database_time_despite_host_clock_skew(
+    tmp_path: Path, postgres_dsn: str, host_clock_offset_seconds: int
+) -> None:
+    _assert_coding_product_recovery(
+        tmp_path,
+        BackendConfig.postgres(postgres_dsn),
+        "model",
+        True,
+        host_clock_offset_seconds=host_clock_offset_seconds,
+    )
 
 
 @pytest.mark.parametrize("recovery_action", ["automatic", "manual"])

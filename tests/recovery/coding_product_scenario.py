@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Never
@@ -86,6 +86,25 @@ class _CodingProvider(_RecoveryProvider):
             yield event
 
 
+async def _reconciliation_timestamp(backend: BackendConfig, *, host_time: datetime) -> datetime:
+    """Use the clock that the selected task store uses to validate reconciliation."""
+    if backend.kind == "sqlite":
+        return host_time
+    if backend.kind != "postgres" or backend.dsn is None:
+        raise ValueError("Coding recovery requires a configured native backend.")
+
+    import psycopg
+
+    async with (
+        await psycopg.AsyncConnection.connect(backend.dsn) as connection,
+        connection.cursor() as cursor,
+    ):
+        await cursor.execute("SELECT clock_timestamp()")
+        row = await cursor.fetchone()
+    assert row is not None
+    return row[0]
+
+
 async def run_coding_product(config: dict[str, Any]) -> dict[str, Any]:
     if not config.get("managed_task", False):
         return await _run_coding_product(config)
@@ -113,7 +132,11 @@ async def run_coding_product(config: dict[str, Any]) -> dict[str, Any]:
             # This scenario has no external environment allocation. Registered
             # recovery and exact product readback above prove Runtime settlement;
             # these facts would NOT validate a live Docker/remote-provider owner.
-            validated_at = datetime.now(UTC)
+            validated_at = await _reconciliation_timestamp(
+                BackendConfig.from_json(config["backend"]),
+                host_time=datetime.now(UTC)
+                + timedelta(seconds=config.get("host_clock_offset_seconds", 0)),
+            )
             reconciliation = TaskCancellationReconciliationRequest(
                 task_id=held.id,
                 original_worker_id=held.worker_id,
