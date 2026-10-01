@@ -350,6 +350,7 @@ from cayu.tools.policy import (
     TOOL_POLICY_REAUTHORIZATION_METADATA_KEY,
     AllowAllToolPolicy,
     AllowlistRule,
+    GuardedToolPolicy,
     ParameterConstrainedToolPolicy,
     RequiredAllowlistRule,
     StaticToolPolicy,
@@ -42931,7 +42932,8 @@ def test_cayu_app_tool_policy_receives_run_request_metadata_copy():
     assert sessions_module.session_user_metadata(session.metadata) == {"tenant": {"id": "tenant_1"}}
 
 
-def test_cayu_app_taint_policy_requires_approval_from_prior_durable_tool_result():
+@pytest.mark.parametrize("guard_depth", [0, 1, 2])
+def test_cayu_app_taint_policy_requires_approval_from_prior_durable_tool_result(guard_depth):
     store = InMemorySessionStore()
     echo_tool = EchoTool()
     side_effect_tool = SideEffectTool()
@@ -42961,13 +42963,16 @@ def test_cayu_app_taint_policy_requires_approval_from_prior_durable_tool_result(
     )
     app = CayuApp(session_store=store)
     app.register_provider(provider, default=True)
+    policy = TaintAwareToolPolicy(
+        taint_sources={"echo": ["external_email"]},
+        protected_tools={"side_effect": ["external_email"]},
+    )
+    for _ in range(guard_depth):
+        policy = GuardedToolPolicy(guards=(), then=policy)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
         tools=[echo_tool, side_effect_tool],
-        tool_policy=TaintAwareToolPolicy(
-            taint_sources={"echo": ["external_email"]},
-            protected_tools={"side_effect": ["external_email"]},
-        ),
+        tool_policy=policy,
     )
 
     initial_events = asyncio.run(
@@ -43001,7 +43006,8 @@ def test_cayu_app_taint_policy_requires_approval_from_prior_durable_tool_result(
     assert side_effect_tool.calls == []
 
 
-def test_cayu_app_taint_policy_applies_within_same_tool_round():
+@pytest.mark.parametrize("guard_depth", [0, 1, 2])
+def test_cayu_app_taint_policy_applies_within_same_tool_round(guard_depth):
     echo_tool = EchoTool()
     side_effect_tool = SideEffectTool()
     provider = FakeProvider(
@@ -43023,13 +43029,16 @@ def test_cayu_app_taint_policy_applies_within_same_tool_round():
     )
     app = CayuApp()
     app.register_provider(provider, default=True)
+    policy = TaintAwareToolPolicy(
+        taint_sources={"echo": ["external_email"]},
+        protected_tools={"side_effect": ["external_email"]},
+    )
+    for _ in range(guard_depth):
+        policy = GuardedToolPolicy(guards=(), then=policy)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
         tools=[echo_tool, side_effect_tool],
-        tool_policy=TaintAwareToolPolicy(
-            taint_sources={"echo": ["external_email"]},
-            protected_tools={"side_effect": ["external_email"]},
-        ),
+        tool_policy=policy,
     )
 
     events = asyncio.run(

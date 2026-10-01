@@ -87,8 +87,14 @@ execution, and include the external tool's actual name in its scope.
 `EXTERNAL_TOOL_COVERAGE_UNKNOWN` means an external-effect tool uses a custom or
 otherwise unrecognized policy whose behavior Cayu cannot verify statically.
 This remains an error rather than an acknowledgment-based bypass: use a
-statically describable enforcing policy until Cayu provides a trusted custom
-coverage contract.
+statically describable enforcing policy. To add application validation, compose
+`GuardedToolPolicy(guards=(app_guard,), then=AlwaysRequireApprovalToolPolicy(...))`.
+Each guard returns `None` or a denial; invalid results and exceptions deny, so a
+guard cannot bypass the downstream enforcement. Cayu derives coverage from the
+exact downstream built-ins without calling guards or probing application stores.
+Overriding policy subclasses and unknown downstream policies remain unknown.
+Declare a behavior identity on custom guards for portable recovery; coverage is
+not a self-attestation and does not prove the guard's application logic.
 
 ## tool-approval-validity-rule
 

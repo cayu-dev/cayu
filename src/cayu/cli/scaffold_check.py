@@ -203,7 +203,6 @@ def check_scaffold_capabilities(
     # slice. It does not prove that the starter's approvals capability was
     # restored; preserve that supported extension boundary.
     if plan.preset == "agent" and "knowledge" in selected:
-        expected_decision = "require_approval" if "approvals" in selected else "deny"
         starter_name = _starter_agent_name(root)
         starter = next((agent for agent in manifest.agents if agent.name == starter_name), None)
         proposal = (
@@ -211,24 +210,20 @@ def check_scaffold_capabilities(
             if starter is not None
             else None
         )
-        observed_decision = proposal.parameter_policy_decision if proposal is not None else None
         expected_coverage = "approval_required" if "approvals" in selected else "denied"
-        if (
-            observed_decision != expected_decision
-            or proposal is None
-            or proposal.policy_coverage != expected_coverage
-        ):
+        observed_coverage = proposal.policy_coverage if proposal is not None else "unknown"
+        if observed_coverage != expected_coverage:
             diagnostics.append(
                 _diagnostic(
                     code="SCAFFOLD_CAPABILITY_DRIFT",
-                    path="agents.starter.tools.remember_knowledge.parameter_policy_decision",
+                    path="agents.starter.tools.remember_knowledge.policy_coverage",
                     message="Declared approvals capability disagrees with the starter proposal policy.",
                     hint="Update the starter policy and normalized scaffold plan together.",
                     parameters={
                         "capability": "approvals",
-                        "expected": expected_decision,
-                        "observed": observed_decision,
-                        "coverage": proposal.policy_coverage if proposal is not None else "unknown",
+                        "expected": expected_coverage,
+                        "observed": observed_coverage,
+                        "coverage": observed_coverage,
                     },
                     severity=DiagnosticSeverity.ERROR,
                 )

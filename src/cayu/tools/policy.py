@@ -6,7 +6,7 @@ from collections.abc import Callable, Iterable, Mapping
 from enum import StrEnum
 from math import isfinite
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -146,6 +146,97 @@ class ToolPolicy(ABC):
     @abstractmethod
     async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
         """Return whether this tool call may execute."""
+
+
+class ToolPolicyGuard(Protocol):
+    """A narrowing guard: return ``None`` to continue or a DENY result.
+
+    Custom guards can declare ``execution_profile_identity`` for portable
+    recovery. An undeclared guard keeps the composite process-local.
+    """
+
+    async def check(self, request: ToolPolicyRequest) -> ToolPolicyResult | None: ...
+
+
+class RequiredArguments:
+    """Deny missing or empty argument paths before the downstream policy runs."""
+
+    def __init__(self, rules: Mapping[str, Iterable[str]]) -> None:
+        copied: dict[str, tuple[tuple[str, ...], ...]] = {}
+        for name, parameters in rules.items():
+            tool_name = require_clean_nonblank(name, "tool_name")
+            if isinstance(parameters, str):
+                raise TypeError("Required arguments must be an iterable of parameter paths.")
+            copied[tool_name] = tuple(_copy_parameter_path(parameter) for parameter in parameters)
+        self._rules = MappingProxyType(copied)
+
+    def _execution_profile_material(self) -> dict[str, object]:
+        return {
+            "rules": {
+                name: [".".join(path) for path in paths]
+                for name, paths in sorted(self._rules.items())
+            }
+        }
+
+    async def check(self, request: ToolPolicyRequest) -> ToolPolicyResult | None:
+        for path in self._rules.get(request.tool_name, ()):
+            value = _get_argument_path(request.arguments, path)
+            if value is _MISSING or _is_empty_parameter_value(value):
+                return ToolPolicyResult(
+                    decision=ToolPolicyDecision.DENY,
+                    reason=f"Required argument '{'.'.join(path)}' must be present and non-empty. "
+                    "Correct the call; approval cannot repair invalid arguments.",
+                    metadata={
+                        "reason": "invalid_arguments",
+                        "parameter": ".".join(path),
+                        "rule": "RequiredArguments",
+                    },
+                )
+        return None
+
+
+class GuardedToolPolicy(ToolPolicy):
+    """Apply deny-or-continue guards, then one enforcing downstream policy.
+
+    A guard cannot authorize a call. Invalid returns and ordinary exceptions
+    deny with fixed content-free text; cancellation still propagates.
+    """
+
+    def __init__(self, *, guards: Iterable[ToolPolicyGuard], then: ToolPolicy) -> None:
+        if not isinstance(then, ToolPolicy):
+            raise TypeError("then must be a ToolPolicy.")
+        copied = tuple(guards)
+        if any(not callable(getattr(guard, "check", None)) for guard in copied):
+            raise TypeError("Every guard must implement async check(request).")
+        self._guards = copied
+        self._then = then
+
+    @property
+    def guards(self) -> tuple[ToolPolicyGuard, ...]:
+        return self._guards
+
+    @property
+    def then(self) -> ToolPolicy:
+        return self._then
+
+    async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+        for guard in self.guards:
+            try:
+                result = await guard.check(request.model_copy(deep=True))
+                if result is None:
+                    continue
+                if type(result) is not ToolPolicyResult:
+                    raise TypeError("Invalid guard result.")
+                result = ToolPolicyResult.model_validate(result.model_dump())
+                if result.decision != ToolPolicyDecision.DENY:
+                    raise ValueError("A guard can only deny or continue.")
+                return result
+            except Exception:
+                return ToolPolicyResult(
+                    decision=ToolPolicyDecision.DENY,
+                    reason="Tool policy guard failed closed; repair the guard before retrying.",
+                )
+        return await self.then.authorize(request.model_copy(deep=True))
 
 
 class AllowAllToolPolicy(ToolPolicy):

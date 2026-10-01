@@ -1302,6 +1302,44 @@ inference, or recovery lifecycle. Do not hide an agent loop inside the handle.
 
 ## ToolPolicy
 
+`GuardedToolPolicy` composes application validation with maintained enforcement:
+
+```python
+from cayu import GuardedToolPolicy, RequiredArguments, AlwaysRequireApprovalToolPolicy
+
+policy = GuardedToolPolicy(
+    guards=(RequiredArguments({"ask_user": ("question",)}), application_guard),
+    then=AlwaysRequireApprovalToolPolicy(tools=("remember_knowledge",)),
+)
+```
+
+`ToolPolicyGuard.check(request)` is async and returns `None` to continue or a
+`ToolPolicyResult` with `DENY`. ALLOW, REQUIRE_APPROVAL, invalid objects and ordinary
+exceptions fail closed with a fixed diagnostic. Cancellation propagates. Each
+guard and the downstream policy receive separate detached requests, so guard
+mutation cannot change the arguments or trusted context used by enforcement.
+`RequiredArguments` checks required non-empty dotted paths; ordinary registered
+schema validation remains a separate runtime boundary.
+
+The checker recursively recognizes exact `GuardedToolPolicy` and maintained
+downstream policy types without executing guards. Denial and approval coverage
+remain enforcing even if a custom guard is not statically understood; allowed
+coverage becomes conditional only for tools with nonempty rules in an exact
+`RequiredArguments` guard. Unknown guards and guards for other tools do not earn
+coverage. Taint collection and environment scopes follow exact nested guarded
+policies through to their maintained downstream enforcement. Overriding policy
+subclasses and unknown downstream policies remain `unknown`. Guards are not
+allowed to claim coverage or widen authorization.
+
+Composite execution-profile material includes ordered guards and the downstream
+policy. Maintained components use exact safe configuration material; custom
+guards can declare `execution_profile_identity: ExecutionProfileBehaviorIdentity`.
+A changed guard version, guard configuration, ordering or downstream policy
+changes the composite identity. A component without portable material or an
+explicit behavior identity makes the composite process-local; a statically
+known enforcement boundary does not certify restart compatibility.
+
+
 Authorizes registered tool calls immediately before execution.
 
 Before policy evaluation, ordinary registered tool arguments must satisfy the

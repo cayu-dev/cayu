@@ -119,9 +119,11 @@ An excluded store cannot be restored through a generated factory's injection sea
 For a normalized declared profile, `inspect` and `check` report
 `SCAFFOLD_CAPABILITY_DRIFT` when constructed stores or built-in tool families
 disagree with the capability selection. For agent starters with
-knowledge, this also compares the starter's proposal-policy decision and concrete
-catch-all coverage with `approvals`; independent extension approval policies do not imply that the
-starter capability is enabled. These are structural diagnostics, not
+knowledge, this also compares the starter proposal tool's effective coverage
+(`approval_required` with `approvals`, `denied` without it), including maintained
+policy compositions; independent extension approval policies do not imply that the
+starter capability is enabled. `cayu inspect --json` includes both `manifest`
+and `diagnostics` when drift is found and still exits non-zero. These are structural diagnostics, not
 proof of provider access or arbitrary custom policy behavior. The default agent's
 `search_knowledge` uses its configured project/agent namespace when the caller
 omits the namespace; normal knowledge access and active-entry filters still apply.

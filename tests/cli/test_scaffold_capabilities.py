@@ -393,7 +393,7 @@ def test_cli_reports_starter_approval_decision_drift(tmp_path, capsys, monkeypat
     assert any(
         item["code"] == "SCAFFOLD_CAPABILITY_DRIFT"
         and item["parameters"]["capability"] == "approvals"
-        and item["parameters"]["observed"] == ("require_approval" if add else "deny")
+        and item["parameters"]["observed"] == ("approval_required" if add else "denied")
         for item in payload["diagnostics"]
     )
 

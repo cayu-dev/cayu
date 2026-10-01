@@ -116,6 +116,27 @@ human decision. Handle `SessionStatus.INTERRUPTED`, persist the pending action,
 and resume through the public approval request APIs. Approval prompts alone are
 not enforcement.
 
+For application validation plus maintained authorization, use a narrowing
+composition:
+
+```python
+from cayu import GuardedToolPolicy, RequiredArguments, AlwaysRequireApprovalToolPolicy
+
+policy = GuardedToolPolicy(
+    guards=(RequiredArguments({"ask_user": ("question",)}), application_guard),
+    then=AlwaysRequireApprovalToolPolicy(tools=("remember_knowledge",)),
+)
+```
+
+A custom `application_guard` implements async `check(request)` and returns `None`
+or a `ToolPolicyResult(decision=ToolPolicyDecision.DENY, ...)`. Any other result or
+ordinary exception denies. Guards cannot authorize a call or change the request
+passed to downstream enforcement. Cayu checks coverage without running guards;
+unknown downstream policies and overriding policy subclasses remain unknown.
+Declare a guard's `execution_profile_identity` for portable recovery and bump it
+when behavior changes. Undeclared custom guards remain process-local.
+
+
 ## environments
 
 An `Environment` groups a workspace, runner, artifact store, vault, credential

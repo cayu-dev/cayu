@@ -41,8 +41,10 @@ from cayu.tools.policy import (
     AlwaysRequireApprovalToolPolicy,
     DenyPatternRule,
     EnvironmentScopedToolPolicy,
+    GuardedToolPolicy,
     ParameterConstrainedToolPolicy,
     RequiredAllowlistRule,
+    RequiredArguments,
     RequiredFieldRule,
     StaticToolPolicy,
     TaintAwareToolPolicy,
@@ -735,11 +737,7 @@ def _describe_tool(
         hard_deadline_seconds=execution_contract.hard_deadline_seconds,
         input_schema=app.redact_json(tool.schema),
         policy_coverage=_tool_policy_coverage(tool_policy, tool_name, tool.schema),
-        policy_environment_names=(
-            tuple(sorted(tool_policy.allow.get(tool_name, ())))
-            if type(tool_policy) is EnvironmentScopedToolPolicy
-            else None
-        ),
+        policy_environment_names=_policy_environment_names(tool_policy, tool_name),
         parameter_policy_decision=_parameter_policy_decision(tool_policy, tool_name),
         approval_validity_rules=(
             tuple(
@@ -934,6 +932,8 @@ def _parameter_policy_decision(
     policy: ToolPolicy, tool_name: str
 ) -> Literal["deny", "require_approval"] | None:
     # Do not project built-in semantics onto an overriding extension subclass.
+    if type(policy) is GuardedToolPolicy:
+        return _parameter_policy_decision(policy.then, tool_name)
     if (
         type(policy) is ParameterConstrainedToolPolicy
         and type(policy.decision) is ToolPolicyDecision
@@ -946,6 +946,14 @@ def _parameter_policy_decision(
     return None
 
 
+def _policy_environment_names(policy: ToolPolicy, tool_name: str) -> tuple[str, ...] | None:
+    if type(policy) is GuardedToolPolicy:
+        return _policy_environment_names(policy.then, tool_name)
+    if type(policy) is EnvironmentScopedToolPolicy:
+        return tuple(sorted(policy.allow.get(tool_name, ())))
+    return None
+
+
 def _tool_policy_coverage(
     policy: ToolPolicy,
     tool_name: str,
@@ -954,6 +962,14 @@ def _tool_policy_coverage(
     # These descriptions are static facts about Cayu's concrete built-ins. A
     # subclass can override authorize(), so treating it as its parent would
     # turn an unknown custom policy into trusted coverage.
+    if type(policy) is GuardedToolPolicy:
+        coverage = _tool_policy_coverage(policy.then, tool_name, schema)
+        if coverage == "allowed" and any(
+            type(guard) is RequiredArguments and guard._rules.get(tool_name)
+            for guard in policy.guards
+        ):
+            return "conditional"
+        return coverage
     if type(policy) is AllowAllToolPolicy:
         return "allowed"
     if type(policy) is AlwaysRequireApprovalToolPolicy:

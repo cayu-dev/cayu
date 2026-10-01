@@ -1185,6 +1185,32 @@ def _cayu_policy_material_extractors() -> dict[type[object], _ExecutionProfileMa
 
 
 def _cayu_policy_material(policy: object) -> dict[str, Any] | None:
+    from cayu.runtime.execution_identity import copy_execution_profile_behavior_identity
+    from cayu.tools.policy import GuardedToolPolicy, RequiredArguments
+
+    if type(policy) is GuardedToolPolicy:
+
+        def component(value: object) -> dict[str, Any] | None:
+            material = (
+                RequiredArguments._execution_profile_material(value)
+                if type(value) is RequiredArguments
+                else _cayu_policy_material(value)
+            )
+            if material is not None:
+                return {
+                    "component": f"{type(value).__module__}:{type(value).__qualname__}",
+                    "material": material,
+                }
+            identity = copy_execution_profile_behavior_identity(
+                getattr(value, "execution_profile_identity", None)
+            )
+            return None if identity is None else {"identity": identity.model_dump(mode="json")}
+
+        downstream = component(policy.then)
+        guards = [component(guard) for guard in policy.guards]
+        if downstream is None or any(guard is None for guard in guards):
+            return None
+        return {"then": downstream, "guards": guards}
     return _material_from_exact_type(policy, _cayu_policy_material_extractors())
 
 

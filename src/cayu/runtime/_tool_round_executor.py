@@ -385,6 +385,7 @@ from cayu.tools.patches import ApplyPatchTool
 from cayu.tools.policy import (
     TAINT_LABELS_METADATA_KEY,
     TOOL_POLICY_REAUTHORIZATION_METADATA_KEY,
+    GuardedToolPolicy,
     TaintAwareToolPolicy,
     ToolPolicy,
     ToolPolicyDecision,
@@ -2057,7 +2058,8 @@ class ToolRoundExecutor:
         session = await self._session_store.load(session_id)
         if session is not None:
             labels.update(taint_labels_from_metadata(session.metadata))
-        if not isinstance(policy, TaintAwareToolPolicy):
+        taint_policy = _taint_policy(policy)
+        if taint_policy is None:
             return labels
         for event_type in (EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED):
             records = await query_all_event_records(
@@ -2070,7 +2072,7 @@ class ToolRoundExecutor:
             )
             for record in records:
                 if record.event.tool_name is not None:
-                    labels.update(policy.labels_for_source_tool(record.event.tool_name))
+                    labels.update(taint_policy.labels_for_source_tool(record.event.tool_name))
         return labels
 
     async def checkpoint_pending_tool_approval(
@@ -10732,17 +10734,24 @@ def _tool_round_publishes_arguments(
     return True
 
 
+def _taint_policy(policy: ToolPolicy) -> TaintAwareToolPolicy | None:
+    while type(policy) is GuardedToolPolicy:
+        policy = policy.then
+    return policy if isinstance(policy, TaintAwareToolPolicy) else None
+
+
 def _taint_labels_for_source_tool(
     policy: ToolPolicy,
     tool_name: str,
     *,
     policy_result: ToolPolicyResult | None,
 ) -> set[str]:
-    if not isinstance(policy, TaintAwareToolPolicy):
+    taint_policy = _taint_policy(policy)
+    if taint_policy is None:
         return set()
     if policy_result is not None and policy_result.decision != ToolPolicyDecision.ALLOW:
         return set()
-    return set(policy.labels_for_source_tool(tool_name))
+    return set(taint_policy.labels_for_source_tool(tool_name))
 
 
 @dataclass
