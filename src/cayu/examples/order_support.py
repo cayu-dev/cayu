@@ -177,6 +177,16 @@ class SupportTool(Tool):
             elif self.spec.name == "propose_replacement":
                 body = proposal_body(ctx.session_id, args["item"])
                 identifier = proposal_id(body)
+                existing = db.execute(
+                    "SELECT id FROM proposals WHERE session_id = ?", (ctx.session_id,)
+                ).fetchone()
+                if existing is not None and existing[0] != identifier:
+                    # An expected refusal: report it as a failed result the model can
+                    # explain. Raising would read as an unknown outcome instead.
+                    return ToolResult(
+                        content="This conversation already has a different replacement proposal.",
+                        is_error=True,
+                    )
                 db.execute(
                     "INSERT OR IGNORE INTO proposals VALUES (?, ?, ?)",
                     (identifier, canonical(body).decode(), ctx.session_id),

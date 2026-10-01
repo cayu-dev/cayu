@@ -188,3 +188,22 @@ def test_invalid_receipts_and_changed_version_never_execute(
             assert not rows(state, "replacements", resources)
 
     asyncio.run(scenario())
+
+
+def test_conflicting_proposal_is_reported_as_a_failed_result(tmp_path: Path) -> None:
+    from cayu import ToolContext
+    from cayu.examples.order_support import SupportTool, initialize
+
+    state = tmp_path / "state"
+    initialize(state, tmp_path / "operator")
+    tool = SupportTool(state, "propose_replacement", "1")
+    context = ToolContext(session_id="conversation")
+
+    first = asyncio.run(tool.run(context, {"item": "mug"}))
+    repeated = asyncio.run(tool.run(context, {"item": "mug"}))
+    conflicting = asyncio.run(tool.run(context, {"item": "plate"}))
+
+    assert not first.is_error
+    assert repeated.structured == first.structured
+    assert conflicting.is_error
+    assert "different replacement proposal" in conflicting.content

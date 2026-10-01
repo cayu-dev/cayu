@@ -179,8 +179,9 @@ If the model stops before one of those tools has returned, the policy appends a
 reminder and the model continues, up to two times. After that, the session is
 interrupted with a reason instead of completing. A tool result counts only when
 `is_error` is false, so return `ToolResult(..., is_error=True)` for failures such
-as rejected evidence or an unavailable service. The policy's identity comes from
-its configuration, so use the same tool names in every process.
+as rejected evidence or an unavailable service. The example's `propose_replacement`
+does this when the conversation already has a different proposal. The policy's
+identity comes from its configuration, so use the same tool names in every process.
 
 `tool_completion` skips the provider request after a successful final tool when
 the host displays the question or proposal from that tool's result. Both tools

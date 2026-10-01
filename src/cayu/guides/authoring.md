@@ -272,6 +272,29 @@ Define what happens when an effect starts but completion cannot be proven.
 Never blindly retry an ambiguous external effect. Persist enough identity and
 checkpoint state for an operator or recovery path to reconcile it.
 
+### Report expected failures as failed results
+
+When a tool fails in a way you expected, such as a record not found, input
+rejected, or the service returning an error response, return
+`ToolResult(content="what went wrong", is_error=True)`. The model sees the
+failure and can retry, ask, or explain it, and Cayu records a failed call. A
+failure returned as ordinary content, for example `{"error": ...}` with
+`is_error` left false, looks like a success to Cayu and to loop policies.
+
+Raising behaves differently depending on the declared effect. From a `none` or
+`idempotent` tool, the exception also reaches the model as a failed result.
+From an `external` tool, which is the default when no effect is declared, it
+means the effect's outcome is unknown: Cayu interrupts the session for
+reconciliation instead of continuing. Raise only when that is true.
+
+### End each turn through a known tool
+
+If every turn must end in a particular tool, such as a clarification question
+or a recorded proposal, pass `RequireFinalTool([...])` in `loop_policies` on
+each run and resume. When the model stops before one of those tools has
+returned without error, it gets a reminder instead of the turn silently
+completing with nothing to show. See `cayu guide order-support`.
+
 ### Keep model-controlled command selectors as data
 
 Model-controlled command selectors are untrusted argv input. A value described
