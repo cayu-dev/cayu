@@ -9,14 +9,24 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
+import httpx
 import pytest
+from tests.core.test_openai_subscription_provider import StaticSubscriptionAuth
 
 import cayu.entrypoint as entrypoint_module
-from cayu import ModelStreamEvent, ScriptedModelProvider, run_project_entrypoint
+from cayu import (
+    AgentSpec,
+    CayuApp,
+    ModelStreamEvent,
+    ScriptedModelProvider,
+    run_project_entrypoint,
+)
 from cayu.cli import _build_parser
 from cayu.cli import main as cayu_main
 from cayu.cli.project import project_context
 from cayu.configuration import MAX_STEPS
+from cayu.providers import HttpxOpenAITransport, OpenAISubscriptionProvider
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 
 def test_every_cli_command_help_has_a_purpose_and_next_step() -> None:
@@ -336,3 +346,64 @@ def test_entrypoint_rejects_blank_messages_and_invalid_step_limits(capsys) -> No
         == 2
     )
     assert f"--max-steps must be at most {MAX_STEPS}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("show", [False, True])
+def test_entrypoint_prints_provider_errors_only_when_asked(capsys, show) -> None:
+    detail = "The 'gpt-5.4' model is not supported when using Codex with a ChatGPT account."
+    transport = HttpxOpenAITransport()
+    transport._client._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(400, json={"detail": detail}))
+    )
+
+    def factory() -> CayuApp:
+        app = CayuApp()
+        app.register_provider(
+            OpenAISubscriptionProvider(auth=StaticSubscriptionAuth(), transport=transport),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="gpt-5.4"))
+        return app
+
+    argv = ["--message", "Run.", *(["--show-provider-errors"] if show else [])]
+    assert run_project_entrypoint(factory, argv) == 1
+    err = capsys.readouterr().err
+
+    assert err.startswith("run failed:")
+    if show:
+        assert f"provider error: HTTP 400; {detail}" in err
+        assert "--show-provider-errors" not in err
+    else:
+        assert detail not in err
+        assert "Rerun with --show-provider-errors" in err
+
+
+@pytest.mark.parametrize("prefix_length", [0, 4070])
+def test_entrypoint_redacts_workload_secrets_before_bounding_provider_errors(
+    capsys, prefix_length
+) -> None:
+    secret = "synthetic-workload-secret-1970-boundary"
+    detail = "x" * prefix_length + secret + " invalid input"
+    transport = HttpxOpenAITransport()
+    transport._client._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(400, json={"detail": detail}))
+    )
+
+    def factory() -> CayuApp:
+        app = CayuApp(secret_redactor=SecretRedactor([secret]))
+        app.register_provider(
+            OpenAISubscriptionProvider(auth=StaticSubscriptionAuth(), transport=transport),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="gpt-5.4"))
+        return app
+
+    assert run_project_entrypoint(factory, ["--message", "Run.", "--show-provider-errors"]) == 1
+    err = capsys.readouterr().err
+    assert "provider error: HTTP 400;" in err
+    if prefix_length:
+        assert "...[truncated]" in err
+    else:
+        assert REDACTED_SECRET in err
+    assert secret[:12] not in err
+    assert secret not in err

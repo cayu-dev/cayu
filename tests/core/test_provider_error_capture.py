@@ -123,6 +123,28 @@ def test_real_transport_captures_details_without_changing_public_failures(subscr
         assert record["http_status_code"] == (400 if kind == "http" else 200)
 
 
+def test_fastapi_detail_body_is_captured_as_the_message():
+    detail = "The 'gpt-5.4' model is not supported when using Codex with a ChatGPT account."
+    records = []
+
+    async def run():
+        transport = HttpxOpenAITransport()
+        handler = httpx.MockTransport(lambda request: httpx.Response(400, json={"detail": detail}))
+        async with httpx.AsyncClient(transport=handler) as client:
+            transport._client._client = client
+            provider = OpenAISubscriptionProvider(
+                auth=StaticSubscriptionAuth(), transport=transport
+            )
+            request = ModelRequest(model="gpt-5.4", messages=[Message.text("user", "Hi")])
+            with capture_provider_errors(records.append, redactor=SecretRedactor()):
+                return [event.payload async for event in provider.stream(request)]
+
+    public = asyncio.run(run())
+    assert records[0]["error"]["message"] == detail
+    assert records[0]["http_status_code"] == 400
+    assert detail not in json.dumps(public)
+
+
 def test_bounded_fields_redact_before_truncation_and_report_omissions():
     records = []
     secret = "boundary-secret"

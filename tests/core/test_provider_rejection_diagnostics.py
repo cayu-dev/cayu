@@ -93,6 +93,7 @@ def test_safe_explanation_across_adapters_and_detachment(factory, provider, cred
             "unrecognized_details",
         ),
         ({"error": {"details": {"message": "secret"}}}, "absent_details"),
+        ({"detail": "The 'secret' model is not supported."}, "unrecognized_details"),
         ({"error": {}}, "absent_details"),
         ({"error": []}, "malformed_body"),
         ({"error": {"message": "secret" * 20000}}, "body_too_large"),

@@ -6,10 +6,14 @@ import argparse
 import asyncio
 import sys
 from collections.abc import Callable
+from contextlib import nullcontext
+from typing import Any
 
 from cayu.applications import CayuApp
 from cayu.configuration import DEFAULT_MAX_STEPS, MAX_STEPS
+from cayu.events import EventType
 from cayu.messages import Message
+from cayu.providers.diagnostics import capture_provider_errors
 from cayu.sessions.base import RunRequest
 from cayu.sessions.outcomes import run_to_completion
 
@@ -50,14 +54,41 @@ def run_project_entrypoint(
     )
     if args.max_steps is not None:
         run_request = run_request.model_copy(update={"max_steps": args.max_steps})
-    outcome = asyncio.run(run_to_completion(app, run_request))
+    provider_errors: list[dict[str, Any]] = []
+    # Opt-in only: provider error bodies can echo request content, so they are
+    # printed to the developer's own terminal, never stored with the session.
+    capture = (
+        capture_provider_errors(provider_errors.append, redactor=app._secret_redactor)
+        if args.show_provider_errors
+        else nullcontext()
+    )
+    with capture:
+        outcome = asyncio.run(run_to_completion(app, run_request))
     if outcome.ok:
         print(outcome.final_text)
         return 0
 
     detail = outcome.error or outcome.status.value
     print(f"run failed: {detail} (session {outcome.session_id})", file=sys.stderr)
+    for record in provider_errors:
+        print(f"provider error: {_describe_provider_error(record)}", file=sys.stderr)
+    if not args.show_provider_errors and any(
+        event.type == EventType.MODEL_ERROR for event in outcome.events
+    ):
+        print(
+            "Rerun with --show-provider-errors to print the provider's explanation.",
+            file=sys.stderr,
+        )
     return 1
+
+
+def _describe_provider_error(record: dict[str, Any]) -> str:
+    error = record.get("error", {})
+    status = record.get("http_status_code")
+    parts = [f"HTTP {status}"] if status is not None else []
+    parts.extend(f"{name}={error[name]}" for name in ("type", "code", "param") if name in error)
+    parts.append(error.get("message", "no message in the provider response"))
+    return "; ".join(parts)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -72,6 +103,14 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=f"Model-step ceiling; defaults to the app setting ({DEFAULT_MAX_STEPS} normally).",
+    )
+    parser.add_argument(
+        "--show-provider-errors",
+        action="store_true",
+        help=(
+            "Print provider error details, such as why a model was rejected, to stderr. "
+            "They can echo request content, so use this for local debugging."
+        ),
     )
     return parser
 

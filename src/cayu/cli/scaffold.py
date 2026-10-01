@@ -830,8 +830,9 @@ uv run --no-sync cayu auth openai login
 CAYU_PROVIDER=openai-subscription uv run --no-sync python run.py --message "YOUR REQUEST"
 ```
 
-Subscription mode selects `gpt-5.4` by default. Set `CAYU_MODEL` if your plan
-offers a different model.
+Subscription mode selects `gpt-6-luna` by default. Set `CAYU_MODEL` if your plan
+offers a different model. If a run fails at the provider, add
+`--show-provider-errors` to print the provider's explanation.
 
 This experimental path is intended for the subscription holder's own local
 development and evaluation. It is not intended for production, customer-facing

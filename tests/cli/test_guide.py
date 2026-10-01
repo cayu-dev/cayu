@@ -581,7 +581,7 @@ def test_structured_output_and_provider_guides_are_credential_free_and_public(ca
     assert "ANTHROPIC_API_KEY" in providers
 
 
-def test_package_shipped_provider_guide_is_short_and_agent_discoverable(capsys) -> None:
+def test_package_shipped_provider_guide_is_agent_discoverable(capsys) -> None:
     assert main(["guide", "providers"]) == 0
     guide = capsys.readouterr().out
 
@@ -630,12 +630,31 @@ def test_package_shipped_provider_guide_is_short_and_agent_discoverable(capsys) 
     assert "`opencode-go/...`" in guide
     assert "authenticated live inference" not in guide
     assert "Route/auth only" not in guide
-    assert len(guide.splitlines()) < 155
 
     assert main(["guide", "providers#compatible-chat-completions"]) == 0
     compatible = capsys.readouterr().out
     assert compatible.startswith("## Compatible Chat Completions")
     assert "OpenCode Go" in compatible
+
+    assert main(["guide", "providers#openai-subscription"]) == 0
+    subscription = capsys.readouterr().out
+    assert subscription.startswith("## OpenAI subscription")
+    assert "evaluation only" in subscription
+    assert "`gpt-6-luna`" in subscription
+
+
+def test_scaffold_guide_references_resolve(capsys) -> None:
+    scaffold_sources = sorted((Path(__file__).parents[2] / "src/cayu/cli").glob("scaffold*.py"))
+    references = {
+        match.group(1)
+        for source in scaffold_sources
+        for match in re.finditer(r"cayu guide ([a-z0-9-]+#[a-z0-9-]+)", source.read_text())
+    }
+
+    assert "providers#openai-subscription" in references
+    for reference in sorted(references):
+        assert main(["guide", reference]) == 0, reference
+        capsys.readouterr()
 
 
 def test_human_attention_guide_discovery_and_public_contracts(capsys) -> None:

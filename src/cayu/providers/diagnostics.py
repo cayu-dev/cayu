@@ -236,6 +236,10 @@ def _record_http_error(
             body = body_response.json()
     error = body.get("error", body) if isinstance(body, Mapping) else {}
     error = error if isinstance(error, Mapping) else {}
+    if error is body and "message" not in error and type(body.get("detail")) is str:
+        # FastAPI-style backends, including the ChatGPT Codex backend, send
+        # {"detail": "..."} instead of an OpenAI error object.
+        error = {**error, "message": body["detail"]}
     request_id = response.headers.get("x-request-id")
     source = "header" if request_id is not None else "unavailable"
     if request_id is None and isinstance(body, Mapping):

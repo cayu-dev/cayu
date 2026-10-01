@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import http.client
+import io
+import sys
 import threading
 from pathlib import Path
 
@@ -237,3 +239,50 @@ def test_device_login_caps_polling_sleep_at_deadline(monkeypatch) -> None:
 
     assert transport.polls == 1
     assert sleeps == [900.0]
+
+
+def test_auth_openai_login_device_code_is_an_alias_for_headless(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("CAYU_HOME", str(tmp_path / "cayu-home"))
+    monkeypatch.setattr(auth_cli, "_device_login", lambda *, transport: _credentials())
+
+    def browser_login(**kwargs):
+        raise AssertionError("--device-code must select the device-code flow")
+
+    monkeypatch.setattr(auth_cli, "_browser_login", browser_login)
+
+    assert main(["auth", "openai", "login", "--device-code"]) == 0
+    assert auth_cli.OpenAISubscriptionAuthStore().load() == _credentials()
+
+
+def test_device_login_flushes_the_code_before_polling(monkeypatch) -> None:
+    class RecordingStdout(io.StringIO):
+        def __init__(self) -> None:
+            super().__init__()
+            self.flushed = ""
+
+        def flush(self) -> None:
+            self.flushed = self.getvalue()
+
+    stdout = RecordingStdout()
+    monkeypatch.setattr(sys, "stdout", stdout)
+
+    class DeviceTransport:
+        issuer = "https://auth.openai.com"
+
+        def request_device_authorization(self):
+            return {"device_auth_id": "device-auth-id", "user_code": "ABCD-1234"}
+
+        def poll_device_authorization(self, **kwargs):
+            # A piped stdout is block-buffered; the code must already be out.
+            assert "ABCD-1234" in stdout.flushed
+            raise auth_cli.OpenAISubscriptionAuthError("stop polling")
+
+    try:
+        auth_cli._device_login(transport=DeviceTransport())
+    except auth_cli.OpenAISubscriptionAuthError as exc:
+        assert str(exc) == "stop polling"
+    else:
+        raise AssertionError("polling must run after the code is printed")

@@ -55,6 +55,8 @@ def add_auth_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     login.add_argument(
         "--headless",
+        "--device-code",
+        dest="headless",
         action="store_true",
         help="Use the device-code flow for SSH, containers, and remote hosts.",
     )
@@ -214,7 +216,7 @@ def _browser_login(
         ) from exc
     server.expected_state = state
     server.timeout = 1.0
-    print(f"Open this URL to sign in:\n{authorize_url}")
+    print(f"Open this URL to sign in:\n{authorize_url}", flush=True)
     if open_browser:
         webbrowser.open(authorize_url)
     deadline = time.monotonic() + _LOGIN_TIMEOUT_SECONDS
@@ -258,7 +260,7 @@ def _device_login(
     if not math.isfinite(interval) or interval <= 0:
         raise OpenAISubscriptionAuthError("OpenAI device authorization contained invalid interval.")
     interval = max(interval, 1.0)
-    print(f"Open {transport.issuer}/codex/device and enter code: {user_code}")
+    print(f"Open {transport.issuer}/codex/device and enter code: {user_code}", flush=True)
     deadline = time.monotonic() + 900.0
     while time.monotonic() < deadline:
         response = transport.poll_device_authorization(

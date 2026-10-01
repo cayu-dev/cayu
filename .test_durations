@@ -41263,5 +41263,8 @@
     "tests/core/test_execution_owner_context.py::test_rejected_execution_does_not_keep_the_original_request[keyword-coroutine]": 0.11918983299983665,
     "tests/core/test_execution_owner_context.py::test_rejected_execution_does_not_keep_the_original_request[keyword-stream]": 0.1218670829985058,
     "tests/core/test_execution_owner_context.py::test_rejected_execution_does_not_keep_the_original_request[positional-coroutine]": 0.10983129100350197,
-    "tests/core/test_execution_owner_context.py::test_rejected_execution_does_not_keep_the_original_request[positional-stream]": 0.12679475199547596
+    "tests/core/test_execution_owner_context.py::test_rejected_execution_does_not_keep_the_original_request[positional-stream]": 0.12679475199547596,
+    "tests/cli/test_guide.py::test_package_shipped_provider_guide_is_agent_discoverable": 0.039914750999912485,
+    "tests/cli/test_stable_entrypoint.py::test_entrypoint_redacts_workload_secrets_before_bounding_provider_errors[0]": 0.550379250998958,
+    "tests/cli/test_stable_entrypoint.py::test_entrypoint_redacts_workload_secrets_before_bounding_provider_errors[4070]": 0.321177624995471
 }

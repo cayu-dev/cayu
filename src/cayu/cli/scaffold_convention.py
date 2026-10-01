@@ -248,7 +248,7 @@ _PROVIDER_NAMES = {
 _DEFAULT_MODELS = {
     "openai": "gpt-5.6-luna",
     "anthropic": "claude-sonnet-4-6",
-    "openai-subscription": "gpt-5.4",
+    "openai-subscription": "gpt-6-luna",
 }
 
 

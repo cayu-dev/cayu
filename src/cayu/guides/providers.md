@@ -24,6 +24,17 @@ Google AI Studio automatically uses Gemini usage accounting. For Gemini through
 another OpenAI-compatible Vertex or gateway endpoint, pass
 `usage_dialect=UsageDialect.GEMINI` explicitly.
 
+## OpenAI subscription
+
+`OpenAISubscriptionProvider` experimentally runs agents against the Codex backend
+with the developer's own ChatGPT sign-in: `cayu auth openai login`, or add
+`--headless` for the device-code flow. It is for the subscription holder's local
+development and evaluation only, not production, customer-facing or multi-user
+services, credential sharing, resale, or bypassing plan limits. Use the OpenAI
+Platform API in production. Model availability follows the subscription;
+generated projects select `gpt-6-luna`, and `CAYU_MODEL` overrides it. Sign-in
+credentials stay in the trusted Cayu process and never reach runners or sandboxes.
+
 ## Explicit fallback targets
 
 Use `RunRequest.failover=ModelFailoverPolicy(...)` with explicit provider/model pairs

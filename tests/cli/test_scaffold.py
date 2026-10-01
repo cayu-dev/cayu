@@ -1737,7 +1737,7 @@ def test_scaffold_subscription_mode_selects_a_compatible_model(
         )
 
     assert outcome.ok
-    assert provider.requests[0].model == "gpt-5.4"
+    assert provider.requests[0].model == "gpt-6-luna"
 
 
 def test_scaffold_does_not_infer_provider_from_credentials(

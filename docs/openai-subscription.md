@@ -22,6 +22,8 @@ device-code flow:
 cayu auth openai login --headless
 ```
 
+`--device-code` is an alias for `--headless`.
+
 Inspect or remove the local sign-in without printing token material:
 
 ```bash
@@ -75,7 +77,7 @@ from cayu import AgentSpec, CayuApp, OpenAISubscriptionProvider
 
 app = CayuApp()
 app.register_provider(OpenAISubscriptionProvider(), default=True)
-app.register_agent(AgentSpec(name="assistant", model="gpt-5.4"))
+app.register_agent(AgentSpec(name="assistant", model="gpt-6-luna"))
 ```
 
 ## Estimated cost accounting
@@ -137,8 +139,9 @@ that opt-in as an isolation claim for untrusted code.
 
 Model availability belongs to the user's subscription and may change. A model
 accepted by the OpenAI Platform API is not necessarily available through the
-subscription backend. Generated projects select `gpt-5.4` in subscription mode;
-set `CAYU_MODEL` if the account offers a different model.
+subscription backend. Generated projects select `gpt-6-luna` in subscription mode;
+set `CAYU_MODEL` if the account offers a different model. When the backend rejects
+a model, rerun the generated `run.py` with `--show-provider-errors` to see why.
 
 The adapter honors Codex's typed `end_turn` completion signal. When Codex
 completes a response with `end_turn=false`, Cayu durably records that model step

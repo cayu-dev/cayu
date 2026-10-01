@@ -128,6 +128,9 @@ def project_rejection_response(response: httpx.Response) -> dict[str, str]:
     error = decoded.get("error", decoded)
     if type(error) is not dict:
         return unavailable("malformed_body")
+    if error is decoded and "message" not in error and type(decoded.get("detail")) is str:
+        # FastAPI-style {"detail": "..."} bodies (e.g. the ChatGPT Codex backend).
+        error = {**error, "message": decoded["detail"]}
     fields = project_rejection_error(error)
     fields[PREFIX + "request_id_state"] = (
         "omitted_untrusted"
