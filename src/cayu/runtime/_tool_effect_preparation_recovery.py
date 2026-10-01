@@ -18,10 +18,10 @@ from cayu.runtime._tool_effect_state import (
 )
 from cayu.runtime._tool_round_executor import (
     _event_with_targeted_tool_invocation_authority,
-    _event_with_tool_round_authority,
     _targeted_tool_invocation_payload,
 )
 from cayu.runtime._tool_round_recovery import PendingToolRound
+from cayu.runtime._tool_round_staging import _event_with_tool_round_authority
 from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentity,
     event_with_execution_profile_authority,

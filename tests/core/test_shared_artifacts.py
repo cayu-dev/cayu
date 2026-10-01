@@ -30,7 +30,7 @@ from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runners.local import LocalRunner
 from cayu.runtime import _shared_artifact_results as shared_artifact_results
-from cayu.runtime._tool_round_executor import _project_staged_terminal_event
+from cayu.runtime._tool_round_staging import _project_staged_terminal_event
 from cayu.sessions.base import (
     InMemorySessionStore,
     RunRequest,

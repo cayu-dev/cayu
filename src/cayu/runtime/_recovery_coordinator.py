@@ -337,9 +337,11 @@ from cayu.runtime._tool_round_executor import (
     InterruptedToolRoundRequest,
     ToolApprovalRequired,
     ToolRoundExecutor,
-    _tool_terminal_payload_limits,
     _workspace_mutation_incomplete_event,
     policy_denial_payload_fields,
+)
+from cayu.runtime._tool_round_staging import (
+    _tool_terminal_payload_limits,
     restore_staged_terminal_authority,
 )
 from cayu.runtime._work_attempt_invocation import WorkAttemptInvocationAuthority
