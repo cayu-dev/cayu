@@ -41452,5 +41452,18 @@
     "tests/core/test_verified_completion.py::test_concurrent_worker_settlements_share_registration_and_preserve_public_replay[postgres]": 9.67632370791398,
     "tests/core/test_verified_completion.py::test_concurrent_worker_settlements_share_registration_and_preserve_public_replay[sqlite]": 2.2794527921359986,
     "tests/recovery/test_sigkill_recovery.py::test_coding_recovery_uses_database_time_despite_host_clock_skew[host-behind]": 16.345,
-    "tests/recovery/test_sigkill_recovery.py::test_coding_recovery_uses_database_time_despite_host_clock_skew[host-ahead]": 17.617
+    "tests/recovery/test_sigkill_recovery.py::test_coding_recovery_uses_database_time_despite_host_clock_skew[host-ahead]": 17.617,
+    "tests/server/test_server_eval_runs.py::test_run_routes_preserve_auth_bounds_pagination_and_cancellation[/api]": 1.213,
+    "tests/server/test_server_eval_runs.py::test_run_routes_preserve_auth_bounds_pagination_and_cancellation[/custom/v2]": 0.625,
+    "tests/server/test_server_eval_runs.py::test_run_visibility_precedes_result_reads_and_mutations[hidden]": 0.45,
+    "tests/server/test_server_eval_runs.py::test_run_visibility_precedes_result_reads_and_mutations[missing]": 0.419,
+    "tests/server/test_server_eval_runs.py::test_run_visibility_precedes_result_reads_and_mutations[invalid]": 0.596,
+    "tests/server/test_server_eval_runs.py::test_run_result_routes_preserve_private_storage_errors[missing]": 0.5,
+    "tests/server/test_server_eval_runs.py::test_run_result_routes_preserve_private_storage_errors[oversized]": 0.497,
+    "tests/server/test_server_eval_runs.py::test_run_results_reports_and_same_run_comparison_preserve_store_work[False]": 1.358,
+    "tests/server/test_server_eval_runs.py::test_run_results_reports_and_same_run_comparison_preserve_store_work[True]": 1.39,
+    "tests/server/test_server_eval_runs.py::test_run_queries_and_cancellation_preserve_private_errors[list_runs-invalid]": 0.451,
+    "tests/server/test_server_eval_runs.py::test_run_queries_and_cancellation_preserve_private_errors[list_runs-oversized]": 0.469,
+    "tests/server/test_server_eval_runs.py::test_run_queries_and_cancellation_preserve_private_errors[request_cancel-invalid]": 0.46,
+    "tests/server/test_server_eval_runs.py::test_run_queries_and_cancellation_preserve_private_errors[request_cancel-missing]": 0.46
 }

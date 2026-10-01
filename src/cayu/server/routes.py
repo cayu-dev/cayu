@@ -13,7 +13,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from math import isfinite
-from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, TypeVar, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeVar, cast
 from unicodedata import category as unicode_category
 from urllib.parse import quote
 from uuid import uuid4
@@ -113,12 +113,7 @@ from cayu.evals.execution import (
     compile_corpus_suite,
     evaluation_target_identity,
 )
-from cayu.evals.execution_comparison import compare_corpus_execution_results
 from cayu.evals.execution_profiles import EvalExecutionProfileV1
-from cayu.evals.execution_reporting import (
-    eval_result_report_to_json,
-    render_corpus_execution_html,
-)
 from cayu.evals.memory_reporting import (
     MEMORY_EXPERIMENT_REPORT_MAX_BYTES,
     MemoryExperimentReportRequest,
@@ -130,7 +125,6 @@ from cayu.evals.promotion import (
     runnable_promotion_candidate,
     score_promotion_candidate,
 )
-from cayu.evals.result_presentation import present_eval_result
 from cayu.evals.results import (
     CapturedEvaluationResultV1,
     EvalResultTargetIdentityV1,
@@ -142,25 +136,13 @@ from cayu.evals.scenario_preflight import (
     preflight_eval_scenario,
 )
 from cayu.evals.store import (
-    EVAL_STORE_DEFAULT_PAGE_BYTES,
-    EVAL_STORE_DEFAULT_PAGE_SIZE,
-    EVAL_STORE_MAX_CURSOR_BYTES,
-    EVAL_STORE_MAX_IDENTIFIER_CHARS,
-    EVAL_STORE_MAX_PAGE_BYTES,
-    EVAL_STORE_MAX_PAGE_SIZE,
-    EvalBaselineKey,
     EvalCorpusConflict,
     EvalResultConflict,
     EvalRunAdmissionConflict,
     EvalRunCostBudget,
     EvalRunInvocation,
-    EvalRunPage,
-    EvalRunQuery,
     EvalRunRecord,
     EvalRunRequest,
-    EvalRunStateConflict,
-    EvalRunStatus,
-    EvalScenarioApprovalSubmission,
     EvalScenarioArtifactReference,
     EvalScenarioRunInvocation,
     EvalStorePublicationRejected,
@@ -262,14 +244,13 @@ from cayu.server._evaluation_promotion_routes import (
     register_evaluation_promotion_routes,
 )
 from cayu.server._evaluation_result_routes import register_evaluation_result_routes
+from cayu.server._evaluation_run_routes import register_evaluation_run_routes
 from cayu.server._event_side_effect_health import EventSideEffectHealthResponse
 from cayu.server._http_json import (
     _PREPARSED_PRIVATE_JSON_SCOPE_KEY,
     _json_request_openapi,
-    _model_json_response,
     _parse_json_without_duplicate_keys,
     _PreparsedPrivateJsonBody,
-    _render_utf8,
     _validated_private_json_body,
 )
 from cayu.server._judge_calibration_routes import register_judge_calibration_routes
@@ -342,11 +323,7 @@ from cayu.server.contracts import (
     EvalAuthoredSuiteRunLaunchResponse,
     EvalAuthoredSuiteRunPreviewResponse,
     EvalAuthoredSuiteRunSelectionRequest,
-    EvalComparisonRequest,
-    EvalComparisonResponse,
-    EvalResultResponse,
     EvalRunCreateRequest,
-    EvalScenarioApprovalRequest,
     EvalScenarioRunCreateRequest,
     HealthResponse,
     ListSessionEventsResponse,
@@ -4640,9 +4617,6 @@ def create_router(
                 raise HTTPException(status_code=404, detail="Eval target not found.")
             return target
 
-        def _eval_query_error() -> NoReturn:
-            raise HTTPException(status_code=422, detail="Invalid Evals query.")
-
         def _eval_run_invocation(
             auth_context: AuthContext | None,
             *,
@@ -4997,38 +4971,6 @@ def create_router(
                     detail="Eval corpus is incompatible with the attached target or bounds.",
                 ) from exc
             return effective_target, compiled, invocation
-
-        async def _load_eval_run(run_id: str):
-            try:
-                run = await eval_store.load_run(run_id)
-            except (TypeError, ValueError):
-                _eval_query_error()
-            if run is None:
-                raise HTTPException(status_code=404, detail="Eval run not found.")
-            if active_eval_registry.get(run.spec.target_key) is None:
-                raise HTTPException(status_code=404, detail="Eval run not found.")
-            return run
-
-        async def _load_eval_result(run_id: str):
-            # Authorize the run before hydrating its potentially large result.
-            await _load_eval_run(run_id)
-            try:
-                result = await eval_store.load_result(run_id)
-            except EvalStoreResultTooLarge as exc:
-                raise HTTPException(
-                    status_code=413,
-                    detail="Eval result exceeds the server byte limit.",
-                ) from exc
-            if result is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Eval run has no completed result.",
-                )
-            # Result publication and run terminalization are one store transaction.
-            # Reload after the result becomes visible so a concurrent publication
-            # cannot pair it with the active record observed above.
-            run = await _load_eval_run(run_id)
-            return run, result
 
         @bounded_captured_evaluation_router.post(
             "/evals/sessions/{session_id}/evaluation/launch",
@@ -6158,212 +6100,14 @@ def create_router(
                 compiled=compiled,
             )
 
-        @bounded_evals_router.get(
-            "/evals/runs",
-            response_model=EvalRunPage,
-            responses=EVALS_ENDPOINT_RESPONSES,
-            dependencies=protected,
+        register_evaluation_run_routes(
+            bounded_evals_router,
+            eval_store=eval_store,
+            active_eval_registry=active_eval_registry,
+            captured_eval_store=captured_eval_store,
+            protected=protected,
+            optional_auth_context=optional_auth_context,
         )
-        async def list_eval_runs(
-            target_key: Annotated[
-                str | None,
-                Query(max_length=EVAL_STORE_MAX_IDENTIFIER_CHARS),
-            ] = None,
-            status: EvalRunStatus | None = None,
-            corpus_revision: str | None = None,
-            cursor: Annotated[str | None, Query(max_length=EVAL_STORE_MAX_CURSOR_BYTES)] = None,
-            limit: Annotated[
-                int,
-                Query(ge=1, le=EVAL_STORE_MAX_PAGE_SIZE),
-            ] = EVAL_STORE_DEFAULT_PAGE_SIZE,
-            max_result_bytes: Annotated[
-                int,
-                Query(ge=1_024, le=EVAL_STORE_MAX_PAGE_BYTES),
-            ] = EVAL_STORE_DEFAULT_PAGE_BYTES,
-        ):
-            eval_target = _eval_target(target_key)
-            try:
-                return await eval_store.list_runs(
-                    EvalRunQuery(
-                        target_key=eval_target.key,
-                        status=status,
-                        corpus_revision=corpus_revision,
-                        cursor=cursor,
-                        limit=limit,
-                        max_result_bytes=max_result_bytes,
-                    )
-                )
-            except EvalStoreResultTooLarge as exc:
-                raise HTTPException(
-                    status_code=413,
-                    detail="Eval run page exceeds the requested byte limit.",
-                ) from exc
-            except (TypeError, ValueError):
-                _eval_query_error()
-
-        @bounded_evals_router.get(
-            "/evals/runs/{run_id}",
-            response_model=EvalRunRecord,
-            responses=EVALS_ENDPOINT_RESPONSES,
-            dependencies=protected,
-        )
-        async def get_eval_run(run_id: str):
-            return await _load_eval_run(run_id)
-
-        @bounded_evals_router.post(
-            "/evals/runs/{run_id}/scenario-approval",
-            response_model=EvalRunRecord,
-            responses=EVALS_ENDPOINT_RESPONSES,
-            dependencies=protected,
-        )
-        async def submit_eval_scenario_approval(
-            run_id: str,
-            body: EvalScenarioApprovalRequest,
-            auth_context: AuthContext | None = optional_auth_context,
-        ) -> EvalRunRecord:
-            run = await _load_eval_run(run_id)
-            if run.spec.invocation.scenario is None:
-                raise HTTPException(status_code=409, detail="Eval run is not a scenario run.")
-            actor_id = (
-                "cayu:trusted-local-development" if auth_context is None else auth_context.subject
-            )
-            try:
-                return await eval_store.submit_scenario_approval(
-                    run_id,
-                    EvalScenarioApprovalSubmission(
-                        expected_progress_revision=body.expected_progress_revision,
-                        trial_number=body.trial_number,
-                        event_id=body.event_id,
-                        decision=body.decision,
-                        reason=body.reason,
-                        actor_id=actor_id,
-                    ),
-                )
-            except EvalRunStateConflict as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Scenario approval checkpoint changed before submission.",
-                ) from exc
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(status_code=400, detail="Invalid scenario approval.") from exc
-
-        @bounded_evals_router.post(
-            "/evals/runs/{run_id}/cancel",
-            response_model=EvalRunRecord,
-            status_code=202,
-            responses=EVALS_ENDPOINT_RESPONSES,
-            dependencies=protected,
-        )
-        async def cancel_eval_run(run_id: str):
-            await _load_eval_run(run_id)
-            try:
-                return await eval_store.request_cancel(run_id)
-            except KeyError as exc:
-                raise HTTPException(status_code=404, detail="Eval run not found.") from exc
-            except (TypeError, ValueError):
-                _eval_query_error()
-
-        @bounded_evals_router.get(
-            "/evals/runs/{run_id}/result",
-            response_model=EvalResultResponse,
-            responses=EVALS_ENDPOINT_RESPONSES,
-            dependencies=protected,
-        )
-        async def get_eval_result(run_id: str) -> Response:
-            run, result = await _load_eval_result(run_id)
-            trial_evidence_links = await eval_store.load_trial_evidence_links(run_id)
-            baseline = None
-            if captured_eval_store is not None and captured_eval_store.captured_results:
-                baseline = await captured_eval_store.load_baseline(
-                    EvalBaselineKey(
-                        target_key=run.spec.target_key,
-                        corpus_revision=run.spec.corpus_revision,
-                        suite_id=run.spec.suite_id,
-                    )
-                )
-            presentation = await asyncio.to_thread(present_eval_result, result)
-            response = await asyncio.to_thread(
-                EvalResultResponse,
-                run=run,
-                result=result,
-                presentation=presentation,
-                baseline=baseline,
-                trial_evidence_links=trial_evidence_links,
-            )
-            return await _model_json_response(response, EvalResultResponse)
-
-        @bounded_evals_router.get(
-            "/evals/runs/{run_id}/report.json",
-            response_class=Response,
-            responses=EVALS_ENDPOINT_RESPONSES,
-            dependencies=protected,
-        )
-        async def download_eval_json_report(run_id: str) -> Response:
-            _, result = await _load_eval_result(run_id)
-            report = await asyncio.to_thread(
-                _render_utf8,
-                eval_result_report_to_json,
-                result,
-            )
-            return Response(
-                content=report,
-                media_type="application/json",
-                headers={
-                    "Content-Disposition": f'attachment; filename="{run_id}.eval-result.json"'
-                },
-            )
-
-        @bounded_evals_router.get(
-            "/evals/runs/{run_id}/report.html",
-            response_class=Response,
-            responses=EVALS_ENDPOINT_RESPONSES,
-            dependencies=protected,
-        )
-        async def download_eval_html_report(run_id: str) -> Response:
-            _, result = await _load_eval_result(run_id)
-            report = await asyncio.to_thread(
-                _render_utf8,
-                render_corpus_execution_html,
-                result,
-            )
-            return Response(
-                content=report,
-                media_type="text/html",
-                headers={
-                    "Content-Disposition": f'attachment; filename="{run_id}.eval-report.html"'
-                },
-            )
-
-        @bounded_evals_router.post(
-            "/evals/comparisons",
-            response_model=EvalComparisonResponse,
-            responses=EVALS_ENDPOINT_RESPONSES,
-            dependencies=protected,
-            openapi_extra=_json_request_openapi(EvalComparisonRequest),
-        )
-        async def compare_eval_runs(request: Request) -> Response:
-            body = await _validated_private_json_body(
-                request,
-                EvalComparisonRequest,
-                invalid_detail="Invalid Evals request.",
-            )
-            baseline_run, baseline = await _load_eval_result(body.baseline_run_id)
-            if body.current_run_id == body.baseline_run_id:
-                current_run, current = baseline_run, baseline
-            else:
-                current_run, current = await _load_eval_result(body.current_run_id)
-            comparison = await asyncio.to_thread(
-                compare_corpus_execution_results,
-                baseline,
-                current,
-            )
-            response = await asyncio.to_thread(
-                EvalComparisonResponse,
-                baseline=baseline_run,
-                current=current_run,
-                comparison=comparison,
-            )
-            return await _model_json_response(response, EvalComparisonResponse)
 
     @router.get(
         "/system/diagnostics",

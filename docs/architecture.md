@@ -102,6 +102,14 @@ validation, serialization and storage operations. Catalog reads and run creation
 share one revision loader that enforces current target visibility and private
 storage errors. Run admission, execution and worker lifespan retain their owners.
 
+`server/_evaluation_run_routes.py` owns durable run listing, detail, scenario
+approval, cancellation, results, report downloads and comparisons. It receives
+the bounded router, store, target registry, optional result catalog and shared
+auth dependencies. Run visibility is checked before result loading, and the run
+is reloaded after publication becomes visible. Reporting and comparison compose
+the existing library functions. Launch preparation, admission and the worker
+lifespan remain in router composition.
+
 ## Runtime Shape
 
 ```text
