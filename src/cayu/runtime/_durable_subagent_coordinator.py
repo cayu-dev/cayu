@@ -106,6 +106,7 @@ class DurableSubagentPreparedRun:
     runtime_version: str | None
     runtime_build_provenance: RuntimeBuildProvenance
     execution_profile: ExecutionProfileIdentity
+    policy_evidence: dict[str, Any] | None = None
 
 
 class DurableSubagentCoordinator:
@@ -761,6 +762,7 @@ class DurableSubagentCoordinator:
         child_runtime_version = prepared.runtime_version
         child_runtime_build_provenance = prepared.runtime_build_provenance
         child_execution_profile = prepared.execution_profile
+        child_policy_evidence = prepared.policy_evidence
         # Do not retain the provider-bearing preparation bundle across the durable
         # checkpoint publication below. Store failures may escape with frame locals.
         del prepared
@@ -805,6 +807,7 @@ class DurableSubagentCoordinator:
             request_sha256=durable_subagent_request_sha256(request),
             request=request,
             child_execution_profile=child_execution_profile,
+            policy_evidence=child_policy_evidence,
         )
         require_durable_subagent_intent_matches_seed(intent, seed)
 
@@ -1314,6 +1317,13 @@ class DurableSubagentCoordinator:
             interaction_started_event_id=intent.interaction_started_event_id,
             idempotency_key=intent.idempotency_key,
             submission_sha256=intent.submission_sha256,
+            provider_name=intent.child_provider_name,
+            model=intent.child_model,
+            policy_evidence=(
+                None
+                if intent.policy_evidence is None
+                else canonical_durable_json_bytes(intent.policy_evidence, "model_policy")
+            ),
         )
 
     async def require_prepared_subagent_parent_authority(

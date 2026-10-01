@@ -63,7 +63,12 @@ def run_project_entrypoint(
         else nullcontext()
     )
     with capture:
-        outcome = asyncio.run(run_to_completion(app, run_request))
+
+        async def execute():
+            async with app.model_policy_lifespan():
+                return await run_to_completion(app, run_request)
+
+        outcome = asyncio.run(execute())
     if outcome.ok:
         print(outcome.final_text)
         return 0

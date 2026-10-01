@@ -14,6 +14,7 @@ from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     canonical_durable_json_bytes,
     copy_durable_json_object,
+    copy_durable_metadata,
     require_durable_clean_nonblank,
 )
 from cayu.messages import Message
@@ -815,6 +816,12 @@ class DurableSubagentSubmissionIntent(_DurableSubagentAuthorityRecord):
     seed_sha256: str
     child_execution_profile: ExecutionProfileIdentity
     submission_sha256: str
+    policy_evidence: dict[str, Any] | None = None
+
+    @field_validator("policy_evidence", mode="before")
+    @classmethod
+    def copy_policy_evidence(cls, value):
+        return None if value is None else copy_durable_metadata(value, "model_policy")
 
     @field_validator("child_provider_name", "child_model", "child_runtime_name")
     @classmethod
@@ -851,6 +858,11 @@ class DurableSubagentSubmissionIntent(_DurableSubagentAuthorityRecord):
 
     @model_validator(mode="after")
     def validate_intent(self) -> DurableSubagentSubmissionIntent:
+        if self.policy_evidence is not None and (
+            self.policy_evidence.get("model") != self.child_model
+            or self.policy_evidence.get("provider_name") != self.child_provider_name
+        ):
+            raise ValueError("Durable policy evidence conflicts with the child target.")
         if self.parent_execution_profile_fingerprint == self.child_execution_profile.fingerprint:
             # Equality is allowed; this branch documents that the two authorities remain
             # distinct even when their content happens to match.

@@ -96,6 +96,19 @@ class InteractionSummaryEvidence(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    model_policy: dict[str, object] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+    @field_validator("model_policy", mode="before")
+    @classmethod
+    def validate_model_policy(cls, value):
+        if value is None:
+            return None
+        from cayu._validation import copy_durable_metadata
+
+        return copy_durable_metadata(value, "model_policy")
+
     tool_completion: ToolCompletionResult | None = Field(
         default=None,
         exclude_if=lambda value: value is None,

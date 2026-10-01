@@ -21,6 +21,7 @@ from cayu.storage.targets import (
 
 if TYPE_CHECKING:
     from cayu.knowledge.scopes import KnowledgeAccessScope
+    from cayu.runtime._policy_storage import ModelPolicyStore
     from cayu.runtime.public_authority import PublicAuthorityAliasCodec
     from cayu.server import ProductOperationStore
     from cayu.sessions.base import SessionStore
@@ -42,6 +43,7 @@ class ApplicationStores:
         "_close_lock",
         "_closed",
         "_knowledge_store",
+        "_model_policy_store",
         "_pool",
         "_pool_max_size",
         "_product_store",
@@ -58,6 +60,7 @@ class ApplicationStores:
         task_store: TaskStore | None,
         knowledge_store: KnowledgeStore | None,
         product_store: ProductOperationStore | None = None,
+        model_policy_store: ModelPolicyStore | None = None,
         pool: Any | None = None,
         pool_max_size: int | None = None,
         task_admission_listener: bool = False,
@@ -67,6 +70,7 @@ class ApplicationStores:
         self._task_store = task_store
         self._knowledge_store = knowledge_store
         self._product_store = product_store
+        self._model_policy_store = model_policy_store
         self._pool = pool
         self._pool_max_size = pool_max_size
         self._task_admission_listener = task_admission_listener
@@ -106,6 +110,10 @@ class ApplicationStores:
         return self._product_store
 
     @property
+    def model_policy_store(self) -> ModelPolicyStore | None:
+        return self._model_policy_store
+
+    @property
     def pool_max_size(self) -> int | None:
         """Maximum pooled PostgreSQL connections shared by the stores, if any."""
 
@@ -132,6 +140,7 @@ class ApplicationStores:
         for store in (
             self._task_store,
             self._product_store,
+            self._model_policy_store,
             self._knowledge_store,
             self._session_store,
         ):
@@ -166,6 +175,7 @@ def open_application_stores(
     tasks: bool = True,
     knowledge_scope: KnowledgeAccessScope | None = None,
     product_operations: bool = False,
+    model_policy: bool = False,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
     pool_max_size: int | None = None,
     direct_database_url: str | None = None,
@@ -195,6 +205,8 @@ def open_application_stores(
 
     if type(tasks) is not bool:
         raise TypeError("tasks must be a bool.")
+    if type(model_policy) is not bool:
+        raise TypeError("model_policy must be a bool.")
     if type(product_operations) is not bool:
         raise TypeError("product_operations must be a bool.")
     target = application_store_target(database_url, sqlite_path=sqlite_path)
@@ -205,6 +217,7 @@ def open_application_stores(
             tasks=tasks,
             knowledge_scope=knowledge_scope,
             product_operations=product_operations,
+            model_policy=model_policy,
             public_authority_alias_codec=public_authority_alias_codec,
         )
     assert target.postgres_dsn is not None
@@ -229,6 +242,7 @@ def open_application_stores(
         tasks=tasks,
         knowledge_scope=knowledge_scope,
         product_operations=product_operations,
+        model_policy=model_policy,
         public_authority_alias_codec=public_authority_alias_codec,
     )
 
@@ -239,6 +253,7 @@ def _open_sqlite_stores(
     tasks: bool,
     knowledge_scope: KnowledgeAccessScope | None,
     product_operations: bool,
+    model_policy: bool,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None,
 ) -> ApplicationStores:
     from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore
@@ -262,12 +277,18 @@ def _open_sqlite_stores(
         from cayu.storage.product_operations_sqlite import SQLiteProductOperationStore
 
         product_store = SQLiteProductOperationStore(path)
+    policy_store = None
+    if model_policy:
+        from cayu.storage.model_policy_sqlite import SQLiteModelPolicyStore
+
+        policy_store = SQLiteModelPolicyStore(path)
     return ApplicationStores(
         backend=SessionStoreBackend.SQLITE,
         session_store=session_store,
         task_store=task_store,
         knowledge_store=knowledge_store,
         product_store=product_store,
+        model_policy_store=policy_store,
     )
 
 
@@ -279,6 +300,7 @@ def _open_postgres_stores(
     tasks: bool,
     knowledge_scope: KnowledgeAccessScope | None,
     product_operations: bool,
+    model_policy: bool,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None,
 ) -> ApplicationStores:
     try:
@@ -298,6 +320,11 @@ def _open_postgres_stores(
         ) from exc
 
     product_store_type: Any = None
+    policy_store_type: Any = None
+    if model_policy:
+        from cayu.storage.model_policy_postgres import PostgresModelPolicyStore
+
+        policy_store_type = PostgresModelPolicyStore
     if product_operations:
         from cayu.storage.product_operations_postgres import PostgresProductOperationStore
 
@@ -325,6 +352,9 @@ def _open_postgres_stores(
                 product_store_type(dsn, max_size=pool_max_size)
                 if product_store_type is not None
                 else None
+            ),
+            model_policy_store=(
+                policy_store_type(dsn, max_size=pool_max_size) if policy_store_type else None
             ),
         )
 
@@ -372,6 +402,11 @@ def _open_postgres_stores(
         task_store=task_store,
         knowledge_store=knowledge_store,
         product_store=product_store,
+        model_policy_store=(
+            policy_store_type(pool=pool, schema_mode=SchemaMode.VALIDATE)
+            if policy_store_type
+            else None
+        ),
         pool=pool,
         pool_max_size=pool_max_size,
         task_admission_listener=task_store is not None,

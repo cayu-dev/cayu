@@ -31,6 +31,8 @@ from cayu.runtime._durable_tool_round import (
     _limit_reached_tool_round_results as _limit_reached_tool_round_results,
 )
 from cayu.runtime._durable_tool_round import _limit_value_for_payload as _limit_value_for_payload
+from cayu.runtime._model_policy import PolicySelection
+from cayu.runtime._policy_wire import decode as decode_policy_evidence
 
 if TYPE_CHECKING:
     from cayu.runtime._producer_completion_replay import _ProducerCompletionReplay
@@ -3312,6 +3314,7 @@ class _PreparedInitialRun:
     targeted_tool_grants: tuple[PreparedTargetedToolGrant, ...]
     budget_policy: BudgetPolicy | None
     session_identity: SessionIdentity
+    policy_evidence: bytes | None
 
 
 def _tool_discovery_operation_initializer(
@@ -5173,7 +5176,9 @@ class SessionEngine:
         execution_profile_process_identity: str,
         resource_access_policy: ResourceAccessPolicy | None = None,
         egress_authority_adoption_handler: EgressAuthorityAdoptionHandler | None = None,
+        policy_selection: Callable[[str], PolicySelection | None] | None = None,
     ) -> None:
+        self._policy_selection = policy_selection
         self._resource_access_policy = resource_access_policy
         self.session_store = session_store
         self._require_participant_execution = require_participant_execution
@@ -8113,6 +8118,7 @@ class SessionEngine:
         interaction_id: str,
         targeted_tool_grants: tuple[PreparedTargetedToolGrant, ...] = (),
         queued_profile_handoff: QueuedInteractionProfileHandoff | None = None,
+        policy_evidence: bytes | None = None,
         event_id: str | None = None,
         started_at: datetime | None = None,
     ) -> Event:
@@ -8125,6 +8131,7 @@ class SessionEngine:
             started_at=started_at,
             targeted_tool_grants=targeted_tool_grants,
             queued_profile_handoff=queued_profile_handoff,
+            policy_evidence=policy_evidence,
         )
 
     def _interaction_started_event_from_identity(
@@ -8138,6 +8145,7 @@ class SessionEngine:
         started_at: datetime | None = None,
         targeted_tool_grants: tuple[PreparedTargetedToolGrant, ...] = (),
         queued_profile_handoff: QueuedInteractionProfileHandoff | None = None,
+        policy_evidence: bytes | None = None,
     ) -> Event:
         event_id = (
             str(uuid4()) if event_id is None else require_clean_nonblank(event_id, "event_id")
@@ -8167,6 +8175,11 @@ class SessionEngine:
                         environment_name=environment_name,
                         payload={
                             **evidence.model_dump(mode="json"),
+                            **(
+                                {}
+                                if policy_evidence is None
+                                else {"model_policy": decode_policy_evidence(policy_evidence)}
+                            ),
                             **(
                                 {}
                                 if queued_profile_handoff is None
@@ -10099,19 +10112,49 @@ class SessionEngine:
         self,
         request: RunRequest,
         registered_agent: runtime_records.RegisteredAgentState,
-    ) -> tuple[runtime_records.RegisteredProvider, str]:
+        *,
+        select_current_policy: bool = True,
+    ) -> tuple[runtime_records.RegisteredProvider, str, bytes | None]:
+        prepared = runtime_prepared_session_authority(request)
+        # A queued policy selection belongs to the admitted child, not the
+        # worker's current default. Non-policy children still undergo ordinary
+        # agent/profile compatibility checks and cannot adopt policy retroactively.
+        if prepared is not None and prepared.policy_evidence is not None:
+            if request.target is not None and (
+                request.target.provider_name != prepared.provider_name
+                or request.target.model != prepared.model
+            ):
+                raise durable_subagent_authority_rejected()
+            return (
+                self._get_registered_provider(prepared.provider_name),
+                prepared.model,
+                prepared.policy_evidence,
+            )
         if request.target is not None:
             return (
                 self._get_registered_provider(request.target.provider_name),
                 request.target.model,
+                None,
+            )
+        selection = (
+            None
+            if self._policy_selection is None or prepared is not None or not select_current_policy
+            else self._policy_selection(request.agent_name)
+        )
+        if selection is not None:
+            return (
+                self._get_registered_provider(selection.target.provider_name),
+                selection.target.model,
+                selection.evidence,
             )
         model = registered_agent.spec.model
         if registered_agent.spec.provider_name is not None:
-            return self._get_registered_provider(registered_agent.spec.provider_name), model
+            return self._get_registered_provider(registered_agent.spec.provider_name), model, None
         return (
             self._route_registered_provider_for_model(model=model)
             or self._get_registered_provider(),
             model,
+            None,
         )
 
     def resolve_initial_model_target(self, request: RunRequest) -> ModelTarget:
@@ -10120,7 +10163,7 @@ class SessionEngine:
         if type(request) is not RunRequest:
             raise TypeError("Initial model-target resolution requires a RunRequest.")
         registered_agent = self._get_registered_agent(request.agent_name)
-        registered_provider, model = self._resolve_initial_model_target(
+        registered_provider, model, _ = self._resolve_initial_model_target(
             request,
             registered_agent,
         )
@@ -10317,6 +10360,7 @@ class SessionEngine:
         allow_work_attempt_admission: bool = False,
         prepared_work_attempt: WorkAttemptAdmission | None = None,
         allow_existing_session_id: bool = False,
+        retained_policy_selection: PolicySelection | None = None,
     ) -> _PreparedInitialRun | None:
         """Resolve one new-session request, optionally without ordinary admission."""
 
@@ -10449,10 +10493,20 @@ class SessionEngine:
         )
         # An explicit target is exact. Otherwise the agent model and optional
         # provider pin feed the existing routing/default selection.
-        registered_provider, model = self._resolve_initial_model_target(
-            request,
-            registered_agent,
-        )
+        if retained_policy_selection is not None:
+            if not allow_existing_session_id or request.target is not None:
+                raise ValueError("Retained policy selection requires a defaulted existing session.")
+            registered_provider = self._get_registered_provider(
+                retained_policy_selection.target.provider_name
+            )
+            model = retained_policy_selection.target.model
+            policy_evidence = retained_policy_selection.evidence
+        else:
+            registered_provider, model, policy_evidence = self._resolve_initial_model_target(
+                request,
+                registered_agent,
+                select_current_policy=not allow_existing_session_id,
+            )
         for field_name, value in (
             ("agent_name", registered_agent.spec.name),
             ("provider_name", registered_provider.name),
@@ -10689,6 +10743,7 @@ class SessionEngine:
             targeted_tool_grants=targeted_tool_grants,
             budget_policy=budget_policy,
             session_identity=session_identity,
+            policy_evidence=policy_evidence,
         )
 
     async def _prepare_runtime_work_attempt(
@@ -12527,6 +12582,7 @@ class SessionEngine:
             interaction_id=interaction_id,
             event_id=None,
             targeted_tool_grants=prepared.targeted_tool_grants,
+            policy_evidence=prepared.policy_evidence,
         )
         bind_runtime_session_create_claim(
             prepared_request,
@@ -13306,12 +13362,45 @@ class SessionEngine:
                 raise ValueError("Participant execution requires a session incarnation.")
             if participant_permit_operation is None or participant_permit_commitment is None:
                 raise ValueError("Participant execution requires a durable permit.")
+        retained_policy_selection = None
+        if participant_execution_key is not None:
+            if request.session_id is None:
+                raise ValueError("Participant execution requires a session ID.")
+            retained_session = await self.session_store.load(request.session_id)
+            creation_receipt = await self.session_store.load_participant_session_creation_receipt(
+                request.session_id
+            )
+            if (
+                retained_session is None
+                or retained_session.instance_id != participant_session_instance_id
+                or creation_receipt is None
+                or creation_receipt.binding.session_id != retained_session.id
+                or creation_receipt.binding.session_instance_id != retained_session.instance_id
+            ):
+                raise SessionStatusConflict("Participant creation authority is unavailable.")
+            evidence = creation_receipt.binding.policy_evidence_json
+            if evidence is not None:
+                selected = decode_policy_evidence(evidence.encode())
+                if (
+                    selected["provider_name"] != retained_session.provider_name
+                    or selected["model"] != retained_session.model
+                ):
+                    raise SessionStatusConflict(
+                        "Participant policy selection conflicts with its session."
+                    )
+                retained_policy_selection = PolicySelection(
+                    target=ModelTarget(
+                        provider_name=retained_session.provider_name, model=retained_session.model
+                    ),
+                    evidence=evidence.encode(),
+                )
         preparation = self._prepare_initial_run(
             request,
             expected_execution_profile=expected_execution_profile,
             expected_registered_environment=expected_registered_environment,
             expected_context_policy=expected_context_policy,
             allow_existing_session_id=participant_execution_key is not None,
+            retained_policy_selection=retained_policy_selection,
         )
         del request
         prepared = await preparation
@@ -13337,6 +13426,7 @@ class SessionEngine:
         targeted_tool_grants = prepared.targeted_tool_grants
         budget_policy = prepared.budget_policy
         session_identity = prepared.session_identity
+        policy_evidence = prepared.policy_evidence
         # ``prepared`` also retains the registered provider, whose repr may contain
         # live credentials. Keep the deliberately scoped provider local below so
         # cancellation cleanup can drop it before a traceback escapes this frame.
@@ -13366,6 +13456,7 @@ class SessionEngine:
             agent_name=registered_agent.spec.name,
             environment_name=_environment_name(registered_environment),
             interaction_id=interaction_id,
+            policy_evidence=policy_evidence,
             event_id=(
                 str(
                     uuid5(
@@ -14229,6 +14320,11 @@ class SessionEngine:
                 start_event_type=EventType.SESSION_STARTED,
                 start_event_payload={
                     "agent_name": registered_agent.spec.name,
+                    **(
+                        {}
+                        if policy_evidence is None
+                        else {"model_policy": decode_policy_evidence(policy_evidence)}
+                    ),
                     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: session_input_contract_evidence(
                         request,
                         message_start_index=(len(messages) - len(initial_source_messages)),

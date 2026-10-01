@@ -406,6 +406,7 @@ from cayu.runtime._isolated_tool_process import (
     validate_process_isolated_tool_registration,
 )
 from cayu.runtime._model_execution_selection import ModelExecutionSelection
+from cayu.runtime._model_policy import ModelPolicy
 from cayu.runtime._model_step_executor import (
     ModelCompletionPublicationRequest,
     ModelCompletionPublicationResult,
@@ -1188,7 +1189,11 @@ class CayuApp:
         session_closure_stores: Iterable[SessionClosureStore] | None = None,
         clock: Callable[[], datetime] | None = None,
         session_execution: SessionExecutionConfig | None = None,
+        model_policy: ModelPolicy | None = None,
     ) -> None:
+        if model_policy is not None and type(model_policy) is not ModelPolicy:
+            raise TypeError("model_policy must be ModelPolicy.")
+        self.model_policy = model_policy
         # Resolve once at application startup. Strict deployments fail here,
         # before any session or provider authority can be admitted.
         if browser_control is not None:
@@ -1644,6 +1649,7 @@ class CayuApp:
         )
 
         self._session_engine = SessionEngine(
+            policy_selection=(None if model_policy is None else model_policy.selection),
             resource_access_policy=resource_access_policy,
             session_store=self._runtime_session_store,
             require_participant_execution=self._require_participant_execution,
@@ -3477,6 +3483,9 @@ class CayuApp:
                 execution_profile_commitment=execution_profile_commitment,
                 historical_definition_json=historical_definition_json,
                 creation_key=creation.creation_key,
+                policy_evidence_json=(
+                    None if prepared.policy_evidence is None else prepared.policy_evidence.decode()
+                ),
             )
             material = {
                 "binding": binding.model_dump(mode="json"),
@@ -6098,6 +6107,47 @@ class CayuApp:
         """Resolve initial provider/model routing without preparing runtime state."""
 
         return self._session_engine.resolve_initial_model_target(request)
+
+    async def start_model_policy(self) -> None:
+        """Start explicitly configured policy workers before admitting defaulted runs."""
+        if self.model_policy is not None:
+            for controller in self.model_policy.controllers:
+                self._get_registered_agent(controller.agent_name)
+            await self.model_policy.start(lambda name: self._get_registered_provider(name).provider)
+
+    async def stop_model_policy(self) -> None:
+        """Stop policy workers; application-owned channels and stores remain open."""
+        if self.model_policy is not None:
+            await self.model_policy.close()
+
+    @asynccontextmanager
+    async def model_policy_lifespan(self):
+        """Own policy workers without replacing an application's primary failure."""
+        await self.start_model_policy()
+        try:
+            yield
+        except BaseException as primary:
+            try:
+                await self.stop_model_policy()
+            except BaseException as cleanup:
+                if isinstance(primary, asyncio.CancelledError):
+                    evidence = [cleanup]
+                    if primary.__cause__ is not None:
+                        evidence.insert(0, primary.__cause__)
+                    raise primary from BaseExceptionGroup("Model policy cleanup failed.", evidence)
+                if isinstance(cleanup, asyncio.CancelledError):
+                    evidence = [primary]
+                    if cleanup.__cause__ is not None:
+                        evidence.append(cleanup.__cause__)
+                    raise cleanup from BaseExceptionGroup(
+                        "Application and model policy cleanup failed.", evidence
+                    )
+                raise BaseExceptionGroup(
+                    "Application and model policy cleanup failed.", [primary, cleanup]
+                ) from None
+            raise
+        else:
+            await self.stop_model_policy()
 
     async def inspect_run_execution_profile(self, request: RunRequest) -> str:
         """Return the exact initial profile fingerprint without admitting a session.
@@ -9013,6 +9063,11 @@ class CayuApp:
                 runtime_version=prepared.session_identity.runtime_version,
                 runtime_build_provenance=(prepared.session_identity.runtime_build_provenance),
                 execution_profile=prepared.execution_profile,
+                policy_evidence=(
+                    None
+                    if prepared.policy_evidence is None
+                    else json.loads(prepared.policy_evidence)
+                ),
             )
         finally:
             del prepared

@@ -510,6 +510,8 @@ REVISIONS: tuple[Revision, ...] = (
     # Liveness is observational: older writers remain compatible and have an
     # unknown owner until an instrumented run publishes execution presence.
     Revision(revision=113, kind=RevisionKind.ADDITIVE, compatible_from=111),
+    # Application-default policy state and pending report ownership.
+    Revision(revision=114, kind=RevisionKind.ADDITIVE, compatible_from=111),
 )
 
 #: The revision an empty database is initialized to.

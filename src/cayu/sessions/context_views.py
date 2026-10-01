@@ -692,7 +692,15 @@ class ParticipantSessionBinding(ContractValue):
     execution_profile_commitment: StrictStr
     historical_definition_json: StrictStr
     creation_key: StrictStr
+    policy_evidence_json: StrictStr | None = None
     schema_version: Literal[1] = 1
+
+    @field_validator("policy_evidence_json")
+    @classmethod
+    def validate_policy_evidence(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _canonical_json_text(value, "model policy evidence", max_bytes=16 * 1024)
 
     @field_validator("historical_definition_json")
     @classmethod

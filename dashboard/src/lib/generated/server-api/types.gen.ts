@@ -735,6 +735,12 @@ export type ApiInteractionSummary = {
      */
     interaction_id: string;
     /**
+     * Model Policy
+     */
+    model_policy?: {
+        [key: string]: unknown;
+    } | null;
+    /**
      * Model Step Count
      */
     model_step_count?: number;

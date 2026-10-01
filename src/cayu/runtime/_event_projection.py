@@ -90,6 +90,39 @@ from cayu.workspaces.revisions import (
     WorkspaceRevisionObservationStatus,
 )
 
+_MODEL_POLICY_PATHS = frozenset(
+    [
+        ("model_policy", key)
+        for key in (
+            "scope",
+            "incarnation_id",
+            "incarnation_epoch",
+            "installation_id",
+            "installation_seq",
+            "action",
+            "snapshot",
+            "model",
+            "provider_name",
+        )
+    ]
+    + [
+        ("model_policy", "scope", key)
+        for key in (
+            "organization_id",
+            "cloud_agent_id",
+            "application_id",
+            "instance_id",
+            "integration_id",
+            "credential_family_id",
+            "inference_key_id",
+        )
+    ]
+    + [
+        ("model_policy", "snapshot", key)
+        for key in ("snapshot_id", "effective_revision", "config_sha256")
+    ]
+)
+
 PUBLIC_EVENT_ID_PREFIX = "cayu_event_"
 PUBLIC_EVENT_LINKAGE_SEPARATOR = ":"
 PUBLIC_EVENT_ENVELOPE_ALIAS_PREFIX = PUBLIC_AUTHORITY_ALIAS_PREFIX
@@ -2036,6 +2069,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         policies[event_type] = egress_authority_transition
 
     interaction_summary = _policy(
+        "model_policy",
         "active_duration_ms",
         "completed_at",
         "model_step_count",
@@ -2055,7 +2089,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "token_usage",
         "tool_call_count",
         "wall_duration_ms",
-        owned_nested_paths=_AGGREGATE_USAGE_NESTED_PATHS,
+        owned_nested_paths=_AGGREGATE_USAGE_NESTED_PATHS | _MODEL_POLICY_PATHS,
         authority_keys={"start_event_id"},
     )
     for event_type in (
@@ -3353,9 +3387,9 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         owned_nested_paths=frozenset(failure_evidence_owned_paths),
     )
     policies[EventType.SESSION_STARTED] = _observed_policy(
-        "agent_name input_contract parent_session_id prompt_contribution_manifest run_epoch "
+        "agent_name input_contract model_policy parent_session_id prompt_contribution_manifest run_epoch "
         "traceparent tracestate",
-        owned_nested_paths=_PROMPT_CONTRIBUTION_MANIFEST_NESTED_PATHS,
+        owned_nested_paths=_PROMPT_CONTRIBUTION_MANIFEST_NESTED_PATHS | _MODEL_POLICY_PATHS,
         authority_keys={"input_contract"},
         internal_authority_keys={"input_contract"},
     )

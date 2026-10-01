@@ -28,6 +28,7 @@ from cayu import (
     SessionStore,
     TaskStore,
 )
+from cayu.model_policy import configured_model_policy
 
 from agents.registration import register_agents
 from configuration.providers import (
@@ -74,6 +75,9 @@ def build_app(
         knowledge_review_namespace=runtime.knowledge_review_namespace,
         request_footprint=runtime.request_footprint,
         enable_logging=runtime.enable_logging,
+        model_policy=configured_model_policy(
+            None if stores.configured is None else stores.configured.model_policy_store
+        ),
     )
     selected_provider = provider if provider is not None else configured_provider()
     app.register_provider(selected_provider, default=True)
@@ -423,6 +427,7 @@ from cayu import (
 )
 
 from configuration.settings import configured_public_authority_alias_codec
+from cayu.model_policy import model_policy_enabled
 
 if TYPE_CHECKING:
     from cayu.server import ProductOperationStore
@@ -469,6 +474,7 @@ def build_stores(
         and not build_tasks
         and not build_knowledge
         and not build_product
+        and not model_policy_enabled()
     ):
         return ProjectStores(
             session_store,
@@ -483,6 +489,7 @@ def build_stores(
         tasks=build_tasks,
         knowledge_scope=knowledge_scope if build_knowledge else None,
         product_operations=build_product,
+        model_policy=model_policy_enabled(),
         public_authority_alias_codec=configured_public_authority_alias_codec(),
     )
     return ProjectStores(

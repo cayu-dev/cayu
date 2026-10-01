@@ -66,6 +66,7 @@ from cayu.storage._diagnostic_inspection import (
     DiagnosticStoreInspectionChanged,
     current_diagnostic_store_inspection,
 )
+from cayu.storage._model_policy_schema import SQLITE_MODEL_POLICY_DDL
 from cayu.storage._participant_bindings_schema import (
     SQLITE_PARTICIPANT_BINDINGS_DDL,
     validate_sqlite_participant_bindings,
@@ -1044,6 +1045,7 @@ _MIGRATION_STEPS: dict[int, str] = {
     111: SQLITE_COLLABORATION_WAIT_DDL,
     112: SQLITE_PRODUCT_OPERATION_DDL,
     113: SQLITE_EXECUTION_DDL,
+    114: SQLITE_MODEL_POLICY_DDL,
     110: """
         CREATE TABLE IF NOT EXISTS cayu_producer_cleanup_receipts (
             operation_key TEXT PRIMARY KEY NOT NULL,

@@ -28,7 +28,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from inspect import Parameter, signature
@@ -343,12 +343,12 @@ def create_server(
 
     @asynccontextmanager
     async def cayu_lifespan(server):
-        if browser_recordings is not None:
-            browser_recordings.start()
         side_effect_recovery_task: asyncio.Task[None] | None = None
         incomplete_session_recovery_task: asyncio.Task[None] | None = None
-        if user_lifespan is None:
+        async with app.model_policy_lifespan():
             try:
+                if browser_recordings is not None:
+                    browser_recordings.start()
                 follow_up = await recover_startup_state()
                 incomplete_session_recovery_task = _start_incomplete_session_startup_recovery(
                     app,
@@ -370,32 +370,14 @@ def create_server(
                         await drain_server_work()
                 finally:
                     await _close_project_control_plane_context(resolved_project_context)
-            return
-        async with user_lifespan(server) as state:
-            try:
-                follow_up = await recover_startup_state()
-                incomplete_session_recovery_task = _start_incomplete_session_startup_recovery(
-                    app,
-                    follow_up,
-                )
-                side_effect_recovery_task = _start_persisted_event_side_effect_recovery(
-                    app, side_effect_health
-                )
-                yield state
-            finally:
-                app.seal_knowledge_publications()
-                try:
-                    try:
-                        await _stop_incomplete_session_startup_recovery(
-                            incomplete_session_recovery_task
-                        )
-                        await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
-                    finally:
-                        await drain_server_work()
-                finally:
-                    await _close_project_control_plane_context(resolved_project_context)
 
-    resolved_fastapi_options["lifespan"] = cayu_lifespan
+    @asynccontextmanager
+    async def policy_lifespan(server):
+        resources = nullcontext() if user_lifespan is None else user_lifespan(server)
+        async with resources as state, cayu_lifespan(server):
+            yield state
+
+    resolved_fastapi_options["lifespan"] = policy_lifespan
     resolved_fastapi_options["debug"] = False
     if resolved_config.docs.enabled:
         resolved_fastapi_options["docs_url"] = "/docs"
@@ -1395,7 +1377,7 @@ def _compose_interruption_drain_lifespan(
 
     @asynccontextmanager
     async def lifespan(server_app):
-        async with existing_lifespan(server_app) as state:
+        async with existing_lifespan(server_app) as state, app.model_policy_lifespan():
             side_effect_recovery_task: asyncio.Task[None] | None = None
             try:
                 await _recover_persisted_event_side_effects_during_startup(

@@ -1560,9 +1560,16 @@ class _RuntimePreparedSessionAuthority:
     interaction_started_event_id: str
     idempotency_key: str
     submission_sha256: str
+    provider_name: str
+    model: str
+    policy_evidence: bytes | None
 
     def __post_init__(self) -> None:
+        if self.policy_evidence is not None and type(self.policy_evidence) is not bytes:
+            raise TypeError("Prepared policy evidence must be immutable bytes.")
         for field_name in (
+            "provider_name",
+            "model",
             "session_id",
             "queue_task_id",
             "dispatch_operation_id",
@@ -27185,6 +27192,9 @@ def run_request_with_prepared_session_authority(
     interaction_started_event_id: str,
     idempotency_key: str,
     submission_sha256: str,
+    provider_name: str,
+    model: str,
+    policy_evidence: bytes | None,
 ) -> RunRequest:
     """Bind a validated claimed queue operation to one pre-created child session."""
 
@@ -27201,6 +27211,9 @@ def run_request_with_prepared_session_authority(
         interaction_started_event_id=interaction_started_event_id,
         idempotency_key=idempotency_key,
         submission_sha256=submission_sha256,
+        provider_name=provider_name,
+        model=model,
+        policy_evidence=policy_evidence,
     )
     return copied
 

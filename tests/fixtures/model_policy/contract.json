@@ -1,0 +1,91 @@
+{
+  "effective": {
+    "scope": {
+      "organization_id": "org-example",
+      "cloud_agent_id": "cloud-agent-example",
+      "application_id": "application-example",
+      "instance_id": "replica-1",
+      "integration_id": "default-channel",
+      "credential_family_id": "policy-family-1",
+      "inference_key_id": "inference-key-1"
+    },
+    "effective_revision": 1,
+    "source_revisions": {
+      "organization": 1,
+      "agent": 1,
+      "key": 1
+    },
+    "allowed_models": [
+      "model-a",
+      "model-b"
+    ],
+    "default_model": "model-a",
+    "default_state": "eligible"
+  },
+  "report": {
+    "schema_version": 1,
+    "kind": "installation_report",
+    "scope": {
+      "organization_id": "org-example",
+      "cloud_agent_id": "cloud-agent-example",
+      "application_id": "application-example",
+      "instance_id": "replica-1",
+      "integration_id": "default-channel",
+      "credential_family_id": "policy-family-1",
+      "inference_key_id": "inference-key-1"
+    },
+    "incarnation_id": "incarnation-1",
+    "incarnation_epoch": 1,
+    "operation_id": "report-1",
+    "installation_id": "local-install-1",
+    "installation_seq": 1,
+    "target": "application_default",
+    "action": "install_default",
+    "snapshot": {
+      "snapshot_id": "snapshot-1",
+      "effective_revision": 1,
+      "config_sha256": "1eb0ca559c6e7356d17fa77c4b8b70b9cde5f3d85c57aba8f13c111701337a1c"
+    },
+    "installed_model": "model-a",
+    "locally_committed_at": "2026-09-28T12:00:10.000000Z"
+  },
+  "expected_effective_sha256": "1eb0ca559c6e7356d17fa77c4b8b70b9cde5f3d85c57aba8f13c111701337a1c",
+  "expected_report_sha256": "9f562e28a380bec9be395b9a72fc23d9aee3a677e9a1546084273019151c834a",
+  "scenarios": [
+    "org/key change with unchanged Agent revision",
+    "equal revision conflict",
+    "older read does not roll back",
+    "reordered local installation reports",
+    "expiry versus restoration",
+    "instance replacement and cloned enrollment",
+    "local commit then crash before report",
+    "receipt commit then acknowledgement loss",
+    "credential revocation and explicit rotation",
+    "explicit override and withdrawal"
+  ],
+  "refusal": {
+    "schema_version": 1,
+    "kind": "adoption_refusal",
+    "scope": {
+      "organization_id": "org-example",
+      "cloud_agent_id": "cloud-agent-example",
+      "application_id": "application-example",
+      "instance_id": "replica-1",
+      "integration_id": "default-channel",
+      "credential_family_id": "policy-family-1",
+      "inference_key_id": "inference-key-1"
+    },
+    "incarnation_id": "incarnation-1",
+    "incarnation_epoch": 1,
+    "operation_id": "refusal-2",
+    "decision_seq": 2,
+    "target": "application_default",
+    "snapshot": {
+      "snapshot_id": "snapshot-1",
+      "effective_revision": 1,
+      "config_sha256": "1eb0ca559c6e7356d17fa77c4b8b70b9cde5f3d85c57aba8f13c111701337a1c"
+    },
+    "reason": "model_unknown",
+    "observed_at": "2026-09-28T12:00:10.000000Z"
+  }
+}

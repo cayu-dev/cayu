@@ -65,6 +65,7 @@ from cayu.sessions.base import (
 from cayu.storage import _creation_fence
 from cayu.storage._context_selection_fence import PostgresContextSelectionFenceMixin
 from cayu.storage._creation_fence import PostgresCreationFenceMixin
+from cayu.storage._model_policy_schema import POSTGRES_MODEL_POLICY_DDL
 from cayu.storage._phase_timing import PostgresTimingScope, timed_postgres_connection
 from cayu.storage._session_execution import POSTGRES_EXECUTION_DDL, PostgresSessionExecutionMixin
 
@@ -1542,6 +1543,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     111: POSTGRES_COLLABORATION_WAIT_DDL,
     112: POSTGRES_PRODUCT_OPERATION_DDL,
     113: POSTGRES_EXECUTION_DDL,
+    114: POSTGRES_MODEL_POLICY_DDL,
     106: (),  # Contract-only writer fence; existing typed request records own storage.
     105: POSTGRES_COLLABORATION_CLARIFICATION_DDL,
     104: (
