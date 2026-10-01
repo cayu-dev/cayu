@@ -1762,8 +1762,10 @@ def test_cloud_deploy_wait_reports_typed_deployment_failure(
             "category": "source_build_failed",
             "application": "outbound-agent",
             "deployment_id": "dep_failed",
+            "status": "failed",
             "commands": {
                 "logs": "cayu cloud deployment logs dep_failed --application outbound-agent",
+                "timeline": "cayu cloud deployment timeline dep_failed --application outbound-agent",
             },
             "failure": failure,
             "message": "The Agent image could not be built.",
@@ -2102,8 +2104,11 @@ def test_cloud_deploy_wait_rejects_unsafe_timeline_failure(
             "diagnostic_status": "unavailable_or_unsupported",
             "application": "outbound-agent",
             "deployment_id": "dep_failed",
+            "status": "failed",
             "commands": {
-                "logs": "cayu cloud deployment logs dep_failed --application outbound-agent"
+                "logs": "cayu cloud deployment logs dep_failed --application outbound-agent",
+                "timeline": "cayu cloud deployment timeline dep_failed --application outbound-agent",
+                "retry": "cayu cloud deployment retry dep_failed --application outbound-agent",
             },
         },
         "ok": False,
@@ -2111,7 +2116,7 @@ def test_cloud_deploy_wait_rejects_unsafe_timeline_failure(
     assert unsafe_detail not in rendered
 
 
-def test_cloud_deployment_wait_does_not_request_failure_diagnostics() -> None:
+def test_cloud_deployment_wait_requests_terminal_failure_diagnostics() -> None:
     class Client:
         def __init__(self) -> None:
             self.requests: list[tuple[str, str]] = []
@@ -2123,6 +2128,8 @@ def test_cloud_deployment_wait_does_not_request_failure_diagnostics() -> None:
                 return {"items": [{"id": "outbound-agent", "name": "Outbound Agent"}]}
             if path.endswith("/dep_failed"):
                 return {"id": "dep_failed", "status": "failed"}
+            if path.endswith("/timeline"):
+                return {"failure": None}
             raise AssertionError(f"unexpected request: {method} {path}")
 
     client = Client()
@@ -2144,6 +2151,7 @@ def test_cloud_deployment_wait_does_not_request_failure_diagnostics() -> None:
     assert client.requests == [
         ("GET", "/v1/applications"),
         ("GET", "/v1/applications/outbound-agent/deployments/dep_failed"),
+        ("GET", "/v1/applications/outbound-agent/deployments/dep_failed/timeline"),
     ]
 
 

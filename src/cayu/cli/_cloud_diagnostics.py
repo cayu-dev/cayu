@@ -27,6 +27,9 @@ _PHASES = {
     "sandbox_template_ready",
     "policy_compiled",
     "smoke_tested",
+    # Cloud's service-publication phases for Agents that declare a database.
+    "database_provisioned",
+    "database_migrated",
 }
 _PRIVATE = re.compile(
     r"(?:[a-z][a-z0-9+.-]*://|arn:|\b[A-Za-z_][A-Za-z0-9_]*\s*=|"
@@ -103,7 +106,7 @@ def parse_build_failure(value: object) -> CloudDeploymentFailure | None:
         not isinstance(status, str)
         or status not in {"available", "unavailable", "withheld"}
         or not isinstance(stage, str)
-        or stage not in {"source_validation", "docker_build", "image_build"}
+        or stage not in {"source_validation", "docker_build", "image_build", "database_migration"}
         or (
             reason is not None
             and (not isinstance(reason, str) or re.fullmatch(r"[a-z_]{1,64}", reason) is None)

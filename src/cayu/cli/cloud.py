@@ -16,6 +16,7 @@ import webbrowser
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, Never
+from urllib.parse import urlencode
 
 from cayu.cli._cloud_api import CloudApiClient, CloudApiError
 from cayu.cli._cloud_auth import (
@@ -26,7 +27,7 @@ from cayu.cli._cloud_auth import (
     fresh_cloud_credentials,
 )
 from cayu.cli._cloud_diagnostics import CloudDeploymentFailure as _CloudDeploymentFailure
-from cayu.cli._cloud_diagnostics import parse_build_failure
+from cayu.cli._cloud_diagnostics import parse_build_failure, safe_text
 from cayu.cli._cloud_evidence import EvidenceRecorder
 from cayu.cli._cloud_private_state import write_private_json as _write_private_json
 from cayu.cli._cloud_project import (
@@ -54,17 +55,7 @@ _SERVICE_READY = {"running"}
 _SERVICE_STATUSES = _SERVICE_FAILURES | _SERVICE_IN_PROGRESS | _SERVICE_READY
 _CLOUD_DEPLOYMENT_ID = re.compile(r"dep_[a-z0-9]{1,64}")
 _PRODUCTION_API_URL = "https://cloud.cayu.dev"
-_SOURCE_BUILD_FAILURE_MESSAGE = "The Agent image could not be built."
-_SOURCE_BUILD_FAILURE_HINT = "Fix the Agent source and deploy again."
-_SOURCE_BUILD_FAILURE_DETAILS = frozenset(
-    {
-        "The Agent dependency set could not be resolved.",
-        "The Agent Docker build context is invalid.",
-        "The Agent package discovery configuration is ambiguous.",
-        "The Agent Python project or lockfile is incomplete.",
-        "The Agent source or a required package failed to compile.",
-    }
-)
+_LEGACY_RETRY_REJECTION = "Only paused or failed deployments can be retried."
 
 
 class CloudCommandError(RuntimeError):
@@ -89,6 +80,12 @@ class _CloudServiceHealthError(CloudApiError):
         self.issues = [dict(issue) for issue in issues]
 
 
+class _CloudRetrySubmissionError(CloudApiError):
+    def __init__(self, cause: CloudApiError, *, deployment_id: str, retry_key: str):
+        super().__init__(cause.category, str(cause), status_code=cause.status_code)
+        self.details = {"deployment_id": deployment_id, "retry_idempotency_key": retry_key}
+
+
 class _CloudDeploymentFailureError(CloudApiError):
     """Safe structured Cayu Cloud deployment failure."""
 
@@ -107,7 +104,9 @@ class _CloudDeploymentFailureError(CloudApiError):
 
 class _CloudDeploymentDiagnosticUnavailableError(CloudApiError):
     def __init__(self, details: dict[str, object]) -> None:
-        super().__init__("deployment_failed", "Deployment reached terminal status: failed")
+        super().__init__(
+            "deployment_failed", f"Deployment reached terminal status: {details['status']}"
+        )
         self.details = details
 
 
@@ -261,7 +260,14 @@ def _cloud_failure(exc: Exception) -> int:
     error: dict[str, object] = {"category": category, "message": message}
     if isinstance(exc, CloudSourceInputsError):
         error.update({"path": exc.path, "reason": exc.reason, "hint": exc.hint})
-    if isinstance(exc, (_CloudDeploymentDiagnosticUnavailableError, _CloudDeploymentFailureError)):
+    if isinstance(
+        exc,
+        (
+            _CloudDeploymentDiagnosticUnavailableError,
+            _CloudDeploymentFailureError,
+            _CloudRetrySubmissionError,
+        ),
+    ):
         error.update(exc.details)
     if isinstance(exc, _CloudDeploymentFailureError):
         error["failure"] = exc.failure
@@ -383,6 +389,12 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     )
     deploy.add_argument("--no-wait", action="store_true")
     deploy.add_argument("--no-promote", action="store_true")
+    deploy.add_argument(
+        "--retry-failed",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Retry a replayed Cloud-side terminal failure with a fresh submission key (default: enabled).",
+    )
     deploy.add_argument("--poll-seconds", type=_positive_finite_seconds, default=5.0)
     deploy.add_argument("--wait-seconds", type=_positive_finite_seconds, default=1800.0)
     deploy.set_defaults(_cloud_preflight=_preflight_deploy_wait)
@@ -402,11 +414,14 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         "timeline": "Show the publication milestones for one release.",
         "wait": "Wait until one release is promotable or terminal.",
         "promote": "Select a smoke-tested release for its Agent application.",
+        "retry": "Create a new immutable release attempt from retained source.",
     }
     for action, description in deployment_descriptions.items():
         operation = deployment_commands.add_parser(action, description=description)
         operation.add_argument("deployment_id")
         operation.add_argument("--application", required=True)
+        if action == "retry":
+            operation.add_argument("--idempotency-key")
         if action == "logs":
             operation.add_argument("--diagnostic-offset", type=_diagnostic_offset, default=None)
             operation.add_argument("--diagnostic-limit", type=_diagnostic_limit, default=None)
@@ -767,6 +782,11 @@ def _deploy(
         )
         client.upload_bytes(upload_url, project.bundle)
     correlation_id = _correlation_id("deploy")
+    source_key = _deployment_idempotency_key(
+        application_id=str(application["id"]),
+        version=project.manifest.version,
+        revision=revision,
+    )
     deployment = client.request(
         "POST",
         f"/v1/applications/{application['id']}/deployments",
@@ -774,12 +794,70 @@ def _deploy(
             repository=repository,
             revision=revision,
         ),
-        idempotency_key=_deployment_idempotency_key(
-            application_id=str(application["id"]),
-            version=project.manifest.version,
-            revision=revision,
-        ),
+        idempotency_key=source_key,
     )
+    retry = None
+    original = deployment
+    if _deployment_status(deployment) in _DEPLOYMENT_FAILURES:
+        deployment = _latest_source_retry(client, str(application["id"]), original)
+    if _deployment_status(deployment) in _DEPLOYMENT_FAILURES:
+        old_id = str(deployment["id"])
+        old_status = str(deployment["status"])
+        failure = _deployment_failure(
+            client, path=f"/v1/applications/{application['id']}/deployments/{old_id}"
+        )
+        if (
+            old_status in {"failed", "destroyed"}
+            and getattr(arguments, "retry_failed", True)
+            and failure is not None
+            and failure["automatic_retryable"]
+        ):
+            # Retry the original, not the newest attempt: Cloud adds attempts as direct
+            # children of the original and converges every member's retry on one live
+            # attempt. The key names the failed attempt being replaced, so a repeated
+            # deploy replays the same retry until that attempt fails too.
+            retry_key = (
+                "deploy-retry:" + hashlib.sha256(f"{source_key}:{old_id}".encode()).hexdigest()
+            )
+            try:
+                deployment = client.request(
+                    "POST",
+                    f"/v1/applications/{application['id']}/deployments/{original['id']}/retry",
+                    idempotency_key=retry_key,
+                )
+            except CloudApiError as exc:
+                if exc.status_code == 409:
+                    _raise_terminal_deployment(
+                        application_id=str(application["id"]),
+                        deployment_id=old_id,
+                        status=old_status,
+                        recovery_arguments=_cloud_recovery_arguments(arguments),
+                        failure=failure,
+                        replayed=True,
+                        # Servers without destroyed-failure retry reject it with exactly
+                        # this reason; any other conflict is the server's to explain.
+                        retry_rejection=None
+                        if exc.detail == _LEGACY_RETRY_REJECTION
+                        else exc.detail or str(exc),
+                    )
+                raise _CloudRetrySubmissionError(
+                    exc, deployment_id=str(original["id"]), retry_key=retry_key
+                ) from exc
+            retry = {
+                "previous_deployment_id": old_id,
+                "deployment_id": str(deployment["id"]),
+                "failure_code": failure["code"],
+                "reason": failure["message"],
+            }
+        else:
+            _raise_terminal_deployment(
+                application_id=str(application["id"]),
+                deployment_id=old_id,
+                status=old_status,
+                recovery_arguments=_cloud_recovery_arguments(arguments),
+                failure=failure,
+                replayed=True,
+            )
     if not arguments.no_wait:
         deployment = _wait_for_deployment(
             client,
@@ -839,6 +917,8 @@ def _deploy(
             "revision": revision,
         },
     }
+    if retry is not None:
+        result["retry"] = retry
     safe_result = recorder.redact(result)
     response: dict[str, Any] = {
         "evidence_id": None,
@@ -1071,11 +1151,28 @@ def _deployment(
         result = client.request("GET", path)
         result = _validated_deployment_diagnostics(result)
 
+    elif arguments.deployment_command == "retry":
+        try:
+            result = client.request(
+                "POST",
+                base + "/retry",
+                idempotency_key=arguments.idempotency_key or _correlation_id("deployment-retry"),
+            )
+        except CloudApiError as exc:
+            if exc.status_code != 409 or exc.detail is None:
+                raise
+            raise CloudApiError(
+                exc.category,
+                f"Cayu Cloud API returned HTTP 409: {exc.detail}",
+                status_code=409,
+                detail=exc.detail,
+            ) from exc
     elif arguments.deployment_command == "wait":
         result = _wait_for_deployment(
             client,
             application_id=application_id,
             deployment_id=arguments.deployment_id,
+            include_failure_diagnostics=True,
             poll_seconds=arguments.poll_seconds,
             recovery_arguments=_cloud_recovery_arguments(arguments),
             wait_seconds=arguments.wait_seconds,
@@ -1218,42 +1315,14 @@ def _wait_for_deployment(
         if status in _DEPLOYMENT_READY:
             return deployment
         if status in _DEPLOYMENT_FAILURES:
-            if status == "failed" and include_failure_diagnostics:
-                details: dict[str, object] = {}
-                app = _cloud_application_id(application_id)
-                deployment = _cloud_deployment_id(deployment_id)
-                if app is not None:
-                    details["application"] = app
-                if deployment is not None:
-                    details["deployment_id"] = deployment
-                if app is not None and deployment is not None:
-                    details["commands"] = {
-                        "logs": shlex.join(
-                            [
-                                "cayu",
-                                "cloud",
-                                *recovery_arguments,
-                                "deployment",
-                                "logs",
-                                deployment,
-                                "--application",
-                                app,
-                            ]
-                        )
-                    }
-                failure = _deployment_failure(client, path=path)
-                if failure is not None:
-                    raise _CloudDeploymentFailureError(
-                        failure["code"],
-                        failure["message"],
-                        failure=failure,
-                        details=details,
-                    )
-                details["diagnostic_status"] = "unavailable_or_unsupported"
-                raise _CloudDeploymentDiagnosticUnavailableError(details)
-            raise CloudApiError(
-                "deployment_failed",
-                f"Deployment reached terminal status: {status}",
+            _raise_terminal_deployment(
+                application_id=application_id,
+                deployment_id=deployment_id,
+                status=status,
+                recovery_arguments=recovery_arguments,
+                failure=_deployment_failure(client, path=path)
+                if include_failure_diagnostics
+                else None,
             )
         if monotonic() >= deadline:
             raise _CloudDeploymentStillRunningError(
@@ -1263,6 +1332,65 @@ def _wait_for_deployment(
                 status=status,
             )
         sleep(poll_seconds)
+
+
+def _raise_terminal_deployment(
+    *,
+    application_id: str,
+    deployment_id: str,
+    status: str,
+    recovery_arguments: Sequence[str],
+    failure: _CloudDeploymentFailure | None,
+    replayed: bool = False,
+    retry_rejection: str | None = None,
+) -> Never:
+    details: dict[str, object] = {"status": status}
+    app = _cloud_application_id(application_id)
+    deployment = _cloud_deployment_id(deployment_id)
+    if app is not None:
+        details["application"] = app
+    if deployment is not None:
+        details["deployment_id"] = deployment
+    if replayed:
+        details["replayed"] = True
+    if app is not None and deployment is not None:
+        details["commands"] = {
+            action: shlex.join(
+                [
+                    "cayu",
+                    "cloud",
+                    *recovery_arguments,
+                    "deployment",
+                    action,
+                    deployment,
+                    "--application",
+                    app,
+                ]
+            )
+            for action in (
+                ("logs", "timeline", "retry")
+                if retry_rejection is None and (failure is None or failure["automatic_retryable"])
+                else ("logs", "timeline")
+            )
+        }
+    if failure is not None and retry_rejection is not None:
+        raise _CloudDeploymentFailureError(
+            "deployment_retry_rejected", retry_rejection, failure=failure, details=details
+        )
+    if failure is not None:
+        hint = (
+            " Change the source and deploy again."
+            if replayed and not failure["automatic_retryable"]
+            else ""
+        )
+        raise _CloudDeploymentFailureError(
+            "deployment_failed" if replayed else failure["code"],
+            failure["message"] + hint,
+            failure=failure,
+            details=details,
+        )
+    details["diagnostic_status"] = "unavailable_or_unsupported"
+    raise _CloudDeploymentDiagnosticUnavailableError(details)
 
 
 def _deployment_failure(
@@ -1278,7 +1406,10 @@ def _deployment_failure(
     if not isinstance(candidate, dict):
         return None
     if "schema_version" in candidate:
-        return parse_build_failure(candidate)
+        parsed = parse_build_failure(candidate)
+        if parsed is not None and _application_health_failure(parsed["code"], parsed["detail"]):
+            parsed["automatic_retryable"] = False
+        return parsed
     code = _deployment_failure_string(candidate.get("code"), max_bytes=64)
     phase = _deployment_failure_string(candidate.get("phase"), max_bytes=64)
     detail = _deployment_failure_string(candidate.get("detail"), max_bytes=4096)
@@ -1288,14 +1419,30 @@ def _deployment_failure(
         return None
     automatic_retryable = candidate.get("automatic_retryable")
     if (
-        automatic_retryable is not False
-        or code != "source_build_failed"
-        or phase != "image_built"
-        or message != _SOURCE_BUILD_FAILURE_MESSAGE
-        or hint != _SOURCE_BUILD_FAILURE_HINT
-        or detail not in _SOURCE_BUILD_FAILURE_DETAILS
+        code == "source_build_failed"
+        and "schema_version" not in candidate
+        and detail
+        not in {
+            "The Agent dependency set could not be resolved.",
+            "The Agent Docker build context is invalid.",
+            "The Agent package discovery configuration is ambiguous.",
+            "The Agent Python project or lockfile is incomplete.",
+            "The Agent source or a required package failed to compile.",
+        }
     ):
         return None
+    if (
+        type(automatic_retryable) is not bool
+        or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code) is None
+        or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", phase) is None
+        or any(
+            safe_text(candidate.get(key), limit) is None
+            for key, limit in (("message", 512), ("detail", 4096), ("hint", 1024))
+        )
+    ):
+        return None
+    if _application_health_failure(code, detail):
+        automatic_retryable = False
     return {
         "automatic_retryable": automatic_retryable,
         "code": code,
@@ -1304,6 +1451,86 @@ def _deployment_failure(
         "message": message,
         "phase": phase,
     }
+
+
+def _application_health_failure(code: str, detail: str) -> bool:
+    """Whether a smoke failure was the Agent's own health probe, on any smoke provider.
+
+    Cloud reports it as "application process health check failed inside the release
+    sandbox"; the E2B and Lambda MicroVM providers' raw wording ("... probe failed
+    inside E2B" / "... inside the MicroVM") carries the same phrase.
+    """
+
+    return code == "release_smoke_failed" and "application process health" in detail.lower()
+
+
+_RETRY_FAMILY_VERSION = re.compile(r"(.+?)(?:-retry-[0-9]+)*")
+
+
+def _retry_family_root(version: str) -> str:
+    """Version shared by an original Release and its retries, including nested ones."""
+
+    match = _RETRY_FAMILY_VERSION.fullmatch(version)
+    return (version if match is None else match.group(1))[:110]
+
+
+def _latest_source_retry(
+    client: CloudApiClient, application_id: str, original: dict[str, Any]
+) -> dict[str, Any]:
+    """Follow the immutable retry family before deciding whether to submit work.
+
+    Members are the original's direct `-retry-N` children and, for deployments made
+    by earlier clients and servers, nested `-retry-N-retry-M` versions.
+    """
+
+    version = original.get("version")
+    digest = original.get("manifest_digest")
+    if not isinstance(version, str) or not isinstance(digest, str):
+        return original
+    root = _retry_family_root(version)
+    cursor = None
+    seen = set()
+    latest = original
+    for _page in range(100):
+        query: dict[str, int | str] = {"limit": 100}
+        if cursor is not None:
+            query["cursor"] = cursor
+        page = client.request(
+            "GET", f"/v1/applications/{application_id}/deployments?{urlencode(query)}"
+        )
+        items = page.get("items")
+        if not isinstance(items, list):
+            raise CloudApiError(
+                "api_response_invalid", "Cayu Cloud returned an invalid deployment list."
+            )
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            candidate_version = item.get("version", "")
+            if (
+                isinstance(candidate_version, str)
+                and item.get("id") != original.get("id")
+                and _retry_family_root(candidate_version) == root
+                and item.get("manifest_digest") == digest
+                and item.get("policy_version") == original.get("policy_version")
+                and isinstance(item.get("created_at"), str)
+                and (
+                    latest is original
+                    or (item["created_at"], str(item.get("id")))
+                    > (latest["created_at"], str(latest.get("id")))
+                )
+            ):
+                _deployment_status(item)
+                latest = item
+        cursor = page.get("next_cursor")
+        if cursor is None:
+            return latest
+        if not isinstance(cursor, str) or cursor in seen:
+            break
+        seen.add(cursor)
+    raise CloudApiError(
+        "api_response_invalid", "Cayu Cloud retry history pagination did not converge."
+    )
 
 
 def _deployment_failure_string(value: object, *, max_bytes: int) -> str | None:

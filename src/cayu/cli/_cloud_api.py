@@ -13,6 +13,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from cayu.cli._cloud_diagnostics import safe_text
+
 _SAFE_OBJECT_STORE_ERROR_CODES = frozenset(
     {
         "AccessDenied",
@@ -35,10 +37,20 @@ _SAFE_API_ERROR_DETAILS = {
 class CloudApiError(RuntimeError):
     """Stable customer-facing API failure."""
 
-    def __init__(self, category: str, message: str, *, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        category: str,
+        message: str,
+        *,
+        status_code: int | None = None,
+        detail: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.category = category
         self.status_code = status_code
+        # The server's plain-text rejection reason, when it passes the safe-text filter.
+        # Callers opt in to showing it; the default message never includes it.
+        self.detail = detail
 
 
 @dataclass(frozen=True)
@@ -136,6 +148,7 @@ class CloudApiClient:
                 "api_request_rejected",
                 f"Cayu Cloud API returned HTTP {response.status_code}{suffix}",
                 status_code=response.status_code,
+                detail=_plain_api_error_detail(response),
             ) from None
         if response.status_code == 204:
             return {}
@@ -242,6 +255,18 @@ def _safe_api_error_detail(response: httpx.Response) -> str | None:
     if type(code) is not str:
         return None
     return _SAFE_API_ERROR_DETAILS.get((response.status_code, code))
+
+
+def _plain_api_error_detail(response: httpx.Response) -> str | None:
+    """Return a bounded plain-text API rejection reason with no private-looking content."""
+
+    try:
+        payload = response.json()
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return safe_text(payload.get("detail"), 512)
 
 
 def _is_loopback(hostname: str | None) -> bool:

@@ -96,6 +96,32 @@ servers. A source error generally requires repairing and uploading new source. T
 infrastructure failures may allow retrying the same source. Neither a new CLI nor a retry
 can recover diagnostic output that the server never recorded.
 
+`cayu cloud deploy .` keeps the same source idempotency for in-progress and successful
+submissions. If the create response replays a failed or destroyed attempt with a safe,
+automatically retryable Cloud failure, the command creates one new attempt from the same
+source and includes a `retry` receipt with the old ID, new ID, failure code, and reason.
+The source archive and manifest version are unchanged. A newly submitted attempt that
+fails while waiting is reported to the caller rather than retried again.
+
+`--retry-failed` explicitly enables this default; `--no-retry-failed` reports the retained
+attempt without retrying it. Non-retryable source failures include the retained failure and
+instructions to change the source and deploy again. Terminal errors carry `deployment_id`,
+`status`, and exact logs, timeline, and retry commands when the identifiers are safe.
+
+Submit a retry directly, retaining the same key when retrying an uncertain HTTP outcome:
+
+```bash
+cayu cloud deployment retry DEPLOYMENT_ID --application AGENT_SLUG \
+  --idempotency-key retry-submission-1
+```
+
+Without `--idempotency-key`, each invocation uses a fresh submission key. The server creates
+an immutable `-retry-N` Release from retained source; it can retry a destroyed failed attempt
+if its source bundle still exists. A missing bundle produces an actionable HTTP 409, and the
+CLI reports the server's reason as a `deployment_retry_rejected` error without suggesting
+another retry. Paused publication and failed service finalization retain the existing server
+retry behavior.
+
 `cayu cloud deploy` creates the 8-63 character application slug declared in
 `cayu-cloud.toml` when it does not exist, then updates it on later deploys. Slugs use
 lowercase letters, numbers, and interior hyphens. `--application SLUG`
@@ -199,3 +225,15 @@ cayu cloud env unset VAPI_API_KEY --application my-agent
 
 Set and unset responses include the Agent service rollout status when a live service
 is being updated.
+
+Unchanged-source deploys follow the most recent retry with the same manifest and
+policy, including nested `-retry-N-retry-M` versions made by earlier releases. An
+active or successful retry is reused. When the newest attempt failed with a
+Cloud-retryable failure, the CLI retries the original Release with a deterministic
+submission key derived from the source and that failed attempt. Cloud adds each new
+attempt as `VERSION-retry-N` beside the original and answers any retry of the same
+family, from the CLI, the portal, or `deployment retry`, with the one live attempt.
+If submission loses its response, the CLI reports `deployment_id` and
+`retry_idempotency_key` for `cayu cloud deployment retry DEPLOYMENT_ID
+--idempotency-key KEY`. Agent process health failures, on either smoke provider, and
+other nonretryable failures require repairing the source.

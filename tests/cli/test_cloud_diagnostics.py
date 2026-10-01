@@ -225,3 +225,24 @@ def test_valid_failure_retains_recovery_command_for_explicit_logs(
 
     result = cloud._deployment(arguments, client=LogClient())
     assert result["result"]["diagnostics"] == [payload]
+
+
+@pytest.mark.parametrize(
+    "phase,stage",
+    [("database_provisioned", "image_build"), ("database_migrated", "database_migration")],
+)
+def test_cloud_database_publication_failures_parse_as_versioned_diagnostics(
+    phase: str, stage: str
+) -> None:
+    payload = failure()
+    payload.update(phase=phase, attempt=None, diagnostic_ref=None)
+    payload["diagnostic"] = {
+        "status": "unavailable",
+        "stage": stage,
+        "exit_code": None,
+        "reason": "not_recorded",
+        "excerpt": "",
+        "truncated": False,
+    }
+    assert parse_build_failure(payload) == payload
+    assert wait_error(Client(payload)).failure == payload

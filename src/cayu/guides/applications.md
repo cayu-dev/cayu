@@ -253,6 +253,14 @@ readiness. The deploy command does not generate locks or modify the source for y
 
 ## Cloud build diagnostics
 
+An identical `cayu cloud deploy .` may replay an earlier immutable attempt. Failed or
+destroyed attempts whose recorded failure is automatically retryable receive one fresh
+retry by default; the JSON `retry` receipt identifies both attempts. In-progress and
+successful replays remain idempotent. Use `--no-retry-failed` to report the retained
+attempt, or `cayu cloud deployment retry ID --application SLUG --idempotency-key KEY`
+to submit a deliberate retry. Reuse KEY after an uncertain HTTP outcome. Source errors
+still require corrected source, and expired source bundles require a new upload.
+
 When `cayu cloud deploy` fails, inspect the structured `error.failure`: its code,
 phase, repair hint, retry classification, and diagnostic evidence describe the
 failure. Supported versioned diagnostics include a bounded redacted build excerpt,
