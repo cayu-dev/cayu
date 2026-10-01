@@ -1,7 +1,7 @@
 """Hermetic durable workflow with isolated files, bounded commands, and trusted outcomes.
 
 Run with:
-    uv run python examples/durable_file_workflow/demo.py
+    uv run python -m examples.durable_file_workflow.demo
 """
 
 from __future__ import annotations
@@ -14,30 +14,24 @@ from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from examples.durable_file_workflow.file_worker import register_file_worker
+
 from cayu import (
-    AgentSpec,
     CayuApp,
     Environment,
     EnvironmentFactory,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
     EnvironmentSpec,
-    ExecCommandTool,
     InMemoryTaskStore,
     LocalRunner,
     LocalWorkspace,
     Message,
     NativeBinding,
-    ParameterConstrainedToolPolicy,
-    ProcessCommandPolicy,
-    ReadFileTool,
-    RequiredAllowlistRule,
-    RequiredFieldRule,
     RunRequest,
     Task,
     TaskCreate,
     TaskQuery,
-    WriteFileTool,
     complete_managed_task,
     run_task_worker,
 )
@@ -174,38 +168,7 @@ def build_app(
         factory,
         default=True,
     )
-    app.register_agent(
-        AgentSpec(
-            name="file-worker",
-            model="scripted",
-            system_prompt=GOAL_PROMPT,
-            workflow_tool_names=("write_file", "exec_command", "read_file"),
-        ),
-        tools=[
-            WriteFileTool(),
-            ExecCommandTool(
-                policy=ProcessCommandPolicy(
-                    allowed_executables=(sys.executable,),
-                    allowed_cwds=(str(base_root.resolve()),),
-                    max_timeout_s=30,
-                )
-            ),
-            ReadFileTool(),
-        ],
-        tool_policy=ParameterConstrainedToolPolicy(
-            {
-                "write_file": (
-                    RequiredAllowlistRule("path", values=("transform.py",)),
-                    RequiredFieldRule("content"),
-                ),
-                "exec_command": (
-                    RequiredAllowlistRule("kind", values=("process",)),
-                    RequiredFieldRule("argv"),
-                ),
-                "read_file": (RequiredAllowlistRule("path", values=("result.txt",)),),
-            }
-        ),
-    )
+    register_file_worker(app, workspace_root=base_root, system_prompt=GOAL_PROMPT)
     return app, task_store, factory, provider
 
 

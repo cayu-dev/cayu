@@ -123,6 +123,7 @@ def _valid_wheel_names(sidecar: dict[str, bytes] | None = None) -> set[str]:
         "cayu/guides/structured-output.md",
         "cayu/guides/thinking.md",
         "cayu/guides/tool-effects.md",
+        "cayu/guides/verified-work.md",
         "cayu/server/browser_client/client.js",
         "cayu/server/browser_client/client.d.ts",
         _WHEEL_DASHBOARD_SOURCE,

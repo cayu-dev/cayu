@@ -686,6 +686,33 @@ def test_installed_order_support_discovery(capsys) -> None:
         assert "cayu guide order-support" in capsys.readouterr().out
 
 
+def test_verified_work_guide_discovery_and_reference_example(capsys) -> None:
+    assert main(["guide", "verified-work", "--json"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["package_source"] == "cayu.guides/verified-work.md"
+    guide = result["content"]
+    assert "examples/durable_file_workflow/verified.py" in guide
+    assert "cayu.verified-task-continuation.v1" in guide
+    for status_reason in (
+        "work_contract_attempt_limit",
+        "work_contract_repeated_gap_limit",
+        "work_contract_rejected",
+    ):
+        assert status_reason in guide
+    assert set(result["related_topics"]) >= {"durable-operations", "tool-effects"}
+    assert main(["guide", "verified-work#five-layers-five-owners"]) == 0
+    assert "Completion proposal" in capsys.readouterr().out
+    root = Path(__file__).resolve().parents[2]
+    assert (root / "examples/durable_file_workflow/verified.py").is_file()
+    readme = (root / "README.md").read_text()
+    assert "`cayu guide verified-work`" in readme
+    assert "examples/durable_file_workflow/verified.py" in readme
+    assert "guides/verified-work.md" in (root / "docs/README.md").read_text()
+    examples_index = (root / "examples/README.md").read_text()
+    assert "durable_file_workflow/verified.py" in examples_index
+    assert "`cayu guide verified-work`" in examples_index
+
+
 def test_package_shipped_app_ui_guide_states_the_request_rules(capsys) -> None:
     assert main(["guide", "app-ui", "--json"]) == 0
     guide = json.loads(capsys.readouterr().out)

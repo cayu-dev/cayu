@@ -5703,7 +5703,10 @@ with the supplied proposal and attempt IDs. Final model prose is not a proposal
 or a verdict. Both callbacks are read-only application code and must tolerate
 retry; domain mutations belong inside governed execution. See
 [`ReferencedResultHandler`](../examples/verified_task_handler.py) for a typed
-candidate-reference adapter. The application supplies its read-only candidate
+candidate-reference adapter, and
+[`durable_file_workflow/verified.py`](../examples/durable_file_workflow/verified.py)
+for a complete credential-free rejection, continuation, acceptance, and recovery
+run. The application supplies its read-only candidate
 reader; the registered verifier, not that reader, decides acceptance.
 
 ```python
@@ -6259,17 +6262,22 @@ The in-memory store also maintains contracted-session authority in a dedicated
 session index under the same lock as task publication and ordinary-session
 admission. Contracted creation, running creation, start, and attachment update
 the index atomically with the task snapshot. Multiple contracted tasks may bind
-one session; any binding denies ordinary execution. Terminalization does not
-remove a binding, because no verifier-aware release operation exists yet. The
-index is an in-memory implementation detail rather than a new `TaskStore` API.
+one session; any binding denies ordinary execution. Only work-attempt lifecycle
+settlement retires a binding: its receipt sets `retired_contract_binding` when the
+task completes through an accepted decision or is cancelled by group cancellation,
+and the session leaves the index once no other unretired contracted task binds it.
+Every other terminal outcome keeps the binding. The index is an in-memory
+implementation detail rather than a new `TaskStore` API.
 SQLite and PostgreSQL persist the equivalent decision in
 `cayu_task_session_execution_authority`, in the same writer transaction as
 contracted creation, start, or attachment. PostgreSQL row locking and SQLite's
 immediate writer transaction serialize separate processes and store instances.
 An ordinary admission and contracted attachment therefore have exactly one
 winner; the losing mutation publishes neither a task update nor substitute
-authority. That row is retained across terminalization and restart because no
-verifier-aware release operation exists yet.
+authority. The lifecycle settlement that records `retired_contract_binding`
+deletes that row in the same transaction, once no other unretired contracted task
+binds the session; otherwise the row is retained across terminalization and
+restart.
 
 PostgreSQL serializes each global attempt, proposal, claim, and decision identity
 before taking one transaction-scoped authority lock for the affected task. This

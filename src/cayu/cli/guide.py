@@ -64,6 +64,10 @@ _GUIDES = {
     ),
     "thinking": ("thinking.md", "Reasoning effort vocabulary and provider compatibility."),
     "tool-effects": ("tool-effects.md", "Replay and mutation effect decisions."),
+    "verified-work": (
+        "verified-work.md",
+        "Contract-bound tasks: proposals, independent verifiers, and bounded attempts.",
+    ),
 }
 _INCLUDES = {
     "<!-- cayu-guide-include:pytest-selector -->": (
@@ -102,6 +106,7 @@ _RELATED = {
     "references": ("authoring", "durable-operations"),
     "structured-output": ("authoring", "diagnostics"),
     "tool-effects": ("authoring", "durable-operations"),
+    "verified-work": ("durable-operations", "tool-effects", "evals-ai-quality", "authoring"),
 }
 
 

@@ -55,6 +55,7 @@ only when the requested behavior requires it.
 | Context approaching a model limit | token counting, context policies, compaction, overflow recovery | `cayu guide references#context` |
 | Reviewed or retrievable knowledge | knowledge stores, review state, recall tools | `cayu guide references#knowledge` |
 | Durable background work | `TaskStore`, dispatcher, worker, event watcher | `cayu guide references#background-work` |
+| A task done only when an independent check accepts it | `WorkContract`, `VerifiedTaskWorker`, completion verifier, result resolver | `cayu guide verified-work` |
 | Deterministic orchestration | workflow helpers and runtime hooks | `cayu guide references#workflows-hooks` |
 | Delegated model work | subagent tools and child-session policy | `cayu guide references#subagents` |
 | Behavioral regression proof | `EvalSuite`, runtime assertions, replay | `cayu guide references#evals` |
@@ -247,9 +248,11 @@ independent list in prose or tests.
 
 For a complete credential-free composition of durable work, per-session local
 environments, guarded file/command tools, failure recovery, and
-application-owned verification, see `examples/durable_file_workflow`. “File
-worker” describes that example's job; it is not an `AgentSpec` profile or a new
-runtime concept.
+application-owned verification, see `examples/durable_file_workflow`. Its
+`verified.py` runs the same job as a contract-bound task with an independent
+verifier and bounded attempts; see `cayu guide verified-work`. “File worker”
+describes that example's job; it is not an `AgentSpec` profile or a new runtime
+concept.
 
 ## 5. Treat effects as a security contract
 

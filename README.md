@@ -621,6 +621,7 @@ Start with the document that matches the job:
 | Configure primary or compatible model services | `cayu guide providers` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/providers.md)) |
 | Classify and verify tool mutation and replay behavior | `cayu guide tool-effects` |
 | Build a durable propose, authorize, act, verify, and recover lifecycle | `cayu guide durable-operations` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/durable-operations.md)) |
+| Complete a task only after an independent verifier accepts its evidence | `cayu guide verified-work` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/verified-work.md), [example](https://github.com/cayu-dev/cayu/blob/main/examples/durable_file_workflow/verified.py)) |
 | Notify people about durable questions, approvals, and recovery gates | `cayu guide human-attention` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/human-attention.md), [example](https://github.com/cayu-dev/cayu/tree/main/examples/human_attention/)) |
 | Reconstruct service-backed tools with stable identities and scoped knowledge | `cayu guide durable-service-tools` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/durable-service-tools.md), [example](https://github.com/cayu-dev/cayu/tree/main/examples/durable_service_tools/)) |
 | Understand factories, process roles, and lifecycle | `cayu guide anatomy` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/application-anatomy.md)) |

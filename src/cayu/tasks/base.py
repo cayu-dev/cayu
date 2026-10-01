@@ -2807,9 +2807,11 @@ class TaskStore(ABC):
         """Load a contracted task whose binding retains authority over a session.
 
         A terminal task does not implicitly release pending session work into the
-        ordinary runtime. Until a verifier-aware release operation exists, the
-        durable session binding remains authoritative and callers must start a new
-        ordinary session.
+        ordinary runtime. Only work-attempt lifecycle settlement retires a binding
+        (``retired_contract_binding`` on its receipt): when the task completes
+        through an accepted decision or is cancelled by group cancellation. Until
+        then the durable session binding remains authoritative and callers must
+        start a new ordinary session.
         """
         raise NotImplementedError("This TaskStore does not support verified work contracts.")
 
@@ -2819,7 +2821,8 @@ class TaskStore(ABC):
         Supporting stores must reject admission while a contracted task binding
         retains authority over the session and must durably prevent later contract
         attachment to an admitted session. Task terminalization alone is not a
-        release. Repeated admission of the same session is idempotent.
+        release; only the lifecycle settlement that retires the contract binding
+        is. Repeated admission of the same session is idempotent.
         """
         raise NotImplementedError("This TaskStore does not support verified work contracts.")
 

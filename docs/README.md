@@ -12,6 +12,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Human-attention notifications](../src/cayu/guides/human-attention.md) (`cayu guide human-attention`)
 - [Application UIs over sessions](../src/cayu/guides/app-ui.md) (`cayu guide app-ui`)
 - [Durable service-backed tools](../src/cayu/guides/durable-service-tools.md) (`cayu guide durable-service-tools`)
+- [Verified work](../src/cayu/guides/verified-work.md) (`cayu guide verified-work`)
 
 - [Advanced runtime examples](advanced-runtime-examples.md)
 - [Browser sessions](browser-session.md)
