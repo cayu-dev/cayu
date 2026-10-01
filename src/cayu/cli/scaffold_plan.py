@@ -18,6 +18,7 @@ ProviderName = Literal[
     "openai",
     "anthropic",
     "openrouter",
+    "cayu-gateway",
     "openai-subscription",
 ]
 ExecutionName = Literal["none", "docker"]
@@ -170,6 +171,13 @@ ADAPTERS: tuple[AdapterSpec, ...] = (
         summary="Anthropic API provider.",
         supported_presets=("agent", "service", "coding"),
         environment=("ANTHROPIC_API_KEY",),
+    ),
+    AdapterSpec(
+        name="cayu-gateway",
+        kind="provider",
+        summary="Cayu Gateway Chat Completions provider.",
+        supported_presets=("agent", "service", "coding"),
+        environment=("CAYU_GATEWAY_API_KEY", "CAYU_GATEWAY_BASE_URL", "CAYU_MODEL"),
     ),
     AdapterSpec(
         name="openrouter",

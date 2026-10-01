@@ -32,6 +32,7 @@ from cayu._validation import (
     revalidate_model_inputs,
 )
 from cayu.budgets.billing import BillingIdentity
+from cayu.budgets.reported import ReportedCostPage
 from cayu.budgets.usage import (
     AggregateCacheUsageMetrics,  # noqa: F401 - compatibility re-export
     AggregateCount,
@@ -1047,6 +1048,8 @@ class UsageRollupStoreResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    reported_costs: ReportedCostPage | None = None
+
     as_of: datetime
     start_at: datetime
     end_at: datetime
@@ -1090,6 +1093,7 @@ class UsageRollupStoreResult(BaseModel):
         "session_breakdown",
         "pricing_inputs_accuracy",
         "session_pricing_inputs_accuracy",
+        "reported_costs",
         mode="before",
     )
     @classmethod
@@ -1100,6 +1104,7 @@ class UsageRollupStoreResult(BaseModel):
             AggregateAccuracy,
             UsageAggregateBreakdown,
             UsageSessionAggregateBreakdown,
+            ReportedCostPage,
         )
 
     @field_validator("pricing_inputs", "session_pricing_inputs", mode="before")

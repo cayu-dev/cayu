@@ -14493,6 +14493,64 @@ export type RegistrationProvenance = {
 };
 
 /**
+ * ReportedCostObservation
+ */
+export type ReportedCostObservation = {
+    /**
+     * Cost
+     */
+    cost: string | null;
+    /**
+     * Currency
+     */
+    currency: 'USD' | null;
+    /**
+     * Event Id
+     */
+    event_id: string;
+    /**
+     * Model
+     */
+    model: string | null;
+    /**
+     * Provider Name
+     */
+    provider_name: string | null;
+    /**
+     * Request Id
+     */
+    request_id: string | null;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Status
+     */
+    status: 'reported' | 'pending' | 'unavailable';
+    /**
+     * Timestamp
+     */
+    timestamp: string;
+};
+
+/**
+ * ReportedCostPage
+ *
+ * Latest retained observations, not a total or a current financial readback.
+ */
+export type ReportedCostPage = {
+    /**
+     * Records
+     */
+    records?: Array<ReportedCostObservation>;
+    /**
+     * Truncated
+     */
+    truncated?: boolean;
+};
+
+/**
  * RequestCostRoute
  *
  * Aggregated cost of one method and route template inside the window.
@@ -18716,6 +18774,7 @@ export type UsageRollupResponse = {
     matching_session_count: string;
     model_breakdown: UsageAggregateBreakdown;
     provider_breakdown: UsageAggregateBreakdown;
+    reported_costs?: ReportedCostPage | null;
     /**
      * Scope
      */

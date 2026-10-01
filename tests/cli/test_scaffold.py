@@ -1525,6 +1525,15 @@ def test_cayu_new_service_emits_the_supported_secure_product_shell(
     assert main(["new", "myservice", "--preset", "service", "--dir", str(tmp_path)]) == 0
     project = tmp_path / "myservice"
     _assert_generated_configuration_boundary(project)
+    # Use the generated project's formatter configuration, not the repository's.
+    formatted = subprocess.run(
+        [sys.executable, "-m", "ruff", "format", "--check", "configuration/settings.py"],
+        cwd=project,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert formatted.returncode == 0, formatted.stdout + formatted.stderr
 
     for filename in (
         "service.py",
@@ -1843,6 +1852,63 @@ def test_scaffold_provider_env_explicitly_overrides_scaffold_default(
     agent = app.describe().agents[0]
     assert agent.configured_provider == "anthropic"
     assert agent.model == "claude-sonnet-4-6"
+
+
+@pytest.mark.parametrize("selection", ["cayu-gateway", "neutral"])
+def test_scaffold_gateway_uses_explicit_configuration(tmp_path, monkeypatch, selection):
+    from cayu.providers.gateway import GatewayProvider
+
+    assert main(["new", "myproj", "--dir", str(tmp_path), "--provider", selection]) == 0
+    project = tmp_path / "myproj"
+    monkeypatch.setenv("CAYU_PROVIDER", "cayu-gateway")
+    monkeypatch.setenv("CAYU_GATEWAY_API_KEY", "synthetic-gateway-key")
+    monkeypatch.setenv("CAYU_GATEWAY_BASE_URL", "https://gateway.example/v1")
+    monkeypatch.setenv("CAYU_MODEL", "example/model")
+    with project_context(project):
+        module = importlib.import_module("configuration.providers")
+        provider = module.configured_provider()
+        assert isinstance(provider, GatewayProvider)
+        assert provider.name == "cayu_gateway"
+        assert provider.base_url == "https://gateway.example/v1"
+        assert provider.api_key == "synthetic-gateway-key"
+        settings = importlib.import_module("configuration.settings")
+        assert settings.configured_provider_name() == "cayu_gateway"
+        assert settings.configured_model() == "example/model"
+
+
+def test_scaffold_gateway_resolves_model_set_after_agent_import(tmp_path, monkeypatch):
+    assert main(["new", "myproj", "--dir", str(tmp_path), "--provider", "cayu-gateway"]) == 0
+    project = tmp_path / "myproj"
+    monkeypatch.delenv("CAYU_MODEL", raising=False)
+    monkeypatch.setenv("CAYU_PROVIDER", "cayu-gateway")
+    with project_context(project):
+        module = importlib.import_module("app")
+        monkeypatch.setenv("CAYU_MODEL", "example/new-model")
+        app = module.build_app(
+            provider=ScriptedModelProvider([], name="cayu_gateway"),
+            session_store=InMemorySessionStore(),
+            task_store=InMemoryTaskStore(),
+        )
+        assert app.describe().agents[0].model == "example/new-model"
+
+
+@pytest.mark.parametrize("missing", ["CAYU_MODEL", "CAYU_GATEWAY_API_KEY", "CAYU_GATEWAY_BASE_URL"])
+def test_scaffold_gateway_fails_before_dispatch_with_incomplete_configuration(
+    tmp_path, monkeypatch, missing
+):
+    assert main(["new", "myproj", "--dir", str(tmp_path), "--provider", "cayu-gateway"]) == 0
+    monkeypatch.setenv("CAYU_PROVIDER", "cayu-gateway")
+    for name, value in {
+        "CAYU_MODEL": "example/model",
+        "CAYU_GATEWAY_API_KEY": "test",
+        "CAYU_GATEWAY_BASE_URL": "https://gateway.example/v1",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv(missing)
+    with project_context(tmp_path / "myproj"):
+        provider = importlib.import_module("configuration.providers").configured_provider()
+        with pytest.raises(RuntimeError, match="requires CAYU_MODEL"):
+            provider.preflight_model_target(model="example/model")
 
 
 def test_scaffold_openrouter_builds_first_class_provider_with_explicit_model(

@@ -43,6 +43,7 @@ from cayu.budgets.pricing import (
     PriceBook,
     SessionCostSummary,
 )
+from cayu.budgets.reported import ReportedCostPage
 from cayu.budgets.usage import (
     AggregateUsageMetrics,
     CausalBudgetUsageSummary,
@@ -585,6 +586,7 @@ def _bounded_raw_sequence(
 
 
 class UsageRollupResponse(ApiBaseModel):
+    reported_costs: ReportedCostPage | None = None
     scope: Literal["configured_session_store"]
     time_basis: Literal["event.timestamp"]
     session_filter_basis: Literal["current_session_attributes"]

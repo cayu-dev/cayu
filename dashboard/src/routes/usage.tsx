@@ -13,6 +13,7 @@ import {
 } from "lucide-react"
 import { useMemo, useRef, useState } from "react"
 import { DataCard, Page, PageHeader, StateMessage } from "../components/dashboard/layout"
+import { ReportedCosts } from "../components/dashboard/reported-costs"
 import { Badge } from "../components/ui/badge"
 import { Button, buttonVariants } from "../components/ui/button"
 import { Input } from "../components/ui/input"
@@ -980,13 +981,14 @@ function UsagePageForSearch({ search }: { search: UsageRollupSearch }) {
           </div>
 
           <CostSummary cost={data.cost} />
+          <ReportedCosts page={data.reported_costs} />
           <BillingIdentityBreakdown cost={data.cost} />
 
           <div className="flex items-start gap-3 rounded-md border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">
             <Coins className="mt-0.5 h-4 w-4 shrink-0" />
             <div>
-              Aggregate responses intentionally omit session histories and per-session cost rows.
-              Use{" "}
+              Full session histories are omitted. Reported-cost observations are bounded separately
+              from PriceBook estimates. Use{" "}
               <Link
                 to="/sessions"
                 search={usageRollupSessionSearch(search)}

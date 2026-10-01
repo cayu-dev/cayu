@@ -3132,6 +3132,9 @@ from cayu.providers.bedrock import BedrockProvider as BedrockProvider
 from cayu.providers.cache import CacheBreakpoint as CacheBreakpoint
 from cayu.providers.cache import CachePolicy as CachePolicy
 from cayu.providers.chat_completions import ChatCompletionsProvider as ChatCompletionsProvider
+from cayu.providers.gateway import GatewayProvider as GatewayProvider
+from cayu.providers.gateway import GatewayTransport as GatewayTransport
+from cayu.providers.gateway import HttpxGatewayTransport as HttpxGatewayTransport
 from cayu.providers.hosted import HostedToolCapabilityError as HostedToolCapabilityError
 from cayu.providers.hosted import OpenAIWebSearch as OpenAIWebSearch
 from cayu.providers.openai import OpenAIProvider as OpenAIProvider
@@ -6738,6 +6741,8 @@ __all__ = [
     "FusedChannelMatch",
     "FusedRetrievalCandidate",
     "GateOutcome",
+    "GatewayProvider",
+    "GatewayTransport",
     "GitChangesTool",
     "GitCommandPolicy",
     "GitHubCheckBundle",
@@ -6801,6 +6806,7 @@ __all__ = [
     "HttpEgressPolicy",
     "HttpMcpClient",
     "HttpMcpSession",
+    "HttpxGatewayTransport",
     "HumanAttentionObservation",
     "HumanAttentionReference",
     "HumanAttentionRequest",

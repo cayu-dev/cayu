@@ -32,6 +32,7 @@ from cayu.budgets.aggregates import (
 )
 from cayu.events import EventType
 from cayu.sessions.base import UsageRollupQuery
+from cayu.storage._reported_costs import reported_cost_page, reported_cost_statement
 from cayu.storage._session_store_sql import SessionQuerySqlPlan
 
 _RESULT_SQL = """
@@ -752,6 +753,11 @@ def aggregate_session_usage(
             session_pricing=session_pricing.result(),
             session_breakdown=session_breakdown,
         )
+        cost_rows = connection.execute(
+            reported_cost_statement(session_plan.filter_where_sql, "sqlite"),
+            (*session_plan.filter_params, query.start_at.isoformat(), query.end_at.isoformat()),
+        ).fetchall()
+        result.reported_costs = reported_cost_page([tuple(row) for row in cost_rows])
         if owns_transaction:
             connection.commit()
         return result

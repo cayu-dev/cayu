@@ -31,6 +31,7 @@ from cayu.budgets.aggregates import (
 )
 from cayu.events import EventType
 from cayu.sessions.base import UsageRollupQuery
+from cayu.storage._reported_costs import reported_cost_page, reported_cost_statement
 from cayu.storage._session_store_sql import SessionQuerySqlPlan
 
 _RESULT_SQL = """
@@ -859,7 +860,7 @@ async def aggregate_session_usage(
                 if row is None:
                     break
                 _add_session_pricing_input_from_values(session_pricing, row)
-    return _result_from_rows(
+    result = _result_from_rows(
         rows,
         query=query,
         as_of=as_of,
@@ -867,6 +868,15 @@ async def aggregate_session_usage(
         session_pricing=session_pricing.result(),
         session_breakdown=session_breakdown,
     )
+    async with connection.cursor() as cursor:
+        await cursor.execute(
+            cast(
+                "LiteralString", reported_cost_statement(session_plan.filter_where_sql, "postgres")
+            ),
+            (*session_plan.filter_params, query.start_at, query.end_at),
+        )
+        result.reported_costs = reported_cost_page(await cursor.fetchall())
+    return result
 
 
 def usage_rollup_statement(

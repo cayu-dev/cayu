@@ -8238,6 +8238,7 @@
         "registration_unavailable",
         "registration_incompatible",
         "active_recovery_claim",
+        "active_execution_owner",
         "active_task_claim",
         "model_effect_outcome_unknown",
         "tool_effect_outcome_unknown",
@@ -8248,6 +8249,131 @@
       ],
       "title": "RecoveryBlockerCode",
       "type": "string"
+    },
+    "ReportedCostObservation": {
+      "additionalProperties": false,
+      "properties": {
+        "cost": {
+          "anyOf": [
+            {
+              "maxLength": 18,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cost"
+        },
+        "currency": {
+          "anyOf": [
+            {
+              "const": "USD",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Currency"
+        },
+        "event_id": {
+          "title": "Event Id",
+          "type": "string"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Model"
+        },
+        "provider_name": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Provider Name"
+        },
+        "request_id": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Request Id"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "reported",
+            "pending",
+            "unavailable"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "timestamp": {
+          "format": "date-time",
+          "title": "Timestamp",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "event_id",
+        "timestamp",
+        "request_id",
+        "provider_name",
+        "model",
+        "cost",
+        "currency",
+        "status"
+      ],
+      "title": "ReportedCostObservation",
+      "type": "object"
+    },
+    "ReportedCostPage": {
+      "additionalProperties": false,
+      "description": "Latest retained observations, not a total or a current financial readback.",
+      "properties": {
+        "records": {
+          "default": [],
+          "items": {
+            "$ref": "#/components/schemas/ReportedCostObservation"
+          },
+          "maxItems": 100,
+          "title": "Records",
+          "type": "array"
+        },
+        "truncated": {
+          "default": false,
+          "title": "Truncated",
+          "type": "boolean"
+        }
+      },
+      "title": "ReportedCostPage",
+      "type": "object"
     },
     "RequestCostRoute": {
       "additionalProperties": false,
@@ -13534,6 +13660,16 @@
         },
         "provider_breakdown": {
           "$ref": "#/components/schemas/UsageAggregateBreakdown"
+        },
+        "reported_costs": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ReportedCostPage"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "scope": {
           "const": "configured_session_store",

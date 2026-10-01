@@ -121,6 +121,7 @@ from cayu import (
     AnthropicProvider,
     CayuApp,
     ChatCompletionsProvider,
+    GatewayProvider,
     ModelProvider,
     OpenAIProvider,
     OpenAISubscriptionProvider,
@@ -129,6 +130,8 @@ from cayu import (
 
 from configuration.settings import (
     configured_anthropic_api_key,
+    configured_gateway_api_key,
+    configured_gateway_base_url,
     configured_model_override,
     configured_openai_api_key,
     configured_openrouter_api_key,
@@ -160,7 +163,7 @@ def configured_provider() -> ModelProvider:
             name="unconfigured",
             setup_error=(
                 "no provider is selected; set CAYU_PROVIDER to openai, anthropic, "
-                "openrouter, or openai-subscription (credentials do not select a provider)"
+                "openrouter, cayu-gateway, or openai-subscription (credentials do not select a provider)"
             ),
         )
     if choice == "openai-subscription":
@@ -175,6 +178,18 @@ def configured_provider() -> ModelProvider:
                 setup_error="provider 'openai' is selected but OPENAI_API_KEY is not set",
             )
         )
+    if choice == "cayu-gateway":
+        api_key = configured_gateway_api_key()
+        base_url = configured_gateway_base_url()
+        if not (configured_model_override() and api_key and base_url):
+            return _ScaffoldPlaceholderProvider(
+                name="cayu_gateway",
+                setup_error=(
+                    "provider 'cayu-gateway' requires CAYU_MODEL, "
+                    "CAYU_GATEWAY_API_KEY, and CAYU_GATEWAY_BASE_URL"
+                ),
+            )
+        return GatewayProvider(api_key=api_key, base_url=base_url)
     if choice == "openrouter":
         router_metadata_enabled = configured_openrouter_router_metadata_enabled()
         model = configured_model_override()
@@ -241,11 +256,18 @@ from cayu import (
 _PROJECT_ROOT = Path(__file__).parents[1]
 _LOCAL_MEMORY_KEY = _PROJECT_ROOT / "data" / "memory-evidence.key"
 _SCAFFOLDED_PROVIDER = __PROVIDER_LITERAL__
-_SUPPORTED_PROVIDERS = {"openai", "anthropic", "openrouter", "openai-subscription"}
+_SUPPORTED_PROVIDERS = {
+    "openai",
+    "anthropic",
+    "openrouter",
+    "cayu-gateway",
+    "openai-subscription",
+}
 _PROVIDER_NAMES = {
     "openai": "openai",
     "anthropic": "anthropic",
     "openrouter": "openrouter",
+    "cayu-gateway": "cayu_gateway",
     "openai-subscription": "openai_subscription",
 }
 _DEFAULT_MODELS = {
@@ -277,14 +299,18 @@ def configured_model() -> str:
     if override:
         return override
     selected = configured_provider_choice()
-    if selected == "openrouter":
-        return "openrouter-model-unconfigured"
+    if selected in {"openrouter", "cayu-gateway"}:
+        return f"{selected}-model-unconfigured"
     if selected is None:
         return "provider-model-unconfigured"
     return _DEFAULT_MODELS[selected]
 
 
-_UNCONFIGURED_MODELS = ("provider-model-unconfigured", "openrouter-model-unconfigured")
+_UNCONFIGURED_MODELS = (
+    "provider-model-unconfigured",
+    "openrouter-model-unconfigured",
+    "cayu-gateway-model-unconfigured",
+)
 
 
 def resolve_configured_agent(agent: AgentSpec) -> AgentSpec:
@@ -315,6 +341,14 @@ def configured_openai_api_key() -> str | None:
 
 def configured_anthropic_api_key() -> str | None:
     return os.environ.get("ANTHROPIC_API_KEY")
+
+
+def configured_gateway_api_key() -> str | None:
+    return os.environ.get("CAYU_GATEWAY_API_KEY")
+
+
+def configured_gateway_base_url() -> str | None:
+    return os.environ.get("CAYU_GATEWAY_BASE_URL")
 
 
 def configured_openrouter_api_key() -> str | None:

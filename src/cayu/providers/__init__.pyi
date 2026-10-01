@@ -84,6 +84,9 @@ from cayu.providers.deadlines import (
 from cayu.providers.deadlines import ProviderStreamDeadlines as ProviderStreamDeadlines
 from cayu.providers.diagnostics import ProviderErrorCapture as ProviderErrorCapture
 from cayu.providers.diagnostics import capture_provider_errors as capture_provider_errors
+from cayu.providers.gateway import GatewayProvider as GatewayProvider
+from cayu.providers.gateway import GatewayTransport as GatewayTransport
+from cayu.providers.gateway import HttpxGatewayTransport as HttpxGatewayTransport
 from cayu.providers.hosted import HostedToolCapabilityError as HostedToolCapabilityError
 from cayu.providers.hosted import OpenAIWebSearch as OpenAIWebSearch
 from cayu.providers.openai import HttpxOpenAITransport as HttpxOpenAITransport

@@ -785,7 +785,7 @@ access requires an authenticated access policy.
 ## Run with a live provider
 
 Provider intent is explicit. This scaffold defaults to `__PROVIDER_DISPLAY__`;
-override it with `CAYU_PROVIDER=openai`, `anthropic`, `openrouter`, or
+override it with `CAYU_PROVIDER=openai`, `anthropic`, `openrouter`, `cayu-gateway`, or
 `openai-subscription`. API-key variables authenticate that choice and never
 select it automatically.
 
@@ -822,6 +822,20 @@ retain only bounded routing evidence; free-form pipeline and attempt data is
 never persisted. Put OpenRouter routing controls such as `provider.order`,
 `provider.allow_fallbacks`, `provider.require_parameters`, `provider.zdr`, and
 `provider.data_collection` in `AgentSpec.provider_options["openrouter"]`.
+
+Cayu Gateway (explicit endpoint and model):
+
+```bash
+export CAYU_PROVIDER=cayu-gateway
+export CAYU_GATEWAY_BASE_URL=https://YOUR_GATEWAY/v1
+export CAYU_GATEWAY_API_KEY=YOUR_KEY
+export CAYU_MODEL=YOUR_MODEL
+uv run --no-sync python run.py --message "YOUR REQUEST"
+```
+
+Gateway owns balances and spending caps. Runtime's local cost estimates remain
+execution safeguards. Run `cayu guide providers#cayu-gateway` for reported usage
+and authenticated generation lookup.
 
 Your own ChatGPT subscription for local testing:
 
@@ -2419,7 +2433,14 @@ def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     parser.add_argument(
         "--provider",
-        choices=("neutral", "openai", "anthropic", "openrouter", "openai-subscription"),
+        choices=(
+            "neutral",
+            "openai",
+            "anthropic",
+            "openrouter",
+            "cayu-gateway",
+            "openai-subscription",
+        ),
         help=(
             "Provider adapter (default: neutral). Omit for a provider-neutral scaffold; "
             "CAYU_PROVIDER can select or override it later."

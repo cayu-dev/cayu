@@ -2632,15 +2632,20 @@ def _require_safe_usage_session_authority(
 ) -> None:
     """Fail closed when redaction would corrupt per-session usage identity."""
 
-    if result.session_breakdown is None:
-        return
-    for group in result.session_breakdown.groups:
+    session_ids = (
+        []
+        if result.session_breakdown is None
+        else [group.session_id for group in result.session_breakdown.groups]
+    )
+    if result.reported_costs is not None:
+        session_ids.extend(row.session_id for row in result.reported_costs.records)
+    for session_id in session_ids:
         redacted = _redact_control_plane_json(
             cayu_app,
-            group.session_id,
+            session_id,
             "usage_rollup.session_id",
         )
-        if type(redacted) is not str or redacted != group.session_id:
+        if type(redacted) is not str or redacted != session_id:
             raise HTTPException(
                 status_code=409,
                 detail=("Usage session identity cannot cross the configured redaction boundary."),
@@ -6267,6 +6272,13 @@ def create_router(
             provider_breakdown=result.provider_breakdown,
             model_breakdown=result.model_breakdown,
             cost=cost,
+            reported_costs=(
+                None
+                if result.reported_costs is None
+                else _redact_control_plane_json(
+                    cayu_app, result.reported_costs.model_dump(mode="json"), "reported_costs"
+                )
+            ),
             session_breakdown=result.session_breakdown,
             session_cost_breakdown=session_cost_breakdown,
         )

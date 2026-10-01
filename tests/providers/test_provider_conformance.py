@@ -98,7 +98,11 @@ async def _assert_lifecycle_contract(
         or (
             scenario in {"lifecycle_tail", "lifecycle_repeated_terminal"}
             and registration
-            in {registrations_module.CHAT_COMPLETIONS, registrations_module.BEDROCK}
+            in {
+                registrations_module.CHAT_COMPLETIONS,
+                registrations_module.GATEWAY,
+                registrations_module.BEDROCK,
+            }
         )
     )
     harness = await registration.factory(scenario)
@@ -586,7 +590,7 @@ def _assert_typed_error_contract(
         and payload.get("provider_error_type") == "rate_limit_error"
         and payload.get("provider_error_code") == "rate_limit_exceeded"
         and payload.get("request_id") is None
-        and payload.get("retryable") is True
+        and payload.get("retryable") is registration.retries_failed_requests
         and payload.get("retry_after_s") == 0.25
     )
     require_conformance(

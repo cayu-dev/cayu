@@ -211,6 +211,7 @@ from cayu.budgets.base import (
     session_budget_inspection,
 )
 from cayu.budgets.pricing import PriceBook
+from cayu.budgets.reported import ReportedCostCollector
 from cayu.budgets.usage import UsageMetrics
 from cayu.configuration import DEFAULT_MAX_STEPS, MAX_STEPS
 from cayu.context.structured_output import (
@@ -37573,6 +37574,7 @@ def _usage_rollup_from_session_records(
     matching_session_count: int,
     active_session_count: int,
 ) -> UsageRollupStoreResult:
+    reported = ReportedCostCollector()
     totals = _UsageAccumulator()
     pricing = BoundedUsagePricingInputAccumulator(query.pricing_input_limit)
     session_pricing = BoundedUsagePricingInputAccumulator(query.pricing_input_limit)
@@ -37595,6 +37597,13 @@ def _usage_rollup_from_session_records(
             event_timestamp = normalize_aggregate_event_timestamp(event.timestamp)
             if event_timestamp < query.start_at or event_timestamp >= query.end_at:
                 continue
+            if event.type == EventType.MODEL_COMPLETED:
+                reported.add(
+                    session_id=session_id,
+                    event_id=event.id,
+                    timestamp=event_timestamp,
+                    payload=event.payload,
+                )
             if session_accumulator is not None:
                 session_accumulator.add_event(event)
             if event.type == EventType.TOOL_CALL_STARTED:
@@ -37704,6 +37713,7 @@ def _usage_rollup_from_session_records(
 
     totals.session_count = activity_session_count
     return UsageRollupStoreResult(
+        reported_costs=reported.page(),
         as_of=as_of,
         start_at=query.start_at,
         end_at=query.end_at,

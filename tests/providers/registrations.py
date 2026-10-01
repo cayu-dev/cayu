@@ -17,6 +17,7 @@ from cayu.providers import (
     ChatCompletionsAPIError,
     ChatCompletionsContextOverflowError,
     ChatCompletionsProvider,
+    GatewayProvider,
     ModelStreamDeadlineError,
     OpenAIAPIError,
     OpenAIContextOverflowError,
@@ -347,6 +348,9 @@ class _ChatCompletionsTransport(_AsyncTransport):
         self.scenario = scenario
         self.calls: list[dict[str, Any]] = []
 
+    async def read_json(self, **kwargs: Any) -> Mapping[str, Any]:
+        raise AssertionError("Inference conformance must not perform Gateway lookup.")
+
     async def stream_chat_completions(
         self,
         *,
@@ -631,6 +635,22 @@ async def _chat_completions_factory(scenario: ProviderScenario) -> ProviderHarne
     provider = ChatCompletionsProvider(
         api_key="conformance-key",
         name="chat_conformance",
+        transport=transport,
+        stream_deadlines=ProviderStreamDeadlines(
+            transport_idle_timeout_s=0.02 if scenario == "idle_timeout" else 1.0,
+            absolute_stream_timeout_s=1.0,
+            semantic_progress_timeout_s=1.0,
+            protocol_idle_timeout_s=1.0,
+        ),
+    )
+    return _async_transport_harness(provider, "chat-conformance", transport)
+
+
+async def _gateway_factory(scenario: ProviderScenario) -> ProviderHarness:
+    transport = _ChatCompletionsTransport(scenario)
+    provider = GatewayProvider(
+        api_key="conformance-key",
+        base_url="https://gateway.invalid/v1",
         transport=transport,
         stream_deadlines=ProviderStreamDeadlines(
             transport_idle_timeout_s=0.02 if scenario == "idle_timeout" else 1.0,
@@ -1519,6 +1539,21 @@ CHAT_COMPLETIONS = ProviderConformanceRegistration(
     error_provider="chat_completions",
 )
 
+GATEWAY = ProviderConformanceRegistration(
+    name="cayu-gateway",
+    provider_type=GatewayProvider,
+    factory=_gateway_factory,
+    capabilities=ProviderCapabilities(
+        token_counting=CHAT_COMPLETIONS.capabilities.token_counting,
+        native_structured_output=CapabilityClaim.supported(),
+        attachments=CHAT_COMPLETIONS.capabilities.attachments,
+        reasoning=CHAT_COMPLETIONS.capabilities.reasoning,
+        provider_cache_observation=CHAT_COMPLETIONS.capabilities.provider_cache_observation,
+    ),
+    error_provider="chat_completions",
+    retries_failed_requests=False,
+)
+
 VERTEX = ProviderConformanceRegistration(
     name="vertex",
     provider_type=VertexProvider,
@@ -1551,6 +1586,7 @@ REGISTRATIONS = (
     OPENAI_SUBSCRIPTION,
     ANTHROPIC,
     CHAT_COMPLETIONS,
+    GATEWAY,
     VERTEX,
     BEDROCK,
 )

@@ -5,7 +5,7 @@ endpoints. Other services that expose OpenAI Chat Completions work through
 `ChatCompletionsProvider`.
 
 Provider selection is explicit. `CAYU_PROVIDER` is only a scaffold convenience
-for `openai`, `anthropic`, `openrouter`, and `openai-subscription`; it is not the
+for `openai`, `anthropic`, `openrouter`, `cayu-gateway`, and `openai-subscription`; it is not the
 complete Cayu provider surface. Credentials authenticate but never select one.
 
 ## Primary integrations
@@ -15,6 +15,7 @@ complete Cayu provider surface. Credentials authenticate but never select one.
 | OpenAI Platform | `OpenAIProvider()` | `OPENAI_API_KEY`; use an OpenAI model ID |
 | Anthropic API | `AnthropicProvider()` | `ANTHROPIC_API_KEY`; use an Anthropic model ID |
 | OpenRouter | `ChatCompletionsProvider(name="openrouter", api_key_env="OPENROUTER_API_KEY", base_url="https://openrouter.ai/api/v1")` | `OPENROUTER_API_KEY`; require an explicit `vendor/model` slug |
+| Cayu Gateway | `GatewayProvider(base_url="https://YOUR_GATEWAY/v1")` | `CAYU_GATEWAY_API_KEY`; explicit endpoint and model |
 | Google AI Studio | `ChatCompletionsProvider(name="google", api_key_env="GEMINI_API_KEY", base_url="https://generativelanguage.googleapis.com/v1beta/openai")` | Use a Gemini API model ID |
 | Amazon Bedrock | `BedrockProvider(region_name=...)` | Install `cayu[aws]`; use AWS credentials and a Bedrock model or inference-profile ID |
 | Anthropic on Vertex AI | `VertexProvider(project_id=..., region=...)` | Install `cayu[vertex]`; use Google credentials and a Vertex Claude model ID |
@@ -115,6 +116,59 @@ Put routing controls in `AgentSpec.provider_options["openrouter"]`. Streamed
 value-for-value, across tool continuations; malformed state fails before tools execute.
 Raw OpenRouter `usage.cost` evidence stays separate from Cayu PriceBook estimates.
 Native structured-output support remains model/upstream dependent.
+
+## Cayu Gateway
+
+`cayu new APP --provider cayu-gateway` selects the Gateway adapter. Configure
+`CAYU_GATEWAY_API_KEY`, `CAYU_GATEWAY_BASE_URL` (HTTPS, including `/v1`), and
+`CAYU_MODEL`. A neutral scaffold can select it with `CAYU_PROVIDER=cayu-gateway`.
+The SDK takes the endpoint explicitly:
+
+```python
+from cayu import AgentSpec, CayuApp, GatewayProvider
+
+provider = GatewayProvider(base_url="https://YOUR_GATEWAY/v1")
+app = CayuApp()
+app.register_provider(provider, default=True)
+app.register_agent(AgentSpec(
+    name="assistant",
+    model="YOUR_MODEL",
+    provider_options={"cayu_gateway": {"max_completion_tokens": 2048}},
+))
+```
+
+The provider uses ordinary Chat Completions streaming, tools, reasoning, and
+native JSON schema output when supported by the selected Gateway model. Options
+belong under `provider_options["cayu_gateway"]`. `await provider.get_models()`
+reads the models visible to the key; it does not change an agent's model or limits.
+
+Completed model events retain the response `id` and raw `usage`, including token
+counters and Gateway-reported `cost`, `cost_currency`, and `cost_status`. Cost is
+a decimal USD string when reported. A pending or unavailable cost is `null`,
+which is distinct from a reported zero. For an available response ID,
+`await provider.get_generation(request_id)` reads current status and usage using
+the same key (which needs receipt-read scope). Lookup does not replay output,
+resubmit inference, reserve funds, or settle a charge. Close the provider with
+`await provider.aclose()` when finished with it.
+
+The usage dashboard and `/api/usage/rollup` show up to 100 latest completion-time
+reported-cost observations within the requested session filters and time window.
+They are separate from PriceBook estimates, are not summed into a bill, and do
+not represent current wallet balances. Truncation is explicit; narrow the filters
+to inspect a smaller window. Memory, SQLite, and PostgreSQL support this projection;
+custom stores may report it as unavailable. Generation lookup can return a later
+reported amount but does not rewrite historical completion events or automatically
+refresh these observations.
+
+Gateway owns prices, balances, reservations, spending caps, and settlement.
+Runtime's PriceBook estimates and `max_estimated_cost` remain local execution
+safeguards; they are separate from the reported charge and do not promise a strict
+financial ceiling. Interrupting or deleting a Runtime session does not release a
+Gateway hold. A lost connection can leave remote execution and cost unknown;
+response IDs are retained in completed model events. The normal provider privacy
+boundary omits untrusted error IDs, so an interrupted response may leave no ID
+available for lookup. The adapter disables automatic retries
+of failed inference requests because a new POST can create a new charge.
 
 ## Compatible Chat Completions
 
