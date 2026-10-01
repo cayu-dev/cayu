@@ -1021,7 +1021,8 @@ class ExecutionProfileMismatchError(RuntimeError):
     def _message(self, *, session_id: str, changed: str) -> str:
         return (
             f"Session {session_id} execution profile changed in: {changed}. "
-            "Start a new session or use an explicit profile-adoption flow."
+            "Pending recovery requires a restored compatible registration and a fresh recovery plan. "
+            "Start a new session or, at a clean resume boundary, request explicit profile adoption."
         )
 
 

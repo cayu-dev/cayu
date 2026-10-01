@@ -14452,6 +14452,11 @@ export type RecallItemAdmission = 'admitted' | 'offered';
 export type RecallItemSelectionReason = 'calibrated_strong_match' | 'calibrated_plausible_match' | 'duplicate_strong_reference' | 'strong_match_not_focused' | 'strong_match_offered_by_mode' | 'explicit_application_selection' | 'newly_relevant' | 'reanchored_current_revision';
 
 /**
+ * RecoveryBlockerCode
+ */
+export type RecoveryBlockerCode = 'registration_unavailable' | 'registration_incompatible' | 'active_recovery_claim' | 'active_task_claim' | 'model_effect_outcome_unknown' | 'tool_effect_outcome_unknown' | 'tool_effect_continuation_required' | 'tool_approval_required' | 'user_input_required' | 'invalid_durable_state';
+
+/**
  * RecoveryCleanupPolicyManifest
  */
 export type RecoveryCleanupPolicyManifest = {
@@ -16700,6 +16705,70 @@ export type SseSessionFollowEndEnvelope = {
      * Type
      */
     type: 'session.follow.end';
+};
+
+/**
+ * StartupRecoveryBlockedSession
+ *
+ * Bounded operator evidence; contains no checkpoint or exception content.
+ */
+export type StartupRecoveryBlockedSession = {
+    /**
+     * Blocker Codes
+     */
+    blocker_codes: Array<RecoveryBlockerCode>;
+    /**
+     * Session Id
+     */
+    session_id: string;
+};
+
+/**
+ * StartupRecoveryResult
+ *
+ * Latest process-local interruption sweep, retaining at most 100 blocked roots.
+ */
+export type StartupRecoveryResult = {
+    /**
+     * Blocked Session Count
+     */
+    blocked_session_count?: number;
+    /**
+     * Blocked Sessions
+     */
+    blocked_sessions?: Array<StartupRecoveryBlockedSession>;
+    /**
+     * Blocked Sessions Truncated
+     */
+    blocked_sessions_truncated?: boolean;
+    /**
+     * Completed
+     */
+    completed?: boolean;
+    /**
+     * Deferred Session Count
+     */
+    deferred_session_count?: number;
+    /**
+     * Scheduled Roots
+     */
+    scheduled_roots?: number;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Skipped Session Count
+     */
+    skipped_session_count?: number;
+    /**
+     * Status
+     */
+    status?: 'not_started' | 'running' | 'completed' | 'failed';
+    /**
+     * Sweep Count
+     */
+    sweep_count?: number;
 };
 
 /**
@@ -22382,6 +22451,22 @@ export type ResolveProviderOperationApiProviderOperationsResolvePostResponses = 
 };
 
 export type ResolveProviderOperationApiProviderOperationsResolvePostResponse = ResolveProviderOperationApiProviderOperationsResolvePostResponses[keyof ResolveProviderOperationApiProviderOperationsResolvePostResponses];
+
+export type StartupRecoveryStatusApiRecoveryStartupGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/recovery/startup';
+};
+
+export type StartupRecoveryStatusApiRecoveryStartupGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: StartupRecoveryResult;
+};
+
+export type StartupRecoveryStatusApiRecoveryStartupGetResponse = StartupRecoveryStatusApiRecoveryStartupGetResponses[keyof StartupRecoveryStatusApiRecoveryStartupGetResponses];
 
 export type ResumeAgentApiResumePostData = {
     body: ResumeBody;

@@ -395,6 +395,8 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "SessionTopologyNode": ("cayu.sessions.base", "SessionTopologyNode"),
     "SessionTopologyQuery": ("cayu.sessions.base", "SessionTopologyQuery"),
     "SessionTopologyStoreResult": ("cayu.sessions.base", "SessionTopologyStoreResult"),
+    "StartupRecoveryBlockedSession": ("cayu.sessions.recovery", "StartupRecoveryBlockedSession"),
+    "StartupRecoveryResult": ("cayu.sessions.recovery", "StartupRecoveryResult"),
     "StaleRecoveryPlanError": ("cayu.sessions.recovery", "StaleRecoveryPlanError"),
     "StoreTimeCheckpointTransform": ("cayu.sessions.base", "StoreTimeCheckpointTransform"),
     "StoreTimeSessionOperationTransform": (
@@ -724,6 +726,8 @@ PUBLIC_NAMES = [
     "SessionTopologyNode",
     "SessionTopologyQuery",
     "SessionTopologyStoreResult",
+    "StartupRecoveryBlockedSession",
+    "StartupRecoveryResult",
     "StaleRecoveryPlanError",
     "StoreTimeCheckpointTransform",
     "StoreTimeSessionOperationTransform",

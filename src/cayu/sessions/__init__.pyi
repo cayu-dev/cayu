@@ -408,3 +408,5 @@ from cayu.sessions.recovery import RecoveryRegistrationEvidence as RecoveryRegis
 from cayu.sessions.recovery import RecoveryRegistrationStatus as RecoveryRegistrationStatus
 from cayu.sessions.recovery import RecoveryTaskClaimEvidence as RecoveryTaskClaimEvidence
 from cayu.sessions.recovery import StaleRecoveryPlanError as StaleRecoveryPlanError
+from cayu.sessions.recovery import StartupRecoveryBlockedSession as StartupRecoveryBlockedSession
+from cayu.sessions.recovery import StartupRecoveryResult as StartupRecoveryResult

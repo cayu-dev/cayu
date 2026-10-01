@@ -196,6 +196,57 @@ individual member identifiers or declared versions. No durable evidence extensio
 introduced here. Consequently errors cannot distinguish a changed declared version
 from a member addition/removal, nor name the member responsibly. Inspect the persisted
 execution-profile decision, its changed classes, and the application's declarations.
-For real behavior changes start a new session or follow explicit profile adoption;
-never reuse an old version to conceal a change. Adoption rejection and migration
+At a clean resume boundary, real behavior changes require a new session or explicit
+profile adoption. Pending model or tool recovery is not an adoption boundary. Never
+reuse an old version declaration to conceal a change. Adoption rejection and migration
 requirements remain distinct outcomes.
+
+### Retained sessions blocked by changed registrations
+
+Startup isolates each incompatible interruption-cascade root, keeps its checkpoint
+and unknown outcomes intact, and continues with later roots and the interrupted pass.
+The stale interrupting root is planned before mutation. A hard blocker is reported
+without attempting repair; a typed execution-profile rejection or a manual
+model-completion recovery requirement after planning is isolated too. Store failures,
+invalid cursors and unclassified errors still fail startup.
+Missing registrations and invalid cascade markers are reported with fixed blocker codes.
+
+`await app.get_startup_recovery_status()` returns the latest process-local sweep. It
+keeps the integer return value of `resume_pending_interruption_cascades` and separately
+reports completion, scheduled roots, total blocked roots, and at most 100 blocked session
+IDs with blocker codes. No prompts, arguments, exception text, checkpoints, or component
+configuration appear in the result. Truncation is explicit; inspect an individual session
+with the ordinary recovery planner. Repeated startups plan blocked roots read-only and
+do not append duplicate rejection evidence.
+
+The same result is available at `GET /api/recovery/startup` for `create_server`, or
+`GET /cayu/api/recovery/startup` with the default mount. Configure authenticated server
+access and restrict it to operators; authentication alone does not provide tenant
+isolation. This noninteractive command prints JSON from the running process:
+
+```bash
+curl --fail-with-body --silent --show-error \
+  --header "Authorization: Bearer ${CAYU_OPERATOR_TOKEN}" \
+  "${CAYU_OPERATOR_BASE_URL}/api/recovery/startup"
+```
+
+A supported recovery path is to restore the complete compatible application registration
+in a separate operator process against the same store, with the original declared provider,
+tool and policy implementations. Quiesce other owners first. Do this only when those
+implementations remain available and correct; a historical opaque process identity cannot
+be recreated by adding a stable declaration later. Use the restored factory to produce
+and review a fresh exact plan, then execute its allowed decisions:
+
+```bash
+cayu recovery plan previous_agent:build_app --session SESSION_ID \
+  --inactive-for-seconds 0 --output retained-plan.json
+cayu recovery execute retained-plan.json --target previous_agent:build_app \
+  --execution-id restored-registration-1
+```
+
+The recovery receipt attributes the action to the explicit execution ID. It does not
+adopt the changed profile or dispatch unknown external effects automatically. If the
+restored plan requires an explicit model/tool outcome decision, inspect its evidence and
+supply a decisions JSON file with `--decisions`; do not edit stored events or fabricate
+success. If a compatible registration cannot be restored, leave the retained evidence
+intact and operate healthy sessions under the new registration.

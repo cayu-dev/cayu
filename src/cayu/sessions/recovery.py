@@ -251,6 +251,35 @@ class RecoveryBlockerCode(StrEnum):
     INVALID_DURABLE_STATE = "invalid_durable_state"
 
 
+class StartupRecoveryBlockedSession(BaseModel):
+    """Bounded operator evidence; contains no checkpoint or exception content."""
+
+    model_config = _MODEL_CONFIG
+    session_id: str
+    blocker_codes: tuple[RecoveryBlockerCode, ...] = Field(min_length=1, max_length=16)
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, value: str) -> str:
+        return _clean_id(value, "session_id")
+
+
+class StartupRecoveryResult(BaseModel):
+    """Latest process-local interruption sweep, retaining at most 100 blocked roots."""
+
+    model_config = _MODEL_CONFIG
+    schema_version: Literal[1] = 1
+    completed: StrictBool = False
+    status: Literal["not_started", "running", "completed", "failed"] = "not_started"
+    sweep_count: StrictInt = Field(default=0, ge=0)
+    scheduled_roots: StrictInt = Field(default=0, ge=0)
+    deferred_session_count: StrictInt = Field(default=0, ge=0)
+    skipped_session_count: StrictInt = Field(default=0, ge=0)
+    blocked_session_count: StrictInt = Field(default=0, ge=0)
+    blocked_sessions: tuple[StartupRecoveryBlockedSession, ...] = Field(default=(), max_length=100)
+    blocked_sessions_truncated: StrictBool = False
+
+
 class RecoveryPlanBlocker(BaseModel):
     model_config = _MODEL_CONFIG
 

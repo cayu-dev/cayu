@@ -57,6 +57,7 @@ from cayu.runtime._task_store_operation_boundary import (
 from cayu.runtime._tool_effect_preparation_recovery import requires_explicit_effect_continuation
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
 from cayu.runtime.execution_profiles import (
+    ExecutionProfileMismatchError,
     active_invocation_execution_profile_from_checkpoint,
     execution_profile_from_session_metadata,
 )
@@ -105,10 +106,12 @@ from cayu.sessions.recovery import (
     RecoveryPlan,
     RecoveryPlanAction,
     RecoveryPlanBlocker,
+    RecoveryPlanBounds,
     RecoveryPlanExecutionEvidence,
     RecoveryPlanExecutionFenced,
     RecoveryPlanItem,
     RecoveryPlanRequest,
+    RecoveryPlanSelection,
     RecoveryReceipt,
     RecoveryRegistrationEvidence,
     RecoveryRegistrationStatus,
@@ -154,6 +157,10 @@ _ACTIVE_TASK_STATUSES = frozenset(
 
 class _RecoveryPlanSnapshotChanged(RuntimeError):
     """A session could not be projected from one stable read snapshot."""
+
+
+class _RecoveryPlanSessionMissing(KeyError):
+    """The selected session was removed before its snapshot could be read."""
 
 
 ResolveRegisteredAgent = Callable[[str], runtime_records.RegisteredAgentState]
@@ -486,6 +493,41 @@ class RecoveryPlanCoordinator:
             next_cursor=next_cursor,
         )
 
+    async def startup_interruption_blockers(
+        self, session_id: str, inactive_for_seconds: int
+    ) -> tuple[RecoveryBlockerCode, ...] | None:
+        """Use the ordinary planner without converting infrastructure errors to blockers."""
+        try:
+            item = await self._plan_item(
+                session_id,
+                request=RecoveryPlanRequest(
+                    selection=RecoveryPlanSelection(
+                        session_ids=(self._project_session_id(session_id),),
+                        inactive_for_seconds=inactive_for_seconds,
+                    ),
+                    bounds=RecoveryPlanBounds(item_limit=1, inspection_limit=1),
+                ),
+                startup_preflight=True,
+            )
+        except (_RecoveryPlanSessionMissing, _RecoveryPlanSnapshotChanged):
+            return None
+        if item is None:
+            return None
+        codes = tuple(dict.fromkeys(blocker.code for blocker in item.blockers))
+        if item.registration.reason_code == "model_completion_manual_recovery_required":
+            # Automatic recovery would raise the same preflight error; the model
+            # outcome needs an operator decision even without a planner blocker.
+            return tuple(dict.fromkeys((*codes, RecoveryBlockerCode.MODEL_EFFECT_OUTCOME_UNKNOWN)))
+        if any(
+            action in item.allowed_actions
+            for action in (
+                RecoveryPlanAction.AUTOMATIC_REPAIR,
+                RecoveryPlanAction.TERMINALIZE_ZERO_WORK,
+            )
+        ):
+            return ()
+        return codes
+
     async def _select_sessions(
         self,
         request: RecoveryPlanRequest,
@@ -584,11 +626,12 @@ class RecoveryPlanCoordinator:
         private_session_id: str,
         *,
         request: RecoveryPlanRequest,
+        startup_preflight: bool = False,
     ) -> RecoveryPlanItem | None:
         for _attempt in range(3):
             session = await self._session_store.load(private_session_id)
             if session is None:
-                raise KeyError(f"Session not found: {private_session_id}")
+                raise _RecoveryPlanSessionMissing(f"Session not found: {private_session_id}")
             checkpoint = await self._session_store.load_checkpoint(private_session_id)
             fingerprint = _session_state_fingerprint(session, checkpoint)
             item = await self._project_item_state(
@@ -596,6 +639,7 @@ class RecoveryPlanCoordinator:
                 checkpoint,
                 fingerprint=fingerprint,
                 request=request,
+                startup_preflight=startup_preflight,
             )
             confirmed_session = await self._session_store.load(private_session_id)
             confirmed_checkpoint = await self._session_store.load_checkpoint(private_session_id)
@@ -614,6 +658,7 @@ class RecoveryPlanCoordinator:
         *,
         fingerprint: str,
         request: RecoveryPlanRequest,
+        startup_preflight: bool = False,
     ) -> RecoveryPlanItem:
         from cayu.runtime._producer_recovery_selection import require_recovery_selection
 
@@ -665,6 +710,8 @@ class RecoveryPlanCoordinator:
             except ModelCompletionManualRecoveryRequired:
                 registration_reason = "model_completion_manual_recovery_required"
             except Exception as exc:
+                if startup_preflight and not isinstance(exc, ExecutionProfileMismatchError):
+                    raise
                 registration_status = RecoveryRegistrationStatus.INCOMPATIBLE
                 registration_reason = type(exc).__name__
 

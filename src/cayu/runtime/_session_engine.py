@@ -790,6 +790,11 @@ from cayu.sessions.interactions import (
     interaction_usage_summary,
 )
 from cayu.sessions.invocation import SessionExecutionSource, SessionInvocationBinding
+from cayu.sessions.recovery import (
+    RecoveryBlockerCode,
+    StartupRecoveryBlockedSession,
+    StartupRecoveryResult,
+)
 from cayu.tasks.admission import (
     WORK_ATTEMPT_RECOVERY_CHECKPOINT_KEY,
     WorkAttemptAdmission,
@@ -5182,6 +5187,7 @@ class SessionEngine:
         self._request_footprint = copy_request_footprint_config(request_footprint)
         self._tool_round_executor = tool_round_executor
         self._recovery_coordinator = recovery_coordinator
+        self._startup_recovery_result = StartupRecoveryResult()
         if type(recovery_cleanup_supervisor) is not RecoveryCleanupSupervisor:
             raise TypeError("recovery_cleanup_supervisor must be a RecoveryCleanupSupervisor.")
         self._recovery_cleanup_supervisor = recovery_cleanup_supervisor
@@ -6605,6 +6611,8 @@ class SessionEngine:
         self,
         *,
         interrupting_inactive_for_seconds: int | None = None,
+        startup_preflight: Callable[[str, int], Awaitable[tuple[RecoveryBlockerCode, ...] | None]]
+        | None = None,
     ) -> int:
         """Resume durable descendant interruption work left by an earlier process.
 
@@ -6624,115 +6632,208 @@ class SessionEngine:
             )
 
         scheduled = 0
-        admitted_parent_ids: set[str] = set()
-        for status in (SessionStatus.INTERRUPTING, SessionStatus.INTERRUPTED):
-            if status == SessionStatus.INTERRUPTING and interrupting_inactive_for_seconds is None:
-                continue
-            cursor: str | None = None
-            while True:
-                result = await self.session_store.list_sessions_with_pending_interruption_cascade(
-                    SessionQuery(
-                        status=status,
-                        inactive_for_seconds=(
-                            interrupting_inactive_for_seconds
-                            if status == SessionStatus.INTERRUPTING
-                            else None
-                        ),
-                        limit=1000,
-                        cursor=cursor,
-                        order_by=SessionOrder.CREATED_AT_ASC,
-                    )
-                )
-                for session in result.sessions:
-                    if session.id in admitted_parent_ids:
-                        continue
-                    if (
-                        session.status == SessionStatus.INTERRUPTING
-                        and interrupting_inactive_for_seconds is None
-                    ):
-                        continue
-                    try:
-                        marker = await self._load_pending_interruption_cascade(session.id)
-                    except (TypeError, ValueError) as exc:
-                        logger.warning(
-                            "Could not resume invalid interruption cascade checkpoint for %s: %s",
-                            session.id,
-                            exc,
-                        )
-                        continue
-                    if marker is None:
-                        continue
-                    if session.status == SessionStatus.INTERRUPTING:
-                        (
-                            requires_completion_decision,
-                            admission_failure,
-                        ) = await self._verifier_aware_task_execution_outcome(
-                            None,
-                            session_id=session.id,
-                            admit_session=False,
-                        )
-                        if admission_failure is not None:
-                            del marker, result, session
-                            raise_task_store_operation_failure(admission_failure)
-                        if requires_completion_decision:
-                            # Keep both the stale parent and its durable cascade marker
-                            # untouched for the verifier-aware recovery owner.
-                            continue
-                    already_scheduled = self._background_interruption_coordinator.is_admitted(
-                        session.id
-                    )
-                    if session.status == SessionStatus.INTERRUPTING:
-                        recovery_session_id = session.id
+        blocked_ids: set[str] = set()
+        blocked: list[StartupRecoveryBlockedSession] = []
+        deferred_ids: set[str] = set()
+        skipped_ids: set[str] = set()
+        sweep_count = self._startup_recovery_result.sweep_count + 1
 
-                        async def admit_before_recovery_mutation(
-                            session_id: str = recovery_session_id,
-                        ) -> None:
+        def report(*, status: Literal["running", "completed", "failed"] = "running") -> None:
+            self._startup_recovery_result = StartupRecoveryResult(
+                completed=status == "completed",
+                status=status,
+                sweep_count=sweep_count,
+                scheduled_roots=scheduled,
+                deferred_session_count=len(deferred_ids),
+                skipped_session_count=len(skipped_ids),
+                blocked_session_count=len(blocked_ids),
+                blocked_sessions=tuple(blocked),
+                blocked_sessions_truncated=len(blocked_ids) > len(blocked),
+            )
+
+        def record_blocked(session_id: str, codes: tuple[RecoveryBlockerCode, ...]) -> None:
+            if session_id in blocked_ids:
+                return
+            blocked_ids.add(session_id)
+            if len(blocked) < 100:
+                blocked.append(
+                    StartupRecoveryBlockedSession(session_id=session_id, blocker_codes=codes)
+                )
+            logger.warning(
+                "Startup recovery blocked session=%s blocker=%s",
+                self._secret_redactor.redact_text(session_id),
+                ",".join(code.value for code in codes),
+            )
+            report()
+
+        report()
+        try:
+            admitted_parent_ids: set[str] = set()
+            for status in (SessionStatus.INTERRUPTING, SessionStatus.INTERRUPTED):
+                if (
+                    status == SessionStatus.INTERRUPTING
+                    and interrupting_inactive_for_seconds is None
+                ):
+                    continue
+                cursor: str | None = None
+                while True:
+                    result = (
+                        await self.session_store.list_sessions_with_pending_interruption_cascade(
+                            SessionQuery(
+                                status=status,
+                                inactive_for_seconds=(
+                                    interrupting_inactive_for_seconds
+                                    if status == SessionStatus.INTERRUPTING
+                                    else None
+                                ),
+                                limit=1000,
+                                cursor=cursor,
+                                order_by=SessionOrder.CREATED_AT_ASC,
+                            )
+                        )
+                    )
+                    for session in result.sessions:
+                        if session.id in admitted_parent_ids:
+                            continue
+                        if (
+                            session.status == SessionStatus.INTERRUPTING
+                            and interrupting_inactive_for_seconds is None
+                        ):
+                            continue
+                        try:
+                            marker = await self._load_pending_interruption_cascade(session.id)
+                        except (TypeError, ValueError):
+                            record_blocked(session.id, (RecoveryBlockerCode.INVALID_DURABLE_STATE,))
+                            continue
+                        if marker is None:
+                            continue
+                        if session.status == SessionStatus.INTERRUPTING:
                             (
                                 requires_completion_decision,
                                 admission_failure,
                             ) = await self._verifier_aware_task_execution_outcome(
                                 None,
-                                session_id=session_id,
+                                session_id=session.id,
+                                admit_session=False,
                             )
                             if admission_failure is not None:
+                                del marker, result, session
                                 raise_task_store_operation_failure(admission_failure)
                             if requires_completion_decision:
-                                raise TaskCompletionDecisionRequired(
-                                    "Contracted tasks require the verifier-aware execution "
-                                    "entrance."
-                                ) from None
+                                # Keep both the stale parent and its durable cascade marker
+                                # untouched for the verifier-aware recovery owner.
+                                continue
+                        already_scheduled = self._background_interruption_coordinator.is_admitted(
+                            session.id
+                        )
+                        if session.status == SessionStatus.INTERRUPTING:
+                            if startup_preflight is not None:
+                                assert interrupting_inactive_for_seconds is not None
+                                codes = await startup_preflight(
+                                    session.id, interrupting_inactive_for_seconds
+                                )
+                                if codes is None:
+                                    skipped_ids.add(session.id)
+                                    report()
+                                    continue
+                                if codes:
+                                    if set(codes) <= {
+                                        RecoveryBlockerCode.ACTIVE_RECOVERY_CLAIM,
+                                        RecoveryBlockerCode.ACTIVE_TASK_CLAIM,
+                                    }:
+                                        deferred_ids.add(session.id)
+                                        report()
+                                    else:
+                                        record_blocked(session.id, codes)
+                                    continue
+                            recovery_session_id = session.id
 
-                        with suppress_interruption_cascade():
-                            recovery = await self._recovery_coordinator.recover_incomplete_session(
-                                IncompleteSessionRecoveryRequest(
-                                    session_id=session.id,
-                                    inactive_for_seconds=(interrupting_inactive_for_seconds),
-                                    reason="interruption_cascade_startup_recovery",
-                                    metadata={"source": "resume_pending_interruption_cascades"},
-                                ),
-                                before_mutation=admit_before_recovery_mutation,
-                            )
-                        session = await self._require_session(session.id)
-                        if session.status != SessionStatus.INTERRUPTED:
-                            logger.warning(
-                                "Could not finalize interruption cascade parent %s during "
-                                "startup recovery: %s",
-                                session.id,
-                                recovery.message,
-                            )
-                            continue
-                    admitted_parent_ids.add(session.id)
-                    self._schedule_background_interruption_cascade(
-                        parent_session_id=session.id,
-                        interrupt_payload=marker["interrupt_payload"],
-                        create_if_missing=False,
-                    )
-                    if not already_scheduled:
-                        scheduled += 1
-                cursor = result.next_cursor
-                if cursor is None:
-                    break
+                            async def admit_before_recovery_mutation(
+                                session_id: str = recovery_session_id,
+                            ) -> None:
+                                (
+                                    requires_completion_decision,
+                                    admission_failure,
+                                ) = await self._verifier_aware_task_execution_outcome(
+                                    None,
+                                    session_id=session_id,
+                                )
+                                if admission_failure is not None:
+                                    raise_task_store_operation_failure(admission_failure)
+                                if requires_completion_decision:
+                                    raise TaskCompletionDecisionRequired(
+                                        "Contracted tasks require the verifier-aware execution "
+                                        "entrance."
+                                    ) from None
+
+                            try:
+                                with suppress_interruption_cascade():
+                                    recovery = await self._recovery_coordinator.recover_incomplete_session(
+                                        IncompleteSessionRecoveryRequest(
+                                            session_id=session.id,
+                                            inactive_for_seconds=interrupting_inactive_for_seconds,
+                                            reason="interruption_cascade_startup_recovery",
+                                            metadata={
+                                                "source": "resume_pending_interruption_cascades"
+                                            },
+                                        ),
+                                        before_mutation=admit_before_recovery_mutation,
+                                    )
+                            except ExecutionProfileMismatchError:
+                                # A registration can change after read-only planning. Isolate
+                                # this typed per-session rejection; store and unknown failures propagate.
+                                record_blocked(
+                                    session.id, (RecoveryBlockerCode.REGISTRATION_INCOMPATIBLE,)
+                                )
+                                continue
+                            except ModelCompletionManualRecoveryRequired:
+                                record_blocked(
+                                    session.id, (RecoveryBlockerCode.MODEL_EFFECT_OUTCOME_UNKNOWN,)
+                                )
+                                continue
+                            except KeyError:
+                                # A root deleted after preflight is no longer startup work.
+                                if await self.session_store.load(session.id) is not None:
+                                    raise
+                                skipped_ids.add(session.id)
+                                report()
+                                continue
+                            recovered_session = await self.session_store.load(session.id)
+                            if recovered_session is None:
+                                skipped_ids.add(session.id)
+                                report()
+                                continue
+                            session = recovered_session
+                            if session.status != SessionStatus.INTERRUPTED:
+                                logger.warning(
+                                    "Could not finalize interruption cascade parent %s during "
+                                    "startup recovery: %s",
+                                    session.id,
+                                    recovery.message,
+                                )
+                                continue
+                        admitted_parent_ids.add(session.id)
+                        self._schedule_background_interruption_cascade(
+                            parent_session_id=session.id,
+                            interrupt_payload=marker["interrupt_payload"],
+                            create_if_missing=False,
+                        )
+                        if not already_scheduled:
+                            scheduled += 1
+                            report()
+                    if result.next_cursor is not None and result.next_cursor == cursor:
+                        raise RuntimeError("Startup recovery returned a repeated session cursor.")
+                    cursor = result.next_cursor
+                    if cursor is None:
+                        break
+        except BaseException:
+            report(status="failed")
+            raise
+        report(status="completed")
         return scheduled
+
+    def get_startup_recovery_status(self) -> StartupRecoveryResult:
+        return self._startup_recovery_result.model_copy(deep=True)
 
     async def interruption_cascade_status(self, session_id: str) -> str:
         """Return the public control-plane state of a session's durable cascade."""

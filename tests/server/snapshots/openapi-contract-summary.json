@@ -8233,6 +8233,22 @@
       "title": "ProviderStatePart",
       "type": "object"
     },
+    "RecoveryBlockerCode": {
+      "enum": [
+        "registration_unavailable",
+        "registration_incompatible",
+        "active_recovery_claim",
+        "active_task_claim",
+        "model_effect_outcome_unknown",
+        "tool_effect_outcome_unknown",
+        "tool_effect_continuation_required",
+        "tool_approval_required",
+        "user_input_required",
+        "invalid_durable_state"
+      ],
+      "title": "RecoveryBlockerCode",
+      "type": "string"
+    },
     "RequestCostRoute": {
       "additionalProperties": false,
       "description": "Aggregated cost of one method and route template inside the window.",
@@ -10935,6 +10951,105 @@
         "status"
       ],
       "title": "SseSessionFollowEndEnvelope",
+      "type": "object"
+    },
+    "StartupRecoveryBlockedSession": {
+      "additionalProperties": false,
+      "description": "Bounded operator evidence; contains no checkpoint or exception content.",
+      "properties": {
+        "blocker_codes": {
+          "items": {
+            "$ref": "#/components/schemas/RecoveryBlockerCode"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "title": "Blocker Codes",
+          "type": "array"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "blocker_codes"
+      ],
+      "title": "StartupRecoveryBlockedSession",
+      "type": "object"
+    },
+    "StartupRecoveryResult": {
+      "additionalProperties": false,
+      "description": "Latest process-local interruption sweep, retaining at most 100 blocked roots.",
+      "properties": {
+        "blocked_session_count": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Blocked Session Count",
+          "type": "integer"
+        },
+        "blocked_sessions": {
+          "default": [],
+          "items": {
+            "$ref": "#/components/schemas/StartupRecoveryBlockedSession"
+          },
+          "maxItems": 100,
+          "title": "Blocked Sessions",
+          "type": "array"
+        },
+        "blocked_sessions_truncated": {
+          "default": false,
+          "title": "Blocked Sessions Truncated",
+          "type": "boolean"
+        },
+        "completed": {
+          "default": false,
+          "title": "Completed",
+          "type": "boolean"
+        },
+        "deferred_session_count": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Deferred Session Count",
+          "type": "integer"
+        },
+        "scheduled_roots": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Scheduled Roots",
+          "type": "integer"
+        },
+        "schema_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "skipped_session_count": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Skipped Session Count",
+          "type": "integer"
+        },
+        "status": {
+          "default": "not_started",
+          "enum": [
+            "not_started",
+            "running",
+            "completed",
+            "failed"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "sweep_count": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Sweep Count",
+          "type": "integer"
+        }
+      },
+      "title": "StartupRecoveryResult",
       "type": "object"
     },
     "StructuredOutputSpec": {
@@ -15591,6 +15706,24 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/recovery/startup": {
+      "get": {
+        "operation_id": "startup_recovery_status_api_recovery_startup_get",
+        "parameters": [],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/StartupRecoveryResult"
               }
             }
           }

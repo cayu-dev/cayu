@@ -3871,6 +3871,34 @@ After the parent's durable `session.interrupted` event is persisted, operator-re
 
 Background propagation persists a `pending_interruption_cascade` checkpoint marker until the complete descendant traversal succeeds. A shared app-level worker pool bounds traversal across all roots; workers are not multiplied per parent or tree depth. Root coordinators are bounded by the same limit. Roots whose durable lease belongs to another process move to one deferred supervisor instead of occupying a coordinator. Locally admitted roots waiting for coordinator capacity remain part of the shutdown drain, while external-lease retries do not consume the shutdown grace. A coordinator must atomically acquire a durable, expiring claim and renew it while working; another process cannot start overlapping traversal until that lease expires or is explicitly released. Each new owner also advances a private generation so delayed events from an expired owner can be identified and ignored. Session detail reads the durable marker before applying local scheduling hints, then reports an active lease, a locally queued root, or a newly created marker within its admission grace as `pending`, an expired, recorded-failure, or orphaned marker as `failed`, and no marker as `none`; this prevents a stale external-lease timer from masking completion by another worker. The dashboard shows pending propagation explicitly, exposes Retry only for `failed`, withholds Resume for every outstanding marker, and selects the newest failure generation rather than event arrival order. A retry of a failed cascade emits `session.interruption_cascade_retry_requested` with a unique `retry_request_id` and the retrying actor, reason, and metadata while preserving the original interruption provenance used for descendants. When that retry acquires a generation, its failure or completion event carries the same retry request ID and provenance. Existing-terminal replay and cascade retry use the session's durable agent/environment identity, so an application deployment may remove the historical parent agent without disabling control-plane recovery. If a descendant remains `pending`, `running`, or `interrupting` after an interruption attempt, Cayu releases the claim but retains the marker and emits a bounded `session.interruption_cascade_failed` event on the parent with structured descendant IDs, statuses, and error types; exception messages are not persisted. A later successful retry durably publishes `session.interruption_cascade_completed` before clearing the failed marker, so publication failure leaves retryable state instead of losing the resolution event; first-attempt success clears the marker without adding a redundant event. `CayuApp.resume_pending_interruption_cascades(interrupting_inactive_for_seconds=...)` discovers durable work after a process restart through a paginated store query backed by a partial checkpoint index; startup does not scan historical interrupted sessions or load unrelated checkpoints. Interrupted roots are admitted immediately when their claim is available; an `interrupting` parent is filtered by the supplied inactivity duration, resolved against `SessionStore` time inside the fencing transaction, and finalized only after the store atomically fences it, preventing a fast worker clock from stealing shutdown from a live owner. Recovery claims existing markers only, so a startup race or repeated idempotent request cannot recreate work another owner already completed. `create_server(...)` reads this duration from `ServerLifecycleConfig.recovery_inactive_after_seconds`, while `mount_cayu(...)` exposes `interruption_recovery_inactive_after_seconds`; both drain accepted background work during shutdown using the configured grace period, including work scheduled before a later startup-recovery error. Internal timeout and caller cancellation signal claim loss, stop the current worker generation, and detach cancellation-resistant code without extending that grace. Cooperative coordinators may release claims immediately; detached work cannot accept new queue entries and leaves its durable lease to expire for takeover. A hard process loss uses the same lease-expiry recovery boundary.
 
+The startup interruption sweep plans each stale `interrupting` root against current
+registrations before attempting mutation. Roots that the planner leaves intact because
+of hard blockers, malformed cascade markers, and typed execution-profile rejections
+are isolated and reported; later roots and the `interrupted` pass continue. Planning is
+read-only, so repeated restarts do not add rejection evidence for the same blocked root.
+A root requiring an explicit model/tool outcome decision is also left intact and
+reported, including one whose recovery preflight or recovery attempt requires manual
+model-completion recovery (`model_effect_outcome_unknown`). Live recovery/task claims
+are counted as deferred, not operator blockers; roots deleted during planning or before
+their recovery finishes, and roots repeatedly changed during planning, are counted as
+skipped.
+Store/infrastructure failures and repeated cursors propagate instead of being relabeled
+as session blockers. Unknown exceptions still propagate. The report describes the
+latest sweep: `sweep_count` increases on each call, and `status` distinguishes
+`not_started`, `running`, `completed`, and `failed`. `completed` remains available
+for existing consumers.
+
+The public sweep retains its integer scheduled-root return for compatibility.
+`CayuApp.get_startup_recovery_status()` returns `StartupRecoveryResult`: the latest
+process-local interruption sweep, completion flag, scheduled-root count, blocked-root
+count, up to 100 `StartupRecoveryBlockedSession` records with public session IDs and
+blocker codes, and explicit truncation. `/api/recovery/startup` (or the default mounted
+`/cayu/api/recovery/startup`) exposes this authenticated operator view. It is process-local
+and is not the aggregate state of every replica or a tenant isolation mechanism.
+`cayu guide durable-service-tools` documents the noninteractive JSON read and tested
+recovery under a restored compatible application registration. Pending invocation
+recovery cannot use ordinary resume-boundary profile adoption.
+
 `CayuApp.snapshot_fork_source(...)` captures caller-visible authority for one safe,
 terminal source: status, run epoch, and a transcript digest that binds both the
 permanent cursor and every retained message's absolute index and content,

@@ -124,3 +124,71 @@ def test_recovery_execute_cli_loads_exact_plan_and_decisions(
         "execution_id": "operator-run-one",
         "items": [],
     }
+
+
+def test_recovery_cli_restores_a_startup_blocked_registration(monkeypatch, tmp_path, capsys):
+    import asyncio
+
+    from tests.core.test_startup_recovery_isolation import _app, _seed, _state
+
+    from cayu import InMemorySessionStore, SessionStatus
+
+    store = InMemorySessionStore()
+    restored = _app(store, "3")
+    replacement = _app(store, "4")
+
+    async def seed():
+        await _seed(store, restored, "blocked-cli")
+        before = await _state(store, "blocked-cli")
+        assert (
+            await replacement.resume_pending_interruption_cascades(
+                interrupting_inactive_for_seconds=0
+            )
+            == 0
+        )
+        assert before == await _state(store, "blocked-cli")
+
+    asyncio.run(seed())
+    monkeypatch.setattr(
+        recovery_cli,
+        "resolve_project",
+        lambda *args, **kwargs: SimpleNamespace(root=tmp_path, target="app:build_app"),
+    )
+    monkeypatch.setattr(recovery_cli, "project_context", lambda _root: nullcontext())
+    monkeypatch.setattr(recovery_cli, "build_project_app", lambda *args, **kwargs: restored)
+    plan_path = tmp_path / "recovery-plan.json"
+    assert (
+        main(
+            [
+                "recovery",
+                "plan",
+                "app:build_app",
+                "--session",
+                "blocked-cli",
+                "--inactive-for-seconds",
+                "0",
+                "--output",
+                str(plan_path),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert "automatic_repair" in json.loads(plan_path.read_text())["items"][0]["allowed_actions"]
+    assert (
+        main(
+            [
+                "recovery",
+                "execute",
+                str(plan_path),
+                "--target",
+                "app:build_app",
+                "--execution-id",
+                "restored-cli",
+            ]
+        )
+        == 0
+    )
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["items"][0]["status"] == "executed"
+    assert asyncio.run(store.load("blocked-cli")).status == SessionStatus.INTERRUPTED

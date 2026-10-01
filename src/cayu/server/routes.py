@@ -501,6 +501,7 @@ from cayu.sessions.invocation import (
     SessionExecutionSource,
     TaskExecutionSource,
 )
+from cayu.sessions.recovery import StartupRecoveryResult
 from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
 from cayu.storage.memory import (
     KnowledgeActivationConflict,
@@ -9505,6 +9506,15 @@ def create_router(
                 "Cache-Control": "private, no-store",
             },
         )
+
+    @router.get(
+        "/recovery/startup",
+        response_model=StartupRecoveryResult,
+        dependencies=protected,
+        description="Latest process-local interruption sweep; authenticated server operator view.",
+    )
+    async def startup_recovery_status():
+        return await cayu_app.get_startup_recovery_status()
 
     @router.get(
         "/event-side-effects/health",

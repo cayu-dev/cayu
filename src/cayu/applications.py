@@ -704,6 +704,7 @@ from cayu.sessions.recovery import (
     RecoveryPlan,
     RecoveryPlanRequest,
     RecoveryReceipt,
+    StartupRecoveryResult,
 )
 from cayu.storage.memory import (
     KnowledgeStore,
@@ -5184,7 +5185,22 @@ class CayuApp:
         interrupting_inactive_for_seconds: int | None = None,
     ) -> int:
         return await self._session_engine.resume_pending_interruption_cascades(
-            interrupting_inactive_for_seconds=interrupting_inactive_for_seconds
+            interrupting_inactive_for_seconds=interrupting_inactive_for_seconds,
+            startup_preflight=self._recovery_plan_coordinator.startup_interruption_blockers,
+        )
+
+    async def get_startup_recovery_status(self) -> StartupRecoveryResult:
+        """Return the latest process-local sweep with safe exposed session identities."""
+        result = self._session_engine.get_startup_recovery_status()
+        return result.model_copy(
+            update={
+                "blocked_sessions": tuple(
+                    item.model_copy(
+                        update={"session_id": self.project_session_id_for_exposure(item.session_id)}
+                    )
+                    for item in result.blocked_sessions
+                )
+            }
         )
 
     async def interruption_cascade_status(self, session_id: str) -> str:
