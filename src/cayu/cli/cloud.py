@@ -53,6 +53,9 @@ _SERVICE_FAILURES = {"degraded", "failed", "stopped"}
 _SERVICE_IN_PROGRESS = {"deleting", "deploying", "sleeping", "starting", "stopping"}
 _SERVICE_READY = {"running"}
 _SERVICE_STATUSES = _SERVICE_FAILURES | _SERVICE_IN_PROGRESS | _SERVICE_READY
+# A service wait tolerates this many consecutive throttled, unavailable or 5xx reads.
+_SERVICE_POLL_TRANSIENT_LIMIT = 5
+_TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
 _CLOUD_DEPLOYMENT_ID = re.compile(r"dep_[a-z0-9]{1,64}")
 _PRODUCTION_API_URL = "https://cloud.cayu.dev"
 _LEGACY_RETRY_REJECTION = "Only paused or failed deployments can be retried."
@@ -78,6 +81,21 @@ class _CloudServiceHealthError(CloudApiError):
     ) -> None:
         super().__init__(category, message)
         self.issues = [dict(issue) for issue in issues]
+
+
+class _CloudServicePublicationError(CloudApiError):
+    """Cayu Cloud promoted the release but could not publish it to the service."""
+
+    def __init__(self, publication_error: dict[str, str]) -> None:
+        super().__init__(
+            "service_publication_failed",
+            " ".join(
+                publication_error[key]
+                for key in ("message", "detail", "hint")
+                if key in publication_error
+            ),
+        )
+        self.publication_error = publication_error.copy()
 
 
 class _CloudRetrySubmissionError(CloudApiError):
@@ -156,21 +174,34 @@ class _CloudServiceStillRunningError(CloudApiError):
         deleting: bool,
         recovery_arguments: Sequence[str] = (),
         status: str,
+        waited_seconds: float | None = None,
+        last_issue: str | None = None,
     ) -> None:
+        message = (
+            "Cayu Cloud is still deleting this Agent service."
+            if deleting
+            else "Cayu Cloud is still starting this Agent service."
+        )
+        if waited_seconds is not None:
+            message = f"{message[:-1]} after {waited_seconds:.0f}s."
+        if last_issue is not None:
+            message = f"{message} Last report: {last_issue}"
         super().__init__(
             "service_deletion_still_running" if deleting else "service_still_starting",
-            (
-                "Cayu Cloud is still deleting this Agent service."
-                if deleting
-                else "Cayu Cloud is still starting this Agent service."
-            ),
+            message,
         )
         self.application_id = _cloud_application_id(application_id)
         self.recovery_arguments = tuple(recovery_arguments)
         self.status = status if status in _SERVICE_IN_PROGRESS else "processing"
+        self.waited_seconds = waited_seconds
+        self.last_issue = last_issue
 
     def public_details(self) -> dict[str, object]:
         details: dict[str, object] = {"status": self.status}
+        if self.waited_seconds is not None:
+            details["waited_seconds"] = round(self.waited_seconds)
+        if self.last_issue is not None:
+            details["last_issue"] = self.last_issue
         if self.application_id is not None:
             details["application"] = self.application_id
             details["commands"] = {
@@ -275,6 +306,8 @@ def _cloud_failure(exc: Exception) -> int:
         error.update(exc.public_details())
     if isinstance(exc, _CloudServiceHealthError):
         error["issues"] = exc.issues
+    if isinstance(exc, _CloudServicePublicationError):
+        error["publication_error"] = exc.publication_error
     print(
         json.dumps(
             {"error": error, "ok": False},
@@ -889,15 +922,22 @@ def _deploy(
         )
     service = None
     if project.manifest.runtime_payload() is not None and deployment.get("status") == "promoted":
-        service = client.request(
-            "PUT",
-            f"/v1/applications/{application['id']}/service",
-        )
+        # Promotion's finalizer owns publication. A second PUT registers and
+        # restarts the same processes; observe the exact release instead.
+        try:
+            service = _read_service_or_pending(
+                client, f"/v1/applications/{application['id']}/service"
+            )
+        except CloudApiError as exc:
+            if not _transient_api_error(exc):
+                raise
+            service = None
         if not arguments.no_wait:
             service = _wait_for_service(
                 client,
                 application_id=str(application["id"]),
                 initial=service,
+                expected_deployment_id=str(deployment["id"]),
                 poll_seconds=arguments.poll_seconds,
                 recovery_arguments=_cloud_recovery_arguments(arguments),
                 wait_seconds=arguments.wait_seconds,
@@ -909,6 +949,11 @@ def _deploy(
         "deployment": deployment,
         "runtime_artifact": runtime_artifact,
         "service": service,
+        "service_publication_pending": (
+            project.manifest.runtime_payload() is not None
+            and deployment.get("status") == "promoted"
+            and (service is None or service.get("deployment_id") != deployment.get("id"))
+        ),
         "source": {
             "content_digest": project.content_digest,
             "kind": "local_bundle" if project.bundle is not None else "repository",
@@ -1555,11 +1600,53 @@ def _deployment_status(deployment: dict[str, Any]) -> str:
     return status
 
 
+def _read_service_or_pending(client: CloudApiClient, path: str) -> dict[str, Any] | None:
+    try:
+        return client.request("GET", path)
+    except CloudApiError as exc:
+        if exc.status_code == 404:
+            return None
+        raise
+
+
+def _publication_error(
+    client: CloudApiClient, *, application_id: str, deployment_id: str
+) -> dict[str, str] | None:
+    """Why Cayu Cloud could not publish a promoted release, if it reports one."""
+
+    deployment = client.request(
+        "GET", f"/v1/applications/{application_id}/deployments/{deployment_id}"
+    )
+    candidate = deployment.get("publication_error")
+    if not isinstance(candidate, dict):
+        return None
+    error: dict[str, str] = {}
+    for key, max_bytes in (("code", 64), ("message", 512), ("detail", 4096), ("hint", 1024)):
+        value = _deployment_failure_string(candidate.get(key), max_bytes=max_bytes)
+        if value is not None:
+            error[key] = value
+    if not {"code", "message", "hint"} <= set(error):
+        return None
+    return error
+
+
+def _transient_api_error(exc: CloudApiError) -> bool:
+    return exc.category == "api_unavailable" or exc.status_code in _TRANSIENT_HTTP_STATUSES
+
+
+def _web_not_ready_message(service: dict[str, Any]) -> str | None:
+    for issue in _service_issues(service):
+        if issue.get("code") == "web_not_ready":
+            return _deployment_failure_string(issue.get("message"), max_bytes=512)
+    return None
+
+
 def _wait_for_service(
     client: CloudApiClient,
     *,
     application_id: str,
-    initial: dict[str, Any],
+    initial: dict[str, Any] | None,
+    expected_deployment_id: str | None = None,
     poll_seconds: float,
     recovery_arguments: Sequence[str] = (),
     wait_seconds: float,
@@ -1567,29 +1654,65 @@ def _wait_for_service(
     monotonic: Callable[[], float],
 ) -> dict[str, Any]:
     _validate_wait(poll_seconds, wait_seconds)
-    deadline = monotonic() + wait_seconds
+    started = monotonic()
+    deadline = started + wait_seconds
     path = f"/v1/applications/{application_id}/service"
     service = initial
+    transient_failures = 0
+    last_issue: str | None = None
     while True:
-        status = _service_status(service)
+        pending = service is None or (
+            expected_deployment_id is not None
+            and service.get("deployment_id") != expected_deployment_id
+        )
+        status = "starting" if pending or service is None else _service_status(service)
+        if pending and expected_deployment_id is not None:
+            # A publication failure after promotion leaves the old or no service.
+            try:
+                publication_error = _publication_error(
+                    client,
+                    application_id=application_id,
+                    deployment_id=expected_deployment_id,
+                )
+            except CloudApiError as exc:
+                if not _transient_api_error(exc):
+                    raise
+                publication_error = None
+            if publication_error is not None:
+                raise _CloudServicePublicationError(publication_error)
+        elif service is not None:
+            last_issue = _web_not_ready_message(service) or last_issue
         if status in _SERVICE_READY:
+            assert service is not None
             return service
         if status in _SERVICE_FAILURES:
+            assert service is not None
             issues = _service_issues(service)
             raise _CloudServiceHealthError(
                 "service_degraded" if status == "degraded" else "service_failed",
                 _service_failure_message(issues, status=str(status)),
                 issues=issues,
             )
-        if monotonic() >= deadline:
+        now = monotonic()
+        if now >= deadline:
             raise _CloudServiceStillRunningError(
                 application_id=application_id,
                 deleting=False,
                 recovery_arguments=recovery_arguments,
                 status=status,
+                waited_seconds=now - started,
+                last_issue=last_issue,
             )
         sleep(poll_seconds)
-        service = client.request("GET", path)
+        try:
+            service = _read_service_or_pending(client, path)
+        except CloudApiError as exc:
+            # A brief API outage while the service starts is not a failed deploy.
+            if not _transient_api_error(exc) or transient_failures >= _SERVICE_POLL_TRANSIENT_LIMIT:
+                raise
+            transient_failures += 1
+            continue
+        transient_failures = 0
 
 
 def _service_status(service: dict[str, Any]) -> str:

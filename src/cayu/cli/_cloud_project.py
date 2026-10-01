@@ -61,10 +61,50 @@ class CloudProcess:
     memory_mb: int | None = field(default=None, kw_only=True)
 
 
+# Cayu Cloud's web readiness probe defaults and bounds; keep them identical to Cloud.
+_READY_TIMEOUT_SECONDS = 2
+_READY_TIMEOUT_RANGE = (1, 30)
+_READY_START_PERIOD_SECONDS = 180
+_READY_START_PERIOD_RANGE = (0, 300)
+
+
+def _ready_path(value: object) -> str:
+    # The probe's urllib refuses spaces, control characters and non-ASCII, so such
+    # a path would fail every check and restart the web process in a loop.
+    if (
+        type(value) is not str
+        or not 1 <= len(value) <= 1024
+        or not value.startswith("/")
+        or value.startswith("//")
+        or any(not 33 <= ord(char) <= 126 for char in value)
+    ):
+        raise CloudApiError(
+            "manifest_invalid",
+            "Runtime web ready_path must be a local absolute HTTP path of printable ASCII "
+            "without spaces; percent-encode anything else.",
+        )
+    parsed = urlsplit(value)
+    if parsed.scheme or parsed.netloc or "#" in value:
+        raise CloudApiError(
+            "manifest_invalid", "Runtime web ready_path must not contain an origin or fragment."
+        )
+    return value
+
+
+def _ready_seconds(value: object, *, name: str, bounds: tuple[int, int]) -> int:
+    low, high = bounds
+    if type(value) is not int or not low <= value <= high:
+        raise CloudApiError("manifest_invalid", f"Runtime web {name} must be {low}-{high} seconds.")
+    return value
+
+
 @dataclass(frozen=True)
 class CloudWebProcess(CloudProcess):
     port: int
     idle_timeout_seconds: int | None = None
+    ready_path: str = "/"
+    ready_timeout_seconds: int = _READY_TIMEOUT_SECONDS
+    ready_start_period_seconds: int = _READY_START_PERIOD_SECONDS
 
 
 @dataclass(frozen=True)
@@ -218,6 +258,17 @@ class CloudProjectManifest:
                         command=str(web["command"]),
                         **_process_resources(web),
                         port=web["port"],
+                        ready_path=_ready_path(web.get("ready_path", "/")),
+                        ready_timeout_seconds=_ready_seconds(
+                            web.get("ready_timeout_seconds", _READY_TIMEOUT_SECONDS),
+                            name="ready_timeout_seconds",
+                            bounds=_READY_TIMEOUT_RANGE,
+                        ),
+                        ready_start_period_seconds=_ready_seconds(
+                            web.get("ready_start_period_seconds", _READY_START_PERIOD_SECONDS),
+                            name="ready_start_period_seconds",
+                            bounds=_READY_START_PERIOD_RANGE,
+                        ),
                         idle_timeout_seconds=(
                             None
                             if web.get("idle_timeout_seconds") is None
@@ -297,6 +348,18 @@ class CloudProjectManifest:
             type(self.web.port) is not int or not 1 <= self.web.port <= 65_535
         ):
             raise CloudApiError("manifest_invalid", "Runtime web port is invalid.")
+        if self.web is not None:
+            _ready_path(self.web.ready_path)
+            _ready_seconds(
+                self.web.ready_timeout_seconds,
+                name="ready_timeout_seconds",
+                bounds=_READY_TIMEOUT_RANGE,
+            )
+            _ready_seconds(
+                self.web.ready_start_period_seconds,
+                name="ready_start_period_seconds",
+                bounds=_READY_START_PERIOD_RANGE,
+            )
         if (
             self.web is not None
             and self.web.idle_timeout_seconds is not None
@@ -368,6 +431,18 @@ class CloudProjectManifest:
                     "port": self.web.port,
                     **_process_resources(
                         {"cpu_millis": self.web.cpu_millis, "memory_mb": self.web.memory_mb}
+                    ),
+                    # Defaults are omitted so older Cloud builds accept the payload.
+                    **({} if self.web.ready_path == "/" else {"ready_path": self.web.ready_path}),
+                    **(
+                        {}
+                        if self.web.ready_timeout_seconds == _READY_TIMEOUT_SECONDS
+                        else {"ready_timeout_seconds": self.web.ready_timeout_seconds}
+                    ),
+                    **(
+                        {}
+                        if self.web.ready_start_period_seconds == _READY_START_PERIOD_SECONDS
+                        else {"ready_start_period_seconds": self.web.ready_start_period_seconds}
                     ),
                     **(
                         {}

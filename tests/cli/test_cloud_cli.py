@@ -1388,6 +1388,8 @@ def test_cloud_deploy_starts_the_complete_application_after_promotion(
                         ]
                     }
                 )
+            elif self.path.endswith("/service"):
+                self._service()
             elif "/runtime-artifacts/" in self.path:
                 self._reply({"id": "rta_two", "provider": "e2b"})
             else:
@@ -1427,10 +1429,7 @@ def test_cloud_deploy_starts_the_complete_application_after_promotion(
                     }
                 )
 
-        def do_PUT(self) -> None:
-            length = int(self.headers.get("Content-Length", "0"))
-            body = json.loads(self.rfile.read(length)) if length else None
-            requests.append(("PUT", self.path, body))
+        def _service(self) -> None:
             if Handler.break_evidence_directory is not None:
                 shutil.rmtree(Handler.break_evidence_directory)
                 Handler.break_evidence_directory.write_text("not a directory\n")
@@ -1558,11 +1557,12 @@ EOF
         for item in requests
         if item[0:2]
         == (
-            "PUT",
+            "GET",
             "/v1/applications/domain-research/service",
         )
     )
     assert service_request[2] is None
+    assert not any(method == "PUT" and path.endswith("/service") for method, path, _ in requests)
     assert output["result"]["service"]["resources"]["web"]["effective"] == {
         "cpu_units": 4096,
         "memory_mb": 8192,
@@ -1659,7 +1659,7 @@ def test_cloud_deploy_wait_preserves_every_degraded_process_issue(
                 return {"issues": [], "status": "starting"}
             if method == "GET" and path.endswith("/service"):
                 self.service_reads += 1
-                return {"issues": issues, "status": "degraded"}
+                return {"deployment_id": "dep_health", "issues": issues, "status": "degraded"}
             raise AssertionError(f"unexpected Cloud request: {method} {path}")
 
     manifest = cloud_project.CloudProjectManifest.loads(
@@ -2202,11 +2202,24 @@ def test_cloud_deploy_wait_reports_a_service_that_is_still_starting(
             raise AssertionError("service wait should time out before another request")
 
     times = iter((0.0, 10.0))
+    not_ready = "The promoted Agent web process is not ready yet (190s since startup)."
     with pytest.raises(CloudApiError) as raised:
         cloud_cli._wait_for_service(
             Client(),
             application_id="outbound-agent",
-            initial={"issues": [], "status": "starting"},
+            initial={
+                "issues": [
+                    {
+                        "code": "web_not_ready",
+                        "failure_count": 0,
+                        "hint": "Wait for the readiness probe.",
+                        "message": not_ready,
+                        "process": "web",
+                        "severity": "warning",
+                    }
+                ],
+                "status": "starting",
+            },
             poll_seconds=0.01,
             wait_seconds=1.0,
             sleep=lambda _: None,
@@ -2221,8 +2234,13 @@ def test_cloud_deploy_wait_reports_a_service_that_is_still_starting(
             "commands": {
                 "status": "cayu cloud service status --application outbound-agent",
             },
-            "message": "Cayu Cloud is still starting this Agent service.",
+            "last_issue": not_ready,
+            "message": (
+                "Cayu Cloud is still starting this Agent service after 10s. "
+                f"Last report: {not_ready}"
+            ),
             "status": "starting",
+            "waited_seconds": 10,
         },
         "ok": False,
     }
@@ -3148,3 +3166,281 @@ def test_cloud_structurally_invalid_api_response_remains_machine_readable(
         "category": "api_response_invalid",
         "message": "Cayu Cloud API response is missing required data.",
     }
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "",
+        "relative",
+        "//external.test",
+        "/ready#fragment",
+        "/ready#",
+        "/bad\n",
+        # The probe's urllib cannot send these, so every check would fail.
+        "/a b",
+        "/café",
+        "/" + "a" * 1024,
+    ],
+)
+def test_cloud_manifest_rejects_invalid_readiness_paths(path: str) -> None:
+    with pytest.raises(CloudApiError, match="ready_path"):
+        cloud_project._ready_path(path)
+
+
+def test_cloud_manifest_accepts_percent_encoded_readiness_paths() -> None:
+    assert cloud_project._ready_path("/caf%C3%A9?q=a%20b") == "/caf%C3%A9?q=a%20b"
+
+
+_READY_MANIFEST = """
+schema_version = 2
+application = "ready-agent"
+name = "Ready Agent"
+version = "1.0.0"
+entrypoint = "python app.py"
+capabilities = ["network"]
+cpu_millis = 512
+memory_mb = 1024
+timeout_seconds = 600
+environment = "python"
+compatibility = "cayu>=0.1"
+policy_version = "v1"
+[web]
+command = "python app.py"
+port = 8000
+"""
+
+
+def test_cloud_manifest_sends_probe_timing_only_when_it_is_not_the_default() -> None:
+    default = cloud_project.CloudProjectManifest.loads(_READY_MANIFEST)
+    assert (default.web.ready_timeout_seconds, default.web.ready_start_period_seconds) == (2, 180)
+    assert set(default.runtime_payload()["web"]) == {"command", "port"}
+    tuned = cloud_project.CloudProjectManifest.loads(
+        _READY_MANIFEST + "ready_timeout_seconds = 10\nready_start_period_seconds = 300\n"
+    )
+    web = tuned.runtime_payload()["web"]
+    assert (web["ready_timeout_seconds"], web["ready_start_period_seconds"]) == (10, 300)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "ready_timeout_seconds = 0",
+        "ready_timeout_seconds = 31",
+        'ready_timeout_seconds = "5"',
+        "ready_timeout_seconds = true",
+        "ready_start_period_seconds = -1",
+        "ready_start_period_seconds = 301",
+    ],
+)
+def test_cloud_manifest_rejects_out_of_range_probe_timing(line: str) -> None:
+    with pytest.raises(CloudApiError, match="seconds"):
+        cloud_project.CloudProjectManifest.loads(_READY_MANIFEST + line + "\n")
+
+
+def test_cloud_manifest_preserves_custom_readiness_path_and_default_payload() -> None:
+    web = cloud_project.CloudWebProcess(
+        command="python app.py", port=8000, ready_path="/ready?probe=1"
+    )
+    manifest = cloud_project.CloudProjectManifest.loads("""
+schema_version = 2
+application = "ready-agent"
+name = "Ready Agent"
+version = "1.0.0"
+entrypoint = "python app.py"
+capabilities = ["network"]
+cpu_millis = 512
+memory_mb = 1024
+timeout_seconds = 600
+environment = "python"
+compatibility = "cayu>=0.1"
+policy_version = "v1"
+[web]
+command = "python app.py"
+port = 8000
+ready_path = "/ready?probe=1"
+""")
+    assert manifest.web == web
+    assert manifest.runtime_payload()["web"]["ready_path"] == web.ready_path
+    default = cloud_project.CloudProjectManifest.loads(
+        manifest_text := """
+schema_version = 2
+application = "ready-agent"
+name = "Ready Agent"
+version = "1.0.0"
+entrypoint = "python app.py"
+capabilities = ["network"]
+cpu_millis = 512
+memory_mb = 1024
+timeout_seconds = 600
+environment = "python"
+compatibility = "cayu>=0.1"
+policy_version = "v1"
+[web]
+command = "python app.py"
+port = 8000
+"""
+    )
+    assert "ready_path" not in default.runtime_payload()["web"]
+    assert cloud_project.CloudProjectManifest.loads(manifest_text).web.ready_path == "/"
+
+
+def test_cloud_wait_observes_exact_release_through_absent_and_old_service() -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.reads = 0
+            self.publication_checks = 0
+
+        def request(self, method: str, path: str) -> dict[str, object]:
+            if path == "/v1/applications/ready-agent/deployments/dep-new":
+                self.publication_checks += 1
+                return {"id": "dep-new", "status": "promoted", "publication_error": None}
+            assert method == "GET" and path.endswith("/service")
+            self.reads += 1
+            if self.reads == 1:
+                raise CloudApiError("not_found", "not published", status_code=404)
+            if self.reads == 2:
+                return {"deployment_id": "dep-old", "status": "running", "issues": []}
+            if self.reads == 3:
+                return {
+                    "deployment_id": "dep-new",
+                    "status": "starting",
+                    "issues": [{"code": "web_not_ready", "severity": "warning"}],
+                }
+            return {"deployment_id": "dep-new", "status": "running", "issues": []}
+
+    client = Client()
+    result = cloud_cli._wait_for_service(
+        client,
+        application_id="ready-agent",
+        initial=None,
+        expected_deployment_id="dep-new",
+        poll_seconds=0.01,
+        wait_seconds=10,
+        sleep=lambda _: None,
+        monotonic=lambda: 0,
+    )
+    assert result["deployment_id"] == "dep-new"
+    assert client.reads == 4
+    # Only while the promoted release is not yet the service's release.
+    assert client.publication_checks == 3
+
+
+def test_cloud_wait_reports_readiness_failure_for_current_release_only() -> None:
+    issue = {
+        "code": "process_start_failed",
+        "severity": "error",
+        "process": "web",
+        "failure_count": 3,
+        "message": "The Agent web process failed readiness.",
+        "hint": "Check the web logs and startup recovery.",
+    }
+
+    class Client:
+        def request(self, method: str, path: str) -> dict[str, object]:
+            if path.endswith("/deployments/dep-new"):
+                return {"id": "dep-new", "status": "promoted"}
+            assert method == "GET" and path.endswith("/service")
+            return {"deployment_id": "dep-new", "status": "degraded", "issues": [issue]}
+
+    with pytest.raises(CloudApiError, match="startup recovery") as raised:
+        cloud_cli._wait_for_service(
+            Client(),
+            application_id="ready-agent",
+            initial={
+                "deployment_id": "dep-old",
+                "status": "degraded",
+                "issues": [{"message": "old failure"}],
+            },
+            expected_deployment_id="dep-new",
+            poll_seconds=0.01,
+            wait_seconds=10,
+            sleep=lambda _: None,
+            monotonic=lambda: 0,
+        )
+    assert raised.value.issues == [issue]
+
+
+def test_cloud_wait_reports_a_publication_failure_instead_of_timing_out(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class Client:
+        def request(self, method: str, path: str) -> dict[str, object]:
+            assert method == "GET"
+            if path.endswith("/service"):
+                return {"deployment_id": "dep-old", "status": "running", "issues": []}
+            assert path == "/v1/applications/ready-agent/deployments/dep-new"
+            return {
+                "id": "dep-new",
+                "status": "promoted",
+                "publication_error": {
+                    "code": "database_migration_failed",
+                    "detail": "`cayu storage migrate` exited with code 1.",
+                    "hint": "Read the migration output in the release logs.",
+                    "message": "The database migration failed.",
+                },
+            }
+
+    with pytest.raises(CloudApiError) as raised:
+        cloud_cli._wait_for_service(
+            Client(),
+            application_id="ready-agent",
+            initial=None,
+            expected_deployment_id="dep-new",
+            poll_seconds=0.01,
+            wait_seconds=600,
+            sleep=lambda _: None,
+            monotonic=lambda: 0,
+        )
+
+    assert cloud_cli._cloud_failure(raised.value) == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error["category"] == "service_publication_failed"
+    assert error["message"] == (
+        "The database migration failed. `cayu storage migrate` exited with code 1. "
+        "Read the migration output in the release logs."
+    )
+    assert error["publication_error"]["code"] == "database_migration_failed"
+
+
+def test_cloud_wait_tolerates_a_bounded_run_of_transient_api_failures() -> None:
+    class Client:
+        def __init__(self, failures: list[CloudApiError]) -> None:
+            self.failures = failures
+            self.reads = 0
+
+        def request(self, method: str, path: str) -> dict[str, object]:
+            assert method == "GET" and path.endswith("/service")
+            self.reads += 1
+            if self.failures:
+                raise self.failures.pop(0)
+            return {"deployment_id": "dep-new", "status": "running", "issues": []}
+
+    def wait(client: Client) -> dict[str, object]:
+        return cloud_cli._wait_for_service(
+            client,
+            application_id="ready-agent",
+            initial={"deployment_id": "dep-new", "status": "starting", "issues": []},
+            expected_deployment_id="dep-new",
+            poll_seconds=0.01,
+            wait_seconds=600,
+            sleep=lambda _: None,
+            monotonic=lambda: 0,
+        )
+
+    def http(status_code: int) -> CloudApiError:
+        return CloudApiError(
+            "api_request_rejected",
+            f"Cayu Cloud API returned HTTP {status_code}.",
+            status_code=status_code,
+        )
+
+    transient = [http(500), http(502), CloudApiError("api_unavailable", "down"), http(503)]
+    client = Client(transient)
+    assert wait(client)["status"] == "running"
+    assert client.reads == 5
+
+    with pytest.raises(CloudApiError, match="HTTP 500"):
+        wait(Client([http(500)] * 6))
+    with pytest.raises(CloudApiError, match="HTTP 403"):
+        wait(Client([http(403)]))

@@ -47,7 +47,9 @@ only need to observe the durable Deployment Operation rather than reproduce thos
 
 If release publication finishes but the Agent service is still starting when the same
 local deadline expires, `deploy` exits `2` with category `service_still_starting` and a
-ready-to-run `service status` command. A timed-out service teardown similarly reports
+ready-to-run `service status` command. The error also carries `waited_seconds` and, when
+Cloud reported one, `last_issue`: the last `web_not_ready` message, which includes how
+long the web process has been starting. A timed-out service teardown similarly reports
 `service_deletion_still_running`; neither result marks the retained Cloud operation as
 failed.
 
@@ -62,6 +64,36 @@ By default, `deploy` also waits for a declared Agent service to reach `running`.
 `error.issues` array preserves every structured process diagnostic, while `error.message`
 aggregates their safe messages and remediation hints for humans. `--no-wait` keeps the
 explicit asynchronous workflow.
+
+The deployment worker publishes the promoted release once. `deploy` reads the service
+and waits for its `deployment_id` to match that release; it does not start another
+rollout. A brief 404 while publication is pending is retried as a read, and up to five
+consecutive throttled, unavailable or HTTP 5xx service reads are retried before the wait
+fails. While the service still runs an older release or none, `deploy` also reads the
+release: if Cloud reports a `publication_error` (for example a failed database
+migration), it exits `2` with category `service_publication_failed`, Cloud's message and
+hint, and the structured `error.publication_error`. With `--no-wait`,
+`result.service_publication_pending=true` identifies an absent service or one still
+serving an older release. `rollback` still asks Cloud to publish the selected release.
+
+For web Agents, `[web] ready_path = "/ready"` optionally replaces the default `/`. It is
+a local absolute path of printable ASCII without spaces or a fragment; percent-encode
+anything else. Cloud's Python stdlib container probe GETs the local web port with a
+`ready_timeout_seconds` timeout (default 2, 1-30). HTTP statuses below 500, including
+redirects and 401/403, prove readiness; redirects are not followed. After a
+`ready_start_period_seconds` grace period (default 180, 0-300), three failed probes ten
+seconds apart mark the task unhealthy. Cloud returns `web_not_ready` while starting and
+`process_start_failed` with a log/recovery hint for unhealthy tasks or repeated exits.
+The CLI waits for the healthy task from the current release and preserves these issues.
+
+The probe is also a liveness check: ECS replaces a task that turns unhealthy, so a web
+process whose readiness path stops answering for about 30 seconds is restarted, even in
+the middle of a run. Point `ready_path` at a cheap handler, raise `ready_timeout_seconds`
+for slow ones, and raise `ready_start_period_seconds` when startup recovery takes longer
+than the default grace period. Default values are not sent, so older Cloud builds keep
+accepting the manifest. Agent services currently use a single task and stop before
+starting its replacement, so each redeploy has downtime while provisioning and startup
+complete.
 
 When an immutable Release fails to build, `deploy` automatically reads that Release's
 timeline before exiting. If Cloud has a safe structured diagnostic, the nonzero JSON
