@@ -154,7 +154,7 @@ from cayu.context.base import (
     _defer_billing_identity_cancellation_scope,
     _durable_compaction_completion_evidence,
     _runtime_authored_user_message_checkpoint_transform,
-    automatic_compaction_failure_disposition_payload,
+    automatic_compaction_failure_payload,
     context_build_termination_compaction_telemetry,
     project_compaction_invocation_checkpoint,
     sanitize_context_build_error_checkpoint,
@@ -27896,7 +27896,9 @@ class SessionEngine:
                     )
                 if isinstance(error, resume_ledger.ToolCallEvidenceConflict):
                     failure_payload[resume_ledger.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY] = True
-                compaction_failure = automatic_compaction_failure_disposition_payload(error)
+                compaction_failure = automatic_compaction_failure_payload(
+                    error, redactor=self._secret_redactor
+                )
                 if compaction_failure is not None:
                     failure_payload["compaction_failure"] = compaction_failure
                 if runtime_failure_identity is not None:
@@ -27934,7 +27936,9 @@ class SessionEngine:
             ):
                 if payload is None or prepared_failure_turn_completed is None:
                     raise AssertionError("Runtime failure lost its terminal evidence.") from exc
-                compaction_failure = automatic_compaction_failure_disposition_payload(exc)
+                compaction_failure = automatic_compaction_failure_payload(
+                    exc, redactor=self._secret_redactor
+                )
                 diagnostic_task_error = task_failure_payload_from_diagnostic(
                     failure_diagnostic,
                     session_id=session.id,
@@ -28073,7 +28077,9 @@ class SessionEngine:
                 try:
                     task_error = prepared_runtime_task_error
                     if task_error is None:
-                        compaction_failure = automatic_compaction_failure_disposition_payload(exc)
+                        compaction_failure = automatic_compaction_failure_payload(
+                            exc, redactor=self._secret_redactor
+                        )
                         task_error = task_failure_payload_from_diagnostic(
                             failure_diagnostic,
                             session_id=session.id,

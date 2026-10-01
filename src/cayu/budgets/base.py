@@ -60,6 +60,7 @@ from cayu.budgets.pricing import (
     resolve_price_book,
     session_cost_totals,
 )
+from cayu.budgets.usage import ModelCompletionPurpose
 from cayu.events import (
     Event,
     EventType,
@@ -897,6 +898,21 @@ def _inspection_budget_limit_descriptor(
 def is_budget_inspection_event(event: Event) -> bool:
     """Whether an event contributes to the session budget inspection projection."""
     return event.type in _BUDGET_INSPECTION_EVENT_TYPES
+
+
+def is_budget_model_attempt_terminal_event(event: Event) -> bool:
+    """Whether an event settles one model attempt for budget inspection.
+
+    Automatic-compaction attempts always settle through their ``model.completed``
+    accounting record; a paired compaction ``model.error`` is diagnostic only.
+    """
+
+    if event.type == EventType.MODEL_COMPLETED:
+        return True
+    return (
+        event.type == EventType.MODEL_ERROR
+        and event.payload.get("purpose") != ModelCompletionPurpose.CONTEXT_COMPACTION.value
+    )
 
 
 def project_budget_model_attempt_inspection_event(event: Event) -> Event:

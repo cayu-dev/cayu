@@ -12471,13 +12471,13 @@ class ModelStepRun:
         self,
         *,
         authority: _AutomaticCompactionDispatchAuthority,
-        event: Event,
-    ) -> Event:
+        events: list[Event],
+    ) -> list[Event]:
         """Complete one owned context-compaction stage before budget settlement."""
 
         if not authority.owns_stage or authority.stage.purpose != "context-compaction":
             raise ValueError("Automatic compaction completion requires its owned stage.")
-        prepared_event = self._executor._event_writer.prepare(event)
+        prepared_events = self._executor._event_writer.prepare_many(events)
         publication = RuntimePublicationRequest(
             publication_id=authority.stage.logical_step_id,
             kind="context-compaction",
@@ -12485,18 +12485,18 @@ class ModelStepRun:
             intent=authority.stage.intent,
             mutation=runtime_publication_checkpoint_mutation(None, None),
             transcript_messages=(),
-            events=(prepared_event,),
+            events=tuple(prepared_events),
         )
 
-        async def publish_once() -> Event:
+        async def publish_once() -> list[Event]:
             await self._executor._session_store.complete_model_completion_stage(
                 self._session.id,
                 stage_id=authority.stage.stage_id,
                 publication=publication,
             )
-            return prepared_event.model_copy(deep=True)
+            return [event.model_copy(deep=True) for event in prepared_events]
 
-        async def publish_exactly() -> Event:
+        async def publish_exactly() -> list[Event]:
             try:
                 return await publish_once()
             except (Exception, asyncio.CancelledError) as first_error:
@@ -12554,7 +12554,7 @@ class ModelStepRun:
                 raise cancellation from error
             raise error
         if result is None:
-            raise RuntimeError("Context-compaction durable publication returned no event.")
+            raise RuntimeError("Context-compaction durable publication returned no events.")
         if cancellation is not None:
             raise cancellation
         return result
@@ -12736,15 +12736,89 @@ class ModelStepRun:
                 "parent_model_step_id",
             )
             completion_events[attempt_id] = event.model_copy(deep=True)
+            error_payload: dict[str, Any] | None = None
+            if deadline_error is not None:
+                error_payload = {
+                    "error": str(deadline_error),
+                    "error_type": type(deadline_error).__name__,
+                    "stage": "context_compaction_stream",
+                    "purpose": ModelCompletionPurpose.CONTEXT_COMPACTION.value,
+                    "compactor": payload.get("compactor"),
+                    "compaction_outcome": payload.get("compaction_outcome"),
+                    "step": authority.step,
+                    "attempt": authority.attempt,
+                    "max_attempts": authority.max_attempts,
+                    _COMPACTION_ATTEMPT_ID_KEY: attempt_id,
+                    "model_completion_stage_id": authority.stage.stage_id,
+                    **execution_identity.payload(),
+                    **deadline_error.error_payload_fields(),
+                }
+            elif (
+                provider_error is not None
+                and payload.get("compaction_outcome") == "provider_error"
+                and type(payload.get("retry_disposition")) is str
+            ):
+                # The completion above remains the attempt's accounting record.
+                # Publish the provider rejection with the same classification
+                # and retry decision as a failed model-step attempt.
+                error_payload = {
+                    "error": str(provider_error),
+                    "error_type": type(provider_error).__name__,
+                    "stage": "context_compaction_stream",
+                    "purpose": ModelCompletionPurpose.CONTEXT_COMPACTION.value,
+                    "compactor": payload.get("compactor"),
+                    "compaction_outcome": "provider_error",
+                    "provider_name": authority.provider_name,
+                    "step": authority.step,
+                    "attempt": authority.attempt,
+                    "max_attempts": authority.max_attempts,
+                    _COMPACTION_ATTEMPT_ID_KEY: attempt_id,
+                    "model_completion_stage_id": authority.stage.stage_id,
+                    **execution_identity.payload(),
+                    **provider_error.error_payload_fields(),
+                    **{
+                        key: payload[key]
+                        for key in (
+                            "retry",
+                            "retry_disposition",
+                            "retry_suppression",
+                            "provider_retryable",
+                            "effective_max_attempts",
+                            "reason",
+                        )
+                        if key in payload
+                    },
+                }
+            error_event = (
+                None
+                if error_payload is None
+                else event_with_execution_profile_authority(
+                    _event_with_model_identity_authority(
+                        Event(
+                            type=EventType.MODEL_ERROR,
+                            session_id=self._session.id,
+                            agent_name=self._registered_agent.spec.name,
+                            environment_name=self._environment_name,
+                            payload=error_payload,
+                        ),
+                        execution_identity,
+                    ),
+                    self._execution_profile,
+                )
+            )
             if authority.owns_stage and deadline_error is None:
+                # Keep rejection diagnostics in the durable stage handoff. A
+                # separate write after promotion would lose them on ack failure
+                # or process exit, once the completion suppresses later replay.
+                owned_events = [event] if error_event is None else [event, error_event]
                 promotion_allowed = (
                     not authority.stage.reservation_ids
                     or execution_identity.model_attempt_id in settled_attempt_ids
                 )
                 try:
-                    persisted_event = await self._publish_owned_automatic_compaction_completion(
+                    persisted_events = await self._publish_owned_automatic_compaction_completion(
                         authority=authority,
-                        event=event,
+                        events=owned_events,
                     )
                     if promotion_allowed:
                         await self._promote_settled_automatic_compaction_stage(
@@ -12790,12 +12864,12 @@ class ModelStepRun:
                         # though this invocation must still fail closed. Keep
                         # later context-failure persistence from duplicating it.
                         published_attempt_ids.add(attempt_id)
-                        published_events.append(event.model_copy(deep=True))
+                        published_events.extend(item.model_copy(deep=True) for item in owned_events)
                     raise publication_error
-                completion_events[attempt_id] = persisted_event.model_copy(deep=True)
+                completion_events[attempt_id] = persisted_events[0].model_copy(deep=True)
                 published_attempt_ids.add(attempt_id)
                 if promotion_allowed:
-                    published_events.append(persisted_event)
+                    published_events.extend(persisted_events)
                 continue
             pending.append(
                 (
@@ -12803,35 +12877,7 @@ class ModelStepRun:
                     event.model_copy(deep=True),
                 )
             )
-            if deadline_error is not None:
-                error_payload = {
-                    "error": str(deadline_error),
-                    "error_type": type(deadline_error).__name__,
-                    "stage": "context_compaction_stream",
-                    "purpose": ModelCompletionPurpose.CONTEXT_COMPACTION.value,
-                    "compactor": payload.get("compactor"),
-                    "compaction_outcome": payload.get("compaction_outcome"),
-                    "step": authority.step,
-                    "attempt": authority.attempt,
-                    "max_attempts": authority.max_attempts,
-                    _COMPACTION_ATTEMPT_ID_KEY: attempt_id,
-                    "model_completion_stage_id": authority.stage.stage_id,
-                    **execution_identity.payload(),
-                    **deadline_error.error_payload_fields(),
-                }
-                error_event = event_with_execution_profile_authority(
-                    _event_with_model_identity_authority(
-                        Event(
-                            type=EventType.MODEL_ERROR,
-                            session_id=self._session.id,
-                            agent_name=self._registered_agent.spec.name,
-                            environment_name=self._environment_name,
-                            payload=error_payload,
-                        ),
-                        execution_identity,
-                    ),
-                    self._execution_profile,
-                )
+            if error_event is not None:
                 pending.append((attempt_id, error_event))
         if not pending:
             return

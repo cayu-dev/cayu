@@ -729,6 +729,9 @@ _DECLARED_FIXED_CONTROLS: Mapping[
     EventType.MODEL_STARTED: {
         ("purpose",): frozenset({"context_compaction"}),
     },
+    EventType.MODEL_ERROR: {
+        ("purpose",): frozenset({"context_compaction"}),
+    },
     EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED: {
         ("auxiliary_outcome",): frozenset(
             {"completed", "failed", "cancelled", "timed_out", "outcome_unknown"}
@@ -1000,6 +1003,19 @@ _DECLARED_FIXED_CONTROLS: Mapping[
                         }
                     ),
                     ("retryable",): frozenset({True, False}),
+                    ("provider_retryable",): frozenset({True, False}),
+                    ("retry_disposition",): frozenset(
+                        {
+                            "retry_scheduled",
+                            "permanent_provider_error",
+                            "explicit_nonretryable",
+                            "unknown_provider_attempt_cap",
+                            "configured_attempt_exhaustion",
+                            "policy_disallowed",
+                            "classification_unavailable",
+                            "suppressed",
+                        }
+                    ),
                     ("provider_dispatch_disposition",): frozenset(
                         {"not_dispatched", "dispatched", "unknown"}
                     ),
@@ -2421,6 +2437,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     policies[EventType.MODEL_ERROR] = _policy(
         *model_failure_keys,
+        "purpose",
         "execution_admission",
         "provider_operation_progress",
         "reason",
@@ -3858,11 +3875,12 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "elapsed_ms execution_profile_fingerprint "
         "instruction_digest instruction_present mode model_step_id "
         "newly_compacted_message_count operation_id previous_compacted_transcript_cursor "
-        "phase provider_dispatch_disposition reason recent_message_count recovery_action "
-        "represented_message_count represented_source_end retryable "
+        "phase provider_dispatch_disposition provider_error_code provider_error_type "
+        "provider_retryable reason recent_message_count recovery_action "
+        "represented_message_count represented_source_end retry_disposition retryable "
         "represented_source_start request_id requested_source_end requested_source_start "
-        "result_transcript_cursor source_run_epoch source_transcript_cursor summary_chars "
-        "retained_target retained_target_enforced retained_target_met "
+        "result_transcript_cursor source_run_epoch source_transcript_cursor status_code "
+        "summary_chars retained_target retained_target_enforced retained_target_met "
         "estimated_context_input_tokens estimated_context_window_tokens "
         "estimated_window_within_trigger",
         authority_keys={"execution_profile_fingerprint"},

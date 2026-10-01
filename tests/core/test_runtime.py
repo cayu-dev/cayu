@@ -1840,7 +1840,11 @@ def _expected_failure_evidence(
     }
 
 
-def _expected_compaction_failure(event: Event) -> dict[str, Any]:
+def _expected_compaction_failure(
+    event: Event,
+    *,
+    reason: str = "internal_failed",
+) -> dict[str, Any]:
     assert event.type == EventType.CONTEXT_COMPACTION_FAILED
     elapsed_ms = event.payload["elapsed_ms"]
     assert type(elapsed_ms) is int and elapsed_ms >= 0
@@ -1848,7 +1852,7 @@ def _expected_compaction_failure(event: Event) -> dict[str, Any]:
         "elapsed_ms": elapsed_ms,
         "phase": "provider_dispatch",
         "provider_dispatch_disposition": "unknown",
-        "reason": "internal_failed",
+        "reason": reason,
         "recovery_action": "reconcile_completion",
         "retryable": False,
     }
@@ -50459,7 +50463,10 @@ def test_prompt_cache_compactor_records_exact_overflow_when_bounded_attempt_fail
         for key, value in resume_events[-1].payload.items()
         if key != "session_run_operation_id"
     } == {
-        "compaction_failure": _expected_compaction_failure(failed_compaction),
+        "compaction_failure": _expected_compaction_failure(
+            failed_compaction,
+            reason="provider_failed",
+        ),
         "failure_evidence": _expected_failure_evidence(
             "sess_prompt_cache_failed_fallback_telemetry",
             "RuntimeError",
@@ -52608,7 +52615,9 @@ def test_automatic_compaction_retry_requires_an_independent_reservation(
     assert events[-1].type == terminal_event
 
 
-def test_automatic_compaction_does_not_retry_after_settlement_failure() -> None:
+def test_automatic_compaction_does_not_retry_after_settlement_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class FailingReconcileLedger(InMemoryBudgetLedger):
         async def reconcile(
             self,
@@ -52724,6 +52733,16 @@ def test_automatic_compaction_does_not_retry_after_settlement_failure() -> None:
     )
     assert active is not None and active.stage.state == "completed"
 
+    assert active.stage.publication is not None
+    [staged_error] = [
+        event for event in active.stage.publication.events if event.type is EventType.MODEL_ERROR
+    ]
+    assert staged_error.payload["status_code"] == 503
+    assert staged_error.payload["provider_retryable"] is True
+    assert staged_error.payload["retry"] is False
+    assert staged_error.payload["retry_disposition"] == "suppressed"
+    assert staged_error.payload["retry_suppression"] == "automatic_retry_disabled"
+
     with pytest.raises(RuntimeError, match="ledger reconciliation failed"):
         asyncio.run(
             app.recover_incomplete_session(
@@ -52743,6 +52762,21 @@ def test_automatic_compaction_does_not_retry_after_settlement_failure() -> None:
         and event.payload.get("purpose") == "context_compaction"
         for event in recovered_events
     )
+    assert len(compactor_provider.requests) == 1
+    assert runtime_provider.requests == []
+
+    monkeypatch.setattr(ledger, "reconcile", InMemoryBudgetLedger.reconcile.__get__(ledger))
+    with pytest.raises(ModelCompletionManualRecoveryRequired, match="without a durable context"):
+        asyncio.run(
+            app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=session_id, inactive_for_seconds=0)
+            )
+        )
+    recovered_events = asyncio.run(app.session_store.load_events(session_id))
+    [recovered_error] = [event for event in recovered_events if event.type is EventType.MODEL_ERROR]
+    assert recovered_error.id == staged_error.id
+    assert recovered_error.payload["status_code"] == 503
+    assert [record.status for record in ledger._records.values()] == ["reconciled"]
     assert len(compactor_provider.requests) == 1
     assert runtime_provider.requests == []
 

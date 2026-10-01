@@ -750,6 +750,21 @@ publishes its own `model.completed` evidence before another provider dispatch
 may begin. An attempt that reached provider-controlled execution but returned
 no authoritative completion usage is recorded as usage-unavailable and makes a
 strict event-backed budget fail closed on retry and after process restart.
+When the provider rejected an automatic-compaction attempt, that attempt also
+publishes `model.error` with the model-step classification (`status_code`,
+`provider_error_type`, `provider_error_code`, `retryable`, `retry_after_s`) and
+retry decision (`retry`, `retry_disposition`, `provider_retryable`). The
+completion remains the attempt's accounting and budget-settlement record.
+For an owned compaction stage, both records share its durable publication, so
+lost acknowledgements and process recovery retain the rejection diagnostic
+without repeating the provider dispatch. The terminal session's
+`compaction_failure` includes the same bounded provider classification as
+`context.compaction.failed`.
+Provider diagnostics are redacted before terminal decisions and task failures
+are persisted. A failed budget settlement suppresses automatic retry while
+retaining the rejected attempt's diagnostic in its recoverable publication.
+Retryable rejections back off through the compactor's `RetryPolicy`, honoring a
+provider `Retry-After`.
 A transient automatic-compaction publication failure before provider dispatch
 retries a stable event identity through the durable event handoff. The bounded
 wait tolerates queued SQLite and PostgreSQL writers; exact replay prevents a
@@ -761,10 +776,13 @@ linked-task evidence. `not_dispatched` is asserted only while Cayu still owns a
 pre-dispatch callback that has not returned. Once provider execution may have
 started, the disposition is `unknown` or `dispatched`, recovery reconciles the
 existing completion and settlement authority, and no publication retry can
-authorize another provider call. In a hierarchical compaction, a later
-pre-dispatch publication failure retains that post-dispatch disposition once
-an earlier provider attempt completed; it cannot advertise blind session
-resume that would repeat the completed request.
+authorize another provider call. A final provider rejection reports
+`reason=provider_failed`, `dispatched` when an HTTP status proves the provider
+received the request, and its `status_code`, `provider_error_type`,
+`provider_error_code`, `provider_retryable`, and `retry_disposition`. In a
+hierarchical compaction, a later pre-dispatch publication failure retains that
+post-dispatch disposition once an earlier provider attempt completed; it cannot
+advertise blind session resume that would repeat the completed request.
 A dispatched compaction without authoritative priced usage is charged at its
 reserved amount; mixed known and uncertain completions retain the known cost and
 add one reserved amount for each uncertain completion. Failures before a built-in

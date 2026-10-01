@@ -105,7 +105,15 @@ from cayu.runtime.execution_units import (
     copy_model_attempt_identity,
     strip_runtime_owned_execution_identity,
 )
-from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy, retry_decision
+from cayu.runtime.retry_policy import (
+    RetryDecision,
+    RetryDisposition,
+    RetryPolicy,
+    RetrySuppression,
+    copy_retry_policy,
+    retry_decision,
+    retry_diagnostic_payload,
+)
 from cayu.sessions.base import Session, copy_session
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
@@ -977,6 +985,81 @@ def automatic_compaction_failure_disposition_payload(
     return None
 
 
+_COMPACTION_PROVIDER_FAILURE_KEY = "_cayu_compaction_provider_failure"
+# Provider messages and request identifiers stay out of compaction events.
+_COMPACTION_PROVIDER_ERROR_FIELDS = (
+    "status_code",
+    "provider_error_type",
+    "provider_error_code",
+    "retryable",
+    "retry_after_s",
+)
+
+
+def _compaction_provider_failure_classification(
+    error: ModelProviderError,
+    decision: RetryDecision,
+) -> dict[str, Any]:
+    """Classify one failed compaction attempt like a failed model-step attempt."""
+
+    fields = ModelProviderError.error_payload_fields(error)
+    classification = {
+        key: fields[key] for key in _COMPACTION_PROVIDER_ERROR_FIELDS if key in fields
+    }
+    classification.update(retry_diagnostic_payload(decision))
+    classification["effective_max_attempts"] = decision.effective_max_attempts
+    if decision.reason is not None:
+        classification["reason"] = decision.reason.value
+    return copy_durable_json_object(classification, "provider_failure")
+
+
+def _attach_compaction_provider_failure(
+    error: BaseException,
+    classification: dict[str, Any],
+) -> None:
+    error.__dict__[_COMPACTION_PROVIDER_FAILURE_KEY] = copy_durable_json_object(
+        classification,
+        "provider_failure",
+    )
+
+
+def _compaction_provider_failure_payload(error: BaseException) -> dict[str, Any]:
+    """Return the final provider classification carried by a compaction failure."""
+
+    candidate: BaseException | None = error
+    seen: set[int] = set()
+    while candidate is not None and id(candidate) not in seen:
+        seen.add(id(candidate))
+        classification = candidate.__dict__.get(_COMPACTION_PROVIDER_FAILURE_KEY)
+        if type(classification) is dict:
+            return _sanitized_compaction_provider_failure_fields(classification)
+        if isinstance(candidate, ContextBuildError):
+            candidate = candidate.cause
+        else:
+            cause = candidate.__cause__
+            candidate = cause if isinstance(cause, BaseException) else None
+    return {}
+
+
+def automatic_compaction_failure_payload(
+    error: BaseException,
+    *,
+    redactor: SecretRedactor,
+) -> dict[str, Any] | None:
+    """Project terminal diagnostics before task or session authority is persisted."""
+
+    disposition = automatic_compaction_failure_disposition_payload(error)
+    if disposition is None:
+        return None
+    # Session failure events treat this nested container as untrusted. Apply
+    # that redaction before binding a terminal decision or storing task errors,
+    # so durable authority and its later event projection agree.
+    return copy_durable_json_object(
+        redactor.redact_json({**disposition, **_compaction_provider_failure_payload(error)}),
+        "automatic_compaction_failure",
+    )
+
+
 _COMPACTION_EVENT_TEXT_MAX_BYTES = 512
 _COMPACTION_EVENT_INTEGER_MAX = 9_223_372_036_854_775_807
 _COMPACTION_COVERAGE_MODES = frozenset(
@@ -1017,6 +1100,27 @@ def _compaction_event_integer(value: Any) -> int | None:
 
 def _compaction_event_bool(value: Any) -> bool | None:
     return value if type(value) is bool else None
+
+
+def _sanitized_compaction_provider_failure_fields(source: dict[str, Any]) -> dict[str, Any]:
+    """Keep the same provider fields on lifecycle and session failure events."""
+
+    payload: dict[str, Any] = {}
+    status_code = _compaction_event_integer(source.get("status_code"))
+    if status_code is not None and 100 <= status_code <= 599:
+        payload["status_code"] = status_code
+    for key in ("provider_error_type", "provider_error_code"):
+        value = _compaction_event_text(source.get(key))
+        if value is not None:
+            payload[key] = value
+    # ``retryable`` belongs to session recovery on lifecycle failures.
+    provider_retryable = _compaction_event_bool(source.get("provider_retryable"))
+    if provider_retryable is not None:
+        payload["provider_retryable"] = provider_retryable
+    retry_disposition = _compaction_event_text(source.get("retry_disposition"))
+    if retry_disposition in {item.value for item in RetryDisposition}:
+        payload["retry_disposition"] = retry_disposition
+    return payload
 
 
 def _compaction_usage_integer_field(
@@ -1359,6 +1463,7 @@ def sanitize_context_compaction_telemetry(
             recovery_action = _compaction_event_text(source.get("recovery_action"))
             if recovery_action in {item.value for item in _AutomaticCompactionRecoveryAction}:
                 payload["recovery_action"] = recovery_action
+            payload.update(_sanitized_compaction_provider_failure_fields(source))
     return ContextCompactionTelemetry(event_type=telemetry.event_type, payload=payload)
 
 
@@ -4847,6 +4952,49 @@ async def _run_compaction_model(
                     else type(failure).__name__
                 )
                 attempt_payloads = completion_ledger.completed_payloads[attempt_completion_index:]
+                provider_error = failure if isinstance(failure, ModelProviderError) else None
+                # Decide before publication so the failed attempt's durable
+                # evidence carries the classification that drives the retry.
+                decision: RetryDecision | None = None
+                if provider_failure is not None:
+                    decision = retry_decision(
+                        policy=retry_policy,
+                        attempt=attempt,
+                        error=provider_failure.message,
+                        retryable_output=(
+                            retry_empty_summaries
+                            and provider_error is not None
+                            and provider_error.error_code == "compaction_empty_summary"
+                            and bool(attempt_payloads)
+                        ),
+                        status_code=(
+                            None if provider_error is None else provider_error.status_code
+                        ),
+                        retryable=(None if provider_error is None else provider_error.retryable),
+                        retry_after_s=(
+                            None if provider_error is None else provider_error.retry_after_s
+                        ),
+                        unknown_provider_error=(
+                            provider_error is not None
+                            and provider_error.status_code is None
+                            and provider_error.retryable is None
+                        ),
+                        suppression=(
+                            RetrySuppression.AUTOMATIC_RETRY_DISABLED
+                            if exc.__dict__.get("_cayu_compaction_budget_settlement_failed") is True
+                            else None
+                        ),
+                    )
+                # Only a provider rejection without a completion is classified;
+                # completed attempts keep their completion outcome.
+                provider_failure_classification = (
+                    None
+                    if decision is None
+                    or provider_error is None
+                    or attempt_payloads
+                    or isinstance(provider_error, ModelStreamDeadlineError)
+                    else _compaction_provider_failure_classification(provider_error, decision)
+                )
                 if attempt_payloads:
                     finalized_attempt_payloads: list[dict[str, Any]] = []
                     for payload in attempt_payloads:
@@ -4909,6 +5057,13 @@ async def _run_compaction_model(
                             usage_dialect=usage_dialect,
                         )
                     )
+                    if (
+                        provider_failure_classification is not None
+                        and failed_attempt_payload.get("compaction_outcome") == "provider_error"
+                    ):
+                        # The completion sanitizer keeps only accounting fields;
+                        # the runtime publishes these as the attempt's model.error.
+                        failed_attempt_payload.update(provider_failure_classification)
                     if dispatch_model_attempt_identity is not None:
                         failed_attempt_payload.update(
                             copy_model_attempt_identity(dispatch_model_attempt_identity).payload()
@@ -4996,31 +5151,35 @@ async def _run_compaction_model(
                             )
                         terminal_dispatch_error = failure
                         break
-                    provider_error = failure if isinstance(failure, ModelProviderError) else None
-                    decision = retry_decision(
-                        policy=retry_policy,
-                        attempt=attempt,
-                        error=provider_failure.message,
-                        retryable_output=(
-                            retry_empty_summaries
-                            and provider_error is not None
-                            and provider_error.error_code == "compaction_empty_summary"
-                            and bool(attempt_payloads)
-                        ),
-                        status_code=(
-                            None if provider_error is None else provider_error.status_code
-                        ),
-                        retryable=(None if provider_error is None else provider_error.retryable),
-                        retry_after_s=(
-                            None if provider_error is None else provider_error.retry_after_s
-                        ),
-                        unknown_provider_error=(
-                            provider_error is not None
-                            and provider_error.status_code is None
-                            and provider_error.retryable is None
-                        ),
-                    )
+                    assert decision is not None
                     if not decision.retry or decision.next_attempt is None:
+                        # The dispatch runner classified the detached wrapper;
+                        # keep that lifecycle evidence on the propagated failure.
+                        dispatch_disposition = automatic_compaction_failure_disposition_payload(exc)
+                        if (
+                            dispatch_disposition is not None
+                            and automatic_compaction_failure_disposition_payload(failure) is None
+                        ):
+                            if (
+                                provider_error is not None
+                                and provider_error.status_code is not None
+                            ):
+                                # An HTTP status proves the provider received
+                                # and rejected this request.
+                                dispatch_disposition["provider_dispatch_disposition"] = (
+                                    _AutomaticCompactionDispatchDisposition.DISPATCHED.value
+                                )
+                            _attach_automatic_compaction_failure_disposition(
+                                failure,
+                                _AutomaticCompactionFailureDisposition.model_validate(
+                                    dispatch_disposition
+                                ),
+                            )
+                        if provider_failure_classification is not None:
+                            _attach_compaction_provider_failure(
+                                failure,
+                                provider_failure_classification,
+                            )
                         terminal_dispatch_error = failure
                         break
                     if decision.delay_seconds > 0:
@@ -6173,6 +6332,7 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                                 else {}
                             ),
                             **(failure_disposition if failure_disposition is not None else {}),
+                            **_compaction_provider_failure_payload(exc),
                             "compaction_failed": True,
                         },
                     )

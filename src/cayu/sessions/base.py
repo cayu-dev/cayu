@@ -205,6 +205,7 @@ from cayu.budgets.base import (
     SessionBudgetInspection,
     copy_request_budget_limits,
     is_budget_inspection_event,
+    is_budget_model_attempt_terminal_event,
     model_completion_budget_settlements,
     project_budget_inspection_event,
     project_budget_model_attempt_inspection_event,
@@ -14633,7 +14634,7 @@ class SessionStore(ABC):
                 event_total_bytes += payload_bytes
                 event_largest_bytes = max(event_largest_bytes, payload_bytes)
                 event = record.event
-                if event.type in {EventType.MODEL_COMPLETED, EventType.MODEL_ERROR}:
+                if is_budget_model_attempt_terminal_event(event):
                     model_attempt_event = project_budget_model_attempt_inspection_event(event)
                     retained_event_bytes = _retain_session_inspection_event(
                         retained_event_bytes,

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Record provider rejections during automatic compaction as failures. Each
+  rejected compactor attempt now also publishes `model.error` with the same
+  `status_code`, `provider_error_type`, `provider_error_code`, `retryable`, and
+  retry decision fields as a failed model step; its usage-unavailable
+  `model.completed` stays as the accounting record, and budget inspection no
+  longer treats the pair as contradictory. `context.compaction.failed` and the
+  session's `compaction_failure` report `reason=provider_failed` instead of
+  `internal_failed`, `provider_dispatch_disposition=dispatched` when the
+  provider returned an HTTP status, and the final `status_code`,
+  `provider_error_type`, `provider_error_code`, `provider_retryable`, and
+  `retry_disposition`.
+
 - Apply the workflow target's remaining close deadline to the first post-close
   profile inspection as well as retries, including a workspace fence that waits
   inside inspection. An expired budget reports quiescence failure; caller

@@ -57,10 +57,11 @@ def _assert_internal_post_dispatch_compaction_failure(
     terminal: Event,
     *,
     provider_dispatch_disposition: str = "unknown",
+    reason: str = "internal_failed",
 ) -> dict[str, Any]:
     expected = {
         "phase": "provider_dispatch",
-        "reason": "internal_failed",
+        "reason": reason,
         "retryable": False,
         "provider_dispatch_disposition": provider_dispatch_disposition,
         "recovery_action": "reconcile_completion",
@@ -1477,7 +1478,12 @@ def test_cayu_app_rejects_non_portable_compaction_error_before_retry_or_publicat
     assert "usage_metrics" not in attempt.payload
     assert failed.payload["error_type"] == "DurableValueError"
     assert "error" not in failed.payload
-    compaction_failure = _assert_internal_post_dispatch_compaction_failure(failed, terminal)
+    # The provider dispatch failed even though its diagnostic was not portable.
+    compaction_failure = _assert_internal_post_dispatch_compaction_failure(
+        failed,
+        terminal,
+        reason="provider_failed",
+    )
     assert terminal.payload == {
         "error": "Operation failed with a non-portable diagnostic.",
         "error_type": "DurableValueError",
@@ -1559,15 +1565,18 @@ def test_cayu_app_rejects_non_portable_raised_compaction_error_without_retry_or_
         EventType.CONTEXT_COMPACTION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
+        EventType.MODEL_ERROR,
         EventType.CONTEXT_COMPACTION_FAILED,
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert len(compactor_provider.requests) == 1
     assert runtime_provider.requests == []
-    attempt, failed, terminal = events[3], events[4], events[-1]
+    attempt, rejection, failed, terminal = events[3], events[4], events[5], events[-1]
     assert attempt.payload["compaction_outcome"] == "provider_error"
     assert attempt.payload["error_type"] == "ModelProviderError"
+    assert rejection.payload["provider_error_code"] == "invalid_model_provider_error"
+    assert rejection.payload["retry_disposition"] == "explicit_nonretryable"
     assert failed.payload["error_type"] == "ModelProviderError"
     assert "error" not in failed.payload
     assert terminal.payload["error"] == "Model provider emitted a non-portable error value."
@@ -1639,7 +1648,11 @@ def test_cayu_app_does_not_publish_forged_compaction_durable_value_diagnostics(
     assert "error" not in failed.payload
     terminal = events[-1]
     assert terminal.type == EventType.SESSION_FAILED
-    compaction_failure = _assert_internal_post_dispatch_compaction_failure(failed, terminal)
+    compaction_failure = _assert_internal_post_dispatch_compaction_failure(
+        failed,
+        terminal,
+        reason="provider_failed",
+    )
     assert terminal.payload == {
         "error": "Operation failed with a non-portable diagnostic.",
         "error_type": "DurableValueError",
