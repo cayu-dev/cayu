@@ -6977,6 +6977,7 @@ def test_session_store_conformance_pre_digest_approval_claim_fails_closed(
                 approval,
                 decision=first_decision,
                 resolution_request_digest=first_request_digest,
+                pause_resolved_at=intent.pause_resolved_at,
             )
             legacy_checkpoint = await store.load_checkpoint(session_id)
             assert legacy_checkpoint is not None
@@ -7045,6 +7046,7 @@ def test_session_store_conformance_pre_digest_approval_claim_fails_closed(
                 approval,
                 decision=first_decision,
                 resolution_request_digest=None,
+                pause_resolved_at=intent.pause_resolved_at,
             )
 
             legacy_retry = [event async for event in retry_app.resolve_tool_approval(first_request)]
@@ -7063,6 +7065,7 @@ def test_session_store_conformance_pre_digest_approval_claim_fails_closed(
                 approval,
                 decision=first_decision,
                 resolution_request_digest=None,
+                pause_resolved_at=intent.pause_resolved_at,
             )
             assert approval_support.pending_approval_from_checkpoint(final_checkpoint) == approval
         finally:

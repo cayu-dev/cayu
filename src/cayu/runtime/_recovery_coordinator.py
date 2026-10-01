@@ -286,6 +286,7 @@ from cayu.runtime._run_limit_accounting import (
     RunLimitAccountingContext,
     rebase_run_limit_accounting_context,
     restore_run_limit_accounting_context,
+    resume_run_limit_accounting_context,
 )
 from cayu.runtime._run_limits import (
     BorrowedAutomaticCompactionOutcomeUnknown,
@@ -386,7 +387,13 @@ from cayu.runtime.provider_operations import (
     validate_provider_operation_resolution_outcome_event,
 )
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.stop_policy import RunLimits, StopDecision, copy_run_limits, has_run_limits
+from cayu.runtime.stop_policy import (
+    RunLimits,
+    StopDecision,
+    StopLimit,
+    copy_run_limits,
+    has_run_limits,
+)
 from cayu.runtime.tool_completion import ToolCompletionPolicy, ToolCompletionResult
 from cayu.runtime.tool_effects import (
     ToolEffectReconciliationRequest,
@@ -4530,6 +4537,35 @@ class RecoveryCoordinator:
         for pending_call in pending_calls:
             terminal_sequence, terminal = terminal_by_call_id[pending_call.tool_call_id]
             started = started_by_call_id.get(pending_call.tool_call_id)
+            outcome = resume_ledger.tool_call_outcome_from_terminal_event(
+                event=terminal,
+                pending_tool_call=pending_call,
+            )
+            limit_skip = (
+                terminal.type is EventType.TOOL_CALL_FAILED
+                and terminal.payload.get("reason") == "limit_reached"
+            )
+            if limit_skip:
+                structured = outcome.result.structured
+                if (
+                    started is not None
+                    or pause_kind != "approval"
+                    or approval_decision != ToolApprovalDecision.APPROVE.value
+                    or not outcome.result.is_error
+                    or not isinstance(structured, Mapping)
+                    or structured.get("skipped") is not True
+                    or structured.get("reason") != "limit_reached"
+                    or structured.get("tool_call_id") != pending_call.tool_call_id
+                    or structured.get("tool_name") != pending_call.tool_name
+                    or not identity.matches_payload(structured)
+                    or structured.get("limit") != terminal.payload.get("limit")
+                    or structured.get("limit") not in {limit.value for limit in StopLimit}
+                    or "maximum" not in structured
+                    or "actual" not in structured
+                ):
+                    raise RuntimeError(
+                        "Durable limit skip conflicts with never-dispatched evidence."
+                    )
             if (
                 terminal.type
                 in {
@@ -4539,7 +4575,10 @@ class RecoveryCoordinator:
                 and started is None
                 and not (
                     terminal.type is EventType.TOOL_CALL_FAILED
-                    and terminal.payload.get("registration_state") == "unregistered_at_policy_plan"
+                    and (
+                        terminal.payload.get("registration_state") == "unregistered_at_policy_plan"
+                        or limit_skip
+                    )
                 )
             ):
                 raise RuntimeError("Durable executed tool evidence has no preceding started event.")
@@ -4586,10 +4625,6 @@ class RecoveryCoordinator:
                 raise RuntimeError(
                     "Durable pause-continuation decision conflicts with its terminal result."
                 )
-            outcome = resume_ledger.tool_call_outcome_from_terminal_event(
-                event=terminal,
-                pending_tool_call=pending_call,
-            )
             completed = terminal.type == EventType.TOOL_CALL_COMPLETED
             if completed == outcome.result.is_error:
                 raise RuntimeError(
@@ -6214,6 +6249,7 @@ class RecoveryCoordinator:
                 resolution_stage=resolution_stage,
                 resolution_request_digest=resolution_request_digest,
                 claim_run_epoch=current_session.run_epoch + 1,
+                pause_resolved_at=self._clock(),
                 redactor=self._secret_redactor,
                 runtime_session=current_session,
                 allow_manual_recovery_to_answer=(
@@ -6516,6 +6552,7 @@ class RecoveryCoordinator:
                 resolution_stage="manual-recovery",
                 resolution_request_digest=resolution_request_digest,
                 claim_run_epoch=current_session.run_epoch + 1,
+                pause_resolved_at=self._clock(),
                 redactor=self._secret_redactor,
                 runtime_session=current_session,
                 allow_answer_to_manual_recovery=(
@@ -6928,6 +6965,7 @@ class RecoveryCoordinator:
                 claimed_checkpoint,
                 approval=pending_approval,
                 decision=intent_decision,
+                pause_resolved_at=self._clock(),
                 resolution_request_digest=resolution_request_digest,
                 redactor=self._secret_redactor,
                 reviewed_approval_digest=(
@@ -9086,7 +9124,14 @@ class RecoveryCoordinator:
         effective_limits = invocation_semantics.limits
         effective_budget_limits = invocation_semantics.budget_limits
         effective_retry_policy = invocation_semantics.retry_policy
-        continued_run_limit_accounting = pending.run_limit_accounting
+        continued_run_limit_accounting = (
+            None
+            if pending.run_limit_accounting is None
+            else resume_run_limit_accounting_context(
+                pending.run_limit_accounting,
+                resolved_at=resolution_intent.pause_resolved_at,
+            )
+        )
         effect_settlement: _ReconciledToolEffectReplay | _ToolEffectObservationReplay | None = None
         try:
             resolution_intent = await self._admit_user_input_resolution_execution(
@@ -10263,7 +10308,14 @@ class RecoveryCoordinator:
         effective_limits = invocation_semantics.limits
         effective_budget_limits = invocation_semantics.budget_limits
         effective_retry_policy = invocation_semantics.retry_policy
-        continued_run_limit_accounting = pending_approval.run_limit_accounting
+        continued_run_limit_accounting = (
+            None
+            if pending_approval.run_limit_accounting is None or claimed_resolution_intent is None
+            else resume_run_limit_accounting_context(
+                pending_approval.run_limit_accounting,
+                resolved_at=claimed_resolution_intent.pause_resolved_at,
+            )
+        )
         try:
             transcript_snapshot = await self._session_store.load_transcript_snapshot(session.id)
             try:

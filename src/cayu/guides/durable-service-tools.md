@@ -250,3 +250,22 @@ restored plan requires an explicit model/tool outcome decision, inspect its evid
 supply a decisions JSON file with `--decisions`; do not edit stored events or fabricate
 success. If a compatible registration cannot be restored, leave the retained evidence
 intact and operate healthy sessions under the new registration.
+
+## Human pauses and elapsed limits
+
+`RunLimits(max_elapsed_seconds=900, scope="run")` allows 900 seconds of active
+run time. Durable approval and user-input waits do not consume that allowance.
+The runtime retains the pause interval and its first resolution timestamp in
+existing checkpoint writes; a continuation or restart preserves token, call and
+cost accounting. Work after the first decision still consumes the elapsed allowance.
+Use `scope="session"` when the elapsed bound should include wall-clock human waiting,
+and use approval expiry when a particular grant should expire.
+
+Histories written by older releases retain their original elapsed accounting.
+A recorded `limit_reached` approval skip can be reconciled through normal
+`CayuApp.resume(ResumeRequest(session_id=..., messages=[Message.text("user", "Continue")], limits=...))` without
+editing stored events. Supply the session's compatible registration and the intended
+limits. A valid skip remains not executed; resume never fabricates a start or
+re-dispatches the skipped effect. Conflicting started or terminal evidence remains
+an explicit recovery error. See the runtime contract's run elapsed-time semantics
+for the exact interval and provenance rules.

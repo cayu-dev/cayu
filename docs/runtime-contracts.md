@@ -8824,15 +8824,49 @@ deployment.
 `PriceBook`. Pass `default_price_book()` for Cayu's reviewed default rates. Request-scoped
 `BudgetLimit` entries can be attached through
 `budget_limits` on `RunRequest`, `ResumeRequest`, `DispatchRequest`,
-`ToolApprovalRequest`, and `ToolApprovalRecoveryRequest`. `scope="session"` is
-the default: token, tool-call, and cost limits are session-cumulative because
-they are evaluated from durable `model.completed` and `tool.call.started`
-events. `scope="run"` evaluates token, tool-call, and cost limits against the
-delta since the current `run(...)`, `resume(...)`, dispatch, or
-approval-continuation invocation started. For `max_elapsed_seconds`, session
-scope measures from the durable session creation time using the clock injected
-into `CayuApp`, while run scope uses monotonic per-invocation time and resets for
-each call.
+`ToolApprovalRequest`, and `ToolApprovalRecoveryRequest`. `BudgetLimit` defaults to `scope="session"`; `RunLimits` defaults to `scope="run"`.
+Session-scoped token, tool-call, and cost limits are cumulative because they are
+evaluated from durable `model.completed` and `tool.call.started` events.
+Run-scoped limits retain their original aggregate baseline across approval and
+user-input continuations; a fresh run or clean-boundary resume creates a new baseline.
+
+<a id="run-elapsed-time"></a>
+For `max_elapsed_seconds`, session scope measures wall time from durable session
+creation using the clock injected into `CayuApp`, including human waits. Run scope
+measures active elapsed time from the original run's monotonic origin, retaining it
+across approval and user-input continuations. Publishing either human pause records
+its UTC start in the existing checkpoint publication. The first exact resolution
+claim records its UTC end. Continuation shifts only the elapsed-time origin by that
+interval; token/tool baselines and cost-budget origins stay unchanged. Both endpoints
+are durable, so retries and process restarts exclude the same interval exactly once.
+Time spent executing after the first decision, waiting for process recovery, or
+waiting for a human to retry a failed resolution attempt continues to count. The
+first resolution timestamp is immutable; a retry does not grant a new pause.
+A parent's outstanding subagent call also continues to consume the parent's run
+elapsed allowance while the child waits on its own human action. Only that child's
+own approval/input interval is excluded from its allowance. Use a separate child
+limit and per-operation deadlines when a parent must tolerate an unbounded review.
+Approval expiry independently limits the validity of the decision.
+
+Upgrade behavior: pauses already in flight on 0.7.0 lack the durable timestamps
+and retain their original accounting semantics, including the elapsed human wait.
+The legacy skip recovery below remains available after such a limit stop. Newly
+published pauses use the exclusion. UTC endpoints come from the publishing and
+resolving process clocks; operators must synchronize clocks across replicas. Clock
+skew affects the excluded duration. A pause start earlier than the elapsed origin
+(which an earlier resolution may have shifted by another process's clock) is
+recorded at that origin, and a resolution earlier than the pause start excludes
+nothing; either way the excluded interval is zero rather than negative.
+
+A legacy approval-limit closure may contain `tool.call.failed` with
+`reason="limit_reached"`, an error result with `skipped=true`, and no start event.
+Recovery accepts that never-dispatched outcome only for an approved continuation
+with matching pause, round, call, tool, idempotency key, limit and result identities.
+A start event, duplicate terminal, conflicting identity or non-skip result still
+rejects reconciliation. The retained transcript must match the terminal results.
+The same public `resume` path reconciles these histories without rewriting events,
+creating a start event, or executing the skipped effect. The separate policy-denied
+sibling acknowledgement-loss case is tracked in [#1900](https://github.com/cayu-tech/cayu/issues/1900).
 
 Budget limits are estimates, not billing records. They use normalized usage
 metrics and the app's pricing table. By default, a request-scoped interrupt
@@ -9510,7 +9544,8 @@ the stage carries the original aggregate usage baseline, one bounded invocation 
 for each effective run-scoped budget, and a timezone-aware UTC run origin.
 Process recovery reconstructs the monotonic elapsed-time origin from that durable
 timestamp and propagates the same accounting authority through any recovered tool
-approval or user-input continuation; it does not baseline token, tool, elapsed-time,
+approval or user-input continuation, excluding human waits according to
+[run elapsed-time semantics](#run-elapsed-time). It does not baseline token, tool,
 or estimated-cost allowances against events written by the interrupted run. A
 continuation may restate `RunLimits` or `budget_limits` only when the value preserves
 the invocation's frozen execution profile. A changed value is rejected unless the

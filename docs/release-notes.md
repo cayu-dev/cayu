@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Exclude human approval and user-input waits from run-scoped
+  `RunLimits.max_elapsed_seconds`. The pause records its start when it is
+  published and its end at the first resolution claim, so retries and restarts
+  exclude the same interval once; token, tool-call, and cost limits are unchanged.
+  Pauses already in flight on 0.7.0 have no recorded start and keep the old
+  accounting, including the human wait. An approval-limit skip that 0.7.0
+  recorded without a `tool.call.started` event can now be resumed through
+  `resume` instead of failing reconciliation.
+
 - Invalid arguments can no longer be approved through built-in parameter validity
   rules. `ParameterConstrainedToolPolicy(REQUIRE_APPROVAL)` without an explicit
   application identity changes its execution-profile fingerprint. Resolve paused
@@ -12,7 +21,6 @@
   Built-in command and patch tools retain their structured preflight diagnostics
   and patch-input evidence. Schema denials retain finalized, redacted arguments
   when the tool has static secret scope and publishes arguments.
-
 - Decode compressed upstream responses in virtual egress instead of rejecting
   them. `HttpxUpstream` still requests identity encoding, but when an origin
   (such as the Internet Archive) returns a single `gzip`, `deflate`, `br`, or

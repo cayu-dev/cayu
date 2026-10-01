@@ -14889,7 +14889,9 @@ export type RunInputSpec = {
  *
  * - ``scope="run"`` (the default): token, tool-call, and elapsed-time
  * limits all measure the current runtime invocation — usage deltas since
- * the run entered and wall time since the run started.
+ * the original run entered and active time since the run started. Durable
+ * approval and user-input continuations retain the baseline and exclude the
+ * human wait interval. A fresh run or clean-boundary resume resets it.
  * - ``scope="session"``: token, tool-call, and elapsed-time limits all
  * measure the whole durable session — cumulative usage from the session
  * event stream and wall time since the session was created. A resumed

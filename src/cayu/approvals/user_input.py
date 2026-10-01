@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal
@@ -506,6 +507,7 @@ class UserInputResolutionIntent(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     schema_version: Literal[1] = 1
+    pause_resolved_at: datetime | None = Field(default=None, exclude_if=lambda value: value is None)
     session_id: str
     session_instance_id: str
     source_interaction_id: str
@@ -534,6 +536,15 @@ class UserInputResolutionIntent(BaseModel):
         max_length=64,
         pattern=r"^[0-9a-f]{64}$",
     )
+
+    @field_validator("pause_resolved_at")
+    @classmethod
+    def validate_pause_resolved_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("pause_resolved_at must be timezone-aware.")
+        return value.astimezone(UTC)
 
     @field_validator(
         "session_id",
@@ -1343,6 +1354,7 @@ def user_input_resolution_intent_for(
     resolution_request_digest: str,
     claim_run_epoch: int,
     execution_state: Literal["claimed", "executing"] = "claimed",
+    pause_resolved_at: datetime | None = None,
 ) -> UserInputResolutionIntent:
     """Construct the immutable resolution claim for an exact pause."""
 
@@ -1354,6 +1366,7 @@ def user_input_resolution_intent_for(
         resolution_stage=resolution_stage,
         execution_state=execution_state,
         resolution_request_digest=resolution_request_digest,
+        pause_resolved_at=pause_resolved_at,
     )
 
 
@@ -1427,6 +1440,7 @@ def require_resolution_intent_matches_pending(
         ),
         claim_run_epoch=intent.claim_run_epoch,
         execution_state=intent.execution_state,
+        pause_resolved_at=intent.pause_resolved_at,
     )
     if intent != expected:
         raise RuntimeError("User-input resolution intent conflicts with its pending pause.")
@@ -1530,6 +1544,7 @@ def checkpoint_with_user_input_resolution_intent(
     runtime_session: Session | None = None,
     allow_answer_to_manual_recovery: bool = False,
     allow_manual_recovery_to_answer: bool = False,
+    pause_resolved_at: datetime | None = None,
 ) -> tuple[dict[str, Any], UserInputResolutionIntent]:
     """Set or validate one exact resolution claim under the session transition lock."""
 
@@ -1585,6 +1600,7 @@ def checkpoint_with_user_input_resolution_intent(
             resolution_stage=resolution_stage,
             resolution_request_digest=resolution_request_digest,
             claim_run_epoch=claim_run_epoch,
+            pause_resolved_at=current_intent.pause_resolved_at,
         )
         copied[USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY] = current_intent.model_dump(mode="json")
         return copied, current_intent
@@ -1594,6 +1610,7 @@ def checkpoint_with_user_input_resolution_intent(
         resolution_stage=resolution_stage,
         resolution_request_digest=resolution_request_digest,
         claim_run_epoch=claim_run_epoch,
+        pause_resolved_at=pause_resolved_at,
     )
     copied[USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY] = intent.model_dump(mode="json")
     return copied, intent

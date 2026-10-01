@@ -167,7 +167,10 @@ from cayu.runtime._interruption_coordinator import (
     _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
 )
 from cayu.runtime._invocation_lifecycle import InvocationContext
-from cayu.runtime._run_limit_accounting import RunLimitAccountingContext
+from cayu.runtime._run_limit_accounting import (
+    RunLimitAccountingContext,
+    pause_run_limit_accounting_context,
+)
 from cayu.runtime._run_limits import (
     LimitEvaluation,
     RunLimitGate,
@@ -2174,7 +2177,9 @@ class ToolRoundExecutor:
             thinking=thinking,
             max_steps=max_steps,
             limits=copy_run_limits(limits) if limits is not None else None,
-            run_limit_accounting=pending_round.run_limit_accounting,
+            run_limit_accounting=pause_run_limit_accounting_context(
+                pending_round.run_limit_accounting, now=self._clock()
+            ),
             budget_limits=(
                 copy_request_budget_limits(budget_limits) if budget_limits is not None else None
             ),
@@ -2562,7 +2567,9 @@ class ToolRoundExecutor:
             thinking=thinking,
             max_steps=max_steps,
             limits=copy_run_limits(limits) if limits is not None else None,
-            run_limit_accounting=pending_round.run_limit_accounting,
+            run_limit_accounting=pause_run_limit_accounting_context(
+                pending_round.run_limit_accounting, now=self._clock()
+            ),
             budget_limits=(
                 copy_request_budget_limits(budget_limits) if budget_limits is not None else None
             ),

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Any, Literal, NamedTuple
 
@@ -152,6 +152,7 @@ class ApprovalResolutionIntent(BaseModel):
     model_step_id: str
     model_attempt_id: str
     decision: ToolApprovalDecision
+    pause_resolved_at: datetime | None = Field(default=None, exclude_if=lambda value: value is None)
     # ``None`` loads checkpoints written before request digests existed. It is
     # intentionally non-authoritative and must never be upgraded after the fact.
     resolution_request_digest: str | None = None
@@ -161,6 +162,15 @@ class ApprovalResolutionIntent(BaseModel):
     reviewed_approval_digest: str | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+
+    @field_validator("pause_resolved_at")
+    @classmethod
+    def validate_pause_resolved_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("pause_resolved_at must be timezone-aware.")
+        return value.astimezone(UTC)
 
     @field_validator("approval_id", "tool_call_id")
     @classmethod
@@ -196,6 +206,7 @@ def approval_resolution_intent_for(
     decision: ToolApprovalDecision,
     resolution_request_digest: str | None,
     reviewed_approval_digest: str | None = None,
+    pause_resolved_at: datetime | None = None,
 ) -> ApprovalResolutionIntent:
     if type(approval) is not PendingToolApproval:
         raise TypeError("Pending approval must be a PendingToolApproval.")
@@ -210,6 +221,7 @@ def approval_resolution_intent_for(
         decision=decision,
         resolution_request_digest=resolution_request_digest,
         reviewed_approval_digest=reviewed_approval_digest,
+        pause_resolved_at=pause_resolved_at,
     )
 
 
@@ -272,6 +284,7 @@ def require_resolution_intent_matches_approval(
         approval,
         decision=intent.decision,
         resolution_request_digest=intent.resolution_request_digest,
+        pause_resolved_at=intent.pause_resolved_at,
         reviewed_approval_digest=(
             None
             if intent.reviewed_approval_digest is None
@@ -291,6 +304,7 @@ def checkpoint_with_approval_resolution_intent(
     redactor: SecretRedactor,
     runtime_session: Session | None = None,
     reviewed_approval_digest: str | None = None,
+    pause_resolved_at: datetime | None = None,
 ) -> dict[str, Any]:
     """Set or validate one immutable decision inside an approval claim."""
 
@@ -305,6 +319,7 @@ def checkpoint_with_approval_resolution_intent(
         decision=decision,
         resolution_request_digest=resolution_request_digest,
         reviewed_approval_digest=reviewed_approval_digest,
+        pause_resolved_at=pause_resolved_at,
     )
     current = approval_resolution_intent_from_checkpoint(copied, redactor=redactor)
     if current is not None:
@@ -319,6 +334,7 @@ def checkpoint_with_approval_resolution_intent(
             )
         if current.reviewed_approval_digest != reviewed_approval_digest:
             raise RuntimeError("Tool approval cannot replace its accepted content binding.")
+        expected = current
     copied[APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY] = expected.model_dump(mode="json")
     return copied
 

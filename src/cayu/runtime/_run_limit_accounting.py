@@ -4,7 +4,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from typing import Literal, cast
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cayu.budgets.base import BudgetLimit, _effective_budget_limit_id
 from cayu.budgets.usage import (
@@ -54,10 +54,15 @@ class RunLimitAccountingContext(BaseModel):
     started_at: datetime
     baseline: SessionUsageSummary
     run_budget_authorities: tuple[RunBudgetAccountingAuthority, ...] = ()
+    # Published with the human pause. The immutable resolution claim closes
+    # this interval, so retries never exclude subsequent execution time.
+    pause_started_at: datetime | None = Field(default=None, exclude_if=lambda value: value is None)
 
-    @field_validator("started_at")
+    @field_validator("started_at", "pause_started_at")
     @classmethod
-    def validate_started_at(cls, value: datetime) -> datetime:
+    def validate_started_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("started_at must be timezone-aware.")
         return value.astimezone(UTC)
@@ -109,7 +114,45 @@ class RunLimitAccountingContext(BaseModel):
         identities = [authority.budget_limit_id for authority in self.run_budget_authorities]
         if len(identities) != len(set(identities)):
             raise ValueError("Run budget authorities must have distinct limit identities.")
+        if self.pause_started_at is not None and self.pause_started_at < self.started_at:
+            raise ValueError("A run-limit pause must not precede its elapsed-time origin.")
         return self
+
+
+def pause_run_limit_accounting_context(
+    context: RunLimitAccountingContext | None, *, now: datetime
+) -> RunLimitAccountingContext | None:
+    """Retain the start of a human wait in the existing pause publication."""
+    if context is None:
+        return None
+    if context.pause_started_at is not None:
+        return context
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware.")
+    # A resumed origin was shifted by the resolver's clock. A publisher whose
+    # clock is behind it records an empty interval instead of failing.
+    pause_started_at = max(now.astimezone(UTC), context.started_at)
+    return RunLimitAccountingContext.model_validate(
+        {**context.model_dump(mode="python"), "pause_started_at": pause_started_at}
+    )
+
+
+def resume_run_limit_accounting_context(
+    context: RunLimitAccountingContext, *, resolved_at: datetime | None
+) -> RunLimitAccountingContext:
+    """Exclude exactly one durable human wait without changing usage or budgets."""
+    if context.pause_started_at is None:
+        return context
+    if resolved_at is None or resolved_at.tzinfo is None or resolved_at.utcoffset() is None:
+        raise ValueError("Paused run-limit accounting requires an aware resolution timestamp.")
+    wait = max(timedelta(), resolved_at.astimezone(UTC) - context.pause_started_at)
+    return RunLimitAccountingContext.model_validate(
+        {
+            **context.model_dump(mode="python"),
+            "started_at": context.started_at + wait,
+            "pause_started_at": None,
+        }
+    )
 
 
 def has_run_limit_accounting_authority(
@@ -225,6 +268,7 @@ def rebase_run_limit_accounting_context(
         started_at=started_at,
         baseline=baseline,
         run_budget_authorities=run_budget_authorities,
+        pause_started_at=None if reset_run_limits else context.pause_started_at,
     )
 
 
@@ -247,6 +291,8 @@ def restore_run_limit_accounting_context(
         raise ValueError("Run-limit accounting belongs to a different session.")
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now must be timezone-aware.")
+    if context.pause_started_at is not None:
+        raise ValueError("Run-limit accounting must close its human pause before execution.")
     elapsed_seconds = max(
         0.0,
         (now.astimezone(UTC) - context.started_at).total_seconds(),

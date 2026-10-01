@@ -35,11 +35,14 @@ async def _worker(path, action, metric, phase):
     now = datetime(2026, 9, 13, tzinfo=UTC)
     if phase == "recover" and metric == "elapsed":
         now += timedelta(seconds=30)
+    if phase == "recover" and metric == "human_elapsed":
+        now += timedelta(days=3, seconds=1)
     limits = RunLimits(
         **{
             "tokens": {"max_total_tokens": 3},
             "tools": {"max_tool_calls": 1},
             "elapsed": {"max_elapsed_seconds": 10},
+            "human_elapsed": {"max_elapsed_seconds": 10},
         }.get(metric, {})
     )
 
@@ -72,6 +75,11 @@ async def _worker(path, action, metric, phase):
         if metric in {"tokens", "causal", "tools"}
         else [[ModelStreamEvent.text_delta("parent complete"), done()]]
     )
+    if metric == "human_elapsed":
+        remaining = [
+            [ModelStreamEvent.text_delta("child complete"), done()],
+            [ModelStreamEvent.text_delta("parent complete"), done()],
+        ]
     provider = _Provider(remaining if phase == "recover" else opening + remaining)
     tool = _ContendedTool()
     app = CayuApp(session_store=store, enable_logging=False, clock=lambda: now)
@@ -132,6 +140,8 @@ async def _worker(path, action, metric, phase):
                     )
                 )
             ]
+            if metric == "human_elapsed":
+                now += timedelta(days=3)
         child = (await store.list_sessions(SessionQuery(parent_session_id="parent"))).sessions[0]
         parent = await store.load("parent")
         assert child.parent_session_id == parent.id
@@ -157,6 +167,11 @@ async def _worker(path, action, metric, phase):
                 if event.type == "session.interrupted"
                 and event.payload.get("reason") == "limit_reached"
             ]
+            if metric == "human_elapsed":
+                assert not stops, [(event.type, event.payload) for event in events]
+                assert (await store.load(child.id)).status.value == "completed"
+                assert sum(event.type == "model.started" for event in events) == 2
+                return
             assert stops, [(event.type, event.payload) for event in events]
             expected = {
                 "tokens": "total_tokens",
@@ -216,7 +231,9 @@ async def _worker(path, action, metric, phase):
 
 
 @pytest.mark.parametrize("action", ["approval", "input"])
-@pytest.mark.parametrize("metric", ["tokens", "tools", "elapsed", "steps", "causal"])
+@pytest.mark.parametrize(
+    "metric", ["tokens", "tools", "elapsed", "steps", "causal", "human_elapsed"]
+)
 def test_child_close_restart_preserves_limit_consumption(tmp_path, action, metric):
     command = [
         sys.executable,

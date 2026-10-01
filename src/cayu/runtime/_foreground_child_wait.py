@@ -39,6 +39,7 @@ from cayu.runtime._foreground_subagent_recovery import (
 from cayu.runtime._run_limit_accounting import (
     RunLimitAccountingContext,
     has_run_limit_accounting_authority,
+    resume_run_limit_accounting_context,
 )
 from cayu.runtime._tool_effect_state import ToolEffectIntent, ToolEffectRecord, ToolEffectStateOwner
 from cayu.runtime._tool_round_recovery import PENDING_TOOL_ROUND_CHECKPOINT_KEY, PendingToolRound
@@ -241,7 +242,7 @@ def post_action_continuation_round_from_checkpoint(
 ) -> PendingToolRound | None:
     """Retain execution configuration, not merely pending-action display evidence."""
     pending_round = pending_action_evidence_round_from_checkpoint(checkpoint)
-    pending_input, _ = user_input_lifecycle_authority_from_checkpoint(checkpoint)
+    pending_input, input_intent = user_input_lifecycle_authority_from_checkpoint(checkpoint)
     if pending_round is not None and pending_input is not None:
         pending_round = pending_round.model_copy(
             update={
@@ -254,6 +255,22 @@ def post_action_continuation_round_from_checkpoint(
                     "retry_policy",
                     "thinking",
                     "source_run_epoch",
+                )
+            },
+            deep=True,
+        )
+    approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+    if approval is not None:
+        context = approval.run_limit_accounting
+        intent = approval_support.approval_resolution_intent_from_checkpoint(checkpoint)
+    else:
+        context = None if pending_input is None else pending_input.run_limit_accounting
+        intent = input_intent
+    if pending_round is not None and context is not None:
+        pending_round = pending_round.model_copy(
+            update={
+                "run_limit_accounting": resume_run_limit_accounting_context(
+                    context, resolved_at=None if intent is None else intent.pause_resolved_at
                 )
             },
             deep=True,

@@ -8863,7 +8863,7 @@
     },
     "RunLimits": {
       "additionalProperties": false,
-      "description": "Optional hard limits for one session run or resume call.\n\nEvery limit is evaluated against the clock selected by ``scope``:\n\n- ``scope=\"run\"`` (the default): token, tool-call, and elapsed-time\n  limits all measure the current runtime invocation \u2014 usage deltas since\n  the run entered and wall time since the run started.\n- ``scope=\"session\"``: token, tool-call, and elapsed-time limits all\n  measure the whole durable session \u2014 cumulative usage from the session\n  event stream and wall time since the session was created. A resumed\n  session that already meets a limit stops immediately.",
+      "description": "Optional hard limits for one session run or resume call.\n\nEvery limit is evaluated against the clock selected by ``scope``:\n\n- ``scope=\"run\"`` (the default): token, tool-call, and elapsed-time\n  limits all measure the current runtime invocation \u2014 usage deltas since\n  the original run entered and active time since the run started. Durable\n  approval and user-input continuations retain the baseline and exclude the\n  human wait interval. A fresh run or clean-boundary resume resets it.\n- ``scope=\"session\"``: token, tool-call, and elapsed-time limits all\n  measure the whole durable session \u2014 cumulative usage from the session\n  event stream and wall time since the session was created. A resumed\n  session that already meets a limit stops immediately.",
       "properties": {
         "max_elapsed_seconds": {
           "anyOf": [
