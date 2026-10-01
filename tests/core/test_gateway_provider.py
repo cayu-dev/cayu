@@ -390,7 +390,7 @@ async def test_stream_error_preserves_uncertainty_without_completion_or_retry():
         assert events[-1].type is ModelStreamEventType.ERROR
         # Reuse the normal provider privacy boundary, which omits untrusted
         # error request IDs. The service still owns the uncertain request.
-        assert "request_id" not in events[-1].payload
+        assert events[-1].payload["request_id"] == "req_example"
         assert events[-1].payload["retryable"] is False
         assert not any(e.type is ModelStreamEventType.COMPLETED for e in events)
     finally:

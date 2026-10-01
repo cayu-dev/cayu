@@ -50,7 +50,11 @@ def test_invalid_prompt_survives_provider_projection(subscription, event_type):
     assert failure["provider_error_code"] == "invalid_prompt"
     assert failure["provider_error_type"] == "invalid_request_error"
     assert failure["retryable"] is False
-    assert "private" not in json.dumps(failure)
+    # The provider's message is public (#1974); a request ID that is not a plain
+    # identifier and the request parameter are not.
+    assert failure["error"].endswith("private prompt text")
+    assert "request_id" not in failure
+    assert "private parameter" not in json.dumps(failure)
 
 
 def test_nested_stream_status_conflicts_do_not_authorize_retry_or_overflow():

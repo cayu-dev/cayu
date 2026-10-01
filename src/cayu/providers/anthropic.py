@@ -38,6 +38,7 @@ from cayu.providers._http import (
     SharedAsyncClient,
     _trusted_sse_retry_after_s,
     aclose_transport,
+    attach_provider_error_text,
     copy_headers,
     credential_safe_error_event,
     credential_safe_post_completion_failure,
@@ -47,6 +48,7 @@ from cayu.providers._http import (
     optional_error_string,
     post_json,
     response_json_object,
+    retain_provider_error_metadata,
     safe_error_response_text,
     sanitize_provider_cancellation,
     stream_sse_json_events,
@@ -1469,6 +1471,9 @@ async def anthropic_stream_events(
             )
             if isinstance(failure, ModelProviderError) and type(raw_error) is dict:
                 failure.rejection_diagnostic = project_rejection_error(raw_error)
+            retain_provider_error_metadata(failure, event)
+            if not isinstance(failure, ModelContextOverflowError):
+                attach_provider_error_text(failure, error.get("message"))
             # The exported parser serves both Anthropic and Vertex. Clear the
             # untrusted envelope and source iterator before exposing failure.
             raw_error = None

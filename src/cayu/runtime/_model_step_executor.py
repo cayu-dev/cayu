@@ -194,6 +194,10 @@ from cayu.providers._credential_boundary import (
     provider_cancellation_failures,
     stream_cleanup_cancelled_after_provider_failure,
 )
+from cayu.providers._http import (
+    bind_provider_error_workload_redactor,
+    reset_provider_error_workload_redactor,
+)
 from cayu.providers._openai_protocol import protocol_exception_fields
 from cayu.providers._stream_cleanup import (
     _LocalHttpCleanupObserver,
@@ -5005,7 +5009,18 @@ class ModelStepExecutor:
                         )
                     else:
                         recovery_status = connection.status
-                        async for raw_event in reconnect_events:
+                        reconnect_iterator = aiter(reconnect_events)
+                        while True:
+                            redactor_token = bind_provider_error_workload_redactor(
+                                self._secret_redactor
+                            )
+                            try:
+                                try:
+                                    raw_event = await anext(reconnect_iterator)
+                                except StopAsyncIteration:
+                                    break
+                            finally:
+                                reset_provider_error_workload_redactor(redactor_token)
                             await require_recovery_owner()
                             try:
                                 await accept_recovered_event(raw_event, persist_progress=True)
@@ -6738,11 +6753,15 @@ class ModelStepExecutor:
 
             # Optional verification must not create a second disclosure path.
             # Counting has no model-attempt receiver or exposure receipt.
-            provider_result = (
-                None
-                if has_peer_content(count_request)
-                else await provider.count_input_tokens(count_request)
-            )
+            redactor_token = bind_provider_error_workload_redactor(self._secret_redactor)
+            try:
+                provider_result = (
+                    None
+                    if has_peer_content(count_request)
+                    else await provider.count_input_tokens(count_request)
+                )
+            finally:
+                reset_provider_error_workload_redactor(redactor_token)
             provider_result = copy_input_token_count_result(provider_result)
             result = (
                 provider_result
@@ -7172,6 +7191,7 @@ class ModelStepExecutor:
                         deadline_admission,
                         refresh_live_model_semantics,
                         cleanup_observer,
+                        error_redactor=self._secret_redactor,
                     ),
                     cancellation_baseline=provider_cancellation_baseline,
                     max_concurrent_streams=deadline_admission.max_concurrent_streams,
@@ -7648,7 +7668,16 @@ class ModelStepExecutor:
                 if start_outcome.cancellation is not None:
                     raise_start_cancellation()
                 yield emitted_operation_event, None
-            async for raw_stream_event in provider_events:
+            provider_iterator = aiter(provider_events)
+            while True:
+                redactor_token = bind_provider_error_workload_redactor(self._secret_redactor)
+                try:
+                    try:
+                        raw_stream_event = await anext(provider_iterator)
+                    except StopAsyncIteration:
+                        break
+                finally:
+                    reset_provider_error_workload_redactor(redactor_token)
                 boundary_value = _validate_stream_event(
                     raw_stream_event,
                     provider_name=registered_provider.name,
@@ -13794,7 +13823,11 @@ class ModelStepRun:
 
             if has_peer_content(request):
                 return None
-            result = await self._request_provider.count_input_tokens(request)
+            redactor_token = bind_provider_error_workload_redactor(self._executor._secret_redactor)
+            try:
+                result = await self._request_provider.count_input_tokens(request)
+            finally:
+                reset_provider_error_workload_redactor(redactor_token)
             return None if result is None else result.input_tokens
 
         return count_input_tokens

@@ -53,8 +53,10 @@ from cayu.providers._credential_boundary import ProviderStreamCleanupError
 from cayu.providers._http import (
     SharedAsyncClient,
     _trusted_sse_retry_after_s,
+    bind_provider_error_workload_redactor,
     credential_safe_error_event,
     new_async_client,
+    reset_provider_error_workload_redactor,
     retry_after_seconds,
     stream_sse_json_events,
     validate_base_url,
@@ -74,6 +76,7 @@ from cayu.providers.deadlines import (
     ProviderStreamDeadlines,
 )
 from cayu.providers.openai_subscription import OpenAISubscriptionCredentials
+from cayu.vaults import SecretRedactor
 
 
 def _deadline_controller(protocol_idle_timeout_s: float = 1.0) -> ProviderStreamDeadlineController:
@@ -799,35 +802,56 @@ async def _stream_mock_sse(
         ("vertex", "Vertex"),
     ],
 )
-def test_provider_error_projection_omits_arbitrary_identity_strings(
+def test_provider_error_projection_passes_plain_identifiers_and_drops_secrets(
     provider_name: str,
     provider_label: str,
 ) -> None:
-    secret = "provider-identity-secret-canary-ABCDEFGHIJKLMNOP"
-    error = ModelProviderError(
+    credential = "provider-credential-ABCDEFGHIJKLMNOP"
+    workload_secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
+    identified = ModelProviderError(
         "fixed provider failure",
         provider=provider_name,
         status_code=500,
-        error_type=secret,
-        error_code=secret[:16],
-        request_id=secret,
+        error_type="insufficient_quota",
+        error_code="model_not_found",
+        request_id="req_0123/abc=",
         retryable=True,
     )
-
-    event = credential_safe_error_event(
-        error,
-        provider_label=provider_label,
-        provider_name=provider_name,
-        credential_values=("provider-credential",),
-    )
+    token = bind_provider_error_workload_redactor(SecretRedactor([workload_secret]))
+    try:
+        event = credential_safe_error_event(
+            identified,
+            provider_label=provider_label,
+            provider_name=provider_name,
+            credential_values=(credential,),
+        )
+        leaking = credential_safe_error_event(
+            ModelProviderError(
+                "fixed provider failure",
+                provider=provider_name,
+                status_code=500,
+                error_type=credential,
+                error_code=f"code-{workload_secret}",
+                request_id="request id with spaces",
+            ),
+            provider_label=provider_label,
+            provider_name=provider_name,
+            credential_values=(credential,),
+        )
+    finally:
+        reset_provider_error_workload_redactor(token)
 
     assert event.payload["status_code"] == 500
     assert event.payload["retryable"] is True
-    assert "provider_error_type" not in event.payload
-    assert "provider_error_code" not in event.payload
-    assert "request_id" not in event.payload
-    assert secret not in repr(event.payload)
-    assert secret[:16] not in repr(event.payload)
+    assert event.payload["provider_error_type"] == "insufficient_quota"
+    assert event.payload["provider_error_code"] == "model_not_found"
+    assert event.payload["request_id"] == "req_0123/abc="
+    # Identity that carries a known secret, or is not a plain identifier, is dropped.
+    assert "provider_error_type" not in leaking.payload
+    assert "provider_error_code" not in leaking.payload
+    assert "request_id" not in leaking.payload
+    assert credential not in repr(leaking.payload)
+    assert workload_secret not in repr(leaking.payload)
 
 
 @pytest.mark.parametrize(

@@ -81,7 +81,7 @@ def run_project_entrypoint(
         event.type == EventType.MODEL_ERROR for event in outcome.events
     ):
         print(
-            "Rerun with --show-provider-errors to print the provider's explanation.",
+            "Rerun with --show-provider-errors for the full provider error record.",
             file=sys.stderr,
         )
     return 1

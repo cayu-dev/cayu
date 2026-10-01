@@ -1,11 +1,43 @@
 # Provider-error diagnostics
 
-Normal Cayu events deliberately omit raw provider error bodies and arbitrary
-request IDs. Such fields can echo credentials or customer input. Error identity,
-status and retry classification remain available where safely recognized.
+Provider errors show the provider's own explanation by default. When a bundled
+adapter (OpenAI, OpenAI subscription, Chat Completions, Anthropic, Vertex) gets an
+HTTP error or an SSE `error` / `response.failed` event, the public exception and
+the `model.error` / `session.failed` events carry:
+
+- The provider's message, for example `OpenAI API request failed with HTTP 404:
+  The model 'gpt-x' does not exist or you do not have access to it.`
+- The provider request ID (`request_id`), from the `x-request-id` / `request-id`
+  header or the body, when it is a plain identifier.
+- The provider error type and code (`provider_error_type`,
+  `provider_error_code`) whenever they are plain identifiers, so values such as
+  `insufficient_quota`, `invalid_api_key` and `model_not_found` surface.
+
+Before anything is shown, Cayu removes the credentials it knows: the request's
+own auth headers and cookie values, API key and credential query parameters,
+the adapter's extra headers, and every secret registered in the application's
+`SecretRedactor`. The runtime supplies that registry to model streams,
+live and reconnected background streams, auxiliary inference and provider
+token-count requests.
+Redaction runs on the complete text first; the message is then bounded to
+2 KiB. A message that would need truncation while the application's registry is
+unavailable (a provider used directly, outside `CayuApp`) is omitted instead, so a
+secret is never cut in half before a later redaction pass. The same rule applies
+when formatting would replace control characters before that later pass;
+otherwise, edge whitespace is preserved. Bodies that cannot be
+read completely within 64 KiB, and messages before credentials are resolved,
+stay omitted. Error types, codes and request IDs that contain a known secret, or
+are not plain identifiers, are dropped.
+
+Remaining risk: a secret the application never registered (for example a token
+a user pasted into a prompt) can still appear if the provider echoes it back.
+Register every workload secret with the app's `SecretRedactor`.
+
 An error event inside an HTTP-200 SSE response is still a provider failure.
 
-For an authorized investigation, opt into a separate private capture scope:
+For an authorized investigation that needs more than the public message (full
+parameters, field states, status conflicts), opt into a separate private
+capture scope:
 
 ```python
 from cayu.providers import capture_provider_errors
@@ -137,12 +169,9 @@ fields and no unbounded values. Malformed JSON and nesting failures leave HTTP
 status and retry classification intact.
 
 `provider_rejection_request_id_state` is `absent`, `omitted_untrusted`, or
-`unavailable`. No raw, truncated, or hashed upstream identifier is made durable:
-its format cannot prove it is not a credential or customer identifier. Use the
-existing session ID, model attempt ID, and workflow child failure's session and
-terminal-event references to locate the durable failure. For upstream/gateway
-correlation, use the explicitly authorized private capture above, with one scope
-per request and an application-owned association to these local identities.
+`unavailable`, and describes only this fixed-vocabulary projection, which never
+copies identifiers. The provider request ID itself is reported separately in
+`request_id` (see the top of this page) when it is a plain identifier.
 
 Inspect retained details with:
 

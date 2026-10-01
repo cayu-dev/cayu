@@ -27,6 +27,10 @@ from cayu.providers._credential_boundary import (
     retain_native_model_admission_expiry,
     stream_cleanup_cancelled_after_provider_failure,
 )
+from cayu.providers._http import (
+    bind_provider_error_workload_redactor,
+    reset_provider_error_workload_redactor,
+)
 from cayu.providers._stream_cleanup import (
     _local_http_cleanup_observer,
     _LocalHttpCleanupObserver,
@@ -36,6 +40,7 @@ from cayu.providers.deadlines import (
     bind_provider_deadline_admission,
     reset_provider_deadline_admission,
 )
+from cayu.vaults import SecretRedactor
 
 
 class _ProviderStreamSelfCancellation(asyncio.CancelledError):
@@ -150,8 +155,13 @@ async def _admitted_model_provider_events(
     admission: ProviderStreamDeadlineAdmission,
     refresh_live_model_semantics: Callable[[], Awaitable[None]],
     cleanup_observer: _LocalHttpCleanupObserver | None = None,
+    error_redactor: SecretRedactor | None = None,
 ) -> AsyncGenerator[ModelStreamEvent, None]:
-    """Transfer one pre-dispatch deadline admission into the provider stream."""
+    """Transfer one pre-dispatch deadline admission into the provider stream.
+
+    ``error_redactor`` lets the provider's public error boundary also remove
+    registered workload secrets before it bounds a provider error message.
+    """
 
     from cayu.resource_access import require_dispatch
 
@@ -170,12 +180,14 @@ async def _admitted_model_provider_events(
         while True:
             token = bind_provider_deadline_admission(admission)
             cleanup_token = _local_http_cleanup_observer.set(cleanup_observer)
+            redactor_token = bind_provider_error_workload_redactor(error_redactor)
             try:
                 try:
                     event = await anext(iterator)
                 except StopAsyncIteration:
                     return
             finally:
+                reset_provider_error_workload_redactor(redactor_token)
                 reset_provider_deadline_admission(token)
                 _local_http_cleanup_observer.reset(cleanup_token)
             yield event

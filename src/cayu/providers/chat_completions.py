@@ -44,6 +44,7 @@ from cayu.providers._http import (
     SharedAsyncClient,
     _trusted_sse_retry_after_s,
     aclose_transport,
+    attach_provider_error_text,
     copy_headers,
     credential_safe_error_event,
     credential_safe_post_completion_failure,
@@ -51,6 +52,7 @@ from cayu.providers._http import (
     credential_sanitization_values,
     optional_error_string,
     response_json_object,
+    retain_provider_error_metadata,
     safe_error_json,
     safe_error_response_text,
     sanitize_provider_cancellation,
@@ -1191,6 +1193,7 @@ async def chat_completions_stream_events(
                 request_id=_optional_string(event, "request_id"),
                 retry_after_s=_trusted_sse_retry_after_s(event),
             )
+            retain_provider_error_metadata(failure, event)
             # The exported parser is itself a public exception boundary. Do
             # not retain the raw provider envelope in traceback frame locals.
             error = None
@@ -1328,6 +1331,7 @@ def _stream_error_chunk_exception(
     )
 
     failure.rejection_diagnostic = project_rejection_error(error) if type(error) is dict else {}
+    attach_provider_error_text(failure, error_mapping.get("message"))
     return failure
 
 
@@ -2228,6 +2232,8 @@ def _chat_api_error_from_response(
     request_id = optional_error_string(error.get("request_id"))
     if request_id is None and decoded is not None:
         request_id = optional_error_string(decoded.get("request_id"))
+    if request_id is None:
+        request_id = optional_error_string(response.headers.get("x-request-id"))
     failure = ChatCompletionsAPIError(
         message,
         status_code=status_code,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import AsyncIterator, Iterable, Mapping
+from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from dataclasses import replace
 from functools import cache
 from hashlib import sha256
@@ -64,6 +64,7 @@ from cayu.providers._http import (
     _trusted_sse_response_structure,
     _trusted_sse_retry_after_s,
     aclose_transport,
+    attach_provider_error_text,
     copy_headers,
     credential_safe_error_event,
     credential_safe_post_completion_failure,
@@ -73,6 +74,7 @@ from cayu.providers._http import (
     post_json,
     request_json,
     response_json_object,
+    retain_provider_error_metadata,
     safe_error_json,
     safe_error_response_text,
     sanitize_provider_cancellation,
@@ -962,6 +964,10 @@ class _OpenAIBackgroundOperationAdapter(ProviderOperationAdapter):
                 state=state,
                 first=first,
                 reasoning_state=self._provider.reasoning_state,
+                credential_values=credential_sanitization_values(
+                    self._provider.api_key,
+                    extra_headers=self._provider.extra_headers,
+                ),
             )
             guarded = _guard_normalized_provider_stream(
                 events,
@@ -2019,6 +2025,7 @@ def openai_response_events(
             safe_message=f"OpenAI response error: {OMITTED_PROVIDER_ERROR_BODY}",
             request_id=optional_error_string(response.get("request_id")),
         )
+        retain_provider_error_metadata(failure, response)
         # This exported parser is a public exception boundary. Do not retain
         # the raw provider envelope in traceback frame locals.
         error = None
@@ -2798,6 +2805,7 @@ async def _openai_background_stream_events(
     state: ProviderOperationState,
     first: Mapping[str, Any] | None,
     reasoning_state: str,
+    credential_values: Sequence[str],
 ) -> AsyncIterator[ModelStreamEvent]:
     lifecycle = _openai_background_lifecycle(state)
     cursor = state.recovery_metadata.cursor
@@ -3096,19 +3104,22 @@ async def _openai_background_stream_events(
                     stream_model=lifecycle.model,
                 )
             continue
-        elif event_type == "response.failed":
+        elif event_type in {"response.failed", "error"}:
             failure = _openai_stream_error_exception(event)
-            normalized = ModelStreamEvent.error(
-                str(failure),
-                cause=failure,
-                provider_operation_status=ProviderOperationStatus.FAILED,
+            safe = credential_safe_error_event(
+                failure,
+                provider_label="OpenAI",
+                provider_name="openai",
+                credential_values=credential_values,
             )
-        elif event_type == "error":
-            failure = _openai_stream_error_exception(event)
-            normalized = ModelStreamEvent.error(
-                str(failure),
-                cause=failure,
-                provider_operation_status=ProviderOperationStatus.IN_PROGRESS,
+            normalized = ModelStreamEvent(
+                type=safe.type,
+                payload=safe.payload,
+                provider_operation_status=(
+                    ProviderOperationStatus.FAILED
+                    if event_type == "response.failed"
+                    else ProviderOperationStatus.IN_PROGRESS
+                ),
             )
         elif event_type in {"response.cancelled", "response.expired"}:
             terminal_status = event_type.removeprefix("response.")
@@ -5566,7 +5577,7 @@ def _openai_stream_error_exception(event: Mapping[str, Any]) -> OpenAIAPIError:
             response,
             event,
         )
-        return _openai_error_value_exception(
+        failure = _openai_error_value_exception(
             response if error is None else error,
             safe_message=f"OpenAI streaming error: {OMITTED_PROVIDER_ERROR_BODY}",
             request_id=optional_error_string(response.get("request_id")),
@@ -5574,13 +5585,15 @@ def _openai_stream_error_exception(event: Mapping[str, Any]) -> OpenAIAPIError:
             transport_status_code=status_code,
             status_conflict=status_conflict,
         )
+        retain_provider_error_metadata(failure, event)
+        return failure
     # Responses uses flat error events; the subscription endpoint can wrap the
     # same fields in ``error``. The outer ``type=error`` is then an envelope,
     # not the provider's error identity. Preserve explicit status conflicts.
     nested_error = event.get("error")
     error_mapping = nested_error if isinstance(nested_error, Mapping) else event
     status_code, status_conflict = _openai_stream_status_code(error_mapping, event)
-    return _openai_error_value_exception(
+    failure = _openai_error_value_exception(
         error_mapping,
         safe_message=f"OpenAI streaming error: {OMITTED_PROVIDER_ERROR_BODY}",
         request_id=optional_error_string(event.get("request_id")),
@@ -5588,6 +5601,8 @@ def _openai_stream_error_exception(event: Mapping[str, Any]) -> OpenAIAPIError:
         transport_status_code=status_code,
         status_conflict=status_conflict,
     )
+    retain_provider_error_metadata(failure, event)
+    return failure
 
 
 def _openai_error_value_exception(
@@ -5644,6 +5659,7 @@ def _openai_error_value_exception(
     )
 
     failure.rejection_diagnostic = project_rejection_error(error_mapping)
+    attach_provider_error_text(failure, error_mapping.get("message"))
     return failure
 
 
@@ -7483,7 +7499,8 @@ def _openai_api_error_from_response(
         error_type=error_type,
         error_code=error_code,
         param=optional_error_string(error.get("param")),
-        request_id=optional_error_string(request_id),
+        request_id=optional_error_string(request_id)
+        or optional_error_string(response.headers.get("x-request-id")),
         retryable=retryable,
         retry_after_s=retry_after_s,
         response_body=_safe_error_response_text(response),

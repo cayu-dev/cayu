@@ -12,13 +12,17 @@ import asyncio
 import json
 import math
 import os
+import re
 import ssl
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, aclosing, suppress
+from contextvars import ContextVar, Token
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from http.cookies import CookieError, SimpleCookie
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
+from weakref import WeakKeyDictionary
 
 import certifi
 import httpx
@@ -73,13 +77,51 @@ from cayu.vaults.redaction import SecretRedactor
 MAX_PROVIDER_ERROR_BODY_CHARS = 2_000
 MAX_PROVIDER_ERROR_BODY_BYTES = 64 * 1024
 OMITTED_PROVIDER_ERROR_BODY = "[provider response body omitted]"
+# Public provider error messages are bounded after redaction, never before.
+PUBLIC_PROVIDER_ERROR_MESSAGE_BYTES = 2_048
+_PUBLIC_PROVIDER_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
+_PUBLIC_PROVIDER_REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/+=-]{0,255}\Z")
+_CREDENTIAL_NAME_PARTS = (
+    "auth",
+    "cookie",
+    "credential",
+    "key",
+    "secret",
+    "session",
+    "signature",
+    "token",
+)
+_PROVIDER_ERROR_WORKLOAD_REDACTOR: ContextVar[SecretRedactor | None] = ContextVar(
+    "cayu_provider_error_workload_redactor", default=None
+)
+# Raw provider error text, keyed by the typed failure it explains. Kept outside
+# the exception so its message, vars and traceback stay free of provider text.
+_PROVIDER_ERROR_TEXT: WeakKeyDictionary[ModelProviderError, str] = WeakKeyDictionary()
+_PROVIDER_ERROR_REQUEST_REDACTORS: WeakKeyDictionary[ModelProviderError, SecretRedactor] = (
+    WeakKeyDictionary()
+)
 _PROVIDER_CA_BUNDLE_ENV = "CAYU_PROVIDER_CA_BUNDLE"
 _POST_TERMINAL_DRAIN_SECONDS = 0.05
 _ApiErrorFromResponse = Callable[[httpx.Response, str, float | None], Exception]
 _RaiseContextOverflowFromStatus = Callable[[int], None]
 
 
-class _TrustedSseJsonEvent(dict[str, Any]):
+class _TrustedJsonResponse(dict[str, Any]):
+    """Decoded provider JSON with Cayu-owned request metadata outside wire fields."""
+
+    def __init__(
+        self,
+        response: Mapping[str, Any],
+        *,
+        error_redactor: SecretRedactor | None = None,
+        request_id: str | None = None,
+    ) -> None:
+        super().__init__(response)
+        self._error_redactor = error_redactor
+        self._request_id = request_id
+
+
+class _TrustedSseJsonEvent(_TrustedJsonResponse):
     """Decoded SSE dict carrying Cayu-owned HTTP response metadata."""
 
     def __init__(self, event: Mapping[str, Any], *, retry_after_s: float | None) -> None:
@@ -87,6 +129,23 @@ class _TrustedSseJsonEvent(dict[str, Any]):
         self._retry_after_s = retry_after_s
         self._response_structure: ResponseStructureDiagnostic | None = None
         self._terminal_accepted = False
+
+
+def retain_provider_error_metadata(failure: Exception, event: Mapping[str, Any]) -> None:
+    """Transfer trusted HTTP error metadata without retaining the raw JSON envelope."""
+
+    if (type(event) is not _TrustedJsonResponse and type(event) is not _TrustedSseJsonEvent) or (
+        not isinstance(failure, ModelProviderError)
+    ):
+        return
+    if event._error_redactor is not None:
+        _PROVIDER_ERROR_REQUEST_REDACTORS[failure] = event._error_redactor
+    if (
+        failure.request_id is None
+        and event._request_id is not None
+        and _PUBLIC_PROVIDER_REQUEST_ID.fullmatch(event._request_id) is not None
+    ):
+        failure.request_id = event._request_id
 
 
 def _accept_sse_terminal(event: Mapping[str, Any]) -> None:
@@ -333,103 +392,6 @@ _SAFE_INTERNAL_PROVIDER_ERROR_TYPES = frozenset(
         "ModelStreamDeadlineError",
     }
 )
-_SAFE_PROVIDER_ERROR_TYPES = {
-    "anthropic": frozenset(
-        {
-            "api_error",
-            "authentication_error",
-            "billing_error",
-            "conflict_error",
-            "invalid_request_error",
-            "not_found_error",
-            "overloaded_error",
-            "permission_error",
-            "rate_limit_error",
-            "request_too_large",
-            "timeout_error",
-        }
-    ),
-    "chat_completions": frozenset(
-        {
-            "authentication_error",
-            "context_length_exceeded",
-            "error",
-            "invalid_request_error",
-            "not_found_error",
-            "permission_error",
-            "rate_limit_error",
-            "server_error",
-        }
-    ),
-    "openai": frozenset(
-        {
-            "authentication_error",
-            "context_length_exceeded",
-            "error",
-            "invalid_request_error",
-            "not_found_error",
-            "permission_error",
-            "rate_limit_error",
-            "server_error",
-        }
-    ),
-    "vertex": frozenset(
-        {
-            "DEADLINE_EXCEEDED",
-            "INTERNAL",
-            "INVALID_ARGUMENT",
-            "PERMISSION_DENIED",
-            "RESOURCE_EXHAUSTED",
-            "UNAUTHENTICATED",
-            "UNAVAILABLE",
-            "api_error",
-            "authentication_error",
-            "billing_error",
-            "conflict_error",
-            "invalid_request_error",
-            "not_found_error",
-            "overloaded_error",
-            "permission_error",
-            "rate_limit_error",
-            "request_too_large",
-            "timeout_error",
-        }
-    ),
-}
-_SAFE_PROVIDER_ERROR_CODES = {
-    "anthropic": frozenset(
-        {
-            "context_length_exceeded",
-            "rate_limit_exceeded",
-        }
-    ),
-    "chat_completions": frozenset(
-        {
-            "context_length_exceeded",
-            "internal_error",
-            "rate_limit_exceeded",
-            "server_error",
-        }
-    ),
-    "openai": frozenset(
-        {
-            "bad_request",
-            "context_length_exceeded",
-            "internal_error",
-            "invalid_prompt",
-            "previous_response_not_found",
-            "rate_limit_exceeded",
-            "server_error",
-            "server_is_overloaded",
-        }
-    ),
-    "vertex": frozenset(
-        {
-            "context_length_exceeded",
-            "rate_limit_exceeded",
-        }
-    ),
-}
 _SAFE_PROVIDER_EXCEPTION_TYPE_NAMES = frozenset(
     {
         "AnthropicAPIError",
@@ -609,6 +571,9 @@ async def request_json(
             try:
                 raise_context_overflow(exc.response)
             except ModelContextOverflowError as overflow:
+                _PROVIDER_ERROR_REQUEST_REDACTORS[overflow] = request_credential_redactor(
+                    exc.response
+                )
                 raise overflow from exc
         message = (
             f"{request_label} request failed with HTTP "
@@ -633,7 +598,11 @@ async def request_json(
         raise protocol_error(f"{response_label} response was not valid JSON.") from exc
     if not isinstance(decoded, Mapping):
         raise protocol_error(f"{response_label} response must be a JSON object.")
-    return decoded
+    return _TrustedJsonResponse(
+        decoded,
+        error_redactor=request_credential_redactor(response),
+        request_id=_response_error_request_id(response),
+    )
 
 
 async def _read_owned_json_response(
@@ -787,7 +756,13 @@ async def stream_sse_json_events(
                     body_response=error_response,
                 )
                 if error_response is not None and raise_context_overflow is not None:
-                    raise_context_overflow(error_response)
+                    try:
+                        raise_context_overflow(error_response)
+                    except ModelContextOverflowError as overflow:
+                        _PROVIDER_ERROR_REQUEST_REDACTORS[overflow] = request_credential_redactor(
+                            response
+                        )
+                        raise
                 if error_response is None and raise_context_overflow_from_status is not None:
                     # Only classifiers explicitly wired for status-only
                     # evidence may run here. Unsupported, oversized, or stalled
@@ -803,16 +778,19 @@ async def stream_sse_json_events(
                     # The HTTP status and Retry-After header are authoritative
                     # even when a provider or intermediary supplied a body Cayu
                     # could not safely read. Do not decode that body.
-                    raise api_error(
+                    raise _response_api_error(
+                        httpx.Response(response.status_code, headers=response.headers),
                         message,
-                        status_code=response.status_code,
-                        retry_after_s=retry_after_seconds(response),
+                        api_error=api_error,
+                        api_error_from_response=None,
+                        request_redactor=request_credential_redactor(response),
                     )
                 raise _response_api_error(
                     error_response,
                     message,
                     api_error=api_error,
                     api_error_from_response=api_error_from_response,
+                    request_redactor=request_credential_redactor(response),
                 )
             if not _response_uses_identity_encoding(response):
                 raise protocol_error(
@@ -830,6 +808,7 @@ async def stream_sse_json_events(
                 deadline_controller=deadline_controller,
             )
             structure = ResponseStructureTrace() if capture_response_structure else None
+            error_redactor = request_credential_redactor(response)
             async for event in aiter_sse_json_events(
                 bounded_lines,
                 deadline_controller=deadline_controller,
@@ -838,6 +817,10 @@ async def stream_sse_json_events(
                 on_interrupted=retain_interrupted_read,
             ):
                 envelope = _TrustedSseJsonEvent(event, retry_after_s=retry_after_s)
+                envelope._error_redactor = error_redactor
+                envelope._request_id = response.headers.get("x-request-id") or response.headers.get(
+                    "request-id"
+                )
                 if structure is not None:
                     structure.record(event)
                     envelope._response_structure = structure.snapshot()
@@ -910,18 +893,56 @@ def _response_api_error(
     *,
     api_error: Callable[..., Exception],
     api_error_from_response: _ApiErrorFromResponse | None,
+    request_redactor: SecretRedactor | None = None,
 ) -> Exception:
     retry_after_s = retry_after_seconds(response)
     if api_error_from_response is not None:
         error = api_error_from_response(response, message, retry_after_s)
         if isinstance(error, ModelProviderError) and not error.rejection_diagnostic:
             error.rejection_diagnostic = project_rejection_response(response)
-        return error
-    return api_error(
-        message,
-        status_code=response.status_code,
-        retry_after_s=retry_after_s,
-    )
+    else:
+        error = api_error(
+            message,
+            status_code=response.status_code,
+            retry_after_s=retry_after_s,
+        )
+    if isinstance(error, ModelProviderError):
+        _PROVIDER_ERROR_REQUEST_REDACTORS[error] = (
+            request_credential_redactor(response) if request_redactor is None else request_redactor
+        )
+        if error.request_id is None:
+            error.request_id = _response_error_request_id(response)
+    # Keep the complete text for one pass with the combined request/workload
+    # registry; separate passes can expose fragments of overlapping secrets.
+    attach_provider_error_text(error, _provider_error_body_text(response))
+    return error
+
+
+def _response_error_request_id(response: httpx.Response) -> str | None:
+    """Recover a plain correlation ID when the adapter has not supplied one."""
+
+    candidates: list[object] = [
+        response.headers.get("x-request-id"),
+        response.headers.get("request-id"),
+    ]
+    try:
+        content = response.content
+    except httpx.ResponseNotRead:
+        content = b""
+    if content and len(content) <= MAX_PROVIDER_ERROR_BODY_BYTES:
+        with suppress(ValueError, RecursionError):
+            decoded = json.loads(content)
+            if isinstance(decoded, list) and decoded:
+                decoded = decoded[0]
+            if isinstance(decoded, Mapping):
+                candidates.append(decoded.get("request_id"))
+                nested = decoded.get("error")
+                if isinstance(nested, Mapping):
+                    candidates.append(nested.get("request_id"))
+    for candidate in candidates:
+        if type(candidate) is str and _PUBLIC_PROVIDER_REQUEST_ID.fullmatch(candidate) is not None:
+            return candidate
+    return None
 
 
 def _is_retryable_transport_error(exc: httpx.RequestError) -> bool:
@@ -1027,6 +1048,65 @@ def copy_headers(headers: Mapping[str, str] | None, *, protected: set[str]) -> d
     return copied
 
 
+def bind_provider_error_workload_redactor(
+    redactor: SecretRedactor | None,
+) -> Token[SecretRedactor | None]:
+    """Let the public provider error boundary also remove workload secrets.
+
+    The runtime binds its application redactor around provider stream steps
+    and token counts, so messages can be shown with registered secrets removed.
+    """
+
+    if redactor is not None and not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor or None.")
+    return _PROVIDER_ERROR_WORKLOAD_REDACTOR.set(redactor)
+
+
+def reset_provider_error_workload_redactor(token: Token[SecretRedactor | None]) -> None:
+    _PROVIDER_ERROR_WORKLOAD_REDACTOR.reset(token)
+
+
+def _is_credential_name(name: str) -> bool:
+    lowered = name.lower()
+    return any(part in lowered for part in _CREDENTIAL_NAME_PARTS)
+
+
+def request_credential_redactor(response: httpx.Response) -> SecretRedactor:
+    """Return a redactor for the credentials the failed request itself carried."""
+
+    try:
+        request = response.request
+    except RuntimeError:
+        return SecretRedactor()
+    values: list[str] = []
+    for name, value in request.headers.items():
+        if not _is_credential_name(name) or not value.strip():
+            continue
+        values.append(value)
+        if name.lower() == "cookie":
+            cookies: SimpleCookie[str] = SimpleCookie()
+            with suppress(CookieError):
+                cookies.load(value)
+            values.extend(morsel.value for morsel in cookies.values() if morsel.value.strip())
+            # Also retain the wire values, including cookies accepted by a
+            # backend but rejected by SimpleCookie's stricter name grammar.
+            for cookie in value.split(";"):
+                _, separator, cookie_value = cookie.partition("=")
+                cookie_value = cookie_value.strip().strip('"')
+                if separator and cookie_value.strip():
+                    values.append(cookie_value)
+        _, separator, credential = value.partition(" ")
+        if separator and credential.strip():
+            values.append(credential.strip())
+    query = request.url.query.decode("ascii", "ignore")
+    values.extend(
+        value
+        for name, value in parse_qsl(query, keep_blank_values=False)
+        if _is_credential_name(name) and value.strip()
+    )
+    return SecretRedactor(values)
+
+
 def safe_error_response_text(
     response: httpx.Response,
     *,
@@ -1037,11 +1117,78 @@ def safe_error_response_text(
     Provider adapters run below the application-owned workload-secret scope.
     Retaining even a parsed or truncated body here could preserve a recoverable
     secret fragment before the application gets a chance to redact it. Typed
-    provider exceptions retain authoritative HTTP status/type/code fields.
+    provider exceptions retain authoritative HTTP status/type/code fields. The
+    provider's own message travels separately (``attach_provider_error_text``)
+    and is shown only by the public provider boundary, after redaction.
     """
 
     del response, format_error_json
     return OMITTED_PROVIDER_ERROR_BODY
+
+
+def provider_error_body_text(response: httpx.Response) -> str | None:
+    """Extract a provider error body's message, minus the request's credentials.
+
+    Returns ``None`` when the body was not read completely within the byte
+    bound or carries no text. Registered workload secrets are removed, and the
+    text bounded, only at the public provider boundary.
+    """
+
+    text = _provider_error_body_text(response)
+    return None if text is None else request_credential_redactor(response).redact_text(text)
+
+
+def _provider_error_body_text(response: httpx.Response) -> str | None:
+    """Read complete error text without changing secrets before public redaction."""
+
+    try:
+        content = response.content
+    except httpx.ResponseNotRead:
+        return None
+    if not content or len(content) > MAX_PROVIDER_ERROR_BODY_BYTES:
+        return None
+    text: str | None = None
+    try:
+        decoded: Any = json.loads(content)
+    except (ValueError, RecursionError):
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    else:
+        text = _provider_error_message_field(decoded)
+    if text is None or not text.strip():
+        return None
+    return text
+
+
+def _provider_error_message_field(decoded: Any) -> str | None:
+    # GCP array-wraps some errors; FastAPI-style backends use {"detail": "..."}.
+    if isinstance(decoded, list) and decoded:
+        decoded = decoded[0]
+    if not isinstance(decoded, Mapping):
+        return None
+    error = decoded.get("error")
+    for container in (error, decoded):
+        if isinstance(container, Mapping):
+            message = container.get("message")
+            if type(message) is str:
+                return message
+    detail = decoded.get("detail")
+    if type(error) is str:
+        return error
+    return detail if type(detail) is str else None
+
+
+def attach_provider_error_text(failure: BaseException, text: str | None) -> None:
+    """Carry a provider's raw error text beside a typed failure.
+
+    The text never enters the exception's message, attributes or traceback; the
+    public provider boundary reads it, redacts known secrets, then bounds it.
+    """
+
+    if isinstance(failure, ModelProviderError) and type(text) is str and text.strip():
+        _PROVIDER_ERROR_TEXT[failure] = text
 
 
 def safe_error_json(decoded: Mapping[str, Any], *, include_request_id: bool = False) -> str:
@@ -1190,10 +1337,10 @@ def credential_safe_error_event(
             provider_label=provider_label,
             provider_name=provider_name,
             credential_values=credential_values,
-            safe_message=safe_message,
+            safe_message=unresolved_message,
         )
         event = ModelStreamEvent.error(
-            safe_message,
+            str(safe_exception),
             cause=safe_exception,
         )
         payload = dict(event.payload)
@@ -1215,7 +1362,9 @@ def credential_safe_error_event(
     diagnostic_payload.update(
         api_error_diagnostic_fields(exc, credential_values=tuple(credential_values))
     )
-    redacted = SecretRedactor(credential_values).redact_json_values(diagnostic_payload)
+    redacted = _public_error_redactor(credential_values, failure=exc).redact_json_values(
+        diagnostic_payload
+    )
     if type(redacted) is not dict:  # pragma: no cover - SecretRedactor contract guard
         raise AssertionError("provider error payload redaction returned a non-object")
     return ModelStreamEvent(type=event.type, payload=redacted)
@@ -1274,37 +1423,39 @@ def credential_safe_provider_exception(
 
     provider_label = require_clean_nonblank(provider_label, "provider_label")
     provider_name = require_clean_nonblank(provider_name, "provider_name")
-    redactor = SecretRedactor(credential_values)
+    # Without the request's credentials, no provider text can be checked for
+    # them, so only the fixed classification survives.
+    credentials_known = SecretRedactor(credential_values).has_values
+    redactor = _public_error_redactor(credential_values, failure=exc)
+    source = exc if isinstance(exc, ModelProviderError) else None
     if safe_message is not None:
         message = require_nonblank(safe_message, "safe_message")
     elif isinstance(exc, ModelContextOverflowError):
         message = f"{provider_label} model context window exceeded"
     else:
-        message = f"{safe_provider_exception_type_name(exc)}: {provider_label} provider failed"
+        message = (
+            _public_provider_message(source, redactor)
+            if source is not None and credentials_known
+            else None
+        ) or f"{safe_provider_exception_type_name(exc)}: {provider_label} provider failed"
 
-    source = exc if isinstance(exc, ModelProviderError) else None
     string_fields: dict[str, str | None] = {
-        "error_type": _safe_provider_identity_field(
-            provider_name,
-            "error_type",
-            source.error_type if source is not None else None,
-        ),
-        "error_code": _safe_provider_identity_field(
-            provider_name,
-            "error_code",
-            source.error_code if source is not None else None,
-        ),
-        # Provider request IDs are arbitrary provider-controlled strings. They
-        # cannot be compared with a workload secret registry at this boundary.
+        "error_type": None,
+        "error_code": None,
         "request_id": None,
     }
-    if redactor.has_values:
+    if source is not None and credentials_known:
         string_fields = {
-            name: redactor.redact_text(value) if value is not None else None
-            for name, value in string_fields.items()
+            "error_type": _public_provider_identity(
+                source.error_type, _PUBLIC_PROVIDER_IDENTIFIER, redactor
+            ),
+            "error_code": _public_provider_identity(
+                source.error_code, _PUBLIC_PROVIDER_IDENTIFIER, redactor
+            ),
+            "request_id": _public_provider_identity(
+                source.request_id, _PUBLIC_PROVIDER_REQUEST_ID, redactor
+            ),
         }
-    else:
-        string_fields = {name: None for name in string_fields}
 
     common: dict[str, Any] = {
         "provider": provider_name,
@@ -1341,24 +1492,87 @@ def credential_safe_provider_exception(
     )
 
 
-def _safe_provider_identity_field(
-    provider_name: str,
-    field_name: str,
-    value: object,
-) -> str | None:
-    if type(value) is not str:
+def _public_error_redactor(
+    credential_values: Sequence[str], *, failure: Exception | None = None
+) -> SecretRedactor:
+    """Request credentials plus any workload secrets the runtime bound."""
+
+    redactor = SecretRedactor(credential_values)
+    # Opaque transport failures may be built-in exceptions without weakrefs.
+    # Only typed provider failures carry request metadata across this boundary.
+    request_redactor = (
+        _PROVIDER_ERROR_REQUEST_REDACTORS.get(failure)
+        if isinstance(failure, ModelProviderError)
+        else None
+    )
+    if request_redactor is not None:
+        redactor = redactor.merged_with(request_redactor)
+    workload = _PROVIDER_ERROR_WORKLOAD_REDACTOR.get()
+    return redactor if workload is None else redactor.merged_with(workload)
+
+
+def _public_provider_message(source: ModelProviderError, redactor: SecretRedactor) -> str | None:
+    """Show the provider's own message, redacted first and bounded second.
+
+    Truncation and control-character normalization need the complete registry:
+    without it, a later redaction pass could miss a shortened or changed secret.
+    Such messages stay omitted until the workload registry is available.
+    """
+
+    text = _PROVIDER_ERROR_TEXT.get(source)
+    if text is None:
         return None
-    if field_name == "error_type":
-        allowed = (
-            _SAFE_PROVIDER_ERROR_TYPES.get(
-                provider_name,
-                frozenset(),
-            )
-            | _SAFE_INTERNAL_PROVIDER_ERROR_TYPES
-        )
-    else:
-        allowed = _SAFE_PROVIDER_ERROR_CODES.get(provider_name, frozenset())
-    return value if value in allowed else None
+    try:
+        prefix = str(source)
+    except Exception:
+        return None
+    rendered = (
+        prefix.replace(OMITTED_PROVIDER_ERROR_BODY, text)
+        if OMITTED_PROVIDER_ERROR_BODY in prefix
+        else f"{prefix}: {text}"
+    )
+    if len(rendered) > MAX_PROVIDER_ERROR_BODY_BYTES:
+        # Never truncate before redaction: an oversized message stays omitted.
+        return None
+    try:
+        rendered.encode("utf-8")
+    except UnicodeEncodeError:
+        # Lossy repair after redaction could reconstruct a registered secret.
+        return None
+    redacted = redactor.redact_text(rendered)
+    printable = "".join(
+        character if character in "\n\t" or character.isprintable() else " "
+        for character in redacted
+    )
+    if printable != redacted and _PROVIDER_ERROR_WORKLOAD_REDACTOR.get() is None:
+        # A later caller may know workload secrets containing these control
+        # characters. Formatting here would prevent that caller from matching.
+        return None
+    # Redact again after normalization in case replacing a control character
+    # reconstructed a different registered secret, then apply the byte bound.
+    bounded, truncated = redactor.redact_text_bounded_with_marker(
+        printable,
+        max_bytes=PUBLIC_PROVIDER_ERROR_MESSAGE_BYTES,
+        truncation_marker="...[truncated]",
+    )
+    if truncated and _PROVIDER_ERROR_WORKLOAD_REDACTOR.get() is None:
+        return None
+    # Keep edge whitespace for a caller that has not yet supplied its registry.
+    return bounded if _PROVIDER_ERROR_WORKLOAD_REDACTOR.get() is None else bounded.strip() or None
+
+
+def _public_provider_identity(
+    value: object,
+    pattern: re.Pattern[str],
+    redactor: SecretRedactor,
+) -> str | None:
+    """Pass a plain identifier through unless it contains a known secret."""
+
+    if type(value) is not str or pattern.fullmatch(value) is None:
+        return None
+    # Error parsers normalize the outer whitespace of identity fields. Check
+    # that form of the registry too, so normalization cannot expose a secret.
+    return value if redactor.redact_stripped_text(value) == value else None
 
 
 def safe_provider_exception_type_name(error: BaseException) -> str:
@@ -1407,8 +1621,11 @@ __all__ = [
     "MAX_PROVIDER_ERROR_BODY_BYTES",
     "MAX_PROVIDER_ERROR_BODY_CHARS",
     "OMITTED_PROVIDER_ERROR_BODY",
+    "PUBLIC_PROVIDER_ERROR_MESSAGE_BYTES",
     "SharedAsyncClient",
     "aclose_transport",
+    "attach_provider_error_text",
+    "bind_provider_error_workload_redactor",
     "copy_headers",
     "credential_safe_error_event",
     "credential_safe_post_completion_failure",
@@ -1419,8 +1636,12 @@ __all__ = [
     "new_async_client",
     "optional_error_string",
     "post_json",
+    "provider_error_body_text",
+    "request_credential_redactor",
     "request_json",
+    "reset_provider_error_workload_redactor",
     "response_json_object",
+    "retain_provider_error_metadata",
     "retry_after_seconds",
     "safe_error_json",
     "safe_error_response_text",

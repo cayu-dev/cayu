@@ -138,6 +138,18 @@ class SecretRedactor:
         )
         return normalized.redact_text(value)
 
+    def redact_stripped_text(self, value: str) -> str:
+        """Redact text against whitespace-trimmed registered secret values."""
+
+        if type(value) is not str:
+            raise TypeError("SecretRedactor.redact_stripped_text expects a string.")
+        if not self._values:
+            return value
+        normalized = SecretRedactor._from_values(
+            tuple(sorted({secret.strip() for secret in self._values}, key=len, reverse=True))
+        )
+        return normalized.redact_text(value)
+
     def redact_text(self, value: str) -> str:
         if type(value) is not str:
             raise TypeError("SecretRedactor.redact_text expects a string.")

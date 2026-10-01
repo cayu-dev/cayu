@@ -914,7 +914,7 @@ class AuxiliaryInferenceOwner:
                     started = await self._event_writer.emit(started)
                     events = _owned_model_provider_events(
                         lambda: _admitted_model_provider_events(
-                            provider, request, admission, refresh
+                            provider, request, admission, refresh, error_redactor=redactor
                         ),
                         cancellation_baseline=cancellation_baseline,
                         max_concurrent_streams=admission.max_concurrent_streams,

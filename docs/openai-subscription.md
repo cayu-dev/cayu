@@ -141,7 +141,8 @@ Model availability belongs to the user's subscription and may change. A model
 accepted by the OpenAI Platform API is not necessarily available through the
 subscription backend. Generated projects select `gpt-6-luna` in subscription mode;
 set `CAYU_MODEL` if the account offers a different model. When the backend rejects
-a model, rerun the generated `run.py` with `--show-provider-errors` to see why.
+a model, the error shows the backend's reason with credentials removed; rerun the
+generated `run.py` with `--show-provider-errors` for the full private capture.
 
 The adapter honors Codex's typed `end_turn` completion signal. When Codex
 completes a response with `end_turn=false`, Cayu durably records that model step
@@ -149,8 +150,10 @@ and any visible commentary, then requests the next model step inside the same
 run and interaction. It does not add a synthetic user message. Normal Cayu
 step, budget, interruption, cancellation, and recovery limits remain in force.
 
-Subscription HTTP and SSE failures retain only bounded typed retry evidence:
-valid status, retryability, `Retry-After`, and allowlisted error identities.
+Subscription HTTP and SSE failures carry the backend's message, request ID and
+plain error type/code with credentials removed (see
+[provider error diagnostics](provider-error-diagnostics.md)), plus typed retry
+evidence: valid status, retryability and `Retry-After`.
 Known authentication, permission, invalid-request, missing-resource, hosted-tool,
 and context-overflow failures remain terminal. A provider error that has no safe
 classification may use `RetryPolicy.max_unknown_attempts`, which defaults to at

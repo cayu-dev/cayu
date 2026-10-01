@@ -107,7 +107,11 @@ def test_real_transport_captures_details_without_changing_public_failures(subscr
         "NO_PROMPT",
     ):
         assert secret not in serialized
-    assert "Unsupported input" not in json.dumps(after)
+    # Public failures show the provider's message with the request credential
+    # removed (#1974); capture neither adds nor removes anything from them.
+    public = json.dumps(after)
+    assert "subscription-access" not in public
+    assert ("Unsupported input item" in public) is (kind != "transport")
     record = records[0]
     if kind == "transport":
         assert record["error"]["type"] == "ConnectError"
@@ -142,7 +146,8 @@ def test_fastapi_detail_body_is_captured_as_the_message():
     public = asyncio.run(run())
     assert records[0]["error"]["message"] == detail
     assert records[0]["http_status_code"] == 400
-    assert detail not in json.dumps(public)
+    # The backend's refusal reason is public now (#1974).
+    assert detail in json.dumps(public)
 
 
 def test_bounded_fields_redact_before_truncation_and_report_omissions():
@@ -256,7 +261,7 @@ def test_async_sink_is_rejected_and_malformed_event_does_not_change_protocol_han
     assert not records
 
 
-def test_compactor_failure_is_durable_and_private_details_remain_outside_events(tmp_path):
+def test_compactor_failure_is_durable_and_credentials_stay_out_of_events(tmp_path):
     records = []
     database = tmp_path / "sessions.sqlite3"
 
@@ -324,8 +329,9 @@ def test_compactor_failure_is_durable_and_private_details_remain_outside_events(
     assert completions[0].payload["compaction_outcome"] == "provider_error"
     assert any(e.type == EventType.CONTEXT_COMPACTION_FAILED for e in events)
     serialized = json.dumps([e.payload for e in events])
-    assert "Unsupported input item" not in serialized
-    assert "req_compaction" not in serialized
+    # The provider's message is shown (#1974); the subscription token is not.
+    assert "Unsupported input item" in serialized
+    assert "subscription-access" not in serialized
     assert records[0]["error"]["request_id"] == "req_compaction"
     assert records[0]["error"]["param"] == "input[2].content[0]"
     assert records[0]["error"]["message"].startswith("Unsupported input item")

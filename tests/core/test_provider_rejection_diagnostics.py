@@ -241,7 +241,9 @@ def test_http_400_is_durable_and_never_redispatched(tmp_path, capsys, workflow, 
                 assert payload["model_attempt_id"]
                 assert collection[-1].type is EventType.SESSION_FAILED
                 assert not any(event.type is EventType.MODEL_RETRY for event in collection)
-                assert "secret-request" not in json.dumps([event.payload for event in collection])
+                # Provider request IDs pass through for support requests (#1974).
+                assert payload["request_id"] == "secret-request"
+                assert "Unsupported parameter: 'temperature'." in payload["error"]
         assert len(calls) == 1
         return session_id
 
@@ -263,7 +265,6 @@ def test_http_400_is_durable_and_never_redispatched(tmp_path, capsys, workflow, 
     output = capsys.readouterr().out
     assert "temperature" in output
     assert "Remove this parameter" in output
-    assert "secret-request" not in output
 
 
 @pytest.mark.parametrize("provider", ["openai", "chat_completions", "anthropic", "vertex"])

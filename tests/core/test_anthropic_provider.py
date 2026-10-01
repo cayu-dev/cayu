@@ -1292,7 +1292,8 @@ async def test_runtime_recovers_from_anthropic_413_without_requiring_body_identi
             False,
             id="authentication",
         ),
-        pytest.param("future_error", None, None, id="unknown"),
+        # Plain identifier-shaped types pass through (#1974).
+        pytest.param("future_error", "future_error", None, id="unknown"),
         pytest.param(True, None, None, id="boolean"),
         pytest.param("", None, None, id="blank"),
     ],
@@ -1496,7 +1497,7 @@ async def test_anthropic_provider_stream_propagates_context_overflow() -> None:
     assert isinstance(exc_info.value, ModelContextOverflowError)
     assert exc_info.value.status_code == 413
     assert exc_info.value.error_type == "request_too_large"
-    assert exc_info.value.request_id is None
+    assert exc_info.value.request_id == "req_overflow"
     assert exc_info.value.retryable is False
 
 
@@ -1532,6 +1533,7 @@ async def test_anthropic_provider_stream_emits_typed_api_error_payload() -> None
         "provider_rejection_request_id_state": "unavailable",
         "provider_rejection_unavailable_reason": "body_unavailable",
         "provider_error_type": "rate_limit_error",
+        "request_id": "req_429",
         "retryable": True,
         "retry_after_s": 1.5,
     }

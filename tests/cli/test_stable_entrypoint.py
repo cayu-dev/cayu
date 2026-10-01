@@ -374,7 +374,8 @@ def test_entrypoint_prints_provider_errors_only_when_asked(capsys, show) -> None
         assert f"provider error: HTTP 400; {detail}" in err
         assert "--show-provider-errors" not in err
     else:
-        assert detail not in err
+        # The run failure already carries the backend's reason (#1974).
+        assert detail in err
         assert "Rerun with --show-provider-errors" in err
 
 

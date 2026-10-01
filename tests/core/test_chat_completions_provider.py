@@ -2560,7 +2560,7 @@ async def test_chat_completions_provider_stream_omits_cutoff_secret_fragment() -
     assert not any(secret[:size] in rendered for size in range(8, len(secret) + 1))
     assert events[0].payload["provider_error_type"] == "server_error"
     assert events[0].payload["provider_error_code"] == "internal_error"
-    assert "request_id" not in events[0].payload
+    assert events[0].payload["request_id"] == "req_provider_cutoff"
 
 
 @pytest.mark.anyio

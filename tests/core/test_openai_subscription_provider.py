@@ -397,8 +397,9 @@ def test_subscription_provider_requires_tool_provenance_for_generic_value_reject
 
     events = asyncio.run(collect())
     assert [event.type for event in events] == [ModelStreamEventType.ERROR]
-    assert events[0].payload["error"] == "OpenAI subscription provider failed."
-    assert "raw backend detail" not in str(events[0].payload)
+    assert events[0].payload["error"] == (
+        "OpenAI streaming error: raw backend detail must not escape"
+    )
 
 
 def test_subscription_provider_preserves_codex_end_turn_false() -> None:
@@ -575,7 +576,7 @@ async def test_subscription_runtime_retries_generic_stream_error_once_then_compl
     assert retry.payload["effective_max_attempts"] == 2
     assert retry.payload["provider_error_type"] == "error"
     assert retry.payload["delay_seconds"] == 0.0
-    assert canary not in repr([event.model_dump(mode="json") for event in events])
+    assert model_error.payload["error"] == f"OpenAI streaming error: {canary}"
     assert events[-1].type == EventType.SESSION_COMPLETED
 
 
@@ -791,9 +792,8 @@ async def test_subscription_runtime_keeps_known_permanent_sse_errors_terminal(
     assert model_error.payload["status_code"] == status_code
     assert model_error.payload["retryable"] is False
     assert model_error.payload["provider_error_type"] == error_type
-    assert "raw permanent provider detail" not in repr(
-        [event.model_dump(mode="json") for event in events]
-    )
+    # The backend's own message is shown once credentials are redacted (#1974).
+    assert model_error.payload["error"] == "OpenAI streaming error: raw permanent provider detail"
     assert events[-1].type == EventType.SESSION_FAILED
 
 

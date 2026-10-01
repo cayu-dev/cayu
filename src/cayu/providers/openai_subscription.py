@@ -46,6 +46,7 @@ from cayu.providers._http import (
     aclose_transport,
     copy_headers,
     credential_safe_post_completion_failure,
+    credential_safe_provider_exception,
     credential_sanitization_values,
     safe_provider_exception_type_name,
     sanitize_provider_cancellation,
@@ -1158,7 +1159,12 @@ def _safe_subscription_error_event(
     provider_name: str,
     extra_header_values: tuple[str, ...] = (),
 ) -> ModelStreamEvent:
-    """Project a provider failure through an allowlisted, credential-safe shape."""
+    """Project a provider failure through a credential-safe shape.
+
+    Provider API errors show the backend's own message, error type, code and
+    request ID with the subscription credentials and any registered workload
+    secrets removed, like the API adapter.
+    """
 
     if type(exc) is ModelStreamDeadlineError:
         safe = ModelStreamDeadlineError(
@@ -1167,8 +1173,24 @@ def _safe_subscription_error_event(
             stream_cleanup_failed=exc.stream_cleanup_failed,
         )
         return ModelStreamEvent.error(str(safe), cause=safe)
+    credential_values = credential_sanitization_values(
+        *_subscription_credential_values(credentials),
+        *extra_header_values,
+    )
+    public = (
+        credential_safe_provider_exception(
+            exc,
+            provider_label="OpenAI subscription",
+            provider_name=provider_name,
+            credential_values=credential_values,
+        )
+        if isinstance(exc, ModelProviderError) and credentials is not None
+        else None
+    )
     if isinstance(exc, OpenAISubscriptionAuthError):
         message = "OpenAI subscription authentication failed. Run `cayu auth openai login` again."
+    elif public is not None:
+        message = str(public)
     else:
         message = "OpenAI subscription provider failed."
     payload: dict[str, Any] = {
@@ -1182,18 +1204,22 @@ def _safe_subscription_error_event(
             if key in {"status_code", "retryable", "retry_after_s"}
         }
         typed_fields["provider"] = provider_name
-        safe_error_type = _safe_subscription_error_identity(
-            exc.error_type,
-            field_name="error_type",
+        identity = (
+            (public.error_type, public.error_code, public.request_id)
+            if public is not None
+            else (
+                # Unresolved credentials cannot be checked against provider
+                # text, so only fixed, known categories survive.
+                _safe_subscription_error_identity(exc.error_type, field_name="error_type"),
+                _safe_subscription_error_identity(exc.error_code, field_name="error_code"),
+                None,
+            )
         )
-        safe_error_code = _safe_subscription_error_identity(
-            exc.error_code,
-            field_name="error_code",
-        )
-        if safe_error_type is not None:
-            typed_fields["provider_error_type"] = safe_error_type
-        if safe_error_code is not None:
-            typed_fields["provider_error_code"] = safe_error_code
+        for key, value in zip(
+            ("provider_error_type", "provider_error_code", "request_id"), identity, strict=True
+        ):
+            if value is not None:
+                typed_fields[key] = value
         payload.update(typed_fields)
     else:
         status_code = getattr(exc, "status_code", None)

@@ -847,8 +847,8 @@ CAYU_PROVIDER=openai-subscription uv run --no-sync python run.py --message "YOUR
 ```
 
 Subscription mode selects `gpt-6-luna` by default. Set `CAYU_MODEL` if your plan
-offers a different model. If a run fails at the provider, add
-`--show-provider-errors` to print the provider's explanation.
+offers a different model. A provider failure prints the provider's explanation
+with credentials removed; add `--show-provider-errors` for the full error record.
 
 This experimental path is intended for the subscription holder's own local
 development and evaluation. It is not intended for production, customer-facing
