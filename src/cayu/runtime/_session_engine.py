@@ -6935,6 +6935,24 @@ class SessionEngine:
             retry_request=retry_request,
         )
 
+    async def recover_abandoned_execution(
+        self,
+        session: Session,
+        *,
+        participant_context: CollaborationAccessContext | None = None,
+    ) -> tuple[Event, ...]:
+        from cayu.runtime._abandoned_session_recovery import recover_abandoned_execution
+
+        await self._require_participant_execution(session, participant_context)
+        return await recover_abandoned_execution(
+            store=self.session_store,
+            session=session,
+            locally_active=self._session_control.has_active_tasks(session.id),
+            recover=lambda request: self.recover_incomplete_session(
+                request, participant_context=participant_context
+            ),
+        )
+
     async def recover_incomplete_session(
         self,
         request: IncompleteSessionRecoveryRequest,
@@ -20676,6 +20694,19 @@ class SessionEngine:
             != required_session_instance_fingerprint
         ):
             raise RuntimeError("Queued dispatch target session instance changed.")
+        recovery_required = loaded_session.status in {
+            SessionStatus.RUNNING,
+            SessionStatus.INTERRUPTING,
+        }
+        recovery_events = await self.recover_abandoned_execution(
+            loaded_session, participant_context=participant_context
+        )
+        for event in recovery_events:
+            yield event
+        if recovery_required:
+            loaded_session = await self.session_store.load(request.session_id)
+            if loaded_session is None:
+                raise KeyError(f"Session not found: {request.session_id}")
         fork_initial_profile = _require_exact_fork_initial_invocation_profile(
             loaded_session,
             request,
@@ -20859,6 +20890,10 @@ class SessionEngine:
                 yield replayed_profile_decision
                 return
         if loaded_session.status not in _RESUMABLE_SESSION_STATUSES:
+            if loaded_session.status in {SessionStatus.RUNNING, SessionStatus.INTERRUPTING}:
+                from cayu.sessions.base import SessionExecutionInProgress
+
+                raise SessionExecutionInProgress(loaded_session.id, loaded_session.status)
             raise SessionStatusConflict(
                 "Session status transition not allowed: "
                 f"{loaded_session.status} -> {SessionStatus.RUNNING}"

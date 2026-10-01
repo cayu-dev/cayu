@@ -1186,10 +1186,12 @@ class DurableToolRound:
             with phase_scope("effect_state", call_id=pending_tool_call.tool_call_id):
                 result, confirmed_effect_record = await reconcile_call(pending_tool_call, tool_call)
             if result is None:
+                registered_tool = registered_agent.executable_tool(pending_tool_call.tool_name)
                 result = tool_round_recovery.unknown_recovered_tool_result(
                     pending_tool_call=pending_tool_call,
                     pending_round=pending_round,
                     started=pending_tool_call.tool_call_id in effective_started_ids,
+                    effect=None if registered_tool is None else registered_tool.effect,
                 )
             if confirmed_effect_record is not None:
                 confirmed_native_effect_records[pending_tool_call.tool_call_id] = (

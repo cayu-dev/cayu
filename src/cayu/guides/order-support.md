@@ -212,6 +212,15 @@ separate validated output contract.
 - Duplicate session: `run` creates, `resume(ResumeRequest(...))` continues an
   ordinary conversation. The CLI's `clarify` and `verify` use resume. Inspect a
   running or pending session before choosing approval/input resolution or recovery.
+- Process died during a tool: ordinary resume automatically recovers an executor
+  proved dead on the same host, or one whose execution lease has expired.
+  `SessionExecutionInProgress` means the executor may still be running; retry
+  after it finishes or its lease expires (60 seconds by default). For an older
+  session without a recorded owner, first establish that its executor stopped,
+  then call `app.recover_incomplete_session(IncompleteSessionRecoveryRequest(...))`
+  and inspect the result before resuming. The `recover` command demonstrates
+  explicit recovery. Unknown external effects still interrupt for receipt-based
+  reconciliation; automatic recovery never blindly repeats the proposal write.
 - Execution-profile mismatch: keep the same provider/model and declared versions
   across processes. Process-local opaque identities need stable declarations from
   the first run; adding one does not repair a persisted opaque baseline. Digests

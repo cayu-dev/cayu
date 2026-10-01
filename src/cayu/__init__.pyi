@@ -3868,6 +3868,7 @@ from cayu.sessions.base import RunRequest as RunRequest
 from cayu.sessions.base import SerializedRecordSummary as SerializedRecordSummary
 from cayu.sessions.base import Session as Session
 from cayu.sessions.base import SessionAggregateFilter as SessionAggregateFilter
+from cayu.sessions.base import SessionExecutionInProgress as SessionExecutionInProgress
 from cayu.sessions.base import SessionForkProfileRelationship as SessionForkProfileRelationship
 from cayu.sessions.base import SessionIdentity as SessionIdentity
 from cayu.sessions.base import SessionInspectionIdentity as SessionInspectionIdentity
@@ -7866,6 +7867,7 @@ __all__ = [
     "SessionCostTotals",
     "SessionEvidenceClosureStore",
     "SessionExecutionConfig",
+    "SessionExecutionInProgress",
     "SessionExecutionSource",
     "SessionExecutionState",
     "SessionExportAcceptance",

@@ -12,6 +12,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from cayu.sessions._process_liveness import ProcessIdentity, execution_owner_is_live
+
 ExecutionOwnerKind = Literal[
     "in_process_runner", "server_stream", "task_worker", "recovery", "foreground_child_delivery"
 ]
@@ -91,6 +93,7 @@ class _ExecutionOwner(BaseModel):
     last_progress_at: datetime
     last_progress_kind: ExecutionProgressKind = "publishing"
     released: bool = False
+    process_identity: ProcessIdentity | None = None
 
 
 _OWNER_KIND: ContextVar[ExecutionOwnerKind] = ContextVar(
@@ -156,7 +159,7 @@ def execution_state(
         and owner.session_instance_id == session_instance_id
         and owner.run_epoch == run_epoch
     )
-    live = current and not owner.released and owner.lease_expires_at > now
+    live = current and execution_owner_is_live(owner, now)
     if status in {SessionStatus.COMPLETED, SessionStatus.FAILED}:
         state = "terminal"
     elif waiting:
@@ -178,7 +181,14 @@ def execution_state(
     fields = {}
     if current and state in {"executing", "owner_lost"}:
         fields = owner.model_dump(
-            exclude={"session_id", "session_instance_id", "run_epoch", "token", "released"}
+            exclude={
+                "session_id",
+                "session_instance_id",
+                "run_epoch",
+                "token",
+                "released",
+                "process_identity",
+            }
         )
     return SessionExecutionState(session_id=session_id, state=state, run_epoch=run_epoch, **fields)
 

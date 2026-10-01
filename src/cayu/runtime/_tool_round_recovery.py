@@ -63,7 +63,7 @@ from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.sessions.base import Session, SessionStatus, SessionStore
 from cayu.sessions.checkpoints import WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY
-from cayu.tools.base import ToolResult
+from cayu.tools.base import ToolEffect, ToolResult
 from cayu.tools.catalogue import CALL_TOOL_NAME, SEARCH_TOOLS_NAME
 from cayu.tools.exposure import (
     ResolvedToolExposureAuthority,
@@ -1590,6 +1590,7 @@ def unknown_recovered_tool_result(
     pending_tool_call: PendingToolCallApproval,
     pending_round: PendingToolRound,
     started: bool,
+    effect: ToolEffect | None = None,
 ) -> ToolResult:
     if not started:
         return ToolResult(
@@ -1611,12 +1612,24 @@ def unknown_recovered_tool_result(
             is_error=True,
         )
 
+    if effect in (ToolEffect.NONE, ToolEffect.IDEMPOTENT):
+        # Recovery cannot republish the original arguments (their redaction scope
+        # is gone), but the declared effect makes another call for the same
+        # operation safe; "inspect external state" assumes a tool apps rarely have.
+        guidance = (
+            f"Its outcome is unknown and its original arguments are not shown after "
+            f"recovery. {pending_tool_call.tool_name} declares {effect.value} effects, "
+            "so calling it again for the same operation is safe."
+        )
+    else:
+        guidance = (
+            "The external side-effect outcome is unknown; inspect external state before retrying."
+        )
     return ToolResult(
         content=(
             f"Tool call {pending_tool_call.tool_name} ({pending_tool_call.tool_call_id}) "
             "started but did not record a terminal result before Cayu recovered an "
-            "incomplete tool round. The external "
-            "side-effect outcome is unknown; inspect external state before retrying."
+            f"incomplete tool round. {guidance}"
         ),
         structured={
             "recovered": True,

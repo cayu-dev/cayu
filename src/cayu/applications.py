@@ -568,6 +568,9 @@ from cayu.runtime.provider_operations import (
     RecoverableProviderOperation,
     RecoverableProviderOperationStart,
     copy_provider_operation_resolution_request,
+    load_provider_operation_resolution,
+    prepare_provider_operation_resolution_request,
+    provider_operation_resolution_request_digest,
 )
 from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
@@ -11409,6 +11412,11 @@ class CayuApp:
             for event in replay_events:
                 yield event
             return
+        if session is not None:
+            for event in await self._session_engine.recover_abandoned_execution(
+                session, participant_context=participant_context
+            ):
+                yield event
         session_id = response.session_id
         task_worker_id = response.task_worker_id
         task_handoff_id = response.task_handoff_id
@@ -11618,6 +11626,22 @@ class CayuApp:
             for event in replay_events:
                 yield await self._project_emitted_event_for_public_api(event)
             return
+        # An elected task continuation carries the disposition's successor
+        # authority into its own recovery protocol below. Generic recovery
+        # cannot substitute for that worker/handoff authority. An exact retry
+        # of an accepted disposition is a receipt replay: the coordinator
+        # returns the recorded resolution without continuing the session, so
+        # it must not wait for (or take over) the execution that disposition
+        # started.
+        if (
+            session is not None
+            and task_id is None
+            and not await self._is_provider_resolution_replay(request)
+        ):
+            for event in await self._session_engine.recover_abandoned_execution(
+                session, participant_context=context
+            ):
+                yield await self._project_emitted_event_for_public_api(event)
         session_id = request.session_id
         task_worker_id = request.task_worker_id
         task_handoff_id = request.task_handoff_id
@@ -11654,6 +11678,21 @@ class CayuApp:
             async for event in owned_stream:
                 yield await self._project_emitted_event_for_public_api(event)
 
+    async def _is_provider_resolution_replay(
+        self, request: ProviderOperationResolutionRequest
+    ) -> bool:
+        existing = await load_provider_operation_resolution(
+            self.session_store, request.session_id, request.stage_id
+        )
+        if existing is None:
+            return False
+        prepared = prepare_provider_operation_resolution_request(
+            request, redactor=self._secret_redactor
+        )
+        return existing.record.request_digest == provider_operation_resolution_request_digest(
+            prepared
+        )
+
     async def _resolve_tool_approval_private(
         self,
         request: ToolApprovalRequest,
@@ -11688,6 +11727,14 @@ class CayuApp:
             for event in replay_events:
                 yield event
             return
+        # As for provider resolution, an elected task continuation keeps its own
+        # recovery and approval-failure replay authority (approval-close and
+        # task-failure receipts); generic recovery must not fence it first.
+        if session is not None and task_id is None:
+            for event in await self._session_engine.recover_abandoned_execution(
+                session, participant_context=participant_context
+            ):
+                yield event
         session_id = request.session_id
         task_worker_id = request.task_worker_id
         task_handoff_id = request.task_handoff_id

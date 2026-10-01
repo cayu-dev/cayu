@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from cayu._validation import require_clean_nonblank
+from cayu.sessions._process_liveness import execution_owner_is_live
 from cayu.sessions.execution import _ExecutionOwner, execution_state
 
 SQLITE_EXECUTION_DDL = """
@@ -34,10 +35,9 @@ def _live(session, owner, now):
     return (
         owner is not None
         and session is not None
-        and not owner.released
         and owner.session_instance_id == session.instance_id
         and owner.run_epoch == session.run_epoch
-        and owner.lease_expires_at > now
+        and execution_owner_is_live(owner, now)
     )
 
 
@@ -53,6 +53,7 @@ def _claim(
     lease_seconds,
     operation_id,
     operation_run_epoch,
+    process_identity=None,
 ):
     from cayu.sessions.base import _current_session_run_epoch
 
@@ -76,6 +77,7 @@ def _claim(
         run_epoch=session.run_epoch,
         token=token,
         owner_id=owner_id,
+        process_identity=process_identity,
         owner_kind=owner_kind,
         owner_label=owner_label,
         operation_id=None
@@ -175,6 +177,9 @@ class MemorySessionExecutionMixin:
                 )
 
     async def inspect_session_execution(self, session_id):
+        return await self._inspect_session_execution_owner(session_id, include_waits=True)
+
+    async def _inspect_session_execution_owner(self, session_id, *, include_waits=False):
         session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
             session = self._sessions.get(session_id)
@@ -186,11 +191,13 @@ class MemorySessionExecutionMixin:
                 session_instance_id=session.instance_id,
                 run_epoch=session.run_epoch,
                 status=session.status,
-                waiting=any(
+                waiting=include_waits
+                and any(
                     checkpoint.get(name) is not None
                     for name in ("pending_user_input", "pending_tool_approval")
                 ),
-                waiting_for_child=checkpoint.get("foreground_child_wait") is not None,
+                waiting_for_child=include_waits
+                and checkpoint.get("foreground_child_wait") is not None,
                 owner=self._execution_owners.get(session_id),
                 now=self._ownership_clock(),
             )
@@ -307,6 +314,9 @@ class SQLiteSessionExecutionMixin:
         return await self._run_write(statement)
 
     async def inspect_session_execution(self, session_id):
+        return await self._inspect_session_execution_owner(session_id, include_waits=True)
+
+    async def _inspect_session_execution_owner(self, session_id, *, include_waits=False):
         session_id = require_clean_nonblank(session_id, "session_id")
 
         def query(connection):
@@ -321,8 +331,8 @@ class SQLiteSessionExecutionMixin:
                 session_instance_id=row[1],
                 run_epoch=row[2],
                 status=row[3],
-                waiting=bool((row[4] or 0) & 3),
-                waiting_for_child=bool((row[4] or 0) & 8),
+                waiting=include_waits and bool((row[4] or 0) & 3),
+                waiting_for_child=include_waits and bool((row[4] or 0) & 8),
                 owner=None if row[5] is None else _ExecutionOwner.model_validate_json(row[5]),
                 now=self._ownership_clock(),
             )
@@ -431,6 +441,9 @@ class PostgresSessionExecutionMixin:
             await conn.commit()
 
     async def inspect_session_execution(self, session_id):
+        return await self._inspect_session_execution_owner(session_id, include_waits=True)
+
+    async def _inspect_session_execution_owner(self, session_id, *, include_waits=False):
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
@@ -447,8 +460,8 @@ class PostgresSessionExecutionMixin:
                 session_instance_id=row[1],
                 run_epoch=row[2],
                 status=row[3],
-                waiting=bool((row[4] or 0) & 3),
-                waiting_for_child=bool((row[4] or 0) & 8),
+                waiting=include_waits and bool((row[4] or 0) & 3),
+                waiting_for_child=include_waits and bool((row[4] or 0) & 8),
                 owner=None if row[5] is None else _ExecutionOwner.model_validate(row[5]),
                 now=now,
             )

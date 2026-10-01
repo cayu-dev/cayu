@@ -553,6 +553,22 @@ class SessionStatusConflict(ValueError):
     """
 
 
+class SessionExecutionInProgress(SessionStatusConflict):
+    """Continuation cannot establish that the current execution was abandoned."""
+
+    def __init__(self, session_id: str, status: SessionStatus) -> None:
+        self.session_id = session_id
+        self.status = status
+        super().__init__(
+            f"Session {session_id!r} is {status.value}: execution is still in progress "
+            "or its process stopped before releasing ownership. Retry after its execution "
+            "lease expires; continuation recovers an abandoned owner automatically. "
+            "For sessions without execution ownership, confirm that the previous executor "
+            "has stopped before calling app.recover_incomplete_session("
+            "IncompleteSessionRecoveryRequest(session_id=...))."
+        )
+
+
 class SessionForkSourceNotFound(KeyError):
     """A fork's source disappeared before the atomic child-creation boundary."""
 
@@ -10883,6 +10899,10 @@ class SessionStore(ABC):
         """Load a session by id."""
 
     supports_session_execution = False
+
+    async def _inspect_session_execution_owner(self, session_id: str) -> SessionExecutionState:
+        """Internal liveness admission; custom stores without it remain conservative."""
+        return await self.inspect_session_execution(session_id)
 
     async def inspect_session_execution(self, session_id: str) -> SessionExecutionState:
         """Read observational liveness; custom stores without leases return unknown."""

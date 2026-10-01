@@ -384,6 +384,44 @@ unnamed `RunRequest`s should use that environment. Otherwise leave it
 non-default and set `RunRequest.environment_name` explicitly. Registering the
 first environment never makes it the default implicitly.
 
+### Continue after a process crash
+
+Use `app.resume(ResumeRequest(...))` for the customer's next message on an
+existing session. With native stores, continuation recovers a `running` or
+`interrupting` session when its recorded executor is provably gone on this
+host, or its execution lease has expired. It records the takeover as
+`session.run_fenced` before continuing. Approval, user-input and provider-operation
+resolution use the same admission check before their existing recovery protocol.
+
+`SessionExecutionInProgress` means the executor is live or abandonment cannot be
+established. Show that the conversation is still in progress and retry later;
+do not turn this exception into an unconditional recovery call. Liveness uses
+the configured lease (60 seconds by default), independently renewed during
+silent model/tool calls; a process proved dead on this host ends it early.
+Inactivity alone does not establish abandonment. A process that is alive but
+cannot renew its lease, for example because it lost the store or blocks its
+event loop longer than the lease, loses ownership and is fenced, so keep
+blocking work off the event loop.
+
+Sessions created by older writers without an execution owner need explicit
+operator recovery. First stop or otherwise prove the old executor has stopped,
+then call
+`app.recover_incomplete_session(IncompleteSessionRecoveryRequest(session_id=...))`
+and inspect its result before continuing. Keep the original executable profile
+available for recovery; a changed tool/provider identity still requires explicit
+profile adoption.
+
+Recovery does not rerun a tool whose call was interrupted, and it cannot show
+the model that call's original arguments. For `NONE` and `IDEMPOTENT` tools, the
+model receives a failed result saying the outcome is unknown and that calling the
+tool again for the same operation is safe, and the conversation continues. An
+idempotent tool should therefore recognize a repeated request for an operation it
+already started, by business identity rather than exact arguments, and return the
+original outcome, for example by reusing the operation key it saved before the
+first attempt. An uncertain `EXTERNAL` effect emits
+`tool.effect.outcome_unknown` and interrupts for reconciliation. Use the service's receipt or idempotency key to
+establish the outcome; never infer that the write failed because its process died.
+
 ## 7. Prove behavior through public seams
 
 The default credential-free proof is:

@@ -9,6 +9,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from uuid import uuid4
 
+from cayu.sessions._process_liveness import current_process_identity
 from cayu.sessions.execution import (
     SessionExecutionConfig,
     bind_execution_progress,
@@ -61,6 +62,7 @@ class SessionExecutionPresence:
                 session.id,
                 token=uuid4().hex,
                 owner_id=process_owner_id(),
+                process_identity=current_process_identity(),
                 owner_kind=current_execution_owner_kind(task_id=task_id),
                 owner_label=self.config.owner_label,
                 lease_seconds=self.config.lease_seconds,
@@ -119,6 +121,7 @@ class SessionExecutionPresence:
                             owner.session_id,
                             token=owner.token,
                             owner_id=owner.owner_id,
+                            process_identity=owner.process_identity,
                             owner_kind=owner.owner_kind,
                             owner_label=owner.owner_label,
                             lease_seconds=self.config.lease_seconds,

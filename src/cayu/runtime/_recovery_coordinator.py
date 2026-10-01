@@ -2470,6 +2470,9 @@ class RecoveryCoordinator:
             store_now: datetime,
         ) -> dict[str, Any] | None:
             nonlocal desired_checkpoint, reserved_checkpoint, reserved_session
+            from cayu.runtime._abandoned_session_recovery import require_abandoned_execution_matches
+
+            require_abandoned_execution_matches(current_session)
             desired = checkpoint_transform(current_session, checkpoint, store_now)
             if desired is None:
                 return None
@@ -5146,6 +5149,9 @@ class RecoveryCoordinator:
             if after_admission is not None:
                 await after_admission()
                 post_admission_authority_confirmed = True
+            # Continuations can execute accepted tools before entering the model
+            # loop. Publish this epoch's owner before dispatching any such work.
+            await self._session_control.execution_presence.ensure(session)
             if before_resume is not None and not await before_resume(session):
                 return session, None
             resumed_event = await self._resume_interaction(
@@ -17584,6 +17590,9 @@ class RecoveryCoordinator:
         preserve_interaction_id: str | None = None,
         _work_attempt: WorkAttemptInvocationAuthority | None = None,
     ) -> IncompleteSessionRecoveryResult:
+        from cayu.runtime._abandoned_session_recovery import require_abandoned_execution_matches
+
+        require_abandoned_execution_matches(session)
         reason = require_clean_nonblank(reason, "reason")
         metadata = copy_durable_metadata(metadata)
         previous_status = session.status

@@ -140,6 +140,7 @@ from cayu.sessions.base import Session as Session
 from cayu.sessions.base import SessionAggregateFilter as SessionAggregateFilter
 from cayu.sessions.base import SessionBudgetInspection as SessionBudgetInspection
 from cayu.sessions.base import SessionDebugState as SessionDebugState
+from cayu.sessions.base import SessionExecutionInProgress as SessionExecutionInProgress
 from cayu.sessions.base import SessionForkProfileRelationship as SessionForkProfileRelationship
 from cayu.sessions.base import SessionIdentity as SessionIdentity
 from cayu.sessions.base import SessionInspectionIdentity as SessionInspectionIdentity
