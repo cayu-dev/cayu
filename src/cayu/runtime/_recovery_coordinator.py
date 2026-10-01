@@ -103,7 +103,6 @@ from cayu.approvals.user_input import (
     checkpoint_with_executing_user_input_resolution_intent,
     checkpoint_with_user_input_resolution_intent,
     checkpoint_without_exact_pending_user_input,
-    event_with_ambiguous_user_input_supersession_authority,
     event_with_pending_user_input_authority,
     event_with_user_input_supersession_authority,
     pending_user_input_digest,
@@ -178,6 +177,7 @@ from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
+from cayu.runtime._approval_support import _pending_approval_and_round_for_atomic_claim
 from cayu.runtime._auxiliary_invocation import AuxiliaryInvocationPolicy
 from cayu.runtime._child_session_identity import (
     ChildSessionKind,
@@ -219,7 +219,6 @@ from cayu.runtime._environment_lifecycle import (
 )
 from cayu.runtime._event_writer import (
     RuntimeEventWriter,
-    _reconcile_exact_persisted_event,
     prepare_runtime_event,
 )
 from cayu.runtime._execution_profile_admission import ModelFailoverProfileResolution
@@ -304,14 +303,17 @@ from cayu.runtime._session_control import (
 )
 from cayu.runtime._session_queries import query_all_sessions
 from cayu.runtime._terminal_evidence import (
-    TERMINAL_EVIDENCE_EVENT_TYPES,
-    TERMINAL_EVIDENCE_QUERY_LIMIT,
-    classify_current_terminal_evidence,
     interruption_request_id_from_payload,
     require_interruption_event_matches_pending_marker,
 )
 from cayu.runtime._terminal_evidence_finalization import (
+    _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
+    _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+    _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
+    _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+    _TERMINAL_EVENT_TYPE_BY_STATUS,
     TerminalEvidenceFinalization,
+    _provider_cancellation_interrupt_payload,
     _terminal_finalization_failure_without_identity,
     _terminal_finalization_process_control,
 )
@@ -365,7 +367,6 @@ from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_matches_session_epoch,
     checkpoint_with_active_invocation_execution_profile,
     event_with_execution_profile_authority,
-    event_with_execution_profile_fingerprint_authority,
     execution_profile_from_session_metadata,
 )
 from cayu.runtime.execution_units import (
@@ -445,7 +446,6 @@ from cayu.sessions.base import (
     _activate_owned_session_run_fence,
     _activate_session_interaction,
     _activate_session_run_fence,
-    _checkpoint_after_session_run_operation_cleanup,
     _checkpoint_with_session_run_operation,
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
@@ -538,17 +538,12 @@ from cayu.workspaces.observation_recovery import (
     workspace_observations_from_checkpoint,
 )
 
-_INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED = "tool_approval_required"
-_INTERRUPTION_TYPE_USER_INPUT_REQUIRED = "user_input_required"
-_INTERRUPTION_TYPE_RUNTIME_INTERRUPTED = "runtime_interrupted"
-_INTERRUPTION_TYPE_OPERATOR_REQUESTED = "operator_requested"
 _ABANDONED_RUN_REASON = "event_stream_closed"
 _ABANDONED_UNREPLAYABLE_TOOL_ROUND_CHECKPOINT_KEY = "abandoned_unreplayable_tool_round"
 _INCOMPLETE_RECOVERY_CLAIM_LEASE = timedelta(minutes=5)
 _INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS = 30.0
 _INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_RETRY_SECONDS = 5.0
 _MANUAL_RECOVERY_INTERRUPT_POLL_INTERVAL_SECONDS = 0.25
-_TERMINAL_EVIDENCE_REPAIR_NAMESPACE = UUID("bd021bef-ec8f-4e1e-950d-734e2c9ac513")
 _COMPLETION_FINALIZATION_TASK_EVENT_NAMESPACE = UUID("ae86f400-31e6-4cd2-95f3-7d6f115c21a1")
 _PROVIDER_OPERATION_UNAVAILABLE_INTERRUPT_NAMESPACE = UUID("c7b311fa-d36b-4ecb-a93a-c96e4c047f01")
 _INCOMPLETE_RECOVERY_CURSOR_VERSION = 1
@@ -573,11 +568,6 @@ _RECOVERY_RESUMABLE_SESSION_STATUSES = {
 }
 
 _RecoveryResultT = TypeVar("_RecoveryResultT")
-_TERMINAL_EVENT_TYPE_BY_STATUS = {
-    SessionStatus.COMPLETED: EventType.SESSION_COMPLETED,
-    SessionStatus.FAILED: EventType.SESSION_FAILED,
-    SessionStatus.INTERRUPTED: EventType.SESSION_INTERRUPTED,
-}
 _TOOL_ROUND_RECOVERABLE_SESSION_STATUSES = {
     SessionStatus.RUNNING,
     SessionStatus.INTERRUPTING,
@@ -790,92 +780,6 @@ logger = logging.getLogger(__name__)
 
 CheckpointTransformFactory = Callable[[dict[str, Any]], CheckpointTransform]
 EffectiveRetryPolicy = Callable[[RetryPolicy | None], RetryPolicy]
-
-
-def _pending_approval_and_round_for_atomic_claim(
-    checkpoint: dict[str, Any] | None,
-    *,
-    approval_id: str,
-    tool_round_id: str,
-    gating_tool_call_id: str | None = None,
-    recovery_tool_call_id: str | None = None,
-    redactor: SecretRedactor,
-    runtime_session: Session | None = None,
-) -> tuple[PendingToolApproval, tool_round_recovery.PendingToolRound]:
-    if (gating_tool_call_id is None) == (recovery_tool_call_id is None):
-        raise TypeError("Exactly one approval gating or recovery tool-call identity is required.")
-    approval = approval_support.pending_approval_from_checkpoint(
-        checkpoint,
-        redactor=redactor,
-    )
-    if approval is None:
-        raise RuntimeError("Session has no pending tool approval.")
-    if approval.approval_id != approval_id or approval.tool_round_id != tool_round_id:
-        raise ValueError("Tool approval identity does not match the current pending approval.")
-    pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
-        checkpoint,
-        redactor=redactor,
-        runtime_session=runtime_session,
-    )
-    reconstructed_approval_only_round = pending_round is None
-    if reconstructed_approval_only_round:
-        # Compatibility boundary for checkpoints written before the paired
-        # approval/round contract. PendingToolApproval is itself validated and
-        # carries the complete policy-planned call list; the atomic claim below
-        # persists this projection before any resolution work can begin.
-        pending_round = approval_support.planned_tool_round_from_pending_approval(approval)
-    if pending_round.policy_state != "planned":
-        raise RuntimeError("Pending tool approval has no durable policy plan.")
-    if (
-        pending_round.tool_round_id != approval.tool_round_id
-        or pending_round.model_step_id != approval.model_step_id
-        or pending_round.model_attempt_id != approval.model_attempt_id
-        or (
-            not reconstructed_approval_only_round
-            and not approval_support.pending_approval_scope_matches_round(
-                approval,
-                pending_round,
-            )
-        )
-        or [call.model_dump(mode="json") for call in pending_round.tool_calls]
-        != [call.model_dump(mode="json") for call in approval.tool_calls]
-    ):
-        raise RuntimeError("Pending tool approval conflicts with its durable tool round.")
-    gating_calls = [
-        call for call in pending_round.tool_calls if call.tool_call_id == approval.tool_call_id
-    ]
-    gating_evidence = (
-        None
-        if len(gating_calls) != 1
-        else approval_support.effective_tool_policy_evidence(gating_calls[0])
-    )
-    if len(gating_calls) != 1 or not (
-        (
-            gating_evidence is ToolPolicyEvidence.AUTHORITATIVE
-            and gating_calls[0].policy_decision == ToolPolicyDecision.REQUIRE_APPROVAL.value
-        )
-        or gating_evidence is ToolPolicyEvidence.AMBIGUOUS
-    ):
-        raise RuntimeError(
-            "Pending approval call is neither authoritatively approval-gated "
-            "nor explicitly ambiguous."
-        )
-    resolution_intent = approval_support.approval_resolution_intent_from_checkpoint(
-        checkpoint,
-        redactor=redactor,
-    )
-    if resolution_intent is not None:
-        approval_support.require_resolution_intent_matches_approval(
-            resolution_intent,
-            approval=approval,
-        )
-    if gating_tool_call_id is not None and approval.tool_call_id != gating_tool_call_id:
-        raise ValueError("Tool approval identity does not match the current pending approval.")
-    if recovery_tool_call_id is not None and not any(
-        call.tool_call_id == recovery_tool_call_id for call in pending_round.tool_calls
-    ):
-        raise ValueError("Recovery tool call is not part of the pending approval round.")
-    return approval, pending_round
 
 
 def _pending_approval_for_atomic_claim(
@@ -1408,15 +1312,6 @@ class RecoveryAbandonedSessionRequest:
     retain_terminal_publication_repair: bool = False
 
 
-@dataclass(frozen=True)
-class _TerminalEvidenceInspection:
-    event: Event | None
-    pending_interrupt_payload: dict[str, Any] | None
-    pending_action_interrupt_payload: dict[str, Any] | None
-    run_operation: _SessionRunOperation | None
-    terminal_event_required: bool
-
-
 def _consume_incomplete_recovery_store_task(task: asyncio.Task[Any]) -> None:
     """Observe a store mutation retained past the local ownership deadline."""
 
@@ -1467,37 +1362,6 @@ class ModelCompletionManualRecoveryRequired(RuntimeError):
 
 class _RecoveryPreflightMutationRequired(RuntimeError):
     """Internal sentinel proving that recovery reached its first write boundary."""
-
-
-def _provider_cancellation_interrupt_payload(
-    checkpoint: dict[str, Any] | None,
-) -> dict[str, Any] | None:
-    """Return one exact reconstructed provider-cancellation interrupt marker."""
-
-    if checkpoint is None:
-        return None
-    marker = checkpoint.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
-    if marker is None:
-        return None
-    if type(marker) is not dict:
-        raise ValueError("Pending session interrupt checkpoint must be an object.")
-    payload = copy_json_value(marker, "pending_session_interrupt")
-    failures = payload.get("provider_cancellation_failures")
-    if failures is None:
-        return None
-    copied_failures = copy_provider_cancellation_failures(failures)
-    if not copied_failures:
-        raise ValueError("Provider cancellation interruption diagnostics cannot be empty.")
-    interruption_type = payload.get("interruption_type")
-    if type(interruption_type) is not str or interruption_type not in (
-        _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
-        _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
-    ):
-        raise ValueError("Provider cancellation interruption type is invalid.")
-    if interruption_request_id_from_payload(payload) is None:
-        raise ValueError("Provider cancellation interruption request identity is invalid.")
-    payload["provider_cancellation_failures"] = [dict(item) for item in copied_failures]
-    return payload
 
 
 @dataclass(frozen=True)
@@ -1836,6 +1700,9 @@ class RecoveryCoordinator:
         self._recovery_cleanup_supervisor = recovery_cleanup_supervisor
         self._recovery_claim_workers: dict[tuple[str, str], _RecoveryWorkerSettlement] = {}
         self.terminal_finalization = TerminalEvidenceFinalization(
+            event_writer=event_writer,
+            secret_redactor=secret_redactor,
+            logger=logger,
             session_store=session_store,
             session_control=session_control,
             recovery=self,
@@ -12915,7 +12782,7 @@ class RecoveryCoordinator:
                 # Typed release may retain the profile at the current epoch.
                 # Replay completed terminal evidence without taking a new fence:
                 # doing so would invent a second interruption for this stop.
-                inspection = await self._inspect_terminal_evidence(
+                inspection = await self.terminal_finalization.inspect(
                     session=current_session,
                     checkpoint=current_checkpoint,
                 )
@@ -16684,7 +16551,7 @@ class RecoveryCoordinator:
                 )
             await self._event_writer.emit(terminal_event)
             if run_operation is not None:
-                await self._clear_session_run_operation(
+                await self.terminal_finalization.clear_run_operation(
                     session_id=finalized.id,
                     operation=run_operation,
                     terminal_evidence_durable=True,
@@ -17683,7 +17550,7 @@ class RecoveryCoordinator:
         )
         terminal_repair_required = False
         if session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES:
-            terminal_repair = await self._terminal_evidence_repair_required(
+            terminal_repair = await self.terminal_finalization.repair_required(
                 session=session,
                 checkpoint=checkpoint,
             )
@@ -18217,23 +18084,6 @@ class RecoveryCoordinator:
                     authoritative_failure=authoritative_failure,
                 )
 
-    async def _terminal_evidence_repair_required(
-        self,
-        *,
-        session: Session,
-        checkpoint: dict[str, Any] | None,
-    ) -> bool:
-        inspection = await self._inspect_terminal_evidence(
-            session=session,
-            checkpoint=checkpoint,
-        )
-        return (
-            (inspection.event is None and inspection.terminal_event_required)
-            or inspection.pending_interrupt_payload is not None
-            or inspection.run_operation is not None
-            or (checkpoint is not None and _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY in checkpoint)
-        )
-
     async def _reconcile_terminal_evidence_before_continuation(
         self,
         *,
@@ -18247,7 +18097,7 @@ class RecoveryCoordinator:
             raise RuntimeError(
                 "A non-terminal session retains incomplete terminal evidence for a prior run."
             )
-        if not await self._terminal_evidence_repair_required(
+        if not await self.terminal_finalization.repair_required(
             session=session,
             checkpoint=checkpoint,
         ):
@@ -18263,7 +18113,7 @@ class RecoveryCoordinator:
         )
         current = await self._require_session(session.id)
         current_checkpoint = await self._session_store.load_checkpoint(session.id)
-        if await self._terminal_evidence_repair_required(
+        if await self.terminal_finalization.repair_required(
             session=current,
             checkpoint=current_checkpoint,
         ):
@@ -18274,185 +18124,6 @@ class RecoveryCoordinator:
                 "Session terminal evidence recovery did not finish the previous run boundary."
             )
         return current, current_checkpoint
-
-    async def _inspect_terminal_evidence(
-        self,
-        *,
-        session: Session,
-        checkpoint: dict[str, Any] | None,
-    ) -> _TerminalEvidenceInspection:
-        expected_event_type = _TERMINAL_EVENT_TYPE_BY_STATUS.get(session.status)
-        if expected_event_type is None:
-            raise ValueError(f"Session is not terminal: {session.status}.")
-        run_operation = _session_run_operation_from_checkpoint(checkpoint)
-
-        pending_interrupt_payload: dict[str, Any] | None = None
-        pending_interrupt_request_id: str | None = None
-        if checkpoint is not None and _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY in checkpoint:
-            marker = checkpoint[_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY]
-            if type(marker) is not dict:
-                raise ValueError("Pending session interrupt checkpoint must be an object.")
-            pending_interrupt_payload = copy_json_value(marker, "pending_session_interrupt")
-            provider_interrupt_payload = _provider_cancellation_interrupt_payload(checkpoint)
-            if provider_interrupt_payload is not None:
-                pending_interrupt_payload = provider_interrupt_payload
-            if session.status != SessionStatus.INTERRUPTED:
-                raise RuntimeError(
-                    "Terminal evidence is contradictory: a non-interrupted session retains "
-                    "a pending interruption marker."
-                )
-            pending_interrupt_request_id = interruption_request_id_from_payload(
-                pending_interrupt_payload
-            )
-            if pending_interrupt_request_id is None:
-                raise RuntimeError(
-                    "Terminal evidence is not repairable: the pending interruption marker "
-                    "has no stable request identity."
-                )
-            await self._validated_user_input_supersession_interrupt_payload(
-                session=session,
-                pending_interrupt_payload=pending_interrupt_payload,
-            )
-
-        pending_approval = approval_support.pending_approval_from_checkpoint(
-            checkpoint,
-            redactor=self._secret_redactor,
-            consume_on_rejection=True,
-        )
-        pending_user_input, _resolution_intent = user_input_lifecycle_authority_from_checkpoint(
-            checkpoint,
-            redactor=self._secret_redactor,
-            consume_on_rejection=True,
-            current_run_epoch=session.run_epoch,
-            runtime_session=session,
-        )
-        pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(
-            checkpoint,
-            redactor=self._secret_redactor,
-            consume_on_rejection=True,
-            runtime_session=session,
-        )
-        approval_owns_tool_round = False
-        if pending_approval is not None and pending_tool_round is not None:
-            _pending_approval_and_round_for_atomic_claim(
-                checkpoint,
-                approval_id=pending_approval.approval_id,
-                tool_round_id=pending_approval.tool_round_id,
-                gating_tool_call_id=pending_approval.tool_call_id,
-                redactor=self._secret_redactor,
-                runtime_session=session,
-            )
-            approval_owns_tool_round = True
-        pending_actions = tuple(
-            action
-            for action in (
-                pending_approval,
-                pending_user_input,
-                None if approval_owns_tool_round else pending_tool_round,
-            )
-            if action is not None
-        )
-        if len(pending_actions) > 1:
-            raise RuntimeError(
-                "Terminal evidence is not repairable: the checkpoint contains "
-                "conflicting pending actions."
-            )
-        if pending_user_input is not None:
-            pause_state = await self._classify_user_input_pause(
-                session=session,
-                checkpoint=checkpoint,
-                input_id=pending_user_input.input_id,
-            )
-            if pause_state not in {
-                UserInputPauseState.ACTIVE,
-                UserInputPauseState.ANSWERING,
-            }:
-                raise SessionRuntimePublicationConflict(
-                    "Terminal user-input evidence has ambiguous pause authority."
-                )
-        pending_action_interrupt_payload: dict[str, Any] | None = None
-        if pending_approval is not None and session.status == SessionStatus.INTERRUPTED:
-            pending_action_interrupt_payload = {
-                "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
-                "model_step_id": pending_approval.model_step_id,
-                "model_attempt_id": pending_approval.model_attempt_id,
-                "tool_round_id": pending_approval.tool_round_id,
-                **approval_support.bounded_pending_approval_event_payload(
-                    pending_approval,
-                    redactor=self._secret_redactor,
-                ),
-            }
-        elif pending_user_input is not None and session.status == SessionStatus.INTERRUPTED:
-            pending_action_interrupt_payload = {
-                "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
-                "model_step_id": pending_user_input.model_step_id,
-                "model_attempt_id": pending_user_input.model_attempt_id,
-                "tool_round_id": pending_user_input.tool_round_id,
-                **pending_user_input_interruption_payload(pending_user_input),
-            }
-        elif pending_tool_round is not None and session.status == SessionStatus.INTERRUPTED:
-            pending_action_interrupt_payload = {
-                **tool_round_recovery.pending_tool_round_identity(pending_tool_round).payload(),
-                "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
-                "reason": "terminal_event_evidence_repaired",
-                "recovered": True,
-            }
-
-        evidence_records = await self._session_store.query_events(
-            EventQuery(
-                session_id=session.id,
-                event_types=TERMINAL_EVIDENCE_EVENT_TYPES,
-                order_by=EventOrder.SEQUENCE_DESC,
-                limit=TERMINAL_EVIDENCE_QUERY_LIMIT,
-            )
-        )
-        classification = classify_current_terminal_evidence(
-            evidence_events=tuple(record.event for record in evidence_records),
-            expected_event_type=expected_event_type,
-            run_operation_id=(None if run_operation is None else run_operation.operation_id),
-            interruption_request_id=pending_interrupt_request_id,
-        )
-        terminal_events = classification.events
-        if classification.run_operation_conflict:
-            raise RuntimeError(
-                "Terminal evidence is contradictory: the interruption event and "
-                "pending run operation have different identities."
-            )
-        if any(event.type != expected_event_type for event in terminal_events):
-            raise RuntimeError(
-                "Terminal evidence is contradictory: the durable event type does not "
-                f"match session status {session.status.value}."
-            )
-        if len(terminal_events) > 1:
-            raise RuntimeError(
-                "Terminal evidence is contradictory: more than one terminal event exists "
-                "for the current run."
-            )
-
-        existing_event = None if not terminal_events else terminal_events[0].model_copy(deep=True)
-        exact_interrupt_marker_retained = pending_interrupt_payload is not None and (
-            "provider_cancellation_failures" in pending_interrupt_payload
-            or pending_interrupt_payload.get("terminal_publication_repair") is True
-            or USER_INPUT_SUPERSESSION_INTENT_KEY in pending_interrupt_payload
-            or AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY in pending_interrupt_payload
-        )
-        if existing_event is not None and exact_interrupt_marker_retained:
-            require_interruption_event_matches_pending_marker(
-                existing_event,
-                pending_interrupt_payload,
-            )
-        return _TerminalEvidenceInspection(
-            event=existing_event,
-            pending_interrupt_payload=pending_interrupt_payload,
-            pending_action_interrupt_payload=pending_action_interrupt_payload,
-            run_operation=run_operation,
-            terminal_event_required=(
-                run_operation is not None
-                or pending_interrupt_payload is not None
-                or pending_action_interrupt_payload is not None
-                or classification.latest_lifecycle_event_type != EventType.SESSION_FORKED
-            ),
-        )
 
     async def has_completed_queued_predecessor(self, session: Session, event: Event) -> bool:
         """Authenticate a completed interaction in an interrupted queue-bearing run."""
@@ -18499,7 +18170,9 @@ class RecoveryCoordinator:
             session_instance_id=session.instance_id,
             active_profile=active,
         )
-        inspection = await self._inspect_terminal_evidence(session=session, checkpoint=checkpoint)
+        inspection = await self.terminal_finalization.inspect(
+            session=session, checkpoint=checkpoint
+        )
         return (
             inspection.event is not None
             and inspection.event.type is EventType.SESSION_INTERRUPTED
@@ -18534,7 +18207,7 @@ class RecoveryCoordinator:
                 )
             return await self._recover_incomplete_session_with_heartbeat(
                 claim=claim,
-                recovery=lambda: self._repair_terminal_evidence(
+                recovery=lambda: self.terminal_finalization.repair(
                     session=claim.session,
                     terminal_run_epoch=claim.session_before_fence.run_epoch,
                     terminal_timestamp=claim.session_before_fence.updated_at,
@@ -18551,306 +18224,6 @@ class RecoveryCoordinator:
                     authority=claim.require_authority(),
                     authoritative_failure=authoritative_failure,
                 )
-
-    async def _repair_terminal_evidence(
-        self,
-        *,
-        session: Session,
-        terminal_run_epoch: int,
-        terminal_timestamp: datetime,
-        previous_status: SessionStatus,
-        claim_id: str,
-    ) -> IncompleteSessionRecoveryResult:
-        checkpoint = await self._session_store.load_checkpoint(session.id)
-        inspection = await self._inspect_terminal_evidence(
-            session=session,
-            checkpoint=checkpoint,
-        )
-        terminal_event = inspection.event
-        if terminal_event is None and inspection.terminal_event_required:
-            repair_event = self._terminal_evidence_repair_event(
-                session=session,
-                terminal_run_epoch=terminal_run_epoch,
-                terminal_timestamp=terminal_timestamp,
-                pending_interrupt_payload=inspection.pending_interrupt_payload,
-                pending_action_interrupt_payload=(inspection.pending_action_interrupt_payload),
-                run_operation=inspection.run_operation,
-            )
-            if session.status is SessionStatus.COMPLETED:
-                repair_event.payload.update(
-                    await recorded_terminal_tool_completion_payload(self._session_store, session)
-                )
-            terminal_event = await self._persist_terminal_evidence_repair_event(repair_event)
-        if inspection.pending_interrupt_payload is not None:
-            await self._clear_repaired_pending_interrupt(
-                session_id=session.id,
-                claim_id=claim_id,
-                expected_payload=inspection.pending_interrupt_payload,
-            )
-        if inspection.run_operation is not None:
-            await self._clear_session_run_operation(
-                session_id=session.id,
-                operation=inspection.run_operation,
-                required_claim_id=claim_id,
-                terminal_evidence_durable=True,
-            )
-
-        if terminal_event is not None:
-            try:
-                await self._event_writer.fan_out_persisted([terminal_event])
-            except Exception as exc:
-                logger.warning(
-                    "Terminal evidence was repaired but durable side-effect delivery remains "
-                    "pending: session_id=%s event_id=%s error_type=%s",
-                    session.id,
-                    terminal_event.id,
-                    type(exc).__name__,
-                )
-
-        current = await self._require_session(session.id)
-        if current.status != session.status or current.run_epoch != session.run_epoch:
-            raise RuntimeError("Terminal session changed while its evidence was repaired.")
-        return IncompleteSessionRecoveryResult(
-            session_id=session.id,
-            previous_status=previous_status,
-            status=current.status,
-            actions=(IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,),
-            events=(() if terminal_event is None else (terminal_event,)),
-            message=(
-                "Reconciled durable terminal evidence."
-                if terminal_event is None
-                else "Repaired durable terminal event evidence."
-            ),
-        )
-
-    def _terminal_evidence_repair_event(
-        self,
-        *,
-        session: Session,
-        terminal_run_epoch: int,
-        terminal_timestamp: datetime,
-        pending_interrupt_payload: dict[str, Any] | None,
-        pending_action_interrupt_payload: dict[str, Any] | None,
-        run_operation: _SessionRunOperation | None,
-    ) -> Event:
-        event_type = _TERMINAL_EVENT_TYPE_BY_STATUS[session.status]
-        pending_interrupt_request_id = (
-            None
-            if pending_interrupt_payload is None
-            else interruption_request_id_from_payload(pending_interrupt_payload)
-        )
-        if pending_interrupt_request_id is not None:
-            operation_identity = f"interrupt_request:{pending_interrupt_request_id}"
-        elif run_operation is not None:
-            operation_identity = run_operation.operation_id
-        else:
-            operation_identity = f"run_epoch:{terminal_run_epoch}"
-        event_id = (
-            run_operation.terminal_event_id
-            if run_operation is not None and run_operation.terminal_event_id is not None
-            else str(
-                uuid5(
-                    _TERMINAL_EVIDENCE_REPAIR_NAMESPACE,
-                    f"{session.id}\0{operation_identity}\0{session.status.value}",
-                )
-            )
-        )
-        if session.status == SessionStatus.COMPLETED:
-            payload: dict[str, Any] = {
-                "recovered": True,
-                "terminal_evidence_repaired": True,
-            }
-        elif session.status == SessionStatus.FAILED:
-            payload = {
-                "error": "Original terminal failure details were not durably recorded.",
-                "error_type": "TerminalFailureEvidenceUnavailable",
-                "recovered": True,
-                "terminal_evidence_repaired": True,
-            }
-        elif pending_interrupt_payload is not None:
-            payload = copy_json_value(
-                pending_interrupt_payload,
-                "pending_session_interrupt",
-            )
-        elif pending_action_interrupt_payload is not None:
-            payload = copy_json_value(
-                pending_action_interrupt_payload,
-                "pending_action_interrupt",
-            )
-        else:
-            payload = {
-                "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
-                "reason": "terminal_event_evidence_repaired",
-                "recovered": True,
-                "terminal_evidence_repaired": True,
-            }
-        event = event_with_runtime_envelope_authority(
-            event_with_runtime_generated_id(
-                Event(
-                    id=event_id,
-                    type=event_type,
-                    session_id=session.id,
-                    timestamp=terminal_timestamp,
-                    agent_name=session.agent_name,
-                    environment_name=session.environment_name,
-                    payload=payload,
-                )
-            ),
-            "session_id",
-        )
-        if type(payload.get("interruption_request_id")) is str:
-            event = event_with_runtime_payload_authority(
-                event,
-                "interruption_request_id",
-            )
-        supersession_payload = payload.get(USER_INPUT_SUPERSESSION_INTENT_KEY)
-        if supersession_payload is not None:
-            try:
-                supersession_intent = UserInputSupersessionIntent.model_validate(
-                    supersession_payload
-                )
-            except (TypeError, ValueError) as exc:
-                raise RuntimeError("User-input supersession evidence is malformed.") from exc
-            event = event_with_user_input_supersession_authority(
-                event,
-                supersession_intent,
-            )
-        ambiguous_supersession_payload = payload.get(AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY)
-        if ambiguous_supersession_payload is not None:
-            try:
-                ambiguous_supersession_intent = AmbiguousUserInputSupersessionIntent.model_validate(
-                    ambiguous_supersession_payload
-                )
-            except (TypeError, ValueError) as exc:
-                raise RuntimeError(
-                    "Ambiguous user-input supersession evidence is malformed."
-                ) from exc
-            event = event_with_ambiguous_user_input_supersession_authority(
-                event,
-                ambiguous_supersession_intent,
-            )
-        raw_profile_fingerprint = payload.get("execution_profile_fingerprint")
-        if raw_profile_fingerprint is None:
-            profile_fingerprint = None
-        elif type(raw_profile_fingerprint) is str:
-            profile_fingerprint = raw_profile_fingerprint
-        else:
-            raise TypeError("execution_profile_fingerprint must be a string or None.")
-        event = event_with_execution_profile_fingerprint_authority(event, profile_fingerprint)
-        return (
-            event
-            if run_operation is None
-            else _event_with_session_run_operation(event, run_operation)
-        )
-
-    async def _persist_terminal_evidence_repair_event(self, event: Event) -> Event:
-        # Freeze the publication-safe shape before the append attempt. The
-        # writer may redact workload secrets, so acknowledgement-loss
-        # reconciliation must compare durable evidence with this prepared
-        # snapshot rather than with the raw checkpoint-derived payload.
-        event = self._event_writer.prepare(event)
-        try:
-            return await self._event_writer.persist(event)
-        except Exception as append_failure:
-            try:
-                records = await self._session_store.query_events(
-                    EventQuery(
-                        session_id=event.session_id,
-                        event_id=event.id,
-                        limit=1,
-                    )
-                )
-            except Exception as reconciliation_failure:
-                add_exception_note_safely(
-                    append_failure,
-                    "Terminal evidence append reconciliation failed: "
-                    f"{type(reconciliation_failure).__name__}.",
-                )
-                raise ExceptionGroup(
-                    "Terminal evidence append and reconciliation both failed.",
-                    [append_failure, reconciliation_failure],
-                ) from None
-            try:
-                persisted = _reconcile_exact_persisted_event(
-                    event,
-                    records,
-                    conflict_message=(
-                        "Terminal evidence repair event identity is already used by "
-                        "different durable evidence."
-                    ),
-                )
-            except RuntimeError as conflict:
-                raise conflict from append_failure
-            if persisted is None:
-                raise
-            return persisted
-
-    async def _clear_repaired_pending_interrupt(
-        self,
-        *,
-        session_id: str,
-        claim_id: str,
-        expected_payload: dict[str, Any],
-    ) -> None:
-        def clear_marker(
-            current_session: Session,
-            checkpoint: dict[str, Any] | None,
-            store_now: datetime,
-        ) -> dict[str, Any]:
-            if current_session.status != SessionStatus.INTERRUPTED:
-                raise RuntimeError("Session status changed during terminal interruption repair.")
-            if checkpoint is None:
-                raise _IncompleteRecoveryClaimLost(
-                    "Terminal evidence recovery checkpoint disappeared."
-                )
-            updated = copy_durable_record(checkpoint, "checkpoint")
-            claim = _incomplete_recovery_claim_from_checkpoint(updated)
-            if claim is None or claim[0] != claim_id or claim[1] <= store_now:
-                raise _IncompleteRecoveryClaimLost(
-                    "Terminal evidence recovery ownership changed before marker cleanup."
-                )
-            current_payload = updated.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
-            if current_payload != expected_payload:
-                raise RuntimeError(
-                    "Pending interruption identity changed during terminal evidence repair."
-                )
-            updated.pop(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
-            return updated
-
-        await self._session_store.transform_checkpoint_with_store_time(session_id, clear_marker)
-
-    async def _clear_session_run_operation(
-        self,
-        *,
-        session_id: str,
-        operation: _SessionRunOperation,
-        required_claim_id: str | None = None,
-        terminal_evidence_durable: bool = False,
-    ) -> None:
-        def clear_operation(
-            _session: Session,
-            checkpoint: dict[str, Any] | None,
-        ) -> dict[str, Any] | None:
-            current_operation = _session_run_operation_from_checkpoint(checkpoint)
-            if current_operation is None:
-                return checkpoint
-            if current_operation != operation:
-                raise RuntimeError(
-                    "Session run operation changed before terminal evidence cleanup."
-                )
-            if required_claim_id is not None:
-                claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
-                if claim is None or claim[0] != required_claim_id:
-                    raise _IncompleteRecoveryClaimLost(
-                        "Terminal evidence recovery ownership changed before run cleanup."
-                    )
-            return _checkpoint_after_session_run_operation_cleanup(
-                checkpoint,
-                operation=operation,
-                retain_terminal_receipt=terminal_evidence_durable,
-            )
-
-        await self._session_store.transform_checkpoint(session_id, clear_operation)
 
     async def _cleanup_incomplete_recovery_claim(
         self,
@@ -18992,7 +18365,7 @@ class RecoveryCoordinator:
                         # does not settle that invocation or authorize release.
                         # Keep the fence for the next exact recovery owner.
                         return
-                    inspection = await self._inspect_terminal_evidence(
+                    inspection = await self.terminal_finalization.inspect(
                         session=session,
                         checkpoint=checkpoint,
                     )
@@ -21408,7 +20781,7 @@ class RecoveryCoordinator:
             )
             if task_failed_event is not None:
                 events.append(task_failed_event)
-            terminal_repair = await self._repair_terminal_evidence(
+            terminal_repair = await self.terminal_finalization.repair(
                 session=session,
                 terminal_run_epoch=session_before_fence.run_epoch,
                 terminal_timestamp=session_before_fence.updated_at,
@@ -21611,7 +20984,7 @@ class RecoveryCoordinator:
 
         if provider_interrupt_payload is not None:
             if session.status is SessionStatus.INTERRUPTED:
-                return await self._repair_terminal_evidence(
+                return await self.terminal_finalization.repair(
                     session=session,
                     terminal_run_epoch=session_before_fence.run_epoch,
                     terminal_timestamp=session_before_fence.updated_at,
@@ -21867,12 +21240,12 @@ class RecoveryCoordinator:
                 )
 
         if session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES and (
-            await self._terminal_evidence_repair_required(
+            await self.terminal_finalization.repair_required(
                 session=session,
                 checkpoint=checkpoint,
             )
         ):
-            repaired = await self._repair_terminal_evidence(
+            repaired = await self.terminal_finalization.repair(
                 session=session,
                 terminal_run_epoch=session_before_fence.run_epoch,
                 terminal_timestamp=session_before_fence.updated_at,

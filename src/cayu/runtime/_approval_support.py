@@ -1435,3 +1435,87 @@ def taint_labels_from_pending_tool_call(
     """Active taint labels persisted for this call, restored so the resumed tool is gated with the
     same taint the policy used before the pause."""
     return frozenset(pending_tool_call.active_taint_labels)
+
+
+def _pending_approval_and_round_for_atomic_claim(
+    checkpoint: dict[str, Any] | None,
+    *,
+    approval_id: str,
+    tool_round_id: str,
+    gating_tool_call_id: str | None = None,
+    recovery_tool_call_id: str | None = None,
+    redactor: SecretRedactor,
+    runtime_session: Session | None = None,
+) -> tuple[PendingToolApproval, tool_round_recovery.PendingToolRound]:
+    if (gating_tool_call_id is None) == (recovery_tool_call_id is None):
+        raise TypeError("Exactly one approval gating or recovery tool-call identity is required.")
+    approval = pending_approval_from_checkpoint(
+        checkpoint,
+        redactor=redactor,
+    )
+    if approval is None:
+        raise RuntimeError("Session has no pending tool approval.")
+    if approval.approval_id != approval_id or approval.tool_round_id != tool_round_id:
+        raise ValueError("Tool approval identity does not match the current pending approval.")
+    pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+        checkpoint,
+        redactor=redactor,
+        runtime_session=runtime_session,
+    )
+    reconstructed_approval_only_round = pending_round is None
+    if reconstructed_approval_only_round:
+        # Compatibility boundary for checkpoints written before the paired
+        # approval/round contract. PendingToolApproval is itself validated and
+        # carries the complete policy-planned call list; the atomic claim below
+        # persists this projection before any resolution work can begin.
+        pending_round = planned_tool_round_from_pending_approval(approval)
+    if pending_round.policy_state != "planned":
+        raise RuntimeError("Pending tool approval has no durable policy plan.")
+    if (
+        pending_round.tool_round_id != approval.tool_round_id
+        or pending_round.model_step_id != approval.model_step_id
+        or pending_round.model_attempt_id != approval.model_attempt_id
+        or (
+            not reconstructed_approval_only_round
+            and not pending_approval_scope_matches_round(
+                approval,
+                pending_round,
+            )
+        )
+        or [call.model_dump(mode="json") for call in pending_round.tool_calls]
+        != [call.model_dump(mode="json") for call in approval.tool_calls]
+    ):
+        raise RuntimeError("Pending tool approval conflicts with its durable tool round.")
+    gating_calls = [
+        call for call in pending_round.tool_calls if call.tool_call_id == approval.tool_call_id
+    ]
+    gating_evidence = (
+        None if len(gating_calls) != 1 else effective_tool_policy_evidence(gating_calls[0])
+    )
+    if len(gating_calls) != 1 or not (
+        (
+            gating_evidence is ToolPolicyEvidence.AUTHORITATIVE
+            and gating_calls[0].policy_decision == ToolPolicyDecision.REQUIRE_APPROVAL.value
+        )
+        or gating_evidence is ToolPolicyEvidence.AMBIGUOUS
+    ):
+        raise RuntimeError(
+            "Pending approval call is neither authoritatively approval-gated "
+            "nor explicitly ambiguous."
+        )
+    resolution_intent = approval_resolution_intent_from_checkpoint(
+        checkpoint,
+        redactor=redactor,
+    )
+    if resolution_intent is not None:
+        require_resolution_intent_matches_approval(
+            resolution_intent,
+            approval=approval,
+        )
+    if gating_tool_call_id is not None and approval.tool_call_id != gating_tool_call_id:
+        raise ValueError("Tool approval identity does not match the current pending approval.")
+    if recovery_tool_call_id is not None and not any(
+        call.tool_call_id == recovery_tool_call_id for call in pending_round.tool_calls
+    ):
+        raise ValueError("Recovery tool call is not part of the pending approval round.")
+    return approval, pending_round

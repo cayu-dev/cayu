@@ -8567,7 +8567,7 @@ def test_session_store_conformance_settles_replacement_claim_when_terminal_event
                         session_id,
                         SessionStatus.INTERRUPTED,
                     )
-                    repair_event = recovery._terminal_evidence_repair_event(
+                    repair_event = recovery.terminal_finalization._repair_event(
                         session=terminal_session,
                         terminal_run_epoch=terminal_session.run_epoch,
                         terminal_timestamp=terminal_session.updated_at,
@@ -8575,7 +8575,7 @@ def test_session_store_conformance_settles_replacement_claim_when_terminal_event
                         pending_action_interrupt_payload=None,
                         run_operation=None,
                     )
-                    persisted_event = await recovery._persist_terminal_evidence_repair_event(
+                    persisted_event = await recovery.terminal_finalization._persist_repair_event(
                         repair_event
                     )
                 return renewal

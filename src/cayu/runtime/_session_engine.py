@@ -20002,11 +20002,9 @@ class SessionEngine:
                         reloaded_checkpoint = await self.session_store.load_checkpoint(
                             reloaded_session.id
                         )
-                        terminal_inspection = (
-                            await self._recovery_coordinator._inspect_terminal_evidence(
-                                session=reloaded_session,
-                                checkpoint=reloaded_checkpoint,
-                            )
+                        terminal_inspection = await self._terminal_finalization.inspect(
+                            session=reloaded_session,
+                            checkpoint=reloaded_checkpoint,
                         )
                         existing_interrupt_event = terminal_inspection.event
                     else:
@@ -30711,7 +30709,7 @@ class SessionEngine:
         checkpoint = await self.session_store.load_checkpoint(session_id)
         if checkpoint is not None and _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY not in checkpoint:
             return
-        await self._recovery_coordinator._clear_repaired_pending_interrupt(
+        await self._terminal_finalization.clear_pending_interrupt(
             session_id=session_id,
             claim_id=claim_id,
             expected_payload=expected_payload,

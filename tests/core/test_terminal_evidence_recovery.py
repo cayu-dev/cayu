@@ -369,7 +369,7 @@ def test_terminal_evidence_repair_rejects_same_id_with_different_timestamp() -> 
             RuntimeError,
             match="identity is already used by different durable evidence",
         ) as raised:
-            await app._recovery_coordinator._persist_terminal_evidence_repair_event(expected)
+            await app._recovery_coordinator.terminal_finalization._persist_repair_event(expected)
 
         assert raised.value.__cause__ is not None
         records = await store.query_events(
@@ -401,7 +401,7 @@ def test_terminal_evidence_repair_reconciliation_preserves_both_failure_chains(
         monkeypatch.setattr(app._event_writer, "persist", fail_append)
         monkeypatch.setattr(app.session_store, "query_events", fail_query)
         with pytest.raises(ExceptionGroup) as raised:
-            await app._recovery_coordinator._persist_terminal_evidence_repair_event(
+            await app._recovery_coordinator.terminal_finalization._persist_repair_event(
                 Event(
                     type=EventType.SESSION_FAILED,
                     session_id="sess_terminal_repair_dual_failure",
