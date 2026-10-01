@@ -41619,5 +41619,21 @@
     "tests/core/test_verification_package_layout.py::test_boundary_resolves_headers_and_comprehensions_in_their_evaluation_scope[workers = [item for c in modules for item in c.VerifiedTaskWorker]-False]": 0.0002677913289517164,
     "tests/core/test_verification_package_layout.py::test_boundary_resolves_headers_and_comprehensions_in_their_evaluation_scope[workers = [item for item in modules if c.VerifiedTaskWorker]-True]": 0.00021174899302423,
     "tests/core/test_verification_package_layout.py::test_boundary_resolves_headers_and_comprehensions_in_their_evaluation_scope[workers = {c.VerifiedTaskWorker for c in modules}-False]": 0.00019941688515245914,
-    "tests/core/test_verification_package_layout.py::test_boundary_resolves_headers_and_comprehensions_in_their_evaluation_scope[workers = {c: c.VerifiedTaskWorker for c in modules}-False]": 0.00021091685630381107
+    "tests/core/test_verification_package_layout.py::test_boundary_resolves_headers_and_comprehensions_in_their_evaluation_scope[workers = {c: c.VerifiedTaskWorker for c in modules}-False]": 0.00021091685630381107,
+    "tests/server/test_server_eval_admission.py::test_admission_preserves_durable_identity_provenance_and_replay_order[False]": 0.734,
+    "tests/server/test_server_eval_admission.py::test_admission_preserves_durable_identity_provenance_and_replay_order[True]": 0.55,
+    "tests/server/test_server_eval_admission.py::test_admission_profile_failures_remain_private_and_precede_persistence[unavailable-published]": 0.416,
+    "tests/server/test_server_eval_admission.py::test_admission_profile_failures_remain_private_and_precede_persistence[unavailable-effective]": 0.407,
+    "tests/server/test_server_eval_admission.py::test_admission_profile_failures_remain_private_and_precede_persistence[unavailable-recheck]": 0.595,
+    "tests/server/test_server_eval_admission.py::test_admission_profile_failures_remain_private_and_precede_persistence[identity_changed-published]": 0.391,
+    "tests/server/test_server_eval_admission.py::test_admission_profile_failures_remain_private_and_precede_persistence[identity_changed-effective]": 0.405,
+    "tests/server/test_server_eval_admission.py::test_admission_profile_failures_remain_private_and_precede_persistence[identity_changed-recheck]": 0.436,
+    "tests/server/test_server_eval_admission.py::test_admission_storage_errors_preserve_private_responses_and_redaction[conflict]": 0.626,
+    "tests/server/test_server_eval_admission.py::test_admission_storage_errors_preserve_private_responses_and_redaction[unsafe]": 0.444,
+    "tests/server/test_server_eval_admission.py::test_admission_storage_errors_preserve_private_responses_and_redaction[checkpointing]": 0.479,
+    "tests/server/test_server_eval_admission.py::test_admission_rejects_invalid_work_without_persisting_a_run[trials]": 0.388,
+    "tests/server/test_server_eval_admission.py::test_admission_rejects_invalid_work_without_persisting_a_run[suite_concurrency]": 0.394,
+    "tests/server/test_server_eval_admission.py::test_admission_rejects_invalid_work_without_persisting_a_run[unrunnable]": 0.586,
+    "tests/server/test_server_eval_admission.py::test_admission_rejects_invalid_work_without_persisting_a_run[blank_key]": 0.389,
+    "tests/server/test_server_eval_admission.py::test_admission_rejects_invalid_work_without_persisting_a_run[cost_budget]": 0.404
 }

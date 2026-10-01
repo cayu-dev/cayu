@@ -83,8 +83,8 @@ store, target registry and shared auth dependencies. Authoring diagnostics check
 current judge authority, public material and exact scenario references; repeated
 scenario revisions share one read, with at most 16 reads in flight. Authoring
 reads and run launch use the same suite revision loader to enforce persistence
-support, private storage errors and current target visibility. Run admission,
-execution and worker lifespan remain in router composition.
+support, private storage errors and current target visibility. Launch
+orchestration and worker lifespan remain in router composition.
 
 `server/_scenario_authoring_routes.py` owns scenario preview, save, catalog,
 detail, download and artifact fixture preparation. Authoring and launch share
@@ -93,7 +93,7 @@ target-registry inputs. Fixture preparation checks the reviewed revision,
 copies the selected retained bytes into an environment fixture, clears that
 temporary artifact selection and checks readiness against the updated scenario.
 It returns the new scenario revision without saving it. Router composition
-retains scenario run admission, execution and the shared bounded/auth boundary.
+retains scenario launch orchestration and the shared bounded/auth boundary.
 
 `server/_corpus_management_routes.py` owns corpus import, catalog, detail,
 download and suite/case browsing. It receives the bounded router, store, target
@@ -107,8 +107,17 @@ approval, cancellation, results, report downloads and comparisons. It receives
 the bounded router, store, target registry, optional result catalog and shared
 auth dependencies. Run visibility is checked before result loading, and the run
 is reloaded after publication becomes visible. Reporting and comparison compose
-the existing library functions. Launch preparation, admission and the worker
-lifespan remain in router composition.
+the existing library functions. Launch handlers and the worker lifespan remain
+in router composition.
+
+`server/_eval_run_admission.py` owns the shared HTTP invocation, request identity,
+retry lookup, execution-profile preparation and durable admission functions.
+Corpus, authored-suite, scenario and captured-session launch handlers compose
+these functions with explicit store or registry inputs where required. An
+accepted retry is resolved before preparing new work. Fresh work retains the
+published and effective profile checks, execution bounds and target redaction
+before persistence. Each step remains separately callable; family-specific
+preflight, publication and budget narrowing stay with the launch handlers.
 
 ## Runtime Shape
 

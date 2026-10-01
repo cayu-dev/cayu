@@ -44,7 +44,6 @@ if TYPE_CHECKING:
 from cayu._exception_groups import exception_tree_contains
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
-    canonical_durable_json_bytes,
     compact_json_utf8_size,
     copy_durable_json_object,
     copy_json_value,
@@ -98,18 +97,14 @@ from cayu.budgets.usage import (
 from cayu.configuration import DEFAULT_MAX_STEPS, MAX_STEPS
 from cayu.context.structured_output import StructuredOutputSpec
 from cayu.context.thinking import ThinkingConfig
-from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
 from cayu.evals.corpus import (
     ArtifactAssertionSpec,
-    EvalCorpusDocument,
     ToolArgumentsContainAssertionSpec,
     ToolResultContainsAssertionSpec,
     eval_suite_trial_policy,
     pricing_profile_identity,
 )
 from cayu.evals.execution import (
-    CompiledCorpusSuite,
-    CorpusTarget,
     compile_corpus_suite,
     evaluation_target_identity,
 )
@@ -138,11 +133,8 @@ from cayu.evals.scenario_preflight import (
 from cayu.evals.store import (
     EvalCorpusConflict,
     EvalResultConflict,
-    EvalRunAdmissionConflict,
     EvalRunCostBudget,
-    EvalRunInvocation,
     EvalRunRecord,
-    EvalRunRequest,
     EvalScenarioArtifactReference,
     EvalScenarioRunInvocation,
     EvalStorePublicationRejected,
@@ -164,7 +156,6 @@ from cayu.evals.suite_preflight import (
     allocate_authored_suite_launch_concurrency,
     compile_authored_suite_run_exposure,
 )
-from cayu.evals.trial_policy import EvalSuiteRunExposureV1
 from cayu.events import (
     Event,
     EventType,
@@ -239,6 +230,14 @@ from cayu.server._corpus_management_routes import (
     register_corpus_management_routes,
 )
 from cayu.server._diagnostics import SystemDiagnosticsSnapshot, inspect_system_diagnostics
+from cayu.server._eval_run_admission import (
+    admit_eval_run,
+    bind_eval_admission_request,
+    eval_idempotency_digest,
+    eval_run_invocation,
+    prepare_eval_run,
+    replay_eval_run,
+)
 from cayu.server._evaluation_promotion_routes import (
     _promotion_error_detail,
     register_evaluation_promotion_routes,
@@ -1058,7 +1057,6 @@ MutationIdHeader = Annotated[
     ),
 ]
 ArtifactIdPath = Annotated[str, StringConstraints(min_length=1)]
-_EVAL_ADMISSION_REQUEST_REVISION_DOMAIN = b"cayu-eval-admission-request-v1\0"
 _EVENT_PAGE_LIMIT_MAX = 1000
 _TRANSCRIPT_PAGE_LIMIT_MAX = 1000
 _ARTIFACT_PAGE_LIMIT_MAX = 500
@@ -4613,57 +4611,6 @@ def create_router(
         eval_store = eval_runtime.store
         active_eval_registry = eval_runtime.registry
 
-        def _eval_target(target_key: str | None = None):
-            selected_key = (
-                active_eval_registry.default_target_key if target_key is None else target_key
-            )
-            target = active_eval_registry.get(selected_key)
-            if target is None:
-                raise HTTPException(status_code=404, detail="Eval target not found.")
-            return target
-
-        def _eval_run_invocation(
-            auth_context: AuthContext | None,
-            *,
-            max_steps: int | None,
-            limits: RunLimits | None,
-            cost_budget: EvalRunCostBudget | None,
-            scenario: EvalScenarioRunInvocation | None = None,
-            authored_suite_revision: str | None = None,
-            authored_suite_selection_revision: str | None = None,
-            authored_suite_launch_revision: str | None = None,
-            authored_suite_launch_lane: int | None = None,
-            authored_suite_exposure: EvalSuiteRunExposureV1 | None = None,
-        ) -> EvalRunInvocation:
-            try:
-                origin = (
-                    None
-                    if auth_context is None
-                    else InvocationOrigin(
-                        trust=InvocationOriginTrust.SERVER_VERIFIED,
-                        subject=auth_context.subject,
-                        tenant=auth_context.tenant,
-                    )
-                )
-                return EvalRunInvocation(
-                    source=SessionExecutionSource.HTTP_RUN,
-                    origin=origin,
-                    max_steps=max_steps,
-                    limits=limits,
-                    cost_budget=cost_budget,
-                    authored_suite_revision=authored_suite_revision,
-                    authored_suite_selection_revision=(authored_suite_selection_revision),
-                    authored_suite_launch_revision=authored_suite_launch_revision,
-                    authored_suite_launch_lane=authored_suite_launch_lane,
-                    authored_suite_exposure=authored_suite_exposure,
-                    scenario=scenario,
-                )
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Eval execution bounds or authenticated provenance are invalid.",
-                ) from exc
-
         def _narrow_eval_cost_budget(
             current: EvalRunCostBudget | None,
             requested: EvalRunCostBudget | None,
@@ -4681,301 +4628,6 @@ def create_router(
                 ),
                 currency=current.currency,
             )
-
-        def _bind_eval_admission_request(
-            invocation: EvalRunInvocation,
-            *,
-            kind: Literal["authored_suite", "captured", "corpus", "scenario"],
-            target_key: str,
-            resource_identity: Mapping[str, object],
-            body: BaseModel,
-        ) -> EvalRunInvocation:
-            material = {
-                "kind": kind,
-                "target_key": target_key,
-                "resource_identity": copy_json_value(
-                    dict(resource_identity),
-                    "eval admission resource identity",
-                ),
-                "request": body.model_dump(mode="json"),
-                "invocation_provenance": {
-                    "source": invocation.source.value,
-                    "origin": (
-                        None
-                        if invocation.origin is None
-                        else invocation.origin.model_dump(mode="json")
-                    ),
-                },
-            }
-            revision = (
-                "sha256:"
-                + hashlib.sha256(
-                    _EVAL_ADMISSION_REQUEST_REVISION_DOMAIN
-                    + canonical_durable_json_bytes(material, "eval admission request")
-                ).hexdigest()
-            )
-            return EvalRunInvocation.model_validate(
-                {
-                    **invocation.model_dump(mode="python"),
-                    "admission_request_revision": revision,
-                }
-            )
-
-        def _eval_idempotency_digest(
-            target_key: str,
-            idempotency_key: str,
-            *,
-            namespace: str | None = None,
-        ) -> str:
-            try:
-                clean_key = require_clean_nonblank(idempotency_key, "Idempotency-Key")
-                require_unicode_scalar_text(clean_key, "Idempotency-Key")
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(status_code=400, detail="Invalid Idempotency-Key.") from exc
-            if namespace is None:
-                domain = b"cayu-server-eval-idempotency-v1\0"
-            else:
-                try:
-                    clean_namespace = require_clean_nonblank(
-                        namespace,
-                        "internal eval idempotency namespace",
-                    )
-                    namespace_bytes = clean_namespace.encode("ascii")
-                except (TypeError, UnicodeEncodeError, ValueError) as exc:
-                    raise RuntimeError("Invalid internal eval idempotency namespace.") from exc
-                domain = b"cayu-server-eval-idempotency-v1\0internal\0" + namespace_bytes + b"\0"
-            return (
-                "sha256:"
-                + hashlib.sha256(
-                    domain + target_key.encode("ascii") + b"\0" + clean_key.encode("utf-8")
-                ).hexdigest()
-            )
-
-        async def _replay_eval_run(
-            *,
-            target_key: str,
-            idempotency_key: str,
-            admission_request_revision: str,
-            idempotency_namespace: str | None = None,
-        ) -> EvalRunRecord | None:
-            digest = _eval_idempotency_digest(
-                target_key,
-                idempotency_key,
-                namespace=idempotency_namespace,
-            )
-            existing = await eval_store.load_run_by_idempotency_key(digest)
-            if existing is None:
-                return None
-            if (
-                existing.spec.target_key != target_key
-                or existing.spec.invocation.admission_request_revision != admission_request_revision
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="Idempotency-Key is already bound to another eval run request.",
-                )
-            return existing
-
-        async def _admit_eval_run(
-            *,
-            corpus: EvalCorpusDocument,
-            max_concurrency: int,
-            invocation: EvalRunInvocation,
-            idempotency_key: str,
-            idempotency_namespace: str | None = None,
-            eval_target: CorpusTarget,
-            compiled: CompiledCorpusSuite,
-        ) -> EvalRunRecord:
-            if not eval_store.trial_checkpointing:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Restart-safe eval trial checkpointing is not available.",
-                )
-            if eval_target.key != corpus.target_key:
-                raise RuntimeError("Prepared eval target does not match its corpus.")
-            if invocation.execution_profile is None:
-                raise RuntimeError("Server-admitted eval run lost its execution-profile binding.")
-            if invocation.admission_request_revision is None:
-                raise RuntimeError("Server-admitted eval run lost its admission request revision.")
-            run_request = EvalRunRequest(
-                run_id=f"eval-{uuid4().hex}",
-                corpus_revision=corpus.revision,
-                target_key=eval_target.key,
-                suite_id=compiled.run_contract.suite_id,
-                suite_revision=compiled.run_contract.suite_revision,
-                max_concurrency=max_concurrency,
-                invocation=invocation,
-                idempotency_key=_eval_idempotency_digest(
-                    eval_target.key,
-                    idempotency_key,
-                    namespace=idempotency_namespace,
-                ),
-            )
-            try:
-                return await eval_store.admit_run(
-                    run_request,
-                    redact_json=eval_target.app.redact_json,
-                )
-            except EvalRunAdmissionConflict as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Idempotency-Key is already bound to another eval run request.",
-                ) from exc
-            except EvalStorePublicationRejected as exc:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Eval run request contains unsafe public data.",
-                ) from exc
-
-        async def _prepare_eval_run(
-            *,
-            corpus: EvalCorpusDocument,
-            suite_id: str,
-            max_concurrency: int,
-            invocation: EvalRunInvocation,
-            expected_execution_profile_revision: str | None = None,
-            expect_exact_execution_profile: bool = False,
-        ) -> tuple[CorpusTarget, CompiledCorpusSuite, EvalRunInvocation]:
-            eval_target = _eval_target(corpus.target_key)
-            registration = active_eval_registry.registration(eval_target.key)
-            if registration is None:
-                raise HTTPException(status_code=404, detail="Eval target not found.")
-            suite = next((item for item in corpus.suites if item.id == suite_id), None)
-            policy = registration.execution_profile_policy
-            if suite is not None and suite.trial_request.trials > policy.max_trials:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Eval run exceeds the published execution-profile trial limit.",
-                )
-            if (
-                suite is not None
-                and max_concurrency > eval_suite_trial_policy(suite).max_concurrency
-            ):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Eval run exceeds the immutable suite concurrency policy.",
-                )
-            if max_concurrency > policy.max_concurrency:
-                raise HTTPException(
-                    status_code=400,
-                    detail=("Eval run exceeds the published execution-profile concurrency limit."),
-                )
-            if any(case.suite_id == suite_id and case.input is None for case in corpus.cases):
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "This captured evaluation has no runnable input. Author runnable "
-                        "input or a scenario before launching fresh work."
-                    ),
-                )
-            try:
-                published_profile_revision = None
-                if (
-                    expected_execution_profile_revision is not None
-                    and not expect_exact_execution_profile
-                ):
-                    published_profile = await active_eval_registry.prepare_execution_profile(
-                        eval_target.key
-                    )
-                    published_profile_revision = published_profile.snapshot.revision
-                    if published_profile.snapshot.revision != expected_execution_profile_revision:
-                        raise HTTPException(
-                            status_code=409,
-                            detail=(
-                                "The selected eval execution profile changed after it was "
-                                "reviewed. Refresh readiness before launching."
-                            ),
-                        )
-            except HTTPException:
-                raise
-            except EvalExecutionProfileChangedError as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "The application identity for this eval execution profile changed after "
-                        "the target was published. Refresh the deployment before launching."
-                    ),
-                ) from exc
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail="The current eval execution profile is unavailable.",
-                ) from exc
-            try:
-                effective_target = target_for_eval_invocation(
-                    registration.execution_target(),
-                    invocation,
-                )
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Eval run is incompatible with the attached target or bounds.",
-                ) from exc
-            try:
-                prepared_profile = await active_eval_registry.prepare_execution_profile(
-                    eval_target.key,
-                    effective_target=effective_target,
-                )
-                effective_target = prepared_profile.target
-                if (
-                    expected_execution_profile_revision is not None
-                    and expect_exact_execution_profile
-                    and prepared_profile.snapshot.revision != expected_execution_profile_revision
-                ):
-                    raise HTTPException(
-                        status_code=409,
-                        detail=(
-                            "The exact eval execution profile changed after readiness. "
-                            "Check launch readiness again."
-                        ),
-                    )
-                invocation = invocation.model_copy(
-                    update={
-                        "execution_profile": prepared_profile.binding,
-                        "execution_profile_snapshot": prepared_profile.snapshot,
-                    },
-                    deep=True,
-                )
-                if published_profile_revision is not None:
-                    current_published_profile = (
-                        await active_eval_registry.prepare_execution_profile(eval_target.key)
-                    )
-                    if current_published_profile.snapshot.revision != published_profile_revision:
-                        raise HTTPException(
-                            status_code=409,
-                            detail=(
-                                "The selected eval execution profile changed during launch "
-                                "preparation. Refresh readiness before launching."
-                            ),
-                        )
-            except HTTPException:
-                raise
-            except EvalExecutionProfileChangedError as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "The application identity for this eval execution profile changed after "
-                        "the target was published. Refresh the deployment before launching."
-                    ),
-                ) from exc
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail="The exact current eval execution profile is unavailable.",
-                ) from exc
-            try:
-                compiled = await asyncio.to_thread(
-                    compile_corpus_suite,
-                    corpus,
-                    effective_target,
-                    suite_id,
-                )
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Eval corpus is incompatible with the attached target or bounds.",
-                ) from exc
-            return effective_target, compiled, invocation
 
         @bounded_captured_evaluation_router.post(
             "/evals/sessions/{session_id}/evaluation/launch",
@@ -5063,13 +4715,13 @@ def create_router(
                         "The reviewed evaluation cannot be converted to runnable work.",
                     ),
                 ) from exc
-            invocation = _eval_run_invocation(
+            invocation = eval_run_invocation(
                 auth_context,
                 max_steps=body.max_steps,
                 limits=body.limits,
                 cost_budget=body.cost_budget,
             )
-            invocation = _bind_eval_admission_request(
+            invocation = bind_eval_admission_request(
                 invocation,
                 kind="captured",
                 target_key=target.key,
@@ -5079,7 +4731,8 @@ def create_router(
             admission_request_revision = invocation.admission_request_revision
             if admission_request_revision is None:
                 raise RuntimeError("Captured eval launch lost its admission request revision.")
-            replayed = await _replay_eval_run(
+            replayed = await replay_eval_run(
+                eval_store=eval_store,
                 target_key=target.key,
                 idempotency_key=idempotency_key,
                 admission_request_revision=admission_request_revision,
@@ -5092,7 +4745,8 @@ def create_router(
                     captured=CapturedEvaluationSaveResponse(record=record, result=result),
                     run=replayed,
                 )
-            eval_target, compiled, invocation = await _prepare_eval_run(
+            eval_target, compiled, invocation = await prepare_eval_run(
+                active_eval_registry=active_eval_registry,
                 corpus=corpus,
                 suite_id=runnable_candidate.suite.id,
                 max_concurrency=body.max_concurrency,
@@ -5120,7 +4774,8 @@ def create_router(
                     status_code=413,
                     detail="The runnable evaluation exceeds the server byte limit.",
                 ) from exc
-            run = await _admit_eval_run(
+            run = await admit_eval_run(
+                eval_store=eval_store,
                 corpus=corpus,
                 max_concurrency=body.max_concurrency,
                 invocation=invocation,
@@ -5275,7 +4930,7 @@ def create_router(
                     )
             if simple_cases and not diagnostics:
                 try:
-                    simple_invocation = _eval_run_invocation(
+                    simple_invocation = eval_run_invocation(
                         None,
                         max_steps=None,
                         limits=None,
@@ -5413,7 +5068,7 @@ def create_router(
                                     for item in preflight.binding.artifacts
                                 ),
                             )
-                            profile_invocation = _eval_run_invocation(
+                            profile_invocation = eval_run_invocation(
                                 None,
                                 max_steps=preflight.binding.max_steps,
                                 limits=preflight.binding.operator_run_limits,
@@ -5598,8 +5253,8 @@ def create_router(
             suite = await load_authored_suite(
                 suite_revision, eval_store=eval_store, active_eval_registry=active_eval_registry
             )
-            replay_probe = _bind_eval_admission_request(
-                _eval_run_invocation(
+            replay_probe = bind_eval_admission_request(
+                eval_run_invocation(
                     auth_context,
                     max_steps=None,
                     limits=None,
@@ -5613,7 +5268,8 @@ def create_router(
             admission_request_revision = replay_probe.admission_request_revision
             if admission_request_revision is None:
                 raise RuntimeError("Authored eval launch lost its admission request revision.")
-            replayed_first_part = await _replay_eval_run(
+            replayed_first_part = await replay_eval_run(
+                eval_store=eval_store,
                 target_key=suite.target_key,
                 idempotency_key=idempotency_key,
                 idempotency_namespace="authored-suite-part-1",
@@ -5627,7 +5283,8 @@ def create_router(
                 replayed_parts_list: list[EvalRunRecord | None] = [replayed_first_part]
                 for index in range(1, len(body.expected_execution_profiles)):
                     replayed_parts_list.append(
-                        await _replay_eval_run(
+                        await replay_eval_run(
+                            eval_store=eval_store,
                             target_key=suite.target_key,
                             idempotency_key=idempotency_key,
                             idempotency_namespace=f"authored-suite-part-{index + 1}",
@@ -5715,7 +5372,7 @@ def create_router(
             execution_target = registration.execution_target()
             trial_policy = eval_suite_trial_policy(suite.suite)
             cases_by_id = {case.id: case for case in suite.cases}
-            launch_revision = _eval_idempotency_digest(
+            launch_revision = eval_idempotency_digest(
                 suite.target_key,
                 idempotency_key,
                 namespace="authored-suite-launch",
@@ -5732,7 +5389,7 @@ def create_router(
             ):
                 if plan.kind == "simple_input":
                     selection = eval_suite_selection(suite, plan.case_ids)
-                    invocation = _eval_run_invocation(
+                    invocation = eval_run_invocation(
                         auth_context,
                         max_steps=None,
                         limits=None,
@@ -5774,7 +5431,7 @@ def create_router(
                             for item in binding.artifacts
                         ),
                     )
-                    invocation = _eval_run_invocation(
+                    invocation = eval_run_invocation(
                         auth_context,
                         max_steps=binding.max_steps,
                         limits=binding.operator_run_limits,
@@ -5804,7 +5461,7 @@ def create_router(
                     )
                 if plan.execution_profile_revision is None:
                     raise RuntimeError("Ready authored-suite launch lost its profile revision.")
-                invocation = _bind_eval_admission_request(
+                invocation = bind_eval_admission_request(
                     invocation,
                     kind="authored_suite",
                     target_key=suite.target_key,
@@ -5812,7 +5469,8 @@ def create_router(
                     body=body,
                 )
                 try:
-                    eval_target, compiled, invocation = await _prepare_eval_run(
+                    eval_target, compiled, invocation = await prepare_eval_run(
+                        active_eval_registry=active_eval_registry,
                         corpus=corpus,
                         suite_id=suite.suite.id,
                         max_concurrency=allocation.max_concurrency,
@@ -5864,7 +5522,8 @@ def create_router(
                 compiled,
                 allocation,
             ) in enumerate(prepared_runs):
-                run = await _admit_eval_run(
+                run = await admit_eval_run(
+                    eval_store=eval_store,
                     corpus=corpus,
                     max_concurrency=allocation.max_concurrency,
                     invocation=invocation,
@@ -5916,8 +5575,8 @@ def create_router(
             scenario = await load_eval_scenario(
                 scenario_revision, eval_store=eval_store, active_eval_registry=active_eval_registry
             )
-            replay_probe = _bind_eval_admission_request(
-                _eval_run_invocation(
+            replay_probe = bind_eval_admission_request(
+                eval_run_invocation(
                     auth_context,
                     max_steps=None,
                     limits=None,
@@ -5931,7 +5590,8 @@ def create_router(
             admission_request_revision = replay_probe.admission_request_revision
             if admission_request_revision is None:
                 raise RuntimeError("Scenario eval launch lost its admission request revision.")
-            replayed = await _replay_eval_run(
+            replayed = await replay_eval_run(
+                eval_store=eval_store,
                 target_key=scenario.target_key,
                 idempotency_key=idempotency_key,
                 admission_request_revision=admission_request_revision,
@@ -5966,14 +5626,14 @@ def create_router(
                     for item in binding.artifacts
                 ),
             )
-            invocation = _eval_run_invocation(
+            invocation = eval_run_invocation(
                 auth_context,
                 max_steps=binding.max_steps,
                 limits=binding.operator_run_limits,
                 cost_budget=binding.cost_budget,
                 scenario=scenario_invocation,
             )
-            invocation = _bind_eval_admission_request(
+            invocation = bind_eval_admission_request(
                 invocation,
                 kind="scenario",
                 target_key=scenario.target_key,
@@ -5997,7 +5657,8 @@ def create_router(
                     status_code=409,
                     detail="Eval scenario no longer matches its current target binding.",
                 ) from exc
-            eval_target, compiled, invocation = await _prepare_eval_run(
+            eval_target, compiled, invocation = await prepare_eval_run(
+                active_eval_registry=active_eval_registry,
                 corpus=corpus,
                 suite_id="scenario",
                 max_concurrency=binding.max_concurrency,
@@ -6025,7 +5686,8 @@ def create_router(
                     status_code=413,
                     detail="Derived scenario result contract exceeds the server byte limit.",
                 ) from exc
-            return await _admit_eval_run(
+            return await admit_eval_run(
+                eval_store=eval_store,
                 corpus=corpus,
                 max_concurrency=binding.max_concurrency,
                 invocation=invocation,
@@ -6066,13 +5728,13 @@ def create_router(
                 eval_store=eval_store,
                 active_eval_registry=active_eval_registry,
             )
-            invocation = _eval_run_invocation(
+            invocation = eval_run_invocation(
                 auth_context,
                 max_steps=body.max_steps,
                 limits=body.limits,
                 cost_budget=body.cost_budget,
             )
-            invocation = _bind_eval_admission_request(
+            invocation = bind_eval_admission_request(
                 invocation,
                 kind="corpus",
                 target_key=corpus.target_key,
@@ -6082,21 +5744,24 @@ def create_router(
             admission_request_revision = invocation.admission_request_revision
             if admission_request_revision is None:
                 raise RuntimeError("Corpus eval launch lost its admission request revision.")
-            replayed = await _replay_eval_run(
+            replayed = await replay_eval_run(
+                eval_store=eval_store,
                 target_key=corpus.target_key,
                 idempotency_key=idempotency_key,
                 admission_request_revision=admission_request_revision,
             )
             if replayed is not None:
                 return replayed
-            eval_target, compiled, invocation = await _prepare_eval_run(
+            eval_target, compiled, invocation = await prepare_eval_run(
+                active_eval_registry=active_eval_registry,
                 corpus=corpus,
                 suite_id=body.suite_id,
                 max_concurrency=body.max_concurrency,
                 invocation=invocation,
                 expected_execution_profile_revision=(body.expected_execution_profile_revision),
             )
-            return await _admit_eval_run(
+            return await admit_eval_run(
+                eval_store=eval_store,
                 corpus=corpus,
                 max_concurrency=body.max_concurrency,
                 invocation=invocation,
