@@ -7,6 +7,7 @@ Import capabilities from their owning modules, for example::
     from cayu.knowledge.maintenance_contracts import KnowledgeMaintenanceProposal
     from cayu.knowledge.activation_contracts import KnowledgeActivationRequest
     from cayu.knowledge.changes import KnowledgeChange, KnowledgeChangeBatch
+    from cayu.knowledge.indexing import KnowledgeIndexReadiness, knowledge_chunk_embedding_identity
     from cayu.knowledge.scopes import KnowledgeAccessScope
     from cayu.knowledge.curator import KnowledgeCurator
     from cayu.knowledge.governance import KnowledgeActivationPolicy

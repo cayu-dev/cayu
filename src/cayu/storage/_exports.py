@@ -11,7 +11,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "DEFAULT_KNOWLEDGE_CHUNK_TARGET_BYTES",
     ),
     "DEFAULT_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT": (
-        "cayu.storage.memory",
+        "cayu.knowledge.indexing",
         "DEFAULT_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT",
     ),
     "DEFAULT_KNOWLEDGE_INDEX_MAX_CHUNKS": (
@@ -24,22 +24,25 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "DEFAULT_KNOWLEDGE_NAMESPACE": ("cayu.knowledge.records", "DEFAULT_KNOWLEDGE_NAMESPACE"),
     "InMemoryEmbeddingKnowledgeStore": ("cayu.storage.memory", "InMemoryEmbeddingKnowledgeStore"),
     "InMemoryKnowledgeStore": ("cayu.storage.memory", "InMemoryKnowledgeStore"),
-    "KNOWLEDGE_CHUNK_TEXT_GENERATOR": ("cayu.storage.memory", "KNOWLEDGE_CHUNK_TEXT_GENERATOR"),
+    "KNOWLEDGE_CHUNK_TEXT_GENERATOR": ("cayu.knowledge.indexing", "KNOWLEDGE_CHUNK_TEXT_GENERATOR"),
     "KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION": (
-        "cayu.storage.memory",
+        "cayu.knowledge.indexing",
         "KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION",
     ),
     "KNOWLEDGE_CHUNK_TEXT_PREPROCESSING_VERSION": (
-        "cayu.storage.memory",
+        "cayu.knowledge.indexing",
         "KNOWLEDGE_CHUNK_TEXT_PREPROCESSING_VERSION",
     ),
-    "KNOWLEDGE_CHUNK_TEXT_PROJECTION": ("cayu.storage.memory", "KNOWLEDGE_CHUNK_TEXT_PROJECTION"),
+    "KNOWLEDGE_CHUNK_TEXT_PROJECTION": (
+        "cayu.knowledge.indexing",
+        "KNOWLEDGE_CHUNK_TEXT_PROJECTION",
+    ),
     "KNOWLEDGE_REVISION_RESET_POLICY_VERSION": (
         "cayu.storage.knowledge_transition",
         "KNOWLEDGE_REVISION_RESET_POLICY_VERSION",
     ),
     "KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION": (
-        "cayu.storage.memory",
+        "cayu.knowledge.indexing",
         "KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION",
     ),
     "KnowledgeAccessDenied": ("cayu.knowledge.scopes", "KnowledgeAccessDenied"),
@@ -84,18 +87,21 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "KnowledgeChangeKind": ("cayu.knowledge.changes", "KnowledgeChangeKind"),
     "KnowledgeChunk": ("cayu.knowledge.records", "KnowledgeChunk"),
     "KnowledgeChunkConflict": ("cayu.knowledge.records", "KnowledgeChunkConflict"),
-    "KnowledgeEmbeddingBackfillResult": ("cayu.storage.memory", "KnowledgeEmbeddingBackfillResult"),
-    "KnowledgeEmbeddingIdentity": ("cayu.storage.memory", "KnowledgeEmbeddingIdentity"),
-    "KnowledgeEmbeddingProjection": ("cayu.storage.memory", "KnowledgeEmbeddingProjection"),
+    "KnowledgeEmbeddingBackfillResult": (
+        "cayu.knowledge.indexing",
+        "KnowledgeEmbeddingBackfillResult",
+    ),
+    "KnowledgeEmbeddingIdentity": ("cayu.knowledge.indexing", "KnowledgeEmbeddingIdentity"),
+    "KnowledgeEmbeddingProjection": ("cayu.knowledge.indexing", "KnowledgeEmbeddingProjection"),
     "KnowledgeEmbeddingProjectionConflict": (
-        "cayu.storage.memory",
+        "cayu.knowledge.indexing",
         "KnowledgeEmbeddingProjectionConflict",
     ),
     "KnowledgeEmbeddingProjectionWriteResult": (
-        "cayu.storage.memory",
+        "cayu.knowledge.indexing",
         "KnowledgeEmbeddingProjectionWriteResult",
     ),
-    "KnowledgeEmbeddingWorkerResult": ("cayu.storage.memory", "KnowledgeEmbeddingWorkerResult"),
+    "KnowledgeEmbeddingWorkerResult": ("cayu.knowledge.indexing", "KnowledgeEmbeddingWorkerResult"),
     "KnowledgeEntry": ("cayu.knowledge.records", "KnowledgeEntry"),
     "KnowledgeEntryReadLimitExceeded": (
         "cayu.knowledge.records",
@@ -113,14 +119,17 @@ EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "KnowledgeGovernanceMode": ("cayu.knowledge.activation_contracts", "KnowledgeGovernanceMode"),
     "KnowledgeHit": ("cayu.storage.memory", "KnowledgeHit"),
-    "KnowledgeIndexCoverage": ("cayu.storage.memory", "KnowledgeIndexCoverage"),
-    "KnowledgeIndexReadiness": ("cayu.storage.memory", "KnowledgeIndexReadiness"),
-    "KnowledgeIndexReadinessBatch": ("cayu.storage.memory", "KnowledgeIndexReadinessBatch"),
-    "KnowledgeIndexReadinessConflict": ("cayu.storage.memory", "KnowledgeIndexReadinessConflict"),
-    "KnowledgeIndexReadinessUpdate": ("cayu.storage.memory", "KnowledgeIndexReadinessUpdate"),
+    "KnowledgeIndexCoverage": ("cayu.knowledge.indexing", "KnowledgeIndexCoverage"),
+    "KnowledgeIndexReadiness": ("cayu.knowledge.indexing", "KnowledgeIndexReadiness"),
+    "KnowledgeIndexReadinessBatch": ("cayu.knowledge.indexing", "KnowledgeIndexReadinessBatch"),
+    "KnowledgeIndexReadinessConflict": (
+        "cayu.knowledge.indexing",
+        "KnowledgeIndexReadinessConflict",
+    ),
+    "KnowledgeIndexReadinessUpdate": ("cayu.knowledge.indexing", "KnowledgeIndexReadinessUpdate"),
     "KnowledgeIndexRequest": ("cayu.storage.knowledge_indexer", "KnowledgeIndexRequest"),
     "KnowledgeIndexResult": ("cayu.storage.knowledge_indexer", "KnowledgeIndexResult"),
-    "KnowledgeIndexState": ("cayu.storage.memory", "KnowledgeIndexState"),
+    "KnowledgeIndexState": ("cayu.knowledge.indexing", "KnowledgeIndexState"),
     "KnowledgeIndexer": ("cayu.storage.knowledge_indexer", "KnowledgeIndexer"),
     "KnowledgeLineageCurrentness": ("cayu.knowledge.relations", "KnowledgeLineageCurrentness"),
     "KnowledgeLineageLink": ("cayu.knowledge.relations", "KnowledgeLineageLink"),
@@ -226,11 +235,11 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "MAX_KNOWLEDGE_CHUNK_ID_BYTES": ("cayu.knowledge.records", "MAX_KNOWLEDGE_CHUNK_ID_BYTES"),
     "MAX_KNOWLEDGE_CHUNK_INDEX": ("cayu.knowledge.records", "MAX_KNOWLEDGE_CHUNK_INDEX"),
     "MAX_KNOWLEDGE_EMBEDDING_DIMENSIONS": (
-        "cayu.storage.memory",
+        "cayu.knowledge.indexing",
         "MAX_KNOWLEDGE_EMBEDDING_DIMENSIONS",
     ),
     "MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT": (
-        "cayu.storage.memory",
+        "cayu.knowledge.indexing",
         "MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT",
     ),
     "MAX_KNOWLEDGE_ENTRY_ID_BYTES": ("cayu.knowledge.records", "MAX_KNOWLEDGE_ENTRY_ID_BYTES"),
@@ -240,7 +249,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "MAX_KNOWLEDGE_EVIDENCE_JSON_BYTES",
     ),
     "MAX_KNOWLEDGE_INDEX_READINESS_LIMIT": (
-        "cayu.storage.memory",
+        "cayu.knowledge.indexing",
         "MAX_KNOWLEDGE_INDEX_READINESS_LIMIT",
     ),
     "MAX_KNOWLEDGE_MAINTENANCE_BYTES": (
@@ -308,7 +317,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "copy_knowledge_revision_refs": ("cayu.knowledge.records", "copy_knowledge_revision_refs"),
     "knowledge_access_scope_sha256": ("cayu.knowledge.scopes", "knowledge_access_scope_sha256"),
     "knowledge_chunk_embedding_identity": (
-        "cayu.storage.memory",
+        "cayu.knowledge.indexing",
         "knowledge_chunk_embedding_identity",
     ),
     "prepare_knowledge_activation_request": (

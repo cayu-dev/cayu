@@ -57,6 +57,54 @@ from cayu.knowledge.changes import (
 )
 from cayu.knowledge.changes import KnowledgeChangeConsumerState as KnowledgeChangeConsumerState
 from cayu.knowledge.changes import KnowledgeChangeKind as KnowledgeChangeKind
+from cayu.knowledge.indexing import (
+    DEFAULT_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT as DEFAULT_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT,
+)
+from cayu.knowledge.indexing import KNOWLEDGE_CHUNK_TEXT_GENERATOR as KNOWLEDGE_CHUNK_TEXT_GENERATOR
+from cayu.knowledge.indexing import (
+    KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION as KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION,
+)
+from cayu.knowledge.indexing import (
+    KNOWLEDGE_CHUNK_TEXT_PREPROCESSING_VERSION as KNOWLEDGE_CHUNK_TEXT_PREPROCESSING_VERSION,
+)
+from cayu.knowledge.indexing import (
+    KNOWLEDGE_CHUNK_TEXT_PROJECTION as KNOWLEDGE_CHUNK_TEXT_PROJECTION,
+)
+from cayu.knowledge.indexing import (
+    KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION as KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION,
+)
+from cayu.knowledge.indexing import (
+    MAX_KNOWLEDGE_EMBEDDING_DIMENSIONS as MAX_KNOWLEDGE_EMBEDDING_DIMENSIONS,
+)
+from cayu.knowledge.indexing import (
+    MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT as MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT,
+)
+from cayu.knowledge.indexing import (
+    MAX_KNOWLEDGE_INDEX_READINESS_LIMIT as MAX_KNOWLEDGE_INDEX_READINESS_LIMIT,
+)
+from cayu.knowledge.indexing import (
+    KnowledgeEmbeddingBackfillResult as KnowledgeEmbeddingBackfillResult,
+)
+from cayu.knowledge.indexing import KnowledgeEmbeddingIdentity as KnowledgeEmbeddingIdentity
+from cayu.knowledge.indexing import KnowledgeEmbeddingProjection as KnowledgeEmbeddingProjection
+from cayu.knowledge.indexing import (
+    KnowledgeEmbeddingProjectionConflict as KnowledgeEmbeddingProjectionConflict,
+)
+from cayu.knowledge.indexing import (
+    KnowledgeEmbeddingProjectionWriteResult as KnowledgeEmbeddingProjectionWriteResult,
+)
+from cayu.knowledge.indexing import KnowledgeEmbeddingWorkerResult as KnowledgeEmbeddingWorkerResult
+from cayu.knowledge.indexing import KnowledgeIndexCoverage as KnowledgeIndexCoverage
+from cayu.knowledge.indexing import KnowledgeIndexReadiness as KnowledgeIndexReadiness
+from cayu.knowledge.indexing import KnowledgeIndexReadinessBatch as KnowledgeIndexReadinessBatch
+from cayu.knowledge.indexing import (
+    KnowledgeIndexReadinessConflict as KnowledgeIndexReadinessConflict,
+)
+from cayu.knowledge.indexing import KnowledgeIndexReadinessUpdate as KnowledgeIndexReadinessUpdate
+from cayu.knowledge.indexing import KnowledgeIndexState as KnowledgeIndexState
+from cayu.knowledge.indexing import (
+    knowledge_chunk_embedding_identity as knowledge_chunk_embedding_identity,
+)
 from cayu.knowledge.maintenance_contracts import (
     MAX_KNOWLEDGE_MAINTENANCE_BYTES as MAX_KNOWLEDGE_MAINTENANCE_BYTES,
 )
@@ -192,49 +240,10 @@ from cayu.storage.knowledge_transition import (
 from cayu.storage.knowledge_transition import (
     require_empty_knowledge_revision_transition as require_empty_knowledge_revision_transition,
 )
-from cayu.storage.memory import (
-    DEFAULT_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT as DEFAULT_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT,
-)
-from cayu.storage.memory import KNOWLEDGE_CHUNK_TEXT_GENERATOR as KNOWLEDGE_CHUNK_TEXT_GENERATOR
-from cayu.storage.memory import (
-    KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION as KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION,
-)
-from cayu.storage.memory import (
-    KNOWLEDGE_CHUNK_TEXT_PREPROCESSING_VERSION as KNOWLEDGE_CHUNK_TEXT_PREPROCESSING_VERSION,
-)
-from cayu.storage.memory import KNOWLEDGE_CHUNK_TEXT_PROJECTION as KNOWLEDGE_CHUNK_TEXT_PROJECTION
-from cayu.storage.memory import (
-    KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION as KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION,
-)
-from cayu.storage.memory import (
-    MAX_KNOWLEDGE_EMBEDDING_DIMENSIONS as MAX_KNOWLEDGE_EMBEDDING_DIMENSIONS,
-)
-from cayu.storage.memory import (
-    MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT as MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT,
-)
-from cayu.storage.memory import (
-    MAX_KNOWLEDGE_INDEX_READINESS_LIMIT as MAX_KNOWLEDGE_INDEX_READINESS_LIMIT,
-)
 from cayu.storage.memory import InMemoryEmbeddingKnowledgeStore as InMemoryEmbeddingKnowledgeStore
 from cayu.storage.memory import InMemoryKnowledgeStore as InMemoryKnowledgeStore
-from cayu.storage.memory import KnowledgeEmbeddingBackfillResult as KnowledgeEmbeddingBackfillResult
-from cayu.storage.memory import KnowledgeEmbeddingIdentity as KnowledgeEmbeddingIdentity
-from cayu.storage.memory import KnowledgeEmbeddingProjection as KnowledgeEmbeddingProjection
-from cayu.storage.memory import (
-    KnowledgeEmbeddingProjectionConflict as KnowledgeEmbeddingProjectionConflict,
-)
-from cayu.storage.memory import (
-    KnowledgeEmbeddingProjectionWriteResult as KnowledgeEmbeddingProjectionWriteResult,
-)
-from cayu.storage.memory import KnowledgeEmbeddingWorkerResult as KnowledgeEmbeddingWorkerResult
 from cayu.storage.memory import KnowledgeFacet as KnowledgeFacet
 from cayu.storage.memory import KnowledgeHit as KnowledgeHit
-from cayu.storage.memory import KnowledgeIndexCoverage as KnowledgeIndexCoverage
-from cayu.storage.memory import KnowledgeIndexReadiness as KnowledgeIndexReadiness
-from cayu.storage.memory import KnowledgeIndexReadinessBatch as KnowledgeIndexReadinessBatch
-from cayu.storage.memory import KnowledgeIndexReadinessConflict as KnowledgeIndexReadinessConflict
-from cayu.storage.memory import KnowledgeIndexReadinessUpdate as KnowledgeIndexReadinessUpdate
-from cayu.storage.memory import KnowledgeIndexState as KnowledgeIndexState
 from cayu.storage.memory import KnowledgeListGroup as KnowledgeListGroup
 from cayu.storage.memory import KnowledgeListItem as KnowledgeListItem
 from cayu.storage.memory import KnowledgeListQuery as KnowledgeListQuery
@@ -245,9 +254,6 @@ from cayu.storage.memory import KnowledgeQuery as KnowledgeQuery
 from cayu.storage.memory import KnowledgeSearchMode as KnowledgeSearchMode
 from cayu.storage.memory import KnowledgeSearchResult as KnowledgeSearchResult
 from cayu.storage.memory import KnowledgeStore as KnowledgeStore
-from cayu.storage.memory import (
-    knowledge_chunk_embedding_identity as knowledge_chunk_embedding_identity,
-)
 from cayu.storage.memory import prepare_knowledge_publication as prepare_knowledge_publication
 from cayu.storage.postgres import PostgresAgentWorkContextStore as PostgresAgentWorkContextStore
 from cayu.storage.postgres import PostgresBudgetLedger as PostgresBudgetLedger

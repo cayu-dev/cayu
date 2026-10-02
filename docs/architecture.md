@@ -431,8 +431,11 @@ deterministic preparation and validation. Shared exact entry material and revisi
 helpers live with records; access-scope fingerprints live with scopes.
 `knowledge/changes.py` owns change records, bounded pages, consumer claims and
 progress, including detached copies, claim fingerprints and deterministic
-validation and initialization. These contracts, application activation policies
-and the maintenance router/planner can be used without loading a storage
+validation and initialization. `knowledge/indexing.py` owns embedding identities
+and projections, index readiness and coverage, bounded indexing outcomes, and
+their deterministic construction, copying, fingerprints and transition checks.
+These contracts, application activation policies and the maintenance
+router/planner can be used without loading a storage
 implementation. Memory, SQLite and PostgreSQL stores compose the same contracts
 with their own access checks and atomic persistence operations.
 The existing `cayu`, `cayu.storage` and `cayu.storage.memory` imports resolve to

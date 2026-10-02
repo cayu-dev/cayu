@@ -37,6 +37,7 @@ from cayu.context.base import (
 )
 from cayu.events import EventType
 from cayu.knowledge.changes import KnowledgeChangeBatch
+from cayu.knowledge.indexing import KnowledgeIndexReadinessBatch, KnowledgeIndexState
 from cayu.knowledge.records import (
     DEFAULT_KNOWLEDGE_NAMESPACE,
     KnowledgeRevisionRef,
@@ -123,8 +124,6 @@ from cayu.sessions.checkpoints import (
     RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_VERSION,
 )
 from cayu.storage.memory import (
-    KnowledgeIndexReadinessBatch,
-    KnowledgeIndexState,
     KnowledgeStore,
 )
 from cayu.vaults import REDACTED_SECRET, SecretRedactor

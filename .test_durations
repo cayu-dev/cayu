@@ -1,4 +1,9 @@
 {
+    "tests/core/test_knowledge_indexing_contracts.py::test_indexing_contracts_compose_without_storage_implementations[cayu.knowledge.indexing]": 0.139,
+    "tests/core/test_knowledge_indexing_contracts.py::test_indexing_contracts_compose_without_storage_implementations[cayu.storage]": 0.14,
+    "tests/core/test_knowledge_indexing_contracts.py::test_indexing_contracts_compose_without_storage_implementations[cayu]": 0.195,
+    "tests/core/test_knowledge_indexing_contracts.py::test_indexing_contracts_preserve_aliases_stubs_and_annotations": 0.026,
+    "tests/core/test_knowledge_indexing_contracts.py::test_indexing_values_round_trip_through_canonical_pickle_paths": 0.001,
     "tests/core/test_provider_operation_start_owner.py::test_acknowledgement_failure_hands_durable_identity_and_stream_to_cleanup": 0.37,
     "tests/core/test_provider_operation_start_owner.py::test_closing_run_at_start_boundary_preserves_stream_ownership[provider.operation.started]": 0.299,
     "tests/core/test_provider_operation_start_owner.py::test_closing_run_at_start_boundary_preserves_stream_ownership[provider.operation.starting]": 0.689,
