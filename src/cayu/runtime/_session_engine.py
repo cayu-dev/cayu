@@ -49,6 +49,7 @@ from pydantic import (
 )
 
 from cayu._exception_groups import (
+    _failure_without_existing_exception_identities,
     exception_cause,
     exception_group_children,
     iter_exception_tree,
@@ -480,7 +481,6 @@ from cayu.runtime._session_control import (
     ActiveSessionRun,
     SessionControl,
     SessionInterruptedByRequest,
-    TerminalFinalizationClaimHandoff,
     clear_current_task_cancellation,
 )
 from cayu.runtime._structured_output_tool_round import (
@@ -1834,10 +1834,6 @@ _SESSION_OPERATION_STORE_WAIT_TIMEOUT_SECONDS = 5.0
 _INTERACTION_TRANSITION_REPLAY_MAX_ATTEMPTS = 3
 
 _INTERACTION_TRANSITION_REPLAY_WINDOW_SECONDS = 30.0
-
-_INTERRUPTION_REPAIR_JOIN_MAX_ATTEMPTS = 100
-
-_INTERRUPTION_REPAIR_JOIN_INTERVAL_SECONDS = 0.01
 
 _INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE = "_cayu_interaction_transition_run_fence"
 
@@ -4837,100 +4833,6 @@ def _raise_primary_with_secondary_failure(
             [primary, secondary],
         )
     raise primary
-
-
-def _failure_without_existing_exception_identities(
-    error: BaseException,
-    existing_ids: set[int],
-) -> BaseException | None:
-    """Remove already-owned failures while retaining non-overlapping subgroups."""
-
-    pending: list[tuple[BaseException, bool]] = [(error, False)]
-    children_by_group: dict[int, tuple[BaseException, ...]] = {}
-    retained_by_identity: dict[int, BaseException | None] = {}
-    while pending:
-        candidate, expanded = pending.pop()
-        candidate_id = id(candidate)
-        if candidate_id in retained_by_identity:
-            continue
-        if candidate_id in existing_ids:
-            retained_by_identity[candidate_id] = None
-            continue
-        if not isinstance(candidate, BaseExceptionGroup):
-            retained_by_identity[candidate_id] = candidate
-            continue
-        if expanded:
-            children = children_by_group.pop(candidate_id, ())
-            retained_children = [
-                retained
-                for child in children
-                if (retained := retained_by_identity.get(id(child))) is not None
-            ]
-            if not retained_children:
-                retained_by_identity[candidate_id] = None
-            elif len(retained_children) == len(children) and all(
-                retained is child
-                for retained, child in zip(retained_children, children, strict=True)
-            ):
-                retained_by_identity[candidate_id] = candidate
-            else:
-                retained_by_identity[candidate_id] = BaseExceptionGroup(
-                    "Session interruption additional non-duplicate failures.",
-                    retained_children,
-                )
-            continue
-        children = exception_group_children(candidate)
-        if children is None:
-            retained_by_identity[candidate_id] = RuntimeError(
-                "Session interruption received an unreadable exception group."
-            )
-            continue
-        children_by_group[candidate_id] = children
-        pending.append((candidate, True))
-        pending.extend((child, False) for child in reversed(children))
-
-    return retained_by_identity.get(id(error))
-
-
-def _raise_terminal_finalization_process_control(
-    signal: BaseException,
-    secondary_failures: Iterable[BaseException],
-) -> NoReturn:
-    """Redeliver committed claim-transfer control after exact settlement."""
-
-    signal_graph_ids = {id(candidate) for candidate in iter_exception_tree(signal)}
-    retained: list[BaseException] = []
-    existing_cause = exception_cause(signal)
-    if existing_cause is not None:
-        retained.append(existing_cause)
-    existing_ids = {
-        id(candidate) for failure in retained for candidate in iter_exception_tree(failure)
-    } | signal_graph_ids
-    for failure in secondary_failures:
-        retained_failure = _failure_without_existing_exception_identities(
-            failure,
-            existing_ids,
-        )
-        if retained_failure is None:
-            continue
-        retained.append(retained_failure)
-        existing_ids.update(id(candidate) for candidate in iter_exception_tree(retained_failure))
-    cause: BaseException | None
-    if not retained:
-        cause = None
-    elif len(retained) == 1:
-        cause = retained[0]
-    else:
-        cause = BaseExceptionGroup(
-            "Terminal finalization process control retained settlement failures.",
-            retained,
-        )
-    if not set_exception_cause(signal, cause):
-        raise BaseExceptionGroup(
-            "Terminal finalization process control and settlement failures.",
-            [signal, *retained],
-        ) from None
-    raise signal from cause
 
 
 def _pending_interaction_action_kind(
@@ -19233,19 +19135,10 @@ class SessionEngine:
                     raise SessionRuntimePublicationConflict(
                         "Interrupted user-input supersession retains conflicting pause authority."
                     )
-                await self._recovery_coordinator._repair_terminal_evidence_owned(
-                    session=loaded_session,
-                    inactive_for_seconds=None,
-                    previous_status=loaded_session.status,
-                )
-                repaired_event = await self._wait_for_user_input_supersession_interrupt_repair(
+                repaired_event = await self._terminal_finalization.repair_and_join(
                     session=loaded_session,
                     expected_payload=retained_supersession,
                 )
-                if repaired_event is None:
-                    raise TimeoutError(
-                        f"Session interruption is still finalizing: {loaded_session.id}"
-                    )
                 if not interruption_cascade_suppressed():
                     self._schedule_background_interruption_cascade(
                         parent_session_id=loaded_session.id,
@@ -19421,16 +19314,10 @@ class SessionEngine:
                 "interruption_request_id": str(uuid4()),
             }
         )
-        terminal_finalization_claim_id: str | None = None
-        terminal_finalization_claim_expires_at: datetime | None = None
-        terminal_finalization_transfer_cancellation: asyncio.CancelledError | None = None
-        terminal_finalization_transfer_failure: BaseException | None = None
-        terminal_finalization_transfer_process_control: BaseException | None = None
-        terminal_finalization_heartbeat_stop: asyncio.Event | None = None
-        terminal_finalization_heartbeat_task: asyncio.Task[None] | None = None
-        terminal_finalization_claim_retained_for_recovery = False
-        if adopted_user_input_interrupt_payload is None:
-            terminal_finalization_claim_id = self._terminal_finalization.new_claim_id()
+        finalization = self._terminal_finalization.interruption(
+            session_id=loaded_session.id,
+            adopting_pending=adopted_user_input_interrupt_payload is not None,
+        )
         interruption_request_id = interruption_request_id_from_payload(interrupt_payload)
         if interruption_request_id is None:
             raise SessionRuntimePublicationConflict(
@@ -19584,161 +19471,7 @@ class SessionEngine:
         interrupt_terminal_decision: InvocationTerminalDecision | None = None
         interrupt_latest_interaction_event_id: str | None = None
         cascade_suppressed = interruption_cascade_suppressed()
-        self._session_control.begin_interruption_request(loaded_session.id)
-        request_marker_active = True
-        terminal_finalization_handed_to_active_run = False
-        terminal_finalization_preparation_cleaned = False
-
-        async def stop_local_terminal_finalization_heartbeat(
-            *,
-            superseded_by_exact_renewal: bool = False,
-        ) -> None:
-            nonlocal terminal_finalization_heartbeat_stop
-            nonlocal terminal_finalization_heartbeat_task
-            heartbeat_stop = terminal_finalization_heartbeat_stop
-            heartbeat_task = terminal_finalization_heartbeat_task
-            terminal_finalization_heartbeat_stop = None
-            terminal_finalization_heartbeat_task = None
-            if heartbeat_stop is None or heartbeat_task is None:
-                return
-            heartbeat_stop.set()
-            if not superseded_by_exact_renewal:
-                await heartbeat_task
-                return
-            heartbeat_result = await asyncio.gather(
-                heartbeat_task,
-                return_exceptions=True,
-            )
-            heartbeat_failure = heartbeat_result[0]
-            if isinstance(
-                heartbeat_failure,
-                (KeyboardInterrupt, SystemExit, GeneratorExit, BaseExceptionGroup),
-            ) and not isinstance(heartbeat_failure, Exception):
-                raise heartbeat_failure
-
-        async def await_terminal_finalization_operation(
-            operation: Callable[[], Awaitable[_OperationResultT]],
-            *,
-            operation_name: str,
-        ) -> _OperationResultT:
-            heartbeat_task = terminal_finalization_heartbeat_task
-            if heartbeat_task is None:
-                return await operation()
-            return await self._terminal_finalization.await_operation(
-                heartbeat_task=heartbeat_task,
-                operation=operation,
-                operation_name=operation_name,
-            )
-
-        async def cleanup_terminal_finalization_preparation(
-            authoritative_failure: BaseException | None,
-        ) -> None:
-            """Settle every owner created before offline finalization starts."""
-
-            nonlocal request_marker_active
-            nonlocal terminal_finalization_claim_retained_for_recovery
-            nonlocal terminal_finalization_preparation_cleaned
-            if terminal_finalization_preparation_cleaned:
-                return
-            try:
-                reclaimed_handoff_heartbeat: asyncio.Task[None] | None = None
-                if (
-                    terminal_finalization_claim_id is not None
-                    and terminal_finalization_handed_to_active_run
-                ):
-                    reclaimed_handoff_heartbeat = self._session_control.reclaim_unaccepted_terminal_finalization_claim_handoff(
-                        loaded_session.id,
-                        claim_id=terminal_finalization_claim_id,
-                    )
-                if reclaimed_handoff_heartbeat is not None:
-                    terminal_finalization_claim_retained_for_recovery = True
-                    await self._run_cleanup_steps(
-                        authoritative_failure=authoritative_failure,
-                        steps=(
-                            (
-                                "unaccepted terminal finalization heartbeat shutdown",
-                                lambda: reclaimed_handoff_heartbeat,
-                            ),
-                        ),
-                    )
-                if (
-                    terminal_finalization_claim_id is not None
-                    and not terminal_finalization_handed_to_active_run
-                    and not terminal_finalization_claim_retained_for_recovery
-                ):
-                    claim_id = terminal_finalization_claim_id
-                    await self._run_cleanup_steps(
-                        authoritative_failure=authoritative_failure,
-                        steps=(
-                            (
-                                "unstarted terminal finalization heartbeat shutdown",
-                                stop_local_terminal_finalization_heartbeat,
-                            ),
-                            (
-                                "unstarted terminal finalization claim release",
-                                lambda: (
-                                    self._recovery_coordinator._release_incomplete_recovery_claim(
-                                        loaded_session.id,
-                                        claim_id,
-                                    )
-                                ),
-                            ),
-                        ),
-                    )
-            finally:
-                if request_marker_active:
-                    request_marker_active = False
-                    self._session_control.end_interruption_request(loaded_session.id)
-                terminal_finalization_preparation_cleaned = True
-
-        async def settle_terminal_finalization_preparation(
-            authoritative_failure: BaseException | None,
-        ) -> None:
-            """Clean local ownership and redeliver a carried transfer signal."""
-
-            nonlocal terminal_finalization_transfer_cancellation
-            nonlocal terminal_finalization_transfer_failure
-            nonlocal terminal_finalization_transfer_process_control
-            control_signal: BaseException | None = (
-                terminal_finalization_transfer_cancellation
-                or terminal_finalization_transfer_process_control
-            )
-            cleanup_failure: BaseException | None = None
-            try:
-                await cleanup_terminal_finalization_preparation(
-                    control_signal or authoritative_failure,
-                )
-            except BaseException as failure:
-                cleanup_failure = failure
-            if control_signal is None:
-                if cleanup_failure is not None:
-                    raise cleanup_failure
-                return
-            if (
-                isinstance(control_signal, asyncio.CancelledError)
-                and cleanup_failure is not None
-                and not isinstance(cleanup_failure, (Exception, asyncio.CancelledError))
-            ):
-                raise cleanup_failure
-            secondary_failures = [
-                failure
-                for failure in (
-                    terminal_finalization_transfer_process_control
-                    if control_signal is terminal_finalization_transfer_cancellation
-                    else None,
-                    terminal_finalization_transfer_failure,
-                    authoritative_failure,
-                    cleanup_failure,
-                )
-                if failure is not None and failure is not control_signal
-            ]
-            terminal_finalization_transfer_cancellation = None
-            terminal_finalization_transfer_failure = None
-            terminal_finalization_transfer_process_control = None
-            _raise_terminal_finalization_process_control(
-                control_signal,
-                secondary_failures,
-            )
+        finalization.begin_request()
 
         async def clear_locally_claimed_adopted_interrupt(
             event: Event,
@@ -19751,10 +19484,10 @@ class SessionEngine:
                 event,
                 interrupt_payload,
             )
-            claim_id = terminal_finalization_claim_id
+            claim_id = finalization.claim_id
             if claim_id is None:
                 raise RuntimeError("User-input supersession finalization lost its durable owner.")
-            await await_terminal_finalization_operation(
+            await finalization.await_operation(
                 lambda: self._clear_claimed_pending_interrupt_if_retained(
                     session_id=loaded_session.id,
                     claim_id=claim_id,
@@ -19765,7 +19498,7 @@ class SessionEngine:
 
         try:
             if adopted_user_input_interrupt_payload is None:
-                assert terminal_finalization_claim_id is not None
+                assert finalization.claim_id is not None
                 for terminal_decision_attempt in range(3):
                     (
                         interrupt_terminal_decision,
@@ -19790,7 +19523,7 @@ class SessionEngine:
                                 store_time_checkpoint_transform=(
                                     _store_time_checkpoint_with_claimed_pending_session_interrupt(
                                         interrupt_payload,
-                                        claim_id=terminal_finalization_claim_id,
+                                        claim_id=finalization.claim_id,
                                         claim_lease=_INCOMPLETE_RECOVERY_CLAIM_LEASE,
                                         include_interruption_cascade=not cascade_suppressed,
                                         cascade_created_at=self._clock(),
@@ -19824,7 +19557,7 @@ class SessionEngine:
                                     store_time_checkpoint_transform=(
                                         _store_time_checkpoint_with_claimed_pending_session_interrupt(
                                             interrupt_payload,
-                                            claim_id=terminal_finalization_claim_id,
+                                            claim_id=finalization.claim_id,
                                             claim_lease=_INCOMPLETE_RECOVERY_CLAIM_LEASE,
                                             include_interruption_cascade=(not cascade_suppressed),
                                             cascade_created_at=self._clock(),
@@ -19882,30 +19615,11 @@ class SessionEngine:
                             raise
             else:
                 session = loaded_session
-                transferred_claim = await self._terminal_finalization.claim_pending(
-                    session=session,
-                    expected_payload=interrupt_payload,
+                repaired_event = await finalization.claim_or_join(
+                    session=session, expected_payload=interrupt_payload
                 )
-                if transferred_claim is None or isinstance(transferred_claim, Event):
-                    if isinstance(transferred_claim, Event):
-                        repaired_event = transferred_claim
-                    else:
-                        await self._recovery_coordinator._repair_terminal_evidence_owned(
-                            session=session,
-                            inactive_for_seconds=None,
-                            previous_status=session.status,
-                        )
-                        repaired_event = (
-                            await self._wait_for_user_input_supersession_interrupt_repair(
-                                session=session,
-                                expected_payload=interrupt_payload,
-                            )
-                        )
-                    if repaired_event is None:
-                        raise TimeoutError(
-                            f"Session interruption is still finalizing: {session.id}"
-                        )
-                    await settle_terminal_finalization_preparation(None)
+                if repaired_event is not None:
+                    await finalization.finish_preparation(None)
                     if not interruption_cascade_suppressed():
                         self._schedule_background_interruption_cascade(
                             parent_session_id=session.id,
@@ -19914,90 +19628,12 @@ class SessionEngine:
                         )
                     yield repaired_event
                     return
-                terminal_finalization_claim_id = transferred_claim.claim_id
-                terminal_finalization_claim_expires_at = transferred_claim.claim_expires_at
-                terminal_finalization_transfer_cancellation = transferred_claim.cancellation
-                terminal_finalization_transfer_failure = transferred_claim.transfer_failure
-                terminal_finalization_transfer_process_control = transferred_claim.process_control
-            if terminal_finalization_claim_id is not None:
-                interrupt_checkpoint = await self.session_store.load_checkpoint(session.id)
-                persisted_claim = _incomplete_recovery_claim_from_checkpoint(interrupt_checkpoint)
-                if (
-                    persisted_claim is not None
-                    and persisted_claim[0] == terminal_finalization_claim_id
-                ):
-                    terminal_finalization_claim_expires_at = persisted_claim[1]
-                persisted_payload = (
-                    None
-                    if interrupt_checkpoint is None
-                    else interrupt_checkpoint.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
-                )
-                claim_owns_user_input_supersession = (
-                    persisted_claim is not None
-                    and persisted_claim[0] == terminal_finalization_claim_id
-                    and type(persisted_payload) is dict
-                    and (
-                        USER_INPUT_SUPERSESSION_INTENT_KEY in persisted_payload
-                        or AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY in persisted_payload
-                    )
-                    and interruption_request_id_from_payload(persisted_payload)
-                    == interruption_request_id
-                )
-                if claim_owns_user_input_supersession:
-                    assert type(persisted_payload) is dict
-                    renewed_claim = await self._terminal_finalization.renew_claim(
-                        session=session,
-                        claim_id=terminal_finalization_claim_id,
-                        expected_payload=persisted_payload,
-                    )
-                    if renewed_claim is None:
-                        terminal_finalization_claim_retained_for_recovery = True
-                        raise _IncompleteRecoveryClaimLost(
-                            "Terminal finalization ownership expired before live dispatch."
-                        )
-                    (
-                        session,
-                        terminal_finalization_claim_expires_at,
-                        terminal_finalization_local_lease_deadline,
-                    ) = renewed_claim
-                    (
-                        terminal_finalization_heartbeat_stop,
-                        terminal_finalization_heartbeat_task,
-                    ) = self._terminal_finalization.start_heartbeat(
-                        session_id=session.id,
-                        claim_id=terminal_finalization_claim_id,
-                        local_lease_deadline=terminal_finalization_local_lease_deadline,
-                    )
-                    if adopted_user_input_interrupt_payload is None:
-                        try:
-                            terminal_finalization_handed_to_active_run = (
-                                self._session_control.register_terminal_finalization_claim_handoff(
-                                    session.id,
-                                    session_instance_id=session.instance_id,
-                                    run_epoch=session.run_epoch,
-                                    interruption_request_id=interruption_request_id,
-                                    expected_interrupt_payload=persisted_payload,
-                                    claim_id=terminal_finalization_claim_id,
-                                    heartbeat_stop=terminal_finalization_heartbeat_stop,
-                                    heartbeat_task=terminal_finalization_heartbeat_task,
-                                )
-                            )
-                        except BaseException:
-                            terminal_finalization_heartbeat_stop.set()
-                            terminal_finalization_heartbeat_task.cancel()
-                            await asyncio.gather(
-                                terminal_finalization_heartbeat_task,
-                                return_exceptions=True,
-                            )
-                            terminal_finalization_heartbeat_stop = None
-                            terminal_finalization_heartbeat_task = None
-                            raise
-                        if terminal_finalization_handed_to_active_run:
-                            terminal_finalization_heartbeat_stop = None
-                            terminal_finalization_heartbeat_task = None
+            session = await finalization.prepare_dispatch(
+                session=session, interruption_request_id=interruption_request_id
+            )
             self._session_control.signal_interrupt(session.id)
             active_work_signalled = self._session_control.cancel_active_runs(session.id)
-            if terminal_finalization_handed_to_active_run and not active_work_signalled:
+            if finalization.handed_to_active_run and not active_work_signalled:
                 raise RuntimeError(
                     "Terminal finalization handoff lost its live interruption target."
                 )
@@ -20010,11 +19646,11 @@ class SessionEngine:
                 )
                 if existing_interrupt_event is not None:
                     await clear_locally_claimed_adopted_interrupt(existing_interrupt_event)
-                    await settle_terminal_finalization_preparation(None)
+                    await finalization.finish_preparation(None)
                     yield existing_interrupt_event
                     return
                 raise TimeoutError(f"Session interruption is still finalizing: {session.id}")
-            provider_operation_profile = await await_terminal_finalization_operation(
+            provider_operation_profile = await finalization.await_operation(
                 lambda: self._recovery_coordinator.cancel_provider_operation_for_interruption(
                     session,
                     registered_agent=registered_agent,
@@ -20029,7 +19665,7 @@ class SessionEngine:
             # because cancellation was attempted; a prior durable decision still
             # wins when terminal finalization reads it below.
             if loaded_session.status == SessionStatus.RUNNING and not provider_operation_addressed:
-                existing_interrupt_event = await await_terminal_finalization_operation(
+                existing_interrupt_event = await finalization.await_operation(
                     lambda: self._session_control.wait_for_active_interrupted_event(
                         session.id,
                         interruption_request_id=interruption_request_id,
@@ -20038,12 +19674,12 @@ class SessionEngine:
                 )
                 if existing_interrupt_event is not None:
                     await clear_locally_claimed_adopted_interrupt(existing_interrupt_event)
-                    await settle_terminal_finalization_preparation(None)
+                    await finalization.finish_preparation(None)
                     yield existing_interrupt_event
                     return
                 raise TimeoutError(f"Session interruption is still finalizing: {session.id}")
             if provider_operation_profile is not None:
-                session = await await_terminal_finalization_operation(
+                session = await finalization.await_operation(
                     lambda: self._recovery_coordinator.claim_provider_operation_interruption(
                         session,
                         provider_operation_profile.active_profile,
@@ -20063,7 +19699,7 @@ class SessionEngine:
             else:
                 invocation_context = None
         except SessionRuntimePublicationConflict as preparation_failure:
-            await settle_terminal_finalization_preparation(preparation_failure)
+            await finalization.finish_preparation(preparation_failure)
             raise
         except ValueError:
             reconciliation_failure: BaseException | None = None
@@ -20116,7 +19752,7 @@ class SessionEngine:
                                 interrupt_payload=existing_interrupt_event.payload,
                                 create_if_missing=False,
                             )
-                        await settle_terminal_finalization_preparation(None)
+                        await finalization.finish_preparation(None)
                         yield existing_interrupt_event
                         return
                     if reloaded_session.status is SessionStatus.INTERRUPTED:
@@ -20153,9 +19789,9 @@ class SessionEngine:
                 reconciliation_failure = failure
                 raise
             finally:
-                await settle_terminal_finalization_preparation(reconciliation_failure)
+                await finalization.finish_preparation(reconciliation_failure)
         except BaseException as preparation_failure:
-            await settle_terminal_finalization_preparation(preparation_failure)
+            await finalization.finish_preparation(preparation_failure)
             raise
 
         async def release_offline_provider_interruption(
@@ -20181,45 +19817,14 @@ class SessionEngine:
                 ),
             )
 
-        async def release_terminal_finalization_claim(
-            authoritative_failure: BaseException | None,
-        ) -> None:
-            claim_id = terminal_finalization_claim_id
-            if claim_id is None:
-                return
-            steps: list[tuple[str, Callable[[], Awaitable[None]]]] = [
-                (
-                    "terminal evidence finalization heartbeat shutdown",
-                    stop_local_terminal_finalization_heartbeat,
-                )
-            ]
-            if not terminal_finalization_claim_retained_for_recovery:
-                steps.append(
-                    (
-                        "terminal evidence finalization claim release",
-                        lambda: self._recovery_coordinator._release_incomplete_recovery_claim(
-                            session.id,
-                            claim_id,
-                        ),
-                    )
-                )
-            await self._run_cleanup_steps(
-                authoritative_failure=authoritative_failure,
-                steps=tuple(steps),
-            )
-
-        offline_transition_claim_id = (
-            terminal_finalization_claim_id
-            if terminal_finalization_heartbeat_task is not None
-            else None
-        )
+        offline_transition_claim_id = finalization.transition_claim_id
         offline_terminal_decision: InvocationTerminalDecision | None = None
         if (
             provider_operation_profile is not None
             or interrupt_terminal_decision is not None
             or adopted_user_input_interrupt_payload is not None
         ):
-            offline_decision_checkpoint = await await_terminal_finalization_operation(
+            offline_decision_checkpoint = await finalization.await_operation(
                 lambda: self.session_store.load_checkpoint(session.id),
                 operation_name="Offline interruption terminal-decision read",
             )
@@ -20238,7 +19843,7 @@ class SessionEngine:
                     session,
                     _interaction_event,
                     _,
-                ) = await await_terminal_finalization_operation(
+                ) = await finalization.await_operation(
                     lambda: self._publish_sibling_interaction_transition(
                         session=session,
                         invocation_context=invocation_context,
@@ -20265,13 +19870,11 @@ class SessionEngine:
                     operation="failed offline interruption run-fence release",
                 )
             finally:
-                await release_terminal_finalization_claim(transition_failure)
-                if request_marker_active:
-                    request_marker_active = False
-                    self._session_control.end_interruption_request(loaded_session.id)
+                await finalization.release(transition_failure)
+                finalization.end_request()
             raise
         try:
-            payload = await await_terminal_finalization_operation(
+            payload = await finalization.await_operation(
                 lambda: self._load_pending_session_interrupt_payload(
                     session.id,
                     default={
@@ -20291,17 +19894,15 @@ class SessionEngine:
                     operation="offline interruption payload run-fence release",
                 )
             finally:
-                await release_terminal_finalization_claim(payload_failure)
-                if request_marker_active:
-                    request_marker_active = False
-                    self._session_control.end_interruption_request(loaded_session.id)
+                await finalization.release(payload_failure)
+                finalization.end_request()
             raise
         user_input_supersession_retained = (
             USER_INPUT_SUPERSESSION_INTENT_KEY in payload
             or AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY in payload
         )
 
-        async def finalize_terminal_interruption() -> AsyncGenerator[Event, None]:
+        async def finalize_terminal_interruption(session: Session) -> AsyncGenerator[Event, None]:
             owned_terminal_stream: AsyncIterator[Event] | None = None
             try:
                 if offline_terminal_decision is not None:
@@ -20342,13 +19943,13 @@ class SessionEngine:
                             existing_interrupt_event,
                             payload,
                         )
-                        if terminal_finalization_claim_id is None:
+                        if finalization.claim_id is None:
                             raise RuntimeError(
                                 "User-input supersession finalization lost its durable owner."
                             )
                         await self._clear_claimed_pending_interrupt_if_retained(
                             session_id=session.id,
-                            claim_id=terminal_finalization_claim_id,
+                            claim_id=finalization.claim_id,
                             expected_payload=payload,
                         )
                     else:
@@ -20368,11 +19969,11 @@ class SessionEngine:
                 )
                 terminal_event_publisher: Callable[[Event], Awaitable[Event]] | None = None
                 if user_input_supersession_retained:
-                    if terminal_finalization_claim_id is None:
+                    if finalization.claim_id is None:
                         raise RuntimeError(
                             "User-input supersession finalization lost its durable owner."
                         )
-                    owned_claim_id = terminal_finalization_claim_id
+                    owned_claim_id = finalization.claim_id
 
                     async def publish_owned_terminal_event(event: Event) -> Event:
                         return await self._publish_terminal_event_under_finalization_claim(
@@ -20415,13 +20016,13 @@ class SessionEngine:
                         interrupted_event,
                         payload,
                     )
-                    if terminal_finalization_claim_id is None:
+                    if finalization.claim_id is None:
                         raise RuntimeError(
                             "User-input supersession finalization lost its durable owner."
                         )
                     await self._clear_claimed_pending_interrupt_if_retained(
                         session_id=session.id,
-                        claim_id=terminal_finalization_claim_id,
+                        claim_id=finalization.claim_id,
                         expected_payload=payload,
                     )
                 else:
@@ -20451,140 +20052,16 @@ class SessionEngine:
 
         try:
             if user_input_supersession_retained:
-                if (
-                    terminal_finalization_claim_id is None
-                    or terminal_finalization_claim_expires_at is None
-                ):
-                    transferred_claim = await self._terminal_finalization.claim_pending(
-                        session=session,
-                        expected_payload=payload,
-                    )
-                    if isinstance(transferred_claim, Event):
-                        yield transferred_claim
-                        return
-                    if transferred_claim is not None:
-                        terminal_finalization_claim_id = transferred_claim.claim_id
-                        terminal_finalization_claim_expires_at = transferred_claim.claim_expires_at
-                        terminal_finalization_transfer_cancellation = transferred_claim.cancellation
-                        terminal_finalization_transfer_failure = transferred_claim.transfer_failure
-                        terminal_finalization_transfer_process_control = (
-                            transferred_claim.process_control
-                        )
-                    else:
-                        await self._recovery_coordinator._repair_terminal_evidence_owned(
-                            session=session,
-                            inactive_for_seconds=None,
-                            previous_status=session.status,
-                        )
-                        repaired_event = (
-                            await self._wait_for_user_input_supersession_interrupt_repair(
-                                session=session,
-                                expected_payload=payload,
-                            )
-                        )
-                        if repaired_event is None:
-                            raise TimeoutError(
-                                f"Session interruption is still finalizing: {session.id}"
-                            )
-                        yield repaired_event
-                        return
-                if (
-                    terminal_finalization_claim_id is not None
-                    and terminal_finalization_claim_expires_at is not None
-                ):
-                    renewed_claim = await self._terminal_finalization.renew_claim(
-                        session=session,
-                        claim_id=terminal_finalization_claim_id,
-                        expected_payload=payload,
-                    )
-                    if renewed_claim is None:
-                        terminal_finalization_claim_retained_for_recovery = True
-                        raise _IncompleteRecoveryClaimLost(
-                            "Terminal finalization ownership changed before offline settlement."
-                        )
-                    (
-                        session,
-                        terminal_finalization_claim_expires_at,
-                        _local_deadline,
-                    ) = renewed_claim
-                    await stop_local_terminal_finalization_heartbeat(
-                        superseded_by_exact_renewal=True,
-                    )
-                    if offline_terminal_decision is not None:
-                        # The terminal-decision handler renews, monitors, and
-                        # releases this exact claim itself. A second monitor
-                        # would misclassify its successful release as lease loss.
-                        owned_finalization = finalize_terminal_interruption()
-                    else:
-                        owned_finalization = self._terminal_finalization.stream(
-                            session=session,
-                            claim_id=terminal_finalization_claim_id,
-                            expected_payload=payload,
-                            finalization=finalize_terminal_interruption(),
-                        )
-                    if terminal_finalization_transfer_cancellation is not None:
-
-                        async def settle_cancelled_finalization() -> bool:
-                            async with _close_delegated_event_stream(owned_finalization) as owned:
-                                async for _event in owned:
-                                    pass
-                            return True
-
-                        settlement = await await_shielded_task_outcome(
-                            asyncio.create_task(settle_cancelled_finalization()),
-                            cancellation=terminal_finalization_transfer_cancellation,
-                        )
-                        authoritative_cancellation = (
-                            settlement.cancellation or terminal_finalization_transfer_cancellation
-                        )
-                        secondary_failures = [
-                            failure
-                            for failure in (
-                                terminal_finalization_transfer_process_control,
-                                terminal_finalization_transfer_failure,
-                                settlement.error,
-                                settlement.subsequent_cancellation,
-                            )
-                            if failure is not None
-                        ]
-                        if not secondary_failures:
-                            raise authoritative_cancellation
-                        if len(secondary_failures) == 1:
-                            raise authoritative_cancellation from secondary_failures[0]
-                        raise authoritative_cancellation from BaseExceptionGroup(
-                            "Terminal finalization cancellation evidence",
-                            secondary_failures,
-                        )
-                    if terminal_finalization_transfer_process_control is not None:
-
-                        async def settle_process_control_finalization() -> bool:
-                            async with _close_delegated_event_stream(owned_finalization) as owned:
-                                async for _event in owned:
-                                    pass
-                            return True
-
-                        settlement = await await_shielded_task_outcome(
-                            asyncio.create_task(settle_process_control_finalization()),
-                        )
-                        secondary_failures = [
-                            failure
-                            for failure in (
-                                terminal_finalization_transfer_failure,
-                                settlement.error,
-                                settlement.cancellation,
-                                settlement.subsequent_cancellation,
-                            )
-                            if failure is not None
-                        ]
-                        _raise_terminal_finalization_process_control(
-                            terminal_finalization_transfer_process_control,
-                            secondary_failures,
-                        )
-                    async with _close_delegated_event_stream(owned_finalization) as owned:
-                        async for event in owned:
-                            yield event
+                async with finalization.finalize(
+                    session=session,
+                    expected_payload=payload,
+                    finalization=finalize_terminal_interruption,
+                    terminal_decision=offline_terminal_decision,
+                ) as owned:
+                    async for event in owned:
+                        yield event
             else:
-                async for event in finalize_terminal_interruption():
+                async for event in finalize_terminal_interruption(session):
                     yield event
         finally:
             try:
@@ -20594,10 +20071,9 @@ class SessionEngine:
                 )
             finally:
                 try:
-                    await release_terminal_finalization_claim(sys.exception())
+                    await finalization.release(sys.exception())
                 finally:
-                    if request_marker_active:
-                        self._session_control.end_interruption_request(loaded_session.id)
+                    finalization.end_request()
         return
 
     async def _latest_tool_exposure_profile_id(self, session_id: str) -> str | None:
@@ -30740,58 +30216,6 @@ class SessionEngine:
             )
         )
 
-    async def _wait_for_user_input_supersession_interrupt_repair(
-        self,
-        *,
-        session: Session,
-        expected_payload: dict[str, Any],
-    ) -> Event | None:
-        """Join one durable terminal repair without becoming a second publisher."""
-
-        interruption_request_id = interruption_request_id_from_payload(expected_payload)
-        if interruption_request_id is None:
-            raise SessionRuntimePublicationConflict(
-                "Retained user-input supersession has no request identity."
-            )
-        for attempt in range(_INTERRUPTION_REPAIR_JOIN_MAX_ATTEMPTS):
-            checkpoint = await self.session_store.load_checkpoint(session.id)
-            marker = (
-                None
-                if checkpoint is None
-                else checkpoint.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
-            )
-            if marker is None:
-                event = await self._session_control.latest_interrupted_event(
-                    session.id,
-                    interruption_request_id=interruption_request_id,
-                )
-                if event is None:
-                    raise RuntimeError(
-                        "User-input supersession repair cleared its marker without "
-                        "terminal evidence."
-                    )
-                require_interruption_event_matches_pending_marker(
-                    event,
-                    expected_payload,
-                )
-                return event
-            if marker != expected_payload:
-                raise SessionRuntimePublicationConflict(
-                    "Retained user-input supersession changed during terminal repair."
-                )
-            event = await self._session_control.latest_interrupted_event(
-                session.id,
-                interruption_request_id=interruption_request_id,
-            )
-            if event is not None:
-                require_interruption_event_matches_pending_marker(
-                    event,
-                    expected_payload,
-                )
-            if attempt < _INTERRUPTION_REPAIR_JOIN_MAX_ATTEMPTS - 1:
-                await asyncio.sleep(_INTERRUPTION_REPAIR_JOIN_INTERVAL_SECONDS)
-        return None
-
     async def _clear_pending_session_interrupt(
         self,
         session_id: str,
@@ -31471,77 +30895,20 @@ class SessionEngine:
         if current_task is not None:
             self._session_control.unregister_active_task(session.id, current_task)
         self._session_control.begin_emitting_interrupted(session.id)
-        terminal_finalization_claim_id: str | None = None
-        terminal_finalization_handoff: TerminalFinalizationClaimHandoff | None = None
-        borrowed_terminal_finalization = False
-        if current_task is not None:
-            terminal_finalization_handoff = (
-                self._session_control.take_terminal_finalization_claim_handoff(
-                    session.id,
-                    task=current_task,
-                    session_instance_id=session.instance_id,
-                    run_epoch=session.run_epoch,
-                    transferred_from=terminal_finalization_handoff_source_task,
-                )
-            )
-            if terminal_finalization_handoff is not None:
-                terminal_finalization_claim_id = terminal_finalization_handoff.claim_id
-
-        async def await_handoff_operation(
-            operation: Callable[[], Awaitable[_OperationResultT]],
-            *,
-            operation_name: str,
-        ) -> _OperationResultT:
-            if terminal_finalization_handoff is None:
-                return await operation()
-            return await self._terminal_finalization.await_operation(
-                heartbeat_task=terminal_finalization_handoff.heartbeat_task,
-                operation=operation,
-                operation_name=operation_name,
-            )
-
-        async def stop_terminal_finalization_handoff(
-            *,
-            superseded_by_exact_renewal: bool = False,
-        ) -> None:
-            if terminal_finalization_claim_id is None:
-                return
-            heartbeat_task = self._session_control.end_terminal_finalization_claim_handoff(
-                session.id,
-                claim_id=terminal_finalization_claim_id,
-                task=current_task,
-            )
-            if (
-                heartbeat_task is None
-                and terminal_finalization_handoff is not None
-                and terminal_finalization_handoff.claimed_by is current_task
-            ):
-                terminal_finalization_handoff.heartbeat_stop.set()
-                heartbeat_task = terminal_finalization_handoff.heartbeat_task
-            if heartbeat_task is None:
-                return
-            if not superseded_by_exact_renewal:
-                await heartbeat_task
-                return
-            heartbeat_result = await asyncio.gather(
-                heartbeat_task,
-                return_exceptions=True,
-            )
-            heartbeat_failure = heartbeat_result[0]
-            if isinstance(
-                heartbeat_failure,
-                (KeyboardInterrupt, SystemExit, GeneratorExit, BaseExceptionGroup),
-            ) and not isinstance(heartbeat_failure, Exception):
-                raise heartbeat_failure
+        finalization = self._terminal_finalization.interrupted_run(
+            session=session,
+            task=current_task,
+            transferred_from=terminal_finalization_handoff_source_task,
+        )
 
         try:
-            loaded_interrupted = await await_handoff_operation(
+            loaded_interrupted = await finalization.await_operation(
                 lambda: self.session_store.load(session.id),
                 operation_name="Live interruption session read",
             )
             if loaded_interrupted is None:
                 raise KeyError(f"Session not found: {session.id}") from None
-            payload = await await_handoff_operation(
+            payload = await finalization.await_operation(
                 lambda: self._load_pending_session_interrupt_payload(
                     session.id,
                     default={},
@@ -31561,112 +30928,15 @@ class SessionEngine:
                 raise SessionRuntimePublicationConflict(
                     "Pending session interruption has no request identity."
                 )
-            if user_input_supersession_retained:
-                if current_task is None or terminal_finalization_handoff is None:
-                    authenticated_payload = await (
-                        self._validated_user_input_supersession_interrupt_payload(
-                            session=loaded_interrupted,
-                            pending_interrupt_payload=payload,
-                        )
-                    )
-                    if authenticated_payload is None:
-                        raise SessionRuntimePublicationConflict(
-                            "User-input supersession has no authenticated durable authority."
-                        )
-                    checkpoint = await self.session_store.load_checkpoint(session.id)
-                    shared_claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
-                    joined_claim = None
-                    if shared_claim is not None:
-                        joined_claim = await self._terminal_finalization.renew_claim(
-                            session=loaded_interrupted,
-                            claim_id=shared_claim[0],
-                            expected_payload=authenticated_payload,
-                        )
-                    if joined_claim is not None:
-                        assert current_task is not None
-                        assert shared_claim is not None
-                        (
-                            loaded_interrupted,
-                            _joined_claim_expires_at,
-                            joined_local_lease_deadline,
-                        ) = joined_claim
-                        heartbeat_stop, heartbeat_task = (
-                            self._terminal_finalization.start_heartbeat(
-                                session_id=session.id,
-                                claim_id=shared_claim[0],
-                                local_lease_deadline=joined_local_lease_deadline,
-                            )
-                        )
-                        terminal_finalization_claim_id = shared_claim[0]
-                        borrowed_terminal_finalization = (
-                            self._recovery_coordinator._owns_current_recovery_worker(
-                                session.id, shared_claim[0]
-                            )
-                        )
-                        terminal_finalization_handoff = TerminalFinalizationClaimHandoff(
-                            session_instance_id=loaded_interrupted.instance_id,
-                            run_epoch=loaded_interrupted.run_epoch,
-                            interruption_request_id=interruption_request_id,
-                            expected_interrupt_payload=copy_json_value(
-                                authenticated_payload,
-                                "expected_interrupt_payload",
-                            ),
-                            claim_id=shared_claim[0],
-                            eligible_tasks=frozenset({current_task}),
-                            heartbeat_stop=heartbeat_stop,
-                            heartbeat_task=heartbeat_task,
-                            claimed_by=current_task,
-                        )
-                    else:
-                        joined_event = await (
-                            self._wait_for_user_input_supersession_interrupt_repair(
-                                session=loaded_interrupted,
-                                expected_payload=authenticated_payload,
-                            )
-                        )
-                        if joined_event is None:
-                            await self._recovery_coordinator._repair_terminal_evidence_owned(
-                                session=loaded_interrupted,
-                                inactive_for_seconds=None,
-                                previous_status=loaded_interrupted.status,
-                            )
-                            joined_event = await (
-                                self._wait_for_user_input_supersession_interrupt_repair(
-                                    session=loaded_interrupted,
-                                    expected_payload=authenticated_payload,
-                                )
-                            )
-                        if joined_event is None:
-                            raise TimeoutError(
-                                f"Session interruption is still finalizing: {session.id}"
-                            )
-                        yield joined_event
-                        return
-                if (
-                    loaded_interrupted.instance_id
-                    != terminal_finalization_handoff.session_instance_id
-                    or loaded_interrupted.run_epoch != terminal_finalization_handoff.run_epoch
-                    or payload != terminal_finalization_handoff.expected_interrupt_payload
-                    or interruption_request_id
-                    != terminal_finalization_handoff.interruption_request_id
-                ):
-                    raise SessionRuntimePublicationConflict(
-                        "User-input supersession changed after its live finalization handoff."
-                    )
-                renewed_claim = await self._terminal_finalization.renew_claim(
-                    session=loaded_interrupted,
-                    claim_id=terminal_finalization_handoff.claim_id,
-                    expected_payload=terminal_finalization_handoff.expected_interrupt_payload,
-                )
-                if renewed_claim is None:
-                    raise _IncompleteRecoveryClaimLost(
-                        "Terminal finalization ownership changed before live settlement."
-                    )
-                loaded_interrupted, _renewed_until, _local_deadline = renewed_claim
-            elif terminal_finalization_handoff is not None:
-                raise SessionRuntimePublicationConflict(
-                    "Terminal finalization handoff lost its user-input supersession authority."
-                )
+            prepared_finalization = await finalization.prepare(
+                session=loaded_interrupted,
+                payload=payload,
+                interruption_request_id=interruption_request_id,
+            )
+            if isinstance(prepared_finalization, Event):
+                yield prepared_finalization
+                return
+            loaded_interrupted = prepared_finalization
             exact_interrupt_marker_retained = (
                 bool(provider_cancellation_failures) or user_input_supersession_retained
             )
@@ -31720,7 +30990,7 @@ class SessionEngine:
                 # ordinary callbacks cannot see private lifecycle authority.
                 # Read access does not authorize changing that winner.
                 with _invocation_lifecycle_authority_read_scope():
-                    await await_handoff_operation(
+                    await finalization.await_operation(
                         lambda: self.session_store.publish_checkpoint_and_events(
                             session.id,
                             checkpoint_transform=retain_interruption_diagnostics,
@@ -31730,7 +31000,7 @@ class SessionEngine:
                         ),
                         operation_name="Live interruption diagnostic checkpoint publication",
                     )
-            decision_checkpoint = await await_handoff_operation(
+            decision_checkpoint = await finalization.await_operation(
                 lambda: self.session_store.load_checkpoint(session.id),
                 operation_name="Live interruption terminal-decision read",
             )
@@ -31777,7 +31047,7 @@ class SessionEngine:
                 is None
                 and self._supports_terminal_interaction_publication_protocol()
             ):
-                terminal_decision = await await_handoff_operation(
+                terminal_decision = await finalization.await_operation(
                     lambda: self._ensure_interruption_terminal_decision(
                         session=loaded_interrupted,
                         terminal_payload=payload,
@@ -31785,7 +31055,7 @@ class SessionEngine:
                     ),
                     operation_name="Live post-dispatch terminal-decision election",
                 )
-                decision_checkpoint = await await_handoff_operation(
+                decision_checkpoint = await finalization.await_operation(
                     lambda: self.session_store.load_checkpoint(session.id),
                     operation_name="Live interruption elected terminal-decision read",
                 )
@@ -31849,7 +31119,7 @@ class SessionEngine:
                     (
                         loaded_interrupted,
                         prepared_terminal_event,
-                    ) = await await_handoff_operation(
+                    ) = await finalization.await_operation(
                         lambda: self._publish_closed_interaction_terminal_decision(
                             session=loaded_interrupted,
                             decision=terminal_decision,
@@ -31864,7 +31134,7 @@ class SessionEngine:
                         loaded_interrupted,
                         decided_interaction_event,
                         _,
-                    ) = await await_handoff_operation(
+                    ) = await finalization.await_operation(
                         lambda: self._publish_sibling_interaction_transition(
                             session=loaded_interrupted,
                             invocation_context=invocation_context,
@@ -31879,9 +31149,7 @@ class SessionEngine:
                             finalize_unsettled_cancellation=False,
                             terminal_event=prepared_terminal_event,
                             terminal_decision=terminal_decision,
-                            expected_recovery_claim_id=(
-                                terminal_finalization_claim_id or recovery_claim_id
-                            ),
+                            expected_recovery_claim_id=(finalization.claim_id or recovery_claim_id),
                         ),
                         operation_name="Live interruption atomic terminal publication",
                     )
@@ -31920,7 +31188,7 @@ class SessionEngine:
                 assert invocation_context is not None
                 recovery_claim_id = invocation_context.recovery_claim_id
                 assert recovery_claim_id is not None
-                loaded_interrupted = await await_handoff_operation(
+                loaded_interrupted = await finalization.await_operation(
                     lambda: self._transition_status_under_terminal_finalization_claim(
                         session=loaded_interrupted,
                         from_statuses={loaded_interrupted.status},
@@ -31934,7 +31202,7 @@ class SessionEngine:
                     loaded_interrupted,
                     interaction_event,
                     _,
-                ) = await await_handoff_operation(
+                ) = await finalization.await_operation(
                     lambda: self._publish_sibling_interaction_transition(
                         session=loaded_interrupted,
                         invocation_context=invocation_context,
@@ -31944,9 +31212,7 @@ class SessionEngine:
                         to_status=SessionStatus.INTERRUPTED,
                         execution_profile=execution_profile,
                         finalize_unsettled_cancellation=False,
-                        expected_recovery_claim_id=(
-                            terminal_finalization_claim_id or recovery_claim_id
-                        ),
+                        expected_recovery_claim_id=(finalization.claim_id or recovery_claim_id),
                     ),
                     operation_name="Live interruption interaction transition",
                 )
@@ -31955,7 +31221,7 @@ class SessionEngine:
                 and interaction_event is None
                 and _current_session_interaction_id(session.id) is not None
             ):
-                _, interaction_event, _ = await await_handoff_operation(
+                _, interaction_event, _ = await finalization.await_operation(
                     lambda: self._publish_sibling_interaction_transition(
                         session=loaded_interrupted,
                         invocation_context=invocation_context,
@@ -31966,16 +31232,16 @@ class SessionEngine:
                         from_statuses={SessionStatus.INTERRUPTED},
                         execution_profile=execution_profile,
                         finalize_unsettled_cancellation=False,
-                        expected_recovery_claim_id=(
-                            terminal_finalization_claim_id or recovery_claim_id
-                        ),
+                        expected_recovery_claim_id=(finalization.claim_id or recovery_claim_id),
                     ),
                     operation_name="Live interruption residual interaction transition",
                 )
             if interaction_event is not None:
                 yield interaction_event
 
-            async def finalize_interrupted_session() -> AsyncGenerator[Event, None]:
+            async def finalize_interrupted_session(
+                loaded_interrupted: Session,
+            ) -> AsyncGenerator[Event, None]:
                 existing_interrupt_event = await self._session_control.wait_for_interrupted_event(
                     session.id,
                     interruption_request_id=interruption_request_id,
@@ -31987,13 +31253,13 @@ class SessionEngine:
                             payload,
                         )
                     if user_input_supersession_retained:
-                        if terminal_finalization_claim_id is None:
+                        if finalization.claim_id is None:
                             raise RuntimeError(
                                 "User-input supersession finalization lost its durable owner."
                             )
                         await self._clear_claimed_pending_interrupt_if_retained(
                             session_id=session.id,
-                            claim_id=terminal_finalization_claim_id,
+                            claim_id=finalization.claim_id,
                             expected_payload=payload,
                         )
                     else:
@@ -32035,11 +31301,11 @@ class SessionEngine:
                         yield turn_event
                 terminal_event_publisher: Callable[[Event], Awaitable[Event]] | None = None
                 if user_input_supersession_retained:
-                    if terminal_finalization_claim_id is None:
+                    if finalization.claim_id is None:
                         raise RuntimeError(
                             "User-input supersession finalization lost its durable owner."
                         )
-                    owned_claim_id = terminal_finalization_claim_id
+                    owned_claim_id = finalization.claim_id
 
                     async def publish_owned_terminal_event(event: Event) -> Event:
                         return await self._publish_terminal_event_under_finalization_claim(
@@ -32082,13 +31348,13 @@ class SessionEngine:
                         payload,
                     )
                 if user_input_supersession_retained:
-                    if terminal_finalization_claim_id is None:
+                    if finalization.claim_id is None:
                         raise RuntimeError(
                             "User-input supersession finalization lost its durable owner."
                         )
                     await self._clear_claimed_pending_interrupt_if_retained(
                         session_id=session.id,
-                        claim_id=terminal_finalization_claim_id,
+                        claim_id=finalization.claim_id,
                         expected_payload=payload,
                     )
                 else:
@@ -32113,70 +31379,19 @@ class SessionEngine:
                     yield event
 
             if user_input_supersession_retained:
-                if terminal_finalization_claim_id is None:
-                    raise RuntimeError(
-                        "User-input supersession finalization lost its durable owner."
-                    )
-                renewed_claim = await self._terminal_finalization.renew_claim(
+                async with finalization.finalize(
                     session=loaded_interrupted,
-                    claim_id=terminal_finalization_claim_id,
                     expected_payload=payload,
-                )
-                if renewed_claim is None:
-                    raise _IncompleteRecoveryClaimLost(
-                        "Terminal finalization ownership changed before terminal publication."
-                    )
-                loaded_interrupted, _renewed_until, _local_deadline = renewed_claim
-                await stop_terminal_finalization_handoff(
-                    superseded_by_exact_renewal=True,
-                )
-                # Recovery already supervises this exact worker and claim. Run
-                # its nested finalizer inline; another worker/claim supervisor
-                # would depend on the outer worker that is awaiting this stream.
-                owned_finalization = (
-                    finalize_interrupted_session()
-                    if borrowed_terminal_finalization
-                    else self._terminal_finalization.stream(
-                        session=loaded_interrupted,
-                        claim_id=terminal_finalization_claim_id,
-                        expected_payload=payload,
-                        finalization=finalize_interrupted_session(),
-                    )
-                )
-                async with _close_delegated_event_stream(owned_finalization) as owned:
+                    finalization=finalize_interrupted_session,
+                ) as owned:
                     async for event in owned:
                         yield event
             else:
-                async for event in finalize_interrupted_session():
+                async for event in finalize_interrupted_session(loaded_interrupted):
                     yield event
         finally:
             try:
-                if terminal_finalization_claim_id is not None:
-                    await self._run_cleanup_steps(
-                        authoritative_failure=sys.exception(),
-                        steps=(
-                            (
-                                "terminal evidence finalization handoff shutdown",
-                                stop_terminal_finalization_handoff,
-                            ),
-                            # A borrower cannot release its supervisor's claim.
-                            *(
-                                ()
-                                if borrowed_terminal_finalization
-                                else (
-                                    (
-                                        "terminal evidence finalization claim release",
-                                        lambda: (
-                                            self._recovery_coordinator._release_incomplete_recovery_claim(
-                                                session.id,
-                                                terminal_finalization_claim_id,
-                                            )
-                                        ),
-                                    ),
-                                )
-                            ),
-                        ),
-                    )
+                await finalization.release(sys.exception())
             finally:
                 self._session_control.end_emitting_interrupted(session.id)
 

@@ -361,3 +361,56 @@ def _attach_exception_cause_preserving_graph(
         [cause, existing],
     )
     return set_exception_cause(error, combined)
+
+
+def _failure_without_existing_exception_identities(
+    error: BaseException,
+    existing_ids: set[int],
+) -> BaseException | None:
+    """Remove already-owned failures while retaining non-overlapping subgroups."""
+
+    pending: list[tuple[BaseException, bool]] = [(error, False)]
+    children_by_group: dict[int, tuple[BaseException, ...]] = {}
+    retained_by_identity: dict[int, BaseException | None] = {}
+    while pending:
+        candidate, expanded = pending.pop()
+        candidate_id = id(candidate)
+        if candidate_id in retained_by_identity:
+            continue
+        if candidate_id in existing_ids:
+            retained_by_identity[candidate_id] = None
+            continue
+        if not isinstance(candidate, BaseExceptionGroup):
+            retained_by_identity[candidate_id] = candidate
+            continue
+        if expanded:
+            children = children_by_group.pop(candidate_id, ())
+            retained_children = [
+                retained
+                for child in children
+                if (retained := retained_by_identity.get(id(child))) is not None
+            ]
+            if not retained_children:
+                retained_by_identity[candidate_id] = None
+            elif len(retained_children) == len(children) and all(
+                retained is child
+                for retained, child in zip(retained_children, children, strict=True)
+            ):
+                retained_by_identity[candidate_id] = candidate
+            else:
+                retained_by_identity[candidate_id] = BaseExceptionGroup(
+                    "Session interruption additional non-duplicate failures.",
+                    retained_children,
+                )
+            continue
+        children = exception_group_children(candidate)
+        if children is None:
+            retained_by_identity[candidate_id] = RuntimeError(
+                "Session interruption received an unreadable exception group."
+            )
+            continue
+        children_by_group[candidate_id] = children
+        pending.append((candidate, True))
+        pending.extend((child, False) for child in reversed(children))
+
+    return retained_by_identity.get(id(error))

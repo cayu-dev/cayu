@@ -26,7 +26,11 @@ import cayu.runtime._tool_round_executor as tool_round_executor_module
 import cayu.runtime._tool_round_recovery as tool_round_recovery_module
 import cayu.tools._operation_boundary as operation_boundary_module
 import cayu.tools._runner as runner_module
-from cayu._exception_groups import exception_cause, iter_exception_tree
+from cayu._exception_groups import (
+    _failure_without_existing_exception_identities,
+    exception_cause,
+    iter_exception_tree,
+)
 from cayu._exception_state import set_exception_state
 from cayu._validation import canonical_durable_json_bytes
 from cayu._workspace_mutation import WorkspaceMutationSettlementError
@@ -6354,7 +6358,7 @@ def test_interruption_failure_deduplication_handles_deep_groups_iteratively() ->
         failure = BaseExceptionGroup("nested cleanup", [failure])
 
     assert (
-        session_engine_module._failure_without_existing_exception_identities(
+        _failure_without_existing_exception_identities(
             failure,
             set(),
         )

@@ -63,6 +63,10 @@ from cayu.runtime._terminal_evidence import (
     interruption_request_id_from_payload,
     require_interruption_event_matches_pending_marker,
 )
+from cayu.runtime._terminal_finalization_lifetime import (
+    InterruptedRunFinalization,
+    InterruptionFinalization,
+)
 from cayu.runtime._tool_completion import recorded_terminal_tool_completion_payload
 from cayu.runtime.execution_profiles import event_with_execution_profile_fingerprint_authority
 from cayu.sessions.base import (
@@ -83,6 +87,10 @@ from cayu.sessions.base import (
 )
 from cayu.sessions.cleanup import RecoveryCleanupStepInput
 from cayu.vaults.redaction import SecretRedactor
+
+_INTERRUPTION_REPAIR_JOIN_MAX_ATTEMPTS = 100
+
+_INTERRUPTION_REPAIR_JOIN_INTERVAL_SECONDS = 0.01
 
 _RecoveryResultT = TypeVar("_RecoveryResultT")
 _TERMINAL_FINALIZATION_PROCESS_CONTROL_SIGNALS = (GeneratorExit, KeyboardInterrupt, SystemExit)
@@ -233,6 +241,16 @@ class _FinalizationRecoveryOperations(Protocol):
         input_id: str,
     ) -> UserInputPauseState: ...
 
+    def _owns_current_recovery_worker(self, session_id: str, claim_id: str) -> bool: ...
+
+    async def _repair_terminal_evidence_owned(
+        self,
+        *,
+        session: Session,
+        inactive_for_seconds: int | None,
+        previous_status: SessionStatus,
+    ) -> IncompleteSessionRecoveryResult: ...
+
     @property
     def claim_lease_duration(self) -> timedelta: ...
 
@@ -290,6 +308,24 @@ class TerminalEvidenceFinalization:
         self._event_writer = event_writer
         self._secret_redactor = secret_redactor
         self._logger = logger
+
+    def interruption(self, *, session_id: str, adopting_pending: bool) -> InterruptionFinalization:
+        """Create the request lifetime before its atomic interruption transition."""
+        return InterruptionFinalization(
+            self, session_id=session_id, adopting_pending=adopting_pending
+        )
+
+    def interrupted_run(
+        self,
+        *,
+        session: Session,
+        task: asyncio.Task[Any] | None,
+        transferred_from: asyncio.Task[Any] | None,
+    ) -> InterruptedRunFinalization:
+        """Accept a task-bound handoff without claiming another recovery worker."""
+        return InterruptedRunFinalization(
+            self, session=session, task=task, transferred_from=transferred_from
+        )
 
     def new_claim_id(
         self,
@@ -1319,3 +1355,67 @@ class TerminalEvidenceFinalization:
             )
 
         await self._session_store.transform_checkpoint(session_id, clear_operation)
+
+    async def repair_and_join(self, *, session: Session, expected_payload: dict[str, Any]) -> Event:
+        """Finish exact terminal evidence under shared recovery ownership and join it."""
+        await self._recovery._repair_terminal_evidence_owned(
+            session=session,
+            inactive_for_seconds=None,
+            previous_status=session.status,
+        )
+        event = await self.wait_for_repair(session=session, expected_payload=expected_payload)
+        if event is None:
+            raise TimeoutError(f"Session interruption is still finalizing: {session.id}")
+        return event
+
+    async def wait_for_repair(
+        self,
+        *,
+        session: Session,
+        expected_payload: dict[str, Any],
+    ) -> Event | None:
+        """Join one durable terminal repair without becoming a second publisher."""
+
+        interruption_request_id = interruption_request_id_from_payload(expected_payload)
+        if interruption_request_id is None:
+            raise SessionRuntimePublicationConflict(
+                "Retained user-input supersession has no request identity."
+            )
+        for attempt in range(_INTERRUPTION_REPAIR_JOIN_MAX_ATTEMPTS):
+            checkpoint = await self._session_store.load_checkpoint(session.id)
+            marker = (
+                None
+                if checkpoint is None
+                else checkpoint.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
+            )
+            if marker is None:
+                event = await self._session_control.latest_interrupted_event(
+                    session.id,
+                    interruption_request_id=interruption_request_id,
+                )
+                if event is None:
+                    raise RuntimeError(
+                        "User-input supersession repair cleared its marker without "
+                        "terminal evidence."
+                    )
+                require_interruption_event_matches_pending_marker(
+                    event,
+                    expected_payload,
+                )
+                return event
+            if marker != expected_payload:
+                raise SessionRuntimePublicationConflict(
+                    "Retained user-input supersession changed during terminal repair."
+                )
+            event = await self._session_control.latest_interrupted_event(
+                session.id,
+                interruption_request_id=interruption_request_id,
+            )
+            if event is not None:
+                require_interruption_event_matches_pending_marker(
+                    event,
+                    expected_payload,
+                )
+            if attempt < _INTERRUPTION_REPAIR_JOIN_MAX_ATTEMPTS - 1:
+                await asyncio.sleep(_INTERRUPTION_REPAIR_JOIN_INTERVAL_SECONDS)
+        return None

@@ -198,6 +198,14 @@ retains exact event identity, redaction and marker cleanup. Approval/round check
 come from `_approval_support.py`; user-input authority and recovery claim
 acquisition remain with recovery. Shared claim records live in `_recovery_claims.py`.
 
+Request and interrupted-run lifetimes in `_terminal_finalization_lifetime.py` own
+preparation, claim handoff, heartbeat shutdown and settlement. They reuse
+SessionControl's task-bound handoffs and select execution under the existing
+supervisor. Borrowed work runs inside its original recovery worker and cannot
+release that worker's claim. The engine supplies interruption policy and terminal
+publication; the lifetime supplies the session authenticated by its final renewal.
+Evidence inspection and claimed crash repair remain independently usable.
+
 `ToolRoundExecutor` delegates ordinary tool-round publication to
 `DurableToolRound`. The owner reserves capacity for private terminal stages before
 dispatch, retains the round's lifecycle evidence, and publishes staged results in
