@@ -5063,10 +5063,10 @@ def _replace_checkpoint_preserving_completion_result_event_publications(
     """Replace caller state while retaining decoded runtime-owned checkpoint authority."""
 
     from cayu.collaboration import _session_export_store as session_exports
-    from cayu.runtime import _producer_output_store as producers
 
     # Validate before decoding can normalize caller-controlled authority.
     from cayu.runtime import _session_continuation_store as continuations
+    from cayu.sessions import _producer_checkpoint as producers
 
     producer_root = producers.project_checkpoint_root(current, replacement, session_id=session_id)
     continuation_root = (
@@ -5204,8 +5204,8 @@ def _copy_checkpoint_for_transform(
     """Validate and detach callback-visible state from store-owned authority."""
 
     from cayu.collaboration import _session_export_store as session_exports
-    from cayu.runtime import _producer_output_store as producers
     from cayu.runtime import _session_continuation_store as continuations
+    from cayu.sessions import _producer_checkpoint as producers
 
     if checkpoint is None:
         return None
@@ -18917,7 +18917,8 @@ class InMemorySessionStore(MemorySessionExecutionMixin, MemoryCreationFenceMixin
                 if key.startswith(session_exports.OPERATION_PREFIX)
             },
         )
-        from cayu.runtime._producer_output_store import OPERATION_PREFIX, require_erasure_quiescence
+        from cayu.runtime._producer_output_store import require_erasure_quiescence
+        from cayu.sessions._producer_checkpoint import OPERATION_PREFIX
 
         require_erasure_quiescence(
             session=session,
@@ -23373,8 +23374,8 @@ class InMemorySessionStore(MemorySessionExecutionMixin, MemoryCreationFenceMixin
                 idempotency_key
             )
             from cayu.collaboration import _session_export_store as session_exports
-            from cayu.runtime import _producer_output_store as producers
             from cayu.runtime import _session_continuation_store as continuations
+            from cayu.sessions import _producer_checkpoint as producers
 
             callback_session = session.model_copy(deep=True)
             callback_checkpoint = (
@@ -29691,14 +29692,14 @@ def _reject_reserved_runtime_publication_key(
     value: str, field_name: str, *, browser_control_read: bool = False
 ) -> str:
     from cayu.collaboration._session_export_store import require_operation_key_access
-    from cayu.runtime._producer_output_store import (
-        require_operation_key_access as require_producer_key_access,
-    )
     from cayu.runtime._session_continuation_scope import (
         require_operation_key_access as require_continuation_key_access,
     )
     from cayu.sessions._argument_continuity import require_private_key_access
     from cayu.sessions._browser_control_checkpoint import require_browser_control_operation_owner
+    from cayu.sessions._producer_checkpoint import (
+        require_operation_key_access as require_producer_key_access,
+    )
 
     value = require_clean_nonblank(value, field_name)
     require_operation_key_access(value, read=browser_control_read)

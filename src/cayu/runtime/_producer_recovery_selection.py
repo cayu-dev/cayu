@@ -3,8 +3,8 @@
 from cayu.collaboration._contracts import CollaborationContractError
 from cayu.collaboration._preparation import prepare_contract
 from cayu.collaboration.access import CollaborationAccessContext
-from cayu.runtime._producer_output_store import ROOT_KEY, NativeProducerIndex
 from cayu.sessions import SessionStatus
+from cayu.sessions._producer_checkpoint import ROOT_KEY, NativeProducerIndex
 from cayu.sessions.recovery import (
     RECOVERY_PLAN_MAX_ITEMS,
     ContinuationRecoveryExpectation,

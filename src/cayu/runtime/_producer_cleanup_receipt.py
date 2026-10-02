@@ -17,17 +17,17 @@ from cayu.collaboration._producer_contracts import (
     ProducerOutputRecord,
 )
 from cayu.collaboration.prepared_admission import FreshRecipientAdmissionTarget
-from cayu.runtime._producer_cleanup_contract import (
-    NativeProducerCleanupReceipt as NativeProducerCleanupReceipt,
-)
-from cayu.runtime._producer_output_store import (
+from cayu.runtime._producer_release import release_from_snapshot
+from cayu.sessions._producer_checkpoint import (
     ROOT_KEY,
     NativeProducerAttachment,
     NativeProducerIndex,
     attachment_index,
     attachment_operation_key,
 )
-from cayu.runtime._producer_release import release_from_snapshot
+from cayu.sessions._producer_cleanup_contract import (
+    NativeProducerCleanupReceipt as NativeProducerCleanupReceipt,
+)
 from cayu.vaults.redaction import SecretRedactor
 
 _SEAL = object()

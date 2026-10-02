@@ -11,7 +11,7 @@ from cayu.collaboration._producer_registration import producer_launch_guard
 from cayu.collaboration._request_coordinator import _safe_request_failure
 from cayu.collaboration.mandates import MandateAccessContext
 from cayu.collaboration.prepared_admission import FreshRecipientAdmissionTarget
-from cayu.runtime._producer_output_store import (
+from cayu.sessions._producer_checkpoint import (
     ROOT_KEY,
     NativeProducerAttachment,
     NativeProducerIndex,

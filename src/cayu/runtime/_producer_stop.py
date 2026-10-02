@@ -14,14 +14,14 @@ from cayu.collaboration._preparation import contract_bytes, prepare_contract, re
 from cayu.collaboration._producer_contracts import ProducerOutputRecord
 from cayu.collaboration.prepared_admission import FreshRecipientAdmissionTarget, NativeCommitment
 from cayu.collaboration.requests import RequestControlReceipt
-from cayu.runtime._producer_output_store import (
+from cayu.runtime._session_steering import accept_session_steering
+from cayu.runtime.session_steering import StopAfterCurrentToolRoundRequest
+from cayu.sessions._producer_checkpoint import (
     ROOT_KEY,
     NativeProducerAttachment,
     NativeProducerIndex,
     attachment_operation_key,
 )
-from cayu.runtime._session_steering import accept_session_steering
-from cayu.runtime.session_steering import StopAfterCurrentToolRoundRequest
 from cayu.sessions.base import _invocation_lifecycle_authority_read_scope
 from cayu.vaults.redaction import SecretRedactor
 

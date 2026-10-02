@@ -36,7 +36,7 @@ async def recover_interrupted_producer(app, command, *, context, inactive_for_se
     retains live/human/unknown-effect gates; store-time admission still owns the
     inactivity decision. A blocked plan is not proof that production settled.
     """
-    from cayu.runtime._producer_output_store import attachment_index
+    from cayu.sessions._producer_checkpoint import attachment_index
     from cayu.sessions.recovery import (
         ProducerRecoveryExpectation,
         RecoveryExecutionRequest,

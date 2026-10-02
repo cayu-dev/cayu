@@ -42074,5 +42074,16 @@
     "tests/core/test_argument_continuity_boundary.py::test_old_pickled_argument_batch_uses_the_canonical_contract": 0.0005509171169251204,
     "tests/core/test_argument_continuity_boundary.py::test_private_read_scope_is_shared_and_restored_after_nested_failure[canonical]": 0.00027037481777369976,
     "tests/core/test_argument_continuity_boundary.py::test_private_read_scope_is_shared_and_restored_after_nested_failure[legacy]": 0.00018529221415519714,
-    "tests/core/test_argument_continuity_boundary.py::test_private_records_operate_without_runtime_or_store_implementations": 0.10463020694442093
+    "tests/core/test_argument_continuity_boundary.py::test_private_records_operate_without_runtime_or_store_implementations": 0.10463020694442093,
+  "tests/core/test_producer_checkpoint_authority.py::test_legacy_producer_imports_share_contracts_and_authority": 0.000325249508023262,
+  "tests/core/test_producer_checkpoint_authority.py::test_old_pickled_producer_classes_resolve_to_the_session_owner[NativeProducerAttachment]": 0.0002405419945716858,
+  "tests/core/test_producer_checkpoint_authority.py::test_old_pickled_producer_classes_resolve_to_the_session_owner[NativeProducerCleanupReceipt]": 0.00015425006859004498,
+  "tests/core/test_producer_checkpoint_authority.py::test_old_pickled_producer_classes_resolve_to_the_session_owner[NativeProducerIndex]": 0.00016479077748954296,
+  "tests/core/test_producer_checkpoint_authority.py::test_old_pickled_producer_classes_resolve_to_the_session_owner[NativeProducerInvocation]": 0.0001878740731626749,
+  "tests/core/test_producer_checkpoint_authority.py::test_old_pickled_producer_classes_resolve_to_the_session_owner[NativeProducerPausedStop]": 0.00016329181380569935,
+  "tests/core/test_producer_checkpoint_authority.py::test_producer_checkpoint_rules_operate_without_runtime_or_stores": 0.3173613741528243,
+  "tests/core/test_producer_checkpoint_authority.py::test_producer_root_requires_exact_scope_and_preserves_unowned_authority": 0.003920207731425762,
+  "tests/core/test_producer_checkpoint_authority.py::test_producer_scope_is_shared_and_restored_after_nested_failure[canonical]": 0.0011421248782426119,
+  "tests/core/test_producer_checkpoint_authority.py::test_producer_scope_is_shared_and_restored_after_nested_failure[legacy]": 0.00029241712763905525,
+  "tests/core/test_producer_checkpoint_authority.py::test_producer_scope_is_task_local_and_restored_on_cancellation[asyncio]": 0.006851874059066176
 }

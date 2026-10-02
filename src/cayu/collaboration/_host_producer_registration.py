@@ -26,7 +26,7 @@ from cayu.collaboration.access import CollaborationAccessContext
 from cayu.collaboration.base import REQUEST_FAMILY
 from cayu.collaboration.mandates import MandateAccessContext
 from cayu.collaboration.participants import CollaborationUnavailable
-from cayu.runtime._producer_output_store import NativeProducerAttachment
+from cayu.sessions._producer_checkpoint import NativeProducerAttachment
 from cayu.sessions.context_views import ParticipantSessionExecutionRequest
 
 

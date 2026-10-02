@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from cayu.collaboration._preparation import prepare_contract, require_exact_contract
 from cayu.runtime._invocation_lifecycle import InvocationContext
-from cayu.runtime._producer_output_store import (
+from cayu.sessions._producer_checkpoint import (
     ROOT_KEY,
     NativeProducerAttachment,
     NativeProducerIndex,

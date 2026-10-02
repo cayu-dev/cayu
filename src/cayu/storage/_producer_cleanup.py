@@ -40,7 +40,7 @@ async def memory_cleanup(store, registration, *, authority=None, commit=False):
             attachment=store._session_operation_records.get(sid, {}).get(key),
             children=bool(store._child_session_keys_by_parent.get(sid)),
         )
-        from cayu.runtime._producer_output_store import (
+        from cayu.sessions._producer_checkpoint import (
             ROOT_KEY,
             NativeProducerIndex,
             _publication_scope,

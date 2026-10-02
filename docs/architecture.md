@@ -315,6 +315,14 @@ scope state. Operator authentication, browser I/O, invocation admission and
 publication orchestration remain with their existing owners; the checkpoint
 rules can operate independently of runtime.
 
+`sessions/_producer_checkpoint.py` owns producer attachment/index records,
+checkpoint visibility and projection, reserved-operation guards, and the shared
+publication scope. `_producer_cleanup_contract.py` owns the immutable cleanup
+receipt used by the index and runtime readback. Runtime publishers and store
+guards use the same definitions and scope; the former runtime imports remain
+compatible. Admission, output publication, cleanup and recovery execution retain
+their existing owners and native transaction boundaries.
+
 ## Multi-Agent Shape
 
 Cayu must support systems where multiple agents collaborate through shared state.

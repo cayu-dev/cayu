@@ -26,10 +26,8 @@ from cayu.collaboration._request_store import operation_key, retained_request
 from cayu.collaboration.base import _Anchor
 from cayu.collaboration.participants import CollaborationUnavailable
 from cayu.collaboration.requests import RequestSnapshot
-from cayu.runtime._producer_cleanup_receipt import (
-    NativeProducerCleanupReceipt,
-    read_cleanup_receipt,
-)
+from cayu.runtime._producer_cleanup_receipt import read_cleanup_receipt
+from cayu.sessions._producer_cleanup_contract import NativeProducerCleanupReceipt
 
 _SEAL = object()
 

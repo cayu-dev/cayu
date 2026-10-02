@@ -86,8 +86,8 @@ def prepare_retirement(retirement, authority, limit):
 
 
 def validate_retiring_receipt(retirement, operation_key, raw):
-    from cayu.runtime._producer_cleanup_receipt import NativeProducerCleanupReceipt
-    from cayu.runtime._producer_output_store import OPERATION_PREFIX
+    from cayu.sessions._producer_checkpoint import OPERATION_PREFIX
+    from cayu.sessions._producer_cleanup_contract import NativeProducerCleanupReceipt
 
     receipt = prepare_contract(NativeProducerCleanupReceipt, raw, redactor=SecretRedactor())
     if (

@@ -2971,8 +2971,8 @@ def invocation_checkpoint_state_sha256(
     if checkpoint is not None:
         checkpoint = copy_durable_json_object(checkpoint, "invocation lifecycle checkpoint")
         from cayu.collaboration._session_export_store import ROOT_KEY as EXPORT_ROOT_KEY
-        from cayu.runtime._producer_output_store import ROOT_KEY as PRODUCER_ROOT_KEY
         from cayu.runtime._session_continuation_store import ROOT_KEY
+        from cayu.sessions._producer_checkpoint import ROOT_KEY as PRODUCER_ROOT_KEY
 
         checkpoint.pop(ROOT_KEY, None)
         # Export ownership is projected separately by native stores and is not
@@ -3289,7 +3289,7 @@ async def apply_invocation_lifecycle_command(
     if type(copied) is RebindInvocationCommand:
 
         def rebind_checkpoint(session: Session, checkpoint: dict[str, Any] | None):
-            from cayu.runtime._producer_output_store import ROOT_KEY, NativeProducerIndex
+            from cayu.sessions._producer_checkpoint import ROOT_KEY, NativeProducerIndex
 
             if checkpoint is not None and ROOT_KEY in checkpoint:
                 producer = NativeProducerIndex.model_validate(checkpoint[ROOT_KEY])

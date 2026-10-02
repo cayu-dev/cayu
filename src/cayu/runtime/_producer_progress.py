@@ -4,13 +4,13 @@ from hashlib import sha256
 
 from cayu.collaboration._preparation import contract_bytes, prepare_contract, require_exact_contract
 from cayu.collaboration._producer_progress_contracts import ProducerProgressEvidence
-from cayu.runtime._producer_output_store import (
+from cayu.runtime._producer_release import release_read_target
+from cayu.sessions._producer_checkpoint import (
     ROOT_KEY,
     NativeProducerAttachment,
     NativeProducerIndex,
     attachment_index,
 )
-from cayu.runtime._producer_release import release_read_target
 from cayu.vaults.redaction import SecretRedactor
 
 

@@ -4,7 +4,7 @@ from cayu.collaboration._contracts import ContractValue, Generation, Identifier
 from cayu.collaboration._preparation import prepare_contract, require_exact_contract
 from cayu.collaboration._producer_contracts import ProducerOutputRegistration
 from cayu.collaboration.prepared_admission import FreshRecipientAdmissionTarget, NativeCommitment
-from cayu.runtime._producer_output_store import (
+from cayu.sessions._producer_checkpoint import (
     ROOT_KEY,
     NativeProducerAttachment,
     NativeProducerIndex,
