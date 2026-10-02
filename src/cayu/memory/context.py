@@ -36,6 +36,7 @@ from cayu.context.base import (
     _publish_or_record_recall_telemetry,
 )
 from cayu.events import EventType
+from cayu.knowledge.changes import KnowledgeChangeBatch
 from cayu.knowledge.records import (
     DEFAULT_KNOWLEDGE_NAMESPACE,
     KnowledgeRevisionRef,
@@ -122,7 +123,6 @@ from cayu.sessions.checkpoints import (
     RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_VERSION,
 )
 from cayu.storage.memory import (
-    KnowledgeChangeBatch,
     KnowledgeIndexReadinessBatch,
     KnowledgeIndexState,
     KnowledgeStore,

@@ -35,6 +35,7 @@ from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
 from cayu._validation import require_durable_nonblank as require_nonblank
+from cayu.knowledge.changes import MAX_KNOWLEDGE_CHANGE_SEQUENCE
 from cayu.knowledge.records import (
     DEFAULT_KNOWLEDGE_NAMESPACE,
     KnowledgeRevisionRef,
@@ -71,7 +72,6 @@ from cayu.sessions.base import (
     encode_transcript_search_cursor,
 )
 from cayu.storage.memory import (
-    MAX_KNOWLEDGE_CHANGE_SEQUENCE,
     KnowledgeHit,
     KnowledgeIndexCoverage,
     KnowledgeQuery,

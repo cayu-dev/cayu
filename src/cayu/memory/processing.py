@@ -20,6 +20,7 @@ from cayu._validation import (
     canonical_durable_json_bytes,
     require_durable_clean_nonblank,
 )
+from cayu.knowledge.changes import KnowledgeChange, KnowledgeChangeBatch, copy_knowledge_change
 from cayu.knowledge.records import (
     MAX_KNOWLEDGE_REVISION_SEARCH_REFS,
     KnowledgeRevisionRef,
@@ -48,15 +49,12 @@ from cayu.memory.recall import (
 )
 from cayu.memory.retrieval import WeightedReciprocalRankFusionConfig
 from cayu.storage.memory import (
-    KnowledgeChange,
-    KnowledgeChangeBatch,
     KnowledgeEmbeddingIdentity,
     KnowledgeIndexReadiness,
     KnowledgeIndexReadinessBatch,
     KnowledgeIndexState,
     KnowledgeSearchMode,
     KnowledgeStore,
-    copy_knowledge_change,
     copy_knowledge_index_readiness,
 )
 from cayu.work_context import (

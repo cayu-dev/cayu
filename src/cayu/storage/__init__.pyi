@@ -47,6 +47,16 @@ from cayu.knowledge.activation_contracts import KnowledgeReviewApproval as Knowl
 from cayu.knowledge.activation_contracts import (
     prepare_knowledge_activation_request as prepare_knowledge_activation_request,
 )
+from cayu.knowledge.changes import MAX_KNOWLEDGE_CHANGE_LIMIT as MAX_KNOWLEDGE_CHANGE_LIMIT
+from cayu.knowledge.changes import MAX_KNOWLEDGE_CHANGE_SEQUENCE as MAX_KNOWLEDGE_CHANGE_SEQUENCE
+from cayu.knowledge.changes import KnowledgeChange as KnowledgeChange
+from cayu.knowledge.changes import KnowledgeChangeBatch as KnowledgeChangeBatch
+from cayu.knowledge.changes import KnowledgeChangeClaim as KnowledgeChangeClaim
+from cayu.knowledge.changes import (
+    KnowledgeChangeConsumerConflict as KnowledgeChangeConsumerConflict,
+)
+from cayu.knowledge.changes import KnowledgeChangeConsumerState as KnowledgeChangeConsumerState
+from cayu.knowledge.changes import KnowledgeChangeKind as KnowledgeChangeKind
 from cayu.knowledge.maintenance_contracts import (
     MAX_KNOWLEDGE_MAINTENANCE_BYTES as MAX_KNOWLEDGE_MAINTENANCE_BYTES,
 )
@@ -196,8 +206,6 @@ from cayu.storage.memory import KNOWLEDGE_CHUNK_TEXT_PROJECTION as KNOWLEDGE_CHU
 from cayu.storage.memory import (
     KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION as KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION,
 )
-from cayu.storage.memory import MAX_KNOWLEDGE_CHANGE_LIMIT as MAX_KNOWLEDGE_CHANGE_LIMIT
-from cayu.storage.memory import MAX_KNOWLEDGE_CHANGE_SEQUENCE as MAX_KNOWLEDGE_CHANGE_SEQUENCE
 from cayu.storage.memory import (
     MAX_KNOWLEDGE_EMBEDDING_DIMENSIONS as MAX_KNOWLEDGE_EMBEDDING_DIMENSIONS,
 )
@@ -209,12 +217,6 @@ from cayu.storage.memory import (
 )
 from cayu.storage.memory import InMemoryEmbeddingKnowledgeStore as InMemoryEmbeddingKnowledgeStore
 from cayu.storage.memory import InMemoryKnowledgeStore as InMemoryKnowledgeStore
-from cayu.storage.memory import KnowledgeChange as KnowledgeChange
-from cayu.storage.memory import KnowledgeChangeBatch as KnowledgeChangeBatch
-from cayu.storage.memory import KnowledgeChangeClaim as KnowledgeChangeClaim
-from cayu.storage.memory import KnowledgeChangeConsumerConflict as KnowledgeChangeConsumerConflict
-from cayu.storage.memory import KnowledgeChangeConsumerState as KnowledgeChangeConsumerState
-from cayu.storage.memory import KnowledgeChangeKind as KnowledgeChangeKind
 from cayu.storage.memory import KnowledgeEmbeddingBackfillResult as KnowledgeEmbeddingBackfillResult
 from cayu.storage.memory import KnowledgeEmbeddingIdentity as KnowledgeEmbeddingIdentity
 from cayu.storage.memory import KnowledgeEmbeddingProjection as KnowledgeEmbeddingProjection

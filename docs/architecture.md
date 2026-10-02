@@ -409,11 +409,13 @@ maintenance proposals, decisions, receipts and their deterministic preparation,
 consistency and replay checks. `knowledge/activation_contracts.py` owns governance
 configuration, activation requests, decisions, authority, receipts and their
 deterministic preparation and validation. Shared exact entry material and revision
-helpers live with records; access-scope fingerprints live with scopes. These
-contracts, application activation policies and the maintenance router/planner can
-be used without loading a storage implementation. Memory, SQLite and
-PostgreSQL stores compose the same contracts with their own access checks and
-atomic persistence operations.
+helpers live with records; access-scope fingerprints live with scopes.
+`knowledge/changes.py` owns change records, bounded pages, consumer claims and
+progress, including detached copies, claim fingerprints and deterministic
+validation and initialization. These contracts, application activation policies
+and the maintenance router/planner can be used without loading a storage
+implementation. Memory, SQLite and PostgreSQL stores compose the same contracts
+with their own access checks and atomic persistence operations.
 The existing `cayu`, `cayu.storage` and `cayu.storage.memory` imports resolve to
 the same canonical types, including persisted legacy pickle class paths.
 

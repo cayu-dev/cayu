@@ -1,4 +1,9 @@
 {
+    "tests/core/test_knowledge_change_contracts.py::test_change_contracts_preserve_exports_stubs_and_runtime_annotations": 0.021,
+    "tests/core/test_knowledge_change_contracts.py::test_change_feed_contracts_work_without_storage_implementations[cayu.knowledge.changes]": 0.121,
+    "tests/core/test_knowledge_change_contracts.py::test_change_feed_contracts_work_without_storage_implementations[cayu.storage]": 0.115,
+    "tests/core/test_knowledge_change_contracts.py::test_change_feed_contracts_work_without_storage_implementations[cayu]": 0.133,
+    "tests/core/test_knowledge_change_contracts.py::test_change_feed_values_round_trip_through_canonical_pickle_paths": 0.001,
     "tests/core/test_knowledge_activation_contracts.py::test_activation_contracts_preserve_aliases_stubs_and_runtime_annotations": 0.043,
     "tests/core/test_knowledge_activation_contracts.py::test_activation_policies_compose_without_storage_implementations[cayu.knowledge.activation_contracts]": 0.28,
     "tests/core/test_knowledge_activation_contracts.py::test_activation_policies_compose_without_storage_implementations[cayu.storage]": 0.279,
