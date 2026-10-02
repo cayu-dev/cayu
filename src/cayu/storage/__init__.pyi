@@ -2,6 +2,7 @@
 
 from cayu.knowledge.records import BUILTIN_KNOWLEDGE_KINDS as BUILTIN_KNOWLEDGE_KINDS
 from cayu.knowledge.records import DEFAULT_KNOWLEDGE_KIND as DEFAULT_KNOWLEDGE_KIND
+from cayu.knowledge.records import DEFAULT_KNOWLEDGE_LIMIT as DEFAULT_KNOWLEDGE_LIMIT
 from cayu.knowledge.records import DEFAULT_KNOWLEDGE_MAX_BYTES as DEFAULT_KNOWLEDGE_MAX_BYTES
 from cayu.knowledge.records import DEFAULT_KNOWLEDGE_NAMESPACE as DEFAULT_KNOWLEDGE_NAMESPACE
 from cayu.knowledge.records import (
@@ -35,6 +36,27 @@ from cayu.knowledge.records import KnowledgeRevisionRef as KnowledgeRevisionRef
 from cayu.knowledge.records import KnowledgeStatus as KnowledgeStatus
 from cayu.knowledge.records import KnowledgeVisibility as KnowledgeVisibility
 from cayu.knowledge.records import copy_knowledge_revision_refs as copy_knowledge_revision_refs
+from cayu.knowledge.relations import MAX_KNOWLEDGE_RELATION_BATCH as MAX_KNOWLEDGE_RELATION_BATCH
+from cayu.knowledge.relations import MAX_KNOWLEDGE_RELATION_BYTES as MAX_KNOWLEDGE_RELATION_BYTES
+from cayu.knowledge.relations import (
+    MAX_KNOWLEDGE_RELATION_CURSOR_BYTES as MAX_KNOWLEDGE_RELATION_CURSOR_BYTES,
+)
+from cayu.knowledge.relations import MAX_KNOWLEDGE_RELATION_LIMIT as MAX_KNOWLEDGE_RELATION_LIMIT
+from cayu.knowledge.relations import KnowledgeLineageCurrentness as KnowledgeLineageCurrentness
+from cayu.knowledge.relations import KnowledgeLineageLink as KnowledgeLineageLink
+from cayu.knowledge.relations import KnowledgeLineageQuery as KnowledgeLineageQuery
+from cayu.knowledge.relations import KnowledgeLineageResult as KnowledgeLineageResult
+from cayu.knowledge.relations import KnowledgeLineageRole as KnowledgeLineageRole
+from cayu.knowledge.relations import KnowledgeRelation as KnowledgeRelation
+from cayu.knowledge.relations import KnowledgeRelationConflict as KnowledgeRelationConflict
+from cayu.knowledge.relations import KnowledgeRelationDirection as KnowledgeRelationDirection
+from cayu.knowledge.relations import KnowledgeRelationKind as KnowledgeRelationKind
+from cayu.knowledge.relations import (
+    KnowledgeRelationPublicationReceipt as KnowledgeRelationPublicationReceipt,
+)
+from cayu.knowledge.relations import KnowledgeRelationQuery as KnowledgeRelationQuery
+from cayu.knowledge.relations import KnowledgeRelationResult as KnowledgeRelationResult
+from cayu.knowledge.relations import prepare_knowledge_relations as prepare_knowledge_relations
 from cayu.knowledge.scopes import KnowledgeAccessDenied as KnowledgeAccessDenied
 from cayu.knowledge.scopes import KnowledgeAccessScope as KnowledgeAccessScope
 from cayu.storage.budget_ledger import SQLiteBudgetLedger as SQLiteBudgetLedger
@@ -79,7 +101,6 @@ from cayu.storage.knowledge_transition import (
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT as DEFAULT_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT,
 )
-from cayu.storage.memory import DEFAULT_KNOWLEDGE_LIMIT as DEFAULT_KNOWLEDGE_LIMIT
 from cayu.storage.memory import KNOWLEDGE_CHUNK_TEXT_GENERATOR as KNOWLEDGE_CHUNK_TEXT_GENERATOR
 from cayu.storage.memory import (
     KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION as KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION,
@@ -128,12 +149,6 @@ from cayu.storage.memory import (
 from cayu.storage.memory import (
     MAX_KNOWLEDGE_MAINTENANCE_TEXT_BYTES as MAX_KNOWLEDGE_MAINTENANCE_TEXT_BYTES,
 )
-from cayu.storage.memory import MAX_KNOWLEDGE_RELATION_BATCH as MAX_KNOWLEDGE_RELATION_BATCH
-from cayu.storage.memory import MAX_KNOWLEDGE_RELATION_BYTES as MAX_KNOWLEDGE_RELATION_BYTES
-from cayu.storage.memory import (
-    MAX_KNOWLEDGE_RELATION_CURSOR_BYTES as MAX_KNOWLEDGE_RELATION_CURSOR_BYTES,
-)
-from cayu.storage.memory import MAX_KNOWLEDGE_RELATION_LIMIT as MAX_KNOWLEDGE_RELATION_LIMIT
 from cayu.storage.memory import InMemoryEmbeddingKnowledgeStore as InMemoryEmbeddingKnowledgeStore
 from cayu.storage.memory import InMemoryKnowledgeStore as InMemoryKnowledgeStore
 from cayu.storage.memory import KnowledgeActivationAuthority as KnowledgeActivationAuthority
@@ -169,11 +184,6 @@ from cayu.storage.memory import KnowledgeIndexReadinessBatch as KnowledgeIndexRe
 from cayu.storage.memory import KnowledgeIndexReadinessConflict as KnowledgeIndexReadinessConflict
 from cayu.storage.memory import KnowledgeIndexReadinessUpdate as KnowledgeIndexReadinessUpdate
 from cayu.storage.memory import KnowledgeIndexState as KnowledgeIndexState
-from cayu.storage.memory import KnowledgeLineageCurrentness as KnowledgeLineageCurrentness
-from cayu.storage.memory import KnowledgeLineageLink as KnowledgeLineageLink
-from cayu.storage.memory import KnowledgeLineageQuery as KnowledgeLineageQuery
-from cayu.storage.memory import KnowledgeLineageResult as KnowledgeLineageResult
-from cayu.storage.memory import KnowledgeLineageRole as KnowledgeLineageRole
 from cayu.storage.memory import KnowledgeListGroup as KnowledgeListGroup
 from cayu.storage.memory import KnowledgeListItem as KnowledgeListItem
 from cayu.storage.memory import KnowledgeListQuery as KnowledgeListQuery
@@ -190,15 +200,6 @@ from cayu.storage.memory import KnowledgeMaintenanceStale as KnowledgeMaintenanc
 from cayu.storage.memory import KnowledgePublicationConflict as KnowledgePublicationConflict
 from cayu.storage.memory import KnowledgePublicationReceipt as KnowledgePublicationReceipt
 from cayu.storage.memory import KnowledgeQuery as KnowledgeQuery
-from cayu.storage.memory import KnowledgeRelation as KnowledgeRelation
-from cayu.storage.memory import KnowledgeRelationConflict as KnowledgeRelationConflict
-from cayu.storage.memory import KnowledgeRelationDirection as KnowledgeRelationDirection
-from cayu.storage.memory import KnowledgeRelationKind as KnowledgeRelationKind
-from cayu.storage.memory import (
-    KnowledgeRelationPublicationReceipt as KnowledgeRelationPublicationReceipt,
-)
-from cayu.storage.memory import KnowledgeRelationQuery as KnowledgeRelationQuery
-from cayu.storage.memory import KnowledgeRelationResult as KnowledgeRelationResult
 from cayu.storage.memory import KnowledgeReviewApproval as KnowledgeReviewApproval
 from cayu.storage.memory import KnowledgeSearchMode as KnowledgeSearchMode
 from cayu.storage.memory import KnowledgeSearchResult as KnowledgeSearchResult
@@ -214,7 +215,6 @@ from cayu.storage.memory import (
     prepare_knowledge_maintenance_decision as prepare_knowledge_maintenance_decision,
 )
 from cayu.storage.memory import prepare_knowledge_publication as prepare_knowledge_publication
-from cayu.storage.memory import prepare_knowledge_relations as prepare_knowledge_relations
 from cayu.storage.postgres import PostgresAgentWorkContextStore as PostgresAgentWorkContextStore
 from cayu.storage.postgres import PostgresBudgetLedger as PostgresBudgetLedger
 from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore as PostgresEmbeddingKnowledgeStore

@@ -54,6 +54,7 @@ from cayu.knowledge.records import (
     copy_knowledge_revision_ref,
     knowledge_entry_payload_bytes,
 )
+from cayu.knowledge.relations import KnowledgeRelationKind
 from cayu.knowledge.scopes import (
     KnowledgeAccessScope,
     copy_knowledge_access_scope,
@@ -62,7 +63,6 @@ from cayu.storage.memory import (
     MAX_KNOWLEDGE_MAINTENANCE_BYTES,
     MAX_KNOWLEDGE_MAINTENANCE_SOURCES,
     MAX_KNOWLEDGE_MAINTENANCE_TEXT_BYTES,
-    KnowledgeRelationKind,
 )
 
 KNOWLEDGE_MAINTENANCE_PLANNING_SCHEMA_VERSION = 1

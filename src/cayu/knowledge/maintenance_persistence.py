@@ -56,6 +56,7 @@ from cayu.knowledge.records import (
     KnowledgeStatus,
     copy_knowledge_revision_ref,
 )
+from cayu.knowledge.relations import KnowledgeRelation, KnowledgeRelationKind
 from cayu.knowledge.scopes import (
     KnowledgeAccessScope,
     copy_knowledge_access_scope,
@@ -72,8 +73,6 @@ from cayu.storage.knowledge_indexer import (
 from cayu.storage.memory import (
     MAX_KNOWLEDGE_MAINTENANCE_BYTES,
     KnowledgeMaintenanceProposal,
-    KnowledgeRelation,
-    KnowledgeRelationKind,
     copy_knowledge_maintenance_proposal,
     prepare_knowledge_publication,
 )

@@ -25,6 +25,7 @@ from cayu.knowledge.records import (
     KnowledgeRevisionRef,
     copy_knowledge_revision_refs,
 )
+from cayu.knowledge.relations import MAX_KNOWLEDGE_RELATION_BYTES
 from cayu.knowledge.scopes import (
     KnowledgeAccessScope,
     copy_knowledge_access_scope,
@@ -46,7 +47,6 @@ from cayu.memory.recall import (
 )
 from cayu.memory.retrieval import WeightedReciprocalRankFusionConfig
 from cayu.storage.memory import (
-    MAX_KNOWLEDGE_RELATION_BYTES,
     KnowledgeChange,
     KnowledgeChangeBatch,
     KnowledgeEmbeddingIdentity,

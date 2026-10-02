@@ -35,6 +35,7 @@ from cayu.knowledge.governance import (
     decide_knowledge_activation,
 )
 from cayu.knowledge.records import (
+    DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
     DEFAULT_KNOWLEDGE_NAMESPACE,
     MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES,
@@ -63,7 +64,6 @@ from cayu.storage.knowledge_indexer import (
     knowledge_source_hash,
 )
 from cayu.storage.memory import (
-    DEFAULT_KNOWLEDGE_LIMIT,
     KnowledgeActivationAuthority,
     KnowledgeActivationDisposition,
     KnowledgeActivationReceipt,

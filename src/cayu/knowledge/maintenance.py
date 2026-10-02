@@ -44,18 +44,20 @@ from cayu.knowledge.records import (
     copy_knowledge_revision_ref,
     knowledge_entry_payload_bytes,
 )
-from cayu.knowledge.scopes import (
-    KnowledgeAccessScope,
-    copy_knowledge_access_scope,
-)
-from cayu.storage.memory import (
-    MAX_KNOWLEDGE_MAINTENANCE_SOURCES,
+from cayu.knowledge.relations import (
     MAX_KNOWLEDGE_RELATION_BYTES,
     MAX_KNOWLEDGE_RELATION_LIMIT,
     KnowledgeRelation,
     KnowledgeRelationKind,
     KnowledgeRelationQuery,
     KnowledgeRelationResult,
+)
+from cayu.knowledge.scopes import (
+    KnowledgeAccessScope,
+    copy_knowledge_access_scope,
+)
+from cayu.storage.memory import (
+    MAX_KNOWLEDGE_MAINTENANCE_SOURCES,
 )
 
 KNOWLEDGE_MAINTENANCE_ROUTING_SCHEMA_VERSION = 1

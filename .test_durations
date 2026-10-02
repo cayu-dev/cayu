@@ -1,4 +1,9 @@
 {
+    "tests/core/test_knowledge_package_layout.py::test_relation_contracts_do_not_load_storage_implementations[cayu.knowledge.relations]": 0.099,
+    "tests/core/test_knowledge_package_layout.py::test_relation_contracts_do_not_load_storage_implementations[cayu.storage]": 0.1,
+    "tests/core/test_knowledge_package_layout.py::test_relation_contracts_do_not_load_storage_implementations[cayu]": 0.099,
+    "tests/core/test_knowledge_package_layout.py::test_relation_contracts_preserve_type_hints_stubs_and_helper_identity": 0.02,
+    "tests/core/test_knowledge_package_layout.py::test_relation_values_support_pickle_round_trips": 0.001,
     "tests/core/test_recovery_coordinator.py::test_live_finalization_shares_recovery_claim_until_work_settles[cancel]": 0.003357917070388794,
     "tests/core/test_recovery_coordinator.py::test_live_finalization_shares_recovery_claim_until_work_settles[close]": 0.341721624834463,
     "tests/core/test_session_execution_presence.py::test_execution_config_rejects_unbounded_intervals_and_secret_labels": 0.0029574170475825667,

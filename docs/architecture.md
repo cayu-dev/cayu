@@ -373,6 +373,15 @@ The local durable session store is `SQLiteSessionStore`. New projects convention
 
 Context policies are runtime projections over transcript messages, not storage. They let applications customize the model-facing conversation history by trimming, compacting, replacing bulky tool results, or injecting retrieved context while preserving the raw durable transcript for audit, debugging, resume, and future compaction.
 
+Knowledge records and access scopes live in `knowledge/records.py` and
+`knowledge/scopes.py`. `knowledge/relations.py` owns exact-revision relation and
+lineage contracts, detached copies, page validation and relation publication
+preparation/replay validation. These contracts can be used without loading a
+storage implementation. Memory, SQLite and PostgreSQL stores compose the same
+contracts with their own access checks and atomic persistence operations.
+The existing `cayu`, `cayu.storage` and `cayu.storage.memory` imports resolve to
+the same canonical types, including persisted legacy pickle class paths.
+
 Tasks are optional durable work items, not a required execution model. A simple agent can run with only sessions and events. A background job, orchestrated multi-agent app, webhook processor, or dashboard-visible queue can use `TaskStore` to track work status, inputs, outputs, errors, ownership, and parent/child relationships. Worker-owned completion and failure use an atomic terminal receipt so acknowledgement loss can be reconciled without applying a second task transition; that receipt covers Cayu task state, not exactly-once external effects. Interrupted-session handoff uses a separate exact receipt so transient ownership-release failure preserves the running task/session link for bounded retry or expired-lease recovery. Application-owned verified-work contracts add an independent completion-authority boundary: workers propose completion, while durable verifier claims and decisions gate the terminal transition. Every contract also freezes the exact application-owned result-resolver identity used to read the accepted result from durable application state. `CayuApp.resolve_completion_result(...)` invokes that side-effect-free resolver and feeds the validated content into the existing `apply_completion_decision(...)` receipt boundary. Receipt-first replay does not require the process-local resolver after application has committed. `InMemoryTaskStore`, `SQLiteTaskStore`, and `PostgresTaskStore` expose the same verified-work lifecycle; SQLite is the local durable implementation and PostgreSQL supplies cross-process row-lock authority.
 
 Verified-work persistence policy and immutable-authority validation live in

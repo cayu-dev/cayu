@@ -10,6 +10,7 @@ from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
 from cayu.knowledge.records import (
+    DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
     KnowledgeChunk,
     KnowledgeEntry,
@@ -22,7 +23,6 @@ from cayu.knowledge.scopes import (
     copy_knowledge_access_scope,
 )
 from cayu.storage.memory import (
-    DEFAULT_KNOWLEDGE_LIMIT,
     MAX_KNOWLEDGE_ACTIVATION_CHUNKS,
     MAX_KNOWLEDGE_ACTIVATION_EVIDENCE_RECORDS,
     MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES,

@@ -35,6 +35,7 @@ from cayu._validation import (
 )
 from cayu.knowledge.access import runtime_knowledge_operation
 from cayu.knowledge.records import (
+    DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
     KnowledgeActorType,
     KnowledgeChunk,
@@ -57,6 +58,24 @@ from cayu.knowledge.records import (
     copy_knowledge_revision_refs,
     knowledge_entry_payload_bytes,
 )
+from cayu.knowledge.relations import (
+    KnowledgeLineageCurrentness,
+    KnowledgeLineageQuery,
+    KnowledgeLineageResult,
+    KnowledgeRelation,
+    KnowledgeRelationConflict,
+    KnowledgeRelationDirection,
+    KnowledgeRelationKind,
+    KnowledgeRelationPublicationReceipt,
+    KnowledgeRelationQuery,
+    KnowledgeRelationResult,
+    _knowledge_relation_identity,
+    _validate_knowledge_relation_publication_replay,
+    copy_knowledge_lineage_query,
+    copy_knowledge_relation_publication_receipt,
+    copy_knowledge_relation_query,
+    prepare_knowledge_relations,
+)
 from cayu.knowledge.scopes import (
     KnowledgeAccessDenied,
     KnowledgeAccessScope,
@@ -71,7 +90,6 @@ from cayu.storage._knowledge_closure import (
 )
 from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage.memory import (
-    DEFAULT_KNOWLEDGE_LIMIT,
     KNOWLEDGE_CHUNK_TEXT_PROJECTION,
     KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY,
     KnowledgeActivationAuthority,
@@ -92,9 +110,6 @@ from cayu.storage.memory import (
     KnowledgeIndexReadinessConflict,
     KnowledgeIndexReadinessUpdate,
     KnowledgeIndexState,
-    KnowledgeLineageCurrentness,
-    KnowledgeLineageQuery,
-    KnowledgeLineageResult,
     KnowledgeListGroup,
     KnowledgeListItem,
     KnowledgeListQuery,
@@ -108,13 +123,6 @@ from cayu.storage.memory import (
     KnowledgePublicationConflict,
     KnowledgePublicationReceipt,
     KnowledgeQuery,
-    KnowledgeRelation,
-    KnowledgeRelationConflict,
-    KnowledgeRelationDirection,
-    KnowledgeRelationKind,
-    KnowledgeRelationPublicationReceipt,
-    KnowledgeRelationQuery,
-    KnowledgeRelationResult,
     KnowledgeReviewApproval,
     KnowledgeSearchMode,
     KnowledgeSearchResult,
@@ -154,7 +162,6 @@ from cayu.storage.memory import (
     _knowledge_relation_access_snapshot,
     _knowledge_relation_access_snapshot_json,
     _knowledge_relation_change_audiences,
-    _knowledge_relation_identity,
     _knowledge_relation_query_fingerprint,
     _knowledge_scope_allows_activation_receipt,
     _knowledge_scope_allows_entry,
@@ -190,7 +197,6 @@ from cayu.storage.memory import (
     _validate_knowledge_maintenance_record,
     _validate_knowledge_maintenance_replay,
     _validate_knowledge_publication_replay,
-    _validate_knowledge_relation_publication_replay,
     _validate_knowledge_search_frontier,
     _validate_review_approval_authority,
     _validate_review_approval_scope,
@@ -202,18 +208,14 @@ from cayu.storage.memory import (
     copy_knowledge_change_consumer_state,
     copy_knowledge_embedding_identity,
     copy_knowledge_index_readiness_update,
-    copy_knowledge_lineage_query,
     copy_knowledge_list_query,
     copy_knowledge_maintenance_decision,
     copy_knowledge_maintenance_decision_receipt,
     copy_knowledge_maintenance_proposal,
     copy_knowledge_publication_receipt,
     copy_knowledge_query,
-    copy_knowledge_relation_publication_receipt,
-    copy_knowledge_relation_query,
     prepare_knowledge_maintenance_decision,
     prepare_knowledge_publication,
-    prepare_knowledge_relations,
 )
 from cayu.storage.targets import require_sqlite_store_allowed
 

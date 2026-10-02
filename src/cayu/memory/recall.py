@@ -41,6 +41,11 @@ from cayu.knowledge.records import (
     KnowledgeStatus,
     copy_knowledge_revision_refs,
 )
+from cayu.knowledge.relations import (
+    MAX_KNOWLEDGE_RELATION_BYTES,
+    KnowledgeLineageQuery,
+    KnowledgeLineageResult,
+)
 from cayu.knowledge.scopes import (
     KnowledgeAccessScope,
     copy_knowledge_access_scope,
@@ -67,11 +72,8 @@ from cayu.sessions.base import (
 )
 from cayu.storage.memory import (
     MAX_KNOWLEDGE_CHANGE_SEQUENCE,
-    MAX_KNOWLEDGE_RELATION_BYTES,
     KnowledgeHit,
     KnowledgeIndexCoverage,
-    KnowledgeLineageQuery,
-    KnowledgeLineageResult,
     KnowledgeQuery,
     KnowledgeSearchMode,
     KnowledgeSearchResult,
