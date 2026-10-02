@@ -1,4 +1,9 @@
 {
+    "tests/core/test_provider_operation_start_owner.py::test_acknowledgement_failure_hands_durable_identity_and_stream_to_cleanup": 0.37,
+    "tests/core/test_provider_operation_start_owner.py::test_closing_run_at_start_boundary_preserves_stream_ownership[provider.operation.started]": 0.299,
+    "tests/core/test_provider_operation_start_owner.py::test_closing_run_at_start_boundary_preserves_stream_ownership[provider.operation.starting]": 0.689,
+    "tests/core/test_provider_operation_start_owner.py::test_legacy_ambiguous_start_helpers_keep_exact_identity": 0.0,
+    "tests/core/test_provider_operation_start_owner.py::test_start_owner_imports_without_execution_controllers": 1.088,
     "tests/core/test_knowledge_change_contracts.py::test_change_contracts_preserve_exports_stubs_and_runtime_annotations": 0.021,
     "tests/core/test_knowledge_change_contracts.py::test_change_feed_contracts_work_without_storage_implementations[cayu.knowledge.changes]": 0.121,
     "tests/core/test_knowledge_change_contracts.py::test_change_feed_contracts_work_without_storage_implementations[cayu.storage]": 0.115,

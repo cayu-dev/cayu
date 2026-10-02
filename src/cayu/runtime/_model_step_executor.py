@@ -15,7 +15,6 @@ import logging
 import sys
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
-from contextvars import Context
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -37,7 +36,6 @@ from cayu._task_wait import (
     _consume_detached_task_outcome,
     await_shielded_task_outcome,
     consume_pending_task_cancellation,
-    restore_task_cancellation_requests,
     unexpected_child_cancellation_error,
 )
 from cayu._validation import (
@@ -45,7 +43,6 @@ from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
     copy_durable_metadata,
-    copy_durable_record,
     copy_json_value,
     extract_durable_value_error,
     require_clean_nonblank,
@@ -215,14 +212,11 @@ from cayu.providers.deadlines import (
 )
 from cayu.providers.operations import (
     ProviderOperationAdapter,
-    ProviderOperationConnection,
     ProviderOperationMode,
     ProviderOperationSnapshot,
     ProviderOperationStartIdempotencySupport,
-    ProviderOperationStartRequest,
     ProviderOperationState,
     ProviderOperationStatus,
-    copy_provider_operation_connection,
 )
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
@@ -366,7 +360,6 @@ from cayu.runtime._phase_timing import timed_model_step, timed_phase
 from cayu.runtime._provider_cleanup_evidence import local_http_cleanup_event_id
 from cayu.runtime._provider_operation_cancellation_owner import (
     ProviderOperationCancellationOwner,
-    _cancel_provider_operation_after_definite_absence,
 )
 from cayu.runtime._provider_operation_recovery_owner import (
     ProviderOperationRecoveryOwner,
@@ -410,6 +403,16 @@ from cayu.runtime._provider_operation_recovery_owner import (
 )
 from cayu.runtime._provider_operation_recovery_owner import (
     _raise_pending_provider_recovery_cancellation as _raise_pending_provider_recovery_cancellation,
+)
+from cayu.runtime._provider_operation_start_owner import (
+    ProviderOperationStartOwner,
+    ProviderOperationStartState,
+)
+from cayu.runtime._provider_operation_start_owner import (
+    _ambiguous_provider_operation_start_error as _ambiguous_provider_operation_start_error,
+)
+from cayu.runtime._provider_operation_start_owner import (
+    is_ambiguous_provider_operation_start_error as is_ambiguous_provider_operation_start_error,
 )
 from cayu.runtime._provider_stream import (
     _admitted_model_provider_events,
@@ -472,7 +475,6 @@ from cayu.runtime.provider_operations import (
     fallback_dispatch_ordinal_from_checkpoint,
     load_recoverable_provider_operation,
     provider_operation_progress_envelope,
-    provider_operation_started_event_id,
 )
 from cayu.runtime.retry_policy import (
     RetryDecision,
@@ -502,9 +504,7 @@ from cayu.sessions.base import (
     RuntimePublicationOperationRecordMutation,
     RuntimePublicationRequest,
     Session,
-    SessionRunFenced,
     SessionStatus,
-    SessionStatusConflict,
     SessionStore,
     _current_session_interaction_id,
     runtime_publication_checkpoint_mutation,
@@ -556,31 +556,6 @@ from cayu.tools.targeted_projection import (
 from cayu.vaults.redaction import SecretRedactor
 
 logger = logging.getLogger(__name__)
-_PROVIDER_OPERATION_START_SETTLEMENT_TIMEOUT_SECONDS = 5.0
-
-
-def _ambiguous_provider_operation_start_error(
-    *,
-    provider_name: str,
-    cause: BaseException,
-) -> ModelProviderError:
-    return ModelProviderError(
-        "Provider operation start outcome is ambiguous; automatic retry is disabled.",
-        provider=provider_name,
-        error_type=type(cause).__name__,
-        error_code="provider_operation_start_ambiguous",
-        retryable=False,
-    )
-
-
-def is_ambiguous_provider_operation_start_error(failure: BaseException) -> bool:
-    """Return whether one failure retains start-only provider ambiguity."""
-
-    return any(
-        isinstance(candidate, ModelProviderError)
-        and candidate.error_code == "provider_operation_start_ambiguous"
-        for candidate in iter_exception_tree(failure)
-    )
 
 
 class _ModelFailoverCandidateExhausted(Exception):
@@ -1329,9 +1304,12 @@ class ModelStepExecutor:
         self._apply_budget_evaluation = apply_budget_evaluation
         self._apply_limit_evaluation = apply_limit_evaluation
         self._stop_for_budget_reservation_failure = stop_for_budget_reservation_failure
-        self._provider_operation_cancellation_lifecycle = provider_operation_cancellation_lifecycle
         self._peer_exposure_guard = peer_exposure_guard
-        self._provider_operation_reconciliation_tasks: set[asyncio.Task[None]] = set()
+        self._provider_operation_start = ProviderOperationStartOwner(
+            session_store=session_store,
+            event_writer=event_writer,
+            cancellation_lifecycle=provider_operation_cancellation_lifecycle,
+        )
         self._provider_operation_cancellation = ProviderOperationCancellationOwner(
             session_store=session_store,
             event_writer=event_writer,
@@ -1347,15 +1325,6 @@ class ModelStepExecutor:
             secret_redactor=secret_redactor,
             clock=clock,
         )
-
-    def _retain_provider_operation_reconciliation(self, task: asyncio.Task[None]) -> None:
-        self._provider_operation_reconciliation_tasks.add(task)
-
-        def settled(completed: asyncio.Task[None]) -> None:
-            self._provider_operation_reconciliation_tasks.discard(completed)
-            _consume_detached_task_outcome(completed)
-
-        task.add_done_callback(settled)
 
     async def cancel_provider_operation_for_interruption(
         self,
@@ -3111,476 +3080,49 @@ class ModelStepExecutor:
                 )
                 provider_events_owned = True
             else:
-                provider_operation_adapter = provider.provider_operations
-                if not isinstance(provider_operation_adapter, ProviderOperationAdapter):
-                    raise RuntimeError(
-                        "Background provider-operation mode requires a ProviderOperationAdapter."
-                    )
-                start_idempotency_support = provider_operation_adapter.start_idempotency_support
-                if type(start_idempotency_support) is not ProviderOperationStartIdempotencySupport:
-                    raise TypeError(
-                        "ProviderOperationAdapter.start_idempotency_support must return "
-                        "ProviderOperationStartIdempotencySupport."
-                    )
-                start_id = f"provider-operation:{model_attempt_identity.model_attempt_id}"
-                if completion_dispatch is None:
-                    raise RuntimeError(
-                        "Background provider operations require a durable model-completion stage."
-                    )
-                staged_start = completion_dispatch.stage.intent.get("provider_operation_start")
-                if (
-                    type(staged_start) is not dict
-                    or staged_start.get("schema_version") != 1
-                    or staged_start.get("idempotency_key") != start_id
-                    or staged_start.get("idempotency_support") != start_idempotency_support.value
-                ):
-                    raise RuntimeError(
-                        "Provider-operation start contract changed after durable staging."
-                    )
-                starting_event = _event_with_model_identity_authority(
-                    Event(
-                        type=EventType.PROVIDER_OPERATION_STARTING,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        payload={
-                            "provider": registered_provider.name,
-                            "model": model_request.model,
-                            "step": step,
-                            "attempt": attempt,
-                            "max_attempts": max_attempts,
-                            **model_attempt_identity.payload(),
-                            "source_run_epoch": session.run_epoch,
-                            "start_id": start_id,
-                            "start_idempotency_support": start_idempotency_support.value,
-                        },
-                    ),
-                    model_attempt_identity,
-                )
-                starting_event = event_with_execution_profile_authority(
-                    starting_event,
-                    execution_profile,
-                )
-                starting_event = event_with_runtime_payload_authority(
-                    starting_event,
-                    "start_id",
-                )
-                emitted_starting_event = await self._event_writer.emit(starting_event)
-                yield emitted_starting_event, None
-                provider_operation_interaction_id = emitted_starting_event.interaction_id
-                if provider_operation_interaction_id is None:
-                    raise RuntimeError(
-                        "Provider-operation dispatch requires an owning interaction."
-                    )
-
-                async def start_provider_operation() -> ProviderOperationConnection:
-                    nonlocal background_dispatch_invoked
-
-                    # Durable staging and event publication above can yield to
-                    # application code. Recheck at the last pre-dispatch seam.
-                    await refresh_live_model_semantics()
-                    await consume_child_session_notifications()
-                    await refresh_live_model_semantics()
-                    start_request = ProviderOperationStartRequest(
-                        request=model_request,
-                        idempotency_key=start_id,
-                    )
-                    token = bind_provider_deadline_admission(deadline_admission)
-                    try:
-                        from cayu.resource_access import require_dispatch
-
-                        await require_dispatch()
-                        background_dispatch_invoked = True
-                        return await provider_operation_adapter.start(start_request)
-                    finally:
-                        reset_provider_deadline_admission(token)
-
-                start_task = asyncio.create_task(start_provider_operation())
-
-                def operation_event_for(
-                    operation_state: ProviderOperationState,
-                    operation_status: ProviderOperationStatus,
-                ) -> Event:
-                    event = _event_with_model_identity_authority(
-                        Event(
-                            id=provider_operation_started_event_id(start_id),
-                            type=EventType.PROVIDER_OPERATION_STARTED,
-                            session_id=session.id,
-                            interaction_id=emitted_starting_event.interaction_id,
-                            agent_name=registered_agent.spec.name,
+                start_progress = ProviderOperationStartState()
+                try:
+                    async with contextlib.aclosing(
+                        self._provider_operation_start.start(
+                            progress=start_progress,
+                            provider=provider,
+                            model_request=model_request,
+                            deadline_admission=deadline_admission,
+                            completion_dispatch=completion_dispatch,
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_provider=registered_provider,
                             environment_name=environment_name,
-                            payload={
-                                "provider": registered_provider.name,
-                                "model": model_request.model,
-                                "step": step,
-                                "attempt": attempt,
-                                "max_attempts": max_attempts,
-                                **model_attempt_identity.payload(),
-                                "source_run_epoch": session.run_epoch,
-                                "start_id": start_id,
-                                "state_version": operation_state.version,
-                                "operation_id": operation_state.operation_id,
-                                "stream_protocol": operation_state.stream_protocol,
-                                "status": operation_status.value,
-                                "recovery_metadata": operation_state.recovery_metadata.model_dump(
-                                    mode="json",
-                                    exclude_none=True,
-                                ),
-                            },
-                        ),
-                        model_attempt_identity,
-                    )
-                    event = event_with_execution_profile_authority(
-                        event,
-                        execution_profile,
-                    )
-                    return event_with_runtime_payload_authority(event, "start_id")
-
-                start_outcome = await await_shielded_task_outcome(
-                    start_task,
-                    timeout_after_cancellation_s=(
-                        _PROVIDER_OPERATION_START_SETTLEMENT_TIMEOUT_SECONDS
-                    ),
-                )
-
-                def raise_start_cancellation(
-                    cause: BaseException | None = None,
-                    *,
-                    additional_requests_consumed: int = 0,
-                ) -> Never:
-                    cancellation = start_outcome.cancellation
-                    if cancellation is None:
-                        raise RuntimeError("Provider start has no caller cancellation.")
-                    if start_outcome.cancellation_requests_consumed < 1:
-                        raise RuntimeError(
-                            "Provider start cancellation lost its consumed request count."
-                        ) from cancellation
-                    restore_task_cancellation_requests(
-                        start_outcome.cancellation_requests_consumed + additional_requests_consumed,
-                        cancellation=cancellation,
-                    )
-                    if cause is None:
-                        raise cancellation
-                    raise cancellation from cause
-
-                if start_outcome.timed_out:
-                    start_task.cancel()
-                    start_cancellation = start_outcome.cancellation
-                    if start_cancellation is None:  # pragma: no cover - armed by cancellation
-                        raise RuntimeError("Provider operation start settlement timed out.")
-
-                async def reconcile_late_start() -> None:
-                    late_outcome = await await_shielded_task_outcome(start_task)
-                    if late_outcome.error is not None or late_outcome.result is None:
-                        return
-                    raw_late_operation = late_outcome.result
-                    try:
-                        late_operation = copy_provider_operation_connection(raw_late_operation)
-                    except BaseException:
-                        if type(raw_late_operation) is ProviderOperationConnection:
-                            async with aclosing_provider_stream(raw_late_operation.events):
-                                raise
-                        raise
-                    try:
-                        (
-                            late_cleanup_cancellation,
-                            cancellation_snapshot,
-                            late_cleanup_cancellation_requests_consumed,
-                        ) = await _cancel_provider_operation_after_definite_absence(
-                            lifecycle=self._provider_operation_cancellation_lifecycle,
-                            adapter=provider_operation_adapter,
-                            state=late_operation.state,
-                            failure=RuntimeError(
-                                "Caller cancellation preceded provider start acknowledgement."
+                            step=step,
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                            model_attempt_identity=model_attempt_identity,
+                            execution_profile=execution_profile,
+                            refresh_live_model_semantics=refresh_live_model_semantics,
+                            consume_child_session_notifications=consume_child_session_notifications,
+                            acknowledge_context_exposure=lambda operation_id: (
+                                advance_context_exposure(
+                                    ContextExposureState.ACKNOWLEDGED,
+                                    ContextExposureEvidenceKind.PROVIDER_ACKNOWLEDGEMENT,
+                                    context_exposure_ref("provider-operation-started"),
+                                    provider_request_id=operation_id,
+                                )
                             ),
                         )
-                        if late_cleanup_cancellation is not None:
-                            restore_task_cancellation_requests(
-                                late_cleanup_cancellation_requests_consumed,
-                                cancellation=late_cleanup_cancellation,
-                            )
-                            raise late_cleanup_cancellation
-                        reconciled_status = (
-                            late_operation.status
-                            if cancellation_snapshot is None
-                            else cancellation_snapshot.status
-                        )
-                        reconciliation_event = self._event_writer.prepare(
-                            operation_event_for(
-                                late_operation.state,
-                                reconciled_status,
-                            )
-                        )
-
-                        def preserve_checkpoint(
-                            _current: Session,
-                            checkpoint: dict[str, Any] | None,
-                        ) -> dict[str, Any]:
-                            if checkpoint is None:
-                                raise RuntimeError(
-                                    "Late provider-operation reconciliation requires an "
-                                    "existing session checkpoint."
-                                )
-                            copied = copy_durable_record(checkpoint, "checkpoint")
-                            if type(copied) is not dict:
-                                raise TypeError("Session checkpoint must be an object.")
-                            return copied
-
-                        for publication_attempt in range(2):
-                            reconciliation_session = await self._session_store.load(session.id)
-                            if reconciliation_session is None:
-                                return
-                            if reconciliation_session.run_epoch == session.run_epoch:
-                                eligible_statuses = {
-                                    SessionStatus.RUNNING,
-                                    SessionStatus.INTERRUPTING,
-                                }
-                            elif reconciliation_session.run_epoch == session.run_epoch + 1:
-                                eligible_statuses = {
-                                    SessionStatus.INTERRUPTED,
-                                    SessionStatus.FAILED,
-                                }
-                            else:
-                                return
-                            try:
-                                await self._session_store.publish_checkpoint_and_events(
-                                    session.id,
-                                    checkpoint_transform=preserve_checkpoint,
-                                    events=[reconciliation_event],
-                                    expected_statuses=eligible_statuses,
-                                    expected_run_epoch=reconciliation_session.run_epoch,
-                                )
-                                break
-                            except (SessionRunFenced, SessionStatusConflict):
-                                if publication_attempt == 1:
-                                    raise
-                        persisted = await self._session_store.query_events(
-                            EventQuery(
-                                session_id=session.id,
-                                event_id=reconciliation_event.id,
-                                limit=1,
-                            )
-                        )
-                        if len(persisted) != 1 or persisted[0].event != reconciliation_event:
-                            raise RuntimeError(
-                                "Late provider-operation reconciliation readback did not "
-                                "match its durable event."
-                            )
-                        await self._event_writer.fan_out_persisted([persisted[0].event])
-                    finally:
-                        await _close_async_iterator(raw_late_operation.events)
-
-                if start_outcome.timed_out:
-                    start_cancellation = start_outcome.cancellation
-                    if start_cancellation is None:  # pragma: no cover - validated above
-                        raise AssertionError("Timed-out provider start lost caller cancellation.")
-                    reconciliation_task = asyncio.create_task(
-                        reconcile_late_start(),
-                        context=Context(),
-                    )
-                    self._retain_provider_operation_reconciliation(reconciliation_task)
-                    start_cancellation.add_note(
-                        "Provider operation start remained in flight after bounded cancellation "
-                        "settlement; durable starting evidence prevents automatic retry."
-                    )
-                    raise_start_cancellation()
-
-                start_error = start_outcome.error
-                if (
-                    isinstance(start_error, asyncio.CancelledError)
-                    and start_outcome.cancellation is None
-                ):
-                    start_error = unexpected_child_cancellation_error(
-                        start_error,
-                        operation="Provider operation start",
-                    )
-                if start_error is not None:
-                    if start_outcome.cancellation is not None:
-                        raise_start_cancellation(start_error)
-                    if not isinstance(start_error, Exception):
-                        raise start_error
-                    if not background_dispatch_invoked:
-                        raise start_error
-                    if isinstance(start_error, ModelStreamDeadlineError):
-                        # Preserve the typed error for the common provider-error
-                        # boundary to defensively copy and publish. The normal
-                        # deadline stage fence then owns this pre-identity
-                        # background outcome.
-                        raise start_error from None
-                    raise _ambiguous_provider_operation_start_error(
-                        provider_name=registered_provider.name,
-                        cause=start_error,
-                    ) from start_error
-                try:
-                    if start_outcome.result is None:
-                        raise RuntimeError("Provider operation start returned no connection.")
-                    raw_provider_operation = start_outcome.result
-                    try:
-                        provider_operation = copy_provider_operation_connection(
-                            raw_provider_operation
-                        )
-                    except BaseException:
-                        if type(raw_provider_operation) is ProviderOperationConnection:
-                            async with aclosing_provider_stream(raw_provider_operation.events):
-                                raise
-                        raise
-                except Exception as start_validation_error:
-                    if start_outcome.cancellation is not None:
-                        raise_start_cancellation(start_validation_error)
-                    raise _ambiguous_provider_operation_start_error(
-                        provider_name=registered_provider.name,
-                        cause=start_validation_error,
-                    ) from start_validation_error
-                operation_state = provider_operation.state
-                provider_operation_state = operation_state
-                operation_event = operation_event_for(
-                    provider_operation.state,
-                    provider_operation.status,
-                )
-                provider_events = provider_operation.events
-                try:
-                    operation_event = self._event_writer.prepare(operation_event)
-                except BaseException as preparation_error:
-                    (
-                        cleanup_cancellation,
-                        _,
-                        cleanup_cancellation_requests_consumed,
-                    ) = await _cancel_provider_operation_after_definite_absence(
-                        lifecycle=self._provider_operation_cancellation_lifecycle,
-                        adapter=provider_operation_adapter,
-                        state=operation_state,
-                        failure=preparation_error,
-                        cancellation=start_outcome.cancellation,
-                    )
-                    provider_operation_state = None
-                    if cleanup_cancellation is not None:
-                        if cleanup_cancellation is start_outcome.cancellation:
-                            raise_start_cancellation(
-                                preparation_error,
-                                additional_requests_consumed=(
-                                    cleanup_cancellation_requests_consumed
-                                ),
-                            )
-                        restore_task_cancellation_requests(
-                            cleanup_cancellation_requests_consumed,
-                            cancellation=cleanup_cancellation,
-                        )
-                        raise cleanup_cancellation from preparation_error
-                    if isinstance(
-                        preparation_error,
-                        SessionInterruptedByRequest | SessionRunFenced,
-                    ):
-                        raise
-                    if isinstance(preparation_error, Exception):
-                        raise _ambiguous_provider_operation_start_error(
-                            provider_name=registered_provider.name,
-                            cause=preparation_error,
-                        ) from preparation_error
-                    raise
-                try:
-                    persisted_operation_event = await self._event_writer.persist_exact_replay(
-                        operation_event
-                    )
-                except BaseException as persistence_error:
-                    try:
-                        exact_identity_is_durable = await self._event_writer.is_exact_persisted(
-                            operation_event
-                        )
-                    except BaseException as verification_error:
-                        persistence_error.add_note(
-                            "Provider operation start-evidence readback also failed: "
-                            f"{type(verification_error).__name__}."
-                        )
-                        if start_outcome.cancellation is not None:
-                            raise_start_cancellation(
-                                BaseExceptionGroup(
-                                    "Provider operation publication and readback both failed.",
-                                    [persistence_error, verification_error],
-                                )
-                            )
-                        if isinstance(
-                            verification_error,
-                            SessionInterruptedByRequest | SessionRunFenced,
-                        ) or not isinstance(verification_error, Exception):
-                            raise
-                        if isinstance(
-                            persistence_error,
-                            SessionInterruptedByRequest | SessionRunFenced,
-                        ):
-                            raise persistence_error from verification_error
-                        if isinstance(persistence_error, Exception):
-                            raise _ambiguous_provider_operation_start_error(
-                                provider_name=registered_provider.name,
-                                cause=persistence_error,
-                            ) from verification_error
-                        raise persistence_error from verification_error
-                    if not exact_identity_is_durable:
-                        (
-                            cleanup_cancellation,
-                            _,
-                            cleanup_cancellation_requests_consumed,
-                        ) = await _cancel_provider_operation_after_definite_absence(
-                            lifecycle=self._provider_operation_cancellation_lifecycle,
-                            adapter=provider_operation_adapter,
-                            state=operation_state,
-                            failure=persistence_error,
-                            cancellation=start_outcome.cancellation,
-                        )
-                        provider_operation_state = None
-                        if cleanup_cancellation is not None:
-                            if cleanup_cancellation is start_outcome.cancellation:
-                                raise_start_cancellation(
-                                    persistence_error,
-                                    additional_requests_consumed=(
-                                        cleanup_cancellation_requests_consumed
-                                    ),
-                                )
-                            restore_task_cancellation_requests(
-                                cleanup_cancellation_requests_consumed,
-                                cancellation=cleanup_cancellation,
-                            )
-                            raise cleanup_cancellation from persistence_error
-                    if start_outcome.cancellation is not None:
-                        raise_start_cancellation(persistence_error)
-                    if isinstance(
-                        persistence_error,
-                        SessionInterruptedByRequest | SessionRunFenced,
-                    ):
-                        raise
-                    if isinstance(persistence_error, Exception):
-                        raise _ambiguous_provider_operation_start_error(
-                            provider_name=registered_provider.name,
-                            cause=persistence_error,
-                        ) from persistence_error
-                    raise
-                try:
-                    [emitted_operation_event] = await self._event_writer.fan_out_persisted(
-                        [persisted_operation_event]
-                    )
-                except BaseException as delivery_error:
-                    if start_outcome.cancellation is not None:
-                        raise_start_cancellation(delivery_error)
-                    if isinstance(
-                        delivery_error,
-                        SessionInterruptedByRequest | SessionRunFenced,
-                    ):
-                        raise
-                    if isinstance(delivery_error, Exception):
-                        raise _ambiguous_provider_operation_start_error(
-                            provider_name=registered_provider.name,
-                            cause=delivery_error,
-                        ) from delivery_error
-                    raise
-                provider_operation_identity_durable = True
-                await advance_context_exposure(
-                    ContextExposureState.ACKNOWLEDGED,
-                    ContextExposureEvidenceKind.PROVIDER_ACKNOWLEDGEMENT,
-                    context_exposure_ref("provider-operation-started"),
-                    provider_request_id=provider_operation_state.operation_id,
-                )
-                if start_outcome.cancellation is not None:
-                    raise_start_cancellation()
-                yield emitted_operation_event, None
+                    ) as starting:
+                        async for event in starting:
+                            yield event, None
+                finally:
+                    # Startup may have published identity or acquired a stream before it
+                    # fails. Hand those exact effects to the existing live cleanup paths.
+                    provider_operation_adapter = start_progress.adapter
+                    provider_operation_state = start_progress.operation_state
+                    provider_operation_interaction_id = start_progress.interaction_id
+                    provider_events = start_progress.events
+                    provider_operation_identity_durable = start_progress.identity_durable
+                    background_dispatch_invoked = start_progress.dispatch_invoked
+            if provider_events is None:  # pragma: no cover - startup invariant
+                raise AssertionError("Provider startup completed without an event stream.")
             provider_iterator = aiter(provider_events)
             while True:
                 redactor_token = bind_provider_error_workload_redactor(self._secret_redactor)

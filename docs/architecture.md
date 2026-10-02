@@ -206,8 +206,17 @@ projection and hosted tool-discovery preparation live in independent runtime
 modules used by both execution and recovery. Their former executor imports
 resolve to the same definitions, preserving exact type checks and legacy pickle
 paths. The executor wires the recovery owner's store, event writer, run-limit
-controller, redactor, clock and cancellation owner; initial dispatch, live retry
-decisions and automatic compaction remain with the executor.
+controller, redactor, clock and cancellation owner. Live retry decisions and
+automatic compaction remain with the executor.
+
+`ProviderOperationStartOwner` owns background-provider dispatch, exact start
+identity publication, bounded cancellation settlement and late acknowledgement
+reconciliation. It shares the existing cancellation lifecycle and retains its
+late reconciliation tasks. Run-local admission, notification consumption and
+context-exposure callbacks preserve the caller's authority; the start owner
+orders these boundaries around dispatch and publication. Its per-attempt state
+records observed effects even when startup raises or closes, so the executor's
+stream cleanup retains the exact operation, stream and durable-identity status.
 
 `TerminalEvidenceFinalization` owns terminal-evidence inspection and crash repair,
 as well as live claim transfer, exact renewal, heartbeat-monitored preparation and

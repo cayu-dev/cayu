@@ -1873,7 +1873,7 @@ def test_cancellation_during_unsettled_provider_start_is_bounded(
 ) -> None:
     async def scenario() -> tuple[bool, int, ProviderOperationInspectionStatus]:
         monkeypatch.setattr(
-            "cayu.runtime._model_step_executor._PROVIDER_OPERATION_START_SETTLEMENT_TIMEOUT_SECONDS",
+            "cayu.runtime._provider_operation_start_owner._PROVIDER_OPERATION_START_SETTLEMENT_TIMEOUT_SECONDS",
             0.0,
         )
         provider = _ReconnectableProvider(background=True)
@@ -1933,7 +1933,7 @@ def test_late_successful_start_acknowledgement_cancels_exact_returned_operation(
         list[Event],
     ]:
         monkeypatch.setattr(
-            "cayu.runtime._model_step_executor._PROVIDER_OPERATION_START_SETTLEMENT_TIMEOUT_SECONDS",
+            "cayu.runtime._provider_operation_start_owner._PROVIDER_OPERATION_START_SETTLEMENT_TIMEOUT_SECONDS",
             0.0,
         )
         provider = _ReconnectableProvider(background=True)
@@ -1992,7 +1992,7 @@ def test_late_invalid_start_acknowledgement_closes_returned_stream(
 ) -> None:
     async def scenario() -> None:
         monkeypatch.setattr(
-            "cayu.runtime._model_step_executor._PROVIDER_OPERATION_START_SETTLEMENT_TIMEOUT_SECONDS",
+            "cayu.runtime._provider_operation_start_owner._PROVIDER_OPERATION_START_SETTLEMENT_TIMEOUT_SECONDS",
             0.0,
         )
         provider = _ReconnectableProvider(background=True)
@@ -2032,7 +2032,7 @@ def test_late_start_acknowledgement_cannot_publish_after_run_epoch_moves(
 ) -> None:
     async def scenario() -> tuple[ProviderOperationInspectionStatus, list[Event]]:
         monkeypatch.setattr(
-            "cayu.runtime._model_step_executor._PROVIDER_OPERATION_START_SETTLEMENT_TIMEOUT_SECONDS",
+            "cayu.runtime._provider_operation_start_owner._PROVIDER_OPERATION_START_SETTLEMENT_TIMEOUT_SECONDS",
             0.0,
         )
         provider = _ReconnectableProvider(background=True)
@@ -2112,7 +2112,7 @@ def test_late_start_cancellation_failure_preserves_exact_in_progress_identity(
 ) -> None:
     async def scenario() -> tuple[ProviderOperationInspectionStatus, str | None]:
         monkeypatch.setattr(
-            "cayu.runtime._model_step_executor._PROVIDER_OPERATION_START_SETTLEMENT_TIMEOUT_SECONDS",
+            "cayu.runtime._provider_operation_start_owner._PROVIDER_OPERATION_START_SETTLEMENT_TIMEOUT_SECONDS",
             0.0,
         )
         provider = _ReconnectableProvider(background=True)
