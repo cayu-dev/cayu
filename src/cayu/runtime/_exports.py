@@ -1,6 +1,17 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "ApplicationAdmission": ("cayu.runtime.application_lifecycle", "ApplicationAdmission"),
+    "ApplicationAdmissionsSealed": (
+        "cayu.runtime.application_lifecycle",
+        "ApplicationAdmissionsSealed",
+    ),
+    "ApplicationShutdown": ("cayu.runtime.application_lifecycle", "ApplicationShutdown"),
+    "ApplicationShutdownOutcome": (
+        "cayu.runtime.application_lifecycle",
+        "ApplicationShutdownOutcome",
+    ),
+    "ApplicationShutdownStep": ("cayu.runtime.application_lifecycle", "ApplicationShutdownStep"),
     "RuntimeEvidenceAuxiliaryInference": (
         "cayu.runtime.evidence",
         "RuntimeEvidenceAuxiliaryInference",
@@ -30,6 +41,9 @@ EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "SessionClosureLineageStore": ("cayu.runtime.session_closure", "SessionClosureLineageStore"),
     "SessionClosureProgress": ("cayu.runtime.session_closure", "SessionClosureProgress"),
+    "ShutdownBudget": ("cayu.runtime.application_lifecycle", "ShutdownBudget"),
+    "ShutdownStepSpec": ("cayu.runtime.application_lifecycle", "ShutdownStepSpec"),
+    "SupportsAsyncClose": ("cayu.runtime.application_lifecycle", "SupportsAsyncClose"),
     "TaskSessionClosureClaim": ("cayu.tasks.base", "TaskSessionClosureClaim"),
     "ALL_REGISTERED_TOOLS_PROFILE_ID": ("cayu.tools.exposure", "ALL_REGISTERED_TOOLS_PROFILE_ID"),
     "ANY_TAINT_LABEL": ("cayu.tools.policy", "ANY_TAINT_LABEL"),
@@ -1968,6 +1982,11 @@ EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 PUBLIC_NAMES = [
+    "ApplicationAdmission",
+    "ApplicationAdmissionsSealed",
+    "ApplicationShutdown",
+    "ApplicationShutdownOutcome",
+    "ApplicationShutdownStep",
     "RuntimeEvidenceAuxiliaryInference",
     "PersistedEventSideEffectHealth",
     "PersistedEventSideEffectInspection",
@@ -1979,6 +1998,9 @@ PUBLIC_NAMES = [
     "SessionClosureExportIncomplete",
     "SessionClosureLineageStore",
     "SessionClosureProgress",
+    "ShutdownBudget",
+    "ShutdownStepSpec",
+    "SupportsAsyncClose",
     "TaskSessionClosureClaim",
     "ALL_REGISTERED_TOOLS_PROFILE_ID",
     "ANY_TAINT_LABEL",

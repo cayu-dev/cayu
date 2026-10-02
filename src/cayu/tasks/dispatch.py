@@ -4,13 +4,13 @@ import asyncio
 import contextlib
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, Protocol, TypeVar, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
@@ -69,6 +69,10 @@ from cayu.runtime._durable_worker_loop import (
 from cayu.runtime._message_redaction import redact_untrusted_message_for_boundary
 from cayu.runtime._task_store_operation_boundary import (
     task_store_cancellation_reconciliation_capability_is_complete,
+)
+from cayu.runtime.application_lifecycle import (
+    ApplicationAdmissionsSealed,
+    ApplicationLifecycleState,
 )
 from cayu.runtime.execution_profiles import (
     ExecutionProfileAdoptionIntent,
@@ -130,6 +134,8 @@ from cayu.vaults import SecretRedactor
 from cayu.workspaces.observation_recovery import (
     is_workspace_observation_recovery_rejected,
 )
+
+_StepResult = TypeVar("_StepResult")
 
 logger = logging.getLogger(__name__)
 _DISPATCH_DIAGNOSTIC_MAX_BYTES = 4096
@@ -650,6 +656,13 @@ class _QueuedDispatchEnvelope(BaseModel):
 
 class _ProfiledDispatchRuntime(_DurableDispatchRuntime, Protocol):
     """Private runtime seam for profile-bound durable dispatch."""
+
+    @property
+    def lifecycle_state(self) -> ApplicationLifecycleState:
+        """``open`` while the runtime admits new dispatch execution."""
+
+    async def _run_worker_step(self, step: Callable[[], Awaitable[_StepResult]]) -> _StepResult:
+        """Run one worker step so the runtime's shutdown waits for it."""
 
     async def _prepare_queued_dispatch(
         self,
@@ -2761,11 +2774,14 @@ class TaskStoreDispatcher(Dispatcher):
                 # transfer it to the caller instead of orphaning exact proof.
                 if has_task_execution_settlement_pending(exc):
                     raise
-                logger.error(
-                    "dispatch worker failed while processing a task: error_type=%s error=%s",
-                    type(exc).__name__,
-                    _safe_runtime_text(durable_runtime, str(exc)),
-                )
+                # A dispatch refused because the runtime is closing was released
+                # back to the queue; that is shutdown, not a failure.
+                if not isinstance(exc, ApplicationAdmissionsSealed):
+                    logger.error(
+                        "dispatch worker failed while processing a task: error_type=%s error=%s",
+                        type(exc).__name__,
+                        _safe_runtime_text(durable_runtime, str(exc)),
+                    )
                 handle = None
             finally:
                 if uses_base_claim_boundary and poller.last_claimed:
@@ -2813,11 +2829,23 @@ class TaskStoreDispatcher(Dispatcher):
                 activity=meaningful_activity,
             )
 
+        # A closing runtime's stores may already be closed.
+        if durable_runtime.lifecycle_state != "open":
+            return
         admission_wakeup = None
         try:
             admission_wakeup = await self._tasks._task_admission_wakeup(claim_queries)
+
+            async def counted_step(now: float, handled: int) -> DurableWorkerStep:
+                # A closing runtime refuses new dispatch execution and its stores
+                # may already be closed, so stop before any maintenance. A step
+                # already running is waited for by the runtime's shutdown.
+                if durable_runtime.lifecycle_state != "open":
+                    return DurableWorkerStep(stop=True)
+                return await durable_runtime._run_worker_step(lambda: run_step(now, handled))
+
             await run_durable_worker_loop(
-                run_step,
+                counted_step,
                 poll_interval_s=poll_interval_s,
                 stop=stop,
                 wait=(
@@ -3882,6 +3910,7 @@ def _require_profiled_dispatch_runtime(
         "_queued_dispatch_settlement_state",
         "_list_queued_dispatch_terminal_receipts",
         "_acknowledge_queued_dispatch",
+        "_run_worker_step",
     ):
         try:
             method = getattr(durable_runtime, method_name)
@@ -3889,6 +3918,8 @@ def _require_profiled_dispatch_runtime(
             raise TypeError(f"Dispatch runtime {method_name} must be callable.") from None
         if not callable(method):
             raise TypeError(f"Dispatch runtime {method_name} must be callable.")
+    if type(getattr(durable_runtime, "lifecycle_state", None)) is not str:
+        raise TypeError("Dispatch runtime lifecycle_state must be a string.")
     return cast("_ProfiledDispatchRuntime", durable_runtime)
 
 

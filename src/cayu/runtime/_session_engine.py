@@ -6415,6 +6415,14 @@ class SessionEngine:
             )
         return error, outcome.cancellation
 
+    def background_interruptions_pending(self) -> bool:
+        return self._background_interruption_coordinator.pending
+
+    def seal_background_interruptions(self) -> None:
+        """Refuse new background interruption cascades for application shutdown."""
+
+        self._background_interruption_coordinator.seal()
+
     async def drain_background_interruptions(self, *, timeout_s: float = 10.0) -> bool:
         """Wait for accepted background interruption cascades to finish.
 

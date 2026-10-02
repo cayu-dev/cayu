@@ -2831,3 +2831,48 @@ async def test_public_question_uses_real_assistant_export(
             if backend != "memory":
                 await store.close()
                 await collaboration.close()
+
+
+@pytest.mark.anyio
+async def test_clarification_service_permits_belong_to_the_servicing_app(
+    tmp_path, request, monkeypatch
+):
+    from cayu.collaboration._ownership import _MutationScope
+
+    scoped_keys: list[object] = []
+    run = _MutationScope.run
+
+    async def recording_run(self, operation, **kwargs):
+        scoped_keys.append(kwargs["key"])
+        return await run(self, operation, **kwargs)
+
+    monkeypatch.setattr(_MutationScope, "run", recording_run)
+    from cayu.runtime import _session_continuation_owner
+
+    trackers: list[object] = []
+    owner_init = _session_continuation_owner.SessionContinuationOwner.__init__
+
+    def recording_init(self, *args, **kwargs):
+        trackers.append(kwargs.get("track"))
+        owner_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        _session_continuation_owner.SessionContinuationOwner, "__init__", recording_init
+    )
+    await test_public_question_uses_real_assistant_export(
+        "memory",
+        tmp_path,
+        request,
+        monkeypatch,
+        temporary_service=True,
+        public_reply=False,
+        post_admission=True,
+        side_session=False,
+    )
+
+    # The app's shutdown waits for its service permit mutations, not just requests.
+    # Permit keys carry the application scope; the coordinator's own key does not.
+    assert any(key[0] == "clarification-service" and isinstance(key[1], str) for key in scoped_keys)
+    # Continuation owners retain work past their observers; the app waits for it.
+    assert trackers
+    assert all(isinstance(getattr(track, "__self__", None), _MutationScope) for track in trackers)

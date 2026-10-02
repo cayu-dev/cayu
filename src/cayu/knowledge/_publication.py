@@ -7,20 +7,58 @@ from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from math import isfinite
-from typing import Any, Generic, Protocol, TypeVar, runtime_checkable
+from typing import Any, Generic, TypeVar
 
 _ResultT = TypeVar("_ResultT")
 
 
-@runtime_checkable
-class KnowledgePublicationLifecycle(Protocol):
-    """Complete shutdown lifecycle exposed by one registered knowledge writer."""
+class KnowledgePublicationScope:
+    """One application's share of the publications made through registered tools.
+
+    Knowledge tools can be shared by several applications, so an application's
+    shutdown must not seal or close a tool. Instead the application binds this
+    scope to its tool calls: sealing it refuses that application's new
+    publications, and draining it waits only for work that application started.
+    The tool keeps owning that work; ``aclose`` on the tool stays the permanent
+    close for whoever created it.
+    """
+
+    def __init__(self) -> None:
+        self._sealed = False
+        self._tasks: set[asyncio.Future[Any]] = set()
+
+    @property
+    def sealed(self) -> bool:
+        return self._sealed
+
+    @property
+    def pending(self) -> bool:
+        """Whether a publication this application started is still running."""
+
+        return bool(self._tasks)
 
     def seal(self) -> None:
-        """Synchronously reject new publication dispatch."""
+        """Synchronously refuse new publications started by this application."""
 
-    async def aclose(self, *, timeout_s: float = 10.0) -> bool:
-        """Drain all lifecycle-owned work within one shared deadline."""
+        self._sealed = True
+
+    def track(self, task: asyncio.Future[Any]) -> None:
+        """Wait for ``task`` when this scope drains; it stays owned by its tool."""
+
+        if task.done() or task in self._tasks:
+            return
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def drain(self, *, timeout_s: float) -> bool:
+        """Seal, then wait for this application's work without cancelling it."""
+
+        timeout = _positive_seconds(timeout_s)
+        self.seal()
+        if not self._tasks:
+            return True
+        _, pending = await asyncio.wait(tuple(self._tasks), timeout=timeout)
+        return not pending
 
 
 class KnowledgePublicationOwnerClosed(RuntimeError):
@@ -113,8 +151,13 @@ class RetainedKnowledgePublicationOwner(Generic[_ResultT]):
         operation_id: str,
         fingerprint: str,
         operation_factory: Callable[[], Awaitable[_ResultT]],
+        *,
+        scope: KnowledgePublicationScope | None = None,
     ) -> RetainedKnowledgePublicationResult[_ResultT]:
-        """Join an exact operation or dispatch it under this owner's capacity."""
+        """Join an exact operation or dispatch it under this owner's capacity.
+
+        A sealed ``scope`` refuses a new dispatch but may still join exact work.
+        """
 
         if not callable(operation_factory):
             raise TypeError("operation_factory must be callable.")
@@ -123,7 +166,7 @@ class RetainedKnowledgePublicationOwner(Generic[_ResultT]):
         if owned is not None and owned.fingerprint != fingerprint:
             raise KnowledgePublicationOperationConflict
         if owned is None:
-            if self._sealed:
+            if self._sealed or (scope is not None and scope.sealed):
                 raise KnowledgePublicationOwnerClosed
             if len(self._publications) >= self._max_publications:
                 raise KnowledgePublicationCapacityExhausted
@@ -138,6 +181,8 @@ class RetainedKnowledgePublicationOwner(Generic[_ResultT]):
                     operation_id, owned, completed
                 )
             )
+        if scope is not None:
+            scope.track(owned.task)
         return RetainedKnowledgePublicationResult(
             value=await asyncio.shield(owned.task),
             joined=joined,

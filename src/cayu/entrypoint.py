@@ -65,8 +65,14 @@ def run_project_entrypoint(
     with capture:
 
         async def execute():
-            async with app.model_policy_lifespan():
+            try:
+                # aclose() owns stopping it, within the shutdown deadline.
+                await app.start_model_policy()
                 return await run_to_completion(app, run_request)
+            finally:
+                shutdown = await app.aclose()
+                if not shutdown.settled:
+                    print(f"warning: {shutdown.summary()}", file=sys.stderr, flush=True)
 
         outcome = asyncio.run(execute())
     if outcome.ok:

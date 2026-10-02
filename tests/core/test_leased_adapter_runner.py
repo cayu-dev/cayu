@@ -5,7 +5,11 @@ from contextlib import suppress
 
 import pytest
 
-from cayu.verification._leased_adapter_runner import LeasedAdapterLease, LeasedAdapterRunner
+from cayu.verification._leased_adapter_runner import (
+    LeasedAdapterLease,
+    LeasedAdapterRunner,
+    LeasedAdapterSettlement,
+)
 
 
 def test_cancelled_single_flight_waiter_cannot_split_an_active_queue() -> None:
@@ -245,5 +249,88 @@ def test_successful_dispatch_detaches_its_lease_watch() -> None:
         stop.set()
         with suppress(asyncio.CancelledError):
             await heartbeat_task
+
+    asyncio.run(scenario())
+
+
+def test_wait_idle_observes_owned_work_without_cancelling_it() -> None:
+    async def scenario() -> None:
+        runner = LeasedAdapterRunner[LeasedAdapterSettlement[None]]()
+        release = asyncio.Event()
+        heartbeat = runner.start_heartbeat(release.wait(), name="test-heartbeat")
+        assert runner.pending
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        assert await runner.wait_idle(0.05) is False
+        assert loop.time() - started < 1.0
+        # Shutdown only observes: the work keeps running.
+        assert not heartbeat.done() and runner.pending
+        release.set()
+        assert await runner.wait_idle(1.0) is True
+        assert not runner.pending
+
+    asyncio.run(scenario())
+
+
+def test_a_failed_settlement_kept_for_acknowledgement_is_not_pending() -> None:
+    async def scenario() -> None:
+        runner = LeasedAdapterRunner[LeasedAdapterSettlement[None]]()
+        drain = LeasedAdapterSettlement[None]()
+        runner.retain_drain("operation", drain)
+
+        async def settle() -> None:
+            return None
+
+        runner.adopt_settlement(
+            "operation",
+            drain,
+            asyncio.create_task(settle()),
+            failure_for=lambda _result: RuntimeError("settlement failed"),
+        )
+        assert await runner.wait_idle(1.0) is True
+        # The failure is kept until acknowledged, but nothing is still running.
+        assert runner.draining("operation") is drain and drain.settlement_failure is not None
+        assert not runner.pending
+
+    asyncio.run(scenario())
+
+
+def test_drains_that_are_not_settlements_are_not_waited_for() -> None:
+    async def scenario() -> None:
+        runner = LeasedAdapterRunner[object]()
+        runner.retain_drain("opaque", object())
+        assert not runner.pending
+        assert await runner.wait_idle(0.05) is True
+
+    asyncio.run(scenario())
+
+
+def test_settlement_failures_are_reported_once_and_stay_retained() -> None:
+    async def scenario() -> None:
+        runner = LeasedAdapterRunner[LeasedAdapterSettlement[None]]()
+        failed = LeasedAdapterSettlement[None]()
+        unsettled = LeasedAdapterSettlement[None]()
+        runner.retain_drain("failed", failed)
+        runner.retain_drain("unsettled", unsettled)
+        failure = RuntimeError("settlement failed")
+
+        async def settle() -> None:
+            return None
+
+        async def crash() -> None:
+            raise LookupError("settlement ended without an outcome")
+
+        runner.adopt_settlement(
+            "failed", failed, asyncio.create_task(settle()), failure_for=lambda _result: failure
+        )
+        runner.adopt_settlement(
+            "unsettled", unsettled, asyncio.create_task(crash()), failure_for=lambda _result: None
+        )
+        assert await runner.wait_idle(1.0) is True
+        reported = runner.report_settlement_failures()
+        assert len(reported) == 2 and failure in reported and None in reported
+        assert runner.report_settlement_failures() == []
+        assert runner.draining("failed") is failed
+        assert runner.draining("unsettled") is unsettled
 
     asyncio.run(scenario())

@@ -24,6 +24,10 @@ from cayu.sessions.base import (
 _T = TypeVar("_T")
 
 
+class ForegroundChildDeliverySealed(PersistedEventSideEffectClaimLost):
+    """Delivery is refused during application shutdown; the durable claim is retried later."""
+
+
 class ForegroundChildDeliveryOwner:
     """Keep renewal and cleanup owned when a delivery caller stops waiting."""
 
@@ -31,6 +35,18 @@ class ForegroundChildDeliveryOwner:
         self._store = store
         self._workers: dict[str, asyncio.Task[CapturedAwaitableOutcome[None]]] = {}
         self._store_tasks: set[asyncio.Future[Any]] = set()
+        self._sealed = False
+
+    def seal(self) -> None:
+        """Refuse new deliveries for application shutdown; their claims stay durable."""
+
+        self._sealed = True
+
+    @property
+    def pending(self) -> bool:
+        """Whether a delivery or its retained store write is still running."""
+
+        return bool(self._workers) or bool(self._store_tasks)
 
     def active(self, child_session_id: str) -> bool:
         task = self._workers.get(child_session_id)
@@ -60,6 +76,8 @@ class ForegroundChildDeliveryOwner:
         claim: PersistedEventSideEffectClaim,
         operation: Callable[[Callable[[], Awaitable[None]]], Awaitable[None]],
     ) -> None:
+        if self._sealed:
+            raise ForegroundChildDeliverySealed("Foreground delivery is sealed for shutdown.")
         claim = PersistedEventSideEffectClaim.model_validate_json(claim.model_dump_json())
         if self.active(claim.session_id):
             raise PersistedEventSideEffectClaimLost(
@@ -247,8 +265,15 @@ class ForegroundChildDeliveryOwner:
     async def drain(self, *, timeout_s: float) -> bool:
         if type(timeout_s) not in {int, float} or not 0 <= timeout_s < float("inf"):
             raise ValueError("timeout_s must be finite and non-negative.")
-        pending = {*self._workers.values(), *self._store_tasks}
-        if not pending:
-            return True
-        _, remaining = await asyncio.wait(pending, timeout=max(0, timeout_s))
-        return not remaining and not self._workers and not self._store_tasks
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while True:
+            # Re-check after every completion: settling work can start another
+            # delivery, which a one-time snapshot would miss.
+            pending = {*self._workers.values(), *self._store_tasks}
+            if not pending:
+                return True
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            await asyncio.wait(pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)

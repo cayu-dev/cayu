@@ -234,8 +234,13 @@ async def service_clarification(
             owner=initialized.owner, mutations=(), readbacks=(LATCH_FAMILY,)
         ),
         redactor=redactor,
+        track=app._request_coordinator.owners.track,
         temporary_permits=TemporaryServicePermitAuthority(
-            store, initialized, redactor=redactor, admission_guard=authority_guard
+            store,
+            initialized,
+            redactor=redactor,
+            admission_guard=authority_guard,
+            owners=app._request_coordinator.owners,
         ),
     )
     parent = await app.session_store.load_continuation_ticket(

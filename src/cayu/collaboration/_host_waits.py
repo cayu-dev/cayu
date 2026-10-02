@@ -67,6 +67,7 @@ class HostWaitOwner:
                     owner=initialized.owner, mutations=(), readbacks=(LATCH_FAMILY,)
                 ),
                 redactor=app._secret_redactor,
+                track=app._request_coordinator.owners.track,
             )
         return self._continuations[key]
 

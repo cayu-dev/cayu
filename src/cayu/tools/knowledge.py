@@ -22,9 +22,9 @@ from cayu._validation import (
 )
 from cayu.knowledge._publication import (
     KnowledgePublicationCapacityExhausted,
-    KnowledgePublicationLifecycle,
     KnowledgePublicationOperationConflict,
     KnowledgePublicationOwnerClosed,
+    KnowledgePublicationScope,
     RetainedKnowledgePublicationOwner,
 )
 from cayu.knowledge.activation_contracts import (
@@ -94,6 +94,7 @@ from cayu.storage.memory import (
 from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
 from cayu.tools._operation_boundary import (
     BoundedInvocationOperationRegistry,
+    _InvocationOperationRegistry,
     await_invocation_operation,
 )
 from cayu.tools._redaction import (
@@ -145,6 +146,29 @@ _REMEMBER_KNOWLEDGE_STORE_METHODS = (
     "publish_entry_revision",
     "load_entry_publication_receipt",
 )
+
+
+class _ScopedReadOperations:
+    """Retain reads in the tool's registry while the calling application waits for them."""
+
+    def __init__(
+        self, registry: BoundedInvocationOperationRegistry, scope: KnowledgePublicationScope
+    ) -> None:
+        self._registry = registry
+        self._scope = scope
+
+    def reserve(self) -> bool:
+        return self._registry.reserve()
+
+    def release_reservation(self) -> None:
+        self._registry.release_reservation()
+
+    def track(self, operation: asyncio.Future[Any]) -> None:
+        self._registry.track(operation)
+        self._scope.track(operation)
+
+    def release(self, operation: asyncio.Future[Any]) -> None:
+        self._registry.release(operation)
 
 
 class _RememberKnowledgePublicationLifecycle:
@@ -757,11 +781,9 @@ class RememberKnowledgeTool(Tool):
         self._read_operations = BoundedInvocationOperationRegistry(
             max_operations=MAX_RETAINED_REMEMBER_KNOWLEDGE_READS
         )
-        self._knowledge_publication_lifecycle: KnowledgePublicationLifecycle = (
-            _RememberKnowledgePublicationLifecycle(
-                self._publication_owner,
-                self._read_operations,
-            )
+        self._knowledge_publication_lifecycle = _RememberKnowledgePublicationLifecycle(
+            self._publication_owner,
+            self._read_operations,
         )
 
     @property
@@ -813,6 +835,12 @@ class RememberKnowledgeTool(Tool):
                 chunk_target_bytes=self._chunk_target_bytes,
                 max_chunks=self._max_chunks,
             )
+        scope = ctx._runtime_knowledge_publication_scope
+        reads: _InvocationOperationRegistry = (
+            self._read_operations
+            if scope is None
+            else _ScopedReadOperations(self._read_operations, scope)
+        )
         try:
             joined = await self._publication_owner.join_existing(
                 operation_id,
@@ -830,6 +858,12 @@ class RememberKnowledgeTool(Tool):
             )
         if joined is not None:
             return joined.value
+        if scope is not None and scope.sealed:
+            # The calling application is shutting down; the shared tool stays open.
+            return _knowledge_write_failed_result(
+                entry_id=None,
+                outcome="publication_owner_closed",
+            )
         if not _remember_store_supports_owned_publication(store):
             return _knowledge_write_failed_result(
                 entry_id=None,
@@ -839,7 +873,7 @@ class RememberKnowledgeTool(Tool):
             prior_receipt = await _remember_load_publication_receipt(
                 store,
                 operation_id,
-                operation_registry=self._read_operations,
+                operation_registry=reads,
             )
         except NotImplementedError:
             return _knowledge_write_failed_result(
@@ -870,7 +904,7 @@ class RememberKnowledgeTool(Tool):
             existing_entry = await _remember_load_entry(
                 store,
                 entry_id,
-                operation_registry=self._read_operations,
+                operation_registry=reads,
             )
             if existing_entry is not None:
                 if _remember_entry_matches_material_and_scope(
@@ -933,7 +967,7 @@ class RememberKnowledgeTool(Tool):
                 activation_receipt = await _remember_load_activation_receipt(
                     store,
                     operation_id,
-                    operation_registry=self._read_operations,
+                    operation_registry=reads,
                 )
             except asyncio.CancelledError:
                 raise
@@ -975,7 +1009,7 @@ class RememberKnowledgeTool(Tool):
                 operation_id=operation_id,
                 receipt=prior_receipt,
                 activation_authority=activation_authority,
-                operation_registry=self._read_operations,
+                operation_registry=reads,
             )
             if observation.confirmed:
                 return _remember_knowledge_replayed_result(result)
@@ -1006,6 +1040,8 @@ class RememberKnowledgeTool(Tool):
             access_scope=store.bound_access_scope(),
             model_identity=ctx.agent_name or policy.default_created_by,
             intent_sha256=intent_sha256,
+            scope=scope,
+            reads=reads,
         )
 
     async def _await_owned_publication(
@@ -1024,6 +1060,8 @@ class RememberKnowledgeTool(Tool):
         access_scope: KnowledgeAccessScope,
         model_identity: str,
         intent_sha256: str,
+        scope: KnowledgePublicationScope | None,
+        reads: _InvocationOperationRegistry,
     ) -> ToolResult:
         try:
             publication = await self._publication_owner.run(
@@ -1042,8 +1080,9 @@ class RememberKnowledgeTool(Tool):
                     activation_policy=activation_policy,
                     access_scope=access_scope,
                     model_identity=model_identity,
-                    operation_registry=self._read_operations,
+                    operation_registry=reads,
                 ),
+                scope=scope,
             )
         except KnowledgePublicationOperationConflict:
             return _knowledge_write_failed_result(
@@ -1134,7 +1173,7 @@ async def _remember_load_publication_receipt(
     store: Any,
     operation_id: str,
     *,
-    operation_registry: BoundedInvocationOperationRegistry,
+    operation_registry: _InvocationOperationRegistry,
 ) -> KnowledgePublicationReceipt | None:
     async def operation_factory(
         store: Any = store,
@@ -1173,7 +1212,7 @@ async def _remember_load_activation_receipt(
     store: Any,
     operation_id: str,
     *,
-    operation_registry: BoundedInvocationOperationRegistry,
+    operation_registry: _InvocationOperationRegistry,
 ) -> KnowledgeActivationReceipt | None:
     async def operation_factory(
         store: Any = store,
@@ -1203,7 +1242,7 @@ async def _remember_load_entry(
     store: Any,
     entry_id: str,
     *,
-    operation_registry: BoundedInvocationOperationRegistry,
+    operation_registry: _InvocationOperationRegistry,
 ) -> KnowledgeEntry | None:
     """Load one entry without trusting extension-owned cancellation or output."""
 
@@ -1308,7 +1347,7 @@ async def _remember_publish_owned(
     activation_policy: KnowledgeActivationPolicy | None,
     access_scope: KnowledgeAccessScope,
     model_identity: str,
-    operation_registry: BoundedInvocationOperationRegistry,
+    operation_registry: _InvocationOperationRegistry,
 ) -> ToolResult:
     # Keep reconciliation authority detached from mutable objects handed to an
     # extension store. The public store hook receives its own normalized copies,
@@ -1574,7 +1613,7 @@ async def _remember_confirm_owned_publication(
     operation_id: str,
     activation_authority: KnowledgeActivationAuthority,
     receipt: KnowledgePublicationReceipt | None = None,
-    operation_registry: BoundedInvocationOperationRegistry,
+    operation_registry: _InvocationOperationRegistry,
 ) -> bool:
     observation = await _remember_observe_owned_publication(
         store,
@@ -1594,7 +1633,7 @@ async def _remember_observe_owned_publication(
     operation_id: str,
     activation_authority: KnowledgeActivationAuthority,
     receipt: KnowledgePublicationReceipt | None = None,
-    operation_registry: BoundedInvocationOperationRegistry,
+    operation_registry: _InvocationOperationRegistry,
 ) -> _RememberPublicationObservation:
     try:
         durable_receipt = await _remember_load_publication_receipt(
@@ -1846,7 +1885,7 @@ async def _remember_live_matching_entry(
     kind: str,
     visibility: KnowledgeVisibility,
     required_labels: dict[str, str],
-    operation_registry: BoundedInvocationOperationRegistry,
+    operation_registry: _InvocationOperationRegistry,
 ) -> KnowledgeEntry | None:
     entry = await _remember_load_entry(
         store,

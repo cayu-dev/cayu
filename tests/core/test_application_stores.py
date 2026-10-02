@@ -602,3 +602,61 @@ def test_one_process_stays_within_the_pool_and_listener_budget(
         assert max(observed) >= 2
 
     asyncio.run(scenario())
+
+
+def test_a_failed_close_is_retried_for_only_the_parts_that_did_not_close() -> None:
+    closes: list[str] = []
+
+    class Part:
+        def __init__(self, name: str, failures: int = 0) -> None:
+            self.name = name
+            self.failures = failures
+
+        async def close(self) -> None:
+            closes.append(self.name)
+            if self.failures:
+                self.failures -= 1
+                raise RuntimeError(f"{self.name} did not close")
+
+    stores = ApplicationStores(
+        backend=SessionStoreBackend.SQLITE,
+        session_store=Part("sessions", failures=1),  # ty: ignore[invalid-argument-type]
+        task_store=Part("tasks"),  # ty: ignore[invalid-argument-type]
+        knowledge_store=None,
+    )
+
+    async def scenario() -> None:
+        with pytest.raises(RuntimeError, match="sessions did not close"):
+            await stores.close()
+        await stores.close()
+        await stores.close()
+
+    asyncio.run(scenario())
+    assert closes == ["tasks", "sessions", "sessions"]
+
+
+def test_a_concurrent_close_waits_for_and_reports_the_close_in_progress() -> None:
+    release = asyncio.Event()
+
+    class SlowFailingPart:
+        async def close(self) -> None:
+            await release.wait()
+            raise RuntimeError("sessions did not close")
+
+    stores = ApplicationStores(
+        backend=SessionStoreBackend.SQLITE,
+        session_store=SlowFailingPart(),  # ty: ignore[invalid-argument-type]
+        task_store=None,
+        knowledge_store=None,
+    )
+
+    async def scenario() -> None:
+        first = asyncio.create_task(stores.close())
+        second = asyncio.create_task(stores.close())
+        await asyncio.sleep(0)
+        assert not second.done()
+        release.set()
+        results = await asyncio.gather(first, second, return_exceptions=True)
+        assert all(isinstance(result, RuntimeError) for result in results)
+
+    asyncio.run(scenario())

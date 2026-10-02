@@ -275,7 +275,10 @@ async def reconcile_service(
             owner=initialized.owner, mutations=(), readbacks=(LATCH_FAMILY,)
         ),
         redactor=redactor,
-        temporary_permits=TemporaryServicePermitAuthority(store, initialized, redactor=redactor),
+        track=app._request_coordinator.owners.track,
+        temporary_permits=TemporaryServicePermitAuthority(
+            store, initialized, redactor=redactor, owners=app._request_coordinator.owners
+        ),
     )
     if isinstance(request, ClarificationServiceRecovery):
         assert owner.temporary_permits is not None

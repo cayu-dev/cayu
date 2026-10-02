@@ -544,8 +544,8 @@ class SessionExportCoordinator:
         assert failure is not None
         raise failure
 
-    async def close(self) -> None:
-        await self.owners.drain()
+    async def close(self, *, timeout_s: float | None = None) -> None:
+        await self.owners.drain(timeout_s=timeout_s)
 
     async def session(self, session_id: str, instance: str | None = None) -> Session:
         session = await self.store.load(session_id)

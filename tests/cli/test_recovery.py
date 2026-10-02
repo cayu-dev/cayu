@@ -28,7 +28,13 @@ def _empty_plan(request: RecoveryPlanRequest | None = None) -> RecoveryPlan:
 def test_recovery_plan_cli_builds_registered_app_once(monkeypatch, tmp_path, capsys) -> None:
     build_calls: list[str] = []
 
+    closed: list[float] = []
+
     class App:
+        async def aclose(self, *, timeout_s: float):
+            closed.append(timeout_s)
+            return SimpleNamespace(settled=True)
+
         async def plan_recovery(self, request: RecoveryPlanRequest) -> RecoveryPlan:
             assert request.selection.session_ids == ("session-one", "session-two")
             return _empty_plan(request)
@@ -60,6 +66,7 @@ def test_recovery_plan_cli_builds_registered_app_once(monkeypatch, tmp_path, cap
 
     assert result == 0
     assert build_calls == ["project:build_app"]
+    assert len(closed) == 1
     assert json.loads(capsys.readouterr().out)["record_type"] == "cayu.recovery-plan"
 
 
@@ -75,7 +82,13 @@ def test_recovery_execute_cli_loads_exact_plan_and_decisions(
     decisions_path.write_text("[]", encoding="utf-8")
     build_calls: list[str] = []
 
+    closed: list[float] = []
+
     class App:
+        async def aclose(self, *, timeout_s: float):
+            closed.append(timeout_s)
+            return SimpleNamespace(settled=True)
+
         async def execute_recovery(self, request):
             assert request.plan == plan
             assert request.execution_id == "operator-run-one"
@@ -117,6 +130,7 @@ def test_recovery_execute_cli_loads_exact_plan_and_decisions(
 
     assert result == 0
     assert build_calls == ["project:build_app"]
+    assert len(closed) == 1
     assert json.loads(capsys.readouterr().out) == {
         "record_type": "cayu.recovery-receipt",
         "schema_version": 1,
@@ -155,7 +169,8 @@ def test_recovery_cli_restores_a_startup_blocked_registration(monkeypatch, tmp_p
         lambda *args, **kwargs: SimpleNamespace(root=tmp_path, target="app:build_app"),
     )
     monkeypatch.setattr(recovery_cli, "project_context", lambda _root: nullcontext())
-    monkeypatch.setattr(recovery_cli, "build_project_app", lambda *args, **kwargs: restored)
+    # Like the real CLI, every command builds (and then closes) its own app.
+    monkeypatch.setattr(recovery_cli, "build_project_app", lambda *args, **kwargs: _app(store, "3"))
     plan_path = tmp_path / "recovery-plan.json"
     assert (
         main(

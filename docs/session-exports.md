@@ -238,8 +238,9 @@ Settlement clears pending responsibility but is not pruning: retained output and
 historical evidence are not reclaimed, and export/retained-byte capacity is not
 reset. Exact export and settlement replay remain subject to current readback
 permission. Stop issuing new export API calls before calling
-`drain_session_exports()` during shutdown. Drain seals this export owner; it is
-not a reusable flush, and later calls are rejected. If work remains in flight,
+`drain_session_exports()` during shutdown, or call `app.aclose()`, which includes
+it. Drain seals this export owner; it is not a reusable flush, and later calls are
+rejected. `timeout_s` bounds the wait. If work remains in flight,
 keep the host and store alive and retry draining rather than assuming it stopped.
 Cancellation of an awaiting caller does not prove a dispatched projector or
 store mutation stopped.

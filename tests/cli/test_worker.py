@@ -62,6 +62,46 @@ def _wait_for_worker_start(process: subprocess.Popen[str], marker: Path) -> None
     assert marker.is_file()
 
 
+def test_worker_closes_its_app_after_the_target_finishes(tmp_path: Path, monkeypatch) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        """[tool.cayu]
+factory = "closing_worker:build_app"
+
+[tool.cayu.workers]
+once = "closing_worker:run_once"
+""",
+        encoding="utf-8",
+    )
+    (project / "closing_worker.py").write_text(
+        """from pathlib import Path
+
+from cayu import CayuApp
+
+
+class ClosedMarker:
+    async def close(self):
+        Path("closed.txt").write_text("closed\\n", encoding="utf-8")
+
+
+def build_app():
+    return CayuApp(enable_logging=False, owned_resources=(ClosedMarker(),))
+
+
+async def run_once(app, stop):
+    assert app.lifecycle_state == "open"
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project)
+    sys.modules.pop("closing_worker", None)
+
+    assert main(["worker", "once"]) == 0
+
+    assert (project / "closed.txt").read_text(encoding="utf-8") == "closed\n"
+
+
 @pytest.mark.parametrize("value", ["nan", "inf", "-inf", "0"])
 def test_worker_requires_a_finite_positive_shutdown_grace(value: str) -> None:
     with pytest.raises(SystemExit) as excinfo:
@@ -480,8 +520,13 @@ wait = "signal_worker:wait_for_stop"
 from cayu import CayuApp
 
 
+class ClosedMarker:
+    async def close(self):
+        Path("closed.txt").write_text("closed\\n", encoding="utf-8")
+
+
 def build_app():
-    return CayuApp(enable_logging=False)
+    return CayuApp(enable_logging=False, owned_resources=(ClosedMarker(),))
 
 
 async def wait_for_stop(app, stop):
@@ -502,6 +547,8 @@ async def wait_for_stop(app, stop):
 
         assert process.returncode == expected_exit, stdout + stderr
         assert (project / "stopped.txt").read_text(encoding="utf-8") == "stopped\n"
+        # The app was closed with the rest of the grace after the worker stopped.
+        assert (project / "closed.txt").read_text(encoding="utf-8") == "closed\n"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal exit contract")

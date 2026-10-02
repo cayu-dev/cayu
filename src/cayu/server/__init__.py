@@ -296,9 +296,9 @@ def create_server(
             if browser_control_server is not None and not await browser_control_server.drain():
                 raise RuntimeError("Browser control shutdown remains unsettled.")
         finally:
-            # A retained browser owner must not prevent the existing recovery
-            # and allocation cleanup owners from making shutdown progress.
-            await _drain_server_owned_work(app, lifecycle=lifecycle)
+            # A retained browser owner must not prevent the application's own
+            # shutdown from making progress.
+            await _shutdown_cayu_app(app, timeout_s=_server_shutdown_timeout_seconds(lifecycle))
 
     side_effect_health = EventSideEffectRecoveryLoop(
         interval_seconds=_PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_INTERVAL_SECONDS,
@@ -343,33 +343,36 @@ def create_server(
 
     @asynccontextmanager
     async def cayu_lifespan(server):
+        _require_open_app(app)
         side_effect_recovery_task: asyncio.Task[None] | None = None
         incomplete_session_recovery_task: asyncio.Task[None] | None = None
-        async with app.model_policy_lifespan():
+        try:
+            # aclose() owns stopping it, within the shutdown deadline.
+            await app.start_model_policy()
+            if browser_recordings is not None:
+                browser_recordings.start()
+            follow_up = await recover_startup_state()
+            incomplete_session_recovery_task = _start_incomplete_session_startup_recovery(
+                app,
+                follow_up,
+            )
+            side_effect_recovery_task = _start_persisted_event_side_effect_recovery(
+                app, side_effect_health
+            )
+            yield
+        finally:
             try:
-                if browser_recordings is not None:
-                    browser_recordings.start()
-                follow_up = await recover_startup_state()
-                incomplete_session_recovery_task = _start_incomplete_session_startup_recovery(
-                    app,
-                    follow_up,
-                )
-                side_effect_recovery_task = _start_persisted_event_side_effect_recovery(
-                    app, side_effect_health
-                )
-                yield
-            finally:
-                app.seal_knowledge_publications()
                 try:
-                    try:
-                        await _stop_incomplete_session_startup_recovery(
-                            incomplete_session_recovery_task
-                        )
-                        await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
-                    finally:
-                        await drain_server_work()
+                    # Stop the server's own loops before the app seals, so
+                    # neither starts new work against a closing application.
+                    await _stop_incomplete_session_startup_recovery(
+                        incomplete_session_recovery_task
+                    )
+                    await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
                 finally:
-                    await _close_project_control_plane_context(resolved_project_context)
+                    await drain_server_work()
+            finally:
+                await _close_project_control_plane_context(resolved_project_context)
 
     @asynccontextmanager
     async def policy_lifespan(server):
@@ -574,11 +577,11 @@ def mount_cayu(
     dependency-free browser client is served at ``{path}/client.js`` with types
     at ``{path}/client.d.ts``, even when ``dashboard=False``. Its composed
     lifespan recovers persisted event side effects, then cascade parents
-    inactive for at least ``interruption_recovery_inactive_after_seconds``, and
-    drains accepted background interruption cascades for up to
-    ``interruption_shutdown_grace_seconds`` before the host shuts down. Registered
-    knowledge-publication owners are sealed first and drained independently for
-    ``knowledge_publication_shutdown_grace_seconds``.
+    inactive for at least ``interruption_recovery_inactive_after_seconds``. On
+    shutdown it closes the app with ``app.aclose()`` under one deadline of
+    ``interruption_shutdown_grace_seconds`` plus
+    ``knowledge_publication_shutdown_grace_seconds``, and logs every step that
+    did not settle. A shut-down app cannot start another lifespan.
 
     ``access`` explicitly selects authenticated or deliberately open access to
     the complete mounted surface. ``AuthenticatedAccess`` wraps the existing
@@ -952,108 +955,67 @@ def _validate_positive_seconds(value: float, field_name: str) -> float:
     return float(value)
 
 
-async def _drain_background_interruptions(app: CayuApp, *, timeout_s: float) -> None:
+_SHUTDOWN_STEP_LOG_SUBJECTS = {
+    "open_operations": "Runs and other admitted operations",
+    "model_policy": "Model policy workers",
+    "background_interruptions": "Background interruption cascades",
+    "recovery_cleanups": "Supervised recovery cleanups",
+    "provider_operation_cancellations": "Provider-operation cancellations",
+    "environment_cleanups": "Retained environment cleanups",
+    "knowledge_publications": "Retained knowledge publications",
+    "collaboration_requests": "Collaboration requests",
+    "session_exports": "Session exports",
+    "verified_completions": "Completion verification and result resolution",
+    "runtime_timing": "Runtime timing delivery",
+    "owned_resources": "Application-owned resources",
+}
+
+
+def _require_open_app(app: CayuApp) -> None:
+    if app.lifecycle_state != "open":
+        raise RuntimeError(
+            "This CayuApp was already shut down; build a new app for each server lifespan."
+        )
+
+
+def _server_shutdown_timeout_seconds(lifecycle: ServerLifecycleConfig) -> float:
+    return (
+        lifecycle.interruption_shutdown_grace_seconds
+        + lifecycle.knowledge_publication_shutdown_grace_seconds
+    )
+
+
+async def _shutdown_cayu_app(app: CayuApp, *, timeout_s: float) -> None:
+    """Close the application under one deadline and log every unsettled step."""
+
     try:
-        drained = await app.drain_background_interruptions(timeout_s=timeout_s)
-    except Exception:
-        logger.exception("Failed to drain background interruption cascades during shutdown.")
+        outcome = await app.aclose(timeout_s=timeout_s)
+    except Exception as error:
+        # Content-free: an exception message can carry secrets.
+        logger.error("Failed to shut down the Cayu application (%s).", type(error).__qualname__)
         return
-    if not drained:
-        logger.warning(
-            "Background interruption cascades exceeded the %.3fs shutdown grace period.",
-            timeout_s,
-        )
-
-
-async def _drain_environment_cleanups(app: CayuApp, *, timeout_s: float) -> None:
-    try:
-        drained = await app.drain_environment_cleanups(timeout_s=timeout_s)
-    except Exception:
-        logger.exception("Failed to drain retained environment cleanups during shutdown.")
-        return
-    if not drained:
-        logger.warning(
-            "Retained environment cleanups exceeded the %.3fs shutdown grace period.",
-            timeout_s,
-        )
-
-
-async def _drain_recovery_cleanups(app: CayuApp, *, timeout_s: float) -> None:
-    try:
-        drained = await app.drain_recovery_cleanups(timeout_s=timeout_s)
-    except Exception:
-        logger.exception("Failed to drain supervised recovery cleanups during shutdown.")
-        return
-    if not drained:
-        logger.warning(
-            "Supervised recovery cleanups exceeded the %.3fs shutdown grace period.",
-            timeout_s,
-        )
-
-
-async def _drain_provider_operation_cancellations(
-    app: CayuApp,
-    *,
-    timeout_s: float,
-) -> None:
-    try:
-        drained = await app.drain_provider_operation_cancellations(timeout_s=timeout_s)
-    except Exception:
-        logger.exception("Failed to drain provider-operation cancellations during shutdown.")
-        return
-    if not drained:
-        status = app.provider_operation_cancellation_status()
-        logger.warning(
-            "%d provider-operation cancellation owner(s) remained unresolved after the "
-            "%.3fs shutdown grace period.",
-            status.active_owners,
-            timeout_s,
-        )
-
-
-async def _drain_knowledge_publications(app: CayuApp, *, timeout_s: float) -> None:
-    try:
-        drained = await app.drain_knowledge_publications(timeout_s=timeout_s)
-    except Exception:
-        logger.exception("Failed to drain retained knowledge publications during shutdown.")
-        return
-    if not drained:
-        logger.warning(
-            "Retained knowledge publications exceeded the %.3fs shutdown grace period.",
-            timeout_s,
-        )
-
-
-async def _drain_server_owned_work(
-    app: CayuApp,
-    *,
-    lifecycle: ServerLifecycleConfig,
-) -> None:
-    try:
-        await _drain_background_interruptions(
-            app,
-            timeout_s=lifecycle.interruption_shutdown_grace_seconds,
-        )
-        await _drain_recovery_cleanups(
-            app,
-            timeout_s=lifecycle.interruption_shutdown_grace_seconds,
-        )
-        await _drain_provider_operation_cancellations(
-            app,
-            timeout_s=lifecycle.interruption_shutdown_grace_seconds,
-        )
-        await _drain_environment_cleanups(
-            app,
-            timeout_s=lifecycle.interruption_shutdown_grace_seconds,
-        )
-    finally:
-        try:
-            await _drain_knowledge_publications(
-                app,
-                timeout_s=lifecycle.knowledge_publication_shutdown_grace_seconds,
+    for step in outcome.steps:
+        subject = _SHUTDOWN_STEP_LOG_SUBJECTS.get(step.subsystem, step.subsystem)
+        if step.status == "failed":
+            logger.error("%s failed during shutdown (%s).", subject, step.failure_type)
+        elif (
+            step.subsystem == "provider_operation_cancellations"
+            and step.status == "incomplete"
+            and step.reason != "unowned_cancellations"
+        ):
+            logger.warning(
+                "%d provider-operation cancellation owner(s) remained unresolved after the "
+                "%.3fs shutdown grace period.",
+                app.provider_operation_cancellation_status().active_owners,
+                outcome.timeout_seconds,
             )
-        finally:
-            await app.close_runtime_timing()
+        elif step.status == "incomplete":
+            logger.warning(
+                "%s did not settle within the %.3fs shutdown grace period (%s).",
+                subject,
+                outcome.timeout_seconds,
+                step.reason,
+            )
 
 
 async def _recover_persisted_event_side_effects_until_idle(
@@ -1377,9 +1339,12 @@ def _compose_interruption_drain_lifespan(
 
     @asynccontextmanager
     async def lifespan(server_app):
-        async with existing_lifespan(server_app) as state, app.model_policy_lifespan():
+        _require_open_app(app)
+        async with existing_lifespan(server_app) as state:
             side_effect_recovery_task: asyncio.Task[None] | None = None
             try:
+                # aclose() owns stopping it, within the shutdown deadline.
+                await app.start_model_policy()
                 await _recover_persisted_event_side_effects_during_startup(
                     app,
                     timeout_s=side_effect_startup_timeout_s,
@@ -1393,27 +1358,13 @@ def _compose_interruption_drain_lifespan(
                 )
                 yield state
             finally:
-                app.seal_knowledge_publications()
                 try:
                     try:
                         await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
                     finally:
-                        try:
-                            await _drain_background_interruptions(app, timeout_s=timeout_s)
-                            await _drain_recovery_cleanups(app, timeout_s=timeout_s)
-                            await _drain_provider_operation_cancellations(
-                                app,
-                                timeout_s=timeout_s,
-                            )
-                            await _drain_environment_cleanups(app, timeout_s=timeout_s)
-                        finally:
-                            try:
-                                await _drain_knowledge_publications(
-                                    app,
-                                    timeout_s=knowledge_publication_timeout_s,
-                                )
-                            finally:
-                                await app.close_runtime_timing()
+                        await _shutdown_cayu_app(
+                            app, timeout_s=timeout_s + knowledge_publication_timeout_s
+                        )
                 finally:
                     await _close_project_control_plane_context(project_context)
 

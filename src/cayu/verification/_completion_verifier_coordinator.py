@@ -768,6 +768,29 @@ class CompletionVerifierCoordinator:
         self._verifiers: dict[tuple[str, str, str, str], _RegisteredVerifier] = {}
         self._adapter_runner = LeasedAdapterRunner[_DrainingAdapter]()
 
+    @property
+    def pending(self) -> bool:
+        """Whether retained adapters, heartbeats or settlements are still running."""
+
+        return self._adapter_runner.pending
+
+    async def drain(self, *, timeout_s: float) -> bool:
+        """Wait up to ``timeout_s`` for retained work, without cancelling it."""
+
+        return await self._adapter_runner.wait_idle(timeout_s)
+
+    def report_retained_failures(self) -> list[BaseException]:
+        """Return, once each, retained executions whose settlement failed."""
+
+        return [
+            failure
+            if failure is not None
+            else CompletionVerifierExecutionError(
+                "A retained completion-verifier execution ended without a settlement."
+            )
+            for failure in self._adapter_runner.report_settlement_failures()
+        ]
+
     def _copy_profile_policy_identity(
         self,
         policy: CompletionVerifierProfilePolicy,
@@ -2829,6 +2852,8 @@ class CompletionVerifierCoordinator:
         )
         self._adapter_runner.retain_drain(operation_key, draining)
         if retained_drain is not None:
+            # Its owner observes and reports the settlement failure itself.
+            draining.failure_reported = True
             retained_drain.set_result(draining)
         if task.done():
             self._ensure_draining_adapter_settlement(operation_key, draining)

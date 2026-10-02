@@ -53,6 +53,7 @@ class WaitCoordinator:
             store=store,
             initialized=initialized,
             redactor=self._redactor,
+            owners=self._requests.owners,
         )
 
     async def register(
@@ -584,10 +585,13 @@ def _elected_latch(snapshot: WaitSnapshot, redactor):
 class CollaborationWaitLatchReceiver:
     """Session continuation receiver backed by durable wait election state."""
 
-    def __init__(self, *, store, initialized, redactor) -> None:
+    def __init__(self, *, store, initialized, redactor, owners=None) -> None:
         self._store = store
         self._initialized = initialized
         self._redactor = redactor
+        # The owning application's mutation view, so its shutdown waits for these;
+        # used on its own, the receiver runs on the store's owners.
+        self._owners = store._owners if owners is None else owners
 
     async def authenticate_continuation_retirement(self, wait, record):
         """Authenticate settlement from the exact durable wait, never caller receipts."""
@@ -655,7 +659,7 @@ class CollaborationWaitLatchReceiver:
             raise PermissionError("Collaboration latch belongs to another owner namespace.")
         from functools import partial
 
-        return await self._store._owners.run(
+        return await self._owners.run(
             partial(self._authenticate_latch, latch),
             key=("wait-latch", self._initialized.binding.application_scope, latch.latch_key),
             expectation=contract_bytes(latch, redactor=self._redactor),

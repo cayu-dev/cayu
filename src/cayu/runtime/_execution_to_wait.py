@@ -179,6 +179,7 @@ async def _build_execution_wait(
             owner=initialized.owner, mutations=(), readbacks=(LATCH_FAMILY,)
         ),
         redactor=app._secret_redactor,
+        track=app._request_coordinator.owners.track,
     )
     intent = ContinuationWait(
         registration_key="execution-wait:" + continuation_digest(wait.operation),

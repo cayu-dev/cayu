@@ -8655,56 +8655,38 @@ def test_mount_cayu_can_disable_dashboard_for_api_only_services() -> None:
     assert client.get("/cayu", follow_redirects=False).json()["app"] == "host"
 
 
-def test_mount_cayu_composes_background_interruption_drain() -> None:
+def test_mount_cayu_closes_the_app_under_one_shutdown_deadline() -> None:
     server = FastAPI()
     cayu_app = CayuApp()
-    drain_timeouts = []
-    recovery_drain_timeouts = []
-    provider_cancellation_drain_timeouts = []
-    environment_drain_timeouts = []
-    knowledge_drain_timeouts = []
-    knowledge_seals = 0
+    calls: list[tuple[str, float | None]] = []
     resume_calls = []
 
     async def resume_pending_interruption_cascades(*, interrupting_inactive_for_seconds):
         resume_calls.append(interrupting_inactive_for_seconds)
         return 0
 
-    async def drain_background_interruptions(*, timeout_s):
-        drain_timeouts.append(timeout_s)
-        return True
+    def drain(name, *, takes_s=0.0):
+        async def record(*, timeout_s):
+            calls.append((name, timeout_s))
+            await asyncio.sleep(takes_s)
+            return True
 
-    async def drain_environment_cleanups(*, timeout_s):
-        environment_drain_timeouts.append(timeout_s)
-        return True
-
-    async def drain_recovery_cleanups(*, timeout_s):
-        recovery_drain_timeouts.append(timeout_s)
-        return True
-
-    async def drain_provider_operation_cancellations(*, timeout_s):
-        provider_cancellation_drain_timeouts.append(timeout_s)
-        return True
-
-    def seal_knowledge_publications():
-        nonlocal knowledge_seals
-        knowledge_seals += 1
-
-    async def drain_knowledge_publications(*, timeout_s):
-        knowledge_drain_timeouts.append(timeout_s)
-        return True
-
-    timing_closes = []
+        return record
 
     async def close_runtime_timing():
-        timing_closes.append(len(knowledge_drain_timeouts))
+        calls.append(("runtime_timing", None))
 
-    cayu_app.drain_background_interruptions = drain_background_interruptions
-    cayu_app.drain_recovery_cleanups = drain_recovery_cleanups
-    cayu_app.drain_provider_operation_cancellations = drain_provider_operation_cancellations
-    cayu_app.drain_environment_cleanups = drain_environment_cleanups
-    cayu_app.seal_knowledge_publications = seal_knowledge_publications
-    cayu_app.drain_knowledge_publications = drain_knowledge_publications
+    # The first drain uses part of the deadline; later ones only get the rest.
+    cayu_app.drain_background_interruptions = drain("drain_background_interruptions", takes_s=0.3)
+    for name in (
+        "drain_recovery_cleanups",
+        "drain_provider_operation_cancellations",
+        "drain_environment_cleanups",
+        "drain_knowledge_publications",
+        "drain_collaboration_requests",
+        "drain_session_exports",
+    ):
+        setattr(cayu_app, name, drain(name))
     cayu_app.close_runtime_timing = close_runtime_timing
     cayu_app.resume_pending_interruption_cascades = resume_pending_interruption_cascades
     mount_cayu(
@@ -8720,17 +8702,172 @@ def test_mount_cayu_composes_background_interruption_drain() -> None:
     with TestClient(server):
         pass
 
-    assert drain_timeouts == [2.5]
-    assert recovery_drain_timeouts == [2.5]
-    assert provider_cancellation_drain_timeouts == [2.5]
-    assert environment_drain_timeouts == [2.5]
-    assert knowledge_seals == 1
-    assert knowledge_drain_timeouts == [1.5]
+    names = [name for name, _ in calls]
+    assert names[:4] == [
+        "drain_background_interruptions",
+        "drain_recovery_cleanups",
+        "drain_provider_operation_cancellations",
+        "drain_environment_cleanups",
+    ]
+    assert set(names[4:7]) == {
+        "drain_knowledge_publications",
+        "drain_collaboration_requests",
+        "drain_session_exports",
+    }
     # Timing delivery stops after the other shutdown owners have drained.
-    assert timing_closes == [1]
+    assert names[7:] == ["runtime_timing"]
+    # Every drain shares the one 4.0s deadline instead of a fresh grace each.
+    assert all(0 < timeout <= 4.0 for _, timeout in calls if timeout is not None)
+    assert all(timeout <= 3.7 for _, timeout in calls[1:] if timeout is not None)
+    assert cayu_app.lifecycle_state == "closed"
+    outcome = cayu_app.shutdown_outcome
+    assert outcome is not None and outcome.settled and outcome.timeout_seconds == 4.0
     assert len(resume_calls) == 1
     assert type(resume_calls[0]) is int
     assert resume_calls[0] >= 0
+
+
+@pytest.mark.parametrize("host", ["mount_cayu", "create_server"])
+def test_a_stalled_model_policy_stop_is_bounded_by_the_shutdown_deadline(host, caplog) -> None:
+    cayu_app = CayuApp()
+    stops: list[str] = []
+
+    async def stalled_stop_model_policy():
+        stops.append("stop")
+        await asyncio.sleep(15)
+
+    cayu_app.stop_model_policy = stalled_stop_model_policy  # ty: ignore[invalid-assignment]
+    lifecycle = ServerLifecycleConfig(
+        interruption_shutdown_grace_seconds=0.2,
+        knowledge_publication_shutdown_grace_seconds=0.2,
+    )
+    if host == "mount_cayu":
+        server = FastAPI()
+        mount_cayu(
+            server,
+            cayu_app,
+            path="/cayu",
+            dashboard=False,
+            access=OpenAccess(),
+            interruption_shutdown_grace_seconds=0.2,
+            knowledge_publication_shutdown_grace_seconds=0.2,
+        )
+    else:
+        server = create_server(
+            cayu_app,
+            config=ServerConfig.local_development(
+                dashboard=DashboardConfig(enabled=False), lifecycle=lifecycle
+            ),
+        )
+
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING, logger="cayu.server"), TestClient(server):
+        pass
+    # The stalled stop no longer holds the host past its deadline.
+    assert time.monotonic() - started < 10
+    assert stops == ["stop"]
+    outcome = cayu_app.shutdown_outcome
+    assert outcome is not None and outcome.status == "incomplete"
+    step = outcome.step("model_policy")
+    assert step is not None and step.reason == "overran_budget"
+    assert any("Model policy workers did not settle" in message for message in caplog.messages)
+
+
+def test_mounted_shutdown_stops_model_policy_when_work_outlasts_the_deadline() -> None:
+    cayu_app = CayuApp()
+    stops: list[str] = []
+
+    async def stop_model_policy():
+        stops.append("stop")
+
+    cayu_app.stop_model_policy = stop_model_policy  # ty: ignore[invalid-assignment]
+
+    @asynccontextmanager
+    async def host_lifespan(_server):
+        # The host keeps one counted operation running past Cayu's shutdown.
+        release = asyncio.Event()
+        holder = asyncio.create_task(cayu_app._run_worker_step(release.wait))
+        try:
+            yield
+        finally:
+            release.set()
+            await holder
+
+    server = FastAPI(lifespan=host_lifespan)
+    mount_cayu(
+        server,
+        cayu_app,
+        path="/cayu",
+        dashboard=False,
+        access=OpenAccess(),
+        interruption_shutdown_grace_seconds=0.1,
+        knowledge_publication_shutdown_grace_seconds=0.1,
+    )
+
+    with TestClient(server):
+        pass
+
+    outcome = cayu_app.shutdown_outcome
+    assert outcome is not None and outcome.status == "incomplete"
+    assert outcome.open_operations == 1
+    step = outcome.step("model_policy")
+    assert step is not None and step.status == "settled"
+    assert stops == ["stop"]
+
+
+@pytest.mark.parametrize("host", ["mount_cayu", "create_server"])
+def test_server_shutdown_stops_a_real_model_policy(host) -> None:
+    from tests.core.test_model_policy_runtime import Channel, make_app
+
+    from cayu.model_policy import InMemoryModelPolicyStore
+
+    cayu_app, controller, _provider = make_app(InMemoryModelPolicyStore(), Channel())
+    if host == "mount_cayu":
+        server = FastAPI()
+        mount_cayu(server, cayu_app, path="/cayu", dashboard=False, access=OpenAccess())
+    else:
+        server = create_server(
+            cayu_app,
+            config=ServerConfig.local_development(dashboard=DashboardConfig(enabled=False)),
+        )
+
+    with TestClient(server):
+        assert controller.status == "ready"
+
+    # The host started the workers and aclose() stopped them.
+    assert controller.status == "stopped"
+    assert cayu_app.model_policy is not None and not cayu_app.model_policy._tasks
+    outcome = cayu_app.shutdown_outcome
+    assert outcome is not None and outcome.settled
+    step = outcome.step("model_policy")
+    assert step is not None and step.status == "settled"
+
+
+def test_every_shutdown_step_has_a_server_log_subject() -> None:
+    from cayu.server import _SHUTDOWN_STEP_LOG_SUBJECTS
+
+    outcome = asyncio.run(CayuApp(owned_resources=(_ClosingResource(),)).aclose())
+    assert {step.subsystem for step in outcome.steps} == set(_SHUTDOWN_STEP_LOG_SUBJECTS)
+
+
+class _ClosingResource:
+    async def close(self) -> None:
+        return None
+
+
+def test_a_closed_app_cannot_start_another_server_lifespan() -> None:
+    server = FastAPI()
+    cayu_app = CayuApp()
+    mount_cayu(server, cayu_app, path="/cayu", dashboard=False, access=OpenAccess())
+
+    with TestClient(server):
+        pass
+
+    with (
+        pytest.raises(RuntimeError, match="already shut down"),
+        TestClient(server),
+    ):
+        pass
 
 
 def test_mount_cayu_reports_unresolved_provider_cancellation_owners(caplog) -> None:
@@ -8738,11 +8875,13 @@ def test_mount_cayu_reports_unresolved_provider_cancellation_owners(caplog) -> N
     cayu_app = CayuApp()
 
     async def unresolved_provider_cancellations(*, timeout_s):
-        assert timeout_s == 10.0
+        assert 0 < timeout_s <= 20.0
         return False
 
     cayu_app.drain_provider_operation_cancellations = unresolved_provider_cancellations
-    cayu_app.provider_operation_cancellation_status = lambda: SimpleNamespace(active_owners=3)
+    cayu_app.provider_operation_cancellation_status = lambda: SimpleNamespace(
+        active_owners=3, admission_rejections=0
+    )
     mount_cayu(server, cayu_app, path="/cayu", dashboard=False, access=OpenAccess())
 
     with caplog.at_level(logging.WARNING, logger="cayu.server"), TestClient(server):
@@ -8750,7 +8889,7 @@ def test_mount_cayu_reports_unresolved_provider_cancellation_owners(caplog) -> N
 
     assert (
         "3 provider-operation cancellation owner(s) remained unresolved after the "
-        "10.000s shutdown grace period."
+        "20.000s shutdown grace period."
     ) in caplog.messages
 
 
@@ -8766,7 +8905,7 @@ def test_mount_cayu_drains_cascades_when_startup_recovery_fails() -> None:
         raise RuntimeError("mounted recovery failed")
 
     async def drain_background_interruptions(*, timeout_s):
-        assert timeout_s == 10.0
+        assert 0 < timeout_s <= 20.0
         calls.append("drain")
         return True
 
@@ -13569,12 +13708,14 @@ def test_create_server_startup_recovery_composes_user_lifespan() -> None:
 
     async def drain_background_interruptions(*, timeout_s):
         calls.append("drain")
-        assert timeout_s == 10.0
+        # One 20.0s server deadline is shared by every shutdown step.
+        assert 0 < timeout_s <= 20.0
         return True
 
     async def drain_provider_operation_cancellations(*, timeout_s):
         calls.append("provider_cancellation_drain")
-        assert timeout_s == 10.0
+        # One 20.0s server deadline is shared by every shutdown step.
+        assert 0 < timeout_s <= 20.0
         return True
 
     async def resume_pending_interruption_cascades(*, interrupting_inactive_for_seconds):
@@ -14022,7 +14163,8 @@ def test_create_server_drains_cascades_when_startup_recovery_fails() -> None:
         raise RuntimeError("recovery failed after scheduling work")
 
     async def drain_background_interruptions(*, timeout_s):
-        assert timeout_s == 10.0
+        # One 20.0s server deadline is shared by every shutdown step.
+        assert 0 < timeout_s <= 20.0
         calls.append("drain")
         return True
 

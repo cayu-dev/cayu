@@ -433,6 +433,30 @@ from cayu.runtime._session_continuation_owner import (
 )
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot as UsageAccountingSnapshot
 from cayu.runtime._usage_accounting import UsageIdentitySummary as UsageIdentitySummary
+from cayu.runtime.application_lifecycle import (
+    ApplicationAdmission as ApplicationAdmission,
+)
+from cayu.runtime.application_lifecycle import (
+    ApplicationAdmissionsSealed as ApplicationAdmissionsSealed,
+)
+from cayu.runtime.application_lifecycle import (
+    ApplicationShutdown as ApplicationShutdown,
+)
+from cayu.runtime.application_lifecycle import (
+    ApplicationShutdownOutcome as ApplicationShutdownOutcome,
+)
+from cayu.runtime.application_lifecycle import (
+    ApplicationShutdownStep as ApplicationShutdownStep,
+)
+from cayu.runtime.application_lifecycle import (
+    ShutdownBudget as ShutdownBudget,
+)
+from cayu.runtime.application_lifecycle import (
+    ShutdownStepSpec as ShutdownStepSpec,
+)
+from cayu.runtime.application_lifecycle import (
+    SupportsAsyncClose as SupportsAsyncClose,
+)
 from cayu.runtime.authority import SessionRunFenced as SessionRunFenced
 from cayu.runtime.checks import AVAILABLE_CHECK_TAGS as AVAILABLE_CHECK_TAGS
 from cayu.runtime.checks import BUILTIN_DIAGNOSTIC_CODES as BUILTIN_DIAGNOSTIC_CODES

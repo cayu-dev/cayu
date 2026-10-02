@@ -124,7 +124,7 @@ new application graph would install the same prompt anatomy; otherwise fork.
 
 ## Application lifecycle boundaries
 
-Keep these four responsibilities conceptually separate so a host makes its
+Keep these five responsibilities conceptually separate so a host makes its
 operational effects explicit:
 
 | Boundary | Meaning | What it does not imply |
@@ -133,8 +133,9 @@ operational effects explicit:
 | Resource acquisition | Open or attach owned database, network, sandbox, or host resources. | Schemas are migrated or active services are running. |
 | Administrative initialization | Explicitly perform migrations, recovery selection, seeding, or maintenance. | A long-running service owns the process. |
 | Active-service startup | Explicitly start a server lifespan, worker loop, watcher, scheduler, or other active integration. | Other processes share this app object or its lifecycle. |
+| Shutdown | `await app.aclose()` refuses new execution, waits for operations in flight, and drains this app's subsystems under one deadline. | Caller-supplied stores or providers are closed, or other processes have stopped. |
 
-Cayu does not yet impose a general `CayuApp` lifecycle protocol, so a configured
+Construction and resource acquisition have no general protocol, so a configured
 component can perform more than one responsibility in its constructor. In the
 generated local project, for example, SQLite store constructors open their files
 and ensure their schemas, while PostgreSQL stores connect lazily and only validate
@@ -142,6 +143,52 @@ the schema that `cayu storage migrate` applied; `cayu console`, `cayu inspect`, 
 `cayu check` call the factory and therefore exercise that configured behavior. Keep module imports
 inert, keep constructor effects bounded and documented, and leave active-service
 startup and cleanup under the explicit host or process entrypoint that owns them.
+
+Shutdown is one call. The host that built the app closes it, and hands over any
+resources it wants closed with it:
+
+```python
+from contextlib import aclosing
+from pathlib import Path
+
+from cayu import (
+    AgentSpec,
+    CayuApp,
+    Message,
+    ModelProvider,
+    RunRequest,
+    configured_database_url,
+    open_application_stores,
+)
+
+
+async def main(provider: ModelProvider) -> None:
+    stores = open_application_stores(
+        configured_database_url(), sqlite_path=Path("state/app.sqlite3").resolve()
+    )
+    # The app closes the stores, but only after every subsystem settled.
+    app = CayuApp(
+        session_store=stores.session_store,
+        task_store=stores.task_store,
+        owned_resources=(stores,),
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="your-model"))
+    async with app:
+        request = RunRequest(agent_name="assistant", messages=[Message.text("user", "Hi")])
+        async with aclosing(app.run(request)) as events:
+            async for event in events:
+                print(event.type)
+    outcome = app.shutdown_outcome
+    if outcome is not None and not outcome.settled:
+        print(f"shutdown {outcome.status}; stores kept open, retry app.aclose()")
+```
+
+`async with app:` calls `aclose()` on exit. `aclosing(...)` closes a stream you
+stop reading early, so shutdown does not wait for it. Without `owned_resources`,
+close your own stores only once `app.shutdown_outcome.settled` is true. Do not
+nest the app inside `async with stores:`, which closes them unconditionally. The
+order, deadline, and outcome are specified in the runtime contracts.
 
 ## Process roles
 

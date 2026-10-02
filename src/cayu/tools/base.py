@@ -38,6 +38,7 @@ from cayu._validation import (
     thaw_json_value,
 )
 from cayu.deadlines import ExecutionDeadline, current_execution_deadline
+from cayu.knowledge._publication import KnowledgePublicationScope
 from cayu.runtime.execution_identity import (
     ExecutionProfileBehaviorIdentity,
     copy_execution_profile_behavior_identity,
@@ -1123,6 +1124,9 @@ class ToolContext(BaseModel):
     _runtime_artifact_store_authority: Any = PrivateAttr(default=None)
     _runtime_causal_budget_limits: tuple[Any, ...] = PrivateAttr(default=())
     _runtime_inference: InferenceInvoker | None = PrivateAttr(default=None)
+    _runtime_knowledge_publication_scope: KnowledgePublicationScope | None = PrivateAttr(
+        default=None
+    )
 
     @property
     def inference(self) -> InferenceInvoker | None:
@@ -1134,6 +1138,11 @@ class ToolContext(BaseModel):
         if self._runtime_inference is not None:
             raise RuntimeError("Runtime inference handle is already bound.")
         self._runtime_inference = inference
+
+    def _bind_runtime_knowledge_publication_scope(self, scope: KnowledgePublicationScope) -> None:
+        if self._runtime_knowledge_publication_scope is not None:
+            raise RuntimeError("Runtime knowledge publication scope is already bound.")
+        self._runtime_knowledge_publication_scope = scope
 
     def _bind_runtime_resource_authorities(
         self,

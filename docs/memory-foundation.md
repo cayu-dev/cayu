@@ -1425,10 +1425,11 @@ approved = await reviewer.approve(
 lifecycle. Caller timeout or cancellation leaves the exact dispatched publication owned so an
 in-process retry joins it rather than racing a second write. Directly constructed components
 should be used as async context managers or closed with `await component.aclose(timeout_s=...)`.
-A `CayuApp` owns this lifecycle for registered tools; server shutdown seals publication before
-draining it for `knowledge_publication_shutdown_grace_seconds`. The same deadline covers
-receipt-reconciliation reads already retained by a publication, so a mounted Cayu application
-does not leave cooperative store tasks behind in a host event loop that remains alive.
+A registered tool can be shared by several applications, so `CayuApp` never seals or closes it.
+`app.aclose()` refuses that application's new publications and waits for the ones it started,
+including receipt-reconciliation reads they retain; whoever created the tool closes it with
+`aclose()` once it is retired, which also bounds work still running after the applications have
+closed.
 
 Grace expiry requests cancellation from the local store awaiter but does not claim that a remote
 transaction failed or was rolled back. A later process uses the same operation ID and durable

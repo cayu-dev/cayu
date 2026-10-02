@@ -19,6 +19,7 @@ from cayu.cli._targets import TargetResolutionError, load_target
 from cayu.cli.project import (
     _discover_configured_project,
     build_project_app,
+    close_project_app,
     project_context,
 )
 from cayu.runtime._process_workers import (
@@ -29,6 +30,9 @@ from cayu.runtime._process_workers import (
     supervisor_watchdog,
     watch_supervisor,
 )
+
+# A worker that used its whole grace still lets the app seal and report.
+_MIN_APP_SHUTDOWN_SECONDS = 0.1
 
 
 class WorkerError(ValueError):
@@ -200,15 +204,17 @@ async def _invoke_worker(
     signal_received = asyncio.Event()
     loop = asyncio.get_running_loop()
     received_signal: int | None = None
+    stop_requested_at: float | None = None
     loop_handlers: list[signal.Signals] = []
     previous_handlers = {
         signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)
     }
 
     def request_stop(signum: int) -> None:
-        nonlocal received_signal
+        nonlocal received_signal, stop_requested_at
         if received_signal is None:
             received_signal = signum
+            stop_requested_at = loop.time()
         stop.set()
         signal_received.set()
 
@@ -271,6 +277,19 @@ async def _invoke_worker(
             loop.remove_signal_handler(signum)
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
+        # After a stop signal the app gets what is left of the same grace, so
+        # the whole shutdown stays within the supervisor's bound.
+        await close_project_app(
+            app,
+            timeout_s=(
+                shutdown_grace_seconds
+                if stop_requested_at is None
+                else max(
+                    stop_requested_at + shutdown_grace_seconds - loop.time(),
+                    _MIN_APP_SHUTDOWN_SECONDS,
+                )
+            ),
+        )
 
 
 def _positive_seconds(value: str) -> float:

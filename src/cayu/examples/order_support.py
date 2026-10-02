@@ -13,7 +13,7 @@ import hashlib
 import json
 import os
 import sqlite3
-from contextlib import contextmanager
+from contextlib import aclosing, contextmanager
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -386,7 +386,8 @@ async def run(args: argparse.Namespace) -> None:
         raise ValueError("Initialize fresh state first")
     provider = OpenAIProvider() if args.live else scripted(args.command, session, args.item)
     store = SQLiteSessionStore(state / "sessions.sqlite")
-    app = CayuApp(session_store=store, enable_logging=False)
+    # The app owns the store it was given: it closes it once shutdown settles.
+    app = CayuApp(session_store=store, enable_logging=False, owned_resources=(store,))
     app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(
@@ -405,7 +406,7 @@ async def run(args: argparse.Namespace) -> None:
         ],
         tool_policy=SupportPolicy(state),
     )
-    try:
+    async with app:
         if args.command == "review":
             result = await review(app, session, state)
             args.output.write_bytes(canonical(result))
@@ -443,10 +444,11 @@ async def run(args: argparse.Namespace) -> None:
                     ],
                 )
             )
-        async for event in stream:
-            print(json.dumps(event.model_dump(mode="json"), default=str))
-    finally:
-        await store.close()
+        # Closing the stream ends its run even if printing fails, so the app's
+        # shutdown does not wait for an abandoned run.
+        async with aclosing(stream) as events:
+            async for event in events:
+                print(json.dumps(event.model_dump(mode="json"), default=str))
 
 
 def main() -> None:

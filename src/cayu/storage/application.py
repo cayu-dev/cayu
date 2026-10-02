@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import threading
 from pathlib import Path
@@ -33,8 +34,9 @@ class ApplicationStores:
     """The stores selected by :func:`open_application_stores` and their resources.
 
     The object owns every store it built and, for PostgreSQL, the shared
-    connection pool. ``close()`` closes the stores and then the pool, at most
-    once. Cayu's server does not close application stores; long-lived processes
+    connection pool. ``close()`` closes the stores and then the pool, each at
+    most once; after a failed close, calling it again retries only what did not
+    close. Cayu's server does not close application stores; long-lived processes
     keep them for their lifetime, and tests or scripts close them explicitly.
     """
 
@@ -42,6 +44,8 @@ class ApplicationStores:
         "_backend",
         "_close_lock",
         "_closed",
+        "_closed_parts",
+        "_closing",
         "_knowledge_store",
         "_model_policy_store",
         "_pool",
@@ -76,6 +80,8 @@ class ApplicationStores:
         self._task_admission_listener = task_admission_listener
         self._close_lock = threading.Lock()
         self._closed = False
+        self._closing: asyncio.Future[None] | None = None
+        self._closed_parts: set[int] = set()
 
     def __repr__(self) -> str:
         return (
@@ -129,33 +135,46 @@ class ApplicationStores:
         return pooled + (1 if self._task_admission_listener else 0)
 
     async def close(self) -> None:
-        """Close the stores, then the shared pool; later calls do nothing."""
+        """Close the stores, then the shared pool.
+
+        Once everything closed, later calls do nothing. After a failure, a later
+        call retries only the parts that did not close.
+        """
 
         with self._close_lock:
             if self._closed:
                 return
-            self._closed = True
+            closing = self._closing
+            if closing is None or closing.done():
+                # Concurrent callers share one pass and see its outcome; a
+                # cancelled caller leaves it running for the next one to join.
+                closing = asyncio.ensure_future(self._close_pass())
+                closing.add_done_callback(_retrieve_close_outcome)
+                self._closing = closing
+        await asyncio.shield(closing)
+
+    async def _close_pass(self) -> None:
         errors: list[Exception] = []
         # The task store first: it owns the dedicated LISTEN connection.
-        for store in (
+        for part in (
             self._task_store,
             self._product_store,
             self._model_policy_store,
             self._knowledge_store,
             self._session_store,
+            self._pool,
         ):
-            close = getattr(store, "close", None)
-            if close is None:
+            close = getattr(part, "close", None)
+            if close is None or id(part) in self._closed_parts:
                 continue
             try:
                 await close()
             except Exception as exc:
                 errors.append(exc)
-        if self._pool is not None:
-            try:
-                await self._pool.close()
-            except Exception as exc:
-                errors.append(exc)
+            else:
+                self._closed_parts.add(id(part))
+        # Only a complete pass without failures closes the stores for good.
+        self._closed = not errors
         if len(errors) == 1:
             raise errors[0]
         if errors:
@@ -414,3 +433,8 @@ def _open_postgres_stores(
 
 
 __all__ = ["ApplicationStores", "open_application_stores"]
+
+
+def _retrieve_close_outcome(closing: asyncio.Future[None]) -> None:
+    if not closing.cancelled():
+        closing.exception()

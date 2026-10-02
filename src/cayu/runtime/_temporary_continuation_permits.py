@@ -14,6 +14,7 @@ from time import monotonic
 
 from cayu.collaboration._clarification_services import ClarificationServiceRecord
 from cayu.collaboration._contracts import ExactMatch, ExactUnavailable, OwnerRef
+from cayu.collaboration._ownership import _MutationOwners, _MutationScope
 from cayu.collaboration._permits import (
     PermitCommand,
     PermitSettlementReader,
@@ -46,8 +47,12 @@ class TemporaryServicePermitAuthority:
         redactor: SecretRedactor,
         admission_guard: Callable[[TemporaryServiceDispatch], AbstractAsyncContextManager[int]]
         | None = None,
+        owners: _MutationOwners | _MutationScope | None = None,
     ) -> None:
         self.store = store
+        # The owning application's mutation view, so its shutdown waits for these;
+        # used on its own, the authority runs on the store's owners.
+        self.owners = store._owners if owners is None else owners
         self.initialized = prepare_contract(
             CollaborationInitialization, initialized, redactor=redactor
         )
@@ -183,7 +188,7 @@ class TemporaryServicePermitAuthority:
                 raise CollaborationUnavailable("Service guard produced no registered decision.")
             return result
 
-        return await self.store._owners.run(
+        return await self.owners.run(
             mutation,
             key=("clarification-service", operation.application_scope, *operation_key(operation)),
             expectation=contract_bytes(preparation or dispatch, redactor=self.redactor),

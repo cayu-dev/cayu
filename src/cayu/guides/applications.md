@@ -317,6 +317,7 @@ For runtime timing around tool work, use
 `await app.inspect_recent_model_step_preparation_timing(session_id)`.
 `CayuApp(runtime_timing=RuntimeTimingConfig(...), timing_sinks=[...])` controls
 the bounded recent view and optional best-effort export. Outside the Cayu
-server, call `await app.close_runtime_timing()` at shutdown. These observations
+server, `await app.aclose()` (or `async with app:`) stops timing delivery at
+shutdown along with the app's other work. These observations
 are process-local and add no durable writes. Phase definitions, native store
 costs and slow-storage interpretation are in `cayu guide durable-service-tools`.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import mimetypes
 import os
 import traceback as traceback_module
@@ -19,7 +20,7 @@ from itertools import islice
 from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Self, TypeVar, cast
 from uuid import uuid4
 
 from cayu._validation import (
@@ -183,6 +184,7 @@ from cayu.collaboration.mandates import MandateAccessContext
 from cayu.collaboration.obligations import ParticipantObligationCursor, ParticipantObligationPage
 from cayu.collaboration.participants import (
     CollaborationInitialization,
+    CollaborationUnavailable,
     ParticipantAlias,
     ParticipantAliasChange,
     ParticipantConfigure,
@@ -291,7 +293,7 @@ from cayu.events import (
     event_with_durable_sequence,
     validate_public_custom_event_type,
 )
-from cayu.knowledge._publication import KnowledgePublicationLifecycle
+from cayu.knowledge._publication import KnowledgePublicationScope
 from cayu.knowledge.scopes import (
     KnowledgeAccessScope,
     copy_knowledge_access_scope,
@@ -487,6 +489,19 @@ from cayu.runtime._work_attempt_session_mutation import (
     capture_work_attempt_session_result,
     read_work_attempt_session_store,
     settle_work_attempt_session_mutation,
+)
+from cayu.runtime.application_lifecycle import (
+    DEFAULT_APPLICATION_SHUTDOWN_TIMEOUT_SECONDS,
+    ApplicationAdmission,
+    ApplicationLifecycleState,
+    ApplicationShutdown,
+    ApplicationShutdownOutcome,
+    ApplicationShutdownStepReason,
+    ShutdownStage,
+    ShutdownStepSpec,
+    SupportsAsyncClose,
+    _admitted_entrance,
+    _tracked_entrance,
 )
 from cayu.runtime.build_provenance import current_runtime_build_provenance
 from cayu.runtime.config_inspection import EffectiveRunConfiguration
@@ -864,8 +879,12 @@ from cayu.verification.completion_verifiers import (
     DeterministicCompletionVerifier,
 )
 
+logger = logging.getLogger(__name__)
+
 RegisteredAgent = runtime_records.RegisteredAgent
 RegisteredEnvironment = runtime_records.RegisteredEnvironment
+
+_WorkerStepResult = TypeVar("_WorkerStepResult")
 
 _RunConfigurationRequest = TypeVar(
     "_RunConfigurationRequest",
@@ -1190,10 +1209,22 @@ class CayuApp:
         clock: Callable[[], datetime] | None = None,
         session_execution: SessionExecutionConfig | None = None,
         model_policy: ModelPolicy | None = None,
+        owned_resources: Iterable[SupportsAsyncClose] = (),
     ) -> None:
         if model_policy is not None and type(model_policy) is not ModelPolicy:
             raise TypeError("model_policy must be ModelPolicy.")
         self.model_policy = model_policy
+        self._admission = ApplicationAdmission()
+        # Caller-supplied stores and providers are never closed by the app. A
+        # caller may hand ownership over explicitly; those are closed, in reverse
+        # order, only once a shutdown settles every subsystem.
+        self._shutdown = ApplicationShutdown(
+            admission=self._admission,
+            stages=self._shutdown_stages,
+            late_work=self._shutdown_late_work,
+            owned_resources=owned_resources,
+        )
+        self._reported_provider_admission_rejections = 0
         # Resolve once at application startup. Strict deployments fail here,
         # before any session or provider authority can be admitted.
         if browser_control is not None:
@@ -1513,7 +1544,7 @@ class CayuApp:
         self._mcp_refresh_owner = object()
         self._mcp_publication_lock = asyncio.Lock()
         self._refreshable_mcp_toolsets: dict[int, McpToolset] = {}
-        self._knowledge_publications_sealed = False
+        self._knowledge_publication_scope = KnowledgePublicationScope()
         self._providers: dict[str, runtime_records.RegisteredProvider] = {}
         self._environments: dict[str, runtime_records.RegisteredEnvironment] = {}
         self._artifact_store_registrations_by_id: dict[str, _ArtifactStoreRegistration] = {}
@@ -1583,6 +1614,7 @@ class CayuApp:
                 else None
             ),
             strict_common_budget_admission=self.enable_common_root_budget_binding,
+            knowledge_publication_scope=self._knowledge_publication_scope,
         )
         self._recovery_coordinator = RecoveryCoordinator(
             resource_access_policy=resource_access_policy,
@@ -1982,6 +2014,7 @@ class CayuApp:
             model_request._peer_serialization_observer = None
             await stack.aclose()
 
+    @_tracked_entrance
     async def accept_collaboration_request(
         self,
         request: CollaborationRequest,
@@ -1991,6 +2024,7 @@ class CayuApp:
         """Retain a question/contribution; never launch an agent or session."""
         return await self._request_coordinator.accept(request, context=context)
 
+    @_tracked_entrance
     async def inspect_collaboration_request(
         self,
         expected: RequestCommand,
@@ -1999,6 +2033,7 @@ class CayuApp:
     ) -> RequestSnapshot | None:
         return await self._request_coordinator.inspect(expected, context=context)
 
+    @_tracked_entrance
     async def lookup_collaboration_request(
         self,
         expected: RequestCommand | RequestControlCommand,
@@ -2007,6 +2042,7 @@ class CayuApp:
     ) -> ExactLookup[RequestReceipt | RequestControlReceipt]:
         return await self._request_coordinator.lookup(expected, context=context)
 
+    @_tracked_entrance
     async def control_collaboration_request(
         self,
         request: RequestControl,
@@ -2015,15 +2051,24 @@ class CayuApp:
     ) -> RequestControlReceipt:
         return await self._request_coordinator.control(request, context=context)
 
-    async def drain_collaboration_requests(self) -> None:
-        await self._request_coordinator.close()
+    async def drain_collaboration_requests(self, *, timeout_s: float | None = None) -> None:
+        """Stop this application's collaboration work and wait for what it started.
 
+        The collaboration store stays open: other applications sharing it are
+        unaffected, and its owner closes it. This waits for every operation still
+        pending on the store, up to ``timeout_s`` (by default this application's
+        observation bound); work still running raises ``CollaborationUnavailable``.
+        """
+        await self._request_coordinator.close(timeout_s=timeout_s)
+
+    @_tracked_entrance
     async def admit_collaboration_request(
         self, command: RequestAdmissionCommand, *, context: MandateAccessContext
     ) -> RequestAdmissionReceipt:
         """Record a trusted receiving-owner admission decision; never launch work."""
         return await self._request_coordinator.admit(command, context=context)
 
+    @_tracked_entrance
     async def plan_collaboration_request(
         self, request: RequestPlanningRequest, *, context: MandateAccessContext
     ) -> RequestPlanningRecord:
@@ -2032,6 +2077,7 @@ class CayuApp:
 
         return await service_application_plan(self, request, context=context)
 
+    @_tracked_entrance
     async def lookup_collaboration_plan(
         self, expected: RequestPlanningRequest, *, context: MandateAccessContext
     ) -> ExactLookup[RequestPlanningRecord]:
@@ -2042,6 +2088,7 @@ class CayuApp:
             self._request_coordinator, expected, context=context, read_only=True
         )
 
+    @_tracked_entrance
     async def reconcile_collaboration_plan(
         self, expected: RequestPlanningRequest, *, context: MandateAccessContext
     ) -> RequestPlanningRecord:
@@ -2052,6 +2099,7 @@ class CayuApp:
             self, expected, context=context, require_retained=True
         )
 
+    @_tracked_entrance
     async def control_collaboration_plan(
         self, command: RequestPlanningControl, *, context: MandateAccessContext
     ) -> RequestPlanningRecord:
@@ -2074,6 +2122,7 @@ class CayuApp:
             recipient_resources=NativePlanningResourceOwner(self),
         )
 
+    @_tracked_entrance
     async def list_pending_collaboration_plans(
         self,
         *,
@@ -2088,11 +2137,13 @@ class CayuApp:
             self._request_coordinator, context=context, after=after, limit=limit
         )
 
+    @_tracked_entrance
     async def record_collaboration_progress(
         self, command: RequestProgressCommand, *, context: MandateAccessContext
     ) -> RequestProgressReceipt:
         return await self._request_coordinator.progress(command, context=context)
 
+    @_tracked_entrance
     async def prepare_recipient_admission(
         self,
         creation: RecipientSessionCreationRequest,
@@ -2104,6 +2155,7 @@ class CayuApp:
 
         return await prepare_request_admission(self, creation, context=context)
 
+    @_tracked_entrance
     async def prepare_recipient_creation(
         self,
         creation: RecipientSessionCreationRequest,
@@ -2115,6 +2167,7 @@ class CayuApp:
 
         return await prepare_fresh_recipient(self, creation, context=context)
 
+    @_tracked_entrance
     async def prepare_recipient_continuation(
         self,
         request: RecipientContinuationRequest,
@@ -2126,6 +2179,7 @@ class CayuApp:
 
         return await prepare_continuation_admission(self, request, context=context)
 
+    @_tracked_entrance
     async def prepare_recipient_fork(
         self,
         creation: RecipientSessionCreationRequest,
@@ -2153,6 +2207,7 @@ class CayuApp:
 
         return RegisteredRequestAdmissionReader(self._request_coordinator)
 
+    @_tracked_entrance
     async def recover_collaboration_admission(
         self,
         expected: RequestSnapshot,
@@ -2164,6 +2219,7 @@ class CayuApp:
 
         return await recover_admission(self._request_coordinator, expected, context=context)
 
+    @_tracked_entrance
     async def prepare_producer_output(
         self,
         proposal: ProducerOutputProposal,
@@ -2176,6 +2232,7 @@ class CayuApp:
 
         return await prepare_producer_output(self, proposal, execution, context=context)
 
+    @_tracked_entrance
     async def register_producer_output(
         self,
         command: ProducerOutputRegistration,
@@ -2188,6 +2245,7 @@ class CayuApp:
 
         return await register_producer_output(self, command, execution, context=context)
 
+    @_tracked_entrance
     async def lookup_producer_registration(
         self,
         expected: ProducerOutputRegistration | ProducerOutputRecovery,
@@ -2199,6 +2257,7 @@ class CayuApp:
 
         return await lookup_producer_registration(self, expected, context=context)
 
+    @_tracked_entrance
     async def pending_producer_outputs(
         self,
         participant: ParticipantRef,
@@ -2214,6 +2273,7 @@ class CayuApp:
             self, participant, context=context, after=after, limit=limit
         )
 
+    @_tracked_entrance
     async def inspect_producer_output(
         self,
         expected: ProducerOutputRegistration | ProducerOutputRecovery,
@@ -2225,6 +2285,7 @@ class CayuApp:
 
         return await inspect_producer_output(self, expected, context=context)
 
+    @_tracked_entrance
     async def lookup_producer_completion(
         self,
         expected: ProducerOutputRegistration | ProducerOutputRecovery,
@@ -2236,6 +2297,7 @@ class CayuApp:
 
         return await lookup_producer_completion(self, expected, context=context)
 
+    @_tracked_entrance
     async def retain_producer_completion(
         self, command: ProducerOutputRegistration, *, context: CollaborationAccessContext
     ) -> ProducerCompletionRecord:
@@ -2244,6 +2306,7 @@ class CayuApp:
 
         return await retain_public_producer_completion(self, command, context=context)
 
+    @_tracked_entrance
     async def settle_producer_output(
         self, command: ProducerOutputRegistration, *, context: CollaborationAccessContext
     ) -> ProducerCleanupFinalized:
@@ -2252,6 +2315,7 @@ class CayuApp:
 
         return await settle_public_producer_output(self, command, context=context)
 
+    @_tracked_entrance
     async def reclaim_producer_cleanup(
         self, namespace: NamespaceRef, *, context: CollaborationAccessContext, limit: int = 32
     ) -> ProducerCleanupReclamation:
@@ -2260,6 +2324,7 @@ class CayuApp:
 
         return await reclaim_producer_cleanup(self, namespace, context=context, limit=limit)
 
+    @_tracked_entrance
     async def reconcile_producer_delivery(
         self,
         recovery: ProducerDeliveryRecovery,
@@ -2272,6 +2337,7 @@ class CayuApp:
 
         return await reconcile_producer_delivery(self, recovery, context=context, exclude=exclude)
 
+    @_tracked_entrance
     async def retire_producer_export(
         self,
         command: ProducerOutputRegistration,
@@ -2284,6 +2350,7 @@ class CayuApp:
 
         return await retire_unneeded_producer_export(self, command, destination, context=context)
 
+    @_admitted_entrance
     async def service_producer_disposition(
         self, command: ProducerOutputRegistration, *, context: CollaborationAccessContext
     ) -> ProducerDispositionStatus:
@@ -2292,6 +2359,7 @@ class CayuApp:
 
         return await service_closed_producer(self, command, context=context)
 
+    @_admitted_entrance
     async def execute_producer_output(
         self,
         command: ProducerOutputRegistration,
@@ -2315,6 +2383,7 @@ class CayuApp:
             async for event in stream:
                 yield event
 
+    @_tracked_entrance
     async def export_producer_output(
         self,
         command: ProducerOutputRegistration,
@@ -2327,6 +2396,7 @@ class CayuApp:
 
         return await export_producer_output(self, command, destination, context=context)
 
+    @_tracked_entrance
     async def record_producer_progress(
         self,
         command: ProducerOutputRegistration,
@@ -2339,6 +2409,7 @@ class CayuApp:
 
         return await record_producer_progress(self, command, occurrence, context=context)
 
+    @_tracked_entrance
     async def publish_producer_outcome(
         self,
         command: ProducerOutputRegistration,
@@ -2353,6 +2424,7 @@ class CayuApp:
             self, command, destination_operation=destination, context=context
         )
 
+    @_tracked_entrance
     async def deliver_producer_output(
         self,
         command: ProducerOutputRegistration,
@@ -2368,17 +2440,20 @@ class CayuApp:
             self, command, destination, context=context, prepare_only=prepare_only
         )
 
+    @_tracked_entrance
     async def lookup_collaboration_admission(
         self, expected: RequestAdmissionCommand, *, context: MandateAccessContext
     ) -> ExactLookup[RequestAdmissionReceipt]:
         """Read exact historical admission evidence without renewing execution authority."""
         return await self._request_coordinator.lookup_admission(expected, context=context)
 
+    @_tracked_entrance
     async def publish_collaboration_outcome(
         self, command: RequestOutcomeCommand, *, context: MandateAccessContext
     ) -> RequestOutcomeReceipt:
         return await self._request_coordinator.outcome(command, context=context)
 
+    @_tracked_entrance
     async def register_collaboration_observation(
         self,
         expected: RequestCommand,
@@ -2388,6 +2463,7 @@ class CayuApp:
     ) -> RequestObservationReceipt:
         return await self._request_coordinator.observe(expected, observation, context=context)
 
+    @_tracked_entrance
     async def read_collaboration_observation(
         self,
         expected: RequestCommand,
@@ -2399,6 +2475,7 @@ class CayuApp:
             expected, observation, context=context
         )
 
+    @_tracked_entrance
     async def register_collaboration_wait(
         self,
         wait: CollaborationWait,
@@ -2407,6 +2484,7 @@ class CayuApp:
     ) -> WaitSnapshot:
         return await self._wait_coordinator.register(wait, context=context)
 
+    @_tracked_entrance
     async def list_collaboration_waits(
         self,
         *,
@@ -2421,6 +2499,7 @@ class CayuApp:
             self._wait_coordinator, context=context, cursor=cursor, limit=limit
         )
 
+    @_tracked_entrance
     async def list_participant_sessions(
         self,
         participant: ParticipantRef,
@@ -2436,6 +2515,7 @@ class CayuApp:
             self, participant, context=context, cursor=cursor, limit=limit
         )
 
+    @_tracked_entrance
     async def list_session_continuations(
         self,
         session: ParticipantSessionReference,
@@ -2451,6 +2531,7 @@ class CayuApp:
             self, session, context=context, after=after, limit=limit
         )
 
+    @_admitted_entrance
     async def recover_session_continuation(
         self, expected: ContinuationRecovery, *, context: CollaborationAccessContext
     ) -> ContinuationRecord:
@@ -2459,6 +2540,7 @@ class CayuApp:
 
         return await recover_session_continuation(self, expected, context=context)
 
+    @_admitted_entrance
     async def recover_collaboration_wait(
         self, expected: WaitRecovery, *, context: MandateAccessContext
     ) -> ExactLookup[CollaborationWait]:
@@ -2467,6 +2549,7 @@ class CayuApp:
 
         return await resolve_wait(self._wait_coordinator, expected, context=context)
 
+    @_tracked_entrance
     async def observe_collaboration_wait(
         self,
         wait: CollaborationWait,
@@ -2475,6 +2558,7 @@ class CayuApp:
     ) -> WaitSnapshot:
         return await self._wait_coordinator.observe(wait, context=context)
 
+    @_tracked_entrance
     async def inspect_collaboration_wait(
         self,
         wait: CollaborationWait,
@@ -2483,6 +2567,7 @@ class CayuApp:
     ) -> WaitSnapshot | None:
         return await self._wait_coordinator.inspect(wait, context=context)
 
+    @_tracked_entrance
     async def lookup_collaboration_wait(
         self,
         wait: CollaborationWait,
@@ -2491,6 +2576,7 @@ class CayuApp:
     ) -> ExactLookup[WaitRegistration]:
         return await self._wait_coordinator.lookup(wait, context=context)
 
+    @_tracked_entrance
     async def cancel_collaboration_wait(
         self,
         wait: CollaborationWait,
@@ -2500,6 +2586,7 @@ class CayuApp:
     ) -> WaitSnapshot:
         return await self._wait_coordinator.cancel(wait, context=context, expired=expired)
 
+    @_tracked_entrance
     async def deliver_collaboration_wait(
         self, wait: CollaborationWait, *, context: MandateAccessContext, continuation_owner
     ) -> WaitSnapshot:
@@ -2507,6 +2594,7 @@ class CayuApp:
             wait, context=context, continuation_owner=continuation_owner
         )
 
+    @_tracked_entrance
     async def exclude_collaboration_wait(
         self,
         wait: CollaborationWait,
@@ -2526,6 +2614,7 @@ class CayuApp:
         """Return the durable receiver used by session-bound wait delivery."""
         return self._wait_coordinator.latch_receiver()
 
+    @_tracked_entrance
     async def list_due_collaboration_requests(
         self,
         *,
@@ -2536,6 +2625,7 @@ class CayuApp:
         """Inspect retained responsibilities without claiming or dispatching work."""
         return await self._request_coordinator.due(context=context, cursor=cursor, limit=limit)
 
+    @_tracked_entrance
     async def initialize_session_exports(
         self,
         session_id: str,
@@ -2544,6 +2634,7 @@ class CayuApp:
     ) -> SessionExportNamespace:
         return await self._session_export_coordinator.initialize(session_id, context=context)
 
+    @_tracked_entrance
     async def export_session(
         self,
         request: SessionExportRequest,
@@ -2555,6 +2646,7 @@ class CayuApp:
             request, context=context, invocation=invocation
         )
 
+    @_tracked_entrance
     async def lookup_session_export(
         self,
         request: SessionExportRequest,
@@ -2563,6 +2655,7 @@ class CayuApp:
     ) -> ExactLookup[SessionExportReceipt]:
         return await self._session_export_coordinator.lookup(request, context=context)
 
+    @_tracked_entrance
     async def read_session_export(
         self,
         request: SessionExportRequest,
@@ -2571,6 +2664,7 @@ class CayuApp:
     ) -> dict[str, Any]:
         return await self._session_export_coordinator.lookup(request, context=context, expose=True)
 
+    @_tracked_entrance
     async def open_clarification(
         self,
         command: ClarificationOpenCommand,
@@ -2581,6 +2675,7 @@ class CayuApp:
         """Publish one exact question; never launch or implicitly deliver service."""
         return await self._clarification_coordinator.open(command, source, context=context)
 
+    @_tracked_entrance
     async def prepare_clarification_delivery(
         self,
         intent: ClarificationDeliveryIntent,
@@ -2592,6 +2687,7 @@ class CayuApp:
             intent, context=context, prepare_only=True
         )
 
+    @_tracked_entrance
     async def deliver_clarification(
         self,
         intent: ClarificationDeliveryIntent,
@@ -2601,6 +2697,7 @@ class CayuApp:
         """Deliver through the peer owner without starting a service or exposing a model."""
         return await self._clarification_coordinator.deliver(intent, context=context)
 
+    @_admitted_entrance
     async def service_clarification(
         self,
         request: ClarificationServiceRequest,
@@ -2613,6 +2710,7 @@ class CayuApp:
             self, request, context=context, delivery_context=delivery_context
         )
 
+    @_tracked_entrance
     async def reconcile_clarification_service(
         self,
         request: ClarificationServiceRequest | ClarificationServiceRecovery,
@@ -2624,6 +2722,7 @@ class CayuApp:
             self, request, context=context
         )
 
+    @_tracked_entrance
     async def list_due_clarification_questions(
         self,
         *,
@@ -2636,12 +2735,14 @@ class CayuApp:
             context=context, cursor=cursor, limit=limit
         )
 
+    @_tracked_entrance
     async def expire_clarification_question(
         self, request: ClarificationExpiryRequest, *, context: CollaborationAccessContext
     ) -> ClarificationExpiryReceipt:
         """Expire an exact due question; pending service and delivery remain owned."""
         return await self._clarification_coordinator.expire_question(request, context=context)
 
+    @_tracked_entrance
     async def list_pending_clarification_deliveries(
         self,
         *,
@@ -2654,6 +2755,7 @@ class CayuApp:
             context=context, cursor=cursor, limit=limit
         )
 
+    @_tracked_entrance
     async def reconcile_clarification_delivery(
         self,
         recovery: ClarificationDeliveryRecovery,
@@ -2663,6 +2765,7 @@ class CayuApp:
         """Read exact receiving evidence; never append, disclose payloads or infer exclusion."""
         return await self._clarification_coordinator.reconcile_delivery(recovery, context=context)
 
+    @_tracked_entrance
     async def list_pending_clarification_services(
         self,
         *,
@@ -2675,6 +2778,7 @@ class CayuApp:
             context=context, cursor=cursor, limit=limit
         )
 
+    @_tracked_entrance
     async def exclude_clarification_delivery(
         self,
         recovery: ClarificationDeliveryRecovery,
@@ -2686,6 +2790,7 @@ class CayuApp:
             recovery, context=context, exclude=True
         )
 
+    @_tracked_entrance
     async def inspect_clarification_services(
         self,
         ticket: ContinuationTicket,
@@ -2699,6 +2804,7 @@ class CayuApp:
             self, ticket, context=context, cursor=cursor, limit=limit
         )
 
+    @_tracked_entrance
     async def exclude_clarification_service(
         self,
         request: ClarificationServiceRequest | ClarificationServiceRecovery,
@@ -2710,12 +2816,14 @@ class CayuApp:
             self, request, context=context, exclude=True
         )
 
+    @_tracked_entrance
     async def reply_to_clarification(
         self, request: ClarificationReplyRequest, *, context: SessionExportAccessContext
     ) -> ClarificationReplyAcceptance:
         """Elect a source-authenticated service reply without dispatch or delivery."""
         return await self._clarification_coordinator.reply(self, request, context=context)
 
+    @_tracked_entrance
     async def close_clarification(
         self,
         command: ClarificationCloseCommand,
@@ -2725,6 +2833,7 @@ class CayuApp:
         """Close a question, without cancelling or settling underlying service work."""
         return await self._request_coordinator.close_clarification(command, context=context)
 
+    @_tracked_entrance
     async def inspect_clarification(
         self,
         expected: ClarificationOpenCommand,
@@ -2734,6 +2843,7 @@ class CayuApp:
         """Inspect current question state under exact historical request authority."""
         return await self._request_coordinator.inspect_clarification(expected, context=context)
 
+    @_tracked_entrance
     async def lookup_clarification(
         self,
         expected: ClarificationOpenCommand | ClarificationCloseCommand,
@@ -2743,6 +2853,7 @@ class CayuApp:
         """Read exact historical question metadata without renewing authority."""
         return await self._request_coordinator.lookup_clarification(expected, context=context)
 
+    @_tracked_entrance
     async def inspect_clarification_source(
         self,
         request: SessionExportRequest,
@@ -2762,6 +2873,7 @@ class CayuApp:
             request, sender=sender, audience=audience, context=context, expected=expected
         )
 
+    @_tracked_entrance
     async def settle_session_export(
         self,
         request: SessionExportSettlementRequest,
@@ -2770,6 +2882,7 @@ class CayuApp:
     ) -> SessionExportSettlementReceipt:
         return await self._session_export_coordinator.settle(request, context=context)
 
+    @_tracked_entrance
     async def reconcile_session_export(
         self,
         request: SessionExportRequest,
@@ -2779,19 +2892,38 @@ class CayuApp:
         """Settle published admission or exclude a retained unpublished preparation."""
         return await self._session_export_coordinator.reconcile(request, context=context)
 
-    async def drain_session_exports(self) -> None:
-        """Seal new export work and drain retained owners before closing the store."""
-        await self._session_export_coordinator.close()
+    async def drain_verified_completions(self, *, timeout_s: float = 10.0) -> bool:
+        """Wait for completion verification and result resolution still running.
 
+        A verifier or resolver can outlive the call that started it, for example
+        after its execution timeout or a caller's cancellation, together with
+        its claim heartbeat and final settlement. This waits for that work
+        without cancelling it, and returns False if any is still running. Work
+        that finished unsuccessfully has its failure raised by one drain or
+        shutdown attempt only, and stays retained for the exact retry. Work that a
+        verified task worker holds is reported by that worker instead.
+        """
+
+        if type(timeout_s) not in {int, float} or not isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("timeout_s must be a finite positive number.")
+        return await self._verified_completion.drain(timeout_s=float(timeout_s))
+
+    async def drain_session_exports(self, *, timeout_s: float | None = None) -> None:
+        """Seal new export work and wait, up to ``timeout_s``, for retained owners."""
+        await self._session_export_coordinator.close(timeout_s=timeout_s)
+
+    @_tracked_entrance
     async def initialize_collaboration(self) -> CollaborationInitialization:
         """Explicitly provision or recover the exact registered collaboration owner."""
         return await self._participant_coordinator.initialize()
 
+    @_tracked_entrance
     async def inspect_collaboration_namespace(
         self, *, context: CollaborationAccessContext
     ) -> NamespaceInspection:
         return await self._participant_coordinator.inspect_namespace(context=context)
 
+    @_tracked_entrance
     async def inspect_collaboration_retirement(
         self,
         namespace: NamespaceRef,
@@ -2800,6 +2932,7 @@ class CayuApp:
     ) -> NamespaceRetirementEvidence | None:
         return await self._participant_coordinator.inspect_retirement(namespace, context=context)
 
+    @_tracked_entrance
     async def seal_collaboration_namespace(
         self, request: NamespaceSeal, *, context: CollaborationAccessContext
     ) -> LifecycleReceipt:
@@ -2807,6 +2940,7 @@ class CayuApp:
             NamespaceSeal, request, context=context
         )
 
+    @_tracked_entrance
     async def rotate_collaboration_namespace(
         self, request: NamespaceRotate, *, context: CollaborationAccessContext
     ) -> LifecycleReceipt:
@@ -2814,6 +2948,7 @@ class CayuApp:
             NamespaceRotate, request, context=context
         )
 
+    @_tracked_entrance
     async def retire_collaboration_namespace(
         self, request: NamespaceRetire, *, context: CollaborationAccessContext
     ) -> LifecycleReceipt:
@@ -2821,6 +2956,7 @@ class CayuApp:
             NamespaceRetire, request, context=context
         )
 
+    @_tracked_entrance
     async def prune_collaboration_namespace(
         self, request: NamespacePrune, *, context: CollaborationAccessContext
     ) -> LifecycleReceipt:
@@ -2828,11 +2964,13 @@ class CayuApp:
             NamespacePrune, request, context=context
         )
 
+    @_tracked_entrance
     async def lookup_collaboration_lifecycle_operation(
         self, expected: LifecycleCommand, *, context: CollaborationAccessContext
     ) -> ExactLookup[LifecycleReceipt]:
         return await self._participant_coordinator.lookup_lifecycle(expected, context=context)
 
+    @_tracked_entrance
     async def change_participant_lifecycle(
         self, request: ParticipantLifecycleChange, *, context: CollaborationAccessContext
     ) -> LifecycleReceipt:
@@ -2841,6 +2979,7 @@ class CayuApp:
                 ParticipantLifecycleChange, request, context=context
             )
 
+    @_tracked_entrance
     async def list_participant_obligations(
         self,
         participant: ParticipantRef,
@@ -2858,6 +2997,7 @@ class CayuApp:
             limit=limit,
         )
 
+    @_tracked_entrance
     async def create_participant(
         self, request: ParticipantCreate, *, context: CollaborationAccessContext
     ) -> ParticipantReceipt:
@@ -2865,6 +3005,7 @@ class CayuApp:
             ParticipantCreate, request, context=context
         )
 
+    @_tracked_entrance
     async def create_participant_session(
         self,
         creation: ParticipantSessionCreationRequest,
@@ -2883,6 +3024,7 @@ class CayuApp:
                 context=context,
             )
 
+    @_tracked_entrance
     async def create_recipient_session(
         self,
         creation: RecipientSessionCreationRequest,
@@ -3096,6 +3238,7 @@ class CayuApp:
             session, participant_receipt = await commit_child()
         return session, build_receipt(session, participant_receipt)
 
+    @_tracked_entrance
     async def settle_recipient_resource_handoff(
         self,
         receipt: RecipientSessionCreationReceipt,
@@ -3195,6 +3338,7 @@ class CayuApp:
                 transfer, destination_owner=resource_owner
             )
 
+    @_tracked_entrance
     async def reconcile_recipient_resource_handoff(
         self,
         creation: RecipientSessionCreationRequest,
@@ -3218,6 +3362,7 @@ class CayuApp:
         )
         return receipt
 
+    @_tracked_entrance
     async def lookup_recipient_session(
         self,
         creation: RecipientSessionCreationRequest,
@@ -3558,6 +3703,7 @@ class CayuApp:
             await settle_recipient_creation(self, creation_target)
         return session, receipt
 
+    @_admitted_entrance
     async def execute_participant_session(
         self,
         execution: ParticipantSessionExecutionRequest,
@@ -3572,6 +3718,7 @@ class CayuApp:
             async for event in stream:
                 yield event
 
+    @_admitted_entrance
     async def execute_participant_session_to_wait(
         self,
         execution: ParticipantSessionExecutionRequest,
@@ -3600,6 +3747,7 @@ class CayuApp:
             async for event in stream:
                 yield event
 
+    @_tracked_entrance
     async def exclude_participant_session_wait(
         self,
         execution: ParticipantSessionExecutionRequest,
@@ -3876,6 +4024,7 @@ class CayuApp:
             async for event in owned_stream:
                 yield event
 
+    @_tracked_entrance
     async def configure_participant(
         self, request: ParticipantConfigure, *, context: CollaborationAccessContext
     ) -> ParticipantReceipt:
@@ -3884,6 +4033,7 @@ class CayuApp:
                 ParticipantConfigure, request, context=context
             )
 
+    @_tracked_entrance
     async def change_participant_alias(
         self, request: ParticipantAliasChange, *, context: CollaborationAccessContext
     ) -> ParticipantReceipt:
@@ -3891,16 +4041,19 @@ class CayuApp:
             ParticipantAliasChange, request, context=context
         )
 
+    @_tracked_entrance
     async def inspect_participant(
         self, participant: ParticipantRef, *, context: CollaborationAccessContext
     ) -> ParticipantInspection:
         return await self._participant_coordinator.inspect(participant, context=context)
 
+    @_tracked_entrance
     async def resolve_participant_alias(
         self, alias: str, *, context: CollaborationAccessContext
     ) -> ParticipantAlias | None:
         return await self._participant_coordinator.resolve_alias(alias, context=context)
 
+    @_tracked_entrance
     async def discover_participants(
         self,
         *,
@@ -3912,6 +4065,7 @@ class CayuApp:
             context=context, cursor=cursor, limit=limit
         )
 
+    @_tracked_entrance
     async def list_participant_events(
         self,
         *,
@@ -3923,6 +4077,7 @@ class CayuApp:
             context=context, cursor=cursor, limit=limit
         )
 
+    @_tracked_entrance
     async def lookup_participant_operation(
         self, expected: ExpectedOperation[ParticipantIntent], *, context: CollaborationAccessContext
     ) -> ExactLookup[ParticipantReceipt]:
@@ -3939,6 +4094,7 @@ class CayuApp:
 
         return project_context_view_extensions(self._context_view_extensions, source)
 
+    @_tracked_entrance
     async def publish_completed_context_view(
         self,
         request: ContextViewPublicationRequest,
@@ -4191,6 +4347,7 @@ class CayuApp:
             )
         return await publish()
 
+    @_tracked_entrance
     async def transition_context_view_ownership(
         self,
         request: ContextViewOwnershipRequest,
@@ -4237,6 +4394,7 @@ class CayuApp:
             )
         return await self.session_store.transition_context_view_ownership(request)
 
+    @_tracked_entrance
     async def select_context_view(
         self,
         request: ContextViewSelectionRequest,
@@ -4277,6 +4435,7 @@ class CayuApp:
             )
         return await self.session_store.select_context_view(request)
 
+    @_tracked_entrance
     async def read_context_view(
         self,
         view_id: str,
@@ -4314,6 +4473,7 @@ class CayuApp:
             raise PermissionError("The authenticated participant does not own the source view.")
         return readback
 
+    @_tracked_entrance
     async def read_context_view_lifecycle_events(
         self,
         view_id: str,
@@ -4365,6 +4525,7 @@ class CayuApp:
 
         return copy_budget_policy(self._budget_policy)
 
+    @_tracked_entrance
     async def resolve_budget_binding(self, *, request: object) -> BudgetBinding:
         """Resolve a trusted common-root binding for a bound operation.
 
@@ -4442,6 +4603,7 @@ class CayuApp:
             secret_redactor=self._secret_redactor,
         )
 
+    @_tracked_entrance
     async def inspect_session_closure(
         self,
         session_id: str,
@@ -4457,6 +4619,7 @@ class CayuApp:
             project_session_id=self.project_session_id_for_exposure,
         )
 
+    @_tracked_entrance
     async def erase_session_closure(
         self,
         session_id: str,
@@ -4477,6 +4640,7 @@ class CayuApp:
             project_session_id=self.project_session_id_for_exposure,
         )
 
+    @_tracked_entrance
     async def validate_session_closure(
         self,
         session_id: str,
@@ -4491,6 +4655,7 @@ class CayuApp:
             project_session_id=self.project_session_id_for_exposure,
         )
 
+    @_tracked_entrance
     async def export_session_closure(
         self,
         session_id: str,
@@ -5050,12 +5215,189 @@ class CayuApp:
 
         return describe_app(self, project_root=project_root)
 
+    @property
+    def lifecycle_state(self) -> ApplicationLifecycleState:
+        """``open``, ``closing`` once sealed, or ``closed`` after a settled shutdown."""
+
+        return self._shutdown.state
+
+    @property
+    def shutdown_outcome(self) -> ApplicationShutdownOutcome | None:
+        """The outcome of the most recent shutdown attempt, if any."""
+
+        return self._shutdown.outcome
+
+    def seal_admissions(self) -> None:
+        """Refuse new runs, recoveries, dispatches and other execution entrances.
+
+        Idempotent and never reopened. Operations already admitted keep running,
+        as do reads, inspections, cleanup and the drains. ``aclose`` seals first.
+        """
+
+        self._admission.seal()
+
+    async def aclose(
+        self, *, timeout_s: float = DEFAULT_APPLICATION_SHUTDOWN_TIMEOUT_SECONDS
+    ) -> ApplicationShutdownOutcome:
+        """Seal admissions and drain every subsystem under one shared deadline.
+
+        Returns the outcome; it never raises merely because work is unfinished.
+        A settled outcome is final. After an incomplete or failed outcome a later
+        call runs another attempt. Caller-supplied stores and providers stay open;
+        only ``owned_resources`` are closed, and only once everything settled.
+        """
+
+        return await self._shutdown.aclose(timeout_s=timeout_s)
+
+    async def __aenter__(self) -> Self:
+        if self.lifecycle_state != "open":
+            raise RuntimeError("A closing or closed CayuApp cannot be entered again.")
+        return self
+
+    async def __aexit__(self, *_exc_info: object) -> None:
+        outcome = await self.aclose()
+        if not outcome.settled:
+            logger.warning("CayuApp %s; see app.shutdown_outcome.", outcome.summary())
+
+    @_tracked_entrance
+    async def _run_worker_step(
+        self, step: Callable[[], Awaitable[_WorkerStepResult]]
+    ) -> _WorkerStepResult:
+        """Run one step of a Cayu worker loop so shutdown waits for it to finish."""
+
+        return await step()
+
+    def _shutdown_stages(self) -> tuple[ShutdownStage, ...]:
+        # Each step drains through the app's public drain, looked up on the
+        # instance so it stays individually replaceable; a few steps also seal
+        # internal owners that have no public seal.
+        async def background_interruptions(budget: float) -> bool:
+            # Sealed only now: admitted operations that just finished may still
+            # have started cascades and deliveries, which this step drains.
+            self._session_engine.seal_background_interruptions()
+            self._foreground_child_delivery_owner.seal()
+            return await self.drain_background_interruptions(timeout_s=budget)
+
+        async def provider_operation_cancellations(budget: float) -> bool:
+            # The drain seals, and only after interruptions settled: an
+            # interrupted provider operation still needs a cancellation owner.
+            return await self.drain_provider_operation_cancellations(timeout_s=budget)
+
+        async def collaboration_requests(budget: float) -> bool:
+            try:
+                await self.drain_collaboration_requests(timeout_s=budget)
+            except CollaborationUnavailable:
+                return False
+            return True
+
+        async def session_exports(budget: float) -> bool:
+            try:
+                await self.drain_session_exports(timeout_s=budget)
+            except CollaborationUnavailable:
+                return False
+            return True
+
+        async def runtime_timing(_budget: float) -> None:
+            await self.close_runtime_timing()
+
+        async def model_policy(_budget: float) -> None:
+            # Policy workers call providers in the background; stop them first.
+            await self.stop_model_policy()
+
+        return (
+            # Floor-protected: hosts leave stopping policy workers to aclose(),
+            # so it must run even when in-flight work used up the deadline.
+            (ShutdownStepSpec("model_policy", model_policy, floor_protected=True),),
+            (
+                ShutdownStepSpec(
+                    "background_interruptions", background_interruptions, floor_protected=True
+                ),
+            ),
+            (
+                ShutdownStepSpec(
+                    "recovery_cleanups",
+                    lambda budget: self.drain_recovery_cleanups(timeout_s=budget),
+                ),
+            ),
+            (
+                ShutdownStepSpec(
+                    "provider_operation_cancellations",
+                    provider_operation_cancellations,
+                    floor_protected=True,
+                ),
+            ),
+            (
+                ShutdownStepSpec(
+                    "environment_cleanups",
+                    lambda budget: self.drain_environment_cleanups(timeout_s=budget),
+                ),
+            ),
+            (
+                ShutdownStepSpec(
+                    "knowledge_publications",
+                    lambda budget: self.drain_knowledge_publications(timeout_s=budget),
+                    seal=self.seal_knowledge_publications,
+                ),
+                ShutdownStepSpec(
+                    "collaboration_requests",
+                    collaboration_requests,
+                    seal=self._request_coordinator.owners.seal,
+                ),
+                ShutdownStepSpec(
+                    "session_exports",
+                    session_exports,
+                    seal=self._session_export_coordinator.owners.seal,
+                ),
+                ShutdownStepSpec(
+                    "verified_completions",
+                    lambda budget: self.drain_verified_completions(timeout_s=budget),
+                ),
+            ),
+            (ShutdownStepSpec("runtime_timing", runtime_timing, floor_protected=True),),
+        )
+
+    def _shutdown_late_work(self) -> dict[str, ApplicationShutdownStepReason]:
+        late: dict[str, ApplicationShutdownStepReason] = {}
+        if (
+            self._session_engine.background_interruptions_pending()
+            or self._foreground_child_delivery_owner.pending
+        ):
+            late["background_interruptions"] = "late_work"
+        if self.recovery_cleanup_status().active_tasks:
+            late["recovery_cleanups"] = "late_work"
+        if self._knowledge_publication_scope.pending:
+            late["knowledge_publications"] = "late_work"
+        if self._request_coordinator.owners.outstanding():
+            late["collaboration_requests"] = "late_work"
+        if self._session_export_coordinator.owners.pending:
+            late["session_exports"] = "late_work"
+        if self._verified_completion.pending:
+            late["verified_completions"] = "late_work"
+        provider = self.provider_operation_cancellation_status()
+        # A rejection after sealing is a provider operation left without a
+        # cancellation owner; report each one in the attempt that saw it.
+        rejections = provider.admission_rejections - self._reported_provider_admission_rejections
+        self._reported_provider_admission_rejections = provider.admission_rejections
+        if rejections:
+            late["provider_operation_cancellations"] = "unowned_cancellations"
+        elif provider.active_owners:
+            late["provider_operation_cancellations"] = "late_work"
+        return late
+
     async def drain_background_interruptions(self, *, timeout_s: float = 10.0) -> bool:
-        settled = await asyncio.gather(
+        results = await asyncio.gather(
             self._session_engine.drain_background_interruptions(timeout_s=timeout_s),
             self._foreground_child_delivery_owner.drain(timeout_s=timeout_s),
+            return_exceptions=True,
         )
-        return all(settled)
+        # Both drains always finish; report every failure instead of leaving one
+        # sibling running unobserved behind the other's exception.
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("Background interruption drains failed.", failures)
+        return all(results)
 
     def provider_operation_cancellation_status(
         self,
@@ -5154,47 +5496,20 @@ class CayuApp:
         return retained_drained and parked_drained
 
     def seal_knowledge_publications(self) -> None:
-        """Reject new retained knowledge writes before application shutdown drains."""
+        """Refuse this application's new knowledge publications before shutdown drains.
 
-        self._knowledge_publications_sealed = True
-        for lifecycle in self._registered_knowledge_publication_lifecycles():
-            lifecycle.seal()
+        Registered knowledge tools may be shared with other applications, so
+        they stay open; close a tool with its own ``aclose`` when it is retired.
+        """
+
+        self._knowledge_publication_scope.seal()
 
     async def drain_knowledge_publications(self, *, timeout_s: float = 10.0) -> bool:
-        """Seal and concurrently drain publications owned by registered tools."""
+        """Seal, then wait for publications this application started through its tools."""
 
-        if type(timeout_s) not in {int, float} or not isfinite(timeout_s) or timeout_s <= 0:
-            raise ValueError("timeout_s must be a finite positive number.")
-        self.seal_knowledge_publications()
-        lifecycles = self._registered_knowledge_publication_lifecycles()
-        if not lifecycles:
-            return True
-        results = await asyncio.gather(
-            *(lifecycle.aclose(timeout_s=float(timeout_s)) for lifecycle in lifecycles)
-        )
-        return all(results)
+        return await self._knowledge_publication_scope.drain(timeout_s=timeout_s)
 
-    def _registered_knowledge_publication_lifecycles(
-        self,
-    ) -> tuple[KnowledgePublicationLifecycle, ...]:
-        lifecycles: list[KnowledgePublicationLifecycle] = []
-        seen: set[int] = set()
-        for agent in self._agents.values():
-            for registered in agent.tools.values():
-                lifecycle = getattr(
-                    registered.tool,
-                    "_knowledge_publication_lifecycle",
-                    None,
-                )
-                if not isinstance(lifecycle, KnowledgePublicationLifecycle):
-                    continue
-                identity = id(lifecycle)
-                if identity in seen:
-                    continue
-                seen.add(identity)
-                lifecycles.append(lifecycle)
-        return tuple(lifecycles)
-
+    @_tracked_entrance
     async def discard_parked_egress_allocations(
         self,
         session_id: str,
@@ -5212,6 +5527,7 @@ class CayuApp:
             session_id=require_durable_clean_nonblank(session_id, "session_id"),
         )
 
+    @_admitted_entrance
     async def resume_pending_interruption_cascades(
         self,
         *,
@@ -5222,6 +5538,7 @@ class CayuApp:
             startup_preflight=self._recovery_plan_coordinator.startup_interruption_blockers,
         )
 
+    @_tracked_entrance
     async def get_startup_recovery_status(self) -> StartupRecoveryResult:
         """Return the latest process-local sweep with safe exposed session identities."""
         result = self._session_engine.get_startup_recovery_status()
@@ -5236,12 +5553,14 @@ class CayuApp:
             }
         )
 
+    @_tracked_entrance
     async def interruption_cascade_status(self, session_id: str) -> str:
         session_id = await self._resolve_public_session_id(
             require_clean_nonblank(session_id, "session_id")
         )
         return await self._session_engine.interruption_cascade_status(session_id=session_id)
 
+    @_tracked_entrance
     async def inspect_targeted_tool_grants(
         self,
         session_id: str,
@@ -5274,6 +5593,7 @@ class CayuApp:
             raise RuntimeError("Targeted grant inspection requires public alias authority.")
         return tuple(targeted_tool_grant_inspection(record, codec) for record in records)
 
+    @_tracked_entrance
     async def require_human_review_resolution_authority(
         self,
         session_id: str,
@@ -5285,6 +5605,7 @@ class CayuApp:
             session_id, reference
         )
 
+    @_tracked_entrance
     async def get_human_attention_state(
         self,
         reference: HumanAttentionReference,
@@ -5296,6 +5617,7 @@ class CayuApp:
         """
         return await observe_human_attention(self._runtime_session_store, reference)
 
+    @_tracked_entrance
     async def inspect_human_review(
         self,
         session_id: str,
@@ -5311,6 +5633,7 @@ class CayuApp:
         session_id = await self._resolve_public_session_id(session_id)
         return await self._recovery_coordinator.inspect_human_review(session_id, context)
 
+    @_tracked_entrance
     async def inspect_tool_discovery_view(
         self,
         session_id: str,
@@ -5732,15 +6055,6 @@ class CayuApp:
                     ),
                 )
                 newly_claimed_refreshable.append(toolset)
-            if self._knowledge_publications_sealed:
-                for registered_tool in tools_by_name.values():
-                    lifecycle = getattr(
-                        registered_tool.tool,
-                        "_knowledge_publication_lifecycle",
-                        None,
-                    )
-                    if isinstance(lifecycle, KnowledgePublicationLifecycle):
-                        lifecycle.seal()
         except BaseException:
             for toolset in newly_claimed_refreshable:
                 toolset._refresh_source.release_refresh_owner(self._mcp_refresh_owner)
@@ -5755,10 +6069,11 @@ class CayuApp:
 
     async def _refresh_mcp_toolset_after_notification(self, source_key: int) -> None:
         current = self._refreshable_mcp_toolsets.get(source_key)
-        if current is None:
+        if current is None or self._admission.sealed:
             return
         await self.refresh_mcp_toolset(current)
 
+    @_admitted_entrance
     async def refresh_mcp_toolset(
         self,
         toolset: McpToolset,
@@ -6120,6 +6435,7 @@ class CayuApp:
 
         return self._session_engine.resolve_initial_model_target(request)
 
+    @_admitted_entrance
     async def start_model_policy(self) -> None:
         """Start explicitly configured policy workers before admitting defaulted runs."""
         if self.model_policy is not None:
@@ -6161,6 +6477,7 @@ class CayuApp:
         else:
             await self.stop_model_policy()
 
+    @_tracked_entrance
     async def inspect_run_execution_profile(self, request: RunRequest) -> str:
         """Return the exact initial profile fingerprint without admitting a session.
 
@@ -6174,6 +6491,7 @@ class CayuApp:
             await self.inspect_effective_run_configuration(request)
         ).execution_profile.fingerprint
 
+    @_tracked_entrance
     async def inspect_effective_run_configuration(
         self,
         request: RunRequest,
@@ -6251,6 +6569,7 @@ class CayuApp:
             }
         )
 
+    @_tracked_entrance
     async def current_prompt_anatomy_sha256(
         self,
         *,
@@ -6407,6 +6726,7 @@ class CayuApp:
             )
         return registered_environment.factory
 
+    @_tracked_entrance
     async def attach_file(
         self,
         content: bytes,
@@ -6721,6 +7041,7 @@ class CayuApp:
         object.__setattr__(resolved, "__pydantic_fields_set__", set(fields_set))
         return resolved
 
+    @_admitted_entrance
     @runtime_stream_entrance
     async def run(self, request: RunRequest) -> AsyncIterator[Event]:
         stream = self._run_with_public_projection(request)
@@ -6730,6 +7051,7 @@ class CayuApp:
                 yield event
         await self._event_writer.recover_persisted_side_effects()
 
+    @_admitted_entrance
     async def _run_with_public_projection(
         self,
         request: RunRequest,
@@ -6747,6 +7069,7 @@ class CayuApp:
             async for event in owned_stream:
                 yield await self._project_emitted_event_for_public_api(event)
 
+    @_admitted_entrance
     async def replay_session(self, request: RuntimeReplayRequest) -> RuntimeReplayReport:
         """Re-drive one promoted trajectory against this app without live effects."""
 
@@ -6761,6 +7084,7 @@ class CayuApp:
             self._work_attempt_execution_owner_id = uuid4().hex
         return f"cayu-work-attempt:{pid}:{self._work_attempt_execution_owner_id}"
 
+    @_admitted_entrance
     async def admit_work_attempt(
         self,
         request: RunRequest | ResumeRequest,
@@ -6947,6 +7271,7 @@ class CayuApp:
             return await admission_operation
         raise AssertionError("Validated work-attempt source request has an unknown type.")
 
+    @_admitted_entrance
     async def _execute_work_attempt(self, request: WorkAttemptRunRequest) -> AsyncIterator[Event]:
         """Resolve this process's exact claim and delegate governed execution.
 
@@ -7015,6 +7340,7 @@ class CayuApp:
             async for event in owned_stream:
                 yield event
 
+    @_tracked_entrance
     async def renew_work_attempt_claim(
         self,
         request: WorkAttemptClaimRenewalRequest,
@@ -7251,6 +7577,7 @@ class CayuApp:
             )
         return checkpoint
 
+    @_admitted_entrance
     async def recover_work_attempt(
         self,
         request: WorkAttemptRecoveryRequest,
@@ -7265,6 +7592,7 @@ class CayuApp:
             del operation
         return await self._recover_claimed_work_attempt(ownership)
 
+    @_admitted_entrance
     async def _claim_work_attempt_recovery(
         self, request: WorkAttemptRecoveryRequest
     ) -> WorkAttemptRecoveryOwnership:
@@ -7389,6 +7717,7 @@ class CayuApp:
             raise RuntimeError("Work-attempt recovery claim returned no authority.")
         return _acknowledged_work_attempt_recovery(task_store, claimed, claim_request)
 
+    @_admitted_entrance
     async def _recover_claimed_work_attempt(
         self, ownership: WorkAttemptRecoveryOwnership
     ) -> WorkAttemptAdmission:
@@ -7989,6 +8318,7 @@ class CayuApp:
             lease_seconds=stable.lease_seconds,
         )
 
+    @_tracked_entrance
     async def submit_work_attempt_proposal(
         self,
         request: WorkAttemptProposalRequest,
@@ -8088,12 +8418,14 @@ class CayuApp:
             raise RuntimeError("Admitted completion proposal returned no receipt.")
         return proposal
 
+    @_tracked_entrance
     async def access(self, subject: str):
         """Bind a subject already authenticated by trusted application code."""
         from cayu.resource_access import admit_access
 
         return await admit_access(self, subject)
 
+    @_admitted_entrance
     async def _run_private(
         self,
         request: RunRequest,
@@ -8206,6 +8538,7 @@ class CayuApp:
         if inspection.participant.lifecycle != "active":
             raise PermissionError("Only active participants can execute a session.")
 
+    @_admitted_entrance
     @runtime_stream_entrance
     async def resume(
         self, request: ResumeRequest, *, context: CollaborationAccessContext | None = None
@@ -8227,6 +8560,7 @@ class CayuApp:
             async for event in owned_stream:
                 yield await self._project_emitted_event_for_public_api(event)
 
+    @_admitted_entrance
     async def _resume_private(
         self,
         request: ResumeRequest,
@@ -8276,6 +8610,7 @@ class CayuApp:
             async for item in owned_stream:
                 yield item
 
+    @_admitted_entrance
     @runtime_stream_entrance
     async def compact_session(
         self,
@@ -8298,6 +8633,7 @@ class CayuApp:
             async for event in owned_stream:
                 yield await self._project_emitted_event_for_public_api(event)
 
+    @_admitted_entrance
     async def _compact_session_private(
         self,
         request: CompactSessionRequest,
@@ -8354,6 +8690,7 @@ class CayuApp:
             async for item in owned_stream:
                 yield item
 
+    @_tracked_entrance
     async def enqueue_session_message(
         self,
         request: EnqueueSessionMessageRequest,
@@ -8363,6 +8700,7 @@ class CayuApp:
         """Queue steering; scoped/provenance admission requires trusted context."""
         return await self._session_message_coordinator.enqueue(request, context=context)
 
+    @_tracked_entrance
     async def append_peer_content(
         self,
         request: PeerContentAppendRequest,
@@ -8439,6 +8777,7 @@ class CayuApp:
                 request, pending_transcript_cursor=pending_transcript_cursor
             )
 
+    @_tracked_entrance
     async def read_peer_content(
         self,
         append_key: PeerAppendKey,
@@ -8477,6 +8816,7 @@ class CayuApp:
         except (SessionExportDenied, PeerContentUnavailable):
             return receipt.model_copy(update={"occurrence": None, "disclosure": "withheld"})
 
+    @_tracked_entrance
     async def service_pending_peer_content(
         self, session_id: str, *, context: CollaborationAccessContext
     ) -> tuple[PeerContentReceipt, ...]:
@@ -8503,6 +8843,7 @@ class CayuApp:
             admit=admit,
         )
 
+    @_tracked_entrance
     async def exclude_peer_content(
         self,
         request: PeerContentAppendRequest,
@@ -8586,6 +8927,7 @@ class CayuApp:
                 )
             return await self.session_store.exclude_peer_content(request, reason=reason)
 
+    @_tracked_entrance
     async def expose_peer_content(
         self,
         request: PeerContentExposureRequest,
@@ -8604,6 +8946,7 @@ class CayuApp:
             "Peer exposure receipts are recorded only by the runtime owner."
         )
 
+    @_tracked_entrance
     async def inspect_session_messages(
         self,
         query: SessionMessageQuery,
@@ -8622,6 +8965,7 @@ class CayuApp:
         """Authorize HTTP replay before exposing an earlier acceptance stream."""
         await self._session_message_coordinator.prepare_enqueue(request, context=context)
 
+    @_tracked_entrance
     async def _enqueue_session_message_from_http(
         self,
         request: EnqueueSessionMessageRequest,
@@ -8631,12 +8975,14 @@ class CayuApp:
         """Trusted server entrance; never pass caller-supplied actor objects."""
         return await self._session_message_coordinator.enqueue_from_http(request, context=context)
 
+    @_tracked_entrance
     async def _enqueue_session_message_from_scenario(
         self, request: EnqueueSessionMessageRequest
     ) -> EnqueueSessionMessageResult:
         """Trusted scenario driver entrance; actor identity is runtime-authored."""
         return await self._session_message_coordinator.enqueue_from_scenario(request)
 
+    @_tracked_entrance
     async def _apply_session_message_action_from_http(
         self,
         request: SessionMessageActionRequest,
@@ -8648,6 +8994,7 @@ class CayuApp:
             request, context=context
         )
 
+    @_tracked_entrance
     async def apply_session_message_action(
         self,
         request: SessionMessageActionRequest,
@@ -8657,6 +9004,7 @@ class CayuApp:
         """Withdraw/quarantine an exact record under application-owned authority."""
         return await self._session_message_coordinator.apply_action(request, context=context)
 
+    @_tracked_entrance
     async def snapshot_session_message_source(
         self,
         session_id: str,
@@ -8690,6 +9038,7 @@ class CayuApp:
             expected_authorized_target_instance_id=expected_authorized_target_instance_id,
         )
 
+    @_tracked_entrance
     async def stop_after_current_tool_round(
         self, request: StopAfterCurrentToolRoundRequest
     ) -> SessionSteeringReceipt:
@@ -8701,6 +9050,7 @@ class CayuApp:
             request, session_store=self._runtime_session_store, redactor=self._secret_redactor
         )
 
+    @_tracked_entrance
     async def interrupt_session(self, request: InterruptSessionRequest) -> AsyncIterator[Event]:
         if type(request) is not InterruptSessionRequest:
             raise TypeError("Runtime interruption requires an InterruptSessionRequest.")
@@ -8733,6 +9083,7 @@ class CayuApp:
             async for item in owned_stream:
                 yield item
 
+    @_admitted_entrance
     @execution_owned_by("recovery")
     async def recover_incomplete_session(
         self,
@@ -8769,6 +9120,7 @@ class CayuApp:
         result = await recovery
         return await self._project_incomplete_recovery_result_for_public_api(result)
 
+    @_tracked_entrance
     async def plan_recovery(self, request: RecoveryPlanRequest) -> RecoveryPlan:
         """Build a bounded, read-only recovery plan for this registered app."""
 
@@ -8776,6 +9128,7 @@ class CayuApp:
             raise TypeError("Recovery planning requires a RecoveryPlanRequest.")
         return await self._recovery_plan_coordinator.plan_recovery(request)
 
+    @_admitted_entrance
     async def execute_recovery(self, request: RecoveryExecutionRequest) -> RecoveryReceipt:
         """Execute exact recovery-plan decisions with durable per-session receipts."""
 
@@ -8783,6 +9136,7 @@ class CayuApp:
             raise TypeError("Recovery execution requires a RecoveryExecutionRequest.")
         return await self._recovery_plan_coordinator.execute_recovery(request)
 
+    @_admitted_entrance
     @execution_owned_by("recovery")
     async def recover_model_completion_stage(
         self,
@@ -8823,6 +9177,7 @@ class CayuApp:
             ) from None
         return await self._session_engine.recover_model_completion_stage(request)
 
+    @_admitted_entrance
     async def _recover_incomplete_session_private(
         self,
         request: IncompleteSessionRecoveryRequest,
@@ -8896,6 +9251,7 @@ class CayuApp:
             settle=settle,
         )
 
+    @_tracked_entrance
     async def inspect_session_execution(self, session_id: str) -> SessionExecutionState:
         """Inspect durable execution presence without renewing or claiming any authority."""
         state = await self._runtime_session_store.inspect_session_execution(session_id)
@@ -8908,10 +9264,12 @@ class CayuApp:
             }
         )
 
+    @_tracked_entrance
     async def get_persisted_event_side_effect_health(self) -> PersistedEventSideEffectHealth:
         """Read the store-wide durable fan-out snapshot; never emit or retry events."""
         return await self._runtime_session_store.get_persisted_event_side_effect_health()
 
+    @_tracked_entrance
     async def inspect_recent_tool_round_timing(
         self, session_id: str, *, limit: int = 20
     ) -> tuple[ToolRoundTiming, ...]:
@@ -8919,6 +9277,7 @@ class CayuApp:
         session_id = require_clean_nonblank(session_id, "session_id")
         return self._event_writer.timing.inspect(session_id, limit, ToolRoundTiming)
 
+    @_tracked_entrance
     async def inspect_recent_model_step_preparation_timing(
         self, session_id: str, *, limit: int = 20
     ) -> tuple[ModelStepPreparationTiming, ...]:
@@ -8942,6 +9301,7 @@ class CayuApp:
         """
         await self._event_writer.timing.aclose()
 
+    @_tracked_entrance
     async def query_persisted_event_side_effect_deliveries(
         self,
         query: PersistedEventSideEffectQuery,
@@ -8949,6 +9309,7 @@ class CayuApp:
         """Inspect bounded, sanitized delivery records without acquiring ownership."""
         return await self._runtime_session_store.query_persisted_event_side_effect_deliveries(query)
 
+    @_admitted_entrance
     async def recover_persisted_event_side_effects(self, *, limit: int = 1000) -> list[Event]:
         """Retry committed event fan-out that was not acknowledged before a crash.
 
@@ -8958,6 +9319,7 @@ class CayuApp:
         """
         return await self._event_writer.recover_persisted_side_effects(limit=limit)
 
+    @_admitted_entrance
     @execution_owned_by("recovery")
     async def recover_incomplete_sessions(
         self,
@@ -9001,6 +9363,7 @@ class CayuApp:
         request = copy_incomplete_sessions_recovery_request(request)
         return await self._session_engine.recover_incomplete_sessions(request)
 
+    @_admitted_entrance
     async def dispatch(self, request: DispatchRequest) -> DispatchHandle:
         if type(request) is not DispatchRequest:
             raise TypeError("Runtime dispatch requires a DispatchRequest.")
@@ -9041,6 +9404,7 @@ class CayuApp:
             deep=True,
         )
 
+    @_tracked_entrance
     async def session_invocation_for_dispatch(
         self,
         session_id: str,
@@ -9128,6 +9492,7 @@ class CayuApp:
             effective_arguments=effective_arguments,
         )
 
+    @_admitted_entrance
     async def dispatch_inline(self, request: DispatchRequest) -> AsyncIterator[Event]:
         if type(request) is not DispatchRequest:
             raise TypeError("Inline dispatch requires a DispatchRequest.")
@@ -9657,6 +10022,7 @@ class CayuApp:
                 "Queued dispatch identity conflicts with the target fork's first invocation."
             )
 
+    @_admitted_entrance
     async def _dispatch_queued(
         self,
         envelope: _QueuedDispatchEnvelope,
@@ -9827,6 +10193,7 @@ class CayuApp:
                 async for event in owned_forwarded_stream:
                     yield event
 
+    @_admitted_entrance
     async def verify_completion_proposal(
         self,
         request: CompletionVerifierExecutionRequest,
@@ -9837,6 +10204,7 @@ class CayuApp:
         del request
         return await operation
 
+    @_tracked_entrance
     async def apply_completion_decision(
         self,
         request: CompletionDecisionApplicationRequest,
@@ -9847,6 +10215,7 @@ class CayuApp:
         del request
         return await operation
 
+    @_admitted_entrance
     async def resolve_completion_result(
         self,
         request: CompletionResultResolutionRequest,
@@ -9857,6 +10226,7 @@ class CayuApp:
         del request
         return await operation
 
+    @_tracked_entrance
     async def create_work_contract(self, request: WorkContractDraft) -> WorkContract:
         if type(request) is not WorkContractDraft:
             del request
@@ -9921,6 +10291,7 @@ class CayuApp:
             ) from None
         return published
 
+    @_tracked_entrance
     async def load_work_contract(self, reference: WorkContractRef) -> WorkContract | None:
         if type(reference) is not WorkContractRef:
             del reference
@@ -9994,6 +10365,7 @@ class CayuApp:
             ) from None
         return loaded
 
+    @_tracked_entrance
     async def create_task(self, request: TaskCreate) -> Task:
         if type(request) is not TaskCreate:
             del request
@@ -10242,24 +10614,28 @@ class CayuApp:
         del copied_invocation_snapshot, parent_invocation_snapshot
         return task
 
+    @_tracked_entrance
     async def create_task_group(self, request: TaskGroupCreate) -> TaskGroupCreationReceipt:
         """Atomically create a graph and a completion policy over selected members."""
         from cayu.runtime._task_groups import create_task_group
 
         return await create_task_group(self, request)
 
+    @_tracked_entrance
     async def load_task_group(self, group_id: str) -> TaskGroupSnapshot | None:
         """Inspect a durable group decision without implying member quiescence."""
         from cayu.runtime._task_groups import load_task_group
 
         return await load_task_group(self, group_id)
 
+    @_tracked_entrance
     async def reconcile_task_group(self, group_id: str) -> TaskGroupSnapshot:
         """Advance the durable barrier without overriding a timeout latch."""
         from cayu.runtime._task_groups import reconcile_task_group
 
         return await reconcile_task_group(self, group_id)
 
+    @_tracked_entrance
     async def resolve_task_group_quiescence(
         self,
         request: TaskGroupQuiescenceResolution,
@@ -10269,6 +10645,7 @@ class CayuApp:
 
         return await resolve_task_group_quiescence(self, request)
 
+    @_tracked_entrance
     async def list_task_group_events(
         self, group_id: str, *, after_sequence: int = 0, limit: int = 100
     ) -> list[TaskGroupEvent]:
@@ -10279,18 +10656,21 @@ class CayuApp:
             self, group_id, after_sequence=after_sequence, limit=limit
         )
 
+    @_tracked_entrance
     async def create_task_graph(self, request: TaskGraphCreate) -> TaskGraphCreationReceipt:
         """Atomically submit a bounded self-contained graph through the Python SDK."""
         from cayu.runtime._task_graphs import create_task_graph
 
         return await create_task_graph(self, request)
 
+    @_tracked_entrance
     async def load_task_graph(self, graph_id: str) -> TaskGraphSnapshot | None:
         """Inspect current graph state and retained terminal member evidence."""
         from cayu.runtime._task_graphs import load_task_graph
 
         return await load_task_graph(self, graph_id)
 
+    @_tracked_entrance
     async def list_task_graph_events(
         self, graph_id: str, *, after_sequence: int = 0, limit: int = 100
     ) -> list[TaskGraphEvent]:
@@ -10301,6 +10681,7 @@ class CayuApp:
             self, graph_id, after_sequence=after_sequence, limit=limit
         )
 
+    @_tracked_entrance
     async def reschedule_task(self, request: TaskRescheduleRequest) -> TaskScheduleReceipt:
         """Replace an unadmitted one-shot schedule at its exact durable revision."""
         if type(request) is not TaskRescheduleRequest:
@@ -10309,6 +10690,7 @@ class CayuApp:
             raise RuntimeError("task_store is required to reschedule tasks.")
         return await publish_task_schedule(self.task_store, request, redactor=self._secret_redactor)
 
+    @_tracked_entrance
     async def list_task_schedule_events(
         self, task_id: str, *, after_sequence: int = 0, limit: int = 100
     ) -> list[TaskScheduleEvent]:
@@ -10323,6 +10705,7 @@ class CayuApp:
             redactor=self._secret_redactor,
         )
 
+    @_tracked_entrance
     async def cancel_scheduled_task(
         self, request: TaskScheduleCancelRequest
     ) -> TaskScheduleReceipt:
@@ -10333,6 +10716,7 @@ class CayuApp:
             raise RuntimeError("task_store is required to cancel scheduled tasks.")
         return await publish_task_schedule(self.task_store, request, redactor=self._secret_redactor)
 
+    @_tracked_entrance
     async def pause_task(
         self,
         task_id: str,
@@ -10344,6 +10728,7 @@ class CayuApp:
             raise RuntimeError("task_store is required to pause tasks.")
         return await self.task_store.pause_task(task_id, reason=reason, payload=payload)
 
+    @_tracked_entrance
     async def block_task(
         self,
         task_id: str,
@@ -10355,6 +10740,7 @@ class CayuApp:
             raise RuntimeError("task_store is required to block tasks.")
         return await self.task_store.block_task(task_id, reason=reason, payload=payload)
 
+    @_tracked_entrance
     async def mark_task_needs_attention(
         self,
         task_id: str,
@@ -10370,11 +10756,13 @@ class CayuApp:
             payload=payload,
         )
 
+    @_tracked_entrance
     async def resume_task(self, task_id: str) -> Task:
         if self.task_store is None:
             raise RuntimeError("task_store is required to resume tasks.")
         return await self.task_store.resume_task(task_id)
 
+    @_tracked_entrance
     async def get_session_usage(self, session_id: str) -> SessionUsageSummary:
         return (await self._session_usage_snapshot(session_id)).summary
 
@@ -10400,6 +10788,7 @@ class CayuApp:
         )
         return snapshot.model_copy(update={"summary": summary})
 
+    @_tracked_entrance
     async def get_causal_budget_usage(
         self,
         causal_budget_id: str,
@@ -10467,6 +10856,7 @@ class CayuApp:
     async def _list_all_sessions(self, query: SessionQuery) -> list[Session]:
         return await query_all_sessions(self.session_store, query)
 
+    @_admitted_entrance
     async def run_event_watchers(
         self,
         watchers: Iterable[EventWatcher],
@@ -10613,6 +11003,7 @@ class CayuApp:
             )
         return results
 
+    @_tracked_entrance
     async def get_session_cost(
         self,
         session_id: str,
@@ -10640,6 +11031,7 @@ class CayuApp:
             deep=True,
         )
 
+    @_tracked_entrance
     async def get_causal_budget_cost(
         self,
         causal_budget_id: str,
@@ -10693,6 +11085,7 @@ class CayuApp:
             deep=True,
         )
 
+    @_tracked_entrance
     async def emit_hook_event(
         self,
         *,
@@ -10709,6 +11102,7 @@ class CayuApp:
         emitted = await self._event_writer.emit(event)
         return await self._project_emitted_event_for_public_api(emitted)
 
+    @_admitted_entrance
     @runtime_stream_entrance
     async def fork_session(self, request: ForkSessionRequest) -> AsyncIterator[Event]:
         if type(request) is not ForkSessionRequest:
@@ -10767,6 +11161,7 @@ class CayuApp:
         for event in events:
             yield event
 
+    @_tracked_entrance
     async def snapshot_fork_source(self, source_session_id: str) -> ForkSourceSnapshot:
         """Return exact public authority for one currently safe fork source."""
 
@@ -11354,6 +11749,7 @@ class CayuApp:
             registered_environment,
         )
 
+    @_admitted_entrance
     async def resolve_user_input(
         self,
         response: UserInputResponse,
@@ -11452,6 +11848,7 @@ class CayuApp:
                 yield event
         await self._event_writer.recover_persisted_side_effects()
 
+    @_admitted_entrance
     @execution_owned_by("recovery")
     async def recover_user_input(
         self,
@@ -11552,6 +11949,7 @@ class CayuApp:
             async for event in owned_stream:
                 yield event
 
+    @_admitted_entrance
     async def resolve_tool_approval(
         self,
         request: ToolApprovalRequest,
@@ -11591,6 +11989,7 @@ class CayuApp:
             async for event in owned_stream:
                 yield await self._project_emitted_event_for_public_api(event)
 
+    @_admitted_entrance
     async def resolve_provider_operation(
         self,
         request: ProviderOperationResolutionRequest,
@@ -11773,6 +12172,7 @@ class CayuApp:
                 yield event
         await self._event_writer.recover_persisted_side_effects()
 
+    @_admitted_entrance
     @execution_owned_by("recovery")
     async def recover_tool_approval(
         self,
@@ -11870,6 +12270,7 @@ class CayuApp:
             async for event in owned_stream:
                 yield event
 
+    @_tracked_entrance
     async def inspect_tool_effect(
         self, session_id: str, *, tool_round_id: str, tool_call_id: str
     ) -> ToolEffectReconciliationTarget:
@@ -11911,6 +12312,7 @@ class CayuApp:
             }
         )
 
+    @_admitted_entrance
     async def reconcile_tool_effect(
         self,
         request: ToolEffectReconciliationRequest,
@@ -12000,6 +12402,7 @@ class CayuApp:
             async for event in owned_stream:
                 yield await self._project_emitted_event_for_public_api(event)
 
+    @_admitted_entrance
     @execution_owned_by("recovery")
     async def recover_tool_round(
         self,
@@ -12407,6 +12810,7 @@ class CayuApp:
 
         return reserve
 
+    @_tracked_entrance
     async def emit_event(self, event: Event) -> Event:
         """Publish an event to the session store and all sinks.
 
@@ -12417,6 +12821,7 @@ class CayuApp:
         emitted = await self._emit_event_private(event)
         return await self._project_emitted_event_for_public_api(emitted)
 
+    @_tracked_entrance
     async def _emit_event_private(self, event: Event) -> Event:
         if not isinstance(event, Event):
             raise TypeError("emit_event requires an Event instance.")
@@ -12450,6 +12855,7 @@ class CayuApp:
             async for item in owned_stream:
                 yield item
 
+    @_tracked_entrance
     async def emit_events(self, session_id: str, events: list[Event]) -> list[Event]:
         """Persist events for one session and fan them out to runtime sinks.
 

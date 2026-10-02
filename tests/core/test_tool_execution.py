@@ -720,7 +720,7 @@ def test_remember_knowledge_operator_interrupt_returns_while_publication_finishe
     assert receipt is not None
 
 
-def test_app_shutdown_seals_and_bounds_registered_knowledge_publications() -> None:
+def test_app_knowledge_drain_is_scoped_to_the_app_and_leaves_the_shared_tool_open() -> None:
     class ShutdownStalledStore(_StalledKnowledgePublicationStore):
         def __init__(self) -> None:
             super().__init__()
@@ -751,89 +751,105 @@ def test_app_shutdown_seals_and_bounds_registered_knowledge_publications() -> No
             finally:
                 self.stopped.set()
 
+    def scoped(context: ToolContext, app: CayuApp, key: str) -> ToolContext:
+        # Mirror the per-call binding performed by the app's tool-round executor.
+        bound = context.model_copy(update={"idempotency_key": key})
+        bound._bind_runtime_knowledge_publication_scope(app._knowledge_publication_scope)
+        return bound
+
     async def run():
         store = ShutdownStalledStore()
         tool = RememberKnowledgeTool()
         app = CayuApp(enable_logging=False)
-        app.register_agent(
-            AgentSpec(name="assistant", model="fake-model"),
-            tools=[tool],
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[tool])
+        context = ToolContext(session_id="shutdown-publication", knowledge_store=store)
+        invocation = asyncio.create_task(
+            tool.run(scoped(context, app, "shutdown-publication-operation"), {"text": "Kept."})
         )
-        context = ToolContext(
-            session_id="shutdown-publication",
-            idempotency_key="shutdown-publication-operation",
-            knowledge_store=store,
-        )
-        invocation = asyncio.create_task(tool.run(context, {"text": "Retained knowledge."}))
         await asyncio.wait_for(store.dispatched.wait(), timeout=10)
         invocation.cancel("caller left")
         with pytest.raises(asyncio.CancelledError, match="caller left"):
             await invocation
 
+        # The app waits for the publication it started but never stops it.
         first_close = asyncio.create_task(app.drain_knowledge_publications(timeout_s=0.01))
         await asyncio.sleep(0)
-        second_close = asyncio.create_task(app.drain_knowledge_publications(timeout_s=1))
+        second_close = asyncio.create_task(app.drain_knowledge_publications(timeout_s=0.05))
         first_result, second_result = await asyncio.gather(first_close, second_close)
-        await asyncio.wait_for(store.stopped.wait(), timeout=1)
-        while tool._publication_owner:
-            await asyncio.sleep(0)
+        still_publishing = not store.stopped.is_set() and len(tool._publication_owner) == 1
+        tool_sealed = tool._publication_owner.sealed
 
         receipt_reads_before_rejection = store.receipt_reads
         rejected = await tool.run(
-            context.model_copy(update={"idempotency_key": "post-shutdown-operation"}),
-            {"text": "New knowledge after shutdown."},
+            scoped(context, app, "post-shutdown-operation"), {"text": "New after shutdown."}
         )
         late_tool = RememberKnowledgeTool()
-        app.register_agent(
-            AgentSpec(name="late-agent", model="fake-model"),
-            tools=[late_tool],
-        )
+        app.register_agent(AgentSpec(name="late-agent", model="fake-model"), tools=[late_tool])
         late_rejected = await late_tool.run(
-            context.model_copy(update={"idempotency_key": "late-registration-operation"}),
-            {"text": "Late registered knowledge."},
+            scoped(context, app, "late-registration-operation"), {"text": "Late knowledge."}
         )
+        receipt_reads_after_rejection = store.receipt_reads
+
+        # Whoever owns the tool closes it permanently; that bounds the publication.
+        tool_closed = await tool.aclose(timeout_s=0.01)
+        await asyncio.wait_for(store.stopped.wait(), timeout=1)
         return (
             first_result,
             second_result,
+            still_publishing,
+            tool_sealed,
             rejected,
             late_rejected,
             store.publish_calls,
             receipt_reads_before_rejection,
-            store.receipt_reads,
+            receipt_reads_after_rejection,
+            tool_closed,
         )
 
     (
         first_result,
         second_result,
+        still_publishing,
+        tool_sealed,
         rejected,
         late_rejected,
         publish_calls,
         receipt_reads_before_rejection,
-        receipt_reads,
+        receipt_reads_after_rejection,
+        tool_closed,
     ) = asyncio.run(run())
 
     assert first_result is False
     assert second_result is False
-    assert rejected.is_error is True
+    assert still_publishing is True
+    assert tool_sealed is False
     assert rejected.structured["outcome"] == "publication_owner_closed"
-    assert late_rejected.is_error is True
     assert late_rejected.structured["outcome"] == "publication_owner_closed"
     assert publish_calls == 1
-    assert receipt_reads == receipt_reads_before_rejection
+    assert receipt_reads_after_rejection == receipt_reads_before_rejection
+    assert tool_closed is False
 
 
-def test_failed_registration_after_shutdown_does_not_seal_an_unregistered_tool() -> None:
-    app = CayuApp(enable_logging=False)
-    app.seal_knowledge_publications()
-    tool = RememberKnowledgeTool()
-
-    with pytest.raises(ValueError, match="Duplicate tool registered for agent"):
-        app.register_agent(
-            AgentSpec(name="rejected-agent", model="fake-model"),
-            tools=[tool, tool],
+def test_knowledge_tool_shared_by_two_apps_keeps_serving_the_open_app() -> None:
+    async def run():
+        store = _StalledKnowledgePublicationStore()
+        store.release.set()
+        tool = RememberKnowledgeTool()
+        closing = CayuApp(enable_logging=False)
+        serving = CayuApp(enable_logging=False)
+        for app in (closing, serving):
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[tool])
+        assert await closing.drain_knowledge_publications(timeout_s=1) is True
+        context = ToolContext(
+            session_id="shared-tool", idempotency_key="shared-tool-op", knowledge_store=store
         )
+        context._bind_runtime_knowledge_publication_scope(serving._knowledge_publication_scope)
+        return await tool.run(context, {"text": "Still accepted."}), tool._publication_owner.sealed
 
-    assert tool._publication_owner.sealed is False
+    result, tool_sealed = asyncio.run(run())
+
+    assert result.is_error is False
+    assert tool_sealed is False
 
 
 @pytest.mark.parametrize("read_phase", ["receipt", "entry"])

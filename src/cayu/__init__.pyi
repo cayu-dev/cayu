@@ -3384,6 +3384,30 @@ from cayu.runtime._task_group_invocation import (
 )
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot as UsageAccountingSnapshot
 from cayu.runtime._usage_accounting import UsageIdentitySummary as UsageIdentitySummary
+from cayu.runtime.application_lifecycle import (
+    ApplicationAdmission as ApplicationAdmission,
+)
+from cayu.runtime.application_lifecycle import (
+    ApplicationAdmissionsSealed as ApplicationAdmissionsSealed,
+)
+from cayu.runtime.application_lifecycle import (
+    ApplicationShutdown as ApplicationShutdown,
+)
+from cayu.runtime.application_lifecycle import (
+    ApplicationShutdownOutcome as ApplicationShutdownOutcome,
+)
+from cayu.runtime.application_lifecycle import (
+    ApplicationShutdownStep as ApplicationShutdownStep,
+)
+from cayu.runtime.application_lifecycle import (
+    ShutdownBudget as ShutdownBudget,
+)
+from cayu.runtime.application_lifecycle import (
+    ShutdownStepSpec as ShutdownStepSpec,
+)
+from cayu.runtime.application_lifecycle import (
+    SupportsAsyncClose as SupportsAsyncClose,
+)
 from cayu.runtime.authority import SessionRunFenced as SessionRunFenced
 from cayu.runtime.checks import DiagnosticSeverity as DiagnosticSeverity
 from cayu.runtime.checks import ProjectCheckReport as ProjectCheckReport
@@ -6054,6 +6078,11 @@ __all__ = [
     "AlwaysRequireApprovalToolPolicy",
     "AnthropicProvider",
     "AppManifest",
+    "ApplicationAdmission",
+    "ApplicationAdmissionsSealed",
+    "ApplicationShutdown",
+    "ApplicationShutdownOutcome",
+    "ApplicationShutdownStep",
     "ApplicationStores",
     "ApplyPatchTool",
     "ApprovedEgressDestination",
@@ -8010,6 +8039,8 @@ __all__ = [
     "SharedArtifactPublicationReceipt",
     "SharedArtifactRef",
     "SharedSessionClosureStore",
+    "ShutdownBudget",
+    "ShutdownStepSpec",
     "StaleRecoveryPlanError",
     "StartupRecoveryBlockedSession",
     "StartupRecoveryResult",
@@ -8042,6 +8073,7 @@ __all__ = [
     "SubagentResultTool",
     "SubagentSpec",
     "SubagentTool",
+    "SupportsAsyncClose",
     "SyncBinding",
     "SyncBindingContext",
     "SyncBindingSourceConflictError",

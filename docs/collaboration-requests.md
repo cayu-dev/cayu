@@ -791,10 +791,12 @@ claims. Reading a page does not execute or settle its records.
 
 Cancellation or timeout can stop observing a mutation while it remains owned.
 Use exact readback rather than assuming that the operation was aborted. During
-shutdown, call `drain_collaboration_requests()` before closing the collaboration
-store. Draining closes new operations on that shared collaboration owner and
-waits boundedly for retained operations; an unavailable result means draining
-must be observed again.
+shutdown, call `drain_collaboration_requests()` (or `app.aclose()`, which includes
+it) before closing the collaboration store. Draining refuses this application's
+new collaboration operations and waits for every operation pending on the store,
+up to `timeout_s` (by default the application's observation bound). The store
+itself stays open, so other applications sharing it keep working; close it once
+every application using it has drained. An unavailable result means draining must be observed again.
 
 Observation reads reconcile against the current owner event frontier in the
 same store transaction as readback. Publication before registration, during

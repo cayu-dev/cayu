@@ -273,6 +273,12 @@ class Harness(NamedTuple):
 class _SecretFreeDispatchRuntime:
     """Test runtime implementing the mandatory durable-dispatch boundary."""
 
+    lifecycle_state = "open"
+
+    @staticmethod
+    async def _run_worker_step(step):
+        return await step()
+
     @staticmethod
     def redact_dispatch_request(request: DispatchRequest) -> DispatchRequest:
         return copy_dispatch_request(request)

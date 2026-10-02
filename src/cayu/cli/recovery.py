@@ -12,7 +12,13 @@ from typing import Any
 from pydantic import ValidationError
 
 from cayu.cli._output import add_output_options, output_destination
-from cayu.cli.project import ProjectError, build_project_app, project_context, resolve_project
+from cayu.cli.project import (
+    ProjectError,
+    build_project_app,
+    close_project_app,
+    project_context,
+    resolve_project,
+)
 from cayu.sessions.base import SessionStatus
 from cayu.sessions.recovery import (
     RECOVERY_PLAN_MAX_CONCURRENCY,
@@ -166,7 +172,10 @@ async def _run_recovery(args: argparse.Namespace) -> int:
         project = resolve_project(args.target, command="cayu recovery plan")
         with project_context(project.root):
             app = build_project_app(project.target, command="Recovery plan")
-            result = await app.plan_recovery(request)
+            try:
+                result = await app.plan_recovery(request)
+            finally:
+                await close_project_app(app)
     elif args.recovery_command == "execute":
         plan = RecoveryPlan.model_validate_json(
             _read_bounded_file(Path(args.plan_file), limit=_MAX_PLAN_FILE_BYTES)
@@ -191,7 +200,10 @@ async def _run_recovery(args: argparse.Namespace) -> int:
         project = resolve_project(args.target, command="cayu recovery execute")
         with project_context(project.root):
             app = build_project_app(project.target, command="Recovery execute")
-            result = await app.execute_recovery(request)
+            try:
+                result = await app.execute_recovery(request)
+            finally:
+                await close_project_app(app)
     else:
         raise ValueError("Unknown recovery command.")
     print(result.model_dump_json(indent=2))

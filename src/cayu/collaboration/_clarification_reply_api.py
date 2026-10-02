@@ -100,7 +100,9 @@ async def accept_reply(coordinator, app, request, *, context):
             or request.source.ref.session_instance_id != intent.target.incarnation
         ):
             raise CollaborationConflict("Reply source or service selection conflicts.")
-        authority = TemporaryServicePermitAuthority(store, initialized, redactor=redactor)
+        authority = TemporaryServicePermitAuthority(
+            store, initialized, redactor=redactor, owners=app._request_coordinator.owners
+        )
         if await authority.lookup(intent) != registered:
             raise CollaborationUnavailable("Reply service responsibility changed.")
         raw_native = await app.session_store.load_session_operation(

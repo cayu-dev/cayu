@@ -97,6 +97,7 @@ from cayu.events import (
     event_with_runtime_payload_authority,
     validate_event_envelope,
 )
+from cayu.knowledge._publication import KnowledgePublicationScope
 from cayu.mcp.tools import McpToolAdapter, McpToolset
 from cayu.messages import Message
 from cayu.observability.hooks import (
@@ -729,6 +730,7 @@ class ToolRoundExecutor:
         checkpoint_transform: CheckpointTransformFactory,
         apply_limit_evaluation: LimitEventStream,
         close_interrupted_round: InterruptedRoundEventStream,
+        knowledge_publication_scope: KnowledgePublicationScope,
         browser_control_service: BrowserControlService | None = None,
         image_decode_policy: ImageDecodePolicy | None = None,
         strict_common_budget_admission: bool = False,
@@ -752,6 +754,7 @@ class ToolRoundExecutor:
         self._close_interrupted_round = close_interrupted_round
         self._browser_control_service = browser_control_service
         self._strict_common_budget_admission = strict_common_budget_admission
+        self._knowledge_publication_scope = knowledge_publication_scope
         self._workspace_capture_operations = BoundedInvocationOperationRegistry(
             max_operations=_MAX_RETAINED_WORKSPACE_CAPTURE_OPERATIONS
         )
@@ -3821,6 +3824,7 @@ class ToolRoundExecutor:
             workspace=raw_workspace,
             artifact_store=raw_artifact_store,
         )
+        tool_context._bind_runtime_knowledge_publication_scope(self._knowledge_publication_scope)
         if effective_tool_call.name == SEARCH_TOOLS_NAME:
             if registered_agent.tool_discovery_mode is None:
                 raise RuntimeError("search_tools execution requires enabled tool discovery.")

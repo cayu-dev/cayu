@@ -11,7 +11,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from cayu.collaboration._capabilities import CapabilityDescriptor, FamilyVersion, require_capability
 from cayu.collaboration._contracts import (
@@ -170,6 +170,7 @@ class SessionContinuationOwner:
         receiver_capability: CapabilityDescriptor,
         redactor: SecretRedactor,
         temporary_permits: TemporaryServicePermitAuthority | None = None,
+        track: Callable[[asyncio.Task[Any]], None] | None = None,
     ) -> None:
         if not store._supports_session_continuation_protocol():
             raise ContinuationUnavailable("Session store does not qualify continuation ownership.")
@@ -189,6 +190,9 @@ class SessionContinuationOwner:
             redactor=redactor,
         )
         self.owners = _MutationOwners()
+        # Lets the owning application's shutdown wait for work this owner retains;
+        # None when the owner is used on its own, outside an application.
+        self._track = track
         self.temporary_permits = temporary_permits
 
     async def _observe(
@@ -240,6 +244,7 @@ class SessionContinuationOwner:
                 key=key,
                 expectation=expected,
                 redactor=self.redactor,
+                track=self._track,
                 failure_snapshot=lambda error: _failure_graph(error, self.redactor),
                 result_failure=lambda result: (
                     result.failure if type(result) is _ContinuationServiceReadFailure else None

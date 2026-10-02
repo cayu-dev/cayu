@@ -20,7 +20,6 @@ from cayu._validation import copy_durable_metadata, copy_json_value
 from cayu.approvals.tools import ResolutionActor, resolution_actor_payload
 from cayu.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime._session_control import clear_current_task_cancellation
 from cayu.sessions._terminal_evidence import interruption_request_id_from_payload
 from cayu.sessions.base import (
     InterruptSessionRequest,
@@ -281,6 +280,7 @@ class BackgroundInterruptionCoordinator:
         self._worker_stop = asyncio.Event()
         self._states: dict[str, _BackgroundInterruptionCascadeState] = {}
         self._draining = False
+        self._sealed = False
         self._shutdown_active = False
         self._workers_stopped = asyncio.Event()
 
@@ -301,6 +301,19 @@ class BackgroundInterruptionCoordinator:
         deferred = self._deferred.get(parent_session_id)
         return deferred is not None and deferred.drain_required
 
+    @property
+    def sealed(self) -> bool:
+        return self._sealed
+
+    def seal(self) -> None:
+        """Refuse new background cascades for application shutdown.
+
+        Refused work keeps its durable parent marker for the next process to
+        recover. ``drain`` itself never seals, so it remains usable selectively.
+        """
+
+        self._sealed = True
+
     async def drain(self, *, timeout_s: float = 10.0) -> bool:
         """Wait for accepted background interruption cascades to finish.
 
@@ -319,11 +332,9 @@ class BackgroundInterruptionCoordinator:
         self._draining = True
         try:
             return await self._drain_background_interruptions_started(float(timeout_s))
-        except asyncio.CancelledError:
-            clear_current_task_cancellation()
-            await self._cancel_background_interruption_work()
-            raise
         except BaseException:
+            # The caller's cancellation is already delivered; keep its request
+            # count intact so enclosing timeouts and task groups stay balanced.
             await self._cancel_background_interruption_work()
             raise
         finally:
@@ -416,6 +427,12 @@ class BackgroundInterruptionCoordinator:
             await asyncio.gather(deferred_task, return_exceptions=True)
         await self._stop_background_interruption_workers()
 
+    @property
+    def pending(self) -> bool:
+        """Whether accepted cascade work is still running or waiting to run."""
+
+        return bool(self._tasks) or bool(self._deferred)
+
     def _has_drain_required_background_interruptions(self) -> bool:
         return any(deferred.drain_required for deferred in self._deferred.values())
 
@@ -440,7 +457,7 @@ class BackgroundInterruptionCoordinator:
                     retry_request=retry_request,
                 )
             return None
-        if self._draining and not allow_during_drain:
+        if (self._draining or self._sealed) and not allow_during_drain:
             return None
         if len(self._tasks) >= _BACKGROUND_INTERRUPTION_CONCURRENCY:
             self.defer(
@@ -511,7 +528,7 @@ class BackgroundInterruptionCoordinator:
         drain_required: bool,
         retry_request: dict[str, Any] | None,
     ) -> None:
-        if self._draining and not drain_required:
+        if (self._draining or self._sealed) and not drain_required:
             return
         retry_at_monotonic = time.monotonic() + max(0.0, retry_after_seconds)
         existing = self._deferred.get(parent_session_id)

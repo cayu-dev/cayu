@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib
 import os
 import subprocess
 import sys
+import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
@@ -408,3 +411,62 @@ def test_entrypoint_redacts_workload_secrets_before_bounding_provider_errors(
         assert REDACTED_SECRET in err
     assert secret[:12] not in err
     assert secret not in err
+
+
+def test_entrypoint_closes_the_app_after_the_run(capsys) -> None:
+    closed: list[str] = []
+
+    class ClosedMarker:
+        async def close(self) -> None:
+            closed.append("closed")
+
+    apps: list[CayuApp] = []
+
+    def factory() -> CayuApp:
+        app = CayuApp(enable_logging=False, owned_resources=(ClosedMarker(),))
+        app.register_provider(_completed_provider("Answered."), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        apps.append(app)
+        return app
+
+    assert run_project_entrypoint(factory, ["--message", "Answer."]) == 0
+    assert capsys.readouterr().out.strip() == "Answered."
+    assert apps[0].lifecycle_state == "closed"
+    assert closed == ["closed"]
+
+
+def test_entrypoint_shutdown_owns_the_model_policy_stop(capsys) -> None:
+    release = threading.Event()
+    observed: list[str] = []
+    apps: list[CayuApp] = []
+
+    def factory() -> CayuApp:
+        app = CayuApp(enable_logging=False)
+        app.register_provider(_completed_provider("Answered."), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        async def blocked_stop_model_policy() -> None:
+            # Unblocked only once shutdown is seen running, so the stop happens
+            # inside aclose() rather than before it.
+            await asyncio.to_thread(release.wait, 10)
+
+        app.stop_model_policy = blocked_stop_model_policy  # ty: ignore[invalid-assignment]
+        apps.append(app)
+        return app
+
+    def watch() -> None:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if apps and apps[0].lifecycle_state != "open":
+                observed.append(apps[0].lifecycle_state)
+                break
+            time.sleep(0.01)
+        release.set()
+
+    watcher = threading.Thread(target=watch)
+    watcher.start()
+    assert run_project_entrypoint(factory, ["--message", "Answer."]) == 0
+    watcher.join()
+    assert observed == ["closing"]
+    assert apps[0].lifecycle_state == "closed"
+    assert capsys.readouterr().out.strip() == "Answered."

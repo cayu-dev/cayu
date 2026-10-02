@@ -252,6 +252,35 @@ class CompletionResultResolverCoordinator:
             LeasedAdapterSettlement[CapturedAwaitableOutcome[None]]
         ]()
 
+    @property
+    def pending(self) -> bool:
+        """Whether retained adapters, heartbeats or settlements are still running."""
+
+        return self._adapter_runner.pending
+
+    async def drain(self, *, timeout_s: float) -> bool:
+        """Wait up to ``timeout_s`` for retained work, without cancelling it."""
+
+        return await self._adapter_runner.wait_idle(timeout_s)
+
+    def report_retained_failures(self) -> list[BaseException]:
+        """Return, once each, retained resolutions whose cleanup failed."""
+
+        failures: list[BaseException] = []
+        # Detaching is idempotent, so a failure detached earlier stays unchanged.
+        for failure in self._adapter_runner.report_settlement_failures():
+            if failure is None:
+                failures.append(
+                    self._safe_execution_error(
+                        "A retained completion result resolution ended without a settlement."
+                    )
+                )
+            elif exception_tree_contains(failure, _PROCESS_CONTROL_SIGNALS):
+                failures.append(self._detached_process_control_failure(failure))
+            else:
+                failures.append(self._detached_cleanup_failure(failure))
+        return failures
+
     def _ensure_process_local_generation(self) -> None:
         self._adapter_runner.ensure_process_local(
             lambda: self._safe_execution_error(

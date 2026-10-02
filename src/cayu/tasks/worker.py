@@ -89,6 +89,7 @@ from cayu.runtime._task_store_operation_boundary import (
     task_store_interrupted_handoff_capability_is_complete,
     task_store_mutation_is_cancellation_quiescent,
 )
+from cayu.runtime.application_lifecycle import ApplicationAdmissionsSealed
 from cayu.runtime.authority import SessionRunFenced
 from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
@@ -102,6 +103,8 @@ from cayu.sessions.base import IncompleteSessionRecoveryRequest, SessionStatus
 from cayu.tasks._execution_settlement import TaskExecutionSettlement
 from cayu.tasks._schedule_wakeup import next_schedule_wake_at
 from cayu.tasks.base import (
+    _TASK_CANCELLATION_REQUESTED_REASON,
+    _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
     InterruptedTaskContinuationClaimPage,
     TaskCancellationReconciliationEvent,
     TaskCancellationReconciliationEvidence,
@@ -365,7 +368,7 @@ async def run_task_worker(
         raise ValueError(
             "worker_id contains a workload secret and cannot be used as durable task authority."
         )
-    if max_tasks == 0 or _is_stopped(stop):
+    if max_tasks == 0 or _worker_should_stop(app, stop):
         return 0
     if not task_store_cancellation_reconciliation_capability_is_complete(task_store):
         raise NotImplementedError(
@@ -494,7 +497,7 @@ async def run_task_worker(
             else:
                 expired_handoff_after = recovery_page.next_after
                 next_interrupted_handoff_recovery_at = 0.0
-            if _is_stopped(stop):
+            if _worker_should_stop(app, stop):
                 return DurableWorkerStep(stop=True, activity=meaningful_activity)
         continuation_activity = False
         handled_this_step = 0
@@ -538,13 +541,13 @@ async def run_task_worker(
                 handled_this_step += 1
                 if (
                     max_tasks is not None and handled + handled_this_step >= max_tasks
-                ) or _is_stopped(stop):
+                ) or _worker_should_stop(app, stop):
                     return DurableWorkerStep(
                         handled=handled_this_step,
                         stop=True,
                         activity=True,
                     )
-        if _is_stopped(stop):
+        if _worker_should_stop(app, stop):
             return DurableWorkerStep(
                 handled=handled_this_step,
                 stop=True,
@@ -686,8 +689,16 @@ async def run_task_worker(
             if not callable(subscribe_to_admissions)
             else await subscribe_to_admissions((query,))
         )
+
+        async def counted_step(now: float, handled: int) -> DurableWorkerStep:
+            # Checked before any maintenance: a closing app's stores may already
+            # be closed. A step already running is waited for by shutdown.
+            if _worker_should_stop(app, stop):
+                return DurableWorkerStep(stop=True)
+            return await app._run_worker_step(lambda: run_step(now, handled))
+
         return await run_durable_worker_loop(
-            run_step,
+            counted_step,
             poll_interval_s=poll_interval_s,
             stop=stop,
             max_handled=max_tasks,
@@ -929,6 +940,21 @@ async def _handle_with_heartbeat_owned(
             nonlocal handler_error
 
             if handler_error is not None:
+                # Only this worker's own closing app counts as shutdown: a refusal
+                # from another, closed app is an ordinary handler failure.
+                if (
+                    isinstance(handler_error, ApplicationAdmissionsSealed)
+                    and app.lifecycle_state != "open"
+                    and await _settle_task_refused_by_shutdown(
+                        task_store,
+                        task.id,
+                        worker_id,
+                        lease_authority,
+                        holds_lease_lock=task.retry_series is None,
+                    )
+                ):
+                    handler_error = None
+                    return
                 if pending_runtime_task_failure is not None:
                     await _settle_pending_runtime_task_failure_owner(
                         app,
@@ -3804,6 +3830,54 @@ async def _safe_fail_unfinished(
 
 def _is_stopped(stop: asyncio.Event | None) -> bool:
     return worker_stop_requested(stop)
+
+
+async def _settle_task_refused_by_shutdown(
+    task_store: TaskStore,
+    task_id: str,
+    worker_id: str,
+    lease_authority: _TaskLeaseAuthority,
+    *,
+    holds_lease_lock: bool,
+) -> bool:
+    """Leave a claim the closing app refused for the next worker, without failing it.
+
+    An unattached claim goes back to pending. A task already attached to a session
+    or settled keeps its lease until it expires, and owner-loss recovery continues
+    it as after a crash. Returns False when a requested cancellation must still
+    settle through the ordinary failure path.
+    """
+
+    current = await task_store.load_task(task_id)
+    if current is not None and current.status_reason in _TASK_CANCELLATION_REASONS:
+        return False
+    if (
+        current is None
+        or current.status is not TaskStatus.CLAIMED
+        or current.worker_id != worker_id
+        or current.session_id is not None
+    ):
+        return True
+    # A retry-policy task settles without the lease lock; take it so a renewal
+    # in flight cannot leave the release with a stale lease expiry.
+    async with contextlib.nullcontext() if holds_lease_lock else lease_authority.lock:
+        # A claim that moved on or changed meanwhile is left to lease expiry.
+        with contextlib.suppress(TaskClaimLost, TaskTerminalizationConflict):
+            await task_store.release_task(
+                task_id, worker_id, lease_expires_at=lease_authority.lease_expires_at
+            )
+    return True
+
+
+_TASK_CANCELLATION_REASONS = frozenset(
+    {_TASK_CANCELLATION_REQUESTED_REASON, _TASK_RETRY_CANCELLATION_REQUESTED_REASON}
+)
+
+
+def _worker_should_stop(app: CayuApp, stop: asyncio.Event | None) -> bool:
+    # A closing application refuses new runs, so claiming more work would only
+    # take tasks away from the next worker.
+    return _is_stopped(stop) or app.lifecycle_state != "open"
 
 
 async def _wait_or_stop(seconds: float, stop: asyncio.Event | None) -> bool:

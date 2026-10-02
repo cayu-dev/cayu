@@ -505,9 +505,10 @@ certified.
 `cayu worker <name>` is a process-role adapter over this same factory contract.
 It discovers the nearest configured project, enters its import context, and
 builds the app exactly once. The named worker receives only the app and a
-cooperative stop event. The CLI owns signals and a bounded shutdown wait but
-does not infer task queries, handlers, recovery policy, or abandoned-session
-boundaries. See [project workers](project-workers.md).
+cooperative stop event. The CLI owns signals and a bounded shutdown wait, then
+closes the app with `aclose()` using what remains of that grace, but it does not
+infer task queries, handlers, recovery policy, or abandoned-session boundaries.
+See [project workers](project-workers.md).
 
 `CayuApp.describe()` emits a structural, redacted manifest plus bounded dynamic
 inspection fields. Agent entries expose
@@ -519,6 +520,158 @@ including `workspace_branch_lifecycle`, remain visible but do not enter the
 structural application fingerprint. Corpus finalization compares that structural
 identity rather than the complete dynamic manifest snapshot, while still failing
 closed if the target key, release identity, or structural fingerprint changes.
+
+## Application lifecycle and shutdown
+
+`await app.aclose(timeout_s=30.0)` is the one shutdown call for an embedded
+`CayuApp`, and `async with CayuApp(...) as app:` runs it on exit. It composes the
+public drains in their dependency order under one shared deadline and returns an
+`ApplicationShutdownOutcome`. It never raises merely because work is unfinished;
+the outcome says so. Each part stays usable alone: `seal_admissions()`, every
+`drain_*` method, and the `cayu.runtime` building blocks `ShutdownBudget`,
+`ApplicationAdmission`, and `ApplicationShutdown`. `outcome.summary()` renders
+one content-free line for logs and terminals.
+
+`app.lifecycle_state` is `open`, then `closing` once admissions are sealed, then
+`closed` after a settled shutdown. Admissions never reopen: a closing or closed
+app cannot be entered as a context manager again or start another Cayu server
+lifespan, so build a new app instead.
+
+**Admission.** `aclose()` first seals admissions, which `seal_admissions()` also
+does on its own. Entrances that start or continue model or tool execution,
+verifiers, or workers then raise `ApplicationAdmissionsSealed`: `run`, `resume`,
+`fork_session`, `compact_session`, `replay_session`, `resolve_tool_approval`,
+`resolve_user_input`, `resolve_provider_operation`, `recover_tool_round`,
+`recover_tool_approval`, `recover_user_input`, `recover_incomplete_session`,
+`recover_incomplete_sessions`, `recover_model_completion_stage`,
+`recover_work_attempt`, `recover_session_continuation`,
+`recover_persisted_event_side_effects`, `recover_collaboration_wait`,
+`execute_recovery`, `dispatch`, `dispatch_inline`, `admit_work_attempt`,
+`execute_participant_session`, `execute_participant_session_to_wait`,
+`execute_producer_output`, `service_clarification`,
+`service_producer_disposition`, `resume_pending_interruption_cascades`,
+`run_event_watchers`, `refresh_mcp_toolset`, `start_model_policy`,
+`verify_completion_proposal`, `resolve_completion_result`, and
+`reconcile_tool_effect`, along with the private entrances other Cayu components
+(workers, dispatch, memory execution, session continuation, and evaluation) use
+to start execution. Every other entrance (reads, inspections, lookups, task and
+collaboration writes, cleanup, terminal persistence, cancellation, and
+interruption) stays available, but a call still running is waited for exactly
+like admitted work, so stores are never closed under it. Only `aclose()`, the
+drains, `flush_runtime_timing()`, `close_runtime_timing()`, and
+`stop_model_policy()` are not counted. Each operation counts once: a call it
+makes in its own task is part of it. Work an
+admitted operation starts while it is still running, including in a background
+task it spawned (for example a background subagent run), is not refused, and it
+is counted like any admitted operation, so shutdown waits for it even after its
+parent finished. A leftover task that calls in after its operation finished is
+refused like any new work. Once an attempt finds nothing left in flight and every
+step settled, admission closes for good in the same instant, before owned
+resources are released: from then on every counted entrance is refused, allowed
+ones included, so no operation can reach a resource that is closing or closed.
+Only the shutdown parts listed above stay callable. Streams are admitted when
+first advanced and release their admission when they finish or are closed. A
+stream you stop reading but never close keeps its run counted until the
+deadline, so close it, for example with `contextlib.aclosing`.
+
+**Order.** One deadline covers these steps:
+
+| Step | What it waits for |
+| --- | --- |
+| `open_operations` | Admitted and allowed operations finish. They are waited for, never interrupted. |
+| `model_policy` | Model policy workers stop, so they make no further provider calls; runs even after the deadline is used up. |
+| `background_interruptions` | Interruption cascades and foreground child delivery, sealed only now. |
+| `recovery_cleanups` | Supervised recovery cleanup. |
+| `provider_operation_cancellations` | Provider cancellation owners, sealed only after interruptions settled. |
+| `environment_cleanups` | Retained environment and parked egress cleanup. |
+| `knowledge_publications`, `collaboration_requests`, `session_exports`, `verified_completions` | This app's work in each, concurrently; `verified_completions` waits for a completion verifier or result resolver, with its heartbeat and settlement, still running after its call returned, timed out, or was cancelled. Such work that then failed makes one attempt's step `failed`; an earlier `drain_verified_completions()` call or attempt that reported it consumes that report, and the record stays for the exact retry. A verified task worker reports failures of work it holds. |
+| `runtime_timing` | Timing delivery stops. |
+| `owned_resources` | Only when every earlier step settled. |
+
+A step gets whatever remains of the deadline. The model policy, interruption,
+provider cancellation, and timing steps, and each owned resource's `close()`,
+still run briefly after the deadline is used up, because nothing after them would
+stop that work or release those resources, so a shutdown can overrun its
+`timeout_s` by up to about 0.3 seconds for each of those steps and 0.05 seconds
+for each owned resource. A step skipped because the deadline is used up still
+refuses its subsystem's new work (knowledge publications, collaboration requests,
+session exports). A drain that does not return within its budget is reported as
+`overran_budget` and kept running; the next attempt joins it before draining that
+subsystem again. If it ended with an error, that attempt reports the late failure
+(re-raising a process-control signal after the remaining steps ran), and the
+subsystem is drained afresh on the attempt after.
+
+**Outcome.** `status` is `settled`, `incomplete`, or `failed`. Each step records
+its `status`, budget, elapsed time, a fixed `reason` (`open_operations`,
+`still_draining`, `overran_budget`, `deadline_exhausted`, `late_work`,
+`unowned_cancellations`, or `retained_until_settled`), and, when it failed, only
+the exception's type name. A failing step does not skip later steps; a step whose
+seal raises is a failed step too. Work that a later step started again (for
+example a cleanup that scheduled an interruption cascade) turns an earlier settled
+step into `late_work`, and a provider operation refused a cancellation owner after
+sealing is `unowned_cancellations`. `open_operations` counts operations still
+running at the end of the attempt; any such operation makes the `open_operations`
+step not settled. The outcome is `scope="process_local"`: it says nothing about
+other processes that share the same durable stores.
+
+**Retry and cancellation.** A settled outcome is final and returned again by
+later calls. After an incomplete or failed outcome, the next call runs a new
+attempt with a fresh deadline. Concurrent callers share one attempt. Cancelling a
+caller cancels only that caller: the attempt keeps running under its own deadline
+and a later call joins it. A process-control signal raised by a drain (such as
+`KeyboardInterrupt`) is re-raised after the remaining steps ran. A drain that
+ends with its own `CancelledError`, or with an exception group holding only
+cancellations and ordinary failures, is a failed step and never cancels the
+caller; a group is re-raised, unchanged, only when it contains a process-control
+signal. Shutdown logs a failure with its subsystem and exception type only,
+never the exception's message or causes, which could carry secrets.
+
+**Ownership.** The app never closes stores, providers, or other resources a caller
+supplied. Pass `owned_resources=(...)` to hand some over: each needs an async
+`close()`, and they are closed once (even if handed over twice), in reverse order,
+only after every step settled. Each close is bounded by the deadline. A close that
+fails or runs over stops the release there: the remaining resources stay open, the
+outcome is `failed` or `incomplete`, and the next attempt joins a close still
+running or calls a failed `close()` again. Otherwise release your own resources
+only once `app.shutdown_outcome.settled` is true; on an incomplete outcome keep
+them open and call `aclose()` again. Do not wrap the app in `async with` blocks of stores
+that close unconditionally on exit, such as `ApplicationStores`; hand them to the
+app through `owned_resources` instead.
+
+Knowledge tools and collaboration stores can be shared by several applications,
+so shutdown is scoped to the app. `drain_knowledge_publications()` refuses this
+app's new publications and waits for the ones it started; the registered tool
+stays open for other apps, and its own `aclose()` remains the permanent close.
+`drain_collaboration_requests()` refuses this app's new collaboration work and,
+without closing the shared store, waits for every operation pending on it. Some
+application paths run on the store's owners directly and cannot be told apart
+from other applications' work, so this may also wait for another application's
+short store writes rather than report settled too early. Work still running
+after its step reports `late_work`.
+
+Cayu's task worker (`run_task_worker`), dispatch worker
+(`TaskStoreDispatcher.run_worker`), and `VerifiedTaskWorker` check their own app
+when they start and before every step, including maintenance, and stop once it is
+no longer open. A step already running is counted, so `aclose()` waits for it.
+A task or dispatch claimed just as the app sealed is released back to its queue
+instead of failing, unless its cancellation was requested, which still settles;
+one already attached to a session, and a verified attempt, records no terminal
+outcome and is recovered once its lease expires. A refusal from a different,
+closed app is an ordinary handler failure. Calling `aclose()` from inside a worker
+handler or another counted operation waits on that operation itself, so it runs
+to the deadline and reports `incomplete`.
+
+`run_event_watchers` is an admitted operation, so stop your watchers before
+calling `aclose()`; otherwise they hold `open_operations` until the deadline.
+Stop workers the same way, or let them observe the closing app and return. After
+sealing, MCP refreshes triggered by server notifications are skipped, and one
+already running is waited for like any admitted operation. Browser control stays
+owned by its host.
+The Cayu server closes the app under one deadline equal to its interruption and
+knowledge publication grace periods combined, and `cayu worker`, `cayu recovery`,
+and generated `run.py` entrypoints call `aclose()` for you. The server and `run.py`
+start model policy workers and leave stopping them to `aclose()`, so a stalled
+policy stop is bounded by that deadline and reported like any other step.
 
 ## Transcript search and recall
 
@@ -6105,6 +6258,12 @@ requires mutation belongs behind Cayu's ordinary effect, idempotency, approval,
 and recovery contracts. Execution has an explicit timeout shorter than the
 verification lease. The app owns at most 64 active or draining adapter tasks;
 capacity exhaustion fails before another claim mutation or adapter dispatch.
+`app.aclose()` and `app.drain_verified_completions()` wait, without cancelling,
+for a draining adapter, its claim heartbeat and its settlement. A failed
+settlement is reported once, by the first of them to see it, and stays retained:
+the exact retry still raises its failure, or reports the execution as still
+draining when the settlement ended without an outcome. A verified task worker
+reports failures of the executions it owns itself.
 Every coordinator generation contributes a runtime-minted execution-owner ID
 to the durable verification claim. An exact live claim owned by another app or
 reconstructed worker therefore cannot authorize a second adapter dispatch;
@@ -6196,7 +6355,9 @@ bounded to 64 active or draining adapters, and has an explicit timeout of at mos
 300 seconds. Caller cancellation and process-control signals remain authoritative.
 An adapter-owned cancellation is an ordinary resolver failure, and an adapter that
 does not settle after caller cancellation or timeout remains draining so the same
-application cannot overlap another exact read. Before adapter dispatch, Cayu
+application cannot overlap another exact read; `app.aclose()` and
+`app.drain_verified_completions()` wait for it without cancelling it and report
+a failed cleanup once, leaving it for the exact retry. Before adapter dispatch, Cayu
 atomically compares the task's attached, authenticated immutable session-instance ID
 and reserves that exact session incarnation for the deterministic result event. A
 missing or same-ID replacement session therefore fails before adapter work even when

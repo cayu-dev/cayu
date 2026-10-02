@@ -16,15 +16,24 @@ local agent registration. Duplicate local-agent or Cloud-scope mappings are
 rejected.
 
 For direct API use, call `await app.start_model_policy()` before creating
-defaulted sessions and `await app.stop_model_policy()` during shutdown. The
-standard project entrypoint and HTTP server (`create_server` and `mount_cayu`)
-own these calls automatically.
-With a server application lifespan, application resources start before policy
-workers and close after policy workers and server work have stopped.
-Direct applications can use `async with app.model_policy_lifespan():` to preserve
-both an application failure and any shutdown failure.
-Stores and manually supplied channels belong to the application and must be
-closed after the workers stop. No network connection is opened by construction.
+defaulted sessions, and stop the workers during shutdown: `await app.aclose()`
+asks them to stop within its shutdown deadline and reports a stop that runs over
+in `app.shutdown_outcome`, and `await app.stop_model_policy()` waits for them
+without a deadline. The standard project entrypoint and HTTP server
+(`create_server` and `mount_cayu`) start the workers and leave stopping them to
+`aclose()`. Once the workers stop, work still running past the shutdown deadline
+cannot start new defaulted sessions; it fails closed instead of guessing a model.
+
+Stores and manually supplied channels belong to the application and must stay
+open until the workers have stopped. With a server application lifespan,
+application resources start before policy workers and close after `aclose()`
+returns; if the stop ran over, it is abandoned when the host's event loop exits,
+and an ownership lease it was releasing expires on its own. To keep the policy
+store and channels open until the stop settles, hand them to the app with
+`owned_resources=(...)` instead of closing them in the host lifespan. Direct
+applications can use `async with app.model_policy_lifespan():` to preserve both
+an application failure and any shutdown failure; its stop waits without a
+deadline. No network connection is opened by construction.
 
 ## Generated projects
 

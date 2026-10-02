@@ -127,9 +127,11 @@ entrypoint policy. The supervisor controls process lifecycle, not external
 container cleanup or sandbox isolation. Windows process mode is unsupported.
 
 SIGINT and SIGTERM set the cooperative event and allow the configured grace
-period. Normal completion exits `0`, SIGINT after cooperative shutdown exits
-`130`, SIGTERM exits `143`, validation or startup failure exits `1`, and a
-shutdown timeout exits `124` after cancelling the local worker task. Exit `124`
+period. When the target returns, the CLI closes the app with `app.aclose()`,
+using what remains of that grace after a signal, and prints a warning if the
+shutdown did not settle. Normal completion exits `0`, SIGINT after cooperative
+shutdown exits `130`, SIGTERM exits `143`, validation or startup failure exits
+`1`, and a shutdown timeout exits `124` after cancelling the local worker task. Exit `124`
 is a hard process boundary so even a cancellation-resistant target cannot
 extend the configured grace period. Project import, factory, and entrypoint
 `SystemExit` failures are converted into labeled CLI errors rather than escaping

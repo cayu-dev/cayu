@@ -210,7 +210,10 @@ it as an async context manager; if closing reports `VerifiedTaskWorkerDraining`,
 alone or inside an exception group, keep the worker and its stores and retry
 `aclose()` until it returns. A cancellation is reported as a cancellation, so
 treat a cancelled worker's stores the same way the application treats any
-cancelled operation that may still have work in flight.
+cancelled operation that may still have work in flight. Close the worker before
+`app.aclose()`, which waits for an attempt still executing before its stores can
+close. A worker left running stops claiming once the app closes, and an attempt
+cut off by shutdown records no terminal outcome, so recovery resumes it.
 
 ## The same concepts in other domains
 

@@ -33,6 +33,7 @@ from cayu.runtime._task_store_operation_boundary import (
     raise_task_store_operation_failure,
     task_store_verified_task_worker_capability_is_complete,
 )
+from cayu.runtime.application_lifecycle import ApplicationAdmissionsSealed
 from cayu.runtime.work_attempt_lifecycle import (
     WorkAttemptLifecycleSettlement,
     WorkAttemptPreEntrySettlementEvidence,
@@ -712,6 +713,9 @@ class VerifiedTaskWorker:
     async def run(self, stop: asyncio.Event | None = None, max_tasks: int | None = None) -> int:
         if self._closed:
             raise RuntimeError("VerifiedTaskWorker is closed.")
+        # A closing app's stores may already be closed: do no settlement work.
+        if self.app.lifecycle_state != "open":
+            return 0
         if self._running is not None:
             raise VerifiedTaskWorkerDraining("The prior worker run must settle before another run.")
         if max_tasks is not None and (type(max_tasks) is not int or max_tasks < 0):
@@ -906,8 +910,24 @@ class VerifiedTaskWorker:
             assert failure is not None
             raise failure from exception_cause(failure)
 
-    async def _step(self, _now: float, _handled: int) -> DurableWorkerStep:
-        await self._group_maintenance.step(self.store, self.app._secret_redactor, now=_now)
+    async def _step(self, now: float, _handled: int) -> DurableWorkerStep:
+        # A closing app refuses new execution and its stores may already be
+        # closed, so stop before any maintenance. A running step is counted, so
+        # the app's shutdown waits for it.
+        if self.app.lifecycle_state != "open":
+            return DurableWorkerStep(stop=True)
+        try:
+            return await self.app._run_worker_step(lambda: self._claim_and_run(now))
+        except ApplicationAdmissionsSealed:
+            # Only this worker's own closing app is shutdown; nothing terminal
+            # was recorded, and the claim expires and is reclaimed as after a
+            # crash. A refusal from another app is an ordinary failure.
+            if self.app.lifecycle_state == "open":
+                raise
+            return DurableWorkerStep(stop=True, activity=True)
+
+    async def _claim_and_run(self, now: float) -> DurableWorkerStep:
+        await self._group_maintenance.step(self.store, self.app._secret_redactor, now=now)
         recovered = await self._discover_unfinished_attempt()
         if recovered is not None:
             return recovered
@@ -1560,6 +1580,13 @@ class VerifiedTaskWorker:
             ):
                 pass
         except Exception as failure:
+            if (
+                isinstance(failure, ApplicationAdmissionsSealed)
+                and self.app.lifecycle_state != "open"
+            ):
+                # This app's shutdown is not an execution failure; the admitted
+                # attempt stays recoverable.
+                raise
             reason = (
                 "work_contract_elapsed_limit"
                 if isinstance(failure, ExecutionDeadlineExceeded)

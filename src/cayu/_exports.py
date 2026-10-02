@@ -1,6 +1,17 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "ApplicationAdmission": ("cayu.runtime.application_lifecycle", "ApplicationAdmission"),
+    "ApplicationAdmissionsSealed": (
+        "cayu.runtime.application_lifecycle",
+        "ApplicationAdmissionsSealed",
+    ),
+    "ApplicationShutdown": ("cayu.runtime.application_lifecycle", "ApplicationShutdown"),
+    "ApplicationShutdownOutcome": (
+        "cayu.runtime.application_lifecycle",
+        "ApplicationShutdownOutcome",
+    ),
+    "ApplicationShutdownStep": ("cayu.runtime.application_lifecycle", "ApplicationShutdownStep"),
     "ContinuationConflict": ("cayu.runtime._session_continuation", "ContinuationConflict"),
     "ContinuationUnavailable": ("cayu.runtime._session_continuation", "ContinuationUnavailable"),
     "ContinuationDiscoveryPage": (
@@ -49,6 +60,9 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.collaboration._producer_inspection",
         "ProducerOutputInspection",
     ),
+    "ShutdownBudget": ("cayu.runtime.application_lifecycle", "ShutdownBudget"),
+    "ShutdownStepSpec": ("cayu.runtime.application_lifecycle", "ShutdownStepSpec"),
+    "SupportsAsyncClose": ("cayu.runtime.application_lifecycle", "SupportsAsyncClose"),
     "WaitDiscoveryCursor": ("cayu.collaboration._wait_discovery", "WaitDiscoveryCursor"),
     "WaitDiscoveryPage": ("cayu.collaboration._wait_discovery", "WaitDiscoveryPage"),
     "WaitRecovery": ("cayu.collaboration._wait_discovery", "WaitRecovery"),
@@ -6426,12 +6440,20 @@ EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 PUBLIC_NAMES = [
+    "ApplicationAdmission",
+    "ApplicationAdmissionsSealed",
+    "ApplicationShutdown",
+    "ApplicationShutdownOutcome",
+    "ApplicationShutdownStep",
     "ModelStepPreparationTiming",
     "RuntimePhaseTiming",
     "RuntimeTimingConfig",
     "RuntimeTimingRecord",
     "RuntimeTimingSink",
     "RuntimeTimingStatus",
+    "ShutdownBudget",
+    "ShutdownStepSpec",
+    "SupportsAsyncClose",
     "ToolCallTiming",
     "ToolRoundTiming",
     "ContinuationConflict",

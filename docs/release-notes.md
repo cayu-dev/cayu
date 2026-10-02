@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- Add `CayuApp.aclose()` and `async with CayuApp(...)`: one shutdown call that
+  refuses new runs, recoveries, and dispatches, waits for operations in flight,
+  and drains every subsystem in dependency order under one shared deadline. It
+  returns one `ApplicationShutdownOutcome` with per-step results instead of
+  raising for unfinished work, and retrying an incomplete shutdown runs a new
+  attempt. The app never closes caller-supplied stores or providers; hand them
+  over with `owned_resources=(...)` to have them closed after a settled
+  shutdown. The Cayu server, `cayu worker`, `cayu recovery`, and generated
+  `run.py` now call it, so the server's shutdown grace is one deadline (the
+  interruption and knowledge publication graces combined) and it now also
+  drains collaboration requests and session exports.
+  `drain_knowledge_publications()` no longer seals shared knowledge tools; it
+  waits for this app's publications. `drain_collaboration_requests()` no longer
+  closes the shared collaboration store; it refuses this app's new work and
+  waits for every operation pending on the store. Cancelling a
+  `drain_background_interruptions()` caller now leaves that cancellation in
+  place instead of clearing it. Cayu's task, dispatch, and verified-work workers
+  stop once their app closes; a task or dispatch claimed during shutdown goes
+  back to its queue, and work already attached to a session is recovered after
+  its lease expires instead of failing. A shut-down app can no longer start a
+  second server lifespan. `ApplicationStores.close()` retries only the stores
+  that failed to close, and concurrent callers share one close. Shutdown also
+  waits, without cancelling, for completion verification and result resolution
+  still running after their call returned (`app.drain_verified_completions()`),
+  and reports such work that then failed instead of settling.
+
 - Record provider rejections during automatic compaction as failures. Each
   rejected compactor attempt now also publishes `model.error` with the same
   `status_code`, `provider_error_type`, `provider_error_code`, `retryable`, and

@@ -27,6 +27,8 @@ from cayu._task_wait import (
 _T = TypeVar("_T")
 _DrainT = TypeVar("_DrainT")
 
+_SETTLEMENT_START_POLL_SECONDS = 0.01
+
 
 @dataclass(slots=True)
 class _SingleFlightLock:
@@ -60,6 +62,7 @@ class LeasedAdapterSettlement(Generic[_T]):
     settlement_task: asyncio.Task[_T] | None = field(default=None, init=False, repr=False)
     settlement_failure: BaseException | None = field(default=None, init=False, repr=False)
     settlement_processed: bool = field(default=False, init=False)
+    failure_reported: bool = field(default=False, init=False)
 
 
 class LeasedAdapterRunner(Generic[_DrainT]):
@@ -86,6 +89,77 @@ class LeasedAdapterRunner(Generic[_DrainT]):
     @property
     def active_heartbeat_count(self) -> int:
         return len(self._heartbeat_tasks)
+
+    def _running(self) -> tuple[set[asyncio.Future[object]], bool]:
+        running: set[asyncio.Future[object]] = {*self._adapter_tasks, *self._heartbeat_tasks}
+        unsettled = False
+        for drain in self._drains.values():
+            # Only a settlement records whether its work has finished.
+            if not isinstance(drain, LeasedAdapterSettlement):
+                continue
+            task = drain.settlement_task
+            if task is None:
+                # The adapter finished but its settlement has not started yet.
+                unsettled = True
+            elif not task.done():
+                running.add(cast("asyncio.Future[object]", task))
+        return running, unsettled
+
+    def report_settlement_failures(self) -> list[BaseException | None]:
+        """Return, once each, retained settlements that finished without success.
+
+        ``None`` stands for a settlement that ended without an outcome. A reported
+        drain stays retained, so the exact retry still receives and acknowledges
+        its failure.
+        """
+
+        reported: list[BaseException | None] = []
+        for drain in self._drains.values():
+            if not isinstance(drain, LeasedAdapterSettlement) or drain.failure_reported:
+                continue
+            task = drain.settlement_task
+            if task is None or not task.done():
+                continue
+            if drain.settlement_processed:
+                if drain.settlement_failure is None:
+                    continue
+                reported.append(drain.settlement_failure)
+            elif task.cancelled() or task.exception() is not None:
+                reported.append(None)
+            else:
+                # Its done callback has not recorded the outcome yet.
+                continue
+            drain.failure_reported = True
+        return reported
+
+    @property
+    def pending(self) -> bool:
+        """Whether adapters, heartbeats or settlements this runner owns still run."""
+
+        running, unsettled = self._running()
+        return bool(running) or unsettled
+
+    async def wait_idle(self, timeout_s: float) -> bool:
+        """Wait up to ``timeout_s`` for owned work to finish, without cancelling it.
+
+        Adapters may resist cancellation, so shutdown only observes them; work
+        still running when the time is up keeps running and is reported.
+        """
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while True:
+            running, unsettled = self._running()
+            if not running and not unsettled:
+                return True
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            if running:
+                await asyncio.wait(running, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+            else:
+                # A finished adapter's settlement starts from its done callback.
+                await asyncio.sleep(min(remaining, _SETTLEMENT_START_POLL_SECONDS))
 
     def ensure_process_local(
         self,

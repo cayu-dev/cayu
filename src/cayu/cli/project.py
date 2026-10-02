@@ -17,6 +17,7 @@ from typing import Any
 from cayu.applications import CayuApp
 from cayu.cli._targets import TargetResolutionError, load_target
 from cayu.project_control_plane import ProjectControlPlaneContext
+from cayu.runtime.application_lifecycle import DEFAULT_APPLICATION_SHUTDOWN_TIMEOUT_SECONDS
 
 
 @dataclass(frozen=True)
@@ -322,6 +323,16 @@ def project_context(root: Path) -> Iterator[None]:
         os.chdir(original_cwd)
         sys.path[:] = original_path
         importlib.invalidate_caches()
+
+
+async def close_project_app(
+    app: CayuApp, *, timeout_s: float = DEFAULT_APPLICATION_SHUTDOWN_TIMEOUT_SECONDS
+) -> None:
+    """Close a project application, warning on stderr when work was left unsettled."""
+
+    outcome = await app.aclose(timeout_s=timeout_s)
+    if not outcome.settled:
+        print(f"warning: {outcome.summary()}", file=sys.stderr, flush=True)
 
 
 def build_project_app(target: str, *, command: str = "Project") -> CayuApp:

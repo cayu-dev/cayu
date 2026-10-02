@@ -7,6 +7,7 @@ process-local completion authority is introduced here.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from hashlib import sha256
@@ -186,6 +187,35 @@ class VerifiedCompletionCoordinator:
             event_writer=event_writer,
             secret_redactor=secret_redactor,
         )
+
+    @property
+    def pending(self) -> bool:
+        """Whether verification or result resolution retained past its caller still runs."""
+
+        return self.verifier.pending or self.resolver.pending
+
+    async def drain(self, *, timeout_s: float) -> bool:
+        """Wait up to ``timeout_s`` for retained verification and resolution work.
+
+        Raises the failures of retained work that finished unsuccessfully, each
+        once; their records stay for the exact retry, which still raises them.
+        """
+
+        results = await asyncio.gather(
+            self.verifier.drain(timeout_s=timeout_s),
+            self.resolver.drain(timeout_s=timeout_s),
+            return_exceptions=True,
+        )
+        # Both drains always finish; report every failure instead of leaving one
+        # unobserved behind the other's exception.
+        failures = [result for result in results if isinstance(result, BaseException)]
+        failures += self.verifier.report_retained_failures()
+        failures += self.resolver.report_retained_failures()
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("Verified completion drains failed.", failures)
+        return all(results)
 
     def _require_store(self) -> TaskStore:
         if self._task_store is None:

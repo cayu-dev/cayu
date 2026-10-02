@@ -37,7 +37,7 @@ from cayu.collaboration._mandate_validation import (
     MandateUse,
     validate_mandate_resolution,
 )
-from cayu.collaboration._ownership import _MutationOwners
+from cayu.collaboration._ownership import _MutationOwners, _MutationScope
 from cayu.collaboration._preparation import contract_bytes, prepare_contract, require_exact_contract
 from cayu.collaboration._request_arbitration import (
     admit_in_transaction,
@@ -235,8 +235,10 @@ class RequestCoordinator:
         self._participants = participants
         self._registration = registration
         self._redactor = redactor
-        self._owners = (
-            participants._store._owners
+        # Share the store's mutation ownership through an application-scoped view:
+        # closing this application's requests must not close the shared store.
+        self._owners: _MutationOwners | _MutationScope = (
+            participants._store._owners.scope()
             if registration is not None and participants._store is not None
             else _MutationOwners()
         )
@@ -425,8 +427,14 @@ class RequestCoordinator:
         require_exact_contract(registered, policy, redactor=self._redactor)
         return prepare_contract(ClarificationPolicy, registered, redactor=self._redactor)
 
-    async def close(self) -> None:
-        await self._owners.drain()
+    @property
+    def owners(self) -> _MutationOwners | _MutationScope:
+        """This application's collaboration mutation owners."""
+
+        return self._owners
+
+    async def close(self, *, timeout_s: float | None = None) -> None:
+        await self._owners.drain(timeout_s=timeout_s)
 
     async def _dependency(self, operation: Callable[[], Awaitable[T]]) -> T:
         task = asyncio.current_task()
