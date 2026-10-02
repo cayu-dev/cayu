@@ -214,7 +214,9 @@ def test_legacy_shaped_approval_limit_skip_resumes_after_restart(
                 )
             ]
             pending = (await store.load_checkpoint(session_id))["pending_tool_approval"]
-            now[0] += timedelta(days=3)
+            # Session-scope elapsed time starts at the store-owned creation
+            # timestamp, not the application's independently injected clock.
+            now[0] = (await store.load(session_id)).created_at + timedelta(days=3)
             _ = await _resolve(app, session_id, "approval")
             before = await store.load_events(session_id)
             skip = next(event for event in before if event.type == EventType.TOOL_CALL_FAILED)

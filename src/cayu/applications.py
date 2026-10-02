@@ -1494,7 +1494,9 @@ class CayuApp:
             max_environment_lifecycle_owners=self._max_environment_lifecycle_owners,
             egress_authority_adoption_handler=egress_authority_adoption_handler,
             execution_presence_stopped=lambda session_id, run_epoch: (
-                self._session_control.execution_presence.stop(session_id, run_epoch=run_epoch)
+                self._session_control.execution_presence.stop_and_wait(
+                    session_id, run_epoch=run_epoch
+                )
             ),
         )
         self._run_limit_controller = RunLimitController(
@@ -5110,9 +5112,19 @@ class CayuApp:
         return self._tool_round_executor.terminal_publication_metrics()
 
     async def drain_recovery_cleanups(self, *, timeout_s: float = 10.0) -> bool:
-        """Wait boundedly for active and outcome-unknown recovery cleanup."""
+        """Wait boundedly for recovery cleanup and stopped execution-presence writes."""
 
-        return await self._recovery_cleanup_supervisor.drain(timeout_s=timeout_s)
+        if type(timeout_s) not in {int, float} or not isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("timeout_s must be a finite positive number.")
+        deadline = asyncio.get_running_loop().time() + timeout_s
+        recovered = await self._recovery_cleanup_supervisor.drain(timeout_s=timeout_s)
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return False
+        presence_released = await self._session_control.execution_presence.drain(
+            timeout_s=remaining,
+        )
+        return recovered and presence_released
 
     async def drain_environment_cleanups(self, *, timeout_s: float = 10.0) -> bool:
         """Settle this process's retained cleanup without cancelling live mutations.

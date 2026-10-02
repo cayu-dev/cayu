@@ -676,6 +676,7 @@ async def test_openai_background_rejects_malformed_reasoning_without_progress(
                 state=state,
                 first=None,
                 reasoning_state="inline",
+                credential_values=(),
             ):
                 pass
         evidence = controller.evidence((ProviderDeadlineKind.SEMANTIC_IDLE,))
@@ -727,6 +728,7 @@ async def test_openai_background_reasoning_progress_is_exact_across_reconnect() 
                 state=initial_state,
                 first=None,
                 reasoning_state="inline",
+                credential_values=(),
             )
         ]
         after_added = controller.evidence((ProviderDeadlineKind.SEMANTIC_IDLE,))
@@ -751,6 +753,7 @@ async def test_openai_background_reasoning_progress_is_exact_across_reconnect() 
                 state=pending_state,
                 first=None,
                 reasoning_state="inline",
+                credential_values=(),
             ):
                 pass
         after_conflict = controller.evidence((ProviderDeadlineKind.SEMANTIC_IDLE,))
@@ -770,6 +773,7 @@ async def test_openai_background_reasoning_progress_is_exact_across_reconnect() 
                 state=pending_state,
                 first=None,
                 reasoning_state="inline",
+                credential_values=(),
             )
         ]
         after_done = controller.evidence((ProviderDeadlineKind.SEMANTIC_IDLE,))
@@ -794,6 +798,7 @@ async def test_openai_background_reasoning_progress_is_exact_across_reconnect() 
                 state=completed_state,
                 first=None,
                 reasoning_state="inline",
+                credential_values=(),
             ):
                 pass
         after_duplicate = controller.evidence((ProviderDeadlineKind.SEMANTIC_IDLE,))
@@ -854,6 +859,7 @@ async def test_openai_background_restores_legacy_pending_reasoning_after_restart
             state=legacy_state,
             first=None,
             reasoning_state="inline",
+            credential_values=(),
         ):
             pass
 
@@ -878,6 +884,7 @@ async def test_openai_background_restores_legacy_pending_reasoning_after_restart
             state=legacy_state,
             first=None,
             reasoning_state="inline",
+            credential_values=(),
         )
     ]
 

@@ -581,6 +581,8 @@ def _assert_typed_error_contract(
     events: list[ModelStreamEvent],
 ) -> None:
     payload = events[0].payload if len(events) == 1 else {}
+    # Bedrock's SDK diagnostic boundary withholds request identities; HTTP
+    # adapters retain this validated, non-secret transport request ID.
     valid = (
         len(events) == 1
         and events[0].type == ModelStreamEventType.ERROR
@@ -589,7 +591,8 @@ def _assert_typed_error_contract(
         and payload.get("status_code") == 429
         and payload.get("provider_error_type") == "rate_limit_error"
         and payload.get("provider_error_code") == "rate_limit_exceeded"
-        and payload.get("request_id") is None
+        and payload.get("request_id")
+        == (None if registration.name == "bedrock" else "123e4567-e89b-42d3-a456-426614174101")
         and payload.get("retryable") is registration.retries_failed_requests
         and payload.get("retry_after_s") == 0.25
     )
@@ -1116,7 +1119,12 @@ async def test_provider_conformance_propagates_context_overflow_as_typed_excepti
     assert error.provider == registration.expected_error_provider
     assert error.status_code == 400
     assert error.error_code == "context_length_exceeded"
-    assert error.request_id is None
+    # These adapters explicitly reconstruct overflow errors without request IDs.
+    assert error.request_id == (
+        None
+        if registration.name in {"bedrock", "openai-subscription"}
+        else "123e4567-e89b-42d3-a456-426614174102"
+    )
     assert error.retryable is False
 
 

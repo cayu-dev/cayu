@@ -7,10 +7,18 @@ import pytest
 
 from cayu.collaboration._capabilities import CapabilityDescriptor
 from cayu.collaboration._clarification_state import clarification_commitment
-from cayu.collaboration._contracts import CollaborationConflict, ObjectRef, OperationRef
+from cayu.collaboration._contracts import (
+    CollaborationConflict,
+    ExactMatch,
+    ExactNotFound,
+    ExactUnavailable,
+    ObjectRef,
+    OperationRef,
+)
 from cayu.collaboration._request_coordinator import _initiator
 from cayu.collaboration.exports import SessionExportRef
 from cayu.collaboration.mandates import ResourceSelector
+from cayu.collaboration.participants import CollaborationUnavailable
 from cayu.collaboration.requests import RequestAdmissionCommand, RequestOutcomeCommand
 from cayu.messages import Message
 from cayu.runtime._session_continuation import (
@@ -21,6 +29,27 @@ from cayu.runtime._session_continuation import (
 from cayu.runtime._session_continuation_owner import LATCH_FAMILY, SessionContinuationOwner
 from cayu.sessions.base import ResumeRequest
 from cayu.vaults.redaction import SecretRedactor
+
+
+async def _admit_with_readback(app, admission, *, context):
+    try:
+        return await app.admit_collaboration_request(admission, context=context)
+    except CollaborationUnavailable as error:
+        # A bounded public observer can expire while the receiving owner still
+        # commits. Authenticate that exact command rather than assuming a failed
+        # write, issuing a replacement, or requiring one-shot acknowledgement.
+        failure = error
+    try:
+        async with asyncio.timeout(30):
+            while True:
+                observed = await app.lookup_collaboration_admission(admission, context=context)
+                if isinstance(observed, ExactMatch):
+                    return observed.receipt
+                assert isinstance(observed, (ExactNotFound, ExactUnavailable)), observed
+                await asyncio.sleep(0.01)
+    except TimeoutError:
+        pass
+    raise failure
 
 
 async def finish_original_wait(
@@ -155,8 +184,8 @@ async def finish_original_wait(
             await app.inspect_collaboration_request(accepted.expected, context=actor_a.context)
             == prior
         )
-    admitted = await app.admit_collaboration_request(admission, context=actor_b.context)
-    assert await app.admit_collaboration_request(admission, context=actor_b.context) == admitted
+    admitted = await _admit_with_readback(app, admission, context=actor_b.context)
+    assert await _admit_with_readback(app, admission, context=actor_b.context) == admitted
     terminal = RequestOutcomeCommand(
         operation=initialized.operation("final-outcome"),
         expected=accepted.expected,

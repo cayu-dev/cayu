@@ -119,6 +119,142 @@ async def _consume(stream):
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+@pytest.mark.parametrize("cancel_during_release", [False, True])
+def test_public_run_waits_for_exact_execution_presence_release(
+    backend, cancel_during_release, request, sqlite_resources
+):
+    async def scenario():
+        async with _stores(backend, request, sqlite_resources) as (store, _):
+            session_id = f"await-presence-release-{cancel_during_release}"
+            provider = VersionedFakeProvider(
+                [[ModelStreamEvent.completed({"finish_reason": "stop"})]]
+            )
+            app = _app(store, provider)
+            entered, release = asyncio.Event(), asyncio.Event()
+            original = store._release_session_execution
+            released = []
+
+            async def delayed_release(owner):
+                entered.set()
+                await release.wait()
+                await original(owner)
+                released.append(owner)
+
+            store._release_session_execution = delayed_release
+            task = asyncio.create_task(
+                _consume(
+                    app.run(
+                        RunRequest(
+                            session_id=session_id,
+                            agent_name="assistant",
+                            messages=[Message.text("user", "complete")],
+                        )
+                    )
+                )
+            )
+            try:
+                await asyncio.wait_for(entered.wait(), 30)
+                assert not task.done() and not released
+                if cancel_during_release:
+                    task.cancel("cancel during presence release")
+                    await asyncio.sleep(0)
+                    assert not task.done()
+                release.set()
+                if cancel_during_release:
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                    assert task.cancelled() and task.cancelling() == 1
+                else:
+                    await task
+                assert len(released) == 1
+                assert not app._session_control.execution_presence.groups
+                assert (await store.load(session_id)).status is SessionStatus.COMPLETED
+                assert len(provider.requests) == 1
+            finally:
+                release.set()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+@pytest.mark.parametrize("cancel_during_release", [False, True])
+def test_public_run_retains_blocked_presence_release_for_bounded_drain(
+    backend, cancel_during_release, request, sqlite_resources, monkeypatch
+):
+    from cayu.runtime import _session_execution_presence as presence_module
+
+    monkeypatch.setattr(presence_module, "_RELEASE_WAIT_SECONDS", 0.1)
+
+    async def scenario():
+        async with _stores(backend, request, sqlite_resources) as (store, _):
+            session_id = f"retained-presence-release-{cancel_during_release}"
+            provider = VersionedFakeProvider(
+                [[ModelStreamEvent.completed({"finish_reason": "stop"})]]
+            )
+            app = _app(store, provider)
+            entered, release = asyncio.Event(), asyncio.Event()
+            original = store._release_session_execution
+            released = []
+
+            async def delayed_release(owner):
+                entered.set()
+                await release.wait()
+                await original(owner)
+                released.append(owner)
+
+            monkeypatch.setattr(store, "_release_session_execution", delayed_release)
+            task = asyncio.create_task(
+                _consume(
+                    app.run(
+                        RunRequest(
+                            session_id=session_id,
+                            agent_name="assistant",
+                            messages=[Message.text("user", "complete")],
+                        )
+                    )
+                )
+            )
+            try:
+                await asyncio.wait_for(entered.wait(), 30)
+                presence = app._session_control.execution_presence
+                group = next(iter(presence.groups.values()))
+                if cancel_during_release:
+                    task.cancel("first cancellation")
+                    await asyncio.sleep(0)
+                    task.cancel("second cancellation")
+                done, _ = await asyncio.wait({task}, timeout=5)
+                assert task in done, "Presence release must not indefinitely hold the caller"
+                if cancel_during_release:
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                    assert task.cancelled() and task.cancelling() == 2
+                else:
+                    assert (await task)[-1].type is EventType.SESSION_COMPLETED
+                assert not released and not group.task.done()
+                assert group.stop.is_set() and group in presence.groups.values()
+                assert not await app.drain_recovery_cleanups(timeout_s=0.01)
+                observer = asyncio.create_task(app.drain_recovery_cleanups(timeout_s=10))
+                await asyncio.sleep(0)
+                observer.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await observer
+                assert observer.cancelled() and observer.cancelling() == 1
+                assert not group.task.done() and group.task.cancelling() == 0
+                release.set()
+                assert await app.drain_recovery_cleanups(timeout_s=10)
+                assert len(released) == 1 and not presence.groups
+                assert (await store.load(session_id)).status is SessionStatus.COMPLETED
+                assert len(provider.requests) == 1
+            finally:
+                release.set()
+                await asyncio.gather(task, return_exceptions=True)
+                await app.drain_recovery_cleanups(timeout_s=10)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
 @pytest.mark.parametrize("phase", ["provider", "tool"])
 def test_independent_heartbeat_keeps_long_silent_work_live(
     backend, phase, request, sqlite_resources
@@ -156,6 +292,12 @@ def test_independent_heartbeat_keeps_long_silent_work_live(
             )
             try:
                 await asyncio.wait_for(blocked.entered.wait(), 15)
+                assert await app.drain_recovery_cleanups(timeout_s=1)
+                assert not run.done()
+                assert all(
+                    not group.stop.is_set()
+                    for group in app._session_control.execution_presence.groups.values()
+                )
                 observer = CayuApp(session_store=reopen(), enable_logging=False)
                 original = await observer.inspect_session_execution(sid)
                 epoch = original.run_epoch

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from datetime import timedelta
 from importlib.metadata import version
 from typing import Any
 from uuid import uuid4
@@ -75,6 +76,19 @@ from cayu.tools.exposure import (
 )
 from cayu.tools.policy import ToolPolicy
 from cayu.vaults import SecretRedactor
+
+
+async def expire_memory_execution_lease(store, session_id: str) -> None:
+    """Advance the in-memory owner clock past an actual execution lease.
+
+    Stalled-run takeover must not steal a live execution merely because its
+    activity threshold is zero. Keep the lease record for the native fence to
+    validate, rather than deleting ownership or bypassing the check.
+    """
+    # Public terminal-state projections deliberately omit owner lease fields.
+    owner = store._execution_owners[session_id]
+    after_expiry = owner.lease_expires_at + timedelta(seconds=1)
+    store._ownership_clock = lambda: after_expiry
 
 
 class _ProfileFixtureTool(Tool):

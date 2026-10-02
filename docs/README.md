@@ -15,6 +15,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Verified work](../src/cayu/guides/verified-work.md) (`cayu guide verified-work`)
 
 - [Advanced runtime examples](advanced-runtime-examples.md)
+- [Agent-authoring evaluations](authoring-evals.md)
 - [Browser sessions](browser-session.md)
 - [Browser recordings](browser-recording.md)
 - [Build a runner](build-a-runner.md)
@@ -38,6 +39,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Opt-in knowledge offers](knowledge-offers.md)
 - [Private tool-argument continuity](private-argument-continuity.md)
 - [Model catalog](model-catalog.md)
+- [Model policy](model-policy.md)
 - [Operation outcomes](operation-outcomes.md)
 - [Participant identity administration](participant-identity.md)
 - [Recipient sessions](recipient-sessions.md)

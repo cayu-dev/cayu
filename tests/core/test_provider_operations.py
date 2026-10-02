@@ -3037,6 +3037,9 @@ class _FenceOnEventStore(InMemorySessionStore):
     async def append_event(self, session_id: str, event: Event) -> None:
         if event.type == self.fence_on and not self.fenced:
             self.fenced = True
+            from tests.core._execution_profile_fixtures import expire_memory_execution_lease
+
+            await expire_memory_execution_lease(self, session_id)
             fenced = await asyncio.create_task(
                 self.fence_stalled_run(
                     session_id,

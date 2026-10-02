@@ -138,7 +138,12 @@ def test_native_admission_race_retains_durable_child_evidence(tmp_path, monkeypa
     original = executor._admitted_model_provider_events
 
     async def racing_events(
-        provider, request, admission, refresh_live_model_semantics, cleanup_observer=None
+        provider,
+        request,
+        admission,
+        refresh_live_model_semantics,
+        cleanup_observer=None,
+        error_redactor=None,
     ):
         async def refresh():
             await refresh_live_model_semantics()
@@ -148,7 +153,9 @@ def test_native_admission_race_retains_durable_child_evidence(tmp_path, monkeypa
                 asyncio.current_task().cancel()
 
         with bind_execution_deadline(ExecutionDeadline.after(0, scope="native-child")):
-            async for event in original(provider, request, admission, refresh, cleanup_observer):
+            async for event in original(
+                provider, request, admission, refresh, cleanup_observer, error_redactor
+            ):
                 yield event
 
     monkeypatch.setattr(executor, "_admitted_model_provider_events", racing_events)

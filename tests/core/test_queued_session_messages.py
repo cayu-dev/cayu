@@ -496,6 +496,7 @@ class LegacySplitQueuedHandoffStore(InMemorySessionStore):
         self.corrupt_stage = corrupt_stage
         self._corrupted = False
         self._dispatch_calls = 0
+        self._historical_handoff = None
 
     async def deliver_queued_session_messages(
         self,
@@ -520,11 +521,13 @@ class LegacySplitQueuedHandoffStore(InMemorySessionStore):
                 interaction_started_event=interaction_started_event,
                 profile_handoff=profile_handoff,
             )
-        legacy_payload = deepcopy(interaction_started_event.payload)
-        legacy_payload.pop(QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY)
-        legacy_started = interaction_started_event.model_copy(
-            update={"payload": legacy_payload},
-            deep=True,
+        # Admit B using today's atomic protocol. The historical A-bound
+        # snapshot is installed only after B has actually entered the fake
+        # provider: current admission correctly rejects that old split state.
+        self._historical_handoff = (
+            session_id,
+            await self.load_checkpoint(session_id),
+            interaction_started_event.id,
         )
         batch = await super().deliver_queued_session_messages(
             session_id,
@@ -533,15 +536,33 @@ class LegacySplitQueuedHandoffStore(InMemorySessionStore):
             eligible_through=eligible_through,
             limit=limit,
             interaction_id=interaction_id,
-            interaction_started_event=legacy_started,
-            profile_handoff=None,
+            interaction_started_event=interaction_started_event,
+            profile_handoff=profile_handoff,
         )
-        return batch.model_copy(
-            update={
-                "active_invocation_profile": profile_handoff.target_active_profile,
-            },
-            deep=True,
+        return batch
+
+    async def install_historical_handoff(self):
+        from cayu.runtime.execution_profiles import (
+            ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
         )
+        from cayu.sessions.checkpoints import INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY
+
+        assert self._historical_handoff is not None
+        session_id, checkpoint, event_id = self._historical_handoff
+        async with self._lock:
+            for key in (
+                ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+                INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+            ):
+                self._checkpoints[session_id][key] = deepcopy(checkpoint[key])
+            for index, event in enumerate(self._events[session_id]):
+                if event.id == event_id:
+                    payload = deepcopy(event.payload)
+                    payload.pop(QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY)
+                    self._events[session_id][index] = event.model_copy(update={"payload": payload})
+                    break
+            else:
+                raise AssertionError("Missing historical interaction start.")
 
     async def mark_model_completion_stage_dispatched(self, session_id: str, *, stage, **kwargs):
         dispatch = await super().mark_model_completion_stage_dispatched(
@@ -2071,7 +2092,15 @@ def test_fresh_runtime_repairs_only_exact_legacy_queued_handoff(
 ) -> None:
     async def run() -> None:
         store = LegacySplitQueuedHandoffStore(corrupt_stage=corrupt_stage)
-        provider = BlockingTwoTurnProvider()
+
+        class HistoricalProvider(BlockingTwoTurnProvider):
+            async def stream(self, request):
+                if self.requests:
+                    await store.install_historical_handoff()
+                async for event in super().stream(request):
+                    yield event
+
+        provider = HistoricalProvider()
         provider.block_second = True
         controller = CayuApp(session_store=store, enable_logging=False)
         controller.register_provider(provider)
@@ -2092,7 +2121,7 @@ def test_fresh_runtime_repairs_only_exact_legacy_queued_handoff(
             ]
 
         run_task = asyncio.create_task(execute())
-        await provider.first_started.wait()
+        await asyncio.wait_for(provider.first_started.wait(), 15)
         await accepting_process.enqueue_session_message(
             EnqueueSessionMessageRequest(
                 session_id=session_id,
@@ -2102,7 +2131,16 @@ def test_fresh_runtime_repairs_only_exact_legacy_queued_handoff(
             )
         )
         provider.release_first.set()
-        await provider.second_started.wait()
+        waiter = asyncio.create_task(provider.second_started.wait())
+        done, _ = await asyncio.wait(
+            {waiter, run_task}, timeout=15, return_when=asyncio.FIRST_COMPLETED
+        )
+        if waiter not in done:
+            waiter.cancel()
+            provider.release_second.set()
+            await asyncio.gather(waiter, return_exceptions=True)
+            await asyncio.wait_for(run_task, 15)  # Surface the actual failure, rather than hang CI.
+            raise AssertionError("Second provider dispatch did not start.")
 
         session = await store.load(session_id)
         checkpoint = await store.load_checkpoint(session_id)

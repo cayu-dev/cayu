@@ -1495,7 +1495,19 @@ def _start_detached_event_stream_response(
                     # resume through wrapper yield boundaries first. Cancellation is
                     # then delivered at the runtime's next real await (factory,
                     # binding, provider stream, or interruption status check).
-                    asyncio.get_running_loop().call_soon(current_task.cancel)
+                    if current_task.cancelling():
+                        current_task.uncancel()
+
+                    def redeliver_cancellation(task: asyncio.Task[Any]) -> None:
+                        # The runtime can consume the original signal while
+                        # resuming (after proving durable interruption ownership).
+                        # Do not turn that acknowledged signal into a new cancel
+                        # during terminal publication, or count it twice.
+                        if cayu_app._session_control.is_emitting_interrupted(session_id, task=task):
+                            return
+                        task.cancel()
+
+                    asyncio.get_running_loop().call_soon(redeliver_cancellation, current_task)
                     deferred_cancellation = None
                 try:
                     event = await anext(event_stream)

@@ -18489,6 +18489,15 @@ class RecoveryCoordinator:
             else:
                 claim_release_completed = True
 
+        async def release_recovery_presence() -> None:
+            if claim_release_completed:
+                # Worker quiescence and exact claim removal precede liveness
+                # release. Do not let a retired heartbeat fence an immediate
+                # retry or outlive the store that public recovery returns to.
+                await self._session_control.execution_presence.stop_and_wait(
+                    session_id, run_epoch=recovery_run_epoch
+                )
+
         try:
             await self._run_cleanup_steps(
                 authoritative_failure=authoritative_failure,
@@ -18502,6 +18511,7 @@ class RecoveryCoordinator:
                         "incomplete recovery claim release",
                         release_recovery_claim,
                     ),
+                    ("recovery execution presence release", release_recovery_presence),
                 ),
             )
         finally:

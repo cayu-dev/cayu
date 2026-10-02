@@ -34,7 +34,6 @@ from cayu import (
     RecoveryPlanSelection,
     ResumeRequest,
     RunRequest,
-    SessionStatusConflict,
     Tool,
     ToolApprovalDecision,
     ToolApprovalRequest,
@@ -481,7 +480,7 @@ def _process_recovery_store(backend, location, committed=None):
     return PausedSQLite(location)
 
 
-def _prepared_fallback_worker(backend, location, committed):
+def _prepared_fallback_worker(backend, location, committed, session_id):
     async def run():
         store = _process_recovery_store(backend, location, committed)
         try:
@@ -491,7 +490,7 @@ def _prepared_fallback_worker(backend, location, committed):
                 async for event in app.run(
                     RunRequest(
                         agent_name="agent",
-                        session_id="prepared-fallback",
+                        session_id=session_id,
                         messages=[Message.text("user", "hello")],
                         retry_policy=RetryPolicy(max_attempts=1, initial_delay_s=0),
                         failover=ModelFailoverPolicy(
@@ -507,20 +506,26 @@ def _prepared_fallback_worker(backend, location, committed):
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "postgres"])
+@pytest.mark.parametrize("explicit_recovery", [False, True])
 def test_process_death_after_backup_preparation_recovers_without_resetting_selection(
-    monkeypatch, tmp_path, backend, request
+    monkeypatch, tmp_path, backend, request, explicit_recovery
 ):
     location = (
         request.getfixturevalue("postgres_dsn")
         if backend == "postgres"
         else tmp_path / "prepared-fallback.sqlite"
     )
+    session_id = f"prepared-fallback-{explicit_recovery}"
     context = multiprocessing.get_context("spawn")
     committed = context.Event()
-    process = context.Process(target=_prepared_fallback_worker, args=(backend, location, committed))
+    process = context.Process(
+        target=_prepared_fallback_worker, args=(backend, location, committed, session_id)
+    )
     process.start()
     try:
-        assert committed.wait(30), f"Preparation did not commit; child exit={process.exitcode}"
+        # This covers child interpreter/import/profile preparation as well as
+        # database startup; it is not the provider or recovery lease deadline.
+        assert committed.wait(90), f"Preparation did not commit; child exit={process.exitcode}"
         process.kill()
         process.join(10)
         assert not process.is_alive() and process.exitcode != 0
@@ -534,44 +539,26 @@ def test_process_death_after_backup_preparation_recovers_without_resetting_selec
         store = _process_recovery_store(backend, location)
         try:
             app, primary, backup = _application(store)
-            active = await store.load_active_model_completion_stage("prepared-fallback")
+            active = await store.load_active_model_completion_stage(session_id)
             assert active is not None and active.stage.intent["provider_name"] == "backup"
             stage_id = active.stage.stage_id
-            assert (
-                await store.load_model_completion_stage_dispatch("prepared-fallback", stage_id)
-                is None
-            )
-            before = await store.load_checkpoint("prepared-fallback")
+            assert await store.load_model_completion_stage_dispatch(session_id, stage_id) is None
+            before = await store.load_checkpoint(session_id)
             assert before is not None
-            before_events = await store.load_events("prepared-fallback")
-            # Process loss is not invocation-release authority. A plain resume
-            # must remain fenced until the existing recovery owner settles it.
-            with pytest.raises(SessionStatusConflict):
-                _ = [
-                    event
-                    async for event in app.resume(
-                        ResumeRequest(
-                            session_id="prepared-fallback",
-                            messages=[Message.text("user", "continue")],
-                            retry_policy=RetryPolicy(max_attempts=1, initial_delay_s=0),
-                        )
-                    )
-                ]
-            assert await store.load_checkpoint("prepared-fallback") == before
-            assert await store.load_events("prepared-fallback") == before_events
-            assert not primary.requests and not backup.requests
-            await app.recover_incomplete_session(
-                IncompleteSessionRecoveryRequest(
-                    session_id="prepared-fallback", inactive_for_seconds=0
+            # Native process/lease evidence now lets ordinary resume invoke the
+            # same guarded abandoned-owner recovery. Qualify both entrances;
+            # neither may dispatch the receipt-less predecessor.
+            if explicit_recovery:
+                await app.recover_incomplete_session(
+                    IncompleteSessionRecoveryRequest(session_id=session_id, inactive_for_seconds=0)
                 )
-            )
-            assert not primary.requests and not backup.requests
-            assert await store.load_active_model_completion_stage("prepared-fallback") is None
+                assert not primary.requests and not backup.requests
+                assert await store.load_active_model_completion_stage(session_id) is None
             resumed = [
                 event
                 async for event in app.resume(
                     ResumeRequest(
-                        session_id="prepared-fallback",
+                        session_id=session_id,
                         messages=[Message.text("user", "continue")],
                         retry_policy=RetryPolicy(max_attempts=1, initial_delay_s=0),
                     )
@@ -580,10 +567,10 @@ def test_process_death_after_backup_preparation_recovers_without_resetting_selec
             assert resumed[-1].type is EventType.SESSION_COMPLETED, resumed[-1].payload
             assert not primary.requests and len(backup.requests) == 1
             assert (
-                await store.load_model_completion_stage_abandonment("prepared-fallback", stage_id)
+                await store.load_model_completion_stage_abandonment(session_id, stage_id)
                 is not None
             )
-            after = await store.load_checkpoint("prepared-fallback")
+            after = await store.load_checkpoint(session_id)
             assert after is not None and after["model_failover"]["candidate_index"] == 1
             assert (
                 after["model_failover"]["logical_step_id"]

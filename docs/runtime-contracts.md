@@ -3940,6 +3940,14 @@ grace deadline instead of treating its first task snapshot as final. A retained
 owner that later settles with failure increments `failed_after_timeout` and is
 logged by operation and error type without exposing the exception message.
 
+Execution-presence shutdown waits at most five seconds in the foreground. A
+still-running heartbeat renewal or release remains owned by the presence tracker;
+timeout does not prove that its store write stopped or its lease was released.
+`drain_recovery_cleanups(...)` also waits for these stopped presence owners within
+the same overall drain deadline, without stopping active executions or cancelling
+pending writes. Presence-only pending work is not included in the recovery
+supervisor's status counters. Workers should drain before closing their stores.
+
 For one exact invocation, use `app.session_recovery_cleanup_status(session_id=...,
 session_instance_id=..., run_epoch=...)`, taking the incarnation and epoch from
 the admitted `Session`. Its immutable `RecoveryCleanupSessionSnapshot` includes

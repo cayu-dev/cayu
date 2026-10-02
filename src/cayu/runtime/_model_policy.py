@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from cayu._task_wait import capture_awaitable_outcome
 from cayu.runtime._policy_freshness import boot_identity, require_fresh
 from cayu.runtime._policy_installation import PolicyInstallationOwner
 from cayu.runtime._policy_storage import ModelPolicyStore
@@ -348,7 +349,11 @@ class ModelPolicy:
 
     async def close(self) -> None:
         if self._closing is None or self._closing.done():
-            self._closing = asyncio.create_task(self._close())
+            # Capture owned cleanup failures before they reach shield's task
+            # machinery. Python 3.14 reports a failing shielded future to the
+            # loop after caller cancellation, even when we subsequently await
+            # that same task and retain its failure as cancellation evidence.
+            self._closing = asyncio.create_task(capture_awaitable_outcome(self._close))
         cancellation = None
         while not self._closing.done():
             try:
@@ -358,7 +363,7 @@ class ModelPolicy:
                     cancellation = exc
             except BaseException:
                 break
-        failure = self._closing.exception()
+        failure = self._closing.result().error
         if cancellation is not None:
             raise cancellation from failure
         if failure is not None:

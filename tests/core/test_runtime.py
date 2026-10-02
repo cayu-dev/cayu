@@ -11657,9 +11657,10 @@ def test_cayu_app_preserves_completed_usage_when_heartbeat_fails_in_same_turn(
     async def force_terminal_item_and_heartbeat_into_same_done_set(
         tasks,
         *,
-        return_when,
+        return_when=asyncio.ALL_COMPLETED,
+        timeout=None,
     ):
-        done, pending = await real_wait(tasks, return_when=return_when)
+        done, pending = await real_wait(tasks, return_when=return_when, timeout=timeout)
         for task in done:
             if task.cancelled() or task.exception() is not None:
                 continue
@@ -24010,7 +24011,7 @@ def test_cayu_app_dispatch_rejects_running_session():
 
     asyncio.run(create_running_session())
 
-    with pytest.raises(ValueError, match="status transition not allowed"):
+    with pytest.raises(ValueError, match="execution is still in progress"):
         asyncio.run(
             collect_dispatch_events(
                 app,
@@ -26583,7 +26584,7 @@ def test_cayu_app_resume_rejects_active_sessions():
 
     asyncio.run(setup_running_session())
 
-    with pytest.raises(ValueError, match="transition not allowed"):
+    with pytest.raises(ValueError, match="execution is still in progress"):
         asyncio.run(
             collect_resume_events(
                 app,
@@ -31663,6 +31664,9 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_cleans_up_while_consumer_is_
         # Do not request another event yet. The background supervisor must still
         # observe lease loss and finish owned cleanup while delivery is paused.
         await asyncio.wait_for(store.release_finished.wait(), timeout=5)
+        # Invocation release precedes presence shutdown and claim removal.
+        # Observe the supervisor's complete cleanup, not that intermediate write.
+        assert await app.drain_recovery_cleanups(timeout_s=5)
         interrupted = await store.load(session_id)
         assert interrupted is not None and interrupted.status == SessionStatus.INTERRUPTED
         checkpoint_after_cleanup = await store.load_checkpoint(session_id)
@@ -32552,6 +32556,9 @@ def test_manual_recovery_interruption_fence_uses_its_own_lease_deadline(
         "time",
         RecoveryMonotonicClock,
     )
+    from cayu.runtime import _recovery_claims
+
+    monkeypatch.setattr(_recovery_claims, "time", RecoveryMonotonicClock)
     monkeypatch.setattr(
         recovery_coordinator_module,
         "_INCOMPLETE_RECOVERY_CLAIM_LEASE",

@@ -330,7 +330,8 @@ def test_upstream_rejection_is_redacted_without_effort_fallback() -> None:
         assert events[-1].payload["status_code"] == 400
         rendered = json.dumps(events[-1].payload)
         assert "secret-key" not in rendered
-        assert "private request body" not in rendered
+        # Provider prose is intentionally retained; the known API credential is not.
+        assert "full private request body" in rendered
         assert "Local thinking incompatibility" not in rendered
 
     asyncio.run(exercise())

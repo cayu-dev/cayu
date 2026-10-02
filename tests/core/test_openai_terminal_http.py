@@ -156,6 +156,7 @@ async def consume(body, *, subscription=False, direct=False, background=False):
                         ),
                         first=None,
                         reasoning_state="inline",
+                        credential_values=(),
                     )
                 async with aclosing_provider_stream(stream):
                     async for event in stream:

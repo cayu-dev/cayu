@@ -2890,6 +2890,9 @@ def test_runtime_cancellation_clears_transition_handoff_after_run_fence_loss() -
                 pass
 
         async def transfer_fence() -> None:
+            from tests.core._execution_profile_fixtures import expire_memory_execution_lease
+
+            await expire_memory_execution_lease(store, session_id)
             fenced = await store.fence_stalled_run(
                 session_id,
                 statuses={SessionStatus.RUNNING},
@@ -3856,6 +3859,9 @@ def test_runtime_replay_fails_closed_after_run_fence_transfer() -> None:
                 pass
 
         async def transfer_fence() -> None:
+            from tests.core._execution_profile_fixtures import expire_memory_execution_lease
+
+            await expire_memory_execution_lease(store, session_id)
             fenced = await store.fence_stalled_run(
                 session_id,
                 statuses={SessionStatus.COMPLETED},

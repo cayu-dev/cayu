@@ -11,7 +11,7 @@
 /** Version of this module's public API, advertised as `client.version` by `/api/contract`. */
 export const CLIENT_VERSION = "1"
 /** Exact server contract version this module was released with. */
-export const CONTRACT_VERSION = "46"
+export const CONTRACT_VERSION = "47"
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "interrupted"])
 const ACTIVE_STATUSES = new Set(["pending", "running", "interrupting"])

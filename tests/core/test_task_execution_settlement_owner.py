@@ -105,6 +105,26 @@ async def retry_until_settled(settlement):
                 await asyncio.sleep(0.01)
 
 
+def expire_worker_start_acknowledgement(store, monkeypatch):
+    """Expire local admission only after the real durable start has committed."""
+    import cayu.tasks.worker as worker
+
+    original = store.mark_claimed_task_execution_started
+    monotonic = worker.monotonic
+    offset = 0
+
+    async def delayed_start(self, *args):
+        nonlocal offset
+        task = await original(*args)
+        # Keep a comfortably live durable lease. Scheduling/database latency
+        # must not expire it before this test reaches its acknowledgement seam.
+        offset = 301
+        return task
+
+    monkeypatch.setattr(worker, "monotonic", lambda: monotonic() + offset)
+    monkeypatch.setattr(type(store), "mark_claimed_task_execution_started", delayed_start)
+
+
 @pytest.mark.parametrize("commit", [False, True])
 async def test_exact_settlement_retry_survives_permitted_task_deletion(store, monkeypatch, commit):
     from tests.core.task_invocation_fixtures import task_backed_session_invocation
@@ -274,14 +294,7 @@ async def test_worker_start_ack_deadline_has_proven_nondispatch_owner(store, mon
     app = CayuApp(task_store=store, enable_logging=False)
     await create_group(app, TaskCreate(task_id="member", type="member"))
     calls = fail_acknowledgements(monkeypatch, store, failures=failures, commit=False)
-    original = store.mark_claimed_task_execution_started
-
-    async def delayed_start(self, *args):
-        task = await original(*args)
-        await asyncio.sleep(0.72)
-        return task
-
-    monkeypatch.setattr(type(store), "mark_claimed_task_execution_started", delayed_start)
+    expire_worker_start_acknowledgement(store, monkeypatch)
 
     async def handler(*args):
         pytest.fail("Expired local dispatch authority must never invoke the callback")
@@ -293,7 +306,7 @@ async def test_worker_start_ack_deadline_has_proven_nondispatch_owner(store, mon
             handler,
             worker_id="owner",
             query=TaskQuery(type="member"),
-            lease_seconds=1,
+            lease_seconds=300,
             max_tasks=1,
         )
 
@@ -442,7 +455,7 @@ async def test_grouped_busy_session_requeues_with_settled_execution(store, monke
             assert execution.settled_at is None
             assert (await store.load_task(identity)).status is TaskStatus.CLAIMED
             read_release.set()
-            await pending.settlement.retry()
+            await retry_until_settled(pending.settlement)
             assert read_count == (2 if lookup_fault == "cancel_read" else 5)
             # The failed process did not requeue without proof. Finish ordinary
             # claim disposition only after its acknowledgement-only retry.
@@ -950,14 +963,7 @@ async def test_ordinary_store_without_group_capability_never_needs_ack_owner(
 
     monkeypatch.setattr(store, "_settle_task_group_execution", unexpected_ack)
     if nondispatch:
-        original = store.mark_claimed_task_execution_started
-
-        async def delayed_start(self, *args):
-            task = await original(*args)
-            await asyncio.sleep(0.72)
-            return task
-
-        monkeypatch.setattr(type(store), "mark_claimed_task_execution_started", delayed_start)
+        expire_worker_start_acknowledgement(store, monkeypatch)
     calls = 0
 
     async def handler(_app, task, worker):
@@ -974,7 +980,7 @@ async def test_ordinary_store_without_group_capability_never_needs_ack_owner(
             handler,
             worker_id="w",
             query=TaskQuery(type="ordinary"),
-            lease_seconds=1 if nondispatch else 300,
+            lease_seconds=300,
             max_tasks=1,
         )
         == 1

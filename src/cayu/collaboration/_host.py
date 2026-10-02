@@ -484,10 +484,16 @@ class CollaborationHost:
                 self._source_errors[error_key] = error
 
     async def _service_clarifications(self, deadline, stop):
+        if not self._owned.has_slot("execution"):
+            # The native owner already occupies this capacity. Revalidating
+            # the same complete service tuple on every pass cannot admit work
+            # and competes with its storage/heartbeat progress. Collection and
+            # reconciliation still run independently of this admission hint.
+            return
         rules = self._registration.clarification_rules
         loop = asyncio.get_running_loop()
         for _ in range(min(self._registration.batch_size, len(rules))):
-            if stop.is_set() or loop.time() >= deadline:
+            if stop.is_set() or loop.time() >= deadline or not self._owned.has_slot("execution"):
                 break
             index = self._next_clarification
             self._next_clarification = (index + 1) % len(rules)

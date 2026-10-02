@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib
 import json
 from pathlib import Path
@@ -196,8 +197,13 @@ def test_cli_check_reports_an_invalid_registration_seam_before_import(
     report = json.loads(capsys.readouterr().out)
 
     assert report["manifest_fingerprint"] == "unavailable"
+    registration_import = next(
+        node
+        for node in ast.walk(ast.parse((project / "app.py").read_text()))
+        if isinstance(node, ast.ImportFrom) and node.module == "agents.registration"
+    )
     assert [(item["code"], item["path"]) for item in report["diagnostics"]] == [
-        ("SCAFFOLD_IMPORT_SIDE_EFFECT", "app.py:18"),
+        ("SCAFFOLD_IMPORT_SIDE_EFFECT", f"app.py:{registration_import.lineno}"),
         ("SCAFFOLD_LAYOUT_PATH_MISSING", "agents/registration.py"),
     ]
     assert report["diagnostics"][0]["parameters"]["expression_kind"] == "ImportFrom"

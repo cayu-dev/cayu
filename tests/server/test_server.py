@@ -10552,8 +10552,17 @@ def test_interrupt_after_run_acceptance_cancels_detached_provider() -> None:
 
 
 def test_interrupt_after_acceptance_before_observer_start_reaches_runtime() -> None:
+    class RecordingProvider(OneShotProvider):
+        dispatches = 0
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.dispatches += 1
+            async for event in super().stream(request):
+                yield event
+
+    provider = RecordingProvider()
     app = CayuApp(enable_logging=False)
-    app.register_provider(OneShotProvider(), default=True)
+    app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
     session_id = "session_interrupt_before_observer_start"
 
@@ -10580,6 +10589,10 @@ def test_interrupt_after_acceptance_before_observer_start_reaches_runtime() -> N
             )
         ]
         observed = [message async for message in response.body_iterator]
+        runtime_task = active_runs[0].runtime_task
+        await asyncio.wait_for(asyncio.shield(runtime_task), timeout=5)
+        assert not runtime_task.cancelled() and runtime_task.cancelling() == 0
+        assert provider.dispatches == 0
         state = await app.session_store.load_state(session_id)
         assert state is not None
         assert await app.drain_background_interruptions(timeout_s=1) is True
@@ -10919,6 +10932,8 @@ def test_request_cancellation_during_acceptance_does_not_cancel_detached_run() -
             await asyncio.sleep(0.01)
 
         records = await app.session_store.query_events(EventQuery(session_id=session_id, limit=100))
+        # Durable completion precedes trailing cleanup and active-task removal.
+        await asyncio.wait_for(asyncio.shield(active_runs[0].runtime_task), timeout=5)
         assert app._session_control.active_runs(session_id) == ()
         return state.status, [record.event.type for record in records]
 

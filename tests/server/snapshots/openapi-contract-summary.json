@@ -914,6 +914,18 @@
           "title": "Interaction Id",
           "type": "string"
         },
+        "model_policy": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Model Policy"
+        },
         "model_step_count": {
           "default": 0,
           "minimum": 0.0,

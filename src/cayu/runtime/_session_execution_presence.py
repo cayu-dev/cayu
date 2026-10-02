@@ -7,6 +7,7 @@ import logging
 import os
 from contextlib import suppress
 from dataclasses import dataclass
+from math import isfinite
 from uuid import uuid4
 
 from cayu.sessions._process_liveness import current_process_identity
@@ -19,6 +20,7 @@ from cayu.sessions.execution import (
 _LOG = logging.getLogger(__name__)
 _PROCESS_PID = os.getpid()
 _PROCESS_ID = uuid4().hex
+_RELEASE_WAIT_SECONDS = 5.0
 
 
 def process_owner_id():
@@ -99,6 +101,73 @@ class SessionExecutionPresence:
         for key, group in tuple(self.groups.items()):
             if key[0] == session_id and key[2] == run_epoch:
                 group.stop.set()
+
+    async def stop_and_wait(self, session_id, *, run_epoch):
+        """Wait boundedly; unfinished release stays owned until actual settlement."""
+        tasks = []
+        for key, group in tuple(self.groups.items()):
+            if key[0] == session_id and key[2] == run_epoch:
+                group.stop.set()
+                tasks.append(group.task)
+        if tasks:
+            # Waiting may be cancelled, but cancellation does not prove the
+            # store's release stopped. Neither timeout nor caller cancellation
+            # cancels the heartbeat or removes its exact entry from groups.
+            cancellation = None
+            pending = set(tasks)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + _RELEASE_WAIT_SECONDS
+            while pending:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                try:
+                    _, pending = await asyncio.wait(pending, timeout=remaining)
+                except asyncio.CancelledError as error:
+                    if cancellation is None:
+                        cancellation = error
+            if pending:
+                _LOG.warning("Session execution presence release remains pending.")
+            failures = []
+            for task in tasks:
+                if not task.done():
+                    continue
+                try:
+                    task.result()
+                except BaseException as error:
+                    failures.append(error)
+            failure = (
+                None
+                if not failures
+                else failures[0]
+                if len(failures) == 1
+                else BaseExceptionGroup("Execution presence release failed.", failures)
+            )
+            if cancellation is not None:
+                raise cancellation from failure
+            if failure is not None:
+                raise failure
+
+    async def drain(self, *, timeout_s: float) -> bool:
+        """Observe stopped owners only; never stop live execution or cancel writes."""
+        if type(timeout_s) not in {int, float} or not isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("timeout_s must be a finite positive number.")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while True:
+            tasks = {group.task for group in self.groups.values() if group.stop.is_set()}
+            if not tasks:
+                return True
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            done, _ = await asyncio.wait(
+                tasks, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not done:
+                return False
+            for task in done:
+                task.result()
 
     async def _heartbeat(self, key, owner, stop):
         generation = -1

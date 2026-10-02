@@ -778,7 +778,7 @@ class EnvironmentLifecycle:
         secret_redactor: SecretRedactor | None = None,
         max_environment_lifecycle_owners: int = DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS,
         egress_authority_adoption_handler: EgressAuthorityAdoptionHandler | None = None,
-        execution_presence_stopped: Callable[[str, int], None] | None = None,
+        execution_presence_stopped: Callable[[str, int], Awaitable[None]] | None = None,
     ) -> None:
         self._session_store = session_store
         self._event_writer = event_writer
@@ -2009,7 +2009,7 @@ class EnvironmentLifecycle:
             # Physical execution has ended, including retained cleanup. An
             # ambiguous fence write must not advertise a living executor forever.
             if self._execution_presence_stopped is not None and run_epoch is not None:
-                self._execution_presence_stopped(session_id, run_epoch)
+                await self._execution_presence_stopped(session_id, run_epoch)
 
     async def _settle_quiescent_invocation_fence(
         self,

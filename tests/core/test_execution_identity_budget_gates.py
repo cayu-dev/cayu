@@ -1052,6 +1052,9 @@ def test_stale_run_cannot_claim_or_release_a_reserved_identity() -> None:
             publication_id: str,
         ) -> None:
             async def replace_owner() -> None:
+                from tests.core._execution_profile_fixtures import expire_memory_execution_lease
+
+                await expire_memory_execution_lease(self, publication_session_id)
                 replacement = await self.fence_stalled_run(
                     publication_session_id,
                     statuses={SessionStatus.RUNNING},

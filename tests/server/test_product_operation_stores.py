@@ -575,11 +575,12 @@ def test_cayu_storage_migrate_upgrades_postgres_to_the_product_revision(
         finally:
             await store.close()
 
-    monkeypatch.setattr(
-        schema, "REVISIONS", tuple(item for item in revisions if item.revision <= 111)
-    )
-    asyncio.run(create_revision_111())
-    monkeypatch.setattr(schema, "REVISIONS", revisions)
+    # Seed the historical database without asking today's store to accept it.
+    # Restore the real minimum before exercising migration and validation.
+    with monkeypatch.context() as seed:
+        seed.setattr(schema, "REVISIONS", tuple(item for item in revisions if item.revision <= 111))
+        seed.setattr(PostgresSessionStore, "_min_required_revision", 111)
+        asyncio.run(create_revision_111())
 
     async def open_product_store() -> bool:
         store = PostgresProductOperationStore(fresh_postgres_dsn)

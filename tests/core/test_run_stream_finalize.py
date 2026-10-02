@@ -554,6 +554,9 @@ def test_wait_for_stream_resumption_retains_stale_run_fence() -> None:
         assert stale_owner is not None
 
         async def take_over() -> int:
+            from tests.core._execution_profile_fixtures import expire_memory_execution_lease
+
+            await expire_memory_execution_lease(h.store, session_id)
             replacement = await h.store.fence_stalled_run(
                 session_id,
                 statuses={SessionStatus.RUNNING},
