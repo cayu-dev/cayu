@@ -686,3 +686,68 @@ def _validate_nonnegative_int(value: int, field_name: str) -> None:
 
 def _dedupe_strings(values: list[str]) -> list[str]:
     return list(dict.fromkeys(values))
+
+
+def _knowledge_publication_operation_id(operation_id: str) -> str:
+    clean = require_clean_nonblank(operation_id, "operation_id")
+    if len(clean.encode("utf-8")) > 256:
+        raise ValueError("`operation_id` must be at most 256 UTF-8 bytes.")
+    return clean
+
+
+def _next_knowledge_revision(expected_revision: int) -> int:
+    _validate_knowledge_revision(expected_revision, "expected_revision")
+    if expected_revision == MAX_KNOWLEDGE_REVISION:
+        raise ValueError(f"Knowledge revision cannot advance beyond {MAX_KNOWLEDGE_REVISION}.")
+    return expected_revision + 1
+
+
+def _copy_entry_chunks(
+    entry_id: str,
+    entry_revision: int,
+    chunks: list[KnowledgeChunk],
+) -> list[KnowledgeChunk]:
+    if type(chunks) is not list:
+        raise ValueError("`chunks` must be a list.")
+    if not chunks:
+        raise ValueError("`chunks` cannot be empty.")
+    copied_chunks = [copy_knowledge_chunk(chunk) for chunk in chunks]
+    seen_ids: set[str] = set()
+    seen_indexes: set[int] = set()
+    for chunk in copied_chunks:
+        if chunk.entry_id != entry_id:
+            raise ValueError("Knowledge chunks must belong to the entry.")
+        if chunk.entry_revision != entry_revision:
+            raise ValueError("Knowledge chunks must belong to the exact entry revision.")
+        if chunk.id in seen_ids:
+            raise ValueError("Knowledge chunk ids must be unique within an entry.")
+        if chunk.chunk_index in seen_indexes:
+            raise ValueError("Knowledge chunk indexes must be unique within an entry.")
+        seen_ids.add(chunk.id)
+        seen_indexes.add(chunk.chunk_index)
+    return sorted(copied_chunks, key=lambda chunk: chunk.chunk_index)
+
+
+def _copy_entry_evidence(
+    entry_id: str,
+    entry_revision: int,
+    evidence: list[KnowledgeEvidence],
+    *,
+    chunks: list[KnowledgeChunk],
+) -> list[KnowledgeEvidence]:
+    if type(evidence) is not list:
+        raise ValueError("`evidence` must be a list.")
+    copied = [copy_knowledge_evidence(item) for item in evidence]
+    chunk_ids = {chunk.id for chunk in chunks}
+    seen_ids: set[str] = set()
+    for item in copied:
+        if item.entry_id != entry_id:
+            raise ValueError("Knowledge evidence must belong to the entry.")
+        if item.entry_revision != entry_revision:
+            raise ValueError("Knowledge evidence must belong to the exact entry revision.")
+        if item.chunk_id is not None and item.chunk_id not in chunk_ids:
+            raise ValueError("Knowledge evidence chunk must belong to the exact entry revision.")
+        if item.id in seen_ids:
+            raise ValueError("Knowledge evidence ids must be unique within a revision.")
+        seen_ids.add(item.id)
+    return sorted(copied, key=lambda item: item.id)

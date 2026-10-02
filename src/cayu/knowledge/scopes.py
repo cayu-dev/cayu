@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from hashlib import sha256
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from cayu._validation import copy_json_value, copy_label_map
+from cayu._validation import canonical_durable_json_bytes, copy_json_value, copy_label_map
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.knowledge.records import KnowledgeStatus, KnowledgeVisibility, _dedupe_strings
 
@@ -160,3 +161,19 @@ def copy_knowledge_access_scope(scope: KnowledgeAccessScope) -> KnowledgeAccessS
         allowed_statuses=list(scope.allowed_statuses),
         include_expired=scope.include_expired,
     )
+
+
+def _knowledge_access_scope_sha256(scope: KnowledgeAccessScope) -> str:
+    scope = copy_knowledge_access_scope(scope)
+    return sha256(
+        canonical_durable_json_bytes(
+            scope.model_dump(mode="json"),
+            "knowledge change access scope",
+        )
+    ).hexdigest()
+
+
+def knowledge_access_scope_sha256(scope: KnowledgeAccessScope) -> str:
+    """Return the canonical public identity of one enforced knowledge access scope."""
+
+    return _knowledge_access_scope_sha256(scope)

@@ -47,6 +47,7 @@ from cayu.knowledge.records import (
 from cayu.knowledge.scopes import (
     KnowledgeAccessScope,
     copy_knowledge_access_scope,
+    knowledge_access_scope_sha256,
 )
 from cayu.memory.recall import (
     KNOWLEDGE_LEXICAL_CHANNEL,
@@ -64,7 +65,6 @@ from cayu.memory.recall import (
 from cayu.memory.retrieval import RetrievalFusionDiagnostics
 from cayu.storage.memory import (
     KnowledgeStore,
-    knowledge_access_scope_sha256,
 )
 
 MAX_KNOWLEDGE_SEMANTIC_WATCH_OBSERVATION_BYTES = RECALL_MAX_QUERY_BYTES

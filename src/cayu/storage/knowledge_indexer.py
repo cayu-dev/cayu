@@ -26,6 +26,7 @@ from cayu.knowledge.records import (
     KnowledgeEntry,
     KnowledgeStatus,
     KnowledgeVisibility,
+    _next_knowledge_revision,
     copy_knowledge_chunk,
     copy_knowledge_entry,
 )
@@ -35,7 +36,6 @@ from cayu.knowledge.scopes import (
 )
 from cayu.storage.memory import (
     KnowledgeStore,
-    _next_knowledge_revision,
 )
 
 DEFAULT_KNOWLEDGE_CHUNK_TARGET_BYTES = 4_000

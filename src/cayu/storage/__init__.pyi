@@ -1,5 +1,52 @@
 """Static declarations for the lazy public API."""
 
+from cayu.knowledge.activation_contracts import (
+    MAX_KNOWLEDGE_ACTIVATION_ANNOTATION_BYTES as MAX_KNOWLEDGE_ACTIVATION_ANNOTATION_BYTES,
+)
+from cayu.knowledge.activation_contracts import (
+    MAX_KNOWLEDGE_ACTIVATION_CHUNKS as MAX_KNOWLEDGE_ACTIVATION_CHUNKS,
+)
+from cayu.knowledge.activation_contracts import (
+    MAX_KNOWLEDGE_ACTIVATION_EVALUATOR_RESULT_BYTES as MAX_KNOWLEDGE_ACTIVATION_EVALUATOR_RESULT_BYTES,
+)
+from cayu.knowledge.activation_contracts import (
+    MAX_KNOWLEDGE_ACTIVATION_EVIDENCE_RECORDS as MAX_KNOWLEDGE_ACTIVATION_EVIDENCE_RECORDS,
+)
+from cayu.knowledge.activation_contracts import (
+    MAX_KNOWLEDGE_ACTIVATION_RECEIPT_BYTES as MAX_KNOWLEDGE_ACTIVATION_RECEIPT_BYTES,
+)
+from cayu.knowledge.activation_contracts import (
+    MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES as MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES,
+)
+from cayu.knowledge.activation_contracts import (
+    KnowledgeActivationAuthority as KnowledgeActivationAuthority,
+)
+from cayu.knowledge.activation_contracts import (
+    KnowledgeActivationConflict as KnowledgeActivationConflict,
+)
+from cayu.knowledge.activation_contracts import (
+    KnowledgeActivationDecision as KnowledgeActivationDecision,
+)
+from cayu.knowledge.activation_contracts import (
+    KnowledgeActivationDisposition as KnowledgeActivationDisposition,
+)
+from cayu.knowledge.activation_contracts import (
+    KnowledgeActivationReceipt as KnowledgeActivationReceipt,
+)
+from cayu.knowledge.activation_contracts import (
+    KnowledgeActivationRequest as KnowledgeActivationRequest,
+)
+from cayu.knowledge.activation_contracts import (
+    KnowledgeActivationSource as KnowledgeActivationSource,
+)
+from cayu.knowledge.activation_contracts import (
+    KnowledgeGovernanceConfig as KnowledgeGovernanceConfig,
+)
+from cayu.knowledge.activation_contracts import KnowledgeGovernanceMode as KnowledgeGovernanceMode
+from cayu.knowledge.activation_contracts import KnowledgeReviewApproval as KnowledgeReviewApproval
+from cayu.knowledge.activation_contracts import (
+    prepare_knowledge_activation_request as prepare_knowledge_activation_request,
+)
 from cayu.knowledge.maintenance_contracts import (
     MAX_KNOWLEDGE_MAINTENANCE_BYTES as MAX_KNOWLEDGE_MAINTENANCE_BYTES,
 )
@@ -95,6 +142,7 @@ from cayu.knowledge.relations import KnowledgeRelationResult as KnowledgeRelatio
 from cayu.knowledge.relations import prepare_knowledge_relations as prepare_knowledge_relations
 from cayu.knowledge.scopes import KnowledgeAccessDenied as KnowledgeAccessDenied
 from cayu.knowledge.scopes import KnowledgeAccessScope as KnowledgeAccessScope
+from cayu.knowledge.scopes import knowledge_access_scope_sha256 as knowledge_access_scope_sha256
 from cayu.storage.budget_ledger import SQLiteBudgetLedger as SQLiteBudgetLedger
 from cayu.storage.evals_postgres import PostgresEvalStore as PostgresEvalStore
 from cayu.storage.evals_sqlite import SQLiteEvalStore as SQLiteEvalStore
@@ -148,22 +196,6 @@ from cayu.storage.memory import KNOWLEDGE_CHUNK_TEXT_PROJECTION as KNOWLEDGE_CHU
 from cayu.storage.memory import (
     KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION as KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION,
 )
-from cayu.storage.memory import (
-    MAX_KNOWLEDGE_ACTIVATION_ANNOTATION_BYTES as MAX_KNOWLEDGE_ACTIVATION_ANNOTATION_BYTES,
-)
-from cayu.storage.memory import MAX_KNOWLEDGE_ACTIVATION_CHUNKS as MAX_KNOWLEDGE_ACTIVATION_CHUNKS
-from cayu.storage.memory import (
-    MAX_KNOWLEDGE_ACTIVATION_EVALUATOR_RESULT_BYTES as MAX_KNOWLEDGE_ACTIVATION_EVALUATOR_RESULT_BYTES,
-)
-from cayu.storage.memory import (
-    MAX_KNOWLEDGE_ACTIVATION_EVIDENCE_RECORDS as MAX_KNOWLEDGE_ACTIVATION_EVIDENCE_RECORDS,
-)
-from cayu.storage.memory import (
-    MAX_KNOWLEDGE_ACTIVATION_RECEIPT_BYTES as MAX_KNOWLEDGE_ACTIVATION_RECEIPT_BYTES,
-)
-from cayu.storage.memory import (
-    MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES as MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES,
-)
 from cayu.storage.memory import MAX_KNOWLEDGE_CHANGE_LIMIT as MAX_KNOWLEDGE_CHANGE_LIMIT
 from cayu.storage.memory import MAX_KNOWLEDGE_CHANGE_SEQUENCE as MAX_KNOWLEDGE_CHANGE_SEQUENCE
 from cayu.storage.memory import (
@@ -177,13 +209,6 @@ from cayu.storage.memory import (
 )
 from cayu.storage.memory import InMemoryEmbeddingKnowledgeStore as InMemoryEmbeddingKnowledgeStore
 from cayu.storage.memory import InMemoryKnowledgeStore as InMemoryKnowledgeStore
-from cayu.storage.memory import KnowledgeActivationAuthority as KnowledgeActivationAuthority
-from cayu.storage.memory import KnowledgeActivationConflict as KnowledgeActivationConflict
-from cayu.storage.memory import KnowledgeActivationDecision as KnowledgeActivationDecision
-from cayu.storage.memory import KnowledgeActivationDisposition as KnowledgeActivationDisposition
-from cayu.storage.memory import KnowledgeActivationReceipt as KnowledgeActivationReceipt
-from cayu.storage.memory import KnowledgeActivationRequest as KnowledgeActivationRequest
-from cayu.storage.memory import KnowledgeActivationSource as KnowledgeActivationSource
 from cayu.storage.memory import KnowledgeChange as KnowledgeChange
 from cayu.storage.memory import KnowledgeChangeBatch as KnowledgeChangeBatch
 from cayu.storage.memory import KnowledgeChangeClaim as KnowledgeChangeClaim
@@ -201,8 +226,6 @@ from cayu.storage.memory import (
 )
 from cayu.storage.memory import KnowledgeEmbeddingWorkerResult as KnowledgeEmbeddingWorkerResult
 from cayu.storage.memory import KnowledgeFacet as KnowledgeFacet
-from cayu.storage.memory import KnowledgeGovernanceConfig as KnowledgeGovernanceConfig
-from cayu.storage.memory import KnowledgeGovernanceMode as KnowledgeGovernanceMode
 from cayu.storage.memory import KnowledgeHit as KnowledgeHit
 from cayu.storage.memory import KnowledgeIndexCoverage as KnowledgeIndexCoverage
 from cayu.storage.memory import KnowledgeIndexReadiness as KnowledgeIndexReadiness
@@ -217,16 +240,11 @@ from cayu.storage.memory import KnowledgeListResult as KnowledgeListResult
 from cayu.storage.memory import KnowledgePublicationConflict as KnowledgePublicationConflict
 from cayu.storage.memory import KnowledgePublicationReceipt as KnowledgePublicationReceipt
 from cayu.storage.memory import KnowledgeQuery as KnowledgeQuery
-from cayu.storage.memory import KnowledgeReviewApproval as KnowledgeReviewApproval
 from cayu.storage.memory import KnowledgeSearchMode as KnowledgeSearchMode
 from cayu.storage.memory import KnowledgeSearchResult as KnowledgeSearchResult
 from cayu.storage.memory import KnowledgeStore as KnowledgeStore
-from cayu.storage.memory import knowledge_access_scope_sha256 as knowledge_access_scope_sha256
 from cayu.storage.memory import (
     knowledge_chunk_embedding_identity as knowledge_chunk_embedding_identity,
-)
-from cayu.storage.memory import (
-    prepare_knowledge_activation_request as prepare_knowledge_activation_request,
 )
 from cayu.storage.memory import prepare_knowledge_publication as prepare_knowledge_publication
 from cayu.storage.postgres import PostgresAgentWorkContextStore as PostgresAgentWorkContextStore

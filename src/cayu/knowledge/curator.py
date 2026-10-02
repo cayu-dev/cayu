@@ -46,6 +46,18 @@ from cayu.knowledge._publication import (
     KnowledgePublicationOwnerClosed,
     RetainedKnowledgePublicationOwner,
 )
+from cayu.knowledge.activation_contracts import (
+    MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES,
+    KnowledgeActivationAuthority,
+    KnowledgeActivationDisposition,
+    KnowledgeActivationReceipt,
+    KnowledgeActivationSource,
+    KnowledgeGovernanceConfig,
+    KnowledgeGovernanceMode,
+    copy_knowledge_activation_authority,
+    copy_knowledge_activation_receipt,
+    prepare_knowledge_activation_request,
+)
 from cayu.knowledge.governance import (
     REVIEWED_ROUTING_POLICY_IDENTITY,
     REVIEWED_ROUTING_POLICY_VERSION,
@@ -75,6 +87,7 @@ from cayu.knowledge.records import (
 from cayu.knowledge.scopes import (
     KnowledgeAccessScope,
     copy_knowledge_access_scope,
+    knowledge_access_scope_sha256,
 )
 from cayu.storage.knowledge_indexer import (
     DEFAULT_KNOWLEDGE_CHUNK_OVERLAP_BYTES,
@@ -84,19 +97,8 @@ from cayu.storage.knowledge_indexer import (
     KnowledgeIndexRequest,
 )
 from cayu.storage.memory import (
-    MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES,
-    KnowledgeActivationAuthority,
-    KnowledgeActivationDisposition,
-    KnowledgeActivationReceipt,
-    KnowledgeActivationSource,
-    KnowledgeGovernanceConfig,
-    KnowledgeGovernanceMode,
     KnowledgePublicationConflict,
     KnowledgePublicationReceipt,
-    copy_knowledge_activation_authority,
-    copy_knowledge_activation_receipt,
-    knowledge_access_scope_sha256,
-    prepare_knowledge_activation_request,
     prepare_knowledge_publication,
 )
 

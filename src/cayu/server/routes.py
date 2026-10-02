@@ -111,6 +111,7 @@ from cayu.events import (
     event_with_runtime_payload_authority,
 )
 from cayu.exceptions import TerminalEventPublicationUncertain
+from cayu.knowledge.activation_contracts import KnowledgeActivationConflict, KnowledgeReviewApproval
 from cayu.knowledge.records import (
     MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES,
     KnowledgeChunk,
@@ -353,9 +354,7 @@ from cayu.sessions.invocation import (
 from cayu.sessions.recovery import StartupRecoveryResult
 from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
 from cayu.storage.memory import (
-    KnowledgeActivationConflict,
     KnowledgeListItem,
-    KnowledgeReviewApproval,
 )
 from cayu.tasks.base import TaskCreate, TaskOrder, TaskQuery, task_create_with_runtime_invocation
 from cayu.tasks.records import Task, TaskStatus

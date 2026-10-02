@@ -29,6 +29,7 @@ from cayu.knowledge.relations import MAX_KNOWLEDGE_RELATION_BYTES
 from cayu.knowledge.scopes import (
     KnowledgeAccessScope,
     copy_knowledge_access_scope,
+    knowledge_access_scope_sha256,
 )
 from cayu.memory.recall import (
     RECALL_MAX_LINEAGE_BYTES_PER_RECORD,
@@ -57,7 +58,6 @@ from cayu.storage.memory import (
     KnowledgeStore,
     copy_knowledge_change,
     copy_knowledge_index_readiness,
-    knowledge_access_scope_sha256,
 )
 from cayu.work_context import (
     MAX_AGENT_WORK_CONTEXT_ID_BYTES,

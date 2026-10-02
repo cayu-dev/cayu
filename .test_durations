@@ -1,4 +1,9 @@
 {
+    "tests/core/test_knowledge_activation_contracts.py::test_activation_contracts_preserve_aliases_stubs_and_runtime_annotations": 0.043,
+    "tests/core/test_knowledge_activation_contracts.py::test_activation_policies_compose_without_storage_implementations[cayu.knowledge.activation_contracts]": 0.28,
+    "tests/core/test_knowledge_activation_contracts.py::test_activation_policies_compose_without_storage_implementations[cayu.storage]": 0.279,
+    "tests/core/test_knowledge_activation_contracts.py::test_activation_policies_compose_without_storage_implementations[cayu]": 0.235,
+    "tests/core/test_knowledge_activation_contracts.py::test_activation_values_round_trip_through_canonical_pickle_paths": 0.006,
     "tests/core/test_knowledge_maintenance_contracts.py::test_maintenance_authoring_modules_do_not_load_storage_implementations[maintenance]": 0.193,
     "tests/core/test_knowledge_maintenance_contracts.py::test_maintenance_authoring_modules_do_not_load_storage_implementations[maintenance_planning]": 0.173,
     "tests/core/test_knowledge_maintenance_contracts.py::test_maintenance_contracts_preserve_exports_stubs_and_runtime_annotations": 0.024,

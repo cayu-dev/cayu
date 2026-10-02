@@ -27,6 +27,17 @@ from cayu.knowledge._publication import (
     KnowledgePublicationOwnerClosed,
     RetainedKnowledgePublicationOwner,
 )
+from cayu.knowledge.activation_contracts import (
+    KnowledgeActivationAuthority,
+    KnowledgeActivationDisposition,
+    KnowledgeActivationReceipt,
+    KnowledgeActivationSource,
+    KnowledgeGovernanceConfig,
+    KnowledgeGovernanceMode,
+    copy_knowledge_activation_authority,
+    copy_knowledge_activation_receipt,
+    prepare_knowledge_activation_request,
+)
 from cayu.knowledge.governance import (
     REVIEWED_ROUTING_POLICY_IDENTITY,
     REVIEWED_ROUTING_POLICY_VERSION,
@@ -47,6 +58,8 @@ from cayu.knowledge.records import (
     KnowledgeRevisionConflict,
     KnowledgeStatus,
     KnowledgeVisibility,
+    _knowledge_publication_operation_id,
+    _next_knowledge_revision,
     copy_knowledge_chunk,
     copy_knowledge_entry,
 )
@@ -54,6 +67,7 @@ from cayu.knowledge.scopes import (
     KnowledgeAccessDenied,
     KnowledgeAccessScope,
     copy_knowledge_access_scope,
+    knowledge_access_scope_sha256,
 )
 from cayu.storage.knowledge_indexer import (
     DEFAULT_KNOWLEDGE_CHUNK_OVERLAP_BYTES,
@@ -64,13 +78,7 @@ from cayu.storage.knowledge_indexer import (
     knowledge_source_hash,
 )
 from cayu.storage.memory import (
-    KnowledgeActivationAuthority,
-    KnowledgeActivationDisposition,
-    KnowledgeActivationReceipt,
-    KnowledgeActivationSource,
     KnowledgeFacet,
-    KnowledgeGovernanceConfig,
-    KnowledgeGovernanceMode,
     KnowledgeHit,
     KnowledgeListGroup,
     KnowledgeListItem,
@@ -80,13 +88,7 @@ from cayu.storage.memory import (
     KnowledgeQuery,
     KnowledgeSearchMode,
     KnowledgeStore,
-    _knowledge_publication_operation_id,
-    _next_knowledge_revision,
-    copy_knowledge_activation_authority,
-    copy_knowledge_activation_receipt,
     copy_knowledge_publication_receipt,
-    knowledge_access_scope_sha256,
-    prepare_knowledge_activation_request,
     prepare_knowledge_publication,
 )
 from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation

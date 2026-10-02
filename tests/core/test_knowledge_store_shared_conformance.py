@@ -2243,7 +2243,7 @@ def test_knowledge_store_revision_exhaustion_fails_before_lifecycle_mutation(
 ) -> None:
     async def run() -> None:
         await _reset_case(knowledge_store_case)
-        monkeypatch.setattr("cayu.storage.memory.MAX_KNOWLEDGE_REVISION", 2)
+        monkeypatch.setattr("cayu.knowledge.records.MAX_KNOWLEDGE_REVISION", 2)
         store = await _open_store(knowledge_store_case)
         try:
             original = await store.create_entry(

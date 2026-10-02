@@ -9,6 +9,20 @@ from cayu._validation import (
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
+from cayu.knowledge.activation_contracts import (
+    MAX_KNOWLEDGE_ACTIVATION_CHUNKS,
+    MAX_KNOWLEDGE_ACTIVATION_EVIDENCE_RECORDS,
+    MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES,
+    KnowledgeActivationAuthority,
+    KnowledgeActivationConflict,
+    KnowledgeActivationReceipt,
+    KnowledgeActivationSource,
+    KnowledgeGovernanceMode,
+    KnowledgeReviewApproval,
+    copy_knowledge_activation_authority,
+    copy_knowledge_activation_receipt,
+    prepare_knowledge_activation_request,
+)
 from cayu.knowledge.maintenance_contracts import (
     KnowledgeMaintenanceDecision,
     KnowledgeMaintenanceDecisionKind,
@@ -29,22 +43,10 @@ from cayu.knowledge.scopes import (
     copy_knowledge_access_scope,
 )
 from cayu.storage.memory import (
-    MAX_KNOWLEDGE_ACTIVATION_CHUNKS,
-    MAX_KNOWLEDGE_ACTIVATION_EVIDENCE_RECORDS,
-    MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES,
-    KnowledgeActivationAuthority,
-    KnowledgeActivationConflict,
-    KnowledgeActivationReceipt,
-    KnowledgeActivationSource,
-    KnowledgeGovernanceMode,
     KnowledgeListQuery,
     KnowledgeListResult,
     KnowledgePublicationReceipt,
-    KnowledgeReviewApproval,
     _replay_review_approval_from_receipts,
-    copy_knowledge_activation_authority,
-    copy_knowledge_activation_receipt,
-    prepare_knowledge_activation_request,
 )
 
 _KNOWLEDGE_REVIEW_STORE_METHODS = (

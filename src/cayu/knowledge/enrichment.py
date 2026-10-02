@@ -38,6 +38,7 @@ from cayu._validation import (
     revalidate_model_input,
     revalidate_model_inputs,
 )
+from cayu.knowledge.activation_contracts import KnowledgeGovernanceMode
 from cayu.knowledge.curator import (
     MAX_LEARNING_BATCH_BYTES,
     MAX_LEARNING_SIGNALS,
@@ -53,6 +54,7 @@ from cayu.knowledge.records import MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES
 from cayu.knowledge.scopes import (
     KnowledgeAccessScope,
     copy_knowledge_access_scope,
+    knowledge_access_scope_sha256,
 )
 from cayu.runtime._durable_worker_loop import (
     DurableWorkerStep,
@@ -63,10 +65,6 @@ from cayu.sessions.invocation import (
     InvocationOriginClaim,
     InvocationOriginTrust,
     TaskExecutionSource,
-)
-from cayu.storage.memory import (
-    KnowledgeGovernanceMode,
-    knowledge_access_scope_sha256,
 )
 from cayu.tasks.base import (
     TaskClaimLost,

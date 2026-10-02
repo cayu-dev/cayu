@@ -388,8 +388,12 @@ Knowledge records and access scopes live in `knowledge/records.py` and
 lineage contracts, detached copies, page validation and relation publication
 preparation/replay validation. `knowledge/maintenance_contracts.py` owns reviewed
 maintenance proposals, decisions, receipts and their deterministic preparation,
-consistency and replay checks. These contracts and the maintenance router/planner
-can be used without loading a storage implementation. Memory, SQLite and
+consistency and replay checks. `knowledge/activation_contracts.py` owns governance
+configuration, activation requests, decisions, authority, receipts and their
+deterministic preparation and validation. Shared exact entry material and revision
+helpers live with records; access-scope fingerprints live with scopes. These
+contracts, application activation policies and the maintenance router/planner can
+be used without loading a storage implementation. Memory, SQLite and
 PostgreSQL stores compose the same contracts with their own access checks and
 atomic persistence operations.
 The existing `cayu`, `cayu.storage` and `cayu.storage.memory` imports resolve to

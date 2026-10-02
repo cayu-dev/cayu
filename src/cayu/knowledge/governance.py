@@ -13,7 +13,7 @@ from contextlib import suppress
 from threading import Lock
 from typing import Protocol
 
-from cayu.storage.memory import (
+from cayu.knowledge.activation_contracts import (
     KnowledgeActivationAuthority,
     KnowledgeActivationDecision,
     KnowledgeActivationDisposition,

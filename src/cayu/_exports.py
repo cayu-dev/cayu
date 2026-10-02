@@ -2785,18 +2785,39 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "KeyedEvidenceFingerprintDomain": ("cayu.memory.evidence", "KeyedEvidenceFingerprintDomain"),
     "KnowledgeAccessDenied": ("cayu.knowledge.scopes", "KnowledgeAccessDenied"),
     "KnowledgeAccessScope": ("cayu.knowledge.scopes", "KnowledgeAccessScope"),
-    "KnowledgeActivationAuthority": ("cayu.storage.memory", "KnowledgeActivationAuthority"),
-    "KnowledgeActivationConflict": ("cayu.storage.memory", "KnowledgeActivationConflict"),
-    "KnowledgeActivationDecision": ("cayu.storage.memory", "KnowledgeActivationDecision"),
-    "KnowledgeActivationDisposition": ("cayu.storage.memory", "KnowledgeActivationDisposition"),
+    "KnowledgeActivationAuthority": (
+        "cayu.knowledge.activation_contracts",
+        "KnowledgeActivationAuthority",
+    ),
+    "KnowledgeActivationConflict": (
+        "cayu.knowledge.activation_contracts",
+        "KnowledgeActivationConflict",
+    ),
+    "KnowledgeActivationDecision": (
+        "cayu.knowledge.activation_contracts",
+        "KnowledgeActivationDecision",
+    ),
+    "KnowledgeActivationDisposition": (
+        "cayu.knowledge.activation_contracts",
+        "KnowledgeActivationDisposition",
+    ),
     "KnowledgeActivationPolicy": ("cayu.knowledge.governance", "KnowledgeActivationPolicy"),
     "KnowledgeActivationPolicyError": (
         "cayu.knowledge.governance",
         "KnowledgeActivationPolicyError",
     ),
-    "KnowledgeActivationReceipt": ("cayu.storage.memory", "KnowledgeActivationReceipt"),
-    "KnowledgeActivationRequest": ("cayu.storage.memory", "KnowledgeActivationRequest"),
-    "KnowledgeActivationSource": ("cayu.storage.memory", "KnowledgeActivationSource"),
+    "KnowledgeActivationReceipt": (
+        "cayu.knowledge.activation_contracts",
+        "KnowledgeActivationReceipt",
+    ),
+    "KnowledgeActivationRequest": (
+        "cayu.knowledge.activation_contracts",
+        "KnowledgeActivationRequest",
+    ),
+    "KnowledgeActivationSource": (
+        "cayu.knowledge.activation_contracts",
+        "KnowledgeActivationSource",
+    ),
     "KnowledgeActorType": ("cayu.knowledge.records", "KnowledgeActorType"),
     "KnowledgeCandidateGenerator": ("cayu.knowledge.curator", "KnowledgeCandidateGenerator"),
     "KnowledgeCandidatePolicy": ("cayu.knowledge.curator", "KnowledgeCandidatePolicy"),
@@ -2874,8 +2895,11 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "KnowledgeEvidenceRole": ("cayu.knowledge.records", "KnowledgeEvidenceRole"),
     "KnowledgeFacet": ("cayu.storage.memory", "KnowledgeFacet"),
     "KnowledgeFrontierRecallSource": ("cayu.memory.recall", "KnowledgeFrontierRecallSource"),
-    "KnowledgeGovernanceConfig": ("cayu.storage.memory", "KnowledgeGovernanceConfig"),
-    "KnowledgeGovernanceMode": ("cayu.storage.memory", "KnowledgeGovernanceMode"),
+    "KnowledgeGovernanceConfig": (
+        "cayu.knowledge.activation_contracts",
+        "KnowledgeGovernanceConfig",
+    ),
+    "KnowledgeGovernanceMode": ("cayu.knowledge.activation_contracts", "KnowledgeGovernanceMode"),
     "KnowledgeHit": ("cayu.storage.memory", "KnowledgeHit"),
     "KnowledgeIndexCoverage": ("cayu.storage.memory", "KnowledgeIndexCoverage"),
     "KnowledgeIndexReadiness": ("cayu.storage.memory", "KnowledgeIndexReadiness"),
@@ -3146,7 +3170,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "KnowledgeRelationQuery": ("cayu.knowledge.relations", "KnowledgeRelationQuery"),
     "KnowledgeRelationResult": ("cayu.knowledge.relations", "KnowledgeRelationResult"),
-    "KnowledgeReviewApproval": ("cayu.storage.memory", "KnowledgeReviewApproval"),
+    "KnowledgeReviewApproval": ("cayu.knowledge.activation_contracts", "KnowledgeReviewApproval"),
     "KnowledgeReviewWorkflow": ("cayu.storage.knowledge_review", "KnowledgeReviewWorkflow"),
     "KnowledgeRevisionConflict": ("cayu.knowledge.records", "KnowledgeRevisionConflict"),
     "KnowledgeRevisionRecallSource": ("cayu.memory.recall", "KnowledgeRevisionRecallSource"),
@@ -3420,16 +3444,19 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES",
     ),
     "MAX_KNOWLEDGE_ACTIVATION_ANNOTATION_BYTES": (
-        "cayu.storage.memory",
+        "cayu.knowledge.activation_contracts",
         "MAX_KNOWLEDGE_ACTIVATION_ANNOTATION_BYTES",
     ),
-    "MAX_KNOWLEDGE_ACTIVATION_CHUNKS": ("cayu.storage.memory", "MAX_KNOWLEDGE_ACTIVATION_CHUNKS"),
+    "MAX_KNOWLEDGE_ACTIVATION_CHUNKS": (
+        "cayu.knowledge.activation_contracts",
+        "MAX_KNOWLEDGE_ACTIVATION_CHUNKS",
+    ),
     "MAX_KNOWLEDGE_ACTIVATION_EVALUATOR_RESULT_BYTES": (
-        "cayu.storage.memory",
+        "cayu.knowledge.activation_contracts",
         "MAX_KNOWLEDGE_ACTIVATION_EVALUATOR_RESULT_BYTES",
     ),
     "MAX_KNOWLEDGE_ACTIVATION_EVIDENCE_RECORDS": (
-        "cayu.storage.memory",
+        "cayu.knowledge.activation_contracts",
         "MAX_KNOWLEDGE_ACTIVATION_EVIDENCE_RECORDS",
     ),
     "MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES": (
@@ -3437,11 +3464,11 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES",
     ),
     "MAX_KNOWLEDGE_ACTIVATION_RECEIPT_BYTES": (
-        "cayu.storage.memory",
+        "cayu.knowledge.activation_contracts",
         "MAX_KNOWLEDGE_ACTIVATION_RECEIPT_BYTES",
     ),
     "MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES": (
-        "cayu.storage.memory",
+        "cayu.knowledge.activation_contracts",
         "MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES",
     ),
     "MAX_KNOWLEDGE_CHANGE_LIMIT": ("cayu.storage.memory", "MAX_KNOWLEDGE_CHANGE_LIMIT"),
@@ -6156,7 +6183,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "preflight_eval_scenario": ("cayu.evals.scenario_preflight", "preflight_eval_scenario"),
     "prepare_eval_judge_calibration": ("cayu.evals.calibration", "prepare_eval_judge_calibration"),
     "prepare_knowledge_activation_request": (
-        "cayu.storage.memory",
+        "cayu.knowledge.activation_contracts",
         "prepare_knowledge_activation_request",
     ),
     "prepare_knowledge_maintenance_decision": (

@@ -1458,11 +1458,9 @@ class AgentRecallSubscription(_WorkContextModel):
         from cayu.knowledge.scopes import (
             KnowledgeAccessScope,
             copy_knowledge_access_scope,
-        )
-        from cayu.memory.recall import RecallSituation
-        from cayu.storage.memory import (
             knowledge_access_scope_sha256,
         )
+        from cayu.memory.recall import RecallSituation
 
         if type(access_scope) is not KnowledgeAccessScope:
             raise TypeError("access_scope must be a KnowledgeAccessScope.")
