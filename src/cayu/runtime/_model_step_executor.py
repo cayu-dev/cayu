@@ -21,16 +21,13 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import partial
 from hashlib import sha256
-from typing import Any, Literal, Never, Protocol, cast
+from typing import Any, Never, cast
 from uuid import uuid4
-
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from cayu._exception_groups import (
     add_exception_note_safely,
     exception_cause,
     exception_context,
-    exception_group_children,
     exception_tree_contains,
     iter_exception_tree,
     set_exception_cause,
@@ -44,20 +41,15 @@ from cayu._task_wait import (
     unexpected_child_cancellation_error,
 )
 from cayu._validation import (
-    DURABLE_DOCUMENT_LIMITS,
     DurableValueError,
     canonical_durable_json_bytes,
     copy_durable_json_object,
-    copy_durable_json_value,
     copy_durable_metadata,
     copy_durable_record,
     copy_json_value,
     extract_durable_value_error,
-    inspect_bounded_durable_json,
     require_clean_nonblank,
     require_durable_clean_nonblank,
-    require_durable_text,
-    require_nonblank,
     safe_durable_value_error_details,
 )
 from cayu.agents import AgentSpec
@@ -72,24 +64,17 @@ from cayu.artifacts.base import InvalidArtifactIdError, copy_artifact_read_resul
 from cayu.budgets.base import (
     BudgetLimit,
     BudgetPolicy,
-    BudgetReservationRecoveryContext,
     BudgetReservationResult,
     budget_limits_for_session,
     copy_request_budget_limits,
     has_deferred_contextual_price,
 )
-from cayu.budgets.billing import BillingIdentity, copy_billing_identity, resolved_billing_identity
+from cayu.budgets.billing import BillingIdentity, resolved_billing_identity
 from cayu.budgets.usage import (
     ModelCompletionPurpose,
-    durable_model_completed_payload,
-    hosted_tool_usage_metrics_from_payload,
     is_conversational_model_completion_payload,
-    normalize_usage_metrics,
-    normalize_usage_metrics_with_overflow_error,
     usage_metrics_from_event_payload,
-    usage_metrics_payload,
 )
-from cayu.configuration import MAX_STEPS
 from cayu.context.base import (
     _COMPACTION_ATTEMPT_ID_KEY,
     CompactionRequest,
@@ -152,9 +137,7 @@ from cayu.context.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
     StructuredOutputSpec,
     StructuredOutputStrategy,
-    StructuredOutputValidation,
     copy_structured_output_spec,
-    require_secret_free_json_schema_keys,
     require_secret_free_structured_output_spec,
     structured_output_spec_payload,
     structured_output_tool_instruction,
@@ -169,22 +152,15 @@ from cayu.events import (
     copy_event,
     event_with_runtime_envelope_authority,
     event_with_runtime_generated_id,
-    event_with_runtime_nested_payload_authority,
     event_with_runtime_payload_authority,
 )
 from cayu.memory.evidence import ContextExposure, ContextExposureEvidenceKind, ContextExposureState
 from cayu.messages import (
-    CitationPart,
-    CitationProvenance,
     FilePart,
-    HostedToolCallPart,
     Message,
     MessageRole,
     ProviderStatePart,
-    ThinkingPart,
-    ToolCallPart,
     ToolResultPart,
-    WebSearchAction,
     detach_message,
 )
 from cayu.providers._credential_boundary import (
@@ -199,7 +175,6 @@ from cayu.providers._http import (
     bind_provider_error_workload_redactor,
     reset_provider_error_workload_redactor,
 )
-from cayu.providers._openai_protocol import protocol_exception_fields
 from cayu.providers._stream_cleanup import (
     _LocalHttpCleanupObserver,
 )
@@ -210,13 +185,11 @@ from cayu.providers.base import (
     MANUAL_MODEL_STREAM_RECOVERY_DISPOSITION,
     OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
     TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
-    TOOL_DISCOVERY_PROJECTION_MAX_TOOLS,
     InputTokenCountConfidence,
     InputTokenCountMethod,
     InputTokenCountResult,
     ModelCompletion,
     ModelContextOverflowError,
-    ModelFinishReason,
     ModelProvider,
     ModelProviderError,
     ModelRequest,
@@ -228,10 +201,7 @@ from cayu.providers.base import (
     ToolDiscoveryProjectionResult,
     UsageDialect,
     copy_input_token_count_result,
-    copy_model_completion,
     copy_model_context_pressure_profile,
-    copy_model_stream_event,
-    normalize_model_completion,
 )
 from cayu.providers.deadlines import (
     ProviderStreamDeadlineAdmission,
@@ -242,30 +212,21 @@ from cayu.providers.deadlines import (
 from cayu.providers.operations import (
     ProviderOperationAdapter,
     ProviderOperationConnection,
-    ProviderOperationMalformedError,
     ProviderOperationMode,
-    ProviderOperationRecoveryMetadata,
     ProviderOperationSnapshot,
     ProviderOperationStartIdempotencySupport,
-    ProviderOperationStartRecoveryRequest,
     ProviderOperationStartRequest,
     ProviderOperationState,
     ProviderOperationStatus,
     copy_provider_operation_connection,
-    copy_provider_operation_snapshot,
-    copy_provider_operation_state,
 )
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
-from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
 from cayu.runtime._child_session_notifications import (
     CHILD_SESSION_NOTIFICATION_INTENT_KEY,
     ChildSessionNotificationStageBinding,
-    child_session_notification_stage_binding,
 )
-from cayu.runtime._completion_projection import portable_model_completion_projection
-from cayu.runtime._diagnostics import exception_diagnostic
 from cayu.runtime._environment_exposure import (
     refresh_and_require_environment_exposed,
     require_environment_exposed,
@@ -280,12 +241,65 @@ from cayu.runtime._memory_evidence import (
     memory_evidence_key_scope,
     memory_evidence_reference_from_checkpoint,
     prepare_context_exposure,
-    recover_context_exposure,
     transition_context_exposure,
-    validate_context_exposure_stage_scope,
 )
 from cayu.runtime._message_redaction import (
     redact_runtime_message_for_boundary,
+)
+from cayu.runtime._model_completion_contracts import (
+    _MAX_MODEL_COMPLETION_RECOVERY_EVIDENCE_ENTRIES as _MAX_MODEL_COMPLETION_RECOVERY_EVIDENCE_ENTRIES,
+)
+from cayu.runtime._model_completion_contracts import (
+    _MAX_MODEL_COMPLETION_RECOVERY_PRICE_ENTRIES as _MAX_MODEL_COMPLETION_RECOVERY_PRICE_ENTRIES,
+)
+from cayu.runtime._model_completion_contracts import (
+    _MAX_MODEL_COMPLETION_RECOVERY_PRICING_CONTEXTS as _MAX_MODEL_COMPLETION_RECOVERY_PRICING_CONTEXTS,
+)
+from cayu.runtime._model_completion_contracts import (
+    _MODEL_COMPLETION_RECOVERY_V1_DEFAULT_MAX_STEPS as _MODEL_COMPLETION_RECOVERY_V1_DEFAULT_MAX_STEPS,
+)
+from cayu.runtime._model_completion_contracts import (
+    MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS as MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS,
+)
+from cayu.runtime._model_completion_contracts import (
+    MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES as MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES,
+)
+from cayu.runtime._model_completion_contracts import (
+    MAX_MODEL_COMPLETION_RECOVERY_METADATA_ENTRIES as MAX_MODEL_COMPLETION_RECOVERY_METADATA_ENTRIES,
+)
+from cayu.runtime._model_completion_contracts import (
+    HostedToolDiscoveryRecoveryAuthority,
+    ModelCompletionDispatch,
+    ModelCompletionDispatchNotAuthorized,
+    ModelCompletionDispatchPreparer,
+    ModelCompletionPublicationRequest,
+    ModelCompletionPublisher,
+    ModelCompletionRecoveryContext,
+    ModelCompletionRecoveryContextFactory,
+    _copy_assistant_step_result,
+    _copy_model_completion_stage,
+    model_completion_recovery_context_from_stage,
+)
+from cayu.runtime._model_completion_contracts import (
+    ModelCompletionPublicationResult as ModelCompletionPublicationResult,
+)
+from cayu.runtime._model_completion_contracts import (
+    _copy_model_completion_stage_result as _copy_model_completion_stage_result,
+)
+from cayu.runtime._model_completion_contracts import (
+    _copy_runtime_publication_result as _copy_runtime_publication_result,
+)
+from cayu.runtime._model_completion_delivery import (
+    ModelAttemptFailed,
+    _combine_authoritative_model_failure,
+    _combine_post_completion_failures,
+    _durable_assistant_step_result,
+    _non_turn_model_completion_event,
+    _publish_model_completion,
+    _take_model_completion_cancellation,
+)
+from cayu.runtime._model_completion_delivery import (
+    _validate_model_completion_publication_result as _validate_model_completion_publication_result,
 )
 from cayu.runtime._model_errors import (
     copy_provider_exception_control,
@@ -306,14 +320,92 @@ from cayu.runtime._model_failover import (
     FailoverObservation,
     decide_model_failover,
 )
-from cayu.runtime._model_failover_stage import model_failover_target_for_stored_stage
+from cayu.runtime._model_stream_events import (
+    _assistant_step_result,
+    _citation_part,
+    _hosted_tool_call_part,
+    _model_stream_event_to_runtime_event,
+    _provider_operation_generated_tool_call_id,
+    _require_unique_tool_call_ids,
+    _retry_attempt_payload,
+    _stream_event_completion,
+    _validate_assistant_stream_event,
+    _validate_stream_event,
+)
+from cayu.runtime._model_stream_events import (
+    _AssistantStreamBoundaryValue as _AssistantStreamBoundaryValue,
+)
+from cayu.runtime._model_stream_events import (
+    _ModelStreamBoundaryValue as _ModelStreamBoundaryValue,
+)
+from cayu.runtime._model_stream_events import (
+    _payload_model as _payload_model,
+)
+from cayu.runtime._model_stream_events import (
+    _provider_operation_id as _provider_operation_id,
+)
+from cayu.runtime._model_stream_events import (
+    _validated_citation_payload as _validated_citation_payload,
+)
+from cayu.runtime._model_stream_events import (
+    _validated_hosted_tool_call_payload as _validated_hosted_tool_call_payload,
+)
 from cayu.runtime._model_target import project_portable_transcript
+from cayu.runtime._model_tool_discovery import (
+    _hosted_tool_discovery_projection,
+    _hosted_tool_discovery_projection_digest,
+    _hosted_tool_discovery_publication_authority,
+    _hosted_tool_name_sha256,
+    _redacted_provider_tool_definitions,
+)
 from cayu.runtime._phase_timing import timed_model_step, timed_phase
 from cayu.runtime._provider_cleanup_evidence import local_http_cleanup_event_id
 from cayu.runtime._provider_operation_cancellation_owner import (
     ProviderOperationCancellationOwner,
     _cancel_provider_operation_after_definite_absence,
-    _provider_operation_target_model,
+)
+from cayu.runtime._provider_operation_recovery_owner import (
+    ProviderOperationRecoveryOwner,
+    _provider_operation_progress_contains_secret,
+)
+from cayu.runtime._provider_operation_recovery_owner import (
+    _attach_provider_recovery_secondary_failure as _attach_provider_recovery_secondary_failure,
+)
+from cayu.runtime._provider_operation_recovery_owner import (
+    _classify_provider_recovery_failure as _classify_provider_recovery_failure,
+)
+from cayu.runtime._provider_operation_recovery_owner import (
+    _close_provider_recovery_iterator as _close_provider_recovery_iterator,
+)
+from cayu.runtime._provider_operation_recovery_owner import (
+    _current_provider_recovery_cancellation as _current_provider_recovery_cancellation,
+)
+from cayu.runtime._provider_operation_recovery_owner import (
+    _detach_provider_recovery_back_edges as _detach_provider_recovery_back_edges,
+)
+from cayu.runtime._provider_operation_recovery_owner import (
+    _emit_provider_recovery_required_event as _emit_provider_recovery_required_event,
+)
+from cayu.runtime._provider_operation_recovery_owner import (
+    _provider_recovery_cleanup_cancellation_baseline as _provider_recovery_cleanup_cancellation_baseline,
+)
+from cayu.runtime._provider_operation_recovery_owner import (
+    _provider_recovery_cleanup_payload as _provider_recovery_cleanup_payload,
+)
+from cayu.runtime._provider_operation_recovery_owner import (
+    _provider_recovery_failure_graph_contains_identity as _provider_recovery_failure_graph_contains_identity,
+)
+from cayu.runtime._provider_operation_recovery_owner import (
+    _provider_recovery_failure_without_identity as _provider_recovery_failure_without_identity,
+)
+from cayu.runtime._provider_operation_recovery_owner import (
+    _ProviderOperationStreamStatusError as _ProviderOperationStreamStatusError,
+)
+from cayu.runtime._provider_operation_recovery_owner import (
+    _ProviderRecoveryRequiredPublicationFailureEvidence as _ProviderRecoveryRequiredPublicationFailureEvidence,
+)
+from cayu.runtime._provider_operation_recovery_owner import (
+    _raise_pending_provider_recovery_cancellation as _raise_pending_provider_recovery_cancellation,
 )
 from cayu.runtime._provider_stream import (
     _admitted_model_provider_events,
@@ -321,10 +413,6 @@ from cayu.runtime._provider_stream import (
     _owned_model_provider_events,
     _provider_stream_self_cancellation_error,
     _ProviderStreamSelfCancellation,
-)
-from cayu.runtime._run_limit_accounting import (
-    RunLimitAccountingContext,
-    has_run_limit_accounting_authority,
 )
 from cayu.runtime._run_limits import (
     _TRUSTED_BINDING_PROVENANCE,
@@ -356,15 +444,12 @@ from cayu.runtime._structured_output_tool_round import (
 from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentity,
     event_with_execution_profile_authority,
-    event_with_execution_profile_fingerprint_authority,
 )
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     ModelStepIdentity,
-    ToolRoundIdentity,
     copy_model_attempt_identity,
     copy_model_step_identity,
-    copy_tool_round_identity,
     new_model_step_identity,
     strip_runtime_owned_execution_identity,
 )
@@ -380,20 +465,14 @@ from cayu.runtime.provider_operation_cancellation import (
 )
 from cayu.runtime.provider_operations import (
     ProviderOperationEvidenceError,
-    ProviderOperationProgressCommit,
-    ProviderOperationProgressEnvelope,
     ProviderOperationRecoveryResult,
     ProviderOperationRecoveryStatus,
-    ProviderOperationUnavailableReason,
     RecoverableProviderOperation,
     RecoverableProviderOperationStart,
-    commit_provider_operation_progress,
     fallback_dispatch_ordinal_from_checkpoint,
     load_recoverable_provider_operation,
     provider_operation_progress_envelope,
-    provider_operation_progress_event_id,
     provider_operation_started_event_id,
-    provider_operation_unavailable_reason,
 )
 from cayu.runtime.retry_policy import (
     RetryDecision,
@@ -404,8 +483,6 @@ from cayu.runtime.retry_policy import (
     retry_diagnostic_payload,
     retry_event_payload,
 )
-from cayu.runtime.stop_policy import RunLimits
-from cayu.runtime.tool_completion import ToolCompletionPolicy
 from cayu.sessions import _model_completion_publication as model_completion_publication
 from cayu.sessions._model_failover import (
     MODEL_FAILOVER_CHECKPOINT_KEY,
@@ -414,20 +491,16 @@ from cayu.sessions._model_failover import (
 )
 from cayu.sessions._provider_operation_cancellation_claim import (
     ProviderOperationCancellationClaim,
-    provider_operation_cancellation_claim_from_checkpoint,
 )
 from cayu.sessions.base import (
-    MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES,
     CheckpointTransform,
     EventOrder,
     EventQuery,
     ModelCompletionStage,
     ModelCompletionStageAbandonmentResult,
     ModelCompletionStageRequest,
-    ModelCompletionStageResult,
     RuntimePublicationOperationRecordMutation,
     RuntimePublicationRequest,
-    RuntimePublicationResult,
     Session,
     SessionRunFenced,
     SessionStatus,
@@ -435,7 +508,6 @@ from cayu.sessions.base import (
     SessionStore,
     _current_session_interaction_id,
     runtime_publication_checkpoint_mutation,
-    runtime_publication_operation_record_value_digest,
 )
 from cayu.tools.catalogue import (
     CALL_TOOL_NAME,
@@ -450,7 +522,6 @@ from cayu.tools.discovery import (
     ToolDiscoverySearchMatch,
     _tool_discovery_definition_for_descriptor,
     current_tool_discovery_view,
-    hosted_tool_discovery_transition,
     resolve_tool_discovery_projection,
     search_tools_spec,
     tool_discovery_generation_id,
@@ -462,10 +533,8 @@ from cayu.tools.exposure import (
     TOOL_EXPOSURE_PROFILE_ID_MAX_CHARS,
     AllRegisteredToolsExposurePolicy,
     ResolvedToolExposure,
-    ResolvedToolExposureAuthority,
     ToolExposure,
     ToolExposurePolicyRequest,
-    copy_resolved_tool_exposure_authority,
     resolve_tool_exposure,
     resolved_tool_exposure_authority,
     tool_capability_ceiling_from_session_metadata,
@@ -488,270 +557,6 @@ from cayu.vaults.redaction import SecretRedactor
 
 logger = logging.getLogger(__name__)
 _PROVIDER_OPERATION_START_SETTLEMENT_TIMEOUT_SECONDS = 5.0
-MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES = MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES
-MAX_MODEL_COMPLETION_RECOVERY_METADATA_ENTRIES = 256
-MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS = 32
-_MAX_MODEL_COMPLETION_RECOVERY_PRICE_ENTRIES = 512
-_MAX_MODEL_COMPLETION_RECOVERY_PRICING_CONTEXTS = 128
-_MAX_MODEL_COMPLETION_RECOVERY_EVIDENCE_ENTRIES = 256
-
-
-def _provider_operation_progress_contains_secret(
-    envelope: ProviderOperationProgressEnvelope,
-    *,
-    redactor: SecretRedactor,
-    targeted_tool_reference_grant_ids: Mapping[str, str] | None = None,
-) -> bool:
-    """Check adapter-owned continuation and output without scanning schema keys."""
-
-    stream_event = envelope.stream_event
-    payload = copy_durable_json_object(stream_event.payload, "provider_operation_stream_payload")
-    if (
-        stream_event.type is ModelStreamEventType.TOOL_CALL
-        and payload.get("name") == CALL_TOOL_NAME
-    ):
-        arguments = payload.get("arguments")
-        if type(arguments) is dict:
-            tool_ref = arguments.get("tool_ref")
-            if (
-                type(tool_ref) is str
-                and targeted_tool_reference_grant_ids is not None
-                and tool_ref in targeted_tool_reference_grant_ids
-            ):
-                # This exact value was projected by the runtime for the model
-                # request. The surrounding model-authored envelope and all
-                # inner arguments remain untrusted and are still scanned.
-                arguments = copy_durable_json_object(arguments, "call_tool.arguments")
-                arguments.pop("tool_ref", None)
-                payload["arguments"] = arguments
-    return (
-        redactor.redact_text(stream_event.delta) != stream_event.delta
-        or durable_value_contains_secret(
-            payload,
-            redactor=redactor,
-            path=("provider_operation_stream_payload",),
-        )
-        or durable_value_contains_secret(
-            envelope.recovery_metadata.opaque,
-            redactor=redactor,
-            path=("provider_operation_recovery_opaque",),
-        )
-    )
-
-
-class HostedToolDiscoveryRecoveryAuthority(BaseModel):
-    """Compact authority for reconstructing one hosted Tool Search request."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    protocol: Literal["openai.tool_search.hosted.v1"] = OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL
-    projection_sha256: str = Field(
-        min_length=64,
-        max_length=64,
-        pattern=r"^[0-9a-f]{64}$",
-    )
-    targeted_tool_name_sha256s: tuple[str, ...] = Field(
-        default=(),
-        max_length=TOOL_DISCOVERY_PROJECTION_MAX_TOOLS,
-    )
-    loaded_tool_name_sha256s: tuple[str, ...] = Field(
-        default=(),
-        max_length=TOOL_DISCOVERY_PROJECTION_MAX_TOOLS,
-    )
-
-    @field_validator(
-        "targeted_tool_name_sha256s",
-        "loaded_tool_name_sha256s",
-        mode="before",
-    )
-    @classmethod
-    def copy_tool_name_sha256s(cls, value: object, info) -> tuple[str, ...]:
-        if not isinstance(value, (list, tuple)):
-            raise TypeError(f"{info.field_name} must be a sequence.")
-        copied = tuple(value)
-        if any(
-            type(digest) is not str
-            or len(digest) != 64
-            or any(character not in "0123456789abcdef" for character in digest)
-            for digest in copied
-        ):
-            raise ValueError(f"{info.field_name} must contain SHA-256 digests.")
-        if copied != tuple(sorted(set(copied))):
-            raise ValueError(f"{info.field_name} must be unique and sorted.")
-        return cast("tuple[str, ...]", copied)
-
-
-_MODEL_COMPLETION_RECOVERY_V1_DEFAULT_MAX_STEPS = 16
-
-
-class ModelCompletionRecoveryContext(BaseModel):
-    """Secret-free run semantics required to publish an offline completion."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    schema_version: Literal[1] = 1
-    interaction_id: str | None = Field(default=None, min_length=1, max_length=256)
-    execution_profile_fingerprint: str | None = Field(
-        default=None,
-        min_length=64,
-        max_length=64,
-        pattern=r"^[0-9a-f]{64}$",
-    )
-    tool_exposure: ResolvedToolExposureAuthority | None = None
-    hosted_tool_discovery: HostedToolDiscoveryRecoveryAuthority | None = None
-    task_id: str | None = None
-    request_metadata: dict[str, Any] = Field(default_factory=dict)
-    tool_completion: ToolCompletionPolicy | None = Field(
-        default=None,
-        exclude_if=lambda value: value is None,
-    )
-    structured_output: StructuredOutputSpec | None = None
-    thinking: ThinkingConfig | None = None
-    # A missing field can be a persisted schema-v1 payload, so changing this
-    # default would rewrite historical run semantics during recovery.
-    max_steps: StrictInt = Field(
-        default=_MODEL_COMPLETION_RECOVERY_V1_DEFAULT_MAX_STEPS,
-        ge=1,
-        le=MAX_STEPS,
-    )
-    limits: RunLimits = Field(default_factory=RunLimits)
-    run_limit_accounting: RunLimitAccountingContext | None = None
-    budget_limits: tuple[BudgetLimit, ...] = ()
-    budget_reservations: tuple[BudgetReservationRecoveryContext, ...] = ()
-    retry_policy: RetryPolicy = Field(default_factory=RetryPolicy)
-    structured_output_attempt: StrictInt | None = Field(default=None, ge=1)
-    billing_identity: BillingIdentity | None = None
-
-    @field_validator("interaction_id", "task_id")
-    @classmethod
-    def validate_recovery_identity(cls, value: str | None, info) -> str | None:
-        if value is None:
-            return None
-        return require_durable_clean_nonblank(value, info.field_name)
-
-    @field_validator("request_metadata", mode="before")
-    @classmethod
-    def copy_request_metadata(cls, value: object) -> dict[str, Any]:
-        copied = copy_durable_metadata(value, "request_metadata")
-        if len(copied) > MAX_MODEL_COMPLETION_RECOVERY_METADATA_ENTRIES:
-            raise ValueError(
-                "request_metadata cannot contain more than "
-                f"{MAX_MODEL_COMPLETION_RECOVERY_METADATA_ENTRIES} entries."
-            )
-        return copied
-
-    @field_validator("budget_limits", mode="before")
-    @classmethod
-    def copy_budget_limits(cls, value: Any) -> tuple[BudgetLimit, ...]:
-        if (
-            type(value) in (list, tuple)
-            and len(value) > MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS
-        ):
-            raise ValueError(
-                "budget_limits cannot contain more than "
-                f"{MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS} limits."
-            )
-        return copy_request_budget_limits(value)
-
-    @field_validator("budget_reservations", mode="before")
-    @classmethod
-    def copy_budget_reservations(
-        cls,
-        value: Any,
-    ) -> tuple[BudgetReservationRecoveryContext, ...]:
-        if type(value) not in (list, tuple):
-            raise TypeError("budget_reservations must be a list or tuple.")
-        if len(value) > MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS:
-            raise ValueError(
-                "budget_reservations cannot contain more than "
-                f"{MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS} entries."
-            )
-        copied = tuple(BudgetReservationRecoveryContext.model_validate(item) for item in value)
-        reservation_ids = [item.reservation_id for item in copied]
-        budget_limit_ids = [item.budget_limit_id for item in copied]
-        if len(set(reservation_ids)) != len(reservation_ids):
-            raise ValueError("budget_reservations must not repeat reservation ids.")
-        if len(set(budget_limit_ids)) != len(budget_limit_ids):
-            raise ValueError("budget_reservations must not repeat budget limit ids.")
-        return copied
-
-    @field_validator("billing_identity", mode="after")
-    @classmethod
-    def copy_context_billing_identity(
-        cls,
-        value: BillingIdentity | None,
-    ) -> BillingIdentity | None:
-        return copy_billing_identity(value)
-
-    @model_validator(mode="after")
-    def validate_durable_bounds(self) -> ModelCompletionRecoveryContext:
-        if self.run_limit_accounting is not None and not has_run_limit_accounting_authority(
-            self.limits,
-            self.budget_limits,
-        ):
-            raise ValueError("run_limit_accounting requires active run-scoped authority.")
-        for limit in (
-            *self.budget_limits,
-            *(
-                reservation.limit
-                for reservation in self.budget_reservations
-                if reservation.limit is not None
-            ),
-        ):
-            price_book = limit.pricing
-            if (
-                len(price_book.prices) > _MAX_MODEL_COMPLETION_RECOVERY_PRICE_ENTRIES
-                or len(price_book.resource_mappings) > _MAX_MODEL_COMPLETION_RECOVERY_PRICE_ENTRIES
-                or len(price_book.contextual_pricing_requirements)
-                > _MAX_MODEL_COMPLETION_RECOVERY_PRICE_ENTRIES
-            ):
-                raise ValueError("budget limit pricing collections exceed recovery bounds.")
-        if self.billing_identity is not None:
-            identity = self.billing_identity
-            if (
-                len(identity.request_evidence) > _MAX_MODEL_COMPLETION_RECOVERY_EVIDENCE_ENTRIES
-                or len(identity.completion_evidence)
-                > _MAX_MODEL_COMPLETION_RECOVERY_EVIDENCE_ENTRIES
-                or len(identity.pricing_contexts) > _MAX_MODEL_COMPLETION_RECOVERY_PRICING_CONTEXTS
-                or any(
-                    len(context.dimensions) > _MAX_MODEL_COMPLETION_RECOVERY_EVIDENCE_ENTRIES
-                    for context in identity.pricing_contexts
-                )
-            ):
-                raise ValueError("billing identity collections exceed recovery bounds.")
-        inspect_bounded_durable_json(
-            self.model_dump(mode="json"),
-            "model_completion_recovery_context",
-            max_bytes=MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES,
-            max_nodes=DURABLE_DOCUMENT_LIMITS.max_nodes,
-            max_nesting=DURABLE_DOCUMENT_LIMITS.max_nesting,
-        )
-        return self
-
-
-ModelCompletionRecoveryContextFactory = Callable[
-    [BillingIdentity | None, tuple[BudgetStepReservation, ...]],
-    ModelCompletionRecoveryContext | None,
-]
-
-
-def model_completion_recovery_context_from_stage(
-    stage: ModelCompletionStage,
-) -> ModelCompletionRecoveryContext | None:
-    """Reconstruct the typed, secret-free continuation context from one stage."""
-
-    raw_context = stage.intent.get("recovery_context")
-    if raw_context is None:
-        return None
-    context = ModelCompletionRecoveryContext.model_validate(
-        copy_durable_json_object(raw_context, "recovery_context")
-    )
-    if (
-        context.run_limit_accounting is not None
-        and context.run_limit_accounting.baseline.session_id != stage.session_id
-    ):
-        raise ValueError("Model completion run-limit accounting belongs to another session.")
-    return context
 
 
 def _ambiguous_provider_operation_start_error(
@@ -776,50 +581,6 @@ def is_ambiguous_provider_operation_start_error(failure: BaseException) -> bool:
         and candidate.error_code == "provider_operation_start_ambiguous"
         for candidate in iter_exception_tree(failure)
     )
-
-
-class ModelAttemptFailed(Exception):
-    """A single provider attempt failed after zero or more streamed events.
-
-    ``completion_observed`` is set only by the durable publication path. Once a
-    valid completed frame has crossed that boundary, a later transport/control
-    error is terminal and cannot authorize another provider dispatch.
-    ``provider_effect_observed`` records whether any valid non-error provider
-    frame was observed, so terminal classification cannot treat a late auth
-    error as proof that the provider rejected the request before all effects.
-    """
-
-    def __init__(
-        self,
-        *,
-        message: str,
-        payload: dict[str, Any],
-        emitted_error_event: bool,
-        cause: Exception | None = None,
-        completion_observed: bool = False,
-        provider_effect_observed: bool = False,
-        automatic_retry_disabled: bool = False,
-        retry_decision: RetryDecision | None = None,
-        retry_suppression: RetrySuppression | None = None,
-    ) -> None:
-        if type(provider_effect_observed) is not bool:
-            raise TypeError("provider_effect_observed must be a bool.")
-        if type(automatic_retry_disabled) is not bool:
-            raise TypeError("automatic_retry_disabled must be a bool.")
-        self.message = require_nonblank(message, "message")
-        self.payload = copy_json_value(payload, "payload")
-        self.emitted_error_event = emitted_error_event
-        self.cause = cause
-        self.completion_observed = completion_observed
-        self.provider_effect_observed = provider_effect_observed
-        self.automatic_retry_disabled = automatic_retry_disabled
-        if retry_decision is not None and type(retry_decision) is not RetryDecision:
-            raise TypeError("retry_decision must be a RetryDecision or None.")
-        if retry_suppression is not None and type(retry_suppression) is not RetrySuppression:
-            raise TypeError("retry_suppression must be a RetrySuppression or None.")
-        self.retry_suppression = retry_suppression
-        self.retry_decision = retry_decision
-        super().__init__(self.message)
 
 
 class _ModelFailoverCandidateExhausted(Exception):
@@ -919,306 +680,6 @@ def _raise_terminal_model_attempt_failure(exc: ModelAttemptFailed) -> Never:
     raise exc.cause from exc
 
 
-def _copy_model_completion_stage(stage: ModelCompletionStage) -> ModelCompletionStage:
-    if type(stage) is not ModelCompletionStage:
-        raise TypeError("Model completion dispatch requires a ModelCompletionStage.")
-    return stage.model_copy(deep=True)
-
-
-def _copy_model_completion_stage_result(
-    result: ModelCompletionStageResult,
-) -> ModelCompletionStageResult:
-    if type(result) is not ModelCompletionStageResult:
-        raise TypeError("Model completion publication requires a ModelCompletionStageResult.")
-    return result.model_copy(deep=True)
-
-
-def _copy_runtime_publication_result(
-    result: RuntimePublicationResult,
-) -> RuntimePublicationResult:
-    if type(result) is not RuntimePublicationResult:
-        raise TypeError("Model completion publication requires a RuntimePublicationResult.")
-    return result.model_copy(deep=True)
-
-
-def _copy_assistant_step_result(result: AssistantStepResult) -> AssistantStepResult:
-    if type(result) is not AssistantStepResult:
-        raise TypeError("Model completion publication requires an AssistantStepResult.")
-    completion = copy_model_completion(result.completion)
-    if completion is None:  # pragma: no cover - AssistantStepResult requires a completion
-        raise RuntimeError("Assistant step result lost its completion metadata.")
-    return AssistantStepResult(
-        session_id=result.session_id,
-        step=result.step,
-        model_step_id=result.model_step_id,
-        model_attempt_id=result.model_attempt_id,
-        tool_round_identity=(
-            None
-            if result.tool_round_identity is None
-            else copy_tool_round_identity(result.tool_round_identity)
-        ),
-        assistant_message=(
-            None if result.assistant_message is None else detach_message(result.assistant_message)
-        ),
-        tool_calls=[
-            runtime_records.ToolCallRequest(
-                id=call.id,
-                name=call.name,
-                arguments=copy_durable_json_object(
-                    call.arguments,
-                    "tool_call_arguments",
-                ),
-                targeted_tool_grant_id=call.targeted_tool_grant_id,
-                model_tool_name=call.model_tool_name,
-                targeted_tool_invocation=call.targeted_tool_invocation,
-                targeted_tool_rejection=call.targeted_tool_rejection,
-            )
-            for call in result.tool_calls
-        ],
-        completion=completion,
-        text_content=result.text_content,
-        has_user_visible_content=result.has_user_visible_content,
-        provider_state_count=result.provider_state_count,
-        thinking_count=result.thinking_count,
-    )
-
-
-def _durable_assistant_step_result(
-    result: AssistantStepResult,
-    *,
-    redactor: SecretRedactor,
-    targeted_tool_reference_grant_ids: Mapping[str, str] | None = None,
-    native_tool_name_grant_ids: Mapping[str, str] | None = None,
-) -> AssistantStepResult:
-    """Project one assistant result across the durable publication boundary."""
-
-    copied = _copy_assistant_step_result(result)
-    if copied.assistant_message is None:
-        if copied.tool_calls:
-            raise ValueError("Assistant tool calls require an assistant message.")
-        return copied
-    # The model never owned tool-round identifiers. Evaluate only its content
-    # against workload secrets, then restore the exact runtime lineage.
-    assistant_message = transcript_helpers.redact_untrusted_assistant_message_for_boundary(
-        copied.assistant_message,
-        tool_round_identity=copied.tool_round_identity,
-        redactor=redactor,
-        field_name="assistant_message",
-    )
-    reference_grant_ids = (
-        {} if targeted_tool_reference_grant_ids is None else dict(targeted_tool_reference_grant_ids)
-    )
-    name_grant_ids = {} if native_tool_name_grant_ids is None else dict(native_tool_name_grant_ids)
-    tool_calls: list[runtime_records.ToolCallRequest] = []
-    for call in copied.tool_calls:
-        projected_arguments = redactor.redact_json_values(call.arguments)
-        if type(projected_arguments) is not dict:
-            raise AssertionError("Tool-call argument redaction returned a non-object.")
-        tool_ref = call.arguments.get("tool_ref") if call.name == CALL_TOOL_NAME else None
-        targeted_tool_grant_id = (
-            reference_grant_ids.get(tool_ref) if type(tool_ref) is str else None
-        )
-        native_grant_id = name_grant_ids.get(call.name)
-        if targeted_tool_grant_id is not None and native_grant_id is not None:
-            raise ValueError(
-                "A model tool call matched both reference and native dynamic-tool authority."
-            )
-        if native_grant_id is not None:
-            targeted_tool_grant_id = native_grant_id
-        if targeted_tool_grant_id is not None and tool_ref is not None:
-            # The exact reference was issued in this request by the runtime.
-            # Retain it only as private executable material paired with its
-            # grant id; transcript projection below replaces it with a
-            # non-authoritative placeholder.
-            projected_arguments["tool_ref"] = tool_ref
-        tool_calls.append(
-            runtime_records.ToolCallRequest(
-                id=call.id,
-                name=call.name,
-                arguments=projected_arguments,
-                targeted_tool_grant_id=targeted_tool_grant_id,
-            )
-        )
-    assistant_message = transcript_helpers.assistant_message_with_tool_call_arguments(
-        assistant_message,
-        tool_calls,
-    )
-    text_content = assistant_text_content(assistant_message)
-    return AssistantStepResult(
-        session_id=copied.session_id,
-        step=copied.step,
-        model_step_id=copied.model_step_id,
-        model_attempt_id=copied.model_attempt_id,
-        tool_round_identity=copied.tool_round_identity,
-        assistant_message=assistant_message,
-        tool_calls=tool_calls,
-        completion=copied.completion,
-        text_content=text_content,
-        has_user_visible_content=bool(text_content.strip()),
-        provider_state_count=provider_state_count(assistant_message),
-        thinking_count=thinking_count(assistant_message),
-    )
-
-
-def _hosted_tool_discovery_projection(
-    *,
-    session: Session,
-    registered_agent: runtime_records.RegisteredAgentState,
-    excluded_tool_names: Iterable[str],
-    redactor: SecretRedactor,
-) -> ToolDiscoveryProjectionRequest:
-    """Build the exact bounded, secret-free hosted candidate projection."""
-
-    excluded = frozenset(excluded_tool_names)
-    if any(type(name) is not str for name in excluded):
-        raise TypeError("Excluded tool names must be strings.")
-    ceiling_names = frozenset(
-        tool_capability_ceiling_from_session_metadata(session.metadata).tool_names
-    )
-    descriptors = tuple(
-        descriptor
-        for descriptor in registered_agent.tool_catalogue.descriptors
-        if descriptor.name in ceiling_names and descriptor.name not in excluded
-    )
-    if len(descriptors) > TOOL_DISCOVERY_PROJECTION_MAX_TOOLS:
-        raise ValueError(
-            "OpenAI hosted Tool Search candidate count exceeds the bounded "
-            f"maximum of {TOOL_DISCOVERY_PROJECTION_MAX_TOOLS}; reduce the session "
-            "tool ceiling or use portable search_tools."
-        )
-    candidates = tuple(
-        sorted(
-            (_tool_discovery_definition_for_descriptor(descriptor) for descriptor in descriptors),
-            key=lambda tool: cast("str", tool["name"]),
-        )
-    )
-    redacted_candidates = tuple(
-        _redacted_provider_tool_definitions(
-            candidates,
-            redactor=redactor,
-            field_name="tool_discovery_candidates",
-        )
-    )
-    return ToolDiscoveryProjectionRequest(
-        protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
-        candidate_tools=redacted_candidates,
-        generation_id=tool_discovery_generation_id(
-            session_id=session.id,
-            root_invocation_id=session.invocation.root_invocation_id,
-        ),
-    )
-
-
-def _hosted_tool_discovery_projection_digest(
-    projection: ToolDiscoveryProjectionRequest,
-) -> str:
-    if projection.protocol != OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL:
-        raise ValueError("Hosted Tool Search authority requires the hosted protocol.")
-    return sha256(
-        canonical_durable_json_bytes(
-            projection.model_dump(mode="json"),
-            "hosted_tool_discovery_projection",
-        )
-    ).hexdigest()
-
-
-def _hosted_tool_name_sha256(name: str) -> str:
-    return sha256(
-        require_durable_clean_nonblank(name, "hosted tool name").encode("utf-8")
-    ).hexdigest()
-
-
-async def _hosted_tool_discovery_publication_authority(
-    *,
-    session_store: SessionStore,
-    session: Session,
-    registered_agent: runtime_records.RegisteredAgentState,
-    projection: ToolDiscoveryProjectionRequest | None,
-    stream_event: ModelStreamEvent,
-    tool_calls: list[runtime_records.ToolCallRequest],
-    model_step_id: str,
-    created_at: datetime,
-) -> tuple[tuple[RuntimePublicationOperationRecordMutation, ...], dict[str, str]]:
-    """Validate a hosted selection and prepare its atomic durable grant update."""
-
-    result = stream_event.tool_discovery_result
-    if projection is None or projection.protocol != OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL:
-        if result is not None:
-            raise ValueError("Provider returned hosted Tool Search evidence unexpectedly.")
-        return (), {}
-
-    candidates_by_name = {cast("str", tool["name"]): tool for tool in projection.candidate_tools}
-    candidate_call_names = {call.name for call in tool_calls if call.name in candidates_by_name}
-    replay_loaded_names = frozenset(projection.loaded_tool_names)
-    if result is None:
-        if candidate_call_names - replay_loaded_names:
-            raise ValueError(
-                "Provider called a deferred function without hosted Tool Search evidence."
-            )
-        return (), {}
-
-    loaded_names = result.loaded_tool_names
-    loaded_name_set = frozenset(loaded_names)
-    if candidate_call_names - loaded_name_set - replay_loaded_names:
-        raise ValueError("Provider called a deferred function outside the loaded subset.")
-    selected_descriptors: list[ToolDescriptor] = []
-    ceiling_names = frozenset(
-        tool_capability_ceiling_from_session_metadata(session.metadata).tool_names
-    )
-    for loaded in result.loaded_tools:
-        name = cast("str", loaded["name"])
-        candidate = candidates_by_name.get(name)
-        if candidate is None:
-            raise ValueError("Provider loaded a function outside the requested catalogue.")
-        if loaded != candidate:
-            raise ValueError("Provider altered a hosted Tool Search function definition.")
-        descriptor = registered_agent.tool_catalogue.descriptor_for_name(name)
-        if descriptor.name not in ceiling_names:
-            raise ValueError("Provider loaded a function outside the session tool ceiling.")
-        selected_descriptors.append(descriptor)
-
-    if not selected_descriptors:
-        return (), {}
-
-    raw_view = await session_store.load_session_operation(
-        session.id,
-        TOOL_DISCOVERY_VIEW_OPERATION_KEY,
-    )
-    view = current_tool_discovery_view(
-        raw_view,
-        session_id=session.id,
-        generation_id=tool_discovery_generation_id(
-            session_id=session.id,
-            root_invocation_id=session.invocation.root_invocation_id,
-        ),
-        agent_name=registered_agent.spec.name,
-        catalogue=registered_agent.tool_catalogue,
-        ceiling=tool_capability_ceiling_from_session_metadata(session.metadata),
-    )
-    desired_view, grant_ids = hosted_tool_discovery_transition(
-        view,
-        descriptors=selected_descriptors,
-        model_step_id=model_step_id,
-        created_at=created_at,
-    )
-    newly_loaded_grant_ids = {
-        name: grant_id for name, grant_id in grant_ids.items() if name not in replay_loaded_names
-    }
-    if desired_view == view:
-        return (), newly_loaded_grant_ids
-    if raw_view is None:  # pragma: no cover - current_tool_discovery_view rejects this
-        raise RuntimeError("Hosted Tool Search lost its source discovery view.")
-    mutation = RuntimePublicationOperationRecordMutation(
-        key=TOOL_DISCOVERY_VIEW_OPERATION_KEY,
-        expected_value_digest=runtime_publication_operation_record_value_digest(raw_view),
-        value=desired_view.model_dump(mode="json"),
-    )
-    return (
-        (mutation,),
-        newly_loaded_grant_ids,
-    )
-
-
 def _assistant_step_result_with_published_targeted_authority(
     live_result: AssistantStepResult,
     published_result: AssistantStepResult,
@@ -1260,253 +721,6 @@ def _assistant_step_result_with_published_targeted_authority(
         provider_state_count=live.provider_state_count,
         thinking_count=live.thinking_count,
     )
-
-
-@dataclass(frozen=True, slots=True)
-class ModelCompletionDispatch:
-    """Detached proof that one exact provider dispatch was durably prepared."""
-
-    stage: ModelCompletionStage
-    request_fingerprint: str
-    context_exposure: ContextExposure | None = None
-    child_session_notifications_consumed: bool = True
-    prepared_events: tuple[Event, ...] = ()
-
-    def __post_init__(self) -> None:
-        stage = _copy_model_completion_stage(self.stage)
-        request_fingerprint = require_durable_clean_nonblank(
-            self.request_fingerprint,
-            "request_fingerprint",
-        )
-        if len(request_fingerprint) != 64 or any(
-            character not in "0123456789abcdef" for character in request_fingerprint
-        ):
-            raise ValueError("request_fingerprint must be a lowercase SHA-256 digest.")
-        if stage.state != "in_flight":
-            raise ValueError("A provider dispatch requires an in-flight completion stage.")
-        if stage.intent.get("request_fingerprint") != request_fingerprint:
-            raise ValueError("Completion-stage intent does not match its request fingerprint.")
-        exposure = self.context_exposure
-        if exposure is not None:
-            exposure = ContextExposure.model_validate(exposure.model_dump(mode="python"))
-            if exposure.state is not ContextExposureState.DISPATCH_STARTED:
-                raise ValueError("A dispatched context exposure must be dispatch_started.")
-            if stage.intent.get("context_exposure") != context_exposure_identity_payload(exposure):
-                raise ValueError("Completion-stage intent does not match its context exposure.")
-            validate_context_exposure_stage_scope(exposure, stage.intent)
-        notifications_consumed = self.child_session_notifications_consumed
-        prepared_events = tuple(copy_event(event) for event in self.prepared_events)
-        if len(prepared_events) > 1 or any(
-            event.type is not EventType.MODEL_FAILOVER_SELECTED
-            or event.session_id != stage.session_id
-            or event.payload.get("stage_id") != stage.stage_id
-            for event in prepared_events
-        ):
-            raise ValueError("Model dispatch contains conflicting preparation events.")
-        object.__setattr__(self, "prepared_events", prepared_events)
-        if type(notifications_consumed) is not bool:
-            raise TypeError("child_session_notifications_consumed must be a boolean.")
-        if (
-            not notifications_consumed
-            and child_session_notification_stage_binding(stage.intent) is None
-        ):
-            raise ValueError("An unconsumed dispatch must bind child-session notifications.")
-        object.__setattr__(self, "stage", stage)
-        object.__setattr__(self, "request_fingerprint", request_fingerprint)
-        object.__setattr__(self, "context_exposure", exposure)
-        object.__setattr__(
-            self,
-            "child_session_notifications_consumed",
-            notifications_consumed,
-        )
-
-    @property
-    def stage_id(self) -> str:
-        return self.stage.stage_id
-
-    @property
-    def logical_step_id(self) -> str:
-        return self.stage.logical_step_id
-
-    @property
-    def dispatch_ordinal(self) -> int:
-        return self.stage.dispatch_ordinal
-
-    @property
-    def reservation_ids(self) -> tuple[str, ...]:
-        return self.stage.reservation_ids
-
-    @property
-    def intent(self) -> dict[str, Any]:
-        return copy_durable_json_object(self.stage.intent, "model_completion_intent")
-
-
-class ModelCompletionDispatchPreparer(Protocol):
-    def __call__(
-        self,
-        request: ModelRequest,
-        reference: MemoryEvidenceReference | None,
-        notifications: ChildSessionNotificationStageBinding | None,
-        consume_notifications: bool,
-        /,
-        *,
-        failover_attempt: ModelFailoverAttempt | None = None,
-    ) -> Awaitable[ModelCompletionDispatch]: ...
-
-
-@dataclass(frozen=True, slots=True)
-class ModelCompletionPublicationRequest:
-    """Immutable, detached terminal material handed to the session owner."""
-
-    dispatch: ModelCompletionDispatch
-    assistant_step_result: AssistantStepResult | None
-    completion_event: Event
-    authoritative_assistant_message: Message | None
-    defer_assistant_message: bool
-    structured_output_validation: StructuredOutputValidation | None
-    tool_exposure: ResolvedToolExposureAuthority | None = None
-    operation_record_mutations: tuple[RuntimePublicationOperationRecordMutation, ...] = ()
-
-    def __post_init__(self) -> None:
-        if type(self.dispatch) is not ModelCompletionDispatch:
-            raise TypeError("dispatch must be a ModelCompletionDispatch.")
-        dispatch = ModelCompletionDispatch(
-            stage=self.dispatch.stage,
-            request_fingerprint=self.dispatch.request_fingerprint,
-            context_exposure=self.dispatch.context_exposure,
-            child_session_notifications_consumed=(
-                self.dispatch.child_session_notifications_consumed
-            ),
-            prepared_events=self.dispatch.prepared_events,
-        )
-        if not dispatch.child_session_notifications_consumed:
-            raise ValueError(
-                "A model completion cannot be published before child notifications "
-                "cross the provider-start fence."
-            )
-        result = (
-            None
-            if self.assistant_step_result is None
-            else _copy_assistant_step_result(self.assistant_step_result)
-        )
-        event = copy_event(self.completion_event)
-        assistant_message = (
-            None
-            if self.authoritative_assistant_message is None
-            else detach_message(self.authoritative_assistant_message)
-        )
-        if type(self.defer_assistant_message) is not bool:
-            raise TypeError("defer_assistant_message must be a bool.")
-        if (
-            self.structured_output_validation is not None
-            and type(self.structured_output_validation) is not StructuredOutputValidation
-        ):
-            raise TypeError("structured_output_validation must be a StructuredOutputValidation.")
-        structured_output_validation = (
-            None
-            if self.structured_output_validation is None
-            else self.structured_output_validation.model_copy(deep=True)
-        )
-        tool_exposure = (
-            None
-            if self.tool_exposure is None
-            else copy_resolved_tool_exposure_authority(self.tool_exposure)
-        )
-        operation_record_mutations = tuple(
-            RuntimePublicationOperationRecordMutation.model_validate(
-                mutation.model_dump(mode="python")
-                if type(mutation) is RuntimePublicationOperationRecordMutation
-                else mutation
-            )
-            for mutation in self.operation_record_mutations
-        )
-        if result is not None and result.session_id != dispatch.stage.session_id:
-            raise ValueError("Assistant result session does not match its completion stage.")
-        if event.session_id != dispatch.stage.session_id:
-            raise ValueError("Completion event session does not match its completion stage.")
-        if event.type != EventType.MODEL_COMPLETED:
-            raise ValueError("Completion publication requires a model.completed event.")
-        if assistant_message is not None:
-            if result is None:
-                raise ValueError(
-                    "An authoritative assistant message requires an assistant step result."
-                )
-            if assistant_message != result.assistant_message:
-                raise ValueError(
-                    "Authoritative assistant message does not match the detached step result."
-                )
-        if self.defer_assistant_message and (
-            result is None or assistant_message is None or not result.tool_calls
-        ):
-            raise ValueError(
-                "Deferred assistant publication requires an ordinary tool-call message."
-            )
-        if structured_output_validation is not None and (
-            result is None
-            or assistant_message is None
-            or not any(call.name == STRUCTURED_OUTPUT_TOOL_NAME for call in result.tool_calls)
-        ):
-            raise ValueError(
-                "Structured-output validation requires a published finalizer tool round."
-            )
-        object.__setattr__(self, "dispatch", dispatch)
-        object.__setattr__(self, "assistant_step_result", result)
-        object.__setattr__(self, "completion_event", event)
-        object.__setattr__(self, "authoritative_assistant_message", assistant_message)
-        object.__setattr__(self, "defer_assistant_message", self.defer_assistant_message)
-        object.__setattr__(
-            self,
-            "structured_output_validation",
-            structured_output_validation,
-        )
-        object.__setattr__(self, "tool_exposure", tool_exposure)
-        object.__setattr__(self, "operation_record_mutations", operation_record_mutations)
-
-
-@dataclass(frozen=True, slots=True)
-class ModelCompletionPublicationResult:
-    """Durable terminal-stage and atomic-promotion acknowledgements."""
-
-    completion: ModelCompletionStageResult
-    publication: RuntimePublicationResult
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "completion",
-            _copy_model_completion_stage_result(self.completion),
-        )
-        object.__setattr__(
-            self,
-            "publication",
-            _copy_runtime_publication_result(self.publication),
-        )
-
-
-ModelCompletionPublisher = Callable[
-    [ModelCompletionPublicationRequest],
-    Awaitable[ModelCompletionPublicationResult],
-]
-
-
-class ModelCompletionDispatchNotAuthorized(RuntimeError):
-    """A prior or ambiguous preparation must never cause another provider call."""
-
-    def __init__(
-        self,
-        *,
-        stage: ModelCompletionStage,
-        request_fingerprint: str,
-    ) -> None:
-        self.stage = _copy_model_completion_stage(stage)
-        self.request_fingerprint = require_durable_clean_nonblank(
-            request_fingerprint,
-            "request_fingerprint",
-        )
-        super().__init__(
-            "Model completion dispatch was not authorized because its durable "
-            f"stage already exists: {stage.stage_id}."
-        )
 
 
 def _model_step_logical_id(
@@ -1639,676 +853,6 @@ async def _terminate_pre_dispatch_context_exposure(
         return False
 
 
-def _non_turn_model_completion_event(
-    event: Event,
-    *,
-    failure: BaseException,
-    cancellation: asyncio.CancelledError | None,
-    transcript_cursor: int,
-) -> Event:
-    payload = copy_durable_json_object(event.payload, "model_completion_payload")
-    if cancellation is not None:
-        reason = "model stream was cancelled before terminal validation completed"
-    elif isinstance(failure, SessionInterruptedByRequest):
-        reason = "session interruption won before terminal validation completed"
-    elif isinstance(failure, ModelAttemptFailed):
-        reason = "provider emitted an invalid event after model completion"
-    else:
-        reason = "model completion failed terminal validation"
-    payload["step_classification"] = {
-        "type": "failed",
-        "reason": reason,
-    }
-    payload["transcript_cursor"] = transcript_cursor
-    return copy_event(event).model_copy(update={"payload": payload}, deep=True)
-
-
-def _validate_model_completion_publication_result(
-    request: ModelCompletionPublicationRequest,
-    result: ModelCompletionPublicationResult,
-) -> None:
-    if type(result) is not ModelCompletionPublicationResult:
-        raise TypeError("Model completion publisher must return ModelCompletionPublicationResult.")
-    detached_result = ModelCompletionPublicationResult(
-        completion=result.completion,
-        publication=result.publication,
-    )
-    prepared = request.dispatch.stage
-    completed = detached_result.completion.stage
-    for field_name in (
-        "session_id",
-        "stage_id",
-        "logical_step_id",
-        "dispatch_ordinal",
-        "purpose",
-        "intent",
-        "reservation_ids",
-        "preparation_request_digest",
-        "preparation_digest",
-        "source_status",
-        "source_run_epoch",
-        "source_transcript_cursor",
-        "prepared_at",
-    ):
-        if getattr(completed, field_name) != getattr(prepared, field_name):
-            raise RuntimeError(
-                "Model completion publisher acknowledged a different prepared "
-                f"stage field: {field_name}."
-            )
-    if completed.state != "completed" or completed.publication is None:
-        raise RuntimeError("Model completion publisher did not return a terminal stage.")
-
-    publication_request = completed.publication
-    expected_messages = (
-        ()
-        if request.authoritative_assistant_message is None or request.defer_assistant_message
-        else (request.authoritative_assistant_message,)
-    )
-    if publication_request.publication_id != request.dispatch.logical_step_id:
-        raise RuntimeError("Model completion publication acknowledged a different logical step.")
-    if publication_request.kind != "model-step":
-        raise RuntimeError("Model completion publication has the wrong publication kind.")
-    if publication_request.intent != request.dispatch.intent:
-        raise RuntimeError("Model completion publication changed the prepared dispatch intent.")
-    if publication_request.transcript_messages != expected_messages:
-        raise RuntimeError("Model completion publication changed the authoritative assistant turn.")
-    if publication_request.events != (request.completion_event,):
-        raise RuntimeError("Model completion publication changed its completion event.")
-    pending_round_operations = [
-        operation
-        for operation in publication_request.mutation.operations
-        if operation.key == "pending_tool_round"
-    ]
-    expects_pending_round = bool(
-        request.assistant_step_result is not None
-        and request.authoritative_assistant_message is not None
-        and request.assistant_step_result.tool_calls
-    )
-    if bool(pending_round_operations) != expects_pending_round:
-        raise RuntimeError("Model completion publication changed its pending tool-round mutation.")
-    durable_validation = None
-    durable_tool_exposure = None
-    if pending_round_operations:
-        if len(pending_round_operations) != 1:
-            raise RuntimeError(
-                "Model completion publication changed its pending tool-round mutation."
-            )
-        pending_round_value = pending_round_operations[0].value
-        if type(pending_round_value) is not dict:
-            raise RuntimeError(
-                "Model completion publication returned a malformed pending tool round."
-            )
-        durable_validation = pending_round_value.get("structured_output_validation")
-        durable_tool_exposure = pending_round_value.get("tool_exposure")
-    expected_validation = (
-        None
-        if request.structured_output_validation is None
-        else request.structured_output_validation.model_dump(mode="json")
-    )
-    if durable_validation != expected_validation:
-        raise RuntimeError("Model completion publication changed its structured-output validation.")
-    expected_tool_exposure = (
-        None
-        if not expects_pending_round or request.tool_exposure is None
-        else request.tool_exposure.model_dump(mode="json")
-    )
-    if durable_tool_exposure != expected_tool_exposure:
-        raise RuntimeError("Model completion publication changed its frozen tool exposure.")
-
-    promoted = detached_result.publication
-    receipt = promoted.receipt
-    if promoted.session.id != prepared.session_id:
-        raise RuntimeError("Model completion publication returned a different session.")
-    if receipt.session_id != prepared.session_id:
-        raise RuntimeError("Model completion receipt belongs to a different session.")
-    if receipt.publication_id != request.dispatch.logical_step_id:
-        raise RuntimeError("Model completion receipt belongs to a different logical step.")
-    if receipt.kind != "model-step":
-        raise RuntimeError("Model completion receipt has the wrong publication kind.")
-    if receipt.appended_event_ids != (request.completion_event.id,):
-        raise RuntimeError("Model completion receipt does not bind the exact completion event.")
-    if receipt.transcript_start_cursor != prepared.source_transcript_cursor:
-        raise RuntimeError("Model completion publication started at a different transcript cursor.")
-    if receipt.transcript_end_cursor != (
-        prepared.source_transcript_cursor + len(expected_messages)
-    ):
-        raise RuntimeError("Model completion publication ended at a different transcript cursor.")
-
-
-async def _publish_model_completion(
-    publisher: ModelCompletionPublisher,
-    request: ModelCompletionPublicationRequest,
-    *,
-    terminal_failure: BaseException | None,
-    publication_cancellation: asyncio.CancelledError | None,
-) -> None:
-    expected_request = request
-    callback_request = ModelCompletionPublicationRequest(
-        dispatch=request.dispatch,
-        assistant_step_result=request.assistant_step_result,
-        completion_event=request.completion_event,
-        authoritative_assistant_message=request.authoritative_assistant_message,
-        defer_assistant_message=request.defer_assistant_message,
-        structured_output_validation=request.structured_output_validation,
-        tool_exposure=request.tool_exposure,
-        operation_record_mutations=request.operation_record_mutations,
-    )
-    if publication_cancellation is not None:
-        assert terminal_failure is not None
-
-        async def publish() -> ModelCompletionPublicationResult:
-            return await publisher(callback_request)
-
-        publication_task = asyncio.create_task(publish())
-        outcome = await await_shielded_task_outcome(
-            publication_task,
-            cancellation=publication_cancellation,
-        )
-        if outcome.error is not None:
-            callback_error = outcome.error
-            if isinstance(callback_error, asyncio.CancelledError):
-                callback_error = unexpected_child_cancellation_error(
-                    callback_error,
-                    operation="model completion publication",
-                )
-            add_exception_note_safely(
-                terminal_failure,
-                "Model completion publication also failed while preserving cancellation: "
-                f"{type(callback_error).__name__}: {callback_error}",
-            )
-        elif outcome.result is None:
-            add_exception_note_safely(
-                terminal_failure,
-                (
-                    "Model completion publication returned no acknowledgement while preserving "
-                    "cancellation."
-                ),
-            )
-        else:
-            try:
-                _validate_model_completion_publication_result(
-                    expected_request,
-                    outcome.result,
-                )
-            except BaseException as validation_error:
-                add_exception_note_safely(
-                    terminal_failure,
-                    (
-                        "Model completion publication acknowledgement was invalid while "
-                        "preserving cancellation: "
-                        f"{type(validation_error).__name__}: {validation_error}"
-                    ),
-                )
-        if terminal_failure is publication_cancellation or (
-            isinstance(terminal_failure, BaseExceptionGroup)
-            and any(
-                candidate is publication_cancellation
-                for candidate in iter_exception_tree(terminal_failure)
-            )
-        ):
-            raise terminal_failure
-        add_exception_note_safely(
-            publication_cancellation,
-            "The provider suppressed caller cancellation before raising "
-            f"{type(terminal_failure).__name__}.",
-        )
-        raise publication_cancellation from terminal_failure
-
-    try:
-        result = await publisher(callback_request)
-        _validate_model_completion_publication_result(expected_request, result)
-    except BaseException as publication_error:
-        if terminal_failure is not None:
-            publication_error.add_note(
-                "The provider stream had already reached a terminal failure after emitting "
-                "completion evidence."
-            )
-        raise
-
-
-def _classify_provider_recovery_failure(
-    failure: BaseException,
-    *,
-    cancellation_baseline: int,
-    operation: str,
-) -> BaseException:
-    """Keep current caller cancellation distinct from child-only cancellation."""
-
-    fatal_leaves = [
-        candidate
-        for candidate in iter_exception_tree(failure)
-        if not isinstance(candidate, BaseExceptionGroup)
-        and not isinstance(candidate, (Exception, asyncio.CancelledError))
-    ]
-    if fatal_leaves:
-        return failure
-    task = asyncio.current_task()
-    if task is not None and task.cancelling() > cancellation_baseline:
-        cancellation = _current_provider_recovery_cancellation(
-            failure,
-            cancellation_baseline=cancellation_baseline,
-        )
-        if cancellation is None:  # pragma: no cover - guarded by the task count
-            raise AssertionError("Provider recovery lost current task cancellation.")
-        secondary = _provider_recovery_failure_without_identity(
-            failure,
-            excluded_identity=id(cancellation),
-        )
-        if secondary is not None and not _attach_provider_recovery_secondary_failure(
-            cancellation,
-            secondary,
-        ):
-            add_exception_note_safely(
-                cancellation,
-                "Provider recovery also reported additional failures that could not be "
-                "attached to caller cancellation.",
-            )
-        return cancellation
-    cancellations = [
-        candidate
-        for candidate in iter_exception_tree(failure)
-        if isinstance(candidate, asyncio.CancelledError)
-    ]
-    if not cancellations:
-        return failure
-    unexpected = unexpected_child_cancellation_error(cancellations[0], operation=operation)
-    if failure is not cancellations[0]:
-        set_exception_cause(unexpected, failure)
-    return unexpected
-
-
-def _raise_pending_provider_recovery_cancellation(*, cancellation_baseline: int) -> None:
-    """Propagate caller cancellation even when a provider await suppressed delivery."""
-
-    cancellation = _current_provider_recovery_cancellation(
-        None,
-        cancellation_baseline=cancellation_baseline,
-    )
-    if cancellation is None:
-        return
-    raise cancellation
-
-
-def _current_provider_recovery_cancellation(
-    failure: BaseException | None,
-    *,
-    cancellation_baseline: int,
-) -> asyncio.CancelledError | None:
-    """Return current cancellation without consuming and re-arming its task request."""
-
-    task = asyncio.current_task()
-    if task is None or task.cancelling() <= cancellation_baseline:
-        return None
-    cancellation = next(
-        (
-            candidate
-            for candidate in (() if failure is None else iter_exception_tree(failure))
-            if isinstance(candidate, asyncio.CancelledError)
-        ),
-        None,
-    )
-    if cancellation is not None:
-        return cancellation
-    cancel_message = getattr(task, "_cancel_message", None)
-    return (
-        asyncio.CancelledError()
-        if cancel_message is None
-        else asyncio.CancelledError(cancel_message)
-    )
-
-
-def _provider_recovery_cleanup_cancellation_baseline(
-    publication_failure: BaseException | None,
-    *,
-    cancellation_baseline: int,
-) -> int:
-    """Ignore one cancellation already delivered by the publication await."""
-
-    task = asyncio.current_task()
-    if (
-        not isinstance(publication_failure, asyncio.CancelledError)
-        or task is None
-        or task.cancelling() <= cancellation_baseline
-    ):
-        return cancellation_baseline
-    return task.cancelling()
-
-
-async def _close_provider_recovery_iterator(
-    iterator: AsyncIterator[Any],
-    *,
-    cancellation_baseline: int,
-    operation: str,
-) -> Exception | None:
-    """Close one provider-owned recovery iterator without forging caller cancellation."""
-
-    try:
-        close = getattr(iterator, "aclose", None)
-        if callable(close):
-            await close()
-    except BaseException as close_failure:
-        classified = _classify_provider_recovery_failure(
-            close_failure,
-            cancellation_baseline=cancellation_baseline,
-            operation=operation,
-        )
-        if not isinstance(classified, Exception):
-            if classified is close_failure:
-                raise
-            raise classified from close_failure
-        return classified
-    _raise_pending_provider_recovery_cancellation(cancellation_baseline=cancellation_baseline)
-    return None
-
-
-def _provider_recovery_cleanup_payload(
-    failure: Exception,
-    *,
-    redactor: SecretRedactor,
-) -> dict[str, Any]:
-    diagnostic = exception_diagnostic(
-        failure,
-        empty_message="provider recovery stream cleanup failed",
-        nonportable_message=(
-            "Provider recovery stream cleanup failed with a non-portable diagnostic."
-        ),
-        redactor=redactor,
-    )
-    return {
-        **diagnostic.payload_fields(),
-        "phase": "provider_recovery_stream_cleanup",
-    }
-
-
-class _ProviderRecoveryRequiredPublicationFailureEvidence(RuntimeError):
-    """Sanitized cleanup evidence retained when typed publication also fails."""
-
-    def __init__(
-        self,
-        *,
-        recovery_reason: ProviderOperationUnavailableReason,
-        cleanup_diagnostic: dict[str, Any],
-    ) -> None:
-        copied = copy_durable_json_object(cleanup_diagnostic, "cleanup_diagnostic")
-        error_type = copied.get("error_type")
-        if type(error_type) is not str or not error_type.strip():
-            raise ValueError("Provider recovery cleanup diagnostic has no error type.")
-        super().__init__(
-            "Provider recovery stream cleanup failed before "
-            f"{recovery_reason.value} recovery evidence was acknowledged "
-            f"({error_type})."
-        )
-        self.recovery_reason = recovery_reason
-        self.cleanup_diagnostic = copied
-
-
-class _ProviderOperationStreamStatusError(RuntimeError):
-    """A validated operation error boundary carrying the provider's typed status."""
-
-    def __init__(
-        self,
-        status: ProviderOperationStatus,
-        provider_error: ModelProviderError,
-    ) -> None:
-        super().__init__(str(provider_error))
-        self.status = status
-        self.provider_error = provider_error
-
-
-async def _emit_provider_recovery_required_event(
-    event_writer: RuntimeEventWriter,
-    event: Event,
-    *,
-    recovery_reason: ProviderOperationUnavailableReason,
-    cleanup_failure: Exception | None,
-    redactor: SecretRedactor,
-) -> Event:
-    """Publish typed recovery evidence without losing sanitized cleanup failure."""
-
-    try:
-        return await event_writer.emit(event)
-    except BaseException as publication_failure:
-        if cleanup_failure is None:
-            raise
-        cleanup_evidence = _ProviderRecoveryRequiredPublicationFailureEvidence(
-            recovery_reason=recovery_reason,
-            cleanup_diagnostic=_provider_recovery_cleanup_payload(
-                cleanup_failure,
-                redactor=redactor,
-            ),
-        )
-        if not _attach_provider_recovery_secondary_failure(
-            publication_failure,
-            cleanup_evidence,
-        ):
-            raise BaseExceptionGroup(
-                "Provider recovery evidence publication and stream cleanup both failed.",
-                [publication_failure, cleanup_evidence],
-            ) from None
-        add_exception_note_safely(
-            publication_failure,
-            "Provider recovery-required publication also retained sanitized "
-            f"{recovery_reason.value} stream-cleanup evidence.",
-        )
-        raise
-
-
-def _provider_recovery_failure_without_identity(
-    error: BaseException,
-    *,
-    excluded_identity: int,
-) -> BaseException | None:
-    """Remove one owned failure while retaining ordered non-overlapping subgroups."""
-
-    pending: list[tuple[BaseException, bool]] = [(error, False)]
-    children_by_group: dict[int, tuple[BaseException, ...]] = {}
-    retained_by_identity: dict[int, BaseException | None] = {}
-    while pending:
-        candidate, expanded = pending.pop()
-        candidate_id = id(candidate)
-        if candidate_id in retained_by_identity:
-            continue
-        if candidate_id == excluded_identity:
-            retained_by_identity[candidate_id] = None
-            continue
-        if not isinstance(candidate, BaseExceptionGroup):
-            retained_by_identity[candidate_id] = candidate
-            continue
-        if expanded:
-            children = children_by_group.pop(candidate_id, ())
-            retained_children = [
-                retained
-                for child in children
-                if (retained := retained_by_identity.get(id(child))) is not None
-            ]
-            if not retained_children:
-                retained_by_identity[candidate_id] = None
-            elif len(retained_children) == len(children) and all(
-                retained is child
-                for retained, child in zip(retained_children, children, strict=True)
-            ):
-                retained_by_identity[candidate_id] = candidate
-            else:
-                retained_by_identity[candidate_id] = BaseExceptionGroup(
-                    "Provider recovery additional non-cancellation failures.",
-                    retained_children,
-                )
-            continue
-        children = exception_group_children(candidate)
-        if children is None:
-            retained_by_identity[candidate_id] = RuntimeError(
-                "Provider recovery received an unreadable exception group."
-            )
-            continue
-        children_by_group[candidate_id] = children
-        pending.append((candidate, True))
-        pending.extend((child, False) for child in reversed(children))
-
-    return retained_by_identity.get(id(error))
-
-
-def _provider_recovery_failure_graph_contains_identity(
-    error: BaseException,
-    *,
-    target_identity: int,
-) -> bool:
-    """Return whether one safe exception graph contains an exact object identity."""
-
-    pending = [error]
-    visited: set[int] = set()
-    while pending:
-        candidate = pending.pop()
-        candidate_id = id(candidate)
-        if candidate_id == target_identity:
-            return True
-        if candidate_id in visited:
-            continue
-        visited.add(candidate_id)
-        if isinstance(candidate, BaseExceptionGroup):
-            children = exception_group_children(candidate)
-            if children is not None:
-                pending.extend(children)
-        cause = exception_cause(candidate)
-        if cause is not None:
-            pending.append(cause)
-        context = exception_context(candidate)
-        if context is not None:
-            pending.append(context)
-    return False
-
-
-def _detach_provider_recovery_back_edges(
-    error: BaseException,
-    *,
-    target: BaseException,
-) -> bool:
-    """Remove causal links back to a primary error before attaching this graph."""
-
-    pending = [error]
-    visited: set[int] = set()
-    while pending:
-        candidate = pending.pop()
-        candidate_id = id(candidate)
-        if candidate_id in visited:
-            continue
-        visited.add(candidate_id)
-        if isinstance(candidate, BaseExceptionGroup):
-            children = exception_group_children(candidate)
-            if children is not None:
-                if any(child is target for child in children):
-                    return False
-                pending.extend(children)
-        cause = exception_cause(candidate)
-        if cause is target:
-            if not set_exception_cause(candidate, None):
-                return False
-        elif cause is not None:
-            pending.append(cause)
-        context = exception_context(candidate)
-        if context is target:
-            if not set_exception_context(candidate, None):
-                return False
-        elif context is not None:
-            pending.append(context)
-    return True
-
-
-def _attach_provider_recovery_secondary_failure(
-    primary: BaseException,
-    secondary: BaseException,
-) -> bool:
-    """Retain one ordered recovery failure as an acyclic causal graph."""
-
-    if primary is secondary:
-        return True
-    if not _detach_provider_recovery_back_edges(secondary, target=primary):
-        return False
-    if _provider_recovery_failure_graph_contains_identity(
-        secondary,
-        target_identity=id(primary),
-    ):
-        return False
-    prior_cause = exception_cause(primary)
-    prior_context = None if prior_cause is not None else exception_context(primary)
-    prior_failure = prior_cause if prior_cause is not None else prior_context
-    if prior_failure is secondary or (
-        prior_failure is not None
-        and _provider_recovery_failure_graph_contains_identity(
-            prior_failure,
-            target_identity=id(secondary),
-        )
-    ):
-        return True
-    if prior_failure is None or _provider_recovery_failure_graph_contains_identity(
-        secondary,
-        target_identity=id(prior_failure),
-    ):
-        combined = secondary
-    else:
-        combined = BaseExceptionGroup(
-            "Provider recovery publication and stream cleanup both failed.",
-            [prior_failure, secondary],
-        )
-    if not set_exception_cause(primary, combined):
-        return False
-    if prior_context is not None:
-        set_exception_context(primary, None)
-    return True
-
-
-def _take_model_completion_cancellation(
-    failure: BaseException | None,
-    *,
-    cancellation_baseline: int,
-) -> asyncio.CancelledError | None:
-    """Take caller cancellation newer than the provider-boundary baseline."""
-
-    task = asyncio.current_task()
-    if task is None or task.cancelling() <= cancellation_baseline:
-        return None
-    cancellation = next(
-        (
-            candidate
-            for candidate in (() if failure is None else iter_exception_tree(failure))
-            if isinstance(candidate, asyncio.CancelledError)
-        ),
-        None,
-    )
-    return consume_pending_task_cancellation(
-        cancellation,
-        preserve_requests=cancellation_baseline,
-    )
-
-
-def _combine_post_completion_failures(
-    current: BaseException | None,
-    subsequent: BaseException,
-) -> BaseException:
-    if current is None or current is subsequent:
-        return subsequent
-    return BaseExceptionGroup(
-        "Model completion encountered multiple terminal failures.",
-        [current, subsequent],
-    )
-
-
-def _combine_authoritative_model_failure(
-    authoritative: BaseException,
-    secondary: BaseException,
-    *,
-    message: str,
-) -> BaseException:
-    """Preserve one authoritative model failure beside later diagnostics."""
-
-    if authoritative is secondary:
-        return authoritative
-    if any(candidate is authoritative for candidate in iter_exception_tree(secondary)):
-        return secondary
-    if any(candidate is secondary for candidate in iter_exception_tree(authoritative)):
-        return authoritative
-    return BaseExceptionGroup(message, [authoritative, secondary])
-
-
 def _combine_context_build_failure_with_secondary(
     error: ContextBuildError,
     secondary: BaseException,
@@ -2372,22 +916,6 @@ def _deadline_with_runtime_recovery_authority(
 class _ContextCountObservation:
     result: InputTokenCountResult
     observation_id: str
-
-
-@dataclass(frozen=True)
-class _ModelStreamBoundaryValue:
-    event: ModelStreamEvent
-    completion_error: DurableValueError | None = None
-    accounting_usage_metrics: dict[str, Any] | None = None
-    accounting_usage_rejected: bool = False
-    usage_normalization_failed: bool = False
-
-
-@dataclass(frozen=True)
-class _AssistantStreamBoundaryValue:
-    event: ModelStreamEvent
-    tool_call: runtime_records.ToolCallRequest | None = None
-    tool_call_part: ToolCallPart | None = None
 
 
 @dataclass(frozen=True)
@@ -2811,6 +1339,14 @@ class ModelStepExecutor:
             lifecycle=provider_operation_cancellation_lifecycle,
             read_recovery_context=model_completion_recovery_context_from_stage,
         )
+        self._provider_operation_recovery = ProviderOperationRecoveryOwner(
+            session_store=session_store,
+            event_writer=event_writer,
+            run_limit_controller=run_limit_controller,
+            cancellation=self._provider_operation_cancellation,
+            secret_redactor=secret_redactor,
+            clock=clock,
+        )
 
     def _retain_provider_operation_reconciliation(self, task: asyncio.Task[None]) -> None:
         self._provider_operation_reconciliation_tasks.add(task)
@@ -2846,160 +1382,6 @@ class ModelStepExecutor:
             model_execution_selection=model_execution_selection,
         )
 
-    def _provider_operation_progress_event(
-        self,
-        *,
-        stage: ModelCompletionStage,
-        state: ProviderOperationState,
-        stream_event: ModelStreamEvent,
-        runtime_event: Event | None,
-        session: Session,
-        interaction_id: str,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_provider: runtime_records.RegisteredProvider,
-        environment_name: str | None,
-        step: int,
-        attempt: int,
-        max_attempts: int,
-        model_attempt_identity: ModelAttemptIdentity,
-        targeted_tool_reference_grant_ids: Mapping[str, str] | None = None,
-    ) -> Event:
-        """Attach private reconnect state to its corresponding normalized event."""
-
-        metadata = stream_event.recovery_metadata
-        if metadata is None or metadata.cursor is None:
-            raise ProviderOperationEvidenceError(
-                "Reconnectable provider events must carry a monotonic recovery cursor."
-            )
-        event_id = provider_operation_progress_event_id(stage.stage_id, metadata.cursor)
-        progress_envelope = provider_operation_progress_envelope(state, stream_event)
-        if _provider_operation_progress_contains_secret(
-            progress_envelope,
-            redactor=self._secret_redactor,
-            targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
-        ):
-            raise ProviderOperationEvidenceError(
-                "Provider-operation recovery metadata or normalized output contains a "
-                "workload secret and cannot cross the durable recovery boundary."
-            )
-        envelope = progress_envelope.model_dump(mode="json")
-        if runtime_event is None:
-            event = _event_with_model_identity_authority(
-                Event(
-                    id=event_id,
-                    type=EventType.PROVIDER_OPERATION_PROGRESS,
-                    session_id=session.id,
-                    interaction_id=interaction_id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload={
-                        "provider": registered_provider.name,
-                        "step": step,
-                        "attempt": attempt,
-                        "max_attempts": max_attempts,
-                        **model_attempt_identity.payload(),
-                        "operation_id": state.operation_id,
-                        "stream_protocol": state.stream_protocol,
-                        "provider_operation_progress": envelope,
-                    },
-                ),
-                model_attempt_identity,
-            )
-            event = event_with_runtime_payload_authority(
-                event,
-                "operation_id",
-                "stream_protocol",
-            )
-        else:
-            event = copy_event(runtime_event)
-            if event.interaction_id not in {None, interaction_id}:
-                raise ProviderOperationEvidenceError(
-                    "Provider-operation progress changed its owning interaction."
-                )
-            payload = copy_durable_json_object(event.payload, "event.payload")
-            payload["provider_operation_progress"] = envelope
-            event = event.model_copy(
-                update={
-                    "id": event_id,
-                    "interaction_id": interaction_id,
-                    "payload": payload,
-                },
-                deep=True,
-            )
-        recovery_context = model_completion_recovery_context_from_stage(stage)
-        event = event_with_execution_profile_fingerprint_authority(
-            event,
-            (None if recovery_context is None else recovery_context.execution_profile_fingerprint),
-        )
-        if (
-            stream_event.type is ModelStreamEventType.TOOL_CALL
-            and stream_event.payload.get("name") == CALL_TOOL_NAME
-            and targeted_tool_reference_grant_ids is not None
-        ):
-            arguments = stream_event.payload.get("arguments")
-            tool_ref = arguments.get("tool_ref") if type(arguments) is dict else None
-            if type(tool_ref) is str and tool_ref in targeted_tool_reference_grant_ids:
-                event = event_with_runtime_nested_payload_authority(
-                    event,
-                    (
-                        "provider_operation_progress",
-                        "stream_event",
-                        "payload",
-                        "arguments",
-                        "tool_ref",
-                    ),
-                )
-        return event_with_runtime_generated_id(event)
-
-    async def _commit_provider_operation_stream_event(
-        self,
-        *,
-        stage: ModelCompletionStage,
-        state: ProviderOperationState,
-        stream_event: ModelStreamEvent,
-        runtime_event: Event | None,
-        session: Session,
-        interaction_id: str,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_provider: runtime_records.RegisteredProvider,
-        environment_name: str | None,
-        step: int,
-        attempt: int,
-        max_attempts: int,
-        model_attempt_identity: ModelAttemptIdentity,
-        targeted_tool_reference_grant_ids: Mapping[str, str] | None = None,
-    ) -> tuple[ProviderOperationProgressCommit, Event | None]:
-        event = self._provider_operation_progress_event(
-            stage=stage,
-            state=state,
-            stream_event=stream_event,
-            runtime_event=runtime_event,
-            session=session,
-            interaction_id=interaction_id,
-            registered_agent=registered_agent,
-            registered_provider=registered_provider,
-            environment_name=environment_name,
-            step=step,
-            attempt=attempt,
-            max_attempts=max_attempts,
-            model_attempt_identity=model_attempt_identity,
-            targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
-        )
-        prepared = self._event_writer.prepare(event)
-        commit = await commit_provider_operation_progress(
-            self._session_store,
-            stage=stage,
-            model_attempt_identity=model_attempt_identity,
-            current_state=state,
-            stream_event=stream_event,
-            event=prepared,
-            expected_run_epoch=session.run_epoch,
-        )
-        if commit.replayed:
-            return commit, None
-        [emitted] = await self._event_writer.fan_out_persisted([commit.event])
-        return commit, emitted
-
     async def recover_provider_operation_start(
         self,
         *,
@@ -3015,283 +1397,16 @@ class ModelStepExecutor:
     ) -> ProviderOperationRecoveryResult:
         """Recover start-only evidence without persisting or replaying a raw request."""
 
-        selected_model = _provider_operation_target_model(session, stage)
-        if model_execution_selection is not None:
-            model_execution_selection.require_recovery_scope(
-                session=session,
-                stage=stage,
-                invocation_context=invocation_context,
-                registered_provider=registered_provider,
-            )
-        elif model_failover_target_for_stored_stage(session=session, stage=stage) is not None:
-            raise RuntimeError("Routed provider-operation recovery requires admitted selection.")
-        if invocation_context is not None and (
-            invocation_context.binding.session_id != session.id
-            or registered_agent is not invocation_context.registered_agent
-            or (
-                model_execution_selection is None
-                and registered_provider is not invocation_context.registered_provider
-            )
-            or environment_name
-            != (
-                None
-                if invocation_context.registered_environment is None
-                else invocation_context.registered_environment.spec.name
-            )
-        ):
-            raise RuntimeError(
-                "Provider-operation start recovery substituted frozen invocation authority."
-            )
-
-        provider = registered_provider.provider
-        adapter = provider.provider_operations
-        recovery_context = model_completion_recovery_context_from_stage(stage)
-        exact_recovery = start.idempotency_support is ProviderOperationStartIdempotencySupport.EXACT
-        if (
-            provider.provider_operation_mode is not ProviderOperationMode.BACKGROUND
-            or not isinstance(adapter, ProviderOperationAdapter)
-        ):
-            raise ProviderOperationEvidenceError(
-                "Provider-operation start recovery is unavailable."
-            )
-        if start.provider != registered_provider.name or start.model != selected_model:
-            raise ProviderOperationEvidenceError(
-                "Provider-operation start recovery resolved a different provider scope."
-            )
-
-        async def unavailable(
-            reason: ProviderOperationUnavailableReason,
-            *,
-            cleanup_failure: Exception | None = None,
-        ) -> ProviderOperationRecoveryResult:
-            payload: dict[str, Any] = {
-                "provider": registered_provider.name,
-                "model": selected_model,
-                "step": start.step,
-                "attempt": start.attempt,
-                "max_attempts": start.max_attempts,
-                **start.model_attempt_identity.payload(),
-                "source_run_epoch": start.source_run_epoch,
-                "run_epoch": session.run_epoch,
-                "start_id": start.start_id,
-                "status": reason.value,
-                "recovery_reason": reason.value,
-                "idempotent_start_recovery": exact_recovery,
-            }
-            if cleanup_failure is not None:
-                payload["provider_cleanup_failure"] = _provider_recovery_cleanup_payload(
-                    cleanup_failure,
-                    redactor=self._secret_redactor,
-                )
-            required = _event_with_model_identity_authority(
-                Event(
-                    type=EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED,
-                    session_id=session.id,
-                    interaction_id=start.interaction_id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload=payload,
-                ),
-                start.model_attempt_identity,
-            )
-            required = event_with_execution_profile_fingerprint_authority(
-                required,
-                (
-                    None
-                    if recovery_context is None
-                    else recovery_context.execution_profile_fingerprint
-                ),
-            )
-            required = event_with_runtime_payload_authority(required, "start_id")
-            emitted = await _emit_provider_recovery_required_event(
-                self._event_writer,
-                required,
-                recovery_reason=reason,
-                cleanup_failure=cleanup_failure,
-                redactor=self._secret_redactor,
-            )
-            return ProviderOperationRecoveryResult(
-                status=ProviderOperationRecoveryStatus.UNAVAILABLE,
-                events=(emitted,),
-                unavailable_reason=reason,
-            )
-
-        if start.idempotency_support is not ProviderOperationStartIdempotencySupport.EXACT:
-            return await unavailable(ProviderOperationUnavailableReason.AMBIGUOUS_SUBMISSION)
-        if adapter.start_idempotency_support is not ProviderOperationStartIdempotencySupport.EXACT:
-            return await unavailable(ProviderOperationUnavailableReason.AMBIGUOUS_SUBMISSION)
-        recovery_task = asyncio.current_task()
-        recovery_cancellation_baseline = 0 if recovery_task is None else recovery_task.cancelling()
-        try:
-            raw_connection = await adapter.recover_start(
-                ProviderOperationStartRecoveryRequest(idempotency_key=start.start_id)
-            )
-        except BaseException as recovery_failure:
-            recovery_failure = _classify_provider_recovery_failure(
-                recovery_failure,
-                cancellation_baseline=recovery_cancellation_baseline,
-                operation="Provider operation start recovery",
-            )
-            if not isinstance(recovery_failure, Exception):
-                raise recovery_failure
-            return await unavailable(ProviderOperationUnavailableReason.UNAVAILABLE)
-        try:
-            connection = copy_provider_operation_connection(raw_connection)
-        except Exception as malformed_failure:
-            cleanup_failure = None
-            if type(raw_connection) is ProviderOperationConnection:
-                cleanup_failure = await _close_provider_recovery_iterator(
-                    raw_connection.events,
-                    cancellation_baseline=recovery_cancellation_baseline,
-                    operation="Provider operation malformed start recovery stream cleanup",
-                )
-            _raise_pending_provider_recovery_cancellation(
-                cancellation_baseline=recovery_cancellation_baseline
-            )
-            if cleanup_failure is not None:
-                add_exception_note_safely(
-                    malformed_failure,
-                    "Provider recovery stream cleanup also failed with "
-                    f"{type(cleanup_failure).__name__}.",
-                )
-            return await unavailable(
-                ProviderOperationUnavailableReason.MALFORMED,
-                cleanup_failure=cleanup_failure,
-            )
-
-        operation_event = _event_with_model_identity_authority(
-            Event(
-                id=provider_operation_started_event_id(start.start_id),
-                type=EventType.PROVIDER_OPERATION_STARTED,
-                session_id=session.id,
-                interaction_id=start.interaction_id,
-                agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
-                payload={
-                    "provider": registered_provider.name,
-                    "model": selected_model,
-                    "step": start.step,
-                    "attempt": start.attempt,
-                    "max_attempts": start.max_attempts,
-                    **start.model_attempt_identity.payload(),
-                    "source_run_epoch": start.source_run_epoch,
-                    "start_id": start.start_id,
-                    "state_version": connection.state.version,
-                    "operation_id": connection.state.operation_id,
-                    "stream_protocol": connection.state.stream_protocol,
-                    "status": connection.status.value,
-                    "recovery_metadata": connection.state.recovery_metadata.model_dump(
-                        mode="json",
-                        exclude_none=True,
-                    ),
-                    "idempotent_start_recovery": True,
-                },
-            ),
-            start.model_attempt_identity,
-        )
-        operation_event = event_with_execution_profile_fingerprint_authority(
-            operation_event,
-            (None if recovery_context is None else recovery_context.execution_profile_fingerprint),
-        )
-        operation_event = event_with_runtime_payload_authority(
-            operation_event,
-            "start_id",
-        )
-        publication_failure: BaseException | None = None
-        try:
-            persisted = await self._event_writer.persist_exact_replay(operation_event)
-            [emitted] = await self._event_writer.fan_out_persisted([persisted])
-        except BaseException as failure:
-            publication_failure = failure
-            raise
-        finally:
-            cleanup_cancellation_baseline = _provider_recovery_cleanup_cancellation_baseline(
-                publication_failure,
-                cancellation_baseline=recovery_cancellation_baseline,
-            )
-            try:
-                cleanup_failure = await _close_provider_recovery_iterator(
-                    raw_connection.events,
-                    cancellation_baseline=cleanup_cancellation_baseline,
-                    operation="Provider operation start recovery stream cleanup",
-                )
-            except BaseException as cleanup_signal:
-                if (
-                    publication_failure is not None
-                    and cleanup_signal is not publication_failure
-                    and not any(
-                        candidate is publication_failure
-                        for candidate in iter_exception_tree(cleanup_signal)
-                    )
-                ):
-                    cleanup_cause = exception_cause(cleanup_signal)
-                    if (
-                        cleanup_cause is not None
-                        and cleanup_cause is not publication_failure
-                        and not _attach_provider_recovery_secondary_failure(
-                            publication_failure,
-                            cleanup_cause,
-                        )
-                    ):
-                        raise BaseExceptionGroup(
-                            "Provider recovery publication and stream cleanup both failed.",
-                            [publication_failure, cleanup_signal],
-                        ) from cleanup_signal
-                    if not set_exception_cause(cleanup_signal, publication_failure):
-                        raise BaseExceptionGroup(
-                            "Provider recovery publication and stream cleanup both failed.",
-                            [publication_failure, cleanup_signal],
-                        ) from cleanup_signal
-                raise
-            if cleanup_failure is not None:
-                diagnostic = _provider_recovery_cleanup_payload(
-                    cleanup_failure,
-                    redactor=self._secret_redactor,
-                )
-                if publication_failure is not None:
-                    if not _attach_provider_recovery_secondary_failure(
-                        publication_failure,
-                        cleanup_failure,
-                    ):
-                        raise BaseExceptionGroup(
-                            "Provider recovery publication and stream cleanup both failed.",
-                            [publication_failure, cleanup_failure],
-                        )
-                    add_exception_note_safely(
-                        publication_failure,
-                        "Provider recovery stream cleanup also failed with "
-                        f"{diagnostic['error_type']}.",
-                    )
-                else:
-                    logger.warning(
-                        "Provider recovery stream cleanup failed after exact start publication: %s",
-                        diagnostic["error_type"],
-                    )
-        operation = await load_recoverable_provider_operation(
-            self._session_store,
-            stage,
-        )
-        if operation is None:
-            raise ProviderOperationEvidenceError(
-                "Idempotent provider start did not produce recoverable operation evidence."
-            )
-        recovered = await self.recover_provider_operation(
+        return await self._provider_operation_recovery.recover_start(
             session=session,
             stage=stage,
-            operation=operation,
+            start=start,
             registered_agent=registered_agent,
             registered_provider=registered_provider,
             environment_name=environment_name,
-            recovery_context=recovery_context,
             model_completion_publisher=model_completion_publisher,
             invocation_context=invocation_context,
             model_execution_selection=model_execution_selection,
-        )
-        return ProviderOperationRecoveryResult(
-            status=recovered.status,
-            events=(emitted, *recovered.events),
-            completion_event=recovered.completion_event,
-            unavailable_reason=recovered.unavailable_reason,
         )
 
     async def recover_provider_operation(
@@ -3310,1271 +1425,17 @@ class ModelStepExecutor:
     ) -> ProviderOperationRecoveryResult:
         """Retrieve and atomically publish one exact offline provider operation."""
 
-        selected_model = _provider_operation_target_model(session, stage)
-        if model_execution_selection is not None:
-            model_execution_selection.require_recovery_scope(
-                session=session,
-                stage=stage,
-                invocation_context=invocation_context,
-                registered_provider=registered_provider,
-            )
-        elif model_failover_target_for_stored_stage(session=session, stage=stage) is not None:
-            raise RuntimeError("Routed provider-operation recovery requires admitted selection.")
-        if invocation_context is not None and (
-            invocation_context.binding.session_id != session.id
-            or registered_agent is not invocation_context.registered_agent
-            or (
-                model_execution_selection is None
-                and registered_provider is not invocation_context.registered_provider
-            )
-            or environment_name
-            != (
-                None
-                if invocation_context.registered_environment is None
-                else invocation_context.registered_environment.spec.name
-            )
-        ):
-            raise RuntimeError(
-                "Provider-operation recovery substituted frozen invocation authority."
-            )
-
-        provider = registered_provider.provider
-        adapter = provider.provider_operations
-        if (
-            provider.provider_operation_mode is not ProviderOperationMode.BACKGROUND
-            or not isinstance(
-                adapter,
-                ProviderOperationAdapter,
-            )
-        ):
-            raise RuntimeError(
-                "The registered provider no longer supports its durable background operation."
-            )
-        if operation.provider != registered_provider.name:
-            raise RuntimeError("Provider-operation recovery resolved a different provider.")
-        if operation.model != selected_model:
-            raise RuntimeError("Provider-operation recovery resolved a different model.")
-        if operation.model_attempt_identity.model_step_id != stage.logical_step_id:
-            raise RuntimeError("Provider-operation recovery belongs to a different model stage.")
-        if (
-            recovery_context is not None
-            and type(recovery_context) is not ModelCompletionRecoveryContext
-        ):
-            raise TypeError("Provider-operation recovery context is invalid.")
-        if (
-            recovery_context is not None
-            and recovery_context.structured_output is not None
-            and recovery_context.structured_output.strategy is StructuredOutputStrategy.NATIVE
-        ):
-            raise ProviderOperationEvidenceError(
-                "Offline recovery of native structured output requires manual reconciliation."
-            )
-        targeted_tool_reference_grant_ids = {
-            record.tool_ref: record.grant_id
-            for record in await self._session_store.list_targeted_tool_grants(
-                session.id,
-                interaction_id=operation.interaction_id,
-            )
-        }
-        hosted_discovery_projection: ToolDiscoveryProjectionRequest | None = None
-        hosted_replay_grant_ids: dict[str, str] = {}
-        if recovery_context is not None and recovery_context.hosted_tool_discovery is not None:
-            if recovery_context.tool_exposure is None:
-                raise ProviderOperationEvidenceError(
-                    "Hosted Tool Search recovery has no durable tool-exposure authority."
-                )
-            try:
-                targeted_name_digests = frozenset(
-                    recovery_context.hosted_tool_discovery.targeted_tool_name_sha256s
-                )
-                targeted_names = frozenset(
-                    descriptor.name
-                    for descriptor in registered_agent.tool_catalogue.descriptors
-                    if _hosted_tool_name_sha256(descriptor.name) in targeted_name_digests
-                )
-                if {
-                    _hosted_tool_name_sha256(name) for name in targeted_names
-                } != targeted_name_digests:
-                    raise ValueError("Hosted Tool Search recovery lost a targeted-tool exclusion.")
-                loaded_name_digests = frozenset(
-                    recovery_context.hosted_tool_discovery.loaded_tool_name_sha256s
-                )
-                loaded_names = frozenset(
-                    descriptor.name
-                    for descriptor in registered_agent.tool_catalogue.descriptors
-                    if _hosted_tool_name_sha256(descriptor.name) in loaded_name_digests
-                )
-                if {_hosted_tool_name_sha256(name) for name in loaded_names} != loaded_name_digests:
-                    raise ValueError("Hosted Tool Search recovery lost replay-loaded authority.")
-                hosted_discovery_projection = _hosted_tool_discovery_projection(
-                    session=session,
-                    registered_agent=registered_agent,
-                    excluded_tool_names=(
-                        *recovery_context.tool_exposure.tool_names,
-                        *targeted_names,
-                    ),
-                    redactor=self._secret_redactor,
-                )
-                if loaded_names:
-                    recovery_view = current_tool_discovery_view(
-                        await self._session_store.load_session_operation(
-                            session.id,
-                            TOOL_DISCOVERY_VIEW_OPERATION_KEY,
-                        ),
-                        session_id=session.id,
-                        generation_id=tool_discovery_generation_id(
-                            session_id=session.id,
-                            root_invocation_id=session.invocation.root_invocation_id,
-                        ),
-                        agent_name=registered_agent.spec.name,
-                        catalogue=registered_agent.tool_catalogue,
-                        ceiling=tool_capability_ceiling_from_session_metadata(session.metadata),
-                    )
-                    grants_by_name = {grant.tool_name: grant for grant in recovery_view.grants}
-                    if any(
-                        name not in grants_by_name
-                        or not tool_discovery_record_matches_descriptor(
-                            grants_by_name[name],
-                            registered_agent.tool_catalogue.descriptor_for_name(name),
-                        )
-                        for name in loaded_names
-                    ):
-                        raise ValueError(
-                            "Hosted Tool Search recovery lost a replay-loaded durable grant."
-                        )
-                    hosted_replay_grant_ids = {
-                        name: grants_by_name[name].grant_id for name in sorted(loaded_names)
-                    }
-                    candidates_by_name = {
-                        cast("str", tool["name"]): tool
-                        for tool in hosted_discovery_projection.candidate_tools
-                    }
-                    if any(name not in candidates_by_name for name in loaded_names):
-                        raise ValueError(
-                            "Hosted Tool Search recovery loaded authority is not a candidate."
-                        )
-                    hosted_discovery_projection = ToolDiscoveryProjectionRequest.model_validate(
-                        {
-                            **hosted_discovery_projection.model_dump(mode="python"),
-                            "loaded_tools": tuple(
-                                candidates_by_name[name] for name in sorted(loaded_names)
-                            ),
-                        }
-                    )
-                recovered_projection_digest = _hosted_tool_discovery_projection_digest(
-                    hosted_discovery_projection
-                )
-            except (TypeError, ValueError) as exc:
-                raise ProviderOperationEvidenceError(
-                    "Hosted Tool Search recovery could not reconstruct its original "
-                    "candidate projection."
-                ) from exc
-            if (
-                recovered_projection_digest
-                != recovery_context.hosted_tool_discovery.projection_sha256
-            ):
-                raise ProviderOperationEvidenceError(
-                    "Hosted Tool Search recovery candidate authority no longer matches "
-                    "the dispatched request."
-                )
-        if durable_value_contains_secret(
-            operation.state.recovery_metadata.opaque,
-            redactor=self._secret_redactor,
-            path=("provider_operation_recovery_opaque",),
-        ) or any(
-            _provider_operation_progress_contains_secret(
-                provider_operation_progress_envelope(operation.state, accepted_event),
-                redactor=self._secret_redactor,
-                targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
-            )
-            for accepted_event in operation.accepted_stream_events
-        ):
-            raise ProviderOperationEvidenceError(
-                "Stored provider-operation recovery state conflicts with a current workload secret."
-            )
-
-        cancellation_claim = ProviderOperationCancellationClaim(
-            claim_id=(
-                f"provider-cancel:{stage.stage_id}:{session.run_epoch}:"
-                f"{operation.state.operation_id}:{operation.state.stream_protocol}"
-            ),
-            stage_id=stage.stage_id,
-            run_epoch=session.run_epoch,
-            operation_id=operation.state.operation_id,
-            stream_protocol=operation.state.stream_protocol,
-            expires_at=session.updated_at,
-        )
-        recovery_under_cancellation_claim = False
-
-        async def require_recovery_owner() -> None:
-            nonlocal recovery_under_cancellation_claim
-            current = await self._session_store.load(session.id)
-            if current is None:
-                raise KeyError(f"Session not found: {session.id}")
-            if current.run_epoch != session.run_epoch:
-                raise SessionRunFenced(
-                    "Provider-operation recovery run epoch is stale: expected "
-                    f"{session.run_epoch}, current {current.run_epoch}."
-                )
-            if current.status is SessionStatus.INTERRUPTING:
-                checkpoint = await self._session_store.load_checkpoint(session.id)
-                if (
-                    stored_claim := provider_operation_cancellation_claim_from_checkpoint(
-                        checkpoint
-                    )
-                ) is None or not stored_claim.same_owner(cancellation_claim):
-                    raise SessionInterruptedByRequest(session.id)
-                recovery_under_cancellation_claim = True
-
-        def recovery_event(
-            event_type: EventType,
-            *,
-            status: str,
-            recovery_reason: ProviderOperationUnavailableReason | None = None,
-            cleanup_failure: Exception | None = None,
-            protocol_failure: Exception | None = None,
-        ) -> Event:
-            payload: dict[str, Any] = {
-                "provider": registered_provider.name,
-                "model": selected_model,
-                "step": operation.step,
-                "attempt": operation.attempt,
-                "max_attempts": operation.max_attempts,
-                **operation.model_attempt_identity.payload(),
-                "source_run_epoch": operation.source_run_epoch,
-                "run_epoch": session.run_epoch,
-                "operation_id": operation.state.operation_id,
-                "stream_protocol": operation.state.stream_protocol,
-                "status": status,
-            }
-            payload.update(protocol_exception_fields(protocol_failure))
-            if recovery_reason is not None:
-                payload["recovery_reason"] = recovery_reason.value
-            if cleanup_failure is not None:
-                payload["provider_cleanup_failure"] = _provider_recovery_cleanup_payload(
-                    cleanup_failure,
-                    redactor=self._secret_redactor,
-                )
-            event = _event_with_model_identity_authority(
-                Event(
-                    type=event_type,
-                    session_id=session.id,
-                    interaction_id=operation.interaction_id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload=payload,
-                ),
-                operation.model_attempt_identity,
-            )
-            event = event_with_execution_profile_fingerprint_authority(
-                event,
-                None
-                if recovery_context is None
-                else recovery_context.execution_profile_fingerprint,
-            )
-            return event_with_runtime_payload_authority(
-                event,
-                "operation_id",
-                "stream_protocol",
-            )
-
-        await require_recovery_owner()
-        await recover_context_exposure(
-            store=self._session_store,
-            session_id=session.id,
-            stage_id=stage.stage_id,
-            stage_intent=stage.intent,
-            state=ContextExposureState.ACKNOWLEDGED,
-            evidence_kind=ContextExposureEvidenceKind.RECOVERY_ACKNOWLEDGEMENT,
-            evidence_ref=f"provider-operation:{operation.state.operation_id}:recovered",
-            provider_request_id=operation.state.operation_id,
-        )
-        scheduled = await self._event_writer.emit(
-            recovery_event(
-                EventType.PROVIDER_OPERATION_RECONNECT_SCHEDULED,
-                status=operation.status.value,
-            )
-        )
-        await require_recovery_owner()
-        started = await self._event_writer.emit(
-            recovery_event(
-                EventType.PROVIDER_OPERATION_RECONNECT_STARTED,
-                status=operation.status.value,
-            )
-        )
-        assistant_parts: list[transcript_helpers.AssistantContentPart] = []
-        tool_calls: list[runtime_records.ToolCallRequest] = []
-        completed_boundary = None
-        completed_event: ModelStreamEvent | None = None
-        completion_diagnostics: dict[str, Any] = {}
-        terminal_progress_verified = False
-        current_state = operation.state
-        recovered_events: list[Event] = [scheduled, started]
-        recovery_task = asyncio.current_task()
-        recovery_cancellation_baseline = 0 if recovery_task is None else recovery_task.cancelling()
-        post_completion_failure: BaseException | None = None
-
-        async def pending_recovery_result(
-            status: ProviderOperationStatus,
-        ) -> ProviderOperationRecoveryResult:
-            await require_recovery_owner()
-            rescheduled = await self._event_writer.emit(
-                recovery_event(
-                    EventType.PROVIDER_OPERATION_RECONNECT_SCHEDULED,
-                    status=status.value,
-                )
-            )
-            recovered_events.append(rescheduled)
-            return ProviderOperationRecoveryResult(
-                status=ProviderOperationRecoveryStatus.PENDING,
-                events=tuple(recovered_events),
-            )
-
-        async def unavailable_recovery_result(
-            reason: ProviderOperationUnavailableReason,
-            status: ProviderOperationStatus | str,
-            *,
-            cleanup_failure: Exception | None = None,
-            deadline_failure: ModelStreamDeadlineError | None = None,
-            protocol_failure: Exception | None = None,
-        ) -> ProviderOperationRecoveryResult:
-            authoritative_deadline: ModelStreamDeadlineError | None = None
-            if deadline_failure is not None:
-                controlled_failure = copy_provider_exception_control(deadline_failure)
-                if type(controlled_failure.cause) is not ModelStreamDeadlineError:
-                    raise RuntimeError(
-                        "Provider reconnect deadline lost its typed control evidence."
-                    )
-                copied_deadline = controlled_failure.cause
-                authoritative_deadline = ModelStreamDeadlineError(
-                    provider=registered_provider.name,
-                    evidence=copied_deadline.deadline_evidence,
-                    stream_cleanup_failed=copied_deadline.stream_cleanup_failed,
-                    recovery_disposition=EXACT_MODEL_STREAM_RECOVERY_DISPOSITION,
-                )
-            try:
-                await require_recovery_owner()
-                if authoritative_deadline is not None:
-                    deadline_event = _event_with_model_identity_authority(
-                        Event(
-                            type=EventType.MODEL_ERROR,
-                            session_id=session.id,
-                            interaction_id=operation.interaction_id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            payload=_retry_attempt_payload(
-                                {
-                                    "error": str(authoritative_deadline),
-                                    "error_type": type(authoritative_deadline).__name__,
-                                    **authoritative_deadline.error_payload_fields(),
-                                },
-                                execution_provider_name=registered_provider.name,
-                                requested_model=operation.model,
-                                step=operation.step,
-                                attempt=operation.attempt,
-                                max_attempts=operation.max_attempts,
-                                model_attempt_identity=operation.model_attempt_identity,
-                            ),
-                        ),
-                        operation.model_attempt_identity,
-                    )
-                    deadline_event = event_with_execution_profile_fingerprint_authority(
-                        deadline_event,
-                        None
-                        if recovery_context is None
-                        else recovery_context.execution_profile_fingerprint,
-                    )
-                    recovered_events.append(await self._event_writer.emit(deadline_event))
-                await recover_context_exposure(
-                    store=self._session_store,
-                    session_id=session.id,
-                    stage_id=stage.stage_id,
-                    stage_intent=stage.intent,
-                    state=ContextExposureState.INDETERMINATE,
-                    evidence_kind=ContextExposureEvidenceKind.RECOVERY_INDETERMINATE,
-                    evidence_ref=f"provider-operation:{operation.state.operation_id}:unavailable",
-                )
-                status_value = (
-                    status.value if isinstance(status, ProviderOperationStatus) else status
-                )
-                required = await _emit_provider_recovery_required_event(
-                    self._event_writer,
-                    recovery_event(
-                        EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED,
-                        status=status_value,
-                        recovery_reason=reason,
-                        cleanup_failure=cleanup_failure,
-                        protocol_failure=protocol_failure,
-                    ),
-                    recovery_reason=reason,
-                    cleanup_failure=cleanup_failure,
-                    redactor=self._secret_redactor,
-                )
-                recovered_events.append(required)
-            except Exception as diagnostic_failure:
-                if authoritative_deadline is None:
-                    raise
-                raise _combine_authoritative_model_failure(
-                    authoritative_deadline,
-                    diagnostic_failure,
-                    message=("Provider reconnect deadline and recovery diagnostics both failed."),
-                ) from None
-            return ProviderOperationRecoveryResult(
-                status=ProviderOperationRecoveryStatus.UNAVAILABLE,
-                events=tuple(recovered_events),
-                unavailable_reason=reason,
-            )
-
-        def retain_post_completion_failure(failure: BaseException) -> None:
-            nonlocal post_completion_failure
-            post_completion_failure = _combine_post_completion_failures(
-                post_completion_failure,
-                failure,
-            )
-
-        def recovered_event_failure_reason(
-            failure: Exception,
-        ) -> ProviderOperationUnavailableReason:
-            if isinstance(failure, ModelProviderError):
-                return ProviderOperationUnavailableReason.FAILED
-            return ProviderOperationUnavailableReason.MALFORMED
-
-        async def accept_recovered_event(
-            raw_event: object,
-            *,
-            persist_progress: bool,
-        ) -> None:
-            nonlocal completed_boundary, completed_event, completion_diagnostics
-            nonlocal current_state, terminal_progress_verified
-            if completed_event is not None:
-                candidate = _validate_stream_event(
-                    raw_event,
-                    provider_name=registered_provider.name,
-                    requested_model=selected_model,
-                    usage_dialect=registered_provider.usage_dialect,
-                ).event
-                if candidate == completed_event:
-                    return
-                raise RuntimeError("Recovered provider operation emitted output after completion.")
-            boundary = _validate_stream_event(
-                raw_event,
-                provider_name=registered_provider.name,
-                requested_model=selected_model,
-                usage_dialect=registered_provider.usage_dialect,
-            )
-            assistant_boundary = _validate_assistant_stream_event(
-                boundary.event,
-                generated_tool_call_id=_provider_operation_generated_tool_call_id(
-                    stage,
-                    boundary.event,
-                ),
-            )
-            stream_event = assistant_boundary.event
-            if (
-                stream_event.type
-                in {
-                    ModelStreamEventType.THINKING,
-                    ModelStreamEventType.TOOL_CALL,
-                    ModelStreamEventType.HOSTED_TOOL_CALL,
-                    ModelStreamEventType.CITATION,
-                }
-                and recovery_context is None
-            ):
-                kind = (
-                    "thinking transcript policy"
-                    if (stream_event.type is ModelStreamEventType.THINKING)
-                    else (
-                        "a tool continuation"
-                        if stream_event.type is ModelStreamEventType.TOOL_CALL
-                        else "hosted execution evidence"
-                    )
-                )
-                raise ProviderOperationEvidenceError(
-                    f"Legacy provider-operation evidence cannot safely reconstruct {kind}."
-                )
-            recovered_provider_error: ModelProviderError | None = None
-            if stream_event.type is ModelStreamEventType.ERROR:
-                stream_event, recovered_provider_error = runtime_owned_model_stream_error_event(
-                    stream_event,
-                    fallback_provider=registered_provider.name,
-                )
-            if persist_progress and stream_event.type is not ModelStreamEventType.COMPLETED:
-                runtime_event = None
-                if stream_event.type in {
-                    ModelStreamEventType.TEXT_DELTA,
-                    ModelStreamEventType.ERROR,
-                    ModelStreamEventType.HOSTED_TOOL_CALL,
-                    ModelStreamEventType.CITATION,
-                } or (
-                    stream_event.type is ModelStreamEventType.THINKING and bool(stream_event.delta)
-                ):
-                    runtime_event = _model_stream_event_to_runtime_event(
-                        stream_event,
-                        session=session,
-                        requested_model=operation.model,
-                        registered_agent=registered_agent,
-                        environment_name=environment_name,
-                        provider_name=registered_provider.name,
-                        step=operation.step,
-                        attempt=operation.attempt,
-                        max_attempts=operation.max_attempts,
-                        model_attempt_identity=operation.model_attempt_identity,
-                        usage_dialect=registered_provider.usage_dialect,
-                        execution_profile_fingerprint=(
-                            None
-                            if recovery_context is None
-                            else recovery_context.execution_profile_fingerprint
-                        ),
-                    )
-                progress, emitted = await self._commit_provider_operation_stream_event(
-                    stage=stage,
-                    state=current_state,
-                    stream_event=stream_event,
-                    runtime_event=runtime_event,
-                    session=session,
-                    interaction_id=operation.interaction_id,
-                    registered_agent=registered_agent,
-                    registered_provider=registered_provider,
-                    environment_name=environment_name,
-                    step=operation.step,
-                    attempt=operation.attempt,
-                    max_attempts=operation.max_attempts,
-                    model_attempt_identity=operation.model_attempt_identity,
-                    targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
-                )
-                current_state = progress.state
-                if progress.replayed:
-                    return
-                if emitted is not None:
-                    recovered_events.append(emitted)
-            if stream_event.type is ModelStreamEventType.TEXT_DELTA:
-                transcript_helpers.append_assistant_text_delta(
-                    assistant_parts,
-                    stream_event.delta,
-                )
-            elif stream_event.type is ModelStreamEventType.THINKING:
-                assert recovery_context is not None
-                transcript_helpers.append_assistant_thinking_delta(
-                    assistant_parts,
-                    stream_event.delta,
-                    provider_state=stream_event.payload.get("provider_state"),
-                    include=(
-                        recovery_context.thinking.include_in_transcript
-                        if recovery_context.thinking is not None
-                        else True
-                    ),
-                )
-            elif stream_event.type is ModelStreamEventType.TOOL_CALL:
-                assert recovery_context is not None
-                tool_call = assistant_boundary.tool_call
-                tool_call_part = assistant_boundary.tool_call_part
-                if tool_call is None or tool_call_part is None:  # pragma: no cover - helper owns it
-                    raise AssertionError("Validated tool-call projection disappeared.")
-                tool_calls.append(tool_call)
-                assistant_parts.append(tool_call_part)
-            elif stream_event.type is ModelStreamEventType.HOSTED_TOOL_CALL:
-                hosted_part = _hosted_tool_call_part(
-                    stream_event,
-                    provider_name=registered_provider.name,
-                    model=selected_model,
-                    model_attempt_identity=operation.model_attempt_identity,
-                )
-                if hosted_part is not None:
-                    assistant_parts.append(hosted_part)
-            elif stream_event.type is ModelStreamEventType.CITATION:
-                assistant_parts.append(
-                    _citation_part(
-                        stream_event,
-                        provider_name=registered_provider.name,
-                        model_attempt_identity=operation.model_attempt_identity,
-                        assistant_parts=assistant_parts,
-                    )
-                )
-            elif stream_event.type is ModelStreamEventType.ERROR:
-                if stream_event.provider_operation_status is not None:
-                    if not isinstance(recovered_provider_error, ModelProviderError):
-                        raise RuntimeError(
-                            "Provider-operation status requires a typed provider error."
-                        )
-                    raise _ProviderOperationStreamStatusError(
-                        stream_event.provider_operation_status,
-                        recovered_provider_error,
-                    ) from recovered_provider_error
-                raise recovered_provider_error or RuntimeError(
-                    "Recovered provider operation failed."
-                )
-            elif stream_event.type is ModelStreamEventType.COMPLETED:
-                completed_boundary = boundary
-                completed_event = stream_event
-                if persist_progress:
-                    envelope = provider_operation_progress_envelope(
-                        current_state,
-                        stream_event,
-                    )
-                    if _provider_operation_progress_contains_secret(
-                        envelope,
-                        redactor=self._secret_redactor,
-                        targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
-                    ):
-                        retain_post_completion_failure(
-                            ProviderOperationEvidenceError(
-                                "Provider-operation terminal recovery state contains a workload "
-                                "secret."
-                            )
-                        )
-                    else:
-                        terminal_cursor = envelope.recovery_metadata.cursor
-                        current_cursor = current_state.recovery_metadata.cursor
-                        current_cursor = -1 if current_cursor is None else current_cursor
-                        if terminal_cursor != current_cursor + 1:
-                            retain_post_completion_failure(
-                                ProviderOperationEvidenceError(
-                                    "Provider-operation terminal cursor is not the next boundary."
-                                )
-                            )
-                        else:
-                            terminal_progress_verified = True
-                if boundary.completion_error is not None:
-                    code, path = safe_durable_value_error_details(boundary.completion_error)
-                    completion_error = ModelProviderError(
-                        "Recovered provider operation returned invalid completion metadata.",
-                        provider=registered_provider.name,
-                        error_type="DurableValueError",
-                        error_code="invalid_model_completion_value",
-                        retryable=False,
-                    )
-                    completion_diagnostics = {
-                        "completion_outcome": "invalid_metadata",
-                        "completion_error": {
-                            "error": str(completion_error),
-                            "error_type": type(completion_error).__name__,
-                            "durable_value_error_code": code,
-                            "durable_value_path": path,
-                            **completion_error.error_payload_fields(),
-                        },
-                    }
-                    retain_post_completion_failure(completion_error)
-            else:  # pragma: no cover - boundary validation owns the closed event vocabulary
-                raise RuntimeError("Recovered provider operation returned an unsupported event.")
-
-        for accepted_event in operation.accepted_stream_events:
-            if (
-                accepted_event.type is ModelStreamEventType.ERROR
-                and accepted_event.provider_operation_status
-                in {
-                    ProviderOperationStatus.QUEUED,
-                    ProviderOperationStatus.IN_PROGRESS,
-                }
-            ):
-                # The error evidence and cursor are already durable. A
-                # nonterminal provider status means recovery should continue
-                # after that boundary rather than replaying the model error.
-                continue
-            await accept_recovered_event(accepted_event, persist_progress=False)
-
-        await require_recovery_owner()
-        if operation.accepted_stream_events:
-            try:
-                raw_connection = await adapter.reconnect(
-                    copy_provider_operation_state(operation.state)
-                )
-            except BaseException as recovery_failure:
-                recovery_failure = _classify_provider_recovery_failure(
-                    recovery_failure,
-                    cancellation_baseline=recovery_cancellation_baseline,
-                    operation="Provider operation reconnect",
-                )
-                if not isinstance(recovery_failure, Exception):
-                    raise recovery_failure
-                malformed = isinstance(recovery_failure, ProviderOperationMalformedError)
-                return await unavailable_recovery_result(
-                    (
-                        ProviderOperationUnavailableReason.MALFORMED
-                        if malformed
-                        else ProviderOperationUnavailableReason.UNAVAILABLE
-                    ),
-                    "malformed" if malformed else ProviderOperationStatus.UNAVAILABLE,
-                    protocol_failure=recovery_failure,
-                    deadline_failure=(
-                        recovery_failure
-                        if isinstance(recovery_failure, ModelStreamDeadlineError)
-                        else None
-                    ),
-                )
-            try:
-                connection = copy_provider_operation_connection(raw_connection)
-            except Exception as malformed_failure:
-                cleanup_failure = None
-                if type(raw_connection) is ProviderOperationConnection:
-                    cleanup_failure = await _close_provider_recovery_iterator(
-                        raw_connection.events,
-                        cancellation_baseline=recovery_cancellation_baseline,
-                        operation="Provider operation malformed reconnect stream cleanup",
-                    )
-                _raise_pending_provider_recovery_cancellation(
-                    cancellation_baseline=recovery_cancellation_baseline
-                )
-                if cleanup_failure is not None:
-                    add_exception_note_safely(
-                        malformed_failure,
-                        "Provider recovery stream cleanup also failed with "
-                        f"{type(cleanup_failure).__name__}.",
-                    )
-                return await unavailable_recovery_result(
-                    ProviderOperationUnavailableReason.MALFORMED,
-                    "malformed",
-                    cleanup_failure=cleanup_failure,
-                )
-            recovery_task = asyncio.current_task()
-            if (
-                recovery_task is not None
-                and recovery_task.cancelling() > recovery_cancellation_baseline
-            ):
-                await _close_provider_recovery_iterator(
-                    connection.events,
-                    cancellation_baseline=recovery_cancellation_baseline,
-                    operation=(
-                        "Provider operation reconnect stream cleanup after suppressed caller "
-                        "cancellation"
-                    ),
-                )
-                raise AssertionError(
-                    "Provider reconnect cleanup returned with caller cancellation pending."
-                )
-            reconnect_unavailable: (
-                tuple[
-                    ProviderOperationUnavailableReason,
-                    ProviderOperationStatus | str,
-                ]
-                | None
-            ) = None
-            reconnect_pending_status: ProviderOperationStatus | None = None
-            reconnect_cleanup_failure: Exception | None = None
-            reconnect_protocol_failure: Exception | None = None
-            reconnect_deadline_failure: ModelStreamDeadlineError | None = None
-            try:
-                async with aclosing_provider_stream(connection.events) as reconnect_events:
-                    if connection.state != operation.state:
-                        reconnect_unavailable = (
-                            ProviderOperationUnavailableReason.WRONG_PROVIDER,
-                            "wrong_provider",
-                        )
-                    else:
-                        recovery_status = connection.status
-                        reconnect_iterator = aiter(reconnect_events)
-                        while True:
-                            redactor_token = bind_provider_error_workload_redactor(
-                                self._secret_redactor
-                            )
-                            try:
-                                try:
-                                    raw_event = await anext(reconnect_iterator)
-                                except StopAsyncIteration:
-                                    break
-                            finally:
-                                reset_provider_error_workload_redactor(redactor_token)
-                            await require_recovery_owner()
-                            try:
-                                await accept_recovered_event(raw_event, persist_progress=True)
-                            except _ProviderOperationStreamStatusError as status_failure:
-                                if completed_event is None:
-                                    if status_failure.status in {
-                                        ProviderOperationStatus.QUEUED,
-                                        ProviderOperationStatus.IN_PROGRESS,
-                                    }:
-                                        reconnect_pending_status = status_failure.status
-                                    else:
-                                        reason = provider_operation_unavailable_reason(
-                                            status_failure.status
-                                        )
-                                        if reason is None:
-                                            reason = ProviderOperationUnavailableReason.MALFORMED
-                                        reconnect_unavailable = (
-                                            reason,
-                                            status_failure.status,
-                                        )
-                                else:
-                                    retain_post_completion_failure(status_failure.provider_error)
-                                break
-                            except Exception as event_failure:
-                                if completed_event is None:
-                                    reason = recovered_event_failure_reason(event_failure)
-                                    reconnect_unavailable = (reason, reason.value)
-                                else:
-                                    retain_post_completion_failure(event_failure)
-                                break
-                            if completed_event is None:
-                                continue
-                            break
-            except BaseException as stream_failure:
-                stream_failure = _classify_provider_recovery_failure(
-                    stream_failure,
-                    cancellation_baseline=recovery_cancellation_baseline,
-                    operation="Provider operation recovery stream",
-                )
-                if completed_event is None:
-                    if isinstance(stream_failure, Exception):
-                        if reconnect_unavailable is None:
-                            if isinstance(stream_failure, ModelStreamDeadlineError):
-                                reconnect_deadline_failure = stream_failure
-                            reconnect_protocol_failure = stream_failure
-                            malformed = isinstance(stream_failure, ProviderOperationMalformedError)
-                            reconnect_unavailable = (
-                                (
-                                    ProviderOperationUnavailableReason.MALFORMED
-                                    if malformed
-                                    else ProviderOperationUnavailableReason.UNAVAILABLE
-                                ),
-                                ("malformed" if malformed else ProviderOperationStatus.UNAVAILABLE),
-                            )
-                        else:
-                            reconnect_cleanup_failure = stream_failure
-                    else:
-                        raise
-                else:
-                    retain_post_completion_failure(stream_failure)
-            if reconnect_unavailable is not None and completed_event is None:
-                return await unavailable_recovery_result(
-                    *reconnect_unavailable,
-                    cleanup_failure=reconnect_cleanup_failure,
-                    deadline_failure=reconnect_deadline_failure,
-                    protocol_failure=reconnect_protocol_failure,
-                )
-            if reconnect_pending_status is not None and completed_event is None:
-                return await pending_recovery_result(reconnect_pending_status)
-        else:
-            try:
-                raw_snapshot = await adapter.retrieve(
-                    copy_provider_operation_state(operation.state)
-                )
-                _raise_pending_provider_recovery_cancellation(
-                    cancellation_baseline=recovery_cancellation_baseline
-                )
-            except BaseException as recovery_failure:
-                recovery_failure = _classify_provider_recovery_failure(
-                    recovery_failure,
-                    cancellation_baseline=recovery_cancellation_baseline,
-                    operation="Provider operation retrieval",
-                )
-                if not isinstance(recovery_failure, Exception):
-                    raise recovery_failure
-                malformed = isinstance(recovery_failure, ProviderOperationMalformedError)
-                return await unavailable_recovery_result(
-                    (
-                        ProviderOperationUnavailableReason.MALFORMED
-                        if malformed
-                        else ProviderOperationUnavailableReason.UNAVAILABLE
-                    ),
-                    "malformed" if malformed else ProviderOperationStatus.UNAVAILABLE,
-                    protocol_failure=recovery_failure,
-                )
-            try:
-                snapshot = copy_provider_operation_snapshot(raw_snapshot)
-            except Exception:
-                return await unavailable_recovery_result(
-                    ProviderOperationUnavailableReason.MALFORMED,
-                    "malformed",
-                )
-            if snapshot.state != operation.state:
-                return await unavailable_recovery_result(
-                    ProviderOperationUnavailableReason.WRONG_PROVIDER,
-                    "wrong_provider",
-                )
-            recovery_status = snapshot.status
-            if snapshot.status in {
-                ProviderOperationStatus.QUEUED,
-                ProviderOperationStatus.IN_PROGRESS,
-            }:
-                return await pending_recovery_result(snapshot.status)
-            for raw_event in snapshot.events:
-                try:
-                    await accept_recovered_event(raw_event, persist_progress=False)
-                except _ProviderOperationStreamStatusError as status_failure:
-                    if completed_event is None:
-                        if status_failure.status in {
-                            ProviderOperationStatus.QUEUED,
-                            ProviderOperationStatus.IN_PROGRESS,
-                        }:
-                            return await pending_recovery_result(status_failure.status)
-                        reason = provider_operation_unavailable_reason(status_failure.status)
-                        if reason is None:
-                            reason = ProviderOperationUnavailableReason.MALFORMED
-                        return await unavailable_recovery_result(
-                            reason,
-                            status_failure.status,
-                        )
-                    retain_post_completion_failure(status_failure.provider_error)
-                    break
-                except Exception as snapshot_failure:
-                    if completed_event is None:
-                        reason = recovered_event_failure_reason(snapshot_failure)
-                        return await unavailable_recovery_result(reason, reason.value)
-                    retain_post_completion_failure(snapshot_failure)
-                    break
-
-        try:
-            await require_recovery_owner()
-        except (SessionInterruptedByRequest, asyncio.CancelledError) as recovery_failure:
-            if completed_event is None:
-                raise
-            post_completion_failure = _combine_post_completion_failures(
-                post_completion_failure,
-                recovery_failure,
-            )
-        if completed_event is None or completed_boundary is None:
-            if recovery_status in {
-                ProviderOperationStatus.QUEUED,
-                ProviderOperationStatus.IN_PROGRESS,
-            }:
-                return await pending_recovery_result(recovery_status)
-            unavailable_reason = provider_operation_unavailable_reason(recovery_status)
-            if unavailable_reason is None:
-                raise RuntimeError("Provider operation returned an unknown terminal status.")
-            return await unavailable_recovery_result(unavailable_reason, recovery_status)
-        if recovery_status not in {
-            ProviderOperationStatus.QUEUED,
-            ProviderOperationStatus.IN_PROGRESS,
-            ProviderOperationStatus.COMPLETED,
-        }:
-            retain_post_completion_failure(
-                RuntimeError(
-                    "Provider operation returned completion output with conflicting terminal "
-                    f"status: {recovery_status.value}."
-                )
-            )
-
-        completion_semantics_valid = completed_boundary.completion_error is None
-        billing_identity = None if recovery_context is None else recovery_context.billing_identity
-        if completion_semantics_valid:
-            try:
-                billing_identity = resolve_completion_billing_identity(
-                    provider,
-                    billing_identity,
-                    copy_durable_json_object(completed_event.payload, "completed_payload"),
-                    provider_name=registered_provider.name,
-                )
-            except ModelProviderError as billing_error:
-                completion_semantics_valid = False
-                completion_diagnostics = {
-                    "completion_outcome": "billing_identity_resolution_failed",
-                    "completion_error": {
-                        "error": str(billing_error),
-                        "error_type": type(billing_error).__name__,
-                        "stage": "billing_identity_for_completion",
-                        **billing_error.error_payload_fields(),
-                    },
-                }
-                retain_post_completion_failure(billing_error)
-
-        assistant_message: Message | None = None
-        step_result: AssistantStepResult | None = None
-        classification = None
-        hosted_discovery_mutations: tuple[RuntimePublicationOperationRecordMutation, ...] = ()
-        hosted_discovery_grant_ids: dict[str, str] = {}
-        if completion_semantics_valid:
-            try:
-                (
-                    hosted_discovery_mutations,
-                    hosted_discovery_grant_ids,
-                ) = await _hosted_tool_discovery_publication_authority(
-                    session_store=self._session_store,
-                    session=session,
-                    registered_agent=registered_agent,
-                    projection=hosted_discovery_projection,
-                    stream_event=completed_event,
-                    tool_calls=tool_calls,
-                    model_step_id=operation.model_attempt_identity.model_step_id,
-                    created_at=self._clock(),
-                )
-            except (TypeError, ValueError) as exc:
-                completion_semantics_valid = False
-                hosted_discovery_error = ModelProviderError(
-                    "Recovered provider operation returned invalid hosted Tool Search evidence.",
-                    provider=registered_provider.name,
-                    error_type=type(exc).__name__,
-                    error_code="invalid_tool_discovery_projection",
-                    retryable=False,
-                )
-                completion_diagnostics = {
-                    "completion_outcome": "invalid_tool_discovery_projection",
-                    "completion_error": {
-                        "error": str(hosted_discovery_error),
-                        "error_type": type(hosted_discovery_error).__name__,
-                        "stage": "hosted_tool_discovery_validation",
-                        **hosted_discovery_error.error_payload_fields(),
-                    },
-                }
-                retain_post_completion_failure(hosted_discovery_error)
-        if completion_semantics_valid:
-            try:
-                _require_unique_tool_call_ids(tool_calls)
-                provider_state_parts = transcript_helpers.provider_state_parts(
-                    completed_event.payload
-                )
-                assistant_message = transcript_helpers.assistant_message(
-                    content_parts=assistant_parts,
-                    provider_state_parts=provider_state_parts,
-                )
-                step_result = _assistant_step_result(
-                    session_id=session.id,
-                    step=operation.step,
-                    model_attempt_identity=operation.model_attempt_identity,
-                    assistant_message=assistant_message,
-                    tool_calls=tool_calls,
-                    completion=_stream_event_completion(completed_event),
-                )
-                classification = classify_assistant_step(step_result)
-            except (TypeError, ValueError):
-                completion_semantics_valid = False
-                transcript_error = ModelProviderError(
-                    "Recovered provider operation returned invalid completion transcript state.",
-                    provider=registered_provider.name,
-                    error_type="ValueError",
-                    error_code="invalid_model_completion_transcript",
-                    retryable=False,
-                )
-                completion_diagnostics = {
-                    "completion_outcome": "invalid_transcript_state",
-                    "completion_error": {
-                        "error": str(transcript_error),
-                        "error_type": type(transcript_error).__name__,
-                        "stage": "completion_transcript_projection",
-                        **transcript_error.error_payload_fields(),
-                    },
-                }
-                retain_post_completion_failure(transcript_error)
-
-        completion_event = _model_stream_event_to_runtime_event(
-            completed_event,
+        return await self._provider_operation_recovery.recover(
             session=session,
-            requested_model=operation.model,
+            stage=stage,
+            operation=operation,
             registered_agent=registered_agent,
+            registered_provider=registered_provider,
             environment_name=environment_name,
-            provider_name=registered_provider.name,
-            step=operation.step,
-            attempt=operation.attempt,
-            max_attempts=operation.max_attempts,
-            model_attempt_identity=operation.model_attempt_identity,
-            tool_round_identity=(None if step_result is None else step_result.tool_round_identity),
-            classification=None if classification is None else classification.payload(),
-            transcript_cursor_after_completion=(
-                stage.source_transcript_cursor
-                + int(assistant_message is not None and not tool_calls)
-            ),
-            input_coverage=(
-                ContextInputCoverage.model_validate(stage.intent["input_coverage"])
-                if "input_coverage" in stage.intent
-                else None
-            ),
-            usage_dialect=registered_provider.usage_dialect,
-            billing_identity=billing_identity,
-            accounting_usage_metrics=completed_boundary.accounting_usage_metrics,
-            accounting_usage_rejected=completed_boundary.accounting_usage_rejected,
-            usage_normalization_failed=completed_boundary.usage_normalization_failed,
-            completion_diagnostics=completion_diagnostics,
-            execution_profile_fingerprint=(
-                None if recovery_context is None else recovery_context.execution_profile_fingerprint
-            ),
-        )
-        completion_event = completion_event.model_copy(
-            update={"interaction_id": operation.interaction_id},
-            deep=True,
-        )
-        if terminal_progress_verified:
-            completion_event = self._provider_operation_progress_event(
-                stage=stage,
-                state=current_state,
-                stream_event=completed_event,
-                runtime_event=completion_event,
-                session=session,
-                interaction_id=operation.interaction_id,
-                registered_agent=registered_agent,
-                registered_provider=registered_provider,
-                environment_name=environment_name,
-                step=operation.step,
-                attempt=operation.attempt,
-                max_attempts=operation.max_attempts,
-                model_attempt_identity=operation.model_attempt_identity,
-                targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
-            )
-        publication_cancellation = _take_model_completion_cancellation(
-            post_completion_failure,
-            cancellation_baseline=recovery_cancellation_baseline,
-        )
-        if publication_cancellation is not None and post_completion_failure is None:
-            post_completion_failure = publication_cancellation
-        elif publication_cancellation is None and isinstance(
-            post_completion_failure,
-            asyncio.CancelledError,
-        ):
-            post_completion_failure = unexpected_child_cancellation_error(
-                post_completion_failure,
-                operation="Provider operation recovery stream",
-            )
-        durable_step_result = None
-        if step_result is not None:
-            try:
-                durable_step_result = _durable_assistant_step_result(
-                    step_result,
-                    redactor=self._secret_redactor,
-                    targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
-                    native_tool_name_grant_ids={
-                        **hosted_replay_grant_ids,
-                        **hosted_discovery_grant_ids,
-                    },
-                )
-            except (TypeError, ValueError):
-                durable_boundary_error = ModelProviderError(
-                    "Recovered provider operation returned assistant output that cannot cross "
-                    "the durable publication boundary.",
-                    provider=registered_provider.name,
-                    error_type="DurableBoundaryError",
-                    error_code="invalid_model_completion_transcript",
-                    retryable=False,
-                )
-                retain_post_completion_failure(durable_boundary_error)
-        structured_output_validation = None
-        if (
-            post_completion_failure is None
-            and recovery_context is not None
-            and recovery_context.structured_output is not None
-            and recovery_context.structured_output.strategy is StructuredOutputStrategy.TOOL
-            and any(call.name == STRUCTURED_OUTPUT_TOOL_NAME for call in tool_calls)
-        ):
-            try:
-                structured_output_validation = _redact_structured_output_validation(
-                    _validate_structured_output_tool_round(
-                        tool_calls=tool_calls,
-                        spec=recovery_context.structured_output,
-                    ),
-                    self._secret_redactor,
-                )
-            except (TypeError, ValueError):
-                structured_output_error = ModelProviderError(
-                    "Recovered provider operation returned invalid structured output.",
-                    provider=registered_provider.name,
-                    error_type="ValueError",
-                    error_code="invalid_model_completion_transcript",
-                    retryable=False,
-                )
-                retain_post_completion_failure(structured_output_error)
-        request_fingerprint = stage.intent.get("request_fingerprint")
-        if type(request_fingerprint) is not str:
-            raise RuntimeError("Provider-operation stage lost its request fingerprint.")
-        authoritative_assistant_message = (
-            durable_step_result.assistant_message
-            if durable_step_result is not None and post_completion_failure is None
-            else None
-        )
-        publication_event = (
-            completion_event
-            if post_completion_failure is None
-            else _non_turn_model_completion_event(
-                completion_event,
-                failure=post_completion_failure,
-                cancellation=publication_cancellation,
-                transcript_cursor=stage.source_transcript_cursor,
-            )
-        )
-        if stage.reservation_ids:
-            if recovery_context is None:
-                raise ProviderOperationEvidenceError(
-                    "Budgeted provider-operation recovery has no durable accounting context."
-                )
-            try:
-                publication_event = (
-                    await self._run_limit_controller.recover_model_completion_budget_evidence(
-                        publication_event,
-                        reservation_ids=stage.reservation_ids,
-                        recovery_contexts=recovery_context.budget_reservations,
-                        session=session,
-                        provider_name=registered_provider.name,
-                        model_attempt_identity=operation.model_attempt_identity,
-                        dispatch_id=stage.stage_id,
-                        request_billing_identity=recovery_context.billing_identity,
-                    )
-                )
-            except (KeyError, NotImplementedError, TypeError, ValueError) as accounting_error:
-                raise ProviderOperationEvidenceError(
-                    "Provider-operation recovery could not reconstruct its original budget "
-                    "reservation and pricing context."
-                ) from accounting_error
-        tool_exposure = None if recovery_context is None else recovery_context.tool_exposure
-        if (
-            durable_step_result is not None
-            and durable_step_result.tool_calls
-            and tool_exposure is None
-        ):
-            raise ProviderOperationEvidenceError(
-                "Provider-operation recovery has no durable tool-exposure authority."
-            )
-        publication_event = self._event_writer.prepare(publication_event)
-        publication = ModelCompletionPublicationRequest(
-            dispatch=ModelCompletionDispatch(
-                stage=stage,
-                request_fingerprint=request_fingerprint,
-            ),
-            assistant_step_result=durable_step_result,
-            completion_event=publication_event,
-            authoritative_assistant_message=authoritative_assistant_message,
-            defer_assistant_message=bool(
-                durable_step_result is not None
-                and durable_step_result.tool_calls
-                and post_completion_failure is None
-            ),
-            structured_output_validation=structured_output_validation,
-            tool_exposure=tool_exposure,
-            operation_record_mutations=(
-                () if post_completion_failure is not None else hosted_discovery_mutations
-            ),
-        )
-        await recover_context_exposure(
-            store=self._session_store,
-            session_id=session.id,
-            stage_id=stage.stage_id,
-            stage_intent=stage.intent,
-            state=ContextExposureState.COMPLETED,
-            evidence_kind=ContextExposureEvidenceKind.RECOVERY_COMPLETION,
-            evidence_ref=f"provider-operation:{operation.state.operation_id}:completed",
-            provider_request_id=operation.state.operation_id,
-        )
-        await _publish_model_completion(
-            model_completion_publisher,
-            publication,
-            terminal_failure=post_completion_failure,
-            publication_cancellation=publication_cancellation,
-        )
-        if post_completion_failure is not None:
-            raise post_completion_failure
-        reconciled = recovery_event(
-            EventType.PROVIDER_OPERATION_RECONCILED,
-            status=recovery_status.value,
-        )
-        try:
-            reconciled = await self._event_writer.emit(reconciled)
-        except Exception as delivery_error:
-            logger.warning(
-                "Provider operation completed durably but reconciliation telemetry failed: "
-                "session_id=%s operation_id=%s error_type=%s",
-                session.id,
-                operation.state.operation_id,
-                type(delivery_error).__name__,
-            )
-        recovered_events.append(reconciled)
-        if recovery_under_cancellation_claim:
-            if stage.reservation_ids:
-                await self._run_limit_controller.reconcile_model_completion_settlements(
-                    publication_event,
-                    reservation_ids=stage.reservation_ids,
-                )
-            await self._provider_operation_cancellation.release_claim(
-                session=session,
-                claim=cancellation_claim,
-            )
-        return ProviderOperationRecoveryResult(
-            status=ProviderOperationRecoveryStatus.RECONCILED,
-            events=tuple(recovered_events),
-            completion_event=publication_event,
+            recovery_context=recovery_context,
+            model_completion_publisher=model_completion_publisher,
+            invocation_context=invocation_context,
+            model_execution_selection=model_execution_selection,
         )
 
     def create_run(
@@ -6787,7 +3648,7 @@ class ModelStepExecutor:
                         (
                             progress,
                             progress_emitted_event,
-                        ) = await self._commit_provider_operation_stream_event(
+                        ) = await self._provider_operation_recovery.commit_stream_event(
                             stage=completion_dispatch.stage,
                             state=provider_operation_state,
                             stream_event=stream_event,
@@ -6841,7 +3702,7 @@ class ModelStepExecutor:
                         (
                             progress,
                             progress_emitted_event,
-                        ) = await self._commit_provider_operation_stream_event(
+                        ) = await self._provider_operation_recovery.commit_stream_event(
                             stage=completion_dispatch.stage,
                             state=provider_operation_state,
                             stream_event=stream_event,
@@ -6911,7 +3772,7 @@ class ModelStepExecutor:
                         (
                             progress,
                             progress_emitted_event,
-                        ) = await self._commit_provider_operation_stream_event(
+                        ) = await self._provider_operation_recovery.commit_stream_event(
                             stage=completion_dispatch.stage,
                             state=provider_operation_state,
                             stream_event=stream_event,
@@ -6965,7 +3826,7 @@ class ModelStepExecutor:
                         (
                             progress,
                             progress_emitted_event,
-                        ) = await self._commit_provider_operation_stream_event(
+                        ) = await self._provider_operation_recovery.commit_stream_event(
                             stage=completion_dispatch.stage,
                             state=provider_operation_state,
                             stream_event=stream_event,
@@ -7189,7 +4050,7 @@ class ModelStepExecutor:
                             raise AssertionError("Background operation lost its completion stage.")
                         if provider_operation_interaction_id is None:  # pragma: no cover
                             raise AssertionError("Background operation lost its interaction.")
-                        completion_event = self._provider_operation_progress_event(
+                        completion_event = self._provider_operation_recovery.progress_event(
                             stage=completion_dispatch.stage,
                             state=provider_operation_state,
                             stream_event=stream_event,
@@ -7336,7 +4197,7 @@ class ModelStepExecutor:
                         (
                             progress,
                             progress_emitted_event,
-                        ) = await self._commit_provider_operation_stream_event(
+                        ) = await self._provider_operation_recovery.commit_stream_event(
                             stage=completion_dispatch.stage,
                             state=provider_operation_state,
                             stream_event=stream_event,
@@ -14037,54 +10898,6 @@ def _redacted_hosted_discovery_tools_with_replay_evidence(
     return tuple(evidenced[name] for name in sorted(evidenced))
 
 
-def _redacted_provider_tool_definitions(
-    tools: Iterable[Mapping[str, Any]],
-    *,
-    redactor: SecretRedactor,
-    field_name: str,
-) -> list[dict[str, Any]]:
-    """Validate executable tool authority and redact its provider-visible values."""
-
-    copied = copy_json_value(list(tools), field_name)
-    if type(copied) is not list or any(type(tool) is not dict for tool in copied):
-        raise AssertionError("Provider tool definitions must be a list of objects.")
-    copied_tools = cast("list[dict[str, Any]]", copied)
-    for index, tool in enumerate(copied_tools):
-        tool_name = tool.get("name")
-        if type(tool_name) is not str:
-            raise AssertionError("A provider tool name must be a string.")
-        if redactor.redact_text(tool_name) != tool_name:
-            raise ValueError(
-                f"{field_name}[{index}].name contains a workload secret and cannot "
-                "be sent as provider execution authority."
-            )
-        redactor.require_no_secret_keys(
-            {
-                "name": tool_name,
-                "description": tool.get("description"),
-                "input_schema": None,
-            },
-            field_name=f"{field_name}[{index}]",
-            preserve_keys={"name", "description", "input_schema"},
-            match_short_substrings=True,
-        )
-        input_schema = tool.get("input_schema")
-        if type(input_schema) is not dict:
-            raise AssertionError("A provider tool input_schema must be an object.")
-        require_secret_free_json_schema_keys(
-            input_schema,
-            redactor=redactor,
-            field_name=f"{field_name}[{index}].input_schema",
-        )
-    redacted = redactor.redact_json_values(
-        copied_tools,
-        preserve_string_fields={"name"},
-    )
-    if type(redacted) is not list or any(type(tool) is not dict for tool in redacted):
-        raise AssertionError("Provider tool redaction returned a non-list of objects.")
-    return redacted
-
-
 def _native_tool_grant_ids_for_request(
     request: ModelRequest,
     *,
@@ -14832,308 +11645,6 @@ def _same_file_attachment_ref(left: FileAttachment, right: FileAttachment) -> bo
     return same_file_attachment_reference(left, right)
 
 
-def _validate_stream_event(
-    value: object,
-    *,
-    provider_name: str,
-    requested_model: str,
-    usage_dialect: str | None,
-) -> _ModelStreamBoundaryValue:
-    if type(value) is not ModelStreamEvent:
-        raise TypeError("Model providers must yield ModelStreamEvent instances.")
-    if type(value.type) is not ModelStreamEventType:
-        raise ValueError("Model provider stream event type must be a ModelStreamEventType.")
-    if value.type != ModelStreamEventType.COMPLETED:
-        return _ModelStreamBoundaryValue(event=copy_model_stream_event(value))
-    if type(value.delta) is not str:
-        raise ValueError("Model provider stream event delta must be a string.")
-    if type(value.payload) is not dict:
-        raise ValueError("Model provider stream event payload must be an object.")
-
-    completion_error: DurableValueError | None = None
-    try:
-        delta = require_durable_text(value.delta, "delta")
-    except DurableValueError as exc:
-        completion_error = exc
-        delta = ""
-    payload_was_projected = False
-    try:
-        payload = copy_durable_json_object(value.payload, "payload")
-    except DurableValueError as exc:
-        if completion_error is None:
-            completion_error = exc
-        payload_was_projected = True
-        payload = portable_model_completion_projection(
-            value.payload,
-            provider_name=provider_name,
-            requested_model=requested_model,
-            usage_dialect=usage_dialect,
-        )
-    usage_normalization_failed = (
-        payload_was_projected and payload.pop("usage_normalization_failed", None) is True
-    )
-    payload.pop("usage_unavailable_reason", None)
-
-    # Raw usage makes runtime normalization authoritative. Preserve the legacy
-    # normalized-only provider path when no raw payload exists, but never let a
-    # provider-supplied projection override contradictory raw counters.
-    has_raw_usage = payload.get("usage") is not None
-    accounting_usage_metrics = payload.pop("usage_metrics", None)
-    accounting_usage_rejected = False
-    if has_raw_usage or type(accounting_usage_metrics) is not dict:
-        accounting_usage_metrics = None
-    if accounting_usage_metrics is None:
-        resolved_model = _payload_model(payload, fallback=requested_model)
-        try:
-            projected_metrics = usage_metrics_payload(
-                normalize_usage_metrics_with_overflow_error(
-                    provider_name=provider_name,
-                    model=resolved_model,
-                    requested_model=requested_model,
-                    raw_usage=payload.get("usage"),
-                    usage_dialect=usage_dialect,
-                )
-            )
-        except (TypeError, ValueError):
-            # Normalization can combine independently valid counters into a
-            # total or cache aggregate beyond the durable int64 domain. The
-            # provider call has completed, so retain its raw portable usage
-            # as rejection evidence and terminalize this attempt.
-            if completion_error is None:
-                completion_error = DurableValueError(
-                    "integer_out_of_range",
-                    "usage_metrics",
-                )
-            accounting_usage_rejected = True
-            projected_metrics = None
-        if projected_metrics is not None:
-            try:
-                accounting_usage_metrics = copy_durable_json_object(
-                    projected_metrics,
-                    "usage_metrics",
-                )
-            except DurableValueError as exc:
-                # Derived counters can exceed the portable integer range even
-                # when each raw counter is independently valid. Completion has
-                # already happened, so fence the attempt as terminal while
-                # retaining the portable raw usage evidence; never redispatch.
-                if completion_error is None:
-                    completion_error = exc
-                accounting_usage_rejected = True
-
-    try:
-        completion = copy_model_completion(value.completion)
-    except (TypeError, ValueError) as exc:
-        if completion_error is None:
-            completion_error = extract_durable_value_error(exc) or DurableValueError(
-                "invalid_json_type",
-                "completion",
-            )
-        completion = None
-    if completion is None:
-        try:
-            completion = normalize_model_completion(payload)
-        except (TypeError, ValueError) as exc:
-            if completion_error is None:
-                completion_error = extract_durable_value_error(exc) or DurableValueError(
-                    "invalid_json_type",
-                    "completion",
-                )
-            completion = ModelCompletion(finish_reason=ModelFinishReason.UNKNOWN)
-
-    recovery_metadata = (
-        None
-        if value.recovery_metadata is None
-        else ProviderOperationRecoveryMetadata.model_validate(
-            value.recovery_metadata.model_dump(mode="python")
-        )
-    )
-    try:
-        tool_discovery_result = (
-            None
-            if value.tool_discovery_result is None
-            else ToolDiscoveryProjectionResult.model_validate(
-                value.tool_discovery_result.model_dump(mode="python")
-            )
-        )
-    except (TypeError, ValueError) as exc:
-        if completion_error is None:
-            completion_error = extract_durable_value_error(exc) or DurableValueError(
-                "invalid_json_type",
-                "tool_discovery_result",
-            )
-        tool_discovery_result = None
-
-    return _ModelStreamBoundaryValue(
-        event=ModelStreamEvent.model_construct(
-            type=ModelStreamEventType.COMPLETED,
-            delta=delta,
-            payload=payload,
-            completion=completion,
-            tool_discovery_result=tool_discovery_result,
-            recovery_metadata=recovery_metadata,
-        ),
-        completion_error=completion_error,
-        accounting_usage_metrics=accounting_usage_metrics,
-        accounting_usage_rejected=accounting_usage_rejected,
-        usage_normalization_failed=usage_normalization_failed,
-    )
-
-
-def _validate_assistant_stream_event(
-    stream_event: ModelStreamEvent,
-    *,
-    generated_tool_call_id: str | None = None,
-) -> _AssistantStreamBoundaryValue:
-    """Validate transcript semantics before a reconnect cursor can advance."""
-
-    if stream_event.type is ModelStreamEventType.TOOL_CALL:
-        if stream_event.payload.get("id") is None and generated_tool_call_id is not None:
-            payload = copy_durable_json_object(stream_event.payload, "payload")
-            payload["id"] = generated_tool_call_id
-            stream_event = copy_model_stream_event(
-                stream_event.model_copy(update={"payload": payload})
-            )
-        tool_call = transcript_helpers.parse_tool_call(stream_event.payload)
-        tool_call_part = transcript_helpers.tool_call_part(tool_call)
-        if stream_event.payload.get("id") is None:
-            payload = copy_durable_json_object(stream_event.payload, "payload")
-            payload["id"] = tool_call.id
-            stream_event = copy_model_stream_event(
-                stream_event.model_copy(update={"payload": payload})
-            )
-        return _AssistantStreamBoundaryValue(
-            event=stream_event,
-            tool_call=tool_call,
-            tool_call_part=tool_call_part,
-        )
-    if stream_event.type is ModelStreamEventType.THINKING:
-        ThinkingPart(
-            text=stream_event.delta,
-            provider_state=stream_event.payload.get("provider_state"),
-        )
-    elif stream_event.type is ModelStreamEventType.HOSTED_TOOL_CALL:
-        payload = _validated_hosted_tool_call_payload(stream_event.payload)
-        stream_event = copy_model_stream_event(stream_event.model_copy(update={"payload": payload}))
-    elif stream_event.type is ModelStreamEventType.CITATION:
-        payload = _validated_citation_payload(stream_event.payload)
-        stream_event = copy_model_stream_event(stream_event.model_copy(update={"payload": payload}))
-    return _AssistantStreamBoundaryValue(event=stream_event)
-
-
-def _validated_hosted_tool_call_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    copied = copy_durable_json_object(payload, "hosted_tool_call")
-    if copied.get("tool_type") != "web_search":
-        raise ValueError("Hosted tool stream events require tool_type='web_search'.")
-    call_id = copied.get("call_id")
-    if type(call_id) is not str:
-        raise ValueError("Hosted tool stream events require a string call_id.")
-    copied["call_id"] = require_durable_clean_nonblank(call_id, "call_id")
-    status = copied.get("status")
-    if status not in {
-        "in_progress",
-        "searching",
-        "completed",
-        "incomplete",
-        "failed",
-        "outcome_unknown",
-    }:
-        raise ValueError("Hosted tool stream events have an unsupported status.")
-    action = copied.get("action")
-    if action is not None:
-        copied["action"] = WebSearchAction.model_validate(action).model_dump(mode="json")
-    return copied
-
-
-def _validated_citation_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    copied = copy_durable_json_object(payload, "citation")
-    probe = CitationPart.model_validate(
-        {
-            **copied,
-            "provenance": CitationProvenance(provider_name="provider-boundary"),
-            "model_step_id": "mstep_00000000000000000000000000000000",
-            "model_attempt_id": "matt_00000000000000000000000000000000",
-        }
-    )
-    return {
-        "citation_type": probe.citation_type,
-        "url": probe.url,
-        "title": probe.title,
-        "start_index": probe.start_index,
-        "end_index": probe.end_index,
-    }
-
-
-def _hosted_tool_call_part(
-    stream_event: ModelStreamEvent,
-    *,
-    provider_name: str,
-    model: str,
-    model_attempt_identity: ModelAttemptIdentity,
-) -> HostedToolCallPart | None:
-    payload = _validated_hosted_tool_call_payload(stream_event.payload)
-    status = payload["status"]
-    if status not in {"completed", "incomplete", "failed", "outcome_unknown"}:
-        return None
-    return HostedToolCallPart(
-        call_id=payload["call_id"],
-        status=status,
-        action=payload.get("action"),
-        provider_name=provider_name,
-        model=model,
-        model_step_id=model_attempt_identity.model_step_id,
-        model_attempt_id=model_attempt_identity.model_attempt_id,
-    )
-
-
-def _citation_part(
-    stream_event: ModelStreamEvent,
-    *,
-    provider_name: str,
-    model_attempt_identity: ModelAttemptIdentity,
-    assistant_parts: list[transcript_helpers.AssistantContentPart],
-) -> CitationPart:
-    payload = _validated_citation_payload(stream_event.payload)
-    assembled_text_length = sum(
-        len(part.text)
-        for part in assistant_parts
-        if type(part) is transcript_helpers.AssistantTextPart
-    )
-    if payload["end_index"] is not None and payload["end_index"] > assembled_text_length:
-        raise ValueError("Citation offsets exceed the associated assistant text.")
-    return CitationPart(
-        **payload,
-        provenance=CitationProvenance(provider_name=provider_name),
-        model_step_id=model_attempt_identity.model_step_id,
-        model_attempt_id=model_attempt_identity.model_attempt_id,
-    )
-
-
-def _provider_operation_generated_tool_call_id(
-    stage: ModelCompletionStage,
-    stream_event: ModelStreamEvent,
-) -> str | None:
-    if stream_event.type is not ModelStreamEventType.TOOL_CALL:
-        return None
-    metadata = stream_event.recovery_metadata
-    if metadata is None or metadata.cursor is None:
-        return None
-    return provider_operation_progress_event_id(stage.stage_id, metadata.cursor)
-
-
-def _provider_operation_id(model_attempt_identity: ModelAttemptIdentity) -> str:
-    """Return the runtime-owned provider-call identity for one model attempt."""
-
-    material = canonical_durable_json_bytes(
-        {
-            "schema_version": 1,
-            "model_attempt_id": model_attempt_identity.model_attempt_id,
-        },
-        "provider_operation_id",
-    )
-    return f"provider-operation:v1:{sha256(material).hexdigest()}"
-
-
 def _copy_model_request_for_counting(request: ModelRequest) -> ModelRequest:
     return _detach_model_request(request)
 
@@ -15294,224 +11805,6 @@ def _actual_input_tokens_from_completed_event(event: Event) -> int | None:
     return input_tokens
 
 
-def _model_stream_event_to_runtime_event(
-    stream_event: ModelStreamEvent,
-    *,
-    session: Session,
-    requested_model: str,
-    registered_agent: runtime_records.RegisteredAgentState,
-    environment_name: str | None,
-    provider_name: str | None,
-    step: int,
-    attempt: int,
-    max_attempts: int,
-    model_attempt_identity: ModelAttemptIdentity,
-    tool_round_identity: ToolRoundIdentity | None = None,
-    classification: dict[str, str] | None = None,
-    context_pressure_estimate: ContextPressureEstimate | None = None,
-    transcript_cursor_after_completion: int | None = None,
-    input_coverage: ContextInputCoverage | None = None,
-    usage_dialect: str | None = None,
-    billing_identity: BillingIdentity | None = None,
-    accounting_usage_metrics: dict[str, Any] | None = None,
-    accounting_usage_rejected: bool = False,
-    usage_normalization_failed: bool = False,
-    completion_diagnostics: dict[str, Any] | None = None,
-    execution_profile_fingerprint: str | None = None,
-    retry_decision: RetryDecision | None = None,
-) -> Event:
-    if type(stream_event) is not ModelStreamEvent:
-        raise TypeError("Model stream events must be ModelStreamEvent instances.")
-    if stream_event.type == ModelStreamEventType.TEXT_DELTA:
-        event_type = EventType.MODEL_TEXT_DELTA
-        payload = {"delta": stream_event.delta}
-    elif stream_event.type == ModelStreamEventType.THINKING:
-        event_type = EventType.MODEL_THINKING_DELTA
-        payload = {"delta": stream_event.delta}
-    elif stream_event.type == ModelStreamEventType.HOSTED_TOOL_CALL:
-        event_type = EventType.MODEL_HOSTED_TOOL_CALL
-        payload = {
-            **_validated_hosted_tool_call_payload(stream_event.payload),
-            "provider_name": provider_name,
-            "model": requested_model,
-            "provider_operation_id": _provider_operation_id(model_attempt_identity),
-        }
-    elif stream_event.type == ModelStreamEventType.CITATION:
-        event_type = EventType.MODEL_CITATION
-        payload = {
-            **_validated_citation_payload(stream_event.payload),
-            "model": requested_model,
-            "provider_operation_id": _provider_operation_id(model_attempt_identity),
-            "provenance": {
-                "provider_name": provider_name,
-                "hosted_tool": "web_search",
-                "untrusted_external_evidence": True,
-            },
-        }
-    elif stream_event.type == ModelStreamEventType.COMPLETED:
-        payload = transcript_helpers.model_completed_event_payload(stream_event.payload)
-        # When raw usage is present, its normalized projection and failure
-        # marker are runtime-owned accounting evidence. Providers that expose
-        # only the established normalized-usage payload retain compatibility.
-        has_raw_usage = payload.get("usage") is not None
-        raw_hosted_tool_usage = payload.get("hosted_tool_usage")
-        if raw_hosted_tool_usage is not None:
-            hosted_tool_usage = hosted_tool_usage_metrics_from_payload(payload)
-            if hosted_tool_usage is None:
-                payload.pop("hosted_tool_usage", None)
-                payload["hosted_tool_usage_rejected"] = True
-            else:
-                payload["hosted_tool_usage"] = hosted_tool_usage.model_dump(mode="json")
-        payload.pop("usage_metrics", None)
-        payload.pop("usage_normalization_failed", None)
-        payload.pop("usage_unavailable_reason", None)
-        payload.pop("usage_metrics_rejected", None)
-        payload.pop("rejected_usage_evidence", None)
-        if accounting_usage_rejected:
-            rejected_usage = payload.pop("usage", None)
-            if rejected_usage is not None:
-                payload["rejected_usage_evidence"] = copy_durable_json_value(
-                    rejected_usage,
-                    "rejected_usage_evidence",
-                )
-            payload["usage_metrics_rejected"] = True
-        resolved_model = _payload_model(payload, fallback=requested_model)
-        payload["model"] = resolved_model
-        payload["requested_model"] = requested_model
-        if provider_name is None:
-            payload.pop("provider_name", None)
-        else:
-            # Provider attribution is runtime-owned. The provider-returned model
-            # remains authoritative, but completion metadata cannot relabel the
-            # commercial provider used by cost and diagnostic readers.
-            payload["provider_name"] = provider_name
-        # Billing identity is runtime-owned. Providers may report completion facts
-        # consumed by their hook, but cannot inject an identity in the raw payload.
-        payload.pop("billing_identity", None)
-        if billing_identity is not None:
-            payload["billing_identity"] = billing_identity.model_dump(mode="json")
-        completion = _stream_event_completion(stream_event)
-        completion_payload: dict[str, str | bool | None] = {
-            "finish_reason": completion.finish_reason.value,
-            "raw_finish_reason": completion.raw_finish_reason,
-            "status": completion.status,
-        }
-        if completion.end_turn is not None:
-            completion_payload["end_turn"] = completion.end_turn
-        payload["completion"] = completion_payload
-        if classification is not None:
-            payload["step_classification"] = classification
-        metrics = (
-            copy_durable_json_object(accounting_usage_metrics, "usage_metrics")
-            if accounting_usage_metrics is not None
-            else None
-            if accounting_usage_rejected
-            else usage_metrics_payload(
-                normalize_usage_metrics(
-                    provider_name=provider_name,
-                    model=resolved_model,
-                    requested_model=requested_model,
-                    raw_usage=payload.get("usage"),
-                    usage_dialect=usage_dialect,
-                    billing_identity=billing_identity,
-                )
-            )
-        )
-        if metrics is not None:
-            # The event-level identity is authoritative. Keeping a second nested
-            # copy would let an untrusted provider payload create conflicting
-            # accounting evidence when normalized usage is unavailable.
-            metrics.pop("billing_identity", None)
-            payload["usage_metrics"] = metrics
-        elif (has_raw_usage and not accounting_usage_rejected) or usage_normalization_failed:
-            payload["usage_normalization_failed"] = True
-        if context_pressure_estimate is not None:
-            payload["context_pressure"] = {
-                "estimated_tool_schema_input_tokens": (
-                    context_pressure_estimate.estimated_tool_schema_input_tokens
-                ),
-                "estimated_structured_output_input_tokens": (
-                    context_pressure_estimate.estimated_structured_output_input_tokens
-                ),
-                "estimated_request_options_input_tokens": (
-                    context_pressure_estimate.estimated_request_options_input_tokens
-                ),
-                "estimated_request_overhead_input_tokens": (
-                    context_pressure_estimate.estimated_request_overhead_input_tokens
-                ),
-            }
-        if transcript_cursor_after_completion is not None:
-            payload["transcript_cursor"] = transcript_cursor_after_completion
-        # This is runtime-owned evidence, never a provider-supplied anchor.
-        payload.pop("input_coverage", None)
-        if input_coverage is not None:
-            payload["input_coverage"] = input_coverage.model_dump(mode="json")
-        if completion_diagnostics:
-            payload.update(
-                copy_durable_json_object(
-                    completion_diagnostics,
-                    "completion_diagnostics",
-                )
-            )
-        event_type = EventType.MODEL_COMPLETED
-    elif stream_event.type == ModelStreamEventType.ERROR:
-        event_type = EventType.MODEL_ERROR
-        payload = copy_json_value(stream_event.payload, "payload")
-    else:
-        raise ValueError(f"Unsupported model stream event type: {stream_event.type}")
-    payload = _retry_attempt_payload(
-        payload,
-        execution_provider_name=provider_name if event_type is EventType.MODEL_ERROR else None,
-        requested_model=requested_model if event_type is EventType.MODEL_ERROR else None,
-        step=step,
-        attempt=attempt,
-        max_attempts=max_attempts,
-        model_attempt_identity=model_attempt_identity,
-        decision=retry_decision,
-    )
-    if tool_round_identity is not None:
-        payload.update(copy_tool_round_identity(tool_round_identity).payload())
-    if event_type == EventType.MODEL_COMPLETED:
-        payload = durable_model_completed_payload(
-            payload,
-            fallback_fields={
-                "provider_name": provider_name,
-                "requested_model": requested_model,
-                "model": requested_model,
-                "step": step,
-                "attempt": attempt,
-                "max_attempts": max_attempts,
-                **model_attempt_identity.payload(),
-                **(
-                    {}
-                    if tool_round_identity is None
-                    else copy_tool_round_identity(tool_round_identity).payload()
-                ),
-            },
-            unavailable_reason="invalid model completion usage telemetry",
-        )
-    event = _event_with_model_identity_authority(
-        Event(
-            type=event_type,
-            session_id=session.id,
-            agent_name=registered_agent.spec.name,
-            environment_name=environment_name,
-            payload=payload,
-        ),
-        model_attempt_identity,
-    )
-    if tool_round_identity is not None and (
-        event.payload.get("tool_round_id") == tool_round_identity.tool_round_id
-    ):
-        event = event_with_runtime_payload_authority(event, "tool_round_id")
-    if event_type in {EventType.MODEL_HOSTED_TOOL_CALL, EventType.MODEL_CITATION}:
-        event = event_with_runtime_payload_authority(event, "provider_operation_id")
-    return event_with_execution_profile_fingerprint_authority(
-        event,
-        execution_profile_fingerprint,
-    )
-
-
 def _with_structured_output_tool_instruction(
     messages: list[Message],
     spec: StructuredOutputSpec,
@@ -15525,16 +11818,6 @@ def _with_structured_output_tool_instruction(
         insert_at += 1
     copied_messages.insert(insert_at, instruction)
     return copied_messages
-
-
-def _stream_event_completion(stream_event: ModelStreamEvent) -> ModelCompletion:
-    if type(stream_event) is not ModelStreamEvent:
-        raise TypeError("Model stream events must be ModelStreamEvent instances.")
-    if stream_event.type != ModelStreamEventType.COMPLETED:
-        raise ValueError("Only completed model stream events have completion metadata.")
-    if stream_event.completion is not None:
-        return stream_event.completion
-    return normalize_model_completion(stream_event.payload)
 
 
 def reconstruct_assistant_step_result(
@@ -15657,47 +11940,6 @@ def reconstruct_assistant_step_result(
     return result
 
 
-def _assistant_step_result(
-    *,
-    session_id: str,
-    step: int,
-    model_attempt_identity: ModelAttemptIdentity,
-    assistant_message: Message | None,
-    tool_calls: list[runtime_records.ToolCallRequest],
-    completion: ModelCompletion,
-) -> AssistantStepResult:
-    model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
-    tool_round_identity = model_attempt_identity.new_tool_round() if tool_calls else None
-    if assistant_message is not None and tool_round_identity is not None:
-        assistant_message = transcript_helpers.assistant_message_with_tool_round(
-            assistant_message,
-            tool_round_identity,
-        )
-    text_content = assistant_text_content(assistant_message)
-    return AssistantStepResult(
-        session_id=session_id,
-        step=step,
-        model_step_id=model_attempt_identity.model_step_id,
-        model_attempt_id=model_attempt_identity.model_attempt_id,
-        tool_round_identity=tool_round_identity,
-        assistant_message=assistant_message,
-        tool_calls=list(tool_calls),
-        completion=completion,
-        text_content=text_content,
-        has_user_visible_content=bool(text_content.strip()),
-        provider_state_count=provider_state_count(assistant_message),
-        thinking_count=thinking_count(assistant_message),
-    )
-
-
-def _require_unique_tool_call_ids(
-    tool_calls: list[runtime_records.ToolCallRequest],
-) -> None:
-    tool_call_ids = [tool_call.id for tool_call in tool_calls]
-    if len(tool_call_ids) != len(set(tool_call_ids)):
-        raise ValueError("Model provider emitted duplicate tool-call identifiers.")
-
-
 def _attempt_retry_suppression(exc: ModelAttemptFailed) -> RetrySuppression | None:
     if exc.completion_observed:
         return RetrySuppression.COMPLETION_OBSERVED
@@ -15808,49 +12050,3 @@ def _model_attempt_discarded_event(
         ),
         model_attempt_identity,
     )
-
-
-def _retry_attempt_payload(
-    payload: dict[str, Any],
-    *,
-    execution_provider_name: str | None = None,
-    requested_model: str | None = None,
-    step: int,
-    attempt: int,
-    max_attempts: int,
-    model_attempt_identity: ModelAttemptIdentity,
-    decision: RetryDecision | None = None,
-) -> dict[str, Any]:
-    enriched = dict(payload)
-    for key in ("retry", "retry_disposition", "retry_suppression", "provider_retryable"):
-        enriched.pop(key, None)
-    strip_runtime_owned_execution_identity(enriched)
-    enriched["step"] = step
-    enriched["attempt"] = attempt
-    enriched["max_attempts"] = max_attempts
-    if execution_provider_name is not None:
-        enriched["provider_name"] = require_clean_nonblank(
-            execution_provider_name, "execution_provider_name"
-        )
-    if requested_model is not None:
-        enriched["requested_model"] = require_clean_nonblank(requested_model, "requested_model")
-    if decision is not None:
-        if type(decision) is not RetryDecision:
-            raise TypeError("decision must be a RetryDecision or None.")
-        if decision.attempt != attempt or decision.max_attempts != max_attempts:
-            raise ValueError("Retry decision does not match the model-attempt evidence.")
-        enriched.pop("effective_max_attempts", None)
-        enriched.pop("reason", None)
-        enriched.update(retry_diagnostic_payload(decision))
-        enriched["effective_max_attempts"] = decision.effective_max_attempts
-        if decision.reason is not None:
-            enriched["reason"] = decision.reason.value
-    enriched.update(copy_model_attempt_identity(model_attempt_identity).payload())
-    return enriched
-
-
-def _payload_model(payload: dict[str, Any], *, fallback: str) -> str:
-    model = payload.get("model")
-    if type(model) is str and model.strip():
-        return model
-    return fallback
