@@ -42049,5 +42049,10 @@
     "tests/core/test_browser_checkpoint_authority.py::test_browser_read_scope_is_shared_and_restored_across_import_paths[legacy]": 0.00017612474039196968,
     "tests/core/test_browser_checkpoint_authority.py::test_legacy_browser_checkpoint_aliases_share_types_and_scope_state": 0.00028729112818837166,
     "tests/core/test_browser_checkpoint_authority.py::test_old_pickled_browser_mutations_retain_exact_authority[close]": 0.0017057918012142181,
-    "tests/core/test_browser_checkpoint_authority.py::test_old_pickled_browser_mutations_retain_exact_authority[mutation]": 0.00197350000962615
+    "tests/core/test_browser_checkpoint_authority.py::test_old_pickled_browser_mutations_retain_exact_authority[mutation]": 0.00197350000962615,
+    "tests/core/test_argument_continuity_boundary.py::test_legacy_argument_continuity_imports_share_contracts_and_scope": 0.0002524170558899641,
+    "tests/core/test_argument_continuity_boundary.py::test_old_pickled_argument_batch_uses_the_canonical_contract": 0.0005509171169251204,
+    "tests/core/test_argument_continuity_boundary.py::test_private_read_scope_is_shared_and_restored_after_nested_failure[canonical]": 0.00027037481777369976,
+    "tests/core/test_argument_continuity_boundary.py::test_private_read_scope_is_shared_and_restored_after_nested_failure[legacy]": 0.00018529221415519714,
+    "tests/core/test_argument_continuity_boundary.py::test_private_records_operate_without_runtime_or_store_implementations": 0.10463020694442093
 }

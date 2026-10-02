@@ -10,8 +10,8 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, m
 from cayu._validation import require_clean_nonblank, require_durable_text
 from cayu.events import Event, EventType
 from cayu.messages import Message, detach_message
-from cayu.runtime._argument_continuity import ArgumentContinuity
 from cayu.runtime._policy_evidence import ToolPolicyEvidence
+from cayu.sessions._argument_continuity import ArgumentContinuity
 from cayu.tools.base import ToolResult
 from cayu.tools.exposure import (
     NOT_EXPOSED_IN_REQUEST_REASON,

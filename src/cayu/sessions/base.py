@@ -50,7 +50,6 @@ from cayu.deadlines import (
     effective_deadline,
 )
 from cayu.runtime import event_side_effect_health as side_effect_health
-from cayu.runtime._argument_continuity import ArgumentContinuity
 from cayu.runtime._durable_operation_ownership import DurableOperationOwnership
 from cayu.runtime.event_side_effect_health import (
     PersistedEventSideEffectHealth,
@@ -58,6 +57,7 @@ from cayu.runtime.event_side_effect_health import (
     PersistedEventSideEffectQuery,
 )
 from cayu.sessions import creation_fence
+from cayu.sessions._argument_continuity import ArgumentContinuity
 from cayu.sessions.execution import SessionExecutionState
 from cayu.storage._creation_fence import MemoryCreationFenceMixin
 from cayu.storage._session_execution import MemorySessionExecutionMixin
@@ -24171,7 +24171,7 @@ class InMemorySessionStore(MemorySessionExecutionMixin, MemoryCreationFenceMixin
 
         private_record = None
         if request.argument_continuity is not None:
-            from cayu.runtime._argument_continuity import STORAGE_KEY, append_record
+            from cayu.sessions._argument_continuity import STORAGE_KEY, append_record
 
             private_record = append_record(
                 operation_records.get(STORAGE_KEY),
@@ -29691,13 +29691,13 @@ def _reject_reserved_runtime_publication_key(
     value: str, field_name: str, *, browser_control_read: bool = False
 ) -> str:
     from cayu.collaboration._session_export_store import require_operation_key_access
-    from cayu.runtime._argument_continuity import require_private_key_access
     from cayu.runtime._producer_output_store import (
         require_operation_key_access as require_producer_key_access,
     )
     from cayu.runtime._session_continuation_scope import (
         require_operation_key_access as require_continuation_key_access,
     )
+    from cayu.sessions._argument_continuity import require_private_key_access
     from cayu.sessions._browser_control_checkpoint import require_browser_control_operation_owner
 
     value = require_clean_nonblank(value, field_name)

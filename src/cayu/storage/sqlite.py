@@ -12004,7 +12004,7 @@ class SQLiteSessionStore(
                     )
 
                 if request.argument_continuity is not None:
-                    from cayu.runtime._argument_continuity import STORAGE_KEY, append_record
+                    from cayu.sessions._argument_continuity import STORAGE_KEY, append_record
 
                     private_row = connection.execute(
                         "SELECT record_json FROM cayu_session_operations "

@@ -64,6 +64,13 @@ has a retained candidate; calls excluded from retention do not require this
 capability. A custom store must implement this atomic contract before declaring
 `supports_private_argument_continuity = True`.
 
+`sessions/_argument_continuity.py` owns the retained batch model, size limits,
+record construction and validation, and private read scope. Store guards and
+runtime share these definitions; the former runtime imports remain available.
+The component operates without importing runtime or a store implementation.
+Capture, secret redaction and model-context restoration remain in runtime, while
+each store keeps its native transaction and replay checks.
+
 Context policies and compactors receive the public projection, not these private
 arguments. After selection, the runtime overlays only still-present, exactly
 matching calls. It does not resurrect compacted-away calls or inject private text

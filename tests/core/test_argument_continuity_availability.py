@@ -10,7 +10,8 @@ from tests.core.test_tool_argument_continuity import _private_fixture, _PrivateR
 from cayu.messages import ProviderStatePart
 from cayu.providers.base import ModelRequest
 from cayu.providers.openai import build_openai_payload
-from cayu.runtime._argument_continuity import append_record, materialize
+from cayu.runtime._argument_continuity import materialize
+from cayu.sessions._argument_continuity import append_record
 from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 
