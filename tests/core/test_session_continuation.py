@@ -2496,7 +2496,7 @@ def test_postgres_competing_admission_excludes_losing_continuation(
 def test_pending_continuation_pins_receipt_until_settlement(
     backend, outcome, tmp_path, monkeypatch
 ):
-    from cayu.runtime import _invocation_lifecycle as lifecycle_module
+    from cayu.sessions import _invocation_lifecycle as lifecycle_module
 
     monkeypatch.setattr(lifecycle_module, "INVOCATION_LIFECYCLE_RECEIPT_LEDGER_MAX_ITEMS", 6)
     asyncio.run(
@@ -2512,7 +2512,7 @@ def test_pending_continuation_pins_receipt_until_settlement(
 def test_postgres_pending_continuation_pins_receipt_until_settlement(
     outcome, continuation_postgres_dsn, monkeypatch
 ):
-    from cayu.runtime import _invocation_lifecycle as lifecycle_module
+    from cayu.sessions import _invocation_lifecycle as lifecycle_module
 
     monkeypatch.setattr(lifecycle_module, "INVOCATION_LIFECYCLE_RECEIPT_LEDGER_MAX_ITEMS", 6)
     asyncio.run(

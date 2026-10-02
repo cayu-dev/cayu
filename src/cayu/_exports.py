@@ -4882,7 +4882,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "SessionQuery": ("cayu.sessions.base", "SessionQuery"),
     "SessionQueuedMessage": ("cayu.sessions.base", "SessionQueuedMessage"),
     "SessionQueuedMessagesPending": ("cayu.sessions.base", "SessionQueuedMessagesPending"),
-    "SessionRunFenced": ("cayu.runtime.authority", "SessionRunFenced"),
+    "SessionRunFenced": ("cayu.sessions.authority", "SessionRunFenced"),
     "SessionExecutionConfig": ("cayu.sessions.execution", "SessionExecutionConfig"),
     "SessionExecutionState": ("cayu.sessions.execution", "SessionExecutionState"),
     "SessionStateSnapshot": ("cayu.sessions.base", "SessionStateSnapshot"),

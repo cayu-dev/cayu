@@ -73,6 +73,7 @@ from cayu.runtime.execution_profiles import (
     checkpoint_with_active_invocation_execution_profile,
 )
 from cayu.runtime.loop_policies import LoopPolicy
+from cayu.sessions import _invocation_lifecycle as invocation_contracts_module
 from cayu.sessions.base import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
     IncompleteSessionRecoveryRequest,
@@ -1919,7 +1920,7 @@ def test_lifecycle_receipt_ledger_rolls_oldest_epoch_before_item_limit(monkeypat
         assert INVOCATION_LIFECYCLE_RECEIPT_LEDGER_MAX_ITEMS == 128
         test_limit = 2
         monkeypatch.setattr(
-            invocation_lifecycle_module,
+            invocation_contracts_module,
             "INVOCATION_LIFECYCLE_RECEIPT_LEDGER_MAX_ITEMS",
             test_limit,
         )
@@ -1979,7 +1980,7 @@ def test_lifecycle_receipt_ledger_rolls_oldest_epoch_before_item_limit(monkeypat
 def test_lifecycle_receipt_ledger_reserves_release_capacity_for_rebind(monkeypatch) -> None:
     async def run() -> None:
         monkeypatch.setattr(
-            invocation_lifecycle_module,
+            invocation_contracts_module,
             "INVOCATION_LIFECYCLE_RECEIPT_LEDGER_MAX_ITEMS",
             4,
         )
@@ -2121,7 +2122,7 @@ async def _assert_active_session_metadata_cannot_invalidate_release_capacity(
     before = await store.load(command.session_id)
     assert before is not None
     monkeypatch.setattr(
-        invocation_lifecycle_module,
+        invocation_contracts_module,
         "INVOCATION_LIFECYCLE_RECEIPT_LEDGER_MAX_BYTES",
         256_000,
     )
@@ -2249,7 +2250,7 @@ def test_lifecycle_receipt_ledger_enforces_exact_encoded_byte_limit(monkeypatch)
     empty_size = projected_size(empty)
     test_limit = empty_size + 4096
     monkeypatch.setattr(
-        invocation_lifecycle_module,
+        invocation_contracts_module,
         "INVOCATION_LIFECYCLE_RECEIPT_LEDGER_MAX_BYTES",
         test_limit,
     )

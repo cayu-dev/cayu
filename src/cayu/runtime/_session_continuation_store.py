@@ -163,7 +163,7 @@ def require_released_wait_invocation(
     permit_commitment: str,
 ) -> ContinuationReleasedExecution:
     """Authenticate original admission and release using the native receipt owner."""
-    from cayu.runtime._invocation_lifecycle import (
+    from cayu.sessions._invocation_lifecycle import (
         InvocationLifecycleCommandKind,
         _invocation_lifecycle_receipt_from_checkpoint,
     )
@@ -491,7 +491,7 @@ def pending_admission_receipt_identities(session: Session, checkpoint) -> frozen
     # cache. Existing admission/release capacity reservation accounts for these
     # protected receipts before dispatch; pruning the owning namespace releases
     # retention. Historical quiescence is never current execution authority.
-    from cayu.runtime._invocation_lifecycle import (
+    from cayu.sessions._invocation_lifecycle import (
         _invocation_lifecycle_receipt_ledger_from_checkpoint,
     )
 

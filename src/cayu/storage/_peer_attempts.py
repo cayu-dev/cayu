@@ -36,7 +36,6 @@ def permits_parked_delivery_append(
     Neither grants execution or bypasses ordinary peer disclosure authority.
     """
     from cayu.collaboration.peer_content import PeerContentUnavailable
-    from cayu.runtime._invocation_lifecycle import _invocation_lifecycle_receipt_from_checkpoint
     from cayu.runtime._session_continuation import (
         ContinuationRecord,
         continuation_digest,
@@ -44,6 +43,9 @@ def permits_parked_delivery_append(
         require_record_writer_generation,
     )
     from cayu.runtime._session_continuation_store import ROOT_KEY, ContinuationRoot
+    from cayu.sessions._invocation_lifecycle import (
+        _invocation_lifecycle_receipt_from_checkpoint,
+    )
     from cayu.sessions.base import PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY
     from cayu.sessions.checkpoints import decode_runtime_checkpoint
 

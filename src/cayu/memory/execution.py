@@ -97,7 +97,12 @@ from cayu.memory.interventions import (
     MemoryInterventionTrialBinding,
     memory_attribution_fingerprint,
 )
-from cayu.runtime._durable_operation_ownership import (
+from cayu.runtime._memory_attribution import (
+    MemoryAttributionCaptureBudget,
+    project_memory_attribution,
+)
+from cayu.runtime._memory_evidence import memory_evidence_key
+from cayu.sessions._durable_operation_ownership import (
     DurableOperationOwnership,
     DurableOperationOwnershipAction,
     DurableOperationOwnershipDisposition,
@@ -106,11 +111,6 @@ from cayu.runtime._durable_operation_ownership import (
     DurableOperationOwnershipTransition,
     transition_durable_operation_ownership,
 )
-from cayu.runtime._memory_attribution import (
-    MemoryAttributionCaptureBudget,
-    project_memory_attribution,
-)
-from cayu.runtime._memory_evidence import memory_evidence_key
 from cayu.sessions.base import (
     CompactSessionRequest,
     IncompleteSessionRecoveryRequest,

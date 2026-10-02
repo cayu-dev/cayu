@@ -186,16 +186,18 @@ from cayu.runtime._environment_exposure import (
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._invocation_lifecycle import (
-    AdmittedInvocationBinding,
     InvocationContext,
-    ReleaseInvocationCommand,
     _release_invocation_command_with_cleanup_authority,
-    invocation_lifecycle_receipt_history_present,
 )
 from cayu.runtime._tool_execution_requirements import effective_execution_requirements
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
+)
+from cayu.sessions._invocation_lifecycle import (
+    AdmittedInvocationBinding,
+    ReleaseInvocationCommand,
+    invocation_lifecycle_receipt_history_present,
 )
 from cayu.sessions._terminal_evidence import (
     TERMINAL_EVIDENCE_EVENT_TYPES,

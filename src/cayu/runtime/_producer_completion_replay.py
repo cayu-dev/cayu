@@ -77,9 +77,11 @@ async def prepare_producer_completion_replay(store, session, checkpoint, invocat
     The common native loop must still run post-model policy/finalization gates.
     This does not elect an answer or create a work-attempt/admission grant.
     """
-    from cayu.runtime._invocation_lifecycle import require_invocation_rebind_lineage
     from cayu.sessions._execution_profile_checkpoint import (
         ActiveInvocationExecutionProfile,
+    )
+    from cayu.sessions._invocation_lifecycle import (
+        require_invocation_rebind_lineage,
     )
 
     raw = None if checkpoint is None else checkpoint.get(ROOT_KEY)

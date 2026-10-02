@@ -10,7 +10,9 @@ from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from cayu._clock import normalize_utc_datetime
 from cayu._validation import canonical_durable_json_bytes, revalidate_model_input
-from cayu.runtime.invocation_release import InvocationReleaseEvidence
+from cayu.sessions.invocation_release import (
+    InvocationReleaseEvidence,
+)
 from cayu.tasks.admission import WorkAttemptAdmission
 from cayu.tasks.contracts import (
     WorkContractRef,

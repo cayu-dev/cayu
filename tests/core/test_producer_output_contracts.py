@@ -2165,8 +2165,8 @@ async def test_producer_human_pause_is_not_failure(
         )
     resumed = [event async for event in stream]
     assert any(event.type is EventType.SESSION_COMPLETED for event in resumed)
-    from cayu.runtime import _invocation_lifecycle as lifecycle
-    from cayu.runtime._invocation_lifecycle import (
+    from cayu.sessions import _invocation_lifecycle as lifecycle
+    from cayu.sessions._invocation_lifecycle import (
         InvocationLifecycleCommandKind,
         _invocation_lifecycle_receipt_ledger_from_checkpoint,
         _InvocationLifecycleReceiptLedger,

@@ -63,7 +63,6 @@ def select_continuation(snapshot: CompletedTurnSnapshot) -> RecipientContinuatio
     from cayu.collaboration.prepared_admission import MAX_PREPARED_PROFILE_BYTES
     from cayu.runtime._approval_support import pending_approval_from_checkpoint
     from cayu.runtime._invocation_lifecycle import (
-        _require_released_invocation_command_receipt,
         invocation_checkpoint_state_sha256,
     )
     from cayu.runtime._session_continuation_store import (
@@ -73,6 +72,9 @@ def select_continuation(snapshot: CompletedTurnSnapshot) -> RecipientContinuatio
     from cayu.sessions._execution_profile_checkpoint import (
         active_invocation_execution_profile_from_checkpoint,
         execution_profile_from_session_metadata,
+    )
+    from cayu.sessions._invocation_lifecycle import (
+        _require_released_invocation_command_receipt,
     )
     from cayu.sessions.base import SessionStatus
 

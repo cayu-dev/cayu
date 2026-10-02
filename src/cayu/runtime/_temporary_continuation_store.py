@@ -326,7 +326,7 @@ def native_service_execution(
     admission: TemporaryServiceAdmission, checkpoint: dict[str, Any] | None
 ) -> TemporaryServiceExecution | None:
     """Project an exact receiving receipt; absence is never admission exclusion."""
-    from cayu.runtime._invocation_lifecycle import (
+    from cayu.sessions._invocation_lifecycle import (
         InvocationLifecycleCommandKind,
         _invocation_lifecycle_receipt_from_checkpoint,
     )
@@ -367,7 +367,7 @@ def native_service_outcome(
 ) -> TemporaryServiceRecord | None:
     """Reconstruct admission/return from native receipts, never exception inference."""
     from cayu.collaboration._permits import ReceivingSettlementReceipt
-    from cayu.runtime._invocation_lifecycle import (
+    from cayu.sessions._invocation_lifecycle import (
         InvocationLifecycleCommandKind,
         _invocation_lifecycle_receipt_from_checkpoint,
     )

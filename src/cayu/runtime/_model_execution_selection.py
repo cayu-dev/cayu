@@ -15,7 +15,9 @@ from cayu.execution_profiles import (
 )
 from cayu.providers.base import ModelProviderError
 from cayu.runtime._execution_profile_admission import ModelFailoverProfileResolution
-from cayu.runtime._invocation_lifecycle import AdmittedInvocationBinding, InvocationContext
+from cayu.runtime._invocation_lifecycle import (
+    InvocationContext,
+)
 from cayu.runtime._model_failover import (
     FailoverDisposition,
     FailoverObservation,
@@ -28,6 +30,9 @@ from cayu.runtime._model_failover_stage import (
 from cayu.runtime._runtime_records import RegisteredAgentState, RegisteredProvider
 from cayu.runtime.execution_units import ModelAttemptIdentity, copy_model_attempt_identity
 from cayu.runtime.retry_policy import RetryDecision
+from cayu.sessions._invocation_lifecycle import (
+    AdmittedInvocationBinding,
+)
 from cayu.sessions._model_failover import (
     MODEL_FAILOVER_CHECKPOINT_KEY,
     ModelFailoverProgress,

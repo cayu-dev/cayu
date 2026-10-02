@@ -10,15 +10,17 @@ from uuid import NAMESPACE_URL, uuid5
 
 from cayu._validation import canonical_durable_json_bytes
 from cayu.runtime._invocation_lifecycle import (
-    AdmitInvocationCommand,
     InvocationContext,
-    InvocationMutationResult,
 )
 from cayu.runtime._session_continuation import (
     ContinuationConsumption,
     ContinuationService,
     continuation_admission_digest,
     continuation_admission_inputs,
+)
+from cayu.sessions._invocation_lifecycle import (
+    AdmitInvocationCommand,
+    InvocationMutationResult,
 )
 
 if TYPE_CHECKING:

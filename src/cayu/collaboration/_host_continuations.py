@@ -16,10 +16,6 @@ from cayu.runtime._host_continuation_discovery import (
     ContinuationRecovery,
     recover_session_continuation,
 )
-from cayu.runtime._invocation_lifecycle import (
-    _require_released_invocation_command_receipt,
-    reconcile_invocation_admission_from_state,
-)
 from cayu.runtime._session_continuation import (
     ContinuationRecord,
     ContinuationService,
@@ -34,6 +30,10 @@ from cayu.runtime._session_continuation_owner import (
 )
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
+)
+from cayu.sessions._invocation_lifecycle import (
+    _require_released_invocation_command_receipt,
+    reconcile_invocation_admission_from_state,
 )
 from cayu.sessions.base import ResumeRequest, copy_resume_request
 

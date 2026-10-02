@@ -42,7 +42,12 @@ _PREPARATION: ContextVar[tuple[bytes, ContinuationPreparation, InvocationContext
 
 
 def require_ticket_invocation(ticket: ContinuationTicket, invocation: InvocationContext) -> None:
-    from cayu.runtime._invocation_lifecycle import AdmittedInvocationBinding, InvocationContext
+    from cayu.runtime._invocation_lifecycle import (
+        InvocationContext,
+    )
+    from cayu.sessions._invocation_lifecycle import (
+        AdmittedInvocationBinding,
+    )
 
     if (
         type(invocation) is not InvocationContext
@@ -87,7 +92,9 @@ def require_namespace_preparation(namespace: ContinuationNamespace) -> None:
 
 
 def require_preparation_writer(session: Session, checkpoint: dict | None) -> None:
-    from cayu.runtime._invocation_lifecycle import require_invocation_command_authority
+    from cayu.sessions._invocation_lifecycle import (
+        require_invocation_command_authority,
+    )
     from cayu.sessions.base import SessionRunFenced, SessionStatus
 
     authority = _PREPARATION.get()

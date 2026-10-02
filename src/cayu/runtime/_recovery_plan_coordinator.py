@@ -24,13 +24,6 @@ from cayu.events import (
 )
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
-from cayu.runtime._durable_operation_ownership import (
-    DurableOperationOwnership,
-    DurableOperationOwnershipAction,
-    DurableOperationOwnershipDisposition,
-    DurableOperationOwnershipTransition,
-    transition_durable_operation_ownership,
-)
 from cayu.runtime._environment_allocation import (
     ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY,
     EnvironmentAllocationRecord,
@@ -40,11 +33,6 @@ from cayu.runtime._environment_lifecycle import (
     pending_completion_finalization_from_checkpoint,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime._invocation_lifecycle import (
-    InvocationLifecycleCommandKind,
-    _invocation_lifecycle_receipt_from_checkpoint,
-    require_released_invocation_command_authority,
-)
 from cayu.runtime._model_step_executor import model_completion_recovery_context_from_stage
 from cayu.runtime._provider_cleanup_evidence import local_http_cleanup_event_id
 from cayu.runtime._recovery_coordinator import (
@@ -60,9 +48,21 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileMismatchError,
 )
 from cayu.runtime.provider_operations import RecoverableProviderOperation
+from cayu.sessions._durable_operation_ownership import (
+    DurableOperationOwnership,
+    DurableOperationOwnershipAction,
+    DurableOperationOwnershipDisposition,
+    DurableOperationOwnershipTransition,
+    transition_durable_operation_ownership,
+)
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
     execution_profile_from_session_metadata,
+)
+from cayu.sessions._invocation_lifecycle import (
+    InvocationLifecycleCommandKind,
+    _invocation_lifecycle_receipt_from_checkpoint,
+    require_released_invocation_command_authority,
 )
 from cayu.sessions.base import (
     PENDING_ACTION_EVENT_TYPE_VALUES,

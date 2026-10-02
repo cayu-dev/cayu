@@ -43,10 +43,6 @@ from cayu.artifacts.base import (
 from cayu.events import Event, EventType, copy_event
 from cayu.messages import Message
 from cayu.runtime._delegated_event_stream import _close_delegated_event_stream
-from cayu.runtime._invocation_lifecycle import (
-    released_invocation_evidence,
-    require_invocation_rebind_lineage,
-)
 from cayu.runtime.completion_result_resolvers import (
     CompletionResultResolver,
     CompletionResultResolverRequest,
@@ -59,6 +55,10 @@ from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
+)
+from cayu.sessions._invocation_lifecycle import (
+    released_invocation_evidence,
+    require_invocation_rebind_lineage,
 )
 from cayu.sessions.base import (
     RunRequest,

@@ -3510,7 +3510,6 @@ from cayu.runtime.application_lifecycle import (
 from cayu.runtime.application_lifecycle import (
     SupportsAsyncClose as SupportsAsyncClose,
 )
-from cayu.runtime.authority import SessionRunFenced as SessionRunFenced
 from cayu.runtime.checks import DiagnosticSeverity as DiagnosticSeverity
 from cayu.runtime.checks import ProjectCheckReport as ProjectCheckReport
 from cayu.runtime.checks import ProjectDiagnostic as ProjectDiagnostic
@@ -3880,6 +3879,7 @@ from cayu.sessions._recipient_continuation import (
 from cayu.sessions.access import SessionAccessRule as SessionAccessRule
 from cayu.sessions.access import SessionAccessScope as SessionAccessScope
 from cayu.sessions.access import SessionAccessSelector as SessionAccessSelector
+from cayu.sessions.authority import SessionRunFenced as SessionRunFenced
 from cayu.sessions.base import (
     DEFAULT_PENDING_ACTION_RESULT_MAX_BYTES as DEFAULT_PENDING_ACTION_RESULT_MAX_BYTES,
 )

@@ -6,7 +6,9 @@ from cayu.sessions._execution_profile_checkpoint import (
 
 
 def require_producer_epoch(index, checkpoint, profile, run_epoch):
-    from cayu.runtime._invocation_lifecycle import require_invocation_rebind_lineage
+    from cayu.sessions._invocation_lifecycle import (
+        require_invocation_rebind_lineage,
+    )
 
     original = index.invocation
     if original is None or "sha256:" + profile.fingerprint != original.profile_commitment:

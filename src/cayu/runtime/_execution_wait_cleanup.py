@@ -14,7 +14,6 @@ from cayu.collaboration.participants import ParticipantRef
 from cayu.collaboration.waits import CollaborationWait, ParticipantSessionWaitExclusionReceipt
 from cayu.runtime._continuation_wait_settlement import acknowledge_retirement, retirement_receipt
 from cayu.runtime._execution_to_wait import _build_execution_wait
-from cayu.runtime._invocation_lifecycle import _invocation_lifecycle_receipt_from_checkpoint
 from cayu.runtime._session_continuation import (
     ContinuationConflict,
     ContinuationReleasedRetirement,
@@ -24,6 +23,9 @@ from cayu.runtime._session_continuation import (
     continuation_digest,
 )
 from cayu.runtime._session_continuation_store import require_released_wait_invocation
+from cayu.sessions._invocation_lifecycle import (
+    _invocation_lifecycle_receipt_from_checkpoint,
+)
 from cayu.sessions.base import _invocation_lifecycle_authority_read_scope
 from cayu.sessions.context_views import ParticipantSessionExecutionRequest
 

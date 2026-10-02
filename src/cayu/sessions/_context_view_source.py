@@ -193,7 +193,7 @@ def capture_source(
     fingerprint = completion.payload.get("execution_profile_fingerprint")
     if type(fingerprint) is not str or not fingerprint:
         raise ValueError("The completed turn has no execution-profile evidence.")
-    from cayu.runtime._invocation_lifecycle import (
+    from cayu.sessions._invocation_lifecycle import (
         _invocation_lifecycle_receipt_ledger_from_checkpoint,
     )
 

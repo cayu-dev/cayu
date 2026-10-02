@@ -5,10 +5,9 @@ from pathlib import Path
 
 # Lifecycle implementations now live with their public workspace concepts. Keep
 # their existing coordination dependencies explicit; adapters must not acquire
-# new dependencies on runtime orchestration. Authority is a dependency-neutral
-# value module formerly owned by core.
+# new dependencies on runtime orchestration. Shared fencing authority lives
+# with the session contracts.
 _ALLOWED_RUNTIME_IMPORTS = {
-    ("_local_branch.py", "cayu.runtime.authority", "SessionRunFenced"),
     ("branch_lifecycle.py", "cayu.runtime.service_manifest", "RuntimeStoreDurability"),
     ("checkpoint_lifecycle.py", "cayu.runtime._runtime_records", "RegisteredEnvironment"),
     ("checkpoint_lifecycle.py", "cayu.runtime._tool_round_executor", "_workspace_writer_isolation"),

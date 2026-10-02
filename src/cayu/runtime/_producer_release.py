@@ -38,13 +38,13 @@ def release_from_snapshot(command, session, checkpoint, raw_attachment):
     from cayu.execution_profiles import (
         ExecutionProfileIdentity,
     )
-    from cayu.runtime._invocation_lifecycle import (
-        _require_released_invocation_command_receipt,
-        require_invocation_rebind_lineage,
-    )
     from cayu.sessions._execution_profile_checkpoint import (
         ActiveInvocationExecutionProfile,
         active_invocation_execution_profile_from_checkpoint,
+    )
+    from cayu.sessions._invocation_lifecycle import (
+        _require_released_invocation_command_receipt,
+        require_invocation_rebind_lineage,
     )
 
     redactor = SecretRedactor()

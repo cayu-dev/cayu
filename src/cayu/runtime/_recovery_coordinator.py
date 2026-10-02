@@ -205,7 +205,6 @@ from cayu.runtime._diagnostics import (
     exception_diagnostic,
     task_failure_payload_from_diagnostic,
 )
-from cayu.runtime._durable_operation_ownership import DurableOperationOwnership
 from cayu.runtime._durable_subagents import (
     durable_subagent_submission_from_checkpoint,
     durable_subagent_submission_receipt_from_checkpoint,
@@ -238,14 +237,9 @@ from cayu.runtime._interruption_coordinator import (
     _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
 )
 from cayu.runtime._invocation_lifecycle import (
-    AdmittedInvocationBinding,
     InvocationContext,
-    InvocationLifecycleCommandConflict,
-    InvocationMutationResult,
-    ReleaseInvocationCommand,
     _authenticated_invocation_context,
     _release_invocation_command_with_cleanup_authority,
-    invocation_lifecycle_receipt_history_present,
     prepare_rebind_invocation_command,
 )
 from cayu.runtime._isolated_tool_process import (
@@ -392,6 +386,7 @@ from cayu.runtime.tool_effects import (
     tool_effect_receipt_digest,
 )
 from cayu.sessions import _model_completion_publication as model_completion_publication
+from cayu.sessions._durable_operation_ownership import DurableOperationOwnership
 from cayu.sessions._execution_profile_checkpoint import (
     EXECUTION_PROFILE_METADATA_KEY,
     ActiveInvocationExecutionProfile,
@@ -400,6 +395,13 @@ from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_matches_session_epoch,
     checkpoint_with_active_invocation_execution_profile,
     execution_profile_from_session_metadata,
+)
+from cayu.sessions._invocation_lifecycle import (
+    AdmittedInvocationBinding,
+    InvocationLifecycleCommandConflict,
+    InvocationMutationResult,
+    ReleaseInvocationCommand,
+    invocation_lifecycle_receipt_history_present,
 )
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalOutcome,
@@ -18158,7 +18160,7 @@ class RecoveryCoordinator:
             or receipt.session.run_epoch != active.run_epoch
         ):
             return False
-        from cayu.runtime._invocation_lifecycle import (
+        from cayu.sessions._invocation_lifecycle import (
             _require_released_invocation_command_receipt,
         )
 

@@ -391,7 +391,6 @@ from cayu.runtime._child_session_notifications import (
 )
 from cayu.runtime._task_admission_wakeup import TaskAdmissionWakeup
 from cayu.runtime._task_lease_authority import managed_task_lease_mutation
-from cayu.runtime.authority import CheckpointValueAuthority
 from cayu.runtime.evidence_spool import EvidenceSpool
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
@@ -428,6 +427,7 @@ from cayu.sessions._invocation_terminal_decision import InvocationTerminalDecisi
 from cayu.sessions._provider_operation_cancellation_claim import (
     active_provider_operation_cancellation_claim_from_checkpoint,
 )
+from cayu.sessions.authority import CheckpointValueAuthority
 from cayu.sessions.base import (
     _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES,
     _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT,
@@ -30749,7 +30749,7 @@ class PostgresSessionStore(
                 loaded = await self._load(cur, session_id)
                 if loaded is None:
                     raise KeyError(f"Session not found: {session_id}")
-                from cayu.runtime._invocation_lifecycle import (
+                from cayu.sessions._invocation_lifecycle import (
                     require_invocation_lifecycle_release_capacity,
                 )
 
@@ -30797,7 +30797,7 @@ class PostgresSessionStore(
                     loaded = await self._load(cur, session_id)
                     if loaded is None:
                         raise KeyError(f"Session not found: {session_id}")
-                    from cayu.runtime._invocation_lifecycle import (
+                    from cayu.sessions._invocation_lifecycle import (
                         require_invocation_lifecycle_release_capacity,
                     )
 
@@ -31819,7 +31819,7 @@ class PostgresSessionStore(
                             "Interaction transition lost its exact terminal recovery claim."
                         )
                     if expected_active_invocation_profile is not None:
-                        from cayu.runtime._invocation_lifecycle import (
+                        from cayu.sessions._invocation_lifecycle import (
                             require_invocation_command_authority,
                             require_released_invocation_command_authority,
                         )
@@ -32139,7 +32139,7 @@ class PostgresSessionStore(
         )
 
     async def settle_session_invocation(self, command: Any) -> InteractionTransitionResult:
-        from cayu.runtime._invocation_lifecycle import (
+        from cayu.sessions._invocation_lifecycle import (
             SettleInvocationCommand,
             copy_invocation_lifecycle_command,
         )
@@ -32540,10 +32540,12 @@ class PostgresSessionStore(
 
     async def release_session_invocation(self, command: Any) -> Any:
         from cayu.runtime._invocation_lifecycle import (
+            checkpoint_with_invocation_lifecycle_receipt,
+        )
+        from cayu.sessions._invocation_lifecycle import (
             InvocationReleaseResult,
             ReleaseInvocationCommand,
             _invocation_lifecycle_receipt_ledger_from_checkpoint,
-            checkpoint_with_invocation_lifecycle_receipt,
             copy_invocation_lifecycle_command,
             invocation_release_replay_from_state,
             require_invocation_command_authority,

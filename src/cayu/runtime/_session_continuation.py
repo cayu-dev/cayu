@@ -30,7 +30,10 @@ from cayu.collaboration._preparation import contract_bytes
 from cayu.vaults.redaction import SecretRedactor
 
 if TYPE_CHECKING:
-    from cayu.runtime._invocation_lifecycle import AdmitInvocationCommand, InvocationMutationResult
+    from cayu.sessions._invocation_lifecycle import (
+        AdmitInvocationCommand,
+        InvocationMutationResult,
+    )
     from cayu.sessions.base import SessionStore
 
 CONTINUATION_OPERATION_PREFIX = "session-continuation:"
@@ -626,7 +629,9 @@ def continuation_digest(value: ContractValue) -> str:
 def continuation_admission_digest(command: Any) -> str:
     """Digest every typed admission field used by a continuation handoff."""
 
-    from cayu.runtime._invocation_lifecycle import invocation_admission_command_sha256
+    from cayu.sessions._invocation_lifecycle import (
+        invocation_admission_command_sha256,
+    )
 
     return invocation_admission_command_sha256(command)
 
@@ -830,7 +835,9 @@ async def admit_continuation(
     if comparable != consumption:
         raise ContinuationConflict("Prepared continuation readback changed before admission.")
     if retained.receipt_stage == "admitted":
-        from cayu.runtime._invocation_lifecycle import reconcile_invocation_admission_from_state
+        from cayu.sessions._invocation_lifecycle import (
+            reconcile_invocation_admission_from_state,
+        )
 
         session = await store.load(consumption.ticket.session_id)
         checkpoint = await store.load_checkpoint(consumption.ticket.session_id)

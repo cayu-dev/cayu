@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from cayu.execution_profiles import (
         ExecutionProfileRejectionResult,
     )
-    from cayu.runtime._invocation_lifecycle import (
+    from cayu.sessions._invocation_lifecycle import (
         AdmitInvocationCommand,
         CreateInvocationCommand,
         InvocationLifecycleCommand,

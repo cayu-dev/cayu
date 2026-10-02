@@ -50,7 +50,6 @@ from cayu.deadlines import (
     effective_deadline,
 )
 from cayu.runtime import event_side_effect_health as side_effect_health
-from cayu.runtime._durable_operation_ownership import DurableOperationOwnership
 from cayu.runtime.event_side_effect_health import (
     PersistedEventSideEffectHealth,
     PersistedEventSideEffectPage,
@@ -58,6 +57,7 @@ from cayu.runtime.event_side_effect_health import (
 )
 from cayu.sessions import creation_fence
 from cayu.sessions._argument_continuity import ArgumentContinuity
+from cayu.sessions._durable_operation_ownership import DurableOperationOwnership
 from cayu.sessions.execution import SessionExecutionState
 from cayu.storage._creation_fence import MemoryCreationFenceMixin
 from cayu.storage._session_execution import MemorySessionExecutionMixin
@@ -65,17 +65,6 @@ from cayu.storage._session_execution import MemorySessionExecutionMixin
 if TYPE_CHECKING:
     from cayu.collaboration._contracts import ExactLookup
     from cayu.collaboration.participants import ParticipantRef as _ParticipantRef
-    from cayu.runtime._invocation_lifecycle import (
-        AdmitInvocationCommand,
-        CreateInvocationCommand,
-        InvocationLifecycleCommand,
-        InvocationMutationResult,
-        InvocationReleaseResult,
-        RebindInvocationCommand,
-        RejectInvocationCommand,
-        ReleaseInvocationCommand,
-        SettleInvocationCommand,
-    )
     from cayu.runtime._model_failover_stage import ModelFailoverStageAdmission
     from cayu.runtime._session_continuation import (
         ContinuationConsumption,
@@ -99,6 +88,17 @@ if TYPE_CHECKING:
     from cayu.sessions._context_view_source import (
         CompletedTurnSnapshot,
         ContextViewPublicationSource,
+    )
+    from cayu.sessions._invocation_lifecycle import (
+        AdmitInvocationCommand,
+        CreateInvocationCommand,
+        InvocationLifecycleCommand,
+        InvocationMutationResult,
+        InvocationReleaseResult,
+        RebindInvocationCommand,
+        RejectInvocationCommand,
+        ReleaseInvocationCommand,
+        SettleInvocationCommand,
     )
     from cayu.sessions._recipient_continuation import RecipientContinuationSelection
     from cayu.sessions.access import _SessionAccessBounds
@@ -310,11 +310,6 @@ from cayu.runtime._child_session_notifications import (
 from cayu.runtime._cost_accounting import CostAccountingSnapshot
 from cayu.runtime._model_target import project_portable_transcript
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot
-from cayu.runtime.authority import (
-    CheckpointValueAuthority,
-    SessionRunFenced,
-    checkpoint_value_authority,
-)
 from cayu.runtime.build_provenance import (
     RuntimeBuildProvenance,
     copy_runtime_build_provenance,
@@ -402,6 +397,11 @@ from cayu.sessions._terminal_evidence import (
     TERMINAL_EVIDENCE_QUERY_LIMIT,
     TERMINAL_LIFECYCLE_EVENT_TYPES,
     classify_current_terminal_evidence,
+)
+from cayu.sessions.authority import (
+    CheckpointValueAuthority,
+    SessionRunFenced,
+    checkpoint_value_authority,
 )
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
@@ -13307,7 +13307,7 @@ class SessionStore(ABC):
                 ).model_dump(mode="json")
             ):
                 raise ContinuationConflict("Continuation admission claim differs from its receipt.")
-            from cayu.runtime._invocation_lifecycle import (
+            from cayu.sessions._invocation_lifecycle import (
                 reconcile_invocation_admission_from_state,
                 superseding_invocation_admission_digest_from_state,
             )
@@ -13454,7 +13454,7 @@ class SessionStore(ABC):
             if current is None:
                 raise ContinuationConflict("Continuation ticket is unavailable.")
             if admission_boundary:
-                from cayu.runtime._invocation_lifecycle import (
+                from cayu.sessions._invocation_lifecycle import (
                     AdmitInvocationCommand,
                     reconcile_invocation_admission_from_state,
                     replay_invocation_lifecycle_command_from_state,
@@ -19344,7 +19344,7 @@ class InMemorySessionStore(MemorySessionExecutionMixin, MemoryCreationFenceMixin
             for owner in self._session_closure_progress.values():
                 _check_closure_lineage_owner(owner, (session_id,))
             updated = session.model_copy(update={"labels": new_labels, "updated_at": now})
-            from cayu.runtime._invocation_lifecycle import (
+            from cayu.sessions._invocation_lifecycle import (
                 require_invocation_lifecycle_release_capacity,
             )
 
@@ -19382,7 +19382,7 @@ class InMemorySessionStore(MemorySessionExecutionMixin, MemoryCreationFenceMixin
             new_metadata = replace_session_user_metadata(session.metadata, user_metadata)
             now = self._ownership_clock()
             updated = session.model_copy(update={"metadata": new_metadata, "updated_at": now})
-            from cayu.runtime._invocation_lifecycle import (
+            from cayu.sessions._invocation_lifecycle import (
                 require_invocation_lifecycle_release_capacity,
             )
 
@@ -20032,7 +20032,7 @@ class InMemorySessionStore(MemorySessionExecutionMixin, MemoryCreationFenceMixin
                     "Interaction transition lost its exact terminal recovery claim."
                 )
             if expected_active_invocation_profile is not None:
-                from cayu.runtime._invocation_lifecycle import (
+                from cayu.sessions._invocation_lifecycle import (
                     require_invocation_command_authority,
                     require_released_invocation_command_authority,
                 )
@@ -20205,7 +20205,7 @@ class InMemorySessionStore(MemorySessionExecutionMixin, MemoryCreationFenceMixin
             )
 
     async def settle_session_invocation(self, command: Any) -> InteractionTransitionResult:
-        from cayu.runtime._invocation_lifecycle import (
+        from cayu.sessions._invocation_lifecycle import (
             SettleInvocationCommand,
             copy_invocation_lifecycle_command,
         )
@@ -20539,10 +20539,12 @@ class InMemorySessionStore(MemorySessionExecutionMixin, MemoryCreationFenceMixin
 
     async def release_session_invocation(self, command: Any) -> Any:
         from cayu.runtime._invocation_lifecycle import (
+            checkpoint_with_invocation_lifecycle_receipt,
+        )
+        from cayu.sessions._invocation_lifecycle import (
             InvocationReleaseResult,
             ReleaseInvocationCommand,
             _invocation_lifecycle_receipt_ledger_from_checkpoint,
-            checkpoint_with_invocation_lifecycle_receipt,
             copy_invocation_lifecycle_command,
             invocation_release_replay_from_state,
             require_invocation_command_authority,
@@ -30059,7 +30061,7 @@ def _validate_interaction_transition_receipt_authority(
         # replayable.  A bare run-fence transfer does not: it proves that this
         # caller lost mutation authority and must retain the earlier failed
         # attempt as causal evidence.
-        from cayu.runtime._invocation_lifecycle import (
+        from cayu.sessions._invocation_lifecycle import (
             ReleaseInvocationCommand,
             invocation_release_replay_from_state,
         )

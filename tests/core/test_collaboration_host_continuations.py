@@ -322,7 +322,11 @@ async def test_host_discovers_and_recovers_public_park_after_reopen(
                 exact = await other.recover_session_continuation(token, context=CONTEXT)
                 assert exact.ticket.state == "CONSUMED"
                 if advance_before_reconcile:
-                    from cayu.runtime import _invocation_lifecycle
+                    from cayu.sessions import _invocation_lifecycle
+                    from cayu.sessions._invocation_lifecycle import (
+                        _invocation_lifecycle_receipt_ledger_from_checkpoint,
+                    )
+                    from cayu.sessions.base import _invocation_lifecycle_authority_read_scope
 
                     # Two original receipts plus the next admission/release
                     # exactly fill this window. The second successor forces
@@ -344,6 +348,12 @@ async def test_host_discovers_and_recovers_public_park_after_reopen(
                                 context=CONTEXT,
                             ):
                                 pass
+                    # Require native compaction even if the injection target moves.
+                    with _invocation_lifecycle_authority_read_scope():
+                        ledger = _invocation_lifecycle_receipt_ledger_from_checkpoint(
+                            await reopened.load_checkpoint(session.id)
+                        )
+                    assert len(ledger.receipts) == 4
                     assert len(provider.requests) == 4
                     assert await other.recover_session_continuation(token, context=CONTEXT) == exact
                 if disable_before_reconcile:

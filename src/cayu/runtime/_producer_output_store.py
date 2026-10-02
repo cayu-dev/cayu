@@ -223,7 +223,7 @@ async def admit_native_producer(store, registration: ProducerOutputRecord, comma
     Only the runtime-owned launch handoff calls this method while holding current
     execution authorization. The source decision alone is not a public grant.
     """
-    from cayu.runtime._invocation_lifecycle import (
+    from cayu.sessions._invocation_lifecycle import (
         AdmitInvocationCommand,
         InvocationCheckpointPatch,
         copy_invocation_lifecycle_command,
@@ -571,9 +571,11 @@ async def retain_native_output(store, session_id, *, invocation, stage_id):
         raise PermissionError("Producer output invocation conflicts.")
     if invocation.profile.fingerprint != binding.profile_commitment.removeprefix("sha256:"):
         raise PermissionError("Producer output profile conflicts.")
-    from cayu.runtime._invocation_lifecycle import require_invocation_rebind_lineage
     from cayu.sessions._execution_profile_checkpoint import (
         ActiveInvocationExecutionProfile,
+    )
+    from cayu.sessions._invocation_lifecycle import (
+        require_invocation_rebind_lineage,
     )
 
     require_invocation_rebind_lineage(
@@ -781,9 +783,11 @@ async def read_retained_native_output(store, command):
     from cayu.execution_profiles import (
         ExecutionProfileIdentity,
     )
-    from cayu.runtime._invocation_lifecycle import require_invocation_rebind_lineage
     from cayu.sessions._execution_profile_checkpoint import (
         ActiveInvocationExecutionProfile,
+    )
+    from cayu.sessions._invocation_lifecycle import (
+        require_invocation_rebind_lineage,
     )
 
     profile = ExecutionProfileIdentity.model_validate_json(prepared.execution_profile_json)

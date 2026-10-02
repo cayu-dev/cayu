@@ -1051,7 +1051,7 @@ def _invocation_lifecycle_receipt_metadata_authority(
     ):
         return frozenset(), frozenset()
     try:
-        from cayu.runtime._invocation_lifecycle import (
+        from cayu.sessions._invocation_lifecycle import (
             _invocation_lifecycle_receipt_ledger_from_checkpoint,
         )
 

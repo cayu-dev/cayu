@@ -355,7 +355,7 @@ def temporary_admission_payload_sha256(command: object) -> str:
     compares those fields separately and retains the complete final command hash.
     This avoids a permit/command self-reference without discarding effect inputs.
     """
-    from cayu.runtime._invocation_lifecycle import (
+    from cayu.sessions._invocation_lifecycle import (
         AdmitInvocationCommand,
         copy_invocation_lifecycle_command,
         invocation_admission_command_sha256,
@@ -374,7 +374,7 @@ def require_temporary_service_command(
     admission: TemporaryServiceAdmission, command: object
 ) -> None:
     """Compare an authenticated handoff to the exact command at native admission."""
-    from cayu.runtime._invocation_lifecycle import (
+    from cayu.sessions._invocation_lifecycle import (
         AdmitInvocationCommand,
         copy_invocation_lifecycle_command,
         invocation_admission_command_sha256,

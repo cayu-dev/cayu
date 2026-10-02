@@ -133,7 +133,6 @@ from cayu.runtime._child_session_notifications import (
     child_session_notification_stage_binding,
     child_session_notification_storage_key,
 )
-from cayu.runtime.authority import CheckpointValueAuthority
 from cayu.runtime.evidence_spool import EvidenceSpool, _settled_evidence_reads_required
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, parse_public_authority_alias
@@ -145,6 +144,7 @@ from cayu.sessions._invocation_terminal_decision import InvocationTerminalDecisi
 from cayu.sessions._provider_operation_cancellation_claim import (
     active_provider_operation_cancellation_claim_from_checkpoint,
 )
+from cayu.sessions.authority import CheckpointValueAuthority
 from cayu.sessions.base import (
     _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES,
     _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT,
@@ -6568,7 +6568,7 @@ class SQLiteSessionStore(
                 loaded = self._load_unlocked(session_id)
                 if loaded is None:
                     raise KeyError(f"Session not found: {session_id}")
-                from cayu.runtime._invocation_lifecycle import (
+                from cayu.sessions._invocation_lifecycle import (
                     require_invocation_lifecycle_release_capacity,
                 )
 
@@ -6618,7 +6618,7 @@ class SQLiteSessionStore(
                 loaded = self._load_unlocked(session_id)
                 if loaded is None:
                     raise KeyError(f"Session not found: {session_id}")
-                from cayu.runtime._invocation_lifecycle import (
+                from cayu.sessions._invocation_lifecycle import (
                     require_invocation_lifecycle_release_capacity,
                 )
 
@@ -7924,7 +7924,7 @@ class SQLiteSessionStore(
                         "Interaction transition lost its exact terminal recovery claim."
                     )
                 if expected_active_invocation_profile is not None:
-                    from cayu.runtime._invocation_lifecycle import (
+                    from cayu.sessions._invocation_lifecycle import (
                         require_invocation_command_authority,
                         require_released_invocation_command_authority,
                     )
@@ -8263,7 +8263,7 @@ class SQLiteSessionStore(
         return await self._run_write(statement)
 
     async def settle_session_invocation(self, command: Any) -> InteractionTransitionResult:
-        from cayu.runtime._invocation_lifecycle import (
+        from cayu.sessions._invocation_lifecycle import (
             SettleInvocationCommand,
             copy_invocation_lifecycle_command,
         )
@@ -8466,10 +8466,12 @@ class SQLiteSessionStore(
 
     async def release_session_invocation(self, command: Any) -> Any:
         from cayu.runtime._invocation_lifecycle import (
+            checkpoint_with_invocation_lifecycle_receipt,
+        )
+        from cayu.sessions._invocation_lifecycle import (
             InvocationReleaseResult,
             ReleaseInvocationCommand,
             _invocation_lifecycle_receipt_ledger_from_checkpoint,
-            checkpoint_with_invocation_lifecycle_receipt,
             copy_invocation_lifecycle_command,
             invocation_release_replay_from_state,
             require_invocation_command_authority,

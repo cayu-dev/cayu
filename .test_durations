@@ -42262,5 +42262,13 @@
     "tests/core/test_knowledge_search_contracts.py::test_search_contracts_compose_without_storage_implementations[cayu.storage]": 0.166,
     "tests/core/test_knowledge_search_contracts.py::test_search_contracts_compose_without_storage_implementations[cayu]": 0.217,
     "tests/core/test_knowledge_search_contracts.py::test_search_contracts_preserve_aliases_stubs_and_annotations": 0.14,
-    "tests/core/test_knowledge_search_contracts.py::test_search_values_round_trip_through_canonical_pickle_paths": 0.002
+    "tests/core/test_knowledge_search_contracts.py::test_search_values_round_trip_through_canonical_pickle_paths": 0.002,
+    "tests/core/test_invocation_lifecycle_contracts.py::test_legacy_invocation_contract_imports_and_pickles_share_the_canonical_owner[_invocation_lifecycle]": 0.0,
+    "tests/core/test_invocation_lifecycle_contracts.py::test_legacy_invocation_contract_imports_and_pickles_share_the_canonical_owner[authority]": 0.001,
+    "tests/core/test_invocation_lifecycle_contracts.py::test_legacy_invocation_contract_imports_and_pickles_share_the_canonical_owner[_durable_operation_ownership]": 0.001,
+    "tests/core/test_invocation_lifecycle_contracts.py::test_legacy_invocation_contract_imports_and_pickles_share_the_canonical_owner[invocation_release]": 0.0,
+    "tests/core/test_invocation_lifecycle_contracts.py::test_runtime_release_authority_survives_validated_copy_but_not_tampering_or_pickle": 0.007,
+    "tests/core/test_invocation_lifecycle_contracts.py::test_invocation_contracts_validate_without_loading_live_execution_owners[False]": 0.69,
+    "tests/core/test_invocation_lifecycle_contracts.py::test_invocation_contracts_validate_without_loading_live_execution_owners[True]": 0.743,
+    "tests/core/test_invocation_lifecycle_contracts.py::test_durable_authority_values_work_without_runtime_or_store_implementations": 0.089
 }

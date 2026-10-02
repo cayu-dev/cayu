@@ -23,13 +23,15 @@ from cayu.runtime._task_store_operation_boundary import (
     capture_task_store_operation,
     raise_task_store_operation_failure,
 )
-from cayu.runtime.invocation_release import InvocationReleaseEvidence
 from cayu.runtime.work_attempt_lifecycle import (
     WorkAttemptLifecycleSettlement,
     work_attempt_admission_authority_sha256,
     work_attempt_lifecycle_settlement_sha256,
 )
 from cayu.sessions.base import ResumeRequest, SessionStore
+from cayu.sessions.invocation_release import (
+    InvocationReleaseEvidence,
+)
 from cayu.tasks._verified_work_authority import require_completion_proposal_integrity
 from cayu.tasks.admission import (
     WORK_ATTEMPT_ADMISSION_LEASE_MAX_SECONDS,

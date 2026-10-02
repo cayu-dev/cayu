@@ -86,7 +86,9 @@ async def read_native_failure(store, attachment, index):
         or event.interaction_id != invocation.interaction_id
     ):
         raise ValueError("Producer failure lacks exact native settlement.")
-    from cayu.runtime._invocation_lifecycle import require_invocation_rebind_lineage
+    from cayu.sessions._invocation_lifecycle import (
+        require_invocation_rebind_lineage,
+    )
 
     with _invocation_lifecycle_authority_read_scope():
         checkpoint = await store.load_checkpoint(index.session_id)

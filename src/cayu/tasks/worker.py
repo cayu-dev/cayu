@@ -90,7 +90,6 @@ from cayu.runtime._task_store_operation_boundary import (
     task_store_mutation_is_cancellation_quiescent,
 )
 from cayu.runtime.application_lifecycle import ApplicationAdmissionsSealed
-from cayu.runtime.authority import SessionRunFenced
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
@@ -99,6 +98,7 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,
     invocation_terminal_decision_matches_active_profile,
 )
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.base import IncompleteSessionRecoveryRequest, SessionStatus
 from cayu.tasks._execution_settlement import TaskExecutionSettlement
 from cayu.tasks._schedule_wakeup import next_schedule_wake_at

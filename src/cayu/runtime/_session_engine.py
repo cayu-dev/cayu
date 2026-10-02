@@ -393,19 +393,9 @@ from cayu.runtime._interruption_coordinator import (
     suppress_interruption_cascade,
 )
 from cayu.runtime._invocation_lifecycle import (
-    AdmitInvocationCommand,
-    AdmittedInvocationBinding,
-    CreateInvocationCommand,
-    InvocationCheckpointPatch,
     InvocationContext,
-    InvocationMutationResult,
-    PreparedInvocationBinding,
-    RejectInvocationCommand,
-    SettleInvocationCommand,
     _authenticated_invocation_context,
     invocation_checkpoint_state_sha256,
-    invocation_lifecycle_receipt_history_present,
-    released_invocation_evidence,
 )
 from cayu.runtime._loop_policy_continuations import (
     before_stop_continuation_checkpoint_transform,
@@ -564,7 +554,6 @@ from cayu.runtime.execution_units import (
     new_model_step_identity,
     strip_runtime_owned_execution_identity,
 )
-from cayu.runtime.invocation_release import InvocationReleaseEvidence
 from cayu.runtime.loop_policies import (
     BeforeStopAction,
     BeforeStopContext,
@@ -618,6 +607,18 @@ from cayu.sessions._execution_profile_checkpoint import (
     checkpoint_with_active_invocation_execution_profile,
     execution_profile_from_session_metadata,
     execution_profile_session_metadata,
+)
+from cayu.sessions._invocation_lifecycle import (
+    AdmitInvocationCommand,
+    AdmittedInvocationBinding,
+    CreateInvocationCommand,
+    InvocationCheckpointPatch,
+    InvocationMutationResult,
+    PreparedInvocationBinding,
+    RejectInvocationCommand,
+    SettleInvocationCommand,
+    invocation_lifecycle_receipt_history_present,
+    released_invocation_evidence,
 )
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalDecision,
@@ -796,6 +797,9 @@ from cayu.sessions.interactions import (
     interaction_usage_summary,
 )
 from cayu.sessions.invocation import SessionExecutionSource, SessionInvocationBinding
+from cayu.sessions.invocation_release import (
+    InvocationReleaseEvidence,
+)
 from cayu.sessions.recovery import (
     RecoveryBlockerCode,
     StartupRecoveryBlockedSession,

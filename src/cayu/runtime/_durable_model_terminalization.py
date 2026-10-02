@@ -15,9 +15,9 @@ from typing import TYPE_CHECKING, Any
 
 from cayu._validation import canonical_durable_json_bytes
 from cayu.events import Event, EventType, event_with_runtime_envelope_authority
-from cayu.runtime._durable_operation_ownership import DurableOperationOwnership
 from cayu.runtime._model_step_executor import model_completion_recovery_context_from_stage
 from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
+from cayu.sessions._durable_operation_ownership import DurableOperationOwnership
 from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
     active_invocation_execution_profile_from_checkpoint,
@@ -219,7 +219,9 @@ async def terminalize_dispatched_model(
             raise SessionRunFenced("Model terminalization replay conflicts with durable state.")
         # Paired terminal evidence and exact release are authenticated by the
         # existing invocation cleanup boundary, including commit-before-ack.
-        from cayu.runtime._invocation_lifecycle import require_released_invocation_command_authority
+        from cayu.sessions._invocation_lifecycle import (
+            require_released_invocation_command_authority,
+        )
         from cayu.sessions.base import _activate_owned_session_run_fence
 
         if session.run_epoch == prior.settlement_run_epoch:

@@ -28,13 +28,7 @@ from cayu.collaboration._ownership import _MutationOwners
 from cayu.collaboration._preparation import contract_bytes, prepare_contract
 from cayu.collaboration.participants import CollaborationCapacityExceeded, CollaborationUnavailable
 from cayu.runtime._invocation_lifecycle import (
-    AdmitInvocationCommand,
-    AdmittedInvocationBinding,
     InvocationContext,
-    InvocationMutationResult,
-    PreparedInvocationBinding,
-    copy_invocation_lifecycle_command,
-    invocation_admission_command_sha256,
 )
 from cayu.runtime._session_continuation import (
     ContinuationConflict,
@@ -83,6 +77,14 @@ from cayu.runtime._temporary_continuation_permits import (
     TemporaryServiceSettlementReader,
 )
 from cayu.runtime._temporary_continuation_scope import temporary_admission_scope
+from cayu.sessions._invocation_lifecycle import (
+    AdmitInvocationCommand,
+    AdmittedInvocationBinding,
+    InvocationMutationResult,
+    PreparedInvocationBinding,
+    copy_invocation_lifecycle_command,
+    invocation_admission_command_sha256,
+)
 from cayu.sessions.base import ResumeRequest, SessionStore, copy_resume_request
 from cayu.vaults.redaction import SecretRedactor
 
@@ -1250,7 +1252,7 @@ class SessionContinuationOwner:
                     return _ContinuationServiceResult(retained, False)
                 if consumption.receipt_stage == "prepared":
                     from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
-                    from cayu.runtime._invocation_lifecycle import (
+                    from cayu.sessions._invocation_lifecycle import (
                         reconcile_invocation_admission_from_state,
                         superseding_invocation_admission_digest_from_state,
                     )
@@ -1408,7 +1410,7 @@ class SessionContinuationOwner:
         async def reconcile() -> ContinuationRecord:
             with consumption_scope(expected):
                 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
-                from cayu.runtime._invocation_lifecycle import (
+                from cayu.sessions._invocation_lifecycle import (
                     superseding_invocation_admission_digest_from_state,
                 )
 

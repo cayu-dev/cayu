@@ -368,6 +368,18 @@ admission, and retains policy execution, diagnostics and decision attestation.
 Public exports and the former runtime imports resolve to the same definitions;
 native stores retain their existing atomic publication and fencing checks.
 
+`sessions/_invocation_lifecycle.py` owns invocation command and result values,
+receipt ledgers, exact replay validation, and checks against transaction-owned
+session state. `sessions/authority.py`, `_durable_operation_ownership.py`, and
+`invocation_release.py` own the shared fencing values, operation-ownership rules,
+and portable release evidence. Runtime retains live invocation context, cleanup
+admission, command dispatch, and receipt publication that composes continuation
+state. Both layers share the same release-authority tokens and validated command
+copies. Existing imports remain compatible, and native stores retain their
+transaction boundaries. The lifecycle contracts still use session models and
+the existing continuation service-key validation; continuation ownership remains
+a separate boundary.
+
 ## Multi-Agent Shape
 
 Cayu must support systems where multiple agents collaborate through shared state.

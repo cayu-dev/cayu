@@ -14,14 +14,16 @@ from typing import Any
 from cayu._validation import canonical_durable_json_bytes
 from cayu.events import Event, EventType, event_with_runtime_envelope_authority
 from cayu.messages import Message
-from cayu.runtime._durable_operation_ownership import DurableOperationOwnership
 from cayu.runtime._invocation_lifecycle import (
-    ReleaseInvocationCommand,
     checkpoint_with_invocation_lifecycle_receipt,
-    require_released_invocation_command_authority,
 )
+from cayu.sessions._durable_operation_ownership import DurableOperationOwnership
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
+)
+from cayu.sessions._invocation_lifecycle import (
+    ReleaseInvocationCommand,
+    require_released_invocation_command_authority,
 )
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalOutcome,

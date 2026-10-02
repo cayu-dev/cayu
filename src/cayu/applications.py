@@ -415,8 +415,6 @@ from cayu.runtime._interruption_coordinator import (
 )
 from cayu.runtime._invocation_lifecycle import (
     InvocationContext,
-    InvocationMutationResult,
-    invocation_lifecycle_receipt_history_present,
     prepare_rebind_invocation_command,
 )
 from cayu.runtime._model_execution_selection import ModelExecutionSelection
@@ -614,6 +612,10 @@ from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_matches_session_epoch,
     checkpoint_with_active_invocation_execution_profile,
     execution_profile_from_session_metadata,
+)
+from cayu.sessions._invocation_lifecycle import (
+    InvocationMutationResult,
+    invocation_lifecycle_receipt_history_present,
 )
 from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,

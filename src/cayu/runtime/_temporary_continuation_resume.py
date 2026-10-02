@@ -9,13 +9,15 @@ from typing import TYPE_CHECKING
 from uuid import NAMESPACE_URL, uuid5
 
 from cayu.runtime._invocation_lifecycle import (
-    AdmitInvocationCommand,
-    AdmittedInvocationBinding,
     InvocationContext,
-    InvocationMutationResult,
 )
 from cayu.runtime._session_continuation import continuation_digest
 from cayu.runtime._temporary_continuation import TemporaryServiceIntent
+from cayu.sessions._invocation_lifecycle import (
+    AdmitInvocationCommand,
+    AdmittedInvocationBinding,
+    InvocationMutationResult,
+)
 
 if TYPE_CHECKING:
     from cayu.runtime._session_continuation_owner import SessionContinuationOwner
