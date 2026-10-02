@@ -130,7 +130,7 @@ def test_native_admission_race_retains_durable_child_evidence(tmp_path, monkeypa
     from cayu.agents import AgentSpec
     from cayu.applications import CayuApp
     from cayu.evals.testing import ScriptedModelProvider
-    from cayu.runtime import _model_step_executor as executor
+    from cayu.runtime import _live_model_attempt as executor
     from cayu.storage.sqlite import SQLiteSessionStore
     from cayu.workflows.base import WorkflowSpec
     from cayu.workflows.workflow import WorkflowBase, step

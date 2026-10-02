@@ -56,6 +56,7 @@ import cayu.context.base as runtime_context_module
 import cayu.providers._credential_boundary as credential_boundary_module
 import cayu.providers.deadlines as provider_deadlines_module
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
+import cayu.runtime._live_model_attempt as live_model_attempt_module
 import cayu.runtime._model_step_executor as model_step_executor_module
 import cayu.runtime._recovery_coordinator as recovery_coordinator_module
 import cayu.runtime._run_limits as run_limits_module
@@ -2024,6 +2025,11 @@ def test_request_footprint_reuses_canonical_context_analysis_for_completion(
 
     monkeypatch.setattr(
         model_step_executor_module,
+        "analyze_request_context_pressure",
+        fail_parallel_estimator,
+    )
+    monkeypatch.setattr(
+        live_model_attempt_module,
         "analyze_request_context_pressure",
         fail_parallel_estimator,
     )
@@ -12373,6 +12379,11 @@ def test_cayu_app_releases_reservation_for_failure_before_provider_dispatch(
 
     monkeypatch.setattr(
         model_step_executor_module,
+        "analyze_request_context_pressure",
+        fail_before_dispatch,
+    )
+    monkeypatch.setattr(
+        live_model_attempt_module,
         "analyze_request_context_pressure",
         fail_before_dispatch,
     )

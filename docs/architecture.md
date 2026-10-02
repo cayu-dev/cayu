@@ -218,6 +218,15 @@ orders these boundaries around dispatch and publication. Its per-attempt state
 records observed effects even when startup raises or closes, so the executor's
 stream cleanup retains the exact operation, stream and durable-identity status.
 
+`LiveModelAttempt` owns one live model attempt from provider-stream consumption
+through response construction, cancellation cleanup and completion publication.
+It composes the existing startup, cancellation and recovery owners with explicit
+store, event writer, session control, redactor and clock dependencies. Run-local
+authority callbacks preserve their dispatch and publication order. The model-step
+executor delegates the complete attempt and retains request preparation,
+observation and retry/failover scheduling. `ModelStepRun` retains context recovery
+and automatic compaction coordination.
+
 `TerminalEvidenceFinalization` owns terminal-evidence inspection and crash repair,
 as well as live claim transfer, exact renewal, heartbeat-monitored preparation and
 streamed completion. Recovery and the engine share one instance. It borrows

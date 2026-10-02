@@ -1,4 +1,8 @@
 {
+    "tests/core/test_live_model_attempt.py::test_closing_live_attempt_at_event_boundary_closes_stream_once[model.completed]": 0.385,
+    "tests/core/test_live_model_attempt.py::test_closing_live_attempt_at_event_boundary_closes_stream_once[model.text.delta]": 0.664,
+    "tests/core/test_live_model_attempt.py::test_existing_attempt_imports_keep_exact_identity": 0.0,
+    "tests/core/test_live_model_attempt.py::test_live_attempt_imports_without_execution_controllers": 1.061,
     "tests/core/test_knowledge_indexing_contracts.py::test_indexing_contracts_compose_without_storage_implementations[cayu.knowledge.indexing]": 0.139,
     "tests/core/test_knowledge_indexing_contracts.py::test_indexing_contracts_compose_without_storage_implementations[cayu.storage]": 0.14,
     "tests/core/test_knowledge_indexing_contracts.py::test_indexing_contracts_compose_without_storage_implementations[cayu]": 0.195,
