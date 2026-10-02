@@ -16,9 +16,8 @@ import webbrowser
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, Never
-from urllib.parse import urlencode
 
-from cayu.cli._cloud_api import CloudApiClient, CloudApiError
+from cayu.cli._cloud_api import CloudApiClient, CloudApiError, archived_agent_error
 from cayu.cli._cloud_auth import (
     CloudAuthCredentials,
     CloudAuthError,
@@ -52,8 +51,9 @@ _DEPLOYMENT_STATUSES = _DEPLOYMENT_FAILURES | _DEPLOYMENT_IN_PROGRESS | _DEPLOYM
 _SERVICE_FAILURES = {"degraded", "failed", "stopped"}
 _SERVICE_IN_PROGRESS = {"deleting", "deploying", "sleeping", "starting", "stopping"}
 _SERVICE_READY = {"running"}
-_SERVICE_STATUSES = _SERVICE_FAILURES | _SERVICE_IN_PROGRESS | _SERVICE_READY
-# A service wait tolerates this many consecutive throttled, unavailable or 5xx reads.
+# `archived` is readable but never waited on: archive retired the service for good.
+_SERVICE_STATUSES = _SERVICE_FAILURES | _SERVICE_IN_PROGRESS | _SERVICE_READY | {"archived"}
+# A service or archive wait tolerates this many consecutive throttled, unavailable or 5xx reads.
 _SERVICE_POLL_TRANSIENT_LIMIT = 5
 _TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
 _CLOUD_DEPLOYMENT_ID = re.compile(r"dep_[a-z0-9]{1,64}")
@@ -162,6 +162,50 @@ class _CloudDeploymentStillRunningError(CloudApiError):
                 for action in ("status", "timeline", "wait")
             }
         return details
+
+
+class _CloudArchiveStillRunningError(CloudApiError):
+    """A local wait ended while Cayu Cloud keeps retiring the archived Agent."""
+
+    def __init__(
+        self,
+        *,
+        application_id: str,
+        operation: dict[str, Any],
+        recovery_arguments: Sequence[str] = (),
+    ) -> None:
+        super().__init__(
+            "archive_still_running",
+            "Cayu Cloud is still archiving this Agent; it continues without the CLI.",
+        )
+        self.application_id = application_id
+        self.recovery_arguments = tuple(recovery_arguments)
+        self.status = str(operation.get("status"))
+        blockers = operation.get("blockers")
+        self.blockers = [
+            {"code": str(item.get("code")), "message": str(item.get("message"))}
+            for item in (blockers if isinstance(blockers, list) else [])
+            if isinstance(item, dict)
+        ]
+
+    def public_details(self) -> dict[str, object]:
+        return {
+            "application": self.application_id,
+            "blockers": self.blockers,
+            "commands": {
+                "status": shlex.join(
+                    [
+                        "cayu",
+                        "cloud",
+                        *self.recovery_arguments,
+                        "applications",
+                        "archive-status",
+                        self.application_id,
+                    ]
+                )
+            },
+            "status": self.status,
+        }
 
 
 class _CloudServiceStillRunningError(CloudApiError):
@@ -289,6 +333,8 @@ def _cloud_failure(exc: Exception) -> int:
     else:
         category, message = "invalid_input", str(exc)
     error: dict[str, object] = {"category": category, "message": message}
+    if isinstance(exc, CloudApiError) and exc.code is not None:
+        error["code"] = exc.code
     if isinstance(exc, CloudSourceInputsError):
         error.update({"path": exc.path, "reason": exc.reason, "hint": exc.hint})
     if isinstance(
@@ -302,7 +348,14 @@ def _cloud_failure(exc: Exception) -> int:
         error.update(exc.details)
     if isinstance(exc, _CloudDeploymentFailureError):
         error["failure"] = exc.failure
-    if isinstance(exc, (_CloudDeploymentStillRunningError, _CloudServiceStillRunningError)):
+    if isinstance(
+        exc,
+        (
+            _CloudArchiveStillRunningError,
+            _CloudDeploymentStillRunningError,
+            _CloudServiceStillRunningError,
+        ),
+    ):
         error.update(exc.public_details())
     if isinstance(exc, _CloudServiceHealthError):
         error["issues"] = exc.issues
@@ -361,10 +414,40 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         dest="application_command",
         required=True,
     )
-    application_commands.add_parser(
+    application_list = application_commands.add_parser(
         "list",
         description="List Agent applications and their selected releases.",
     )
+    application_list.add_argument(
+        "--lifecycle",
+        choices=("active", "archived", "all"),
+        default="active",
+        help="Active Agents by default; archived also lists Agents being archived.",
+    )
+    archive = application_commands.add_parser(
+        "archive",
+        description=(
+            "Archive an Agent: stop its service, schedules and ingress for good and keep its "
+            "Releases, configuration, data and history. Requires an organization "
+            "administrator login and can't be undone."
+        ),
+    )
+    archive.add_argument("application", type=_application_slug, help="The exact Agent slug.")
+    archive.add_argument(
+        "--expected-revision",
+        type=int,
+        required=True,
+        help="The Agent revision the decision was made on (`applications archive-status`).",
+    )
+    archive.add_argument("--idempotency-key", help="Defaults to one derived from the revision.")
+    archive.add_argument("--no-wait", action="store_true", help="Return once requested.")
+    archive.add_argument("--poll-seconds", type=_positive_finite_seconds, default=5.0)
+    archive.add_argument("--wait-seconds", type=_positive_finite_seconds, default=900.0)
+    archive_status = application_commands.add_parser(
+        "archive-status",
+        description="Show an Agent's lifecycle, revision and archive progress.",
+    )
+    archive_status.add_argument("application", type=_application_slug)
 
     context = commands.add_parser(
         "context",
@@ -651,10 +734,7 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
             "result": client.request("GET", "/v1/me"),
         }
     if arguments.command == "applications":
-        return {
-            "operation": "applications.list",
-            "result": client.request("GET", "/v1/applications"),
-        }
+        return _applications(arguments, client=client)
     if arguments.command == "deploy":
         return _deploy(
             arguments,
@@ -925,9 +1005,7 @@ def _deploy(
         # Promotion's finalizer owns publication. A second PUT registers and
         # restarts the same processes; observe the exact release instead.
         try:
-            service = _read_service_or_pending(
-                client, f"/v1/applications/{application['id']}/service"
-            )
+            service = _read_or_none(client, f"/v1/applications/{application['id']}/service")
         except CloudApiError as exc:
             if not _transient_api_error(exc):
                 raise
@@ -1184,16 +1262,15 @@ def _deployment(
         result = client.request("GET", base)
         _deployment_status(result)
     elif arguments.deployment_command in {"logs", "timeline"}:
-        path = f"{base}/{arguments.deployment_command}"
-        query = []
+        query: dict[str, str] = {}
         if arguments.deployment_command == "logs":
             for name in ("diagnostic_offset", "diagnostic_limit"):
                 value = getattr(arguments, name, None)
                 if value is not None:
-                    query.append(f"{name}={value}")
-        if query:
-            path += "?" + "&".join(query)
-        result = client.request("GET", path)
+                    query[name] = str(value)
+        result = client.request(
+            "GET", f"{base}/{arguments.deployment_command}", query=query or None
+        )
         result = _validated_deployment_diagnostics(result)
 
     elif arguments.deployment_command == "retry":
@@ -1317,20 +1394,98 @@ def _service(
     return {"operation": f"service.{action}", "result": result}
 
 
+def _applications(
+    arguments: argparse.Namespace,
+    *,
+    client: CloudApiClient,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    action = arguments.application_command
+    if action == "list":
+        return {
+            "operation": "applications.list",
+            # The server lists active Agents by default; send only a different filter.
+            "result": client.request(
+                "GET",
+                "/v1/applications",
+                query=None
+                if arguments.lifecycle == "active"
+                else {"lifecycle": arguments.lifecycle},
+            ),
+        }
+    application_id = arguments.application
+    path = f"/v1/applications/{application_id}"
+    if action == "archive-status":
+        return {
+            "operation": "applications.archive-status",
+            "result": {
+                "application": client.request("GET", path),
+                "archive": _read_or_none(client, f"{path}/archive"),
+            },
+        }
+    if not arguments.no_wait:
+        _validate_wait(arguments.poll_seconds, arguments.wait_seconds)
+    # One decision, one key: retrying the same revision replays the same archive.
+    idempotency_key = (
+        arguments.idempotency_key or f"archive:{application_id}:{arguments.expected_revision}"
+    )
+    operation = client.request(
+        "POST",
+        f"{path}/archive",
+        payload={"expected_application_revision": arguments.expected_revision},
+        idempotency_key=idempotency_key,
+    )
+    if not arguments.no_wait:
+        deadline = monotonic() + arguments.wait_seconds
+        transient_failures = 0
+        while _archive_status(operation) != "completed":
+            if monotonic() >= deadline:
+                raise _CloudArchiveStillRunningError(
+                    application_id=application_id,
+                    operation=operation,
+                    recovery_arguments=_cloud_recovery_arguments(arguments),
+                )
+            sleep(arguments.poll_seconds)
+            try:
+                operation = client.request("GET", f"{path}/archive")
+                transient_failures = 0
+            except CloudApiError as exc:
+                # Archive keeps running in Cayu Cloud: a brief API outage is not a failure.
+                if (
+                    not _transient_api_error(exc)
+                    or transient_failures >= _SERVICE_POLL_TRANSIENT_LIMIT
+                ):
+                    raise
+                transient_failures += 1
+    return {"operation": "applications.archive", "result": operation}
+
+
+def _archive_status(operation: dict[str, Any]) -> str:
+    status = operation.get("status")
+    if status not in {"requested", "in_progress", "blocked", "completed"}:
+        raise CloudApiError("api_response_invalid", "Archive status is invalid.")
+    return str(status)
+
+
 def _application_id(client: CloudApiClient, reference: str) -> str:
-    applications = client.request("GET", "/v1/applications").get("items", [])
+    # Archived Agents stay readable (status, logs, history), so resolve across lifecycles.
+    applications = client.request("GET", "/v1/applications", query={"lifecycle": "all"}).get(
+        "items", []
+    )
     if not isinstance(applications, list):
         raise CloudApiError("api_response_invalid", "Application list is invalid.")
-    matches = [
-        application
-        for application in applications
-        if isinstance(application, dict)
-        and (
-            application.get("id") == reference
-            or application.get("name") == reference
+    candidates = [application for application in applications if isinstance(application, dict)]
+    # An exact slug always names its Agent: an archived Agent's reserved display name must
+    # never make an active Agent's own slug ambiguous.
+    matches = [application for application in candidates if application.get("id") == reference]
+    if not matches:
+        matches = [
+            application
+            for application in candidates
+            if application.get("name") == reference
             or _slug(str(application.get("name", ""))) == reference
-        )
-    ]
+        ]
     if len(matches) != 1:
         raise CloudApiError(
             "application_not_found" if not matches else "application_ambiguous",
@@ -1537,12 +1692,10 @@ def _latest_source_retry(
     seen = set()
     latest = original
     for _page in range(100):
-        query: dict[str, int | str] = {"limit": 100}
+        query = {"limit": "100"}
         if cursor is not None:
             query["cursor"] = cursor
-        page = client.request(
-            "GET", f"/v1/applications/{application_id}/deployments?{urlencode(query)}"
-        )
+        page = client.request("GET", f"/v1/applications/{application_id}/deployments", query=query)
         items = page.get("items")
         if not isinstance(items, list):
             raise CloudApiError(
@@ -1600,7 +1753,9 @@ def _deployment_status(deployment: dict[str, Any]) -> str:
     return status
 
 
-def _read_service_or_pending(client: CloudApiClient, path: str) -> dict[str, Any] | None:
+def _read_or_none(client: CloudApiClient, path: str) -> dict[str, Any] | None:
+    """GET a resource that may not exist yet, such as a pending service or an archive."""
+
     try:
         return client.request("GET", path)
     except CloudApiError as exc:
@@ -1665,6 +1820,9 @@ def _wait_for_service(
             expected_deployment_id is not None
             and service.get("deployment_id") != expected_deployment_id
         )
+        if service is not None and service.get("status") == "archived":
+            # Archive retires the service for good, even mid-deploy: never wait it out.
+            raise archived_agent_error()
         status = "starting" if pending or service is None else _service_status(service)
         if pending and expected_deployment_id is not None:
             # A publication failure after promotion leaves the old or no service.
@@ -1705,7 +1863,7 @@ def _wait_for_service(
             )
         sleep(poll_seconds)
         try:
-            service = _read_service_or_pending(client, path)
+            service = _read_or_none(client, path)
         except CloudApiError as exc:
             # A brief API outage while the service starts is not a failed deploy.
             if not _transient_api_error(exc) or transient_failures >= _SERVICE_POLL_TRANSIENT_LIMIT:

@@ -214,7 +214,7 @@ def test_deploy_follows_latest_retry_of_unchanged_source(tmp_path, status):
                     "manifest_digest": "sha256:same",
                     "policy_version": "v1",
                 }
-            if method == "GET" and "deployments?" in path:
+            if method == "GET" and path.endswith("/deployments"):
                 return {
                     "items": [
                         {
@@ -271,7 +271,7 @@ class FamilyClient(Client):
                 "policy_version": "v1",
                 "created_at": "2026-09-30T00:00:00Z",
             }
-        if method == "GET" and "deployments?" in path:
+        if method == "GET" and path.endswith("/deployments"):
             self.requests.append((method, path, kwargs))
             return {"items": self.items, "next_cursor": None}
         return super().request(method, path, **kwargs)

@@ -9,7 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 
@@ -32,7 +32,31 @@ _SAFE_API_ERROR_DETAILS = {
         "Agent application slugs must be 8-63 lowercase letters, digits, or interior hyphens."
     ),
     (422, "manifest_invalid"): "Cayu Cloud rejected the manifest resources.",
+    (403, "organization_admin_required"): (
+        "A signed-in organization administrator is required; run `cayu cloud login`."
+    ),
+    (409, "application_archived"): "The Agent is archived; it can't be deployed or changed.",
+    (409, "application_revision_stale"): (
+        "The Agent changed; read its revision again before archiving."
+    ),
+    (409, "idempotency_conflict"): (
+        "The idempotency key was already used for a different request."
+    ),
+    (503, "organization_directory_unavailable"): (
+        "Administrator access can't be confirmed right now; nothing changed. Run the same "
+        "command again."
+    ),
 }
+
+
+def archived_agent_error() -> CloudApiError:
+    """The documented refusal for an archived Agent, raised when the CLI itself sees it."""
+
+    return CloudApiError(
+        "api_request_rejected",
+        _SAFE_API_ERROR_DETAILS[(409, "application_archived")],
+        code="application_archived",
+    )
 
 
 class CloudApiError(RuntimeError):
@@ -45,10 +69,13 @@ class CloudApiError(RuntimeError):
         *,
         status_code: int | None = None,
         detail: str | None = None,
+        code: str | None = None,
     ) -> None:
         super().__init__(message)
         self.category = category
         self.status_code = status_code
+        # Cloud's stable rejection code, only when it is one of the documented safe codes.
+        self.code = code
         # The server's plain-text rejection reason, when it passes the safe-text filter.
         # Callers opt in to showing it; the default message never includes it.
         self.detail = detail
@@ -115,6 +142,7 @@ class CloudApiClient:
         *,
         payload: dict[str, object] | None = None,
         idempotency_key: str | None = None,
+        query: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         headers = {
             "Accept": "application/json",
@@ -133,7 +161,7 @@ class CloudApiClient:
             ) as client:
                 response = client.request(
                     method,
-                    self.api_url.rstrip("/") + path,
+                    self.api_url.rstrip("/") + path + (f"?{urlencode(query)}" if query else ""),
                     content=body,
                     headers=headers,
                 )
@@ -143,13 +171,15 @@ class CloudApiClient:
                 "Cayu Cloud API is unavailable.",
             ) from None
         if not 200 <= response.status_code < 300:
-            detail = _safe_api_error_detail(response)
+            structured = _structured_api_error(response)
+            detail = _safe_api_error_detail(response.status_code, structured)
             suffix = f": {detail}" if detail is not None else "."
             raise CloudApiError(
                 "api_request_rejected",
                 f"Cayu Cloud API returned HTTP {response.status_code}{suffix}",
                 status_code=response.status_code,
                 detail=_plain_api_error_detail(response),
+                code=_safe_api_error_code(response.status_code, structured),
             ) from None
         if response.status_code == 204:
             return {}
@@ -240,9 +270,7 @@ def _object_store_error(content: bytes) -> str | None:
     return normalized if normalized in _SAFE_OBJECT_STORE_ERROR_CODES else None
 
 
-def _safe_api_error_detail(response: httpx.Response) -> str | None:
-    """Return only a versioned, non-secret customer API validation message."""
-
+def _structured_api_error(response: httpx.Response) -> tuple[str, dict[str, Any]] | None:
     try:
         payload = response.json()
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -253,9 +281,29 @@ def _safe_api_error_detail(response: httpx.Response) -> str | None:
     if not isinstance(detail, dict):
         return None
     code = detail.get("code")
-    if type(code) is not str:
+    return (code, detail) if type(code) is str else None
+
+
+def _safe_api_error_code(
+    status_code: int, structured: tuple[str, dict[str, Any]] | None
+) -> str | None:
+    """Return Cloud's rejection code only when it is a documented, non-secret code."""
+
+    if structured is None:
         return None
-    if response.status_code == 422 and code == "manifest_invalid":
+    code = structured[0]
+    return code if (status_code, code) in _SAFE_API_ERROR_DETAILS else None
+
+
+def _safe_api_error_detail(
+    status_code: int, structured: tuple[str, dict[str, Any]] | None
+) -> str | None:
+    """Return only a versioned, non-secret customer API validation message."""
+
+    if structured is None:
+        return None
+    code, detail = structured
+    if status_code == 422 and code == "manifest_invalid":
         pairs = detail.get("valid_pairs")
         if (
             isinstance(pairs, list)
@@ -275,7 +323,7 @@ def _safe_api_error_detail(response: httpx.Response) -> str | None:
                 for pair in pairs
             )
             return "Agent resources exceed supported sizes. Valid manifest pairs: " + options + "."
-    return _SAFE_API_ERROR_DETAILS.get((response.status_code, code))
+    return _SAFE_API_ERROR_DETAILS.get((status_code, code))
 
 
 def _plain_api_error_detail(response: httpx.Response) -> str | None:

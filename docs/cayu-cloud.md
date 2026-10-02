@@ -20,7 +20,7 @@ cayu cloud service status --application my-agent
 `cayu cloud --help` is the authoritative summary. The top-level commands are:
 
 - `login`, `logout`, and `whoami` for interactive identity;
-- `applications list` for deployed Agent discovery;
+- `applications list|archive|archive-status` for Agent discovery and archive;
 - `context use|show|clear` and `doctor` for connection selection and diagnosis;
 - `init` and `deploy` for local project setup and publication;
 - `deployment logs|status|timeline|wait|promote` and `rollback` for immutable releases;
@@ -52,6 +52,44 @@ Cloud reported one, `last_issue`: the last `web_not_ready` message, which includ
 long the web process has been starting. A timed-out service teardown similarly reports
 `service_deletion_still_running`; neither result marks the retained Cloud operation as
 failed.
+
+## Archive an Agent
+
+Archive retires an Agent you no longer use and keeps its Releases, configuration, data and
+history. Unlike `service destroy`, an archived Agent can't be deployed again, and archive
+can't be undone. It requires an organization administrator signed in with `cayu cloud
+login`; an Organization API key is refused with error `code`
+`organization_admin_required`. If Cayu Cloud can't confirm the administrator, the command
+fails with `code` `organization_directory_unavailable` and nothing changes; run it again.
+
+```bash
+cayu cloud applications archive-status my-agent       # read the current revision
+cayu cloud applications archive my-agent --expected-revision 3
+cayu cloud applications list --lifecycle archived
+```
+
+`archive` takes the exact Agent slug, never a display name, and the revision the decision
+was made on; a changed Agent fails with error `code` `application_revision_stale`. The
+idempotency key defaults to one derived from the Agent and revision, so repeating the
+command replays the same archive. The command waits until Cayu Cloud observes that nothing
+of the Agent can run; `--no-wait` returns once it is requested. If the local deadline
+expires first, it exits `2` with category `archive_still_running`, the current `blockers`,
+and a ready-to-run `applications archive-status` command; Cayu Cloud keeps archiving.
+Brief API outages while waiting are retried, like a service wait.
+
+Archived Agents leave `applications list` unless `--lifecycle archived` or `all` is given,
+but `--application` still resolves them for reads such as `service status` and `deployment
+logs`; `service status` then reports `archived`. An exact slug always names its own Agent,
+so an archived Agent's reserved display name never makes another Agent's slug ambiguous.
+Deploys, rollbacks, environment changes and service operations on an archived Agent fail
+with error `code` `application_archived`, and a deploy that is waiting for its service
+stops as soon as archive retires it. The CLI reports a Cloud rejection `code` only for
+these documented codes; other rejections carry just `category` and `message`.
+
+A Cayu app hosted elsewhere that still uses the archived Agent's Gateway key gets `403
+forbidden` from Gateway inference, and its model-policy channel is refused new snapshots
+with a non-retryable `forbidden`. Receipts stay readable. The app sees these as ordinary
+provider and policy errors.
 
 `service status` reports `degraded` when a required Agent process repeatedly fails to
 start. Its `result.issues` array preserves Cloud's safe structured diagnostics, including

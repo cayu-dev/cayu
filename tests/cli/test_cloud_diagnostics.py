@@ -175,10 +175,11 @@ def test_logs_pagination_is_noninteractive() -> None:
     )
 
     class LogClient:
-        def request(self, method: str, path: str, **_: object) -> dict[str, Any]:
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, Any]:
             if path == "/v1/applications":
                 return {"items": [{"id": "example-agent", "name": "Example"}]}
-            assert path.endswith("/logs?diagnostic_offset=20&diagnostic_limit=5")
+            assert path.endswith("/logs")
+            assert kwargs["query"] == {"diagnostic_offset": "20", "diagnostic_limit": "5"}
             return {"diagnostics": [failure()], "next_diagnostic_offset": None}
 
     result = cloud._deployment(args, client=LogClient())

@@ -2276,7 +2276,8 @@ def test_cloud_inspection_commands_are_implemented_by_the_core_package(
 ) -> None:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            if self.path == "/v1/applications":
+            # Resolving an Agent lists every lifecycle; plain `applications list` is active-only.
+            if self.path in {"/v1/applications", "/v1/applications?lifecycle=all"}:
                 result: dict[str, object] = {
                     "items": [{"id": "app_research", "name": "Research Agent"}]
                 }
@@ -2749,6 +2750,7 @@ def test_cloud_api_surfaces_only_allowlisted_validation_detail(
 
     assert safe["error"] == {
         "category": "api_request_rejected",
+        "code": "agent_slug_invalid",
         "message": (
             "Cayu Cloud API returned HTTP 422: Agent application slugs must be 8-63 "
             "lowercase letters, digits, or interior hyphens."
@@ -3446,3 +3448,379 @@ def test_cloud_wait_tolerates_a_bounded_run_of_transient_api_failures() -> None:
         wait(Client([http(500)] * 6))
     with pytest.raises(CloudApiError, match="HTTP 403"):
         wait(Client([http(403)]))
+
+
+class _ArchiveClient:
+    """Records archive requests; the archive completes after `pending` status reads."""
+
+    def __init__(self, *, pending: int = 1, archived: bool = True) -> None:
+        self.pending = pending
+        self.archived = archived
+        self.requests: list[tuple[str, str, dict[str, object]]] = []
+
+    def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+        self.requests.append((method, path, kwargs))
+        if path == "/v1/applications":
+            return {"items": [{"id": "support-desk", "name": "Support desk"}]}
+        if path == "/v1/applications/support-desk":
+            return {"id": "support-desk", "lifecycle": "archiving", "revision": 4}
+        if not path.endswith("/archive"):
+            raise AssertionError(f"unexpected Cloud request: {method} {path}")
+        if not self.archived:
+            raise CloudApiError("api_request_rejected", "HTTP 404.", status_code=404)
+        status = "completed" if method == "GET" and self.pending == 0 else "in_progress"
+        if method == "GET":
+            self.pending -= 1
+        return {
+            "id": "arch_1",
+            "status": status,
+            "blockers": [{"code": "services_stopping", "message": "Stopping."}],
+        }
+
+
+def _archive_arguments(**overrides: object) -> SimpleNamespace:
+    values: dict[str, object] = {
+        "application": "support-desk",
+        "application_command": "archive",
+        "expected_revision": 3,
+        "idempotency_key": None,
+        "no_wait": False,
+        "poll_seconds": 1.0,
+        "wait_seconds": 10.0,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_applications_archive_replays_one_decision_and_waits_for_retirement() -> None:
+    client = _ArchiveClient(pending=1)
+    clock = iter((0.0, 1.0, 2.0))
+
+    result = cloud_cli._applications(
+        _archive_arguments(),
+        client=client,
+        sleep=lambda _: None,
+        monotonic=lambda: next(clock),
+    )
+
+    assert result == {
+        "operation": "applications.archive",
+        "result": {
+            "id": "arch_1",
+            "status": "completed",
+            "blockers": [{"code": "services_stopping", "message": "Stopping."}],
+        },
+    }
+    assert client.requests[0] == (
+        "POST",
+        "/v1/applications/support-desk/archive",
+        {
+            "payload": {"expected_application_revision": 3},
+            "idempotency_key": "archive:support-desk:3",
+        },
+    )
+    assert [request[0] for request in client.requests[1:]] == ["GET", "GET"]
+
+
+def test_applications_archive_timeout_reports_the_cloud_owned_operation(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    clock = iter((0.0, 10.0))
+    with pytest.raises(CloudApiError) as raised:
+        cloud_cli._applications(
+            _archive_arguments(wait_seconds=1.0),
+            client=_ArchiveClient(pending=5),
+            sleep=lambda _: None,
+            monotonic=lambda: next(clock),
+        )
+
+    assert cloud_cli._cloud_failure(raised.value) == 2
+    assert json.loads(capsys.readouterr().out)["error"] == {
+        "application": "support-desk",
+        "blockers": [{"code": "services_stopping", "message": "Stopping."}],
+        "category": "archive_still_running",
+        "commands": {"status": "cayu cloud applications archive-status support-desk"},
+        "message": "Cayu Cloud is still archiving this Agent; it continues without the CLI.",
+        "status": "in_progress",
+    }
+
+
+def test_applications_archive_status_reports_an_unarchived_agent() -> None:
+    result = cloud_cli._applications(
+        SimpleNamespace(application="support-desk", application_command="archive-status"),
+        client=_ArchiveClient(archived=False),
+    )
+
+    assert result == {
+        "operation": "applications.archive-status",
+        "result": {
+            "application": {"id": "support-desk", "lifecycle": "archiving", "revision": 4},
+            "archive": None,
+        },
+    }
+
+
+def test_application_lists_filter_lifecycle_and_resolution_includes_archived() -> None:
+    client = _ArchiveClient()
+
+    cloud_cli._applications(
+        SimpleNamespace(application_command="list", lifecycle="archived"), client=client
+    )
+    cloud_cli._applications(
+        SimpleNamespace(application_command="list", lifecycle="active"), client=client
+    )
+    resolved = cloud_cli._application_id(client, "support-desk")
+
+    assert resolved == "support-desk"
+    assert [request[2] for request in client.requests] == [
+        {"query": {"lifecycle": "archived"}},
+        {"query": None},
+        {"query": {"lifecycle": "all"}},
+    ]
+
+
+def test_applications_archive_requires_an_exact_slug() -> None:
+    # A display name is not an Agent identity: archive never resolves one.
+    with pytest.raises(cloud_cli.CloudCommandError):
+        cloud_cli._build_parser().parse_args(
+            ["applications", "archive", "Support desk", "--expected-revision", "3"]
+        )
+
+
+def test_applications_archive_wait_tolerates_a_brief_api_outage() -> None:
+    class FlakyArchiveClient(_ArchiveClient):
+        def __init__(self, failures: list[CloudApiError]) -> None:
+            super().__init__(pending=1)
+            self.failures = failures
+
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+            if method == "GET" and self.failures:
+                self.requests.append((method, path, kwargs))
+                raise self.failures.pop(0)
+            return super().request(method, path, **kwargs)
+
+    def unavailable(status_code: int) -> CloudApiError:
+        return CloudApiError("api_request_rejected", "HTTP.", status_code=status_code)
+
+    def archive(client: _ArchiveClient) -> dict[str, object]:
+        return cloud_cli._applications(
+            _archive_arguments(wait_seconds=600.0),
+            client=client,
+            sleep=lambda _: None,
+            monotonic=lambda: 0.0,
+        )
+
+    recovered = archive(
+        FlakyArchiveClient([unavailable(503), CloudApiError("api_unavailable", "")])
+    )
+    assert recovered["result"]["status"] == "completed"
+
+    with pytest.raises(CloudApiError, match="HTTP"):
+        archive(FlakyArchiveClient([unavailable(503)] * 6))
+    with pytest.raises(CloudApiError) as refused:
+        archive(FlakyArchiveClient([unavailable(403)]))
+    assert refused.value.status_code == 403
+
+
+def test_archived_service_is_readable_and_never_waited_on() -> None:
+    archived = {"deployment_id": "dep-1", "status": "archived", "issues": []}
+
+    assert cloud_cli._service_status(archived) == "archived"
+    with pytest.raises(CloudApiError) as raised:
+        cloud_cli._wait_for_service(
+            _ArchiveClient(),
+            application_id="support-desk",
+            initial=archived,
+            poll_seconds=0.01,
+            wait_seconds=600,
+            sleep=lambda _: None,
+            monotonic=lambda: 0,
+        )
+    assert raised.value.code == "application_archived"
+
+
+def test_source_retry_lookup_pages_the_retry_family_through_query_parameters() -> None:
+    original = {
+        "id": "dep-1",
+        "version": "1.0.0",
+        "manifest_digest": "sha256:a",
+        "policy_version": "cayu-egress-v1",
+        "created_at": "2026-10-01T10:00:00Z",
+        "status": "failed",
+    }
+    retry = {
+        **original,
+        "id": "dep-2",
+        "version": "1.0.0-retry-1",
+        "created_at": "2026-10-01T11:00:00Z",
+    }
+
+    class PagedClient:
+        def __init__(self) -> None:
+            self.requests: list[tuple[str, str, dict[str, object]]] = []
+
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+            self.requests.append((method, path, kwargs))
+            if kwargs.get("query") == {"limit": "100"}:
+                return {"items": [original], "next_cursor": "page-2"}
+            return {"items": [retry], "next_cursor": None}
+
+    client = PagedClient()
+
+    latest = cloud_cli._latest_source_retry(client, "research-agent", original)
+
+    assert latest == retry
+    assert client.requests == [
+        ("GET", "/v1/applications/research-agent/deployments", {"query": {"limit": "100"}}),
+        (
+            "GET",
+            "/v1/applications/research-agent/deployments",
+            {"query": {"limit": "100", "cursor": "page-2"}},
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status_code", "code"),
+    [
+        (403, "organization_admin_required"),
+        (409, "application_archived"),
+        (409, "application_revision_stale"),
+        (409, "idempotency_conflict"),
+        (503, "organization_directory_unavailable"),
+    ],
+)
+def test_documented_archive_codes_reach_the_error_envelope(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    status_code: int,
+    code: str,
+) -> None:
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            payload = json.dumps(
+                {"detail": {"code": code, "message": "server-controlled customer-secret-material"}}
+            ).encode()
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        api_key_file = tmp_path / "api-key"
+        api_key_file.write_text("customer-secret-material\n")
+        context_path = tmp_path / "cloud-context.json"
+        _write_ready_context(
+            context_path,
+            api_key_file=api_key_file,
+            api_url=f"http://127.0.0.1:{server.server_port}",
+        )
+
+        assert main(["cloud", "--context", str(context_path), "applications", "list"]) == 2
+        rendered = capsys.readouterr().out
+    finally:
+        server.shutdown()
+        thread.join()
+
+    error = json.loads(rendered)["error"]
+    assert (error["category"], error["code"]) == ("api_request_rejected", code)
+    assert "customer-secret-material" not in rendered
+
+
+def test_an_exact_slug_resolves_its_agent_before_display_name_matches() -> None:
+    class Client:
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+            return {
+                "items": [
+                    {"id": "support-desk", "name": "Support Desk 2", "lifecycle": "active"},
+                    # Archived Agents keep their names; this one slugifies to the new slug.
+                    {"id": "support-desk-v1", "name": "Support Desk", "lifecycle": "archived"},
+                    {"id": "support-bot", "name": "Helper", "lifecycle": "active"},
+                    {"id": "helper-two", "name": "Helper", "lifecycle": "archived"},
+                ]
+            }
+
+    assert cloud_cli._application_id(Client(), "support-desk") == "support-desk"
+    assert cloud_cli._application_id(Client(), "support-desk-v1") == "support-desk-v1"
+    with pytest.raises(CloudApiError) as ambiguous:
+        cloud_cli._application_id(Client(), "Helper")
+    assert ambiguous.value.category == "application_ambiguous"
+
+
+def test_deploy_to_an_archived_slug_reports_the_archived_code() -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.requests: list[tuple[str, str]] = []
+
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+            self.requests.append((method, path))
+            if method == "GET":
+                # Archived Agents leave the default list; Cloud keeps their slug reserved.
+                return {"items": []}
+            raise CloudApiError(
+                "api_request_rejected",
+                "Cayu Cloud API returned HTTP 409.",
+                status_code=409,
+                code="application_archived",
+            )
+
+    client = Client()
+    with pytest.raises(CloudApiError) as raised:
+        cloud_cli._resolve_application(client, reference="support-desk", name="Support desk")
+
+    assert raised.value.code == "application_archived"
+    assert client.requests == [
+        ("GET", "/v1/applications"),
+        ("PUT", "/v1/applications/support-desk"),
+    ]
+
+
+def test_a_deploy_wait_ends_at_once_when_archive_retires_the_service() -> None:
+    with pytest.raises(CloudApiError) as raised:
+        cloud_cli._wait_for_service(
+            _ArchiveClient(),
+            application_id="support-desk",
+            initial={"deployment_id": "dep-old", "status": "archived", "issues": []},
+            expected_deployment_id="dep-new",
+            poll_seconds=0.01,
+            wait_seconds=600,
+            sleep=lambda _: None,
+            monotonic=lambda: 0.0,
+        )
+    assert raised.value.code == "application_archived"
+
+
+def test_deployment_logs_page_through_query_parameters() -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.requests: list[tuple[str, str, dict[str, object]]] = []
+
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+            self.requests.append((method, path, kwargs))
+            if path == "/v1/applications":
+                return {"items": [{"id": "research-agent", "name": "Research"}]}
+            return {"diagnostics": [], "next_diagnostic_offset": None}
+
+    client = Client()
+    arguments = SimpleNamespace(
+        application="research-agent",
+        deployment_command="logs",
+        deployment_id="dep_one",
+        diagnostic_offset=40,
+        diagnostic_limit=20,
+    )
+
+    cloud_cli._deployment(arguments, client=client)
+
+    assert client.requests[-1] == (
+        "GET",
+        "/v1/applications/research-agent/deployments/dep_one/logs",
+        {"query": {"diagnostic_offset": "40", "diagnostic_limit": "20"}},
+    )
