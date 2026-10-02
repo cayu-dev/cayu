@@ -10,13 +10,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from cayu.events import Event, EventType
-from cayu.runtime._model_completion_publication import (
-    ModelStepPublicationCheckpoint,
-    model_step_publication_from_checkpoint,
-)
 from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentity,
     execution_profile_from_session_metadata,
+)
+from cayu.sessions._model_completion_publication import (
+    ModelStepPublicationCheckpoint,
+    model_step_publication_from_checkpoint,
 )
 from cayu.sessions.base import (
     RuntimePublicationReceipt,

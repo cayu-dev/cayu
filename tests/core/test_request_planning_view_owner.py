@@ -15,9 +15,9 @@ from cayu.collaboration.lifecycle import ParticipantLifecycleChange
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
-from cayu.runtime._model_completion_publication import model_step_publication_from_checkpoint
 from cayu.sessions import RunRequest
 from cayu.sessions._context_selection_fence import ContextViewSelectionConflict
+from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
 from cayu.sessions._planning_view_owner import NativePlanningViewOwner
 from cayu.sessions.context_views import (
     ContextViewLimits,

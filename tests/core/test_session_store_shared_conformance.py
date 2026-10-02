@@ -187,18 +187,6 @@ from cayu.runtime._invocation_lifecycle import (
     ReleaseInvocationCommand,
     _release_invocation_command_with_cleanup_authority,
 )
-from cayu.runtime._invocation_terminal_decision import (
-    InvocationTerminalOutcome,
-    build_invocation_terminal_decision,
-    checkpoint_with_invocation_terminal_decision,
-    invocation_terminal_decision_from_checkpoint,
-    invocation_terminal_event_id,
-    settled_invocation_terminal_decision_from_checkpoint,
-)
-from cayu.runtime._model_completion_publication import (
-    LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
-    ModelStepPublicationCheckpoint,
-)
 from cayu.runtime._recovery_coordinator import (
     _checkpoint_with_legacy_approval_round,
     _pending_approval_for_atomic_claim,
@@ -236,6 +224,18 @@ from cayu.runtime.provider_operations import (
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.runtime.session_message_lifecycle import SessionMessageQueueStatus
 from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions._invocation_terminal_decision import (
+    InvocationTerminalOutcome,
+    build_invocation_terminal_decision,
+    checkpoint_with_invocation_terminal_decision,
+    invocation_terminal_decision_from_checkpoint,
+    invocation_terminal_event_id,
+    settled_invocation_terminal_decision_from_checkpoint,
+)
+from cayu.sessions._model_completion_publication import (
+    LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
+    ModelStepPublicationCheckpoint,
+)
 from cayu.sessions.base import (
     MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES,
     PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES,

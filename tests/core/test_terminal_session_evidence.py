@@ -39,7 +39,7 @@ from cayu import (
     TranscriptRecord,
 )
 from cayu._validation import compact_json_utf8_size
-from cayu.runtime._terminal_evidence import (
+from cayu.sessions._terminal_evidence import (
     SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
     TERMINAL_EVIDENCE_QUERY_LIMIT,
     classify_current_terminal_evidence,

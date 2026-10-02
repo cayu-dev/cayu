@@ -20,12 +20,12 @@ from cayu.runtime._invocation_lifecycle import (
     checkpoint_with_invocation_lifecycle_receipt,
     require_released_invocation_command_authority,
 )
-from cayu.runtime._invocation_terminal_decision import (
+from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
+from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalOutcome,
     checkpoint_after_invocation_terminal_decision,
     invocation_terminal_decision_from_checkpoint,
 )
-from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
 from cayu.sessions.base import (
     ZERO_WORK_INTERRUPTION_OPERATION_KEY,
     InteractionTransitionSpec,

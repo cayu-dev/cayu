@@ -187,11 +187,6 @@ from cayu.runtime._invocation_lifecycle import (
     _release_invocation_command_with_cleanup_authority,
     invocation_lifecycle_receipt_history_present,
 )
-from cayu.runtime._terminal_evidence import (
-    TERMINAL_EVIDENCE_EVENT_TYPES,
-    TERMINAL_EVIDENCE_QUERY_LIMIT,
-    classify_current_terminal_evidence,
-)
 from cayu.runtime._tool_execution_requirements import effective_execution_requirements
 from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentity,
@@ -200,6 +195,11 @@ from cayu.runtime.execution_profiles import (
     event_with_execution_profile_fingerprint_authority,
 )
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
+from cayu.sessions._terminal_evidence import (
+    TERMINAL_EVIDENCE_EVENT_TYPES,
+    TERMINAL_EVIDENCE_QUERY_LIMIT,
+    classify_current_terminal_evidence,
+)
 from cayu.sessions.base import (
     PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
     CheckpointTransform,

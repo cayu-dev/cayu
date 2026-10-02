@@ -10,7 +10,6 @@ from pydantic import BaseModel, ConfigDict, Field, StrictStr
 
 from cayu._validation import canonical_durable_json_bytes
 from cayu.events import Event, EventType
-from cayu.runtime._invocation_terminal_decision import invocation_terminal_decision_from_checkpoint
 from cayu.runtime._session_control import SessionInterruptedByRequest
 from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
 from cayu.runtime.session_steering import (
@@ -19,6 +18,7 @@ from cayu.runtime.session_steering import (
     StopAfterCurrentToolRoundRequest,
     copy_stop_after_current_tool_round_request,
 )
+from cayu.sessions._invocation_terminal_decision import invocation_terminal_decision_from_checkpoint
 from cayu.sessions.base import (
     Session,
     SessionOperationPublication,

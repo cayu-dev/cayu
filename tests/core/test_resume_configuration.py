@@ -25,8 +25,8 @@ from cayu import (
     ScriptedModelProvider,
     SQLiteSessionStore,
 )
-from cayu.runtime._model_completion_publication import model_step_publication_from_checkpoint
 from cayu.runtime._model_step_executor import model_completion_recovery_context_from_stage
+from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
 from cayu.sessions.base import InMemorySessionStore
 
 

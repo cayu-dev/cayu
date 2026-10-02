@@ -255,7 +255,6 @@ from cayu.providers.operations import (
     copy_provider_operation_snapshot,
     copy_provider_operation_state,
 )
-from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
@@ -310,12 +309,6 @@ from cayu.runtime._model_failover_stage import model_failover_target_for_stored_
 from cayu.runtime._model_target import project_portable_transcript
 from cayu.runtime._phase_timing import timed_model_step, timed_phase
 from cayu.runtime._provider_cleanup_evidence import local_http_cleanup_event_id
-from cayu.runtime._provider_operation_cancellation_claim import (
-    ProviderOperationCancellationClaim,
-    checkpoint_with_provider_operation_cancellation_claim,
-    checkpoint_without_provider_operation_cancellation_claim,
-    provider_operation_cancellation_claim_from_checkpoint,
-)
 from cayu.runtime._provider_stream import (
     _admitted_model_provider_events,
     _close_async_iterator,
@@ -411,10 +404,17 @@ from cayu.runtime.retry_policy import (
 )
 from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.tool_completion import ToolCompletionPolicy
+from cayu.sessions import _model_completion_publication as model_completion_publication
 from cayu.sessions._model_failover import (
     MODEL_FAILOVER_CHECKPOINT_KEY,
     ModelFailoverProgress,
     copy_model_failover_state,
+)
+from cayu.sessions._provider_operation_cancellation_claim import (
+    ProviderOperationCancellationClaim,
+    checkpoint_with_provider_operation_cancellation_claim,
+    checkpoint_without_provider_operation_cancellation_claim,
+    provider_operation_cancellation_claim_from_checkpoint,
 )
 from cayu.sessions.base import (
     MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES,

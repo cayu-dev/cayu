@@ -46,10 +46,6 @@ from cayu.runtime._invocation_lifecycle import (
     SettleInvocationCommand,
     _release_invocation_command_with_cleanup_authority,
 )
-from cayu.runtime._invocation_terminal_decision import (
-    invocation_terminal_decision_from_checkpoint,
-    settled_invocation_terminal_decision_from_checkpoint,
-)
 from cayu.runtime.completion_result_resolvers import (
     CompletionResultResolutionRequest,
     CompletionResultResolver,
@@ -59,6 +55,10 @@ from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
 )
 from cayu.runtime.loop_policies import LoopPolicy
+from cayu.sessions._invocation_terminal_decision import (
+    invocation_terminal_decision_from_checkpoint,
+    settled_invocation_terminal_decision_from_checkpoint,
+)
 from cayu.sessions.base import (
     CheckpointTransform,
     DeferredInteractionInput,

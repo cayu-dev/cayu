@@ -25,16 +25,16 @@ from cayu.messages import Message, ToolResultPart
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._durable_tool_round import DurableToolRound
-from cayu.runtime._model_completion_publication import (
-    LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
-    model_step_publication_from_checkpoint,
-)
 from cayu.runtime._tool_round_executor import InterruptedToolRoundRequest
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
 )
 from cayu.runtime.execution_units import ToolRoundIdentity
+from cayu.sessions._model_completion_publication import (
+    LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
+    model_step_publication_from_checkpoint,
+)
 from cayu.sessions.base import (
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,

@@ -1013,7 +1013,7 @@ def _invocation_terminal_decision_authority(
     if not candidates:
         return frozenset()
 
-    from cayu.runtime._invocation_terminal_decision import InvocationTerminalDecision
+    from cayu.sessions._invocation_terminal_decision import InvocationTerminalDecision
 
     trusted: set[tuple[tuple[str, ...], str]] = set()
     for root, candidate in candidates:

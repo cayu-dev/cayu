@@ -610,7 +610,7 @@ def test_replanned_terminalization_resumes_elected_disposition(
         RecoveryPlanRequest,
         RecoveryPlanSelection,
     )
-    from cayu.runtime._invocation_terminal_decision import (
+    from cayu.sessions._invocation_terminal_decision import (
         invocation_terminal_decision_from_checkpoint,
         settled_invocation_terminal_decision_from_checkpoint,
     )

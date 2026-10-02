@@ -11,7 +11,7 @@ from cayu.events import Event, EventType
 from cayu.exceptions import TerminalEventPublicationUncertain
 from cayu.messages import Message
 from cayu.observability.hooks import RuntimeHookPhase
-from cayu.runtime._terminal_evidence import (
+from cayu.sessions._terminal_evidence import (
     require_interruption_event_matches_pending_marker,
 )
 from cayu.sessions.base import (

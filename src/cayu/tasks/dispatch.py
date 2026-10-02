@@ -70,9 +70,6 @@ from cayu.runtime._message_redaction import redact_untrusted_message_for_boundar
 from cayu.runtime._task_store_operation_boundary import (
     task_store_cancellation_reconciliation_capability_is_complete,
 )
-from cayu.runtime._terminal_evidence import (
-    queued_dispatch_terminal_event_id as _queued_dispatch_terminal_event_id,
-)
 from cayu.runtime.execution_profiles import (
     ExecutionProfileAdoptionIntent,
     ExecutionProfileIdentity,
@@ -84,6 +81,9 @@ from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.sessions._model_failover import ModelFailoverPolicy, copy_optional_model_failover_policy
+from cayu.sessions._terminal_evidence import (
+    queued_dispatch_terminal_event_id as _queued_dispatch_terminal_event_id,
+)
 from cayu.sessions.base import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,

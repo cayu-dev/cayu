@@ -41,12 +41,6 @@ from cayu.runtime._continuation_task_failure import (
     runtime_task_terminalization_idempotency_key,
 )
 from cayu.runtime._interruption_coordinator import _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY
-from cayu.runtime._invocation_terminal_decision import (
-    InvocationTerminalOutcome,
-    invocation_terminal_decision_from_checkpoint,
-    settled_invocation_terminal_decision_from_checkpoint,
-)
-from cayu.runtime._terminal_evidence import interruption_request_id_from_payload
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.provider_operations import (
@@ -55,6 +49,12 @@ from cayu.runtime.provider_operations import (
     provider_operation_resolution_request_digest,
 )
 from cayu.runtime.tool_effects import ToolEffectReconciliationRequest
+from cayu.sessions._invocation_terminal_decision import (
+    InvocationTerminalOutcome,
+    invocation_terminal_decision_from_checkpoint,
+    settled_invocation_terminal_decision_from_checkpoint,
+)
+from cayu.sessions._terminal_evidence import interruption_request_id_from_payload
 from cayu.sessions.base import (
     EnqueueSessionMessageRequest,
     EventQuery,

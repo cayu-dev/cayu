@@ -9,9 +9,9 @@ from cayu.context.base import ObservedDeltaContextEstimator, context_input_cover
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime._event_projection import public_event_sequence
 from cayu.runtime._model_step_executor import _context_usage_state_for_session
+from cayu.sessions import _model_completion_publication as model_completion_publication
 from cayu.sessions.base import (
     EventQuery,
     EventRecord,

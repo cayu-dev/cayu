@@ -51,11 +51,11 @@ from cayu.runners.base import (
 from cayu.runners.docker import DockerRunner
 from cayu.runners.local import LocalRunner
 from cayu.runtime._invocation_secrets import InvocationSecretTracker
-from cayu.runtime._model_completion_publication import (
+from cayu.runtime._tool_execution import run_tool
+from cayu.sessions._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     model_step_publication_from_checkpoint,
 )
-from cayu.runtime._tool_execution import run_tool
 from cayu.sessions.base import RunRequest
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,

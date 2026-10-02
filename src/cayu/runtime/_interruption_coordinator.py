@@ -21,7 +21,7 @@ from cayu.approvals.tools import ResolutionActor, resolution_actor_payload
 from cayu.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._session_control import clear_current_task_cancellation
-from cayu.runtime._terminal_evidence import interruption_request_id_from_payload
+from cayu.sessions._terminal_evidence import interruption_request_id_from_payload
 from cayu.sessions.base import (
     InterruptSessionRequest,
     Session,

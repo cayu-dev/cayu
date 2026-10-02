@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from cayu.runtime._execution_profile_admission import model_finalization_material
-from cayu.runtime._model_completion_publication import model_step_publication_from_checkpoint
 from cayu.runtime._model_step_executor import model_completion_recovery_context_from_stage
 from cayu.runtime.execution_profiles import (
     ExecutionProfileComponentClass,
@@ -14,6 +13,7 @@ from cayu.runtime.execution_profiles import (
     execution_profile_from_session_metadata,
 )
 from cayu.runtime.retry_policy import RetryPolicy
+from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
 from cayu.sessions.base import ResumeRequest, Session, SessionStore
 
 

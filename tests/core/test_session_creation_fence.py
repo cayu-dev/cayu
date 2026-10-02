@@ -79,7 +79,7 @@ def _collaboration_factory(backend, tmp_path, request):
 
 
 async def _fork_selection(application, sessions, participant):
-    from cayu.runtime._model_completion_publication import model_step_publication_from_checkpoint
+    from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
 
     key = uuid4().hex
     request = ParticipantSessionCreationRequest(

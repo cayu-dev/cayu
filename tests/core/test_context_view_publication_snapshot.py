@@ -12,9 +12,9 @@ from cayu.context import MessageWindowContextPolicy
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.events import EventType
 from cayu.providers.base import ModelStreamEvent
-from cayu.runtime._model_completion_publication import model_step_publication_from_checkpoint
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
+from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
 from cayu.sessions.base import InMemorySessionStore, Message, ResumeRequest, RunRequest
 from cayu.sessions.context_views import (
     ContextViewPublicationRequest,

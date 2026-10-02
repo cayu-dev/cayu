@@ -23,10 +23,10 @@ from cayu.approvals.user_input import (
 from cayu.events import Event
 from cayu.runtime._delegated_event_stream import _close_delegated_event_stream
 from cayu.runtime._interruption_coordinator import _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY
-from cayu.runtime._invocation_terminal_decision import InvocationTerminalDecision
 from cayu.runtime._recovery_claims import _IncompleteRecoveryClaimLost
 from cayu.runtime._session_control import TerminalFinalizationClaimHandoff
-from cayu.runtime._terminal_evidence import interruption_request_id_from_payload
+from cayu.sessions._invocation_terminal_decision import InvocationTerminalDecision
+from cayu.sessions._terminal_evidence import interruption_request_id_from_payload
 from cayu.sessions.base import (
     Session,
     SessionRuntimePublicationConflict,

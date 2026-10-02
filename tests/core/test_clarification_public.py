@@ -2188,7 +2188,7 @@ async def test_public_question_uses_real_assistant_export(
             if public_reply:
                 from cayu import ClarificationReplyRequest
                 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
-                from cayu.runtime._model_completion_publication import (
+                from cayu.sessions._model_completion_publication import (
                     model_step_publication_from_checkpoint,
                 )
 

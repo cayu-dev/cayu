@@ -168,7 +168,6 @@ from cayu.resource_access import ResourceAccessPolicy, resource_recovery
 from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _invocation_secrets as invocation_secrets
-from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _structured_output_tool_round as structured_output_tool_round
@@ -245,13 +244,6 @@ from cayu.runtime._invocation_lifecycle import (
     invocation_lifecycle_receipt_history_present,
     prepare_rebind_invocation_command,
 )
-from cayu.runtime._invocation_terminal_decision import (
-    InvocationTerminalOutcome,
-    invocation_terminal_decision_from_checkpoint,
-    invocation_terminal_decision_matches_active_profile,
-    invocation_terminal_decision_matches_recovery_profile,
-    settled_invocation_terminal_decision_from_checkpoint,
-)
 from cayu.runtime._isolated_tool_process import (
     isolated_tool_dispatch_authority_digests,
     isolated_tool_dispatch_authority_storage_key,
@@ -276,9 +268,6 @@ from cayu.runtime._model_step_executor import (
     ModelCompletionRecoveryContext,
     model_completion_recovery_context_from_stage,
 )
-from cayu.runtime._provider_operation_cancellation_claim import (
-    active_provider_operation_cancellation_claim_from_checkpoint,
-)
 from cayu.runtime._recovery_claims import (
     _IncompleteRecoveryClaim,
     _IncompleteRecoveryClaimAuthority,
@@ -302,10 +291,6 @@ from cayu.runtime._session_control import (
     SessionControl,
 )
 from cayu.runtime._session_queries import query_all_sessions
-from cayu.runtime._terminal_evidence import (
-    interruption_request_id_from_payload,
-    require_interruption_event_matches_pending_marker,
-)
 from cayu.runtime._terminal_evidence_finalization import (
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
     _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
@@ -412,6 +397,21 @@ from cayu.runtime.tool_effects import (
     ToolEffectReconciliationRequest,
     ToolEffectReconciliationTarget,
     tool_effect_receipt_digest,
+)
+from cayu.sessions import _model_completion_publication as model_completion_publication
+from cayu.sessions._invocation_terminal_decision import (
+    InvocationTerminalOutcome,
+    invocation_terminal_decision_from_checkpoint,
+    invocation_terminal_decision_matches_active_profile,
+    invocation_terminal_decision_matches_recovery_profile,
+    settled_invocation_terminal_decision_from_checkpoint,
+)
+from cayu.sessions._provider_operation_cancellation_claim import (
+    active_provider_operation_cancellation_claim_from_checkpoint,
+)
+from cayu.sessions._terminal_evidence import (
+    interruption_request_id_from_payload,
+    require_interruption_event_matches_pending_marker,
 )
 from cayu.sessions.base import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,

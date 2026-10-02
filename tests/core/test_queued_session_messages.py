@@ -26,10 +26,6 @@ from cayu.messages import FilePart, Message, MessageRole
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY, public_event_sequence
 from cayu.runtime._interruption_coordinator import _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY
-from cayu.runtime._invocation_terminal_decision import (
-    invocation_terminal_decision_from_checkpoint,
-    settled_invocation_terminal_decision_from_checkpoint,
-)
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import (
     ExecutionProfileAdoptionIntent,
@@ -39,6 +35,10 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
     active_invocation_execution_profile_from_checkpoint,
+)
+from cayu.sessions._invocation_terminal_decision import (
+    invocation_terminal_decision_from_checkpoint,
+    settled_invocation_terminal_decision_from_checkpoint,
 )
 from cayu.sessions.base import (
     MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,

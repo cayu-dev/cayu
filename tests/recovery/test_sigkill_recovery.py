@@ -12,12 +12,12 @@ from worker_harness import BackendConfig, RecoveryHarness
 from cayu.events import EventType
 from cayu.messages import ToolResultPart
 from cayu.runtime._event_projection import public_event_linkage_sequence
-from cayu.runtime._model_completion_publication import (
-    LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
-    model_step_publication_from_checkpoint,
-)
 from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
+)
+from cayu.sessions._model_completion_publication import (
+    LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
+    model_step_publication_from_checkpoint,
 )
 from cayu.sessions.base import SessionStatus
 from cayu.sessions.checkpoints import (

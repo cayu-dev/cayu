@@ -9,7 +9,6 @@ from cayu.events import EventType
 from cayu.messages import MessageRole, ToolCallPart, ToolResultPart
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._execution_profile_admission import model_finalization_material
-from cayu.runtime._model_completion_publication import model_step_publication_from_checkpoint
 from cayu.runtime._model_step_executor import (
     ModelCompletionRecoveryContext,
     model_completion_recovery_context_from_stage,
@@ -29,6 +28,7 @@ from cayu.runtime.execution_profiles import (
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.tool_completion import ToolCompletionPolicy, ToolCompletionResult
+from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
 from cayu.sessions.base import EventOrder, EventQuery, Session, SessionStore
 from cayu.sessions.interactions import INTERACTION_LIFECYCLE_EVENT_TYPES
 from cayu.tools.base import ToolResult

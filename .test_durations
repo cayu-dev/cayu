@@ -42019,5 +42019,15 @@
     "tests/server/test_server_corpus_launch.py::test_corpus_launch_preserves_shared_auth_and_private_json_boundary[/api]": 1.856,
     "tests/server/test_server_corpus_launch.py::test_corpus_launch_preserves_shared_auth_and_private_json_boundary[/custom/v2]": 0.726,
     "tests/server/test_server_corpus_launch.py::test_corpus_launch_cancellation_before_admission_does_not_persist_work[corpus_read]": 0.516,
-    "tests/server/test_server_corpus_launch.py::test_corpus_launch_cancellation_before_admission_does_not_persist_work[profile_preparation]": 0.443
+    "tests/server/test_server_corpus_launch.py::test_corpus_launch_cancellation_before_admission_does_not_persist_work[profile_preparation]": 0.443,
+    "tests/core/test_checkpoint_evidence_contracts.py::test_old_pickled_evidence_preserves_serialized_authority": 0.001713582081720233,
+    "tests/core/test_checkpoint_evidence_contracts.py::test_runtime_compatibility_imports_share_canonical_contracts[_invocation_terminal_decision]": 0.009323541540652514,
+    "tests/core/test_checkpoint_evidence_contracts.py::test_runtime_compatibility_imports_share_canonical_contracts[_model_completion_publication]": 0.060326750157400966,
+    "tests/core/test_checkpoint_evidence_contracts.py::test_runtime_compatibility_imports_share_canonical_contracts[_provider_operation_cancellation_claim]": 0.0011433328036218882,
+    "tests/core/test_checkpoint_evidence_contracts.py::test_runtime_compatibility_imports_share_canonical_contracts[_terminal_evidence]": 0.004429708234965801,
+    "tests/core/test_checkpoint_evidence_contracts.py::test_session_evidence_imports_without_runtime[_invocation_terminal_decision]": 0.11617866600863636,
+    "tests/core/test_checkpoint_evidence_contracts.py::test_session_evidence_imports_without_runtime[_model_completion_publication]": 0.10715479287318885,
+    "tests/core/test_checkpoint_evidence_contracts.py::test_session_evidence_imports_without_runtime[_provider_operation_cancellation_claim]": 0.09802545816637576,
+    "tests/core/test_checkpoint_evidence_contracts.py::test_session_evidence_imports_without_runtime[_terminal_evidence]": 0.10262808273546398,
+    "tests/core/test_checkpoint_evidence_contracts.py::test_session_evidence_imports_without_runtime[checkpoints]": 0.10828287596814334
 }

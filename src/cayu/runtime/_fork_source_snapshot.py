@@ -6,7 +6,7 @@ from hashlib import sha256
 from typing import Any
 
 from cayu._validation import canonical_durable_json_bytes, copy_durable_record
-from cayu.runtime._model_completion_publication import (
+from cayu.sessions._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
 )
 from cayu.sessions.checkpoints import (

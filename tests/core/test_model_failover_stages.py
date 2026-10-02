@@ -23,15 +23,15 @@ from cayu.runtime._invocation_lifecycle import (
     AdmittedInvocationBinding,
     _authenticated_invocation_context,
 )
-from cayu.runtime._model_completion_publication import (
-    LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
-    ModelStepPublicationCheckpoint,
-)
 from cayu.runtime._model_failover import FailoverObservation
 from cayu.runtime._model_failover_stage import ModelFailoverStageAdmission
 from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
 from cayu.runtime.execution_units import new_model_step_identity
 from cayu.runtime.retry_policy import RetryPolicy, retry_decision
+from cayu.sessions._model_completion_publication import (
+    LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
+    ModelStepPublicationCheckpoint,
+)
 from cayu.sessions._model_failover import MODEL_FAILOVER_CHECKPOINT_KEY, ModelFailoverProgress
 from cayu.sessions.base import (
     InMemorySessionStore,

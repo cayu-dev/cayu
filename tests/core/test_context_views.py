@@ -678,7 +678,7 @@ async def _test_public_participant_context_view_witness(
         ]
         assert any(event.type is EventType.SESSION_COMPLETED for event in events)
         checkpoint = await session_store.load_checkpoint(session.id)
-        from cayu.runtime._model_completion_publication import (
+        from cayu.sessions._model_completion_publication import (
             model_step_publication_from_checkpoint,
         )
 
@@ -1475,7 +1475,7 @@ async def _test_public_participant_session_execution_is_authenticated_and_replay
     ]
     assert any(event.type.value == "session.completed" for event in events)
     checkpoint = await application.session_store.load_checkpoint(session.id)
-    from cayu.runtime._model_completion_publication import model_step_publication_from_checkpoint
+    from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
 
     pointer = model_step_publication_from_checkpoint(checkpoint)
     assert pointer is not None
@@ -1982,7 +1982,7 @@ async def _test_public_context_view_publication_selection_and_readback() -> None
     from cayu.agents import AgentSpec
     from cayu.collaboration.memory import InMemoryCollaborationStore
     from cayu.evals.testing import ScriptedModelProvider
-    from cayu.runtime._model_completion_publication import (
+    from cayu.sessions._model_completion_publication import (
         LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
         ModelStepPublicationCheckpoint,
     )

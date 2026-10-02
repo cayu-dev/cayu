@@ -37,7 +37,6 @@ from cayu.messages import Message, ToolCallPart, ToolResultPart
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
-from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_engine as session_engine
 from cayu.runtime import _tool_execution as tool_execution
@@ -57,6 +56,7 @@ from cayu.runtime.execution_profiles import ExecutionProfileIdentity, ExecutionP
 from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions import _model_completion_publication as model_completion_publication
 from cayu.sessions.base import (
     EventQuery,
     IncompleteSessionRecoveryAction,

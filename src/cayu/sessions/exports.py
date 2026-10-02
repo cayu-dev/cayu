@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, canonical_durable_json_bytes
 from cayu.events import EventType
-from cayu.runtime._model_completion_publication import model_step_publication_from_checkpoint
+from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
 from cayu.sessions.base import (
     DeferredInteractionInput,
     EventRecord,

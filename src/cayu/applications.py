@@ -397,10 +397,6 @@ from cayu.runtime._invocation_lifecycle import (
     invocation_lifecycle_receipt_history_present,
     prepare_rebind_invocation_command,
 )
-from cayu.runtime._invocation_terminal_decision import (
-    invocation_terminal_decision_from_checkpoint,
-    settled_invocation_terminal_decision_from_checkpoint,
-)
 from cayu.runtime._isolated_tool_process import (
     isolated_tool_execution_contract,
     validate_process_isolated_tool_registration,
@@ -473,10 +469,6 @@ from cayu.runtime._task_store_operation_boundary import (
     capture_task_store_operation,
     raise_task_store_operation_failure,
     task_store_work_attempt_admission_capability_is_complete,
-)
-from cayu.runtime._terminal_evidence import (
-    SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
-    TERMINAL_EVENT_TYPES,
 )
 from cayu.runtime._tool_effect_reconciliation import register_tool_effect_reconciler
 from cayu.runtime._tool_round_executor import (
@@ -591,6 +583,14 @@ from cayu.runtime.tool_effects import (
     ToolEffectReconciliationRegistration,
     ToolEffectReconciliationRequest,
     ToolEffectReconciliationTarget,
+)
+from cayu.sessions._invocation_terminal_decision import (
+    invocation_terminal_decision_from_checkpoint,
+    settled_invocation_terminal_decision_from_checkpoint,
+)
+from cayu.sessions._terminal_evidence import (
+    SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
+    TERMINAL_EVENT_TYPES,
 )
 from cayu.sessions.base import (
     _RECIPIENT_PROVENANCE_CAPABILITY,

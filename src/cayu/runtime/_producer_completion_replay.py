@@ -21,7 +21,7 @@ def producer_completion_requires_execution(checkpoint):
     This is only a requirement for current authorization, not permission to
     replay. The native owner separately authenticates the complete handoff.
     """
-    from cayu.runtime._model_completion_publication import model_step_publication_from_checkpoint
+    from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
 
     raw = None if checkpoint is None else checkpoint.get(ROOT_KEY)
     if raw is None:

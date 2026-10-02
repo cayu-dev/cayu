@@ -409,7 +409,7 @@ async def test_bound_participant_service_uses_real_resume_preparation(
         from cayu.collaboration._clarification_reply_production import authenticate_reply_production
         from cayu.collaboration._contracts import CollaborationConflict
         from cayu.collaboration._session_export_store import source_digest
-        from cayu.runtime._model_completion_publication import (
+        from cayu.sessions._model_completion_publication import (
             model_step_publication_from_checkpoint,
         )
 

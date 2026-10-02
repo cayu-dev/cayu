@@ -56,7 +56,6 @@ import cayu.context.base as runtime_context_module
 import cayu.providers._credential_boundary as credential_boundary_module
 import cayu.providers.deadlines as provider_deadlines_module
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
-import cayu.runtime._model_completion_publication as model_completion_publication_module
 import cayu.runtime._model_step_executor as model_step_executor_module
 import cayu.runtime._recovery_coordinator as recovery_coordinator_module
 import cayu.runtime._run_limits as run_limits_module
@@ -65,6 +64,7 @@ import cayu.runtime._session_engine as session_engine_module
 import cayu.runtime._tool_round_executor as tool_round_executor_module
 import cayu.runtime.execution_profiles as execution_profiles_module
 import cayu.runtime.execution_units as execution_units_module
+import cayu.sessions._model_completion_publication as model_completion_publication_module
 import cayu.sessions.base as sessions_module
 from cayu._exception_groups import (
     exception_cause,
@@ -238,9 +238,6 @@ from cayu.runtime._event_projection import (
     public_event_linkage_id,
     public_event_sequence,
 )
-from cayu.runtime._invocation_terminal_decision import (
-    settled_invocation_terminal_decision_from_checkpoint,
-)
 from cayu.runtime._model_errors import (
     _BillingIdentityResolutionCancelled,
     detach_billing_identity_cancellation_group,
@@ -264,6 +261,9 @@ from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions._invocation_terminal_decision import (
+    settled_invocation_terminal_decision_from_checkpoint,
+)
 from cayu.sessions.base import (
     EventOrder,
     EventQuery,

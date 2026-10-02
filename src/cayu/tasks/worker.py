@@ -75,11 +75,6 @@ from cayu.runtime._durable_worker_loop import (
     wait_or_stop,
     worker_stop_requested,
 )
-from cayu.runtime._invocation_terminal_decision import (
-    InvocationTerminalOutcome,
-    invocation_terminal_decision_from_checkpoint,
-    invocation_terminal_decision_matches_active_profile,
-)
 from cayu.runtime._task_lease_authority import (
     TaskLeaseAuthority as _TaskLeaseAuthority,
 )
@@ -97,6 +92,11 @@ from cayu.runtime._task_store_operation_boundary import (
 from cayu.runtime.authority import SessionRunFenced
 from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
+)
+from cayu.sessions._invocation_terminal_decision import (
+    InvocationTerminalOutcome,
+    invocation_terminal_decision_from_checkpoint,
+    invocation_terminal_decision_matches_active_profile,
 )
 from cayu.sessions.base import IncompleteSessionRecoveryRequest, SessionStatus
 from cayu.tasks._execution_settlement import TaskExecutionSettlement

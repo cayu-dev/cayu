@@ -18,8 +18,8 @@ from cayu.collaboration.mandates import ResourceSelector
 from cayu.collaboration.peer_content import PeerContentPayload
 from cayu.collaboration.requests import RequestAdmissionCommand
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
-from cayu.runtime._model_completion_publication import model_step_publication_from_checkpoint
 from cayu.runtime._session_continuation import require_ticket_identity
+from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
 from cayu.vaults.redaction import SecretRedactor
 
 

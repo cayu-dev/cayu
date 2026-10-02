@@ -274,7 +274,6 @@ from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
 from cayu.runtime import _invocation_secrets as invocation_secrets
-from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _model_target as model_target
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
@@ -387,18 +386,6 @@ from cayu.runtime._invocation_lifecycle import (
     invocation_lifecycle_receipt_history_present,
     released_invocation_evidence,
 )
-from cayu.runtime._invocation_terminal_decision import (
-    InvocationTerminalDecision,
-    InvocationTerminalOutcome,
-    build_invocation_terminal_decision,
-    checkpoint_after_invocation_terminal_decision,
-    checkpoint_with_invocation_terminal_decision,
-    invocation_terminal_decision_from_checkpoint,
-    invocation_terminal_decision_matches_active_profile,
-    invocation_terminal_decision_matches_recovery_profile,
-    invocation_terminal_event_id,
-    settled_invocation_terminal_decision_from_checkpoint,
-)
 from cayu.runtime._loop_policy_continuations import (
     before_stop_continuation_checkpoint_transform,
     before_stop_continuation_indices,
@@ -499,10 +486,6 @@ from cayu.runtime._task_store_operation_boundary import (
     capture_task_store_operation,
     raise_task_store_operation_failure,
     task_store_work_attempt_admission_capability_is_complete,
-)
-from cayu.runtime._terminal_evidence import (
-    interruption_request_id_from_payload,
-    require_interruption_event_matches_pending_marker,
 )
 from cayu.runtime._tool_completion import (
     load_recorded_tool_completion_policy,
@@ -632,6 +615,23 @@ from cayu.runtime.tool_completion import (
 )
 from cayu.runtime.work_attempt_semantics import WorkAttemptRunSemantics
 from cayu.runtime.work_attempt_source import WorkAttemptSourceRequest, work_attempt_source_digest
+from cayu.sessions import _model_completion_publication as model_completion_publication
+from cayu.sessions._invocation_terminal_decision import (
+    InvocationTerminalDecision,
+    InvocationTerminalOutcome,
+    build_invocation_terminal_decision,
+    checkpoint_after_invocation_terminal_decision,
+    checkpoint_with_invocation_terminal_decision,
+    invocation_terminal_decision_from_checkpoint,
+    invocation_terminal_decision_matches_active_profile,
+    invocation_terminal_decision_matches_recovery_profile,
+    invocation_terminal_event_id,
+    settled_invocation_terminal_decision_from_checkpoint,
+)
+from cayu.sessions._terminal_evidence import (
+    interruption_request_id_from_payload,
+    require_interruption_event_matches_pending_marker,
+)
 from cayu.sessions.base import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
     _QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY,

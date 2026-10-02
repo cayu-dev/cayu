@@ -45,12 +45,6 @@ from cayu.events import (
 from cayu.messages import Message, detach_message
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._durable_operation_ownership import DurableOperationOwnership
-from cayu.runtime._invocation_terminal_decision import (
-    InvocationTerminalOutcome,
-    invocation_terminal_decision_from_checkpoint,
-    invocation_terminal_decision_matches_recovery_profile,
-    settled_invocation_terminal_decision_from_checkpoint,
-)
 from cayu.runtime._work_attempt_invocation import WorkAttemptInvocationAuthority
 from cayu.runtime.build_provenance import (
     RuntimeBuildProvenance,
@@ -76,6 +70,12 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.runtime.invocation_release import InvocationReleaseEvidence
 from cayu.runtime.loop_policies import LoopPolicy
+from cayu.sessions._invocation_terminal_decision import (
+    InvocationTerminalOutcome,
+    invocation_terminal_decision_from_checkpoint,
+    invocation_terminal_decision_matches_recovery_profile,
+    settled_invocation_terminal_decision_from_checkpoint,
+)
 from cayu.sessions.base import (
     ExecutionProfileRejectionResult,
     InteractionTransitionResult,

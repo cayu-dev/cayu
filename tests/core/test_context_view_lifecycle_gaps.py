@@ -95,7 +95,7 @@ def test_inactive_participant_cannot_resume_but_can_release(backend, lifecycle, 
                 )
             ]
             assert any(event.type is EventType.SESSION_COMPLETED for event in events)
-            from cayu.runtime._model_completion_publication import (
+            from cayu.sessions._model_completion_publication import (
                 model_step_publication_from_checkpoint,
             )
 

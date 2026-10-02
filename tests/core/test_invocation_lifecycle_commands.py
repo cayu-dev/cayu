@@ -3465,7 +3465,7 @@ def test_invocation_context_preserves_exact_live_authority_references() -> None:
 def test_settled_predecessor_retains_identity_across_repeated_recovery_epochs(
     decision_epoch: int, wrong_identity: str | None, accepted: bool
 ) -> None:
-    from cayu.runtime._invocation_terminal_decision import (
+    from cayu.sessions._invocation_terminal_decision import (
         InvocationTerminalOutcome,
         build_invocation_terminal_decision,
         invocation_terminal_event_id,

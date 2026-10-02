@@ -15,7 +15,6 @@ from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME, Structur
 from cayu.events import Event, EventType
 from cayu.messages import Message, ToolCallPart, ToolResultPart
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_engine as session_engine_module
 from cayu.runtime import _structured_output_tool_round as structured_output_tool_round
@@ -25,6 +24,7 @@ from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import ExecutionProfileIdentity
 from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
 from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions import _model_completion_publication as model_completion_publication
 from cayu.sessions.base import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,

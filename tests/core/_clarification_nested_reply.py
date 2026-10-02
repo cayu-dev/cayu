@@ -7,7 +7,7 @@ from cayu.collaboration._request_store import operation_key
 from cayu.collaboration.exports import SessionExportRef
 from cayu.collaboration.mandates import ResourceSelector
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
-from cayu.runtime._model_completion_publication import model_step_publication_from_checkpoint
+from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
 
 
 async def accept_nested_reply(

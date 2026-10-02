@@ -21,12 +21,12 @@ from cayu.runtime._foreground_child_wait import (
     foreground_child_state_from_checkpoint,
     observe_foreground_child_wait,
 )
-from cayu.runtime._invocation_terminal_decision import invocation_terminal_decision_from_checkpoint
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
 from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_is_released,
 )
+from cayu.sessions._invocation_terminal_decision import invocation_terminal_decision_from_checkpoint
 from cayu.sessions.base import (
     Session,
     SessionOperationPublication,

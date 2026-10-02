@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from cayu._validation import canonical_durable_json_bytes, copy_durable_json_object
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
-from cayu.runtime._model_completion_publication import ModelStepPublicationCheckpoint
+from cayu.sessions._model_completion_publication import ModelStepPublicationCheckpoint
 from cayu.sessions._model_failover import MODEL_FAILOVER_CHECKPOINT_KEY
 
 if TYPE_CHECKING:

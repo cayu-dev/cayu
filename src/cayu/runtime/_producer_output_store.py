@@ -811,7 +811,7 @@ async def retain_native_output(store, session_id, *, invocation, stage_id):
         ),
         redactor=redactor,
     )
-    from cayu.runtime._model_completion_publication import model_step_publication_from_checkpoint
+    from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
     from cayu.sessions.checkpoints import decode_runtime_checkpoint
 
     pointer = model_step_publication_from_checkpoint(

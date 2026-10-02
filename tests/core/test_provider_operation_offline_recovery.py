@@ -74,9 +74,6 @@ from cayu.runtime import _model_step_executor as model_step_executor
 from cayu.runtime import _recovery_coordinator as recovery_coordinator_module
 from cayu.runtime import _session_engine as session_engine_module
 from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
-from cayu.runtime._invocation_terminal_decision import (
-    settled_invocation_terminal_decision_from_checkpoint,
-)
 from cayu.runtime._model_errors import _BillingIdentityResolutionCancelled
 from cayu.runtime._model_step_executor import ModelCompletionRecoveryContext
 from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
@@ -114,6 +111,9 @@ from cayu.runtime.provider_operations import (
 )
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions._invocation_terminal_decision import (
+    settled_invocation_terminal_decision_from_checkpoint,
+)
 from cayu.sessions.base import (
     ForkSessionRequest,
     IncompleteSessionRecoveryAction,

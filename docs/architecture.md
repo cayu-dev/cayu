@@ -287,6 +287,16 @@ internal modules never type against or depend on the complete façade interface.
 This keeps dependency direction explicit while allowing `CayuApp` to remain the
 single composition root.
 
+### Session checkpoint evidence
+
+`sessions/checkpoints.py` owns root checkpoint decoding and schema migrations.
+The adjacent private modules `_model_completion_publication`, `_terminal_evidence`,
+`_invocation_terminal_decision`, and `_provider_operation_cancellation_claim` own
+the shared records, validation, and terminal-event classification used by sessions,
+storage, and runtime. These components can be imported without loading runtime.
+Runtime retains execution, recovery, and publication orchestration; its former
+evidence module paths forward to the session owners for compatibility.
+
 ## Multi-Agent Shape
 
 Cayu must support systems where multiple agents collaborate through shared state.

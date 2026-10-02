@@ -16,10 +16,6 @@ from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.providers._credential_boundary import provider_cancellation_failures
 from cayu.providers.base import ModelProvider, ModelProviderError, ModelRequest, ModelStreamEvent
-from cayu.runtime._model_completion_publication import (
-    LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
-    ModelStepPublicationCheckpoint,
-)
 from cayu.runtime._model_step_executor import (
     ModelCompletionDispatchNotAuthorized,
     ModelCompletionPublicationRequest,
@@ -31,6 +27,10 @@ from cayu.runtime._run_limits import RunLimitGate
 from cayu.runtime.execution_units import new_model_step_identity
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.stop_policy import RunLimits
+from cayu.sessions._model_completion_publication import (
+    LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
+    ModelStepPublicationCheckpoint,
+)
 from cayu.sessions.base import (
     InMemorySessionStore,
     RunRequest,

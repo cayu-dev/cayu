@@ -56,19 +56,19 @@ from cayu.runtime._recovery_claims import (
 )
 from cayu.runtime._run_limits import SessionUsageTracker
 from cayu.runtime._session_control import SessionControl
-from cayu.runtime._terminal_evidence import (
-    TERMINAL_EVIDENCE_EVENT_TYPES,
-    TERMINAL_EVIDENCE_QUERY_LIMIT,
-    classify_current_terminal_evidence,
-    interruption_request_id_from_payload,
-    require_interruption_event_matches_pending_marker,
-)
 from cayu.runtime._terminal_finalization_lifetime import (
     InterruptedRunFinalization,
     InterruptionFinalization,
 )
 from cayu.runtime._tool_completion import recorded_terminal_tool_completion_payload
 from cayu.runtime.execution_profiles import event_with_execution_profile_fingerprint_authority
+from cayu.sessions._terminal_evidence import (
+    TERMINAL_EVIDENCE_EVENT_TYPES,
+    TERMINAL_EVIDENCE_QUERY_LIMIT,
+    classify_current_terminal_evidence,
+    interruption_request_id_from_payload,
+    require_interruption_event_matches_pending_marker,
+)
 from cayu.sessions.base import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
     EventOrder,
