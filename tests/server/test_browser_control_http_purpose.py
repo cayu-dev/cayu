@@ -11,10 +11,10 @@ from tests.core.test_browser_control_publisher import publication_fixture
 from tests.server.test_browser_control_server import transport
 
 from cayu import BrowserControlConfig, CayuApp
-from cayu.runtime._browser_control_checkpoint import browser_control_checkpoint_read_scope
 from cayu.runtime._browser_control_publisher import BrowserControlPublisher
 from cayu.server import ServerConfig, create_server
 from cayu.server.auth import BasicAuth
+from cayu.sessions._browser_control_checkpoint import browser_control_checkpoint_read_scope
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])

@@ -13,7 +13,6 @@ from cayu.runtime._browser_control_channel import (
     BrowserGuestCommandOwner,
     browser_allocation_digest,
 )
-from cayu.runtime._browser_control_checkpoint import BrowserControlCheckpointMutation
 from cayu.runtime._browser_control_publication import BrowserControlPublication
 from cayu.runtime._browser_control_service import (
     BrowserControlBootstrapPending,
@@ -21,6 +20,7 @@ from cayu.runtime._browser_control_service import (
     _BootstrapOwner,
 )
 from cayu.runtime._invocation_secrets import InvocationPublicationSnapshot
+from cayu.sessions._browser_control_checkpoint import BrowserControlCheckpointMutation
 from cayu.sessions.base import SessionStatus
 from cayu.tools.base import (
     ToolContext,

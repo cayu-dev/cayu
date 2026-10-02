@@ -12,10 +12,10 @@ from tests.core.test_browser_control_publisher import publication_fixture
 from cayu import BrowserControlConfig, BrowserOperatorPurpose, CayuApp
 from cayu.runtime._browser_control_authorization import BrowserControlPermissionDenied
 from cayu.runtime._browser_control_channel import browser_allocation_digest
-from cayu.runtime._browser_control_checkpoint import browser_control_checkpoint_read_scope
 from cayu.runtime._browser_control_coordinator import BrowserControlCoordinator
 from cayu.runtime._browser_control_model import browser_model_control_admission
 from cayu.runtime._browser_control_publisher import BrowserControlPublisher
+from cayu.sessions._browser_control_checkpoint import browser_control_checkpoint_read_scope
 from cayu.tools.browser_control import (
     BrowserControlAllocation,
     BrowserControlConflict,

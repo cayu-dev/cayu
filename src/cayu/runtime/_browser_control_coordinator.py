@@ -17,10 +17,6 @@ from cayu.runtime._browser_control_authorization import (
     BrowserControlRevisionChanged,
     authorize_browser_control,
 )
-from cayu.runtime._browser_control_checkpoint import (
-    BrowserControlCheckpointMutation,
-    browser_control_checkpoint_read_scope,
-)
 from cayu.runtime._browser_control_publication import (
     BrowserControlFencePublication,
     BrowserControlPublication,
@@ -30,6 +26,10 @@ from cayu.runtime._browser_control_publisher import BrowserControlPublisher
 from cayu.runtime._checkpoint_store import (
     load_runtime_session_checkpoint_snapshot,
     runtime_checkpoint_session_store,
+)
+from cayu.sessions._browser_control_checkpoint import (
+    BrowserControlCheckpointMutation,
+    browser_control_checkpoint_read_scope,
 )
 from cayu.sessions.base import SessionStatus, SessionStore
 from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY

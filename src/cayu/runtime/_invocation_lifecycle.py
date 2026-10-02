@@ -3243,7 +3243,7 @@ async def apply_invocation_lifecycle_command(
                 result_session=session,
             )
 
-        from cayu.runtime._browser_control_checkpoint import browser_control_checkpoint_read_scope
+        from cayu.sessions._browser_control_checkpoint import browser_control_checkpoint_read_scope
 
         try:
             # Admission hashes the complete source checkpoint, just like rebind.
@@ -3334,7 +3334,7 @@ async def apply_invocation_lifecycle_command(
                 result_session=session,
             )
 
-        from cayu.runtime._browser_control_checkpoint import browser_control_checkpoint_read_scope
+        from cayu.sessions._browser_control_checkpoint import browser_control_checkpoint_read_scope
 
         try:
             # This typed command compares the complete source checkpoint. Give

@@ -14,13 +14,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from cayu.runtime._browser_control_checkpoint import (
+from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
+from cayu.sessions._browser_control_checkpoint import (
     BrowserControlCheckpointMutation,
     browser_control_checkpoint_mutation_scope,
     browser_control_receipt,
     browser_control_receipt_key,
 )
-from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
 from cayu.sessions.base import (
     Session,
     SessionOperationPublication,

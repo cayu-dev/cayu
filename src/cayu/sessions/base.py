@@ -273,10 +273,6 @@ from cayu.messages import (
     copy_message,
     detach_message,
 )
-from cayu.runtime._browser_control_checkpoint import (
-    browser_control_checkpoint_visible,
-    project_browser_control_checkpoint,
-)
 from cayu.runtime._child_session_notifications import (
     CHILD_SESSION_ADMISSION_OCCURRENCE_TYPE,
     CHILD_SESSION_NOTIFICATION_OPERATION_KEY_PREFIX,
@@ -364,6 +360,10 @@ from cayu.runtime.session_message_lifecycle import (
 )
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.tool_completion import ToolCompletionPolicy, copy_tool_completion_policy
+from cayu.sessions._browser_control_checkpoint import (
+    browser_control_checkpoint_visible,
+    project_browser_control_checkpoint,
+)
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalDecision,
     InvocationTerminalOutcome,
@@ -29692,13 +29692,13 @@ def _reject_reserved_runtime_publication_key(
 ) -> str:
     from cayu.collaboration._session_export_store import require_operation_key_access
     from cayu.runtime._argument_continuity import require_private_key_access
-    from cayu.runtime._browser_control_checkpoint import require_browser_control_operation_owner
     from cayu.runtime._producer_output_store import (
         require_operation_key_access as require_producer_key_access,
     )
     from cayu.runtime._session_continuation_scope import (
         require_operation_key_access as require_continuation_key_access,
     )
+    from cayu.sessions._browser_control_checkpoint import require_browser_control_operation_owner
 
     value = require_clean_nonblank(value, field_name)
     require_operation_key_access(value, read=browser_control_read)
@@ -30273,10 +30273,10 @@ def _validate_invocation_release_settlement_receipt_authority(
 
 def _validate_session_operation_record_keys(records: Mapping[str, Any]) -> None:
     from cayu.collaboration._session_export_store import require_operation_record_owner
-    from cayu.runtime._browser_control_checkpoint import require_browser_control_operation_owner
     from cayu.runtime._session_continuation import (
         require_operation_record_owner as require_continuation_record_owner,
     )
+    from cayu.sessions._browser_control_checkpoint import require_browser_control_operation_owner
 
     for key in records:
         _reject_reserved_runtime_publication_key(key, "operation_records key")

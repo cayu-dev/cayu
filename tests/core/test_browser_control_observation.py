@@ -26,12 +26,12 @@ from cayu.evals.testing import ScriptedModelProvider
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime._browser_control_bootstrap import BrowserGuestBootstrap
-from cayu.runtime._browser_control_checkpoint import (
+from cayu.runtime._browser_control_publication import BrowserControlPublication
+from cayu.runtime._browser_control_service import BrowserControlService
+from cayu.sessions._browser_control_checkpoint import (
     BrowserControlCheckpointMutation,
     browser_control_checkpoint_read_scope,
 )
-from cayu.runtime._browser_control_publication import BrowserControlPublication
-from cayu.runtime._browser_control_service import BrowserControlService
 from cayu.sessions.base import InMemorySessionStore, RunRequest
 from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
 from cayu.sessions.outcomes import run_to_completion
@@ -92,7 +92,7 @@ def test_runtime_observation_atomically_releases_handback_fence(
             nonlocal publication_task
             observation = False
             if disconnect_race and not injected:
-                from cayu.runtime._browser_control_checkpoint import _MUTATION
+                from cayu.sessions._browser_control_checkpoint import _MUTATION
 
                 mutation = _MUTATION.get()
                 if mutation is not None and any(

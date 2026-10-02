@@ -42029,5 +42029,13 @@
     "tests/core/test_checkpoint_evidence_contracts.py::test_session_evidence_imports_without_runtime[_model_completion_publication]": 0.10715479287318885,
     "tests/core/test_checkpoint_evidence_contracts.py::test_session_evidence_imports_without_runtime[_provider_operation_cancellation_claim]": 0.09802545816637576,
     "tests/core/test_checkpoint_evidence_contracts.py::test_session_evidence_imports_without_runtime[_terminal_evidence]": 0.10262808273546398,
-    "tests/core/test_checkpoint_evidence_contracts.py::test_session_evidence_imports_without_runtime[checkpoints]": 0.10828287596814334
+    "tests/core/test_checkpoint_evidence_contracts.py::test_session_evidence_imports_without_runtime[checkpoints]": 0.10828287596814334,
+    "tests/core/test_browser_checkpoint_authority.py::test_browser_checkpoint_rules_import_and_operate_without_runtime": 0.16354154096916318,
+    "tests/core/test_browser_checkpoint_authority.py::test_browser_mutation_scope_is_shared_and_restored_across_import_paths[canonical]": 0.0022597908973693848,
+    "tests/core/test_browser_checkpoint_authority.py::test_browser_mutation_scope_is_shared_and_restored_across_import_paths[legacy]": 0.002063957741484046,
+    "tests/core/test_browser_checkpoint_authority.py::test_browser_read_scope_is_shared_and_restored_across_import_paths[canonical]": 0.0002400816883891821,
+    "tests/core/test_browser_checkpoint_authority.py::test_browser_read_scope_is_shared_and_restored_across_import_paths[legacy]": 0.00017612474039196968,
+    "tests/core/test_browser_checkpoint_authority.py::test_legacy_browser_checkpoint_aliases_share_types_and_scope_state": 0.00028729112818837166,
+    "tests/core/test_browser_checkpoint_authority.py::test_old_pickled_browser_mutations_retain_exact_authority[close]": 0.0017057918012142181,
+    "tests/core/test_browser_checkpoint_authority.py::test_old_pickled_browser_mutations_retain_exact_authority[mutation]": 0.00197350000962615
 }

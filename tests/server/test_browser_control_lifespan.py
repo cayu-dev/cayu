@@ -14,10 +14,10 @@ from websockets.asyncio.client import connect
 from websockets.typing import Origin, Subprotocol
 
 from cayu import BrowserControlConfig, CayuApp
-from cayu.runtime._browser_control_checkpoint import browser_control_checkpoint_read_scope
 from cayu.runtime._browser_control_publisher import BrowserControlPublisher
 from cayu.server import ServerConfig, create_server
 from cayu.server.auth import BasicAuth
+from cayu.sessions._browser_control_checkpoint import browser_control_checkpoint_read_scope
 
 control_tls = _control_tls
 

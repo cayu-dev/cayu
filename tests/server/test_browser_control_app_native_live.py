@@ -36,7 +36,6 @@ from cayu.evals.testing import ScriptedModelProvider
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runners.base import ExecResult, Runner
-from cayu.runtime._browser_control_checkpoint import browser_control_checkpoint_read_scope
 from cayu.server import (
     BasicAuth,
     BrowserControlServerConfig,
@@ -44,6 +43,7 @@ from cayu.server import (
     ServerConfig,
     create_server,
 )
+from cayu.sessions._browser_control_checkpoint import browser_control_checkpoint_read_scope
 from cayu.sessions.base import InMemorySessionStore, RunRequest
 from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
 from cayu.sessions.outcomes import run_to_completion

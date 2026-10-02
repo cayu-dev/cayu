@@ -13,10 +13,10 @@ from tests.core.test_browser_control_coordinator import coordinator, intent_for
 from tests.core.test_browser_control_publisher import publication_fixture
 
 from cayu import SQLiteSessionStore
-from cayu.runtime._browser_control_checkpoint import browser_control_checkpoint_read_scope
 from cayu.runtime._browser_control_model import browser_model_control_admission
 from cayu.runtime._browser_control_publisher import BrowserControlPublisher
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
+from cayu.sessions._browser_control_checkpoint import browser_control_checkpoint_read_scope
 from cayu.tools.browser_control import (
     BrowserControlAllocation,
     BrowserControlConflict,

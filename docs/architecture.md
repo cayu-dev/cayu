@@ -297,6 +297,14 @@ storage, and runtime. These components can be imported without loading runtime.
 Runtime retains execution, recovery, and publication orchestration; its former
 evidence module paths forward to the session owners for compatibility.
 
+`sessions/_browser_control_checkpoint.py` owns browser-control checkpoint
+visibility, exact mutation and close authority, protected-root projection, and
+receipt validation. Runtime publishers and store guards share its read and
+mutation scopes. The former runtime path forwards to the same definitions and
+scope state. Operator authentication, browser I/O, invocation admission and
+publication orchestration remain with their existing owners; the checkpoint
+rules can operate independently of runtime.
+
 ## Multi-Agent Shape
 
 Cayu must support systems where multiple agents collaborate through shared state.

@@ -20,15 +20,15 @@ from tests.core.test_browser_control_transport import control_tls as _control_tl
 from tests.core.test_browser_session import _interactive_request
 from tests.server._browser_control_tls_server import browser_control_tls_server
 
-from cayu.runtime._browser_control_checkpoint import (
-    BrowserControlCheckpointMutation,
-    browser_control_checkpoint_read_scope,
-)
 from cayu.runtime._browser_control_model import browser_model_control_admission
 from cayu.runtime._browser_control_publication import BrowserControlPublication
 from cayu.runtime._browser_control_publisher import BrowserControlPublisher
 from cayu.runtime._browser_control_service import BrowserControlService
 from cayu.server._browser_guest_routes import _GuestSocket, create_browser_guest_router
+from cayu.sessions._browser_control_checkpoint import (
+    BrowserControlCheckpointMutation,
+    browser_control_checkpoint_read_scope,
+)
 from cayu.tools import _browser_guest
 from cayu.tools._browser_control_guest import GuestControlChannel, GuestControlFence
 from cayu.tools._browser_control_transport import open_guest_control_channel

@@ -3,7 +3,7 @@
 import pytest
 from tests.core.test_browser_control import identity
 
-from cayu.runtime._browser_control_checkpoint import (
+from cayu.sessions._browser_control_checkpoint import (
     BrowserControlCheckpointMutation,
     BrowserControlCloseCheckpointMutation,
     browser_control_checkpoint_mutation_scope,

@@ -133,10 +133,6 @@ from cayu.runtime import _web_access_results as web_access_results
 from cayu.runtime._auxiliary_inference import AuxiliaryInferenceOwner
 from cayu.runtime._auxiliary_invocation import AuxiliaryInvocationPolicy
 from cayu.runtime._browser_control_bootstrap import BrowserGuestBootstrap
-from cayu.runtime._browser_control_checkpoint import (
-    browser_control_checkpoint_mutation_scope,
-    browser_control_checkpoint_read_scope,
-)
 from cayu.runtime._browser_control_model import (
     browser_model_control_admission,
     browser_terminal_checkpoint_mutation,
@@ -225,6 +221,10 @@ from cayu.runtime.mcp_manifest_policy import (
 from cayu.runtime.public_authority import parse_public_authority_alias
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
+from cayu.sessions._browser_control_checkpoint import (
+    browser_control_checkpoint_mutation_scope,
+    browser_control_checkpoint_read_scope,
+)
 from cayu.sessions.base import (
     _MCP_MANIFEST_BASELINE_MAX_TOOLS,
     INHERIT_INTERACTION,

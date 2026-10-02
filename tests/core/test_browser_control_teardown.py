@@ -7,12 +7,12 @@ from tests.core.test_browser_control_authorization import Policy
 from tests.core.test_browser_control_coordinator import coordinator, intent_for
 from tests.core.test_browser_control_publisher import publication_fixture
 
-from cayu.runtime._browser_control_checkpoint import BrowserControlCheckpointMutation
 from cayu.runtime._browser_control_publication import (
     BrowserControlFencePublication,
     BrowserControlPublication,
 )
 from cayu.runtime._browser_control_publisher import BrowserControlPublisher
+from cayu.sessions._browser_control_checkpoint import BrowserControlCheckpointMutation
 from cayu.sessions.base import SessionStatus
 from cayu.tools.browser_control import (
     BrowserControlConflict,

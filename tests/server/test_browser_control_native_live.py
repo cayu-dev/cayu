@@ -27,7 +27,6 @@ from cayu.runtime._browser_control_channel import (
     bind_browser_guest_channel,
     browser_allocation_digest,
 )
-from cayu.runtime._browser_control_checkpoint import browser_control_checkpoint_read_scope
 from cayu.runtime._browser_control_input_tickets import BrowserInputTickets
 from cayu.runtime._browser_control_model import browser_model_control_admission
 from cayu.runtime._browser_control_service import BrowserControlService, _BootstrapOwner
@@ -43,6 +42,7 @@ from cayu.server._browser_input_routes import (
 )
 from cayu.server._browser_viewer_routes import create_browser_viewer_router
 from cayu.server.auth import BasicAuth
+from cayu.sessions._browser_control_checkpoint import browser_control_checkpoint_read_scope
 from cayu.tools._browser_control_guest import GuestControlChannel, GuestControlFence
 from cayu.tools._browser_control_transport import CONTROL_SUBPROTOCOL, open_guest_control_channel
 from cayu.tools._browser_guest import _GuestFailure, _InteractiveDaemon, _InteractivePage

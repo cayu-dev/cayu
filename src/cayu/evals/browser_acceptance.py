@@ -931,7 +931,7 @@ async def _case_operator_evidence(
 ) -> BrowserAcceptanceOperatorEvidenceV1 | None:
     if "required_operator_inputs" not in case.oracle_parameters:
         return None
-    from cayu.runtime._browser_control_checkpoint import browser_control_checkpoint_read_scope
+    from cayu.sessions._browser_control_checkpoint import browser_control_checkpoint_read_scope
     from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
     from cayu.tools.browser_control import BrowserControlCheckpoint
 

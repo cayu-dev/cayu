@@ -15,14 +15,14 @@ from tests.core._execution_profile_fixtures import create_admitted_session
 
 from cayu import RunRequest, SQLiteSessionStore
 from cayu._validation import MAX_PORTABLE_JSON_INTEGER
-from cayu.runtime._browser_control_checkpoint import (
+from cayu.runtime._browser_control_model import validate_browser_model_publication
+from cayu.runtime._browser_control_publication import BrowserControlPublication
+from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
+from cayu.sessions._browser_control_checkpoint import (
     BrowserControlCheckpointMutation,
     browser_control_checkpoint_mutation_scope,
     browser_control_checkpoint_read_scope,
 )
-from cayu.runtime._browser_control_model import validate_browser_model_publication
-from cayu.runtime._browser_control_publication import BrowserControlPublication
-from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.sessions.base import InMemorySessionStore, SessionIdentity, SessionOperationPublication
 from cayu.sessions.checkpoints import (
     BROWSER_CONTROLS_CHECKPOINT_KEY,

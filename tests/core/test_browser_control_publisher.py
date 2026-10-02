@@ -11,13 +11,13 @@ from tests.core._execution_profile_fixtures import create_admitted_session
 from tests.core.test_browser_control import identity
 
 from cayu import RunRequest, SQLiteSessionStore
-from cayu.runtime._browser_control_checkpoint import BrowserControlCheckpointMutation
 from cayu.runtime._browser_control_publication import BrowserControlPublication
 from cayu.runtime._browser_control_publisher import (
     BrowserControlPublicationPending,
     BrowserControlPublisher,
 )
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
+from cayu.sessions._browser_control_checkpoint import BrowserControlCheckpointMutation
 from cayu.sessions.base import InMemorySessionStore, SessionOperationPublication
 from cayu.tools.browser_control import (
     BrowserControlCheckpoint,
