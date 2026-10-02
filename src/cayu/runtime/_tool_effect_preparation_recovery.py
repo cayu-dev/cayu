@@ -8,6 +8,10 @@ from cayu._validation import canonical_durable_json_bytes
 from cayu.approvals.tools import PendingToolApproval
 from cayu.approvals.user_input import PendingUserInput
 from cayu.events import Event, EventType
+from cayu.execution_profiles import (
+    ExecutionProfileIdentity,
+    event_with_execution_profile_authority,
+)
 from cayu.runtime._approval_support import tool_call_request_from_pending
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._tool_argument_publication import unavailable_argument_projection
@@ -22,10 +26,6 @@ from cayu.runtime._tool_round_executor import (
 )
 from cayu.runtime._tool_round_recovery import PendingToolRound
 from cayu.runtime._tool_round_staging import _event_with_tool_round_authority
-from cayu.runtime.execution_profiles import (
-    ExecutionProfileIdentity,
-    event_with_execution_profile_authority,
-)
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.tool_effects import ToolEffectConflict
 from cayu.sessions.base import Session, SessionStore

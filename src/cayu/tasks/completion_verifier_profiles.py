@@ -17,17 +17,17 @@ from cayu._validation import (
     revalidate_model_inputs,
 )
 from cayu.approvals.tools import ResolutionActor, copy_resolution_actor
-from cayu.runtime.execution_identity import (
-    ExecutionProfileBehaviorIdentity,
-    copy_execution_profile_behavior_identity,
-)
-from cayu.runtime.execution_profiles import (
+from cayu.execution_profiles import (
     EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS,
     ExecutionProfileAdoptionIntent,
     ExecutionProfileAuthorityDecision,
     ExecutionProfileIdentityStrength,
     ExecutionProfilePolicyResult,
     copy_execution_profile_adoption_intent,
+)
+from cayu.runtime.execution_identity import (
+    ExecutionProfileBehaviorIdentity,
+    copy_execution_profile_behavior_identity,
 )
 from cayu.tasks.contracts import (
     CompletionVerifierRef,

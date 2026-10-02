@@ -25,6 +25,9 @@ from cayu.events import (
     event_with_runtime_generated_id,
     event_with_runtime_payload_authority,
 )
+from cayu.execution_profiles import (
+    event_with_execution_profile_fingerprint_authority,
+)
 from cayu.providers.operations import (
     ProviderOperationAdapter,
     ProviderOperationCancellationSupport,
@@ -43,7 +46,6 @@ from cayu.runtime._model_execution_selection import ModelExecutionSelection
 from cayu.runtime._model_failover_stage import model_failover_target_for_stored_stage
 from cayu.runtime._run_limits import RunLimitController
 from cayu.runtime._session_control import SessionInterruptedByRequest
-from cayu.runtime.execution_profiles import event_with_execution_profile_fingerprint_authority
 from cayu.runtime.execution_units import ModelAttemptIdentity
 from cayu.runtime.provider_operation_cancellation import (
     ProviderOperationCancellationAdmissionsSealed,

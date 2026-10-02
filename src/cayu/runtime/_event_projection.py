@@ -5113,7 +5113,9 @@ def _restore_publication_safe_execution_profile_decision(
     }.intersection(event.payload):
         return
 
-    from cayu.runtime.execution_profiles import ExecutionProfileDecision
+    from cayu.execution_profiles import (
+        ExecutionProfileDecision,
+    )
 
     payload = event.payload
     try:

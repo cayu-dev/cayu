@@ -236,6 +236,27 @@ from cayu.exceptions import (
     _is_runtime_interaction_lifecycle_publication_rejection,
     _runtime_interaction_lifecycle_publication_rejected,
 )
+from cayu.execution_profiles import (
+    ExecutionProfileAdoptionIntent,
+    ExecutionProfileAuthorityDecision,
+    ExecutionProfileComponentClass,
+    ExecutionProfileDecision,
+    ExecutionProfileDecisionKind,
+    ExecutionProfileIdentity,
+    ExecutionProfilePolicyAction,
+    ExecutionProfilePolicyRequest,
+    ExecutionProfilePolicyResult,
+    changed_execution_profile_components,
+    copy_execution_profile_policy_result,
+    event_with_execution_profile_authority,
+    execution_profile_changes_authority,
+    execution_profile_decision_payload,
+    execution_profile_egress_authority_change,
+    execution_profile_with_component,
+    execution_profile_with_tool_capability_ceiling,
+    inherited_execution_profile_component_changes,
+    unavailable_execution_profile_components,
+)
 from cayu.failure_evidence import FailureEvidence, exception_evidence
 from cayu.messages import (
     Message,
@@ -526,41 +547,13 @@ from cayu.runtime._workflow_structured_output_handoff import (
 from cayu.runtime.build_provenance import current_runtime_build_provenance
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import (
-    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
-    EXECUTION_PROFILE_METADATA_KEY,
-    ActiveInvocationExecutionProfile,
-    ExecutionProfileAdoptionIntent,
     ExecutionProfileAdoptionRejected,
-    ExecutionProfileAuthorityDecision,
-    ExecutionProfileComponentClass,
-    ExecutionProfileDecision,
-    ExecutionProfileDecisionKind,
-    ExecutionProfileIdentity,
     ExecutionProfileMigrationRequired,
     ExecutionProfileMismatchError,
     ExecutionProfilePolicy,
-    ExecutionProfilePolicyAction,
     ExecutionProfilePolicyError,
-    ExecutionProfilePolicyRequest,
-    ExecutionProfilePolicyResult,
     _ExecutionProfileAdmissionRequestRejected,
     _with_runtime_execution_profile_decision_authority,
-    active_invocation_execution_profile_from_checkpoint,
-    active_invocation_execution_profile_is_released,
-    active_invocation_execution_profile_matches_session_epoch,
-    changed_execution_profile_components,
-    checkpoint_with_active_invocation_execution_profile,
-    copy_execution_profile_policy_result,
-    event_with_execution_profile_authority,
-    execution_profile_changes_authority,
-    execution_profile_decision_payload,
-    execution_profile_egress_authority_change,
-    execution_profile_from_session_metadata,
-    execution_profile_session_metadata,
-    execution_profile_with_component,
-    execution_profile_with_tool_capability_ceiling,
-    inherited_execution_profile_component_changes,
-    unavailable_execution_profile_components,
 )
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
@@ -616,6 +609,16 @@ from cayu.runtime.tool_completion import (
 from cayu.runtime.work_attempt_semantics import WorkAttemptRunSemantics
 from cayu.runtime.work_attempt_source import WorkAttemptSourceRequest, work_attempt_source_digest
 from cayu.sessions import _model_completion_publication as model_completion_publication
+from cayu.sessions._execution_profile_checkpoint import (
+    EXECUTION_PROFILE_METADATA_KEY,
+    ActiveInvocationExecutionProfile,
+    active_invocation_execution_profile_from_checkpoint,
+    active_invocation_execution_profile_is_released,
+    active_invocation_execution_profile_matches_session_epoch,
+    checkpoint_with_active_invocation_execution_profile,
+    execution_profile_from_session_metadata,
+    execution_profile_session_metadata,
+)
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalDecision,
     InvocationTerminalOutcome,
@@ -774,6 +777,7 @@ from cayu.sessions.base import (
     validate_profiled_fork_evidence,
 )
 from cayu.sessions.checkpoints import (
+    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
     COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,

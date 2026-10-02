@@ -10,8 +10,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from cayu.events import Event, EventType
-from cayu.runtime.execution_profiles import (
+from cayu.execution_profiles import (
     ExecutionProfileIdentity,
+)
+from cayu.sessions._execution_profile_checkpoint import (
     execution_profile_from_session_metadata,
 )
 from cayu.sessions._model_completion_publication import (

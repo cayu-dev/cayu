@@ -29,7 +29,9 @@ from cayu.sessions.creation_fence import SessionCreationTarget
 
 if TYPE_CHECKING:
     from cayu.budgets.binding import BudgetBinding
-    from cayu.runtime.execution_profiles import ExecutionProfileIdentity
+    from cayu.execution_profiles import (
+        ExecutionProfileIdentity,
+    )
     from cayu.vaults.redaction import SecretRedactor
 
 MAX_PREPARED_PROFILE_BYTES = 16 * 1024
@@ -88,7 +90,9 @@ def _snapshot_document(value: str, *, max_bytes: int) -> dict[str, Any]:
 
 def prepared_profile(value: str) -> ExecutionProfileIdentity:
     """Reconstruct identity data using the existing profile validator, not authority."""
-    from cayu.runtime.execution_profiles import ExecutionProfileIdentity
+    from cayu.execution_profiles import (
+        ExecutionProfileIdentity,
+    )
 
     document = _snapshot_document(value, max_bytes=MAX_PREPARED_PROFILE_BYTES)
     profile = None

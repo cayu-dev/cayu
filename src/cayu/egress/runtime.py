@@ -130,6 +130,9 @@ from cayu.environments.factory import (
     environment_factory_cleanup_settlement_tasks,
 )
 from cayu.events import Event, EventType
+from cayu.execution_profiles import (
+    event_with_execution_profile_fingerprint_authority,
+)
 from cayu.knowledge.scopes import KnowledgeAccessScope
 from cayu.runners._subprocess import (
     copy_runner_env,
@@ -168,9 +171,6 @@ from cayu.runtime._binding_cleanup import (
 from cayu.runtime.execution_identity import (
     ExecutionProfileBehaviorIdentity,
     copy_execution_profile_behavior_identity,
-)
-from cayu.runtime.execution_profiles import (
-    event_with_execution_profile_fingerprint_authority,
 )
 from cayu.sessions.base import _current_session_interaction_id
 from cayu.storage.memory import (

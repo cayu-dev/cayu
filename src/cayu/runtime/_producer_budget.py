@@ -11,7 +11,9 @@ from cayu.collaboration._preparation import contract_bytes, prepare_contract, re
 from cayu.collaboration._producer_contracts import ProducerNativeFailure, ProducerOutputRegistration
 from cayu.collaboration.prepared_admission import NativeCommitment, prepared_budget
 from cayu.events import EventType
-from cayu.runtime.execution_profiles import ExecutionProfileIdentity
+from cayu.execution_profiles import (
+    ExecutionProfileIdentity,
+)
 from cayu.sessions.base import EventQuery
 from cayu.vaults.redaction import SecretRedactor
 

@@ -42,6 +42,17 @@ from cayu.events import (
     copy_event,
     event_envelope_authority_is_runtime_generated,
 )
+from cayu.execution_profiles import (
+    ExecutionProfileComponentClass,
+    ExecutionProfileDecision,
+    ExecutionProfileDecisionKind,
+    ExecutionProfileIdentity,
+    changed_execution_profile_components,
+    direct_tool_capability_ceiling_component,
+    execution_profile_changes_authority,
+    execution_profile_provider_target_component,
+    execution_profile_runtime_component,
+)
 from cayu.messages import Message, detach_message
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._durable_operation_ownership import DurableOperationOwnership
@@ -51,25 +62,15 @@ from cayu.runtime.build_provenance import (
     copy_runtime_build_provenance,
     legacy_runtime_build_provenance,
 )
-from cayu.runtime.execution_profiles import (
-    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
-    ActiveInvocationExecutionProfile,
-    ExecutionProfileComponentClass,
-    ExecutionProfileDecision,
-    ExecutionProfileDecisionKind,
-    ExecutionProfileIdentity,
-    active_invocation_execution_profile_from_checkpoint,
-    changed_execution_profile_components,
-    checkpoint_with_active_invocation_execution_profile,
-    direct_tool_capability_ceiling_component,
-    execution_profile_baseline_from_session_metadata,
-    execution_profile_changes_authority,
-    execution_profile_from_session_metadata,
-    execution_profile_provider_target_component,
-    execution_profile_runtime_component,
-)
 from cayu.runtime.invocation_release import InvocationReleaseEvidence
 from cayu.runtime.loop_policies import LoopPolicy
+from cayu.sessions._execution_profile_checkpoint import (
+    ActiveInvocationExecutionProfile,
+    active_invocation_execution_profile_from_checkpoint,
+    checkpoint_with_active_invocation_execution_profile,
+    execution_profile_baseline_from_session_metadata,
+    execution_profile_from_session_metadata,
+)
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalOutcome,
     invocation_terminal_decision_from_checkpoint,
@@ -106,6 +107,7 @@ from cayu.sessions.base import (
     session_user_metadata,
 )
 from cayu.sessions.checkpoints import (
+    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_LEDGER_RECORD_TYPE,

@@ -22,6 +22,14 @@ from cayu._task_wait import (
 from cayu._validation import require_durable_clean_nonblank, revalidate_model_input
 from cayu.approvals.tools import ResolutionActor
 from cayu.deadlines import ExecutionDeadline, effective_deadline
+from cayu.execution_profiles import (
+    EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS,
+    ExecutionProfileAdoptionIntent,
+    ExecutionProfileAuthorityDecision,
+    ExecutionProfilePolicyAction,
+    ExecutionProfilePolicyResult,
+    copy_execution_profile_policy_result,
+)
 from cayu.runtime._diagnostics import (
     MAX_DIAGNOSTIC_UTF8_BYTES,
     credential_safe_runtime_exception,
@@ -36,14 +44,6 @@ from cayu.runtime._task_store_operation_boundary import (
     capture_sensitive_validation,
     capture_task_store_operation,
     raise_task_store_operation_failure,
-)
-from cayu.runtime.execution_profiles import (
-    EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS,
-    ExecutionProfileAdoptionIntent,
-    ExecutionProfileAuthorityDecision,
-    ExecutionProfilePolicyAction,
-    ExecutionProfilePolicyResult,
-    copy_execution_profile_policy_result,
 )
 from cayu.tasks._verified_work_authority import (
     completion_decision_claim_authority_matches,

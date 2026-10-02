@@ -182,6 +182,11 @@ from cayu.events import (
     EventType,
     event_with_runtime_payload_authority,
 )
+from cayu.execution_profiles import (
+    ExecutionProfileDecision,
+    ExecutionProfileIdentity,
+    ExecutionProfileRejectionResult,
+)
 from cayu.knowledge.activation_contracts import (
     KnowledgeActivationAuthority,
     KnowledgeActivationConflict,
@@ -338,12 +343,6 @@ from cayu.runtime._task_admission_wakeup import TaskAdmissionWakeup
 from cayu.runtime._task_lease_authority import managed_task_lease_mutation
 from cayu.runtime.authority import CheckpointValueAuthority
 from cayu.runtime.evidence_spool import EvidenceSpool
-from cayu.runtime.execution_profiles import (
-    ActiveInvocationExecutionProfile,
-    ExecutionProfileDecision,
-    ExecutionProfileIdentity,
-    ExecutionProfileRejectionResult,
-)
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     ToolRoundIdentity,
@@ -372,6 +371,9 @@ from cayu.runtime.local_execution_attempts import (
 )
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, parse_public_authority_alias
 from cayu.runtime.service_manifest import RuntimeStoreDurability
+from cayu.sessions._execution_profile_checkpoint import (
+    ActiveInvocationExecutionProfile,
+)
 from cayu.sessions._invocation_terminal_decision import InvocationTerminalDecision
 from cayu.sessions._provider_operation_cancellation_claim import (
     active_provider_operation_cancellation_claim_from_checkpoint,

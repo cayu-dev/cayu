@@ -97,6 +97,11 @@ from cayu.events import (
     event_with_runtime_payload_authority,
     validate_event_envelope,
 )
+from cayu.execution_profiles import (
+    EXECUTION_PROFILE_FINGERPRINT_FIELD,
+    ExecutionProfileIdentity,
+    event_with_execution_profile_authority,
+)
 from cayu.knowledge._publication import KnowledgePublicationScope
 from cayu.mcp.tools import McpToolAdapter, McpToolset
 from cayu.messages import Message
@@ -201,12 +206,6 @@ from cayu.runtime._tool_round_staging import (
     _tool_terminal_payload_limits,
     _validate_and_synchronize_tool_result_event,
 )
-from cayu.runtime.execution_profiles import (
-    EXECUTION_PROFILE_FINGERPRINT_FIELD,
-    ExecutionProfileIdentity,
-    active_invocation_execution_profile_from_checkpoint,
-    event_with_execution_profile_authority,
-)
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     ToolRoundIdentity,
@@ -225,6 +224,9 @@ from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.sessions._browser_control_checkpoint import (
     browser_control_checkpoint_mutation_scope,
     browser_control_checkpoint_read_scope,
+)
+from cayu.sessions._execution_profile_checkpoint import (
+    active_invocation_execution_profile_from_checkpoint,
 )
 from cayu.sessions.base import (
     _MCP_MANIFEST_BASELINE_MAX_TOOLS,

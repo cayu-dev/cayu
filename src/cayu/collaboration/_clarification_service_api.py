@@ -138,7 +138,9 @@ async def service_clarification(
     )
     from cayu.runtime._session_continuation_owner import LATCH_FAMILY, SessionContinuationOwner
     from cayu.runtime._temporary_continuation_permits import TemporaryServicePermitAuthority
-    from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
+    from cayu.sessions._execution_profile_checkpoint import (
+        active_invocation_execution_profile_from_checkpoint,
+    )
     from cayu.sessions.base import ResumeRequest
 
     requests = coordinator.requests

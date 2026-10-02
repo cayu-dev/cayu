@@ -111,6 +111,9 @@ from cayu.events import (
     event_with_runtime_payload_authority,
 )
 from cayu.exceptions import TerminalEventPublicationUncertain
+from cayu.execution_profiles import (
+    ExecutionProfileAdoptionIntent,
+)
 from cayu.knowledge.activation_contracts import KnowledgeActivationConflict, KnowledgeReviewApproval
 from cayu.knowledge.records import (
     MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES,
@@ -139,7 +142,6 @@ from cayu.runtime.event_side_effect_health import (
 from cayu.runtime.event_side_effect_health import (
     cursor_key as event_side_effect_cursor_key,
 )
-from cayu.runtime.execution_profiles import ExecutionProfileAdoptionIntent
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.provider_operations import (
     ProviderOperationResolutionAction,

@@ -46,7 +46,9 @@ from cayu.storage.targets import require_sqlite_store_allowed
 
 if TYPE_CHECKING:
     from cayu.evals.models import Trajectory
-    from cayu.runtime.execution_profiles import ExecutionProfileIdentity
+    from cayu.execution_profiles import (
+        ExecutionProfileIdentity,
+    )
     from cayu.runtime.manifest import AppManifest
     from cayu.workspaces.revisions import WorkspaceRevisionObservation
 
@@ -1660,7 +1662,9 @@ def execution_profile_snapshot_ref(
 ) -> AgentSnapshotExecutionProfileRef:
     """Project Cayu's existing redacted execution profile into snapshot form."""
 
-    from cayu.runtime.execution_profiles import ExecutionProfileIdentity
+    from cayu.execution_profiles import (
+        ExecutionProfileIdentity,
+    )
 
     if type(profile) is not ExecutionProfileIdentity:
         raise TypeError("profile must be an exact ExecutionProfileIdentity.")

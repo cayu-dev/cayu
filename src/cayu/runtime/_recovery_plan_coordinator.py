@@ -58,10 +58,12 @@ from cayu.runtime._tool_effect_preparation_recovery import requires_explicit_eff
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
 from cayu.runtime.execution_profiles import (
     ExecutionProfileMismatchError,
+)
+from cayu.runtime.provider_operations import RecoverableProviderOperation
+from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
     execution_profile_from_session_metadata,
 )
-from cayu.runtime.provider_operations import RecoverableProviderOperation
 from cayu.sessions.base import (
     PENDING_ACTION_EVENT_TYPE_VALUES,
     EventOrder,

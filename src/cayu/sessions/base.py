@@ -236,6 +236,25 @@ from cayu.events import (
     event_with_runtime_payload_authority,
     validate_event_envelope,
 )
+from cayu.execution_profiles import (
+    EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS,
+    EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS,
+    ExecutionProfileAdoptionIntent,
+    ExecutionProfileAuthorityDecision,
+    ExecutionProfileComponentClass,
+    ExecutionProfileDecision,
+    ExecutionProfileDecisionKind,
+    ExecutionProfileIdentity,
+    ExecutionProfileRejectionResult,
+    changed_execution_profile_components,
+    copy_execution_profile_adoption_intent,
+    copy_execution_profile_decision,
+    direct_tool_capability_ceiling_component,
+    execution_profile_changes_authority,
+    execution_profile_provider_target_component,
+    execution_profile_runtime_component,
+    inherited_execution_profile_component_changes,
+)
 from cayu.memory.evidence import (
     MAX_RECALL_RECEIPT_ITEMS,
     ContextExposure,
@@ -302,36 +321,6 @@ from cayu.runtime.build_provenance import (
     legacy_runtime_build_provenance,
     runtime_build_provenance_identity,
 )
-from cayu.runtime.execution_profiles import (
-    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
-    EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS,
-    EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS,
-    EXECUTION_PROFILE_METADATA_KEY,
-    ActiveInvocationExecutionProfile,
-    ExecutionProfileAdoptionIntent,
-    ExecutionProfileAuthorityDecision,
-    ExecutionProfileComponentClass,
-    ExecutionProfileDecision,
-    ExecutionProfileDecisionKind,
-    ExecutionProfileIdentity,
-    ExecutionProfileRejectionResult,
-    active_invocation_execution_profile_from_checkpoint,
-    active_invocation_execution_profile_is_released,
-    active_invocation_execution_profile_matches_session_epoch,
-    changed_execution_profile_components,
-    checkpoint_with_active_invocation_execution_profile,
-    copy_execution_profile_adoption_intent,
-    copy_execution_profile_decision,
-    direct_tool_capability_ceiling_component,
-    execution_profile_baseline_from_session_metadata,
-    execution_profile_changes_authority,
-    execution_profile_from_session_metadata,
-    execution_profile_metadata_after_adoption,
-    execution_profile_provider_target_component,
-    execution_profile_runtime_component,
-    execution_profile_session_metadata,
-    inherited_execution_profile_component_changes,
-)
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     ToolRoundIdentity,
@@ -363,6 +352,18 @@ from cayu.runtime.tool_completion import ToolCompletionPolicy, copy_tool_complet
 from cayu.sessions._browser_control_checkpoint import (
     browser_control_checkpoint_visible,
     project_browser_control_checkpoint,
+)
+from cayu.sessions._execution_profile_checkpoint import (
+    EXECUTION_PROFILE_METADATA_KEY,
+    ActiveInvocationExecutionProfile,
+    active_invocation_execution_profile_from_checkpoint,
+    active_invocation_execution_profile_is_released,
+    active_invocation_execution_profile_matches_session_epoch,
+    checkpoint_with_active_invocation_execution_profile,
+    execution_profile_baseline_from_session_metadata,
+    execution_profile_from_session_metadata,
+    execution_profile_metadata_after_adoption,
+    execution_profile_session_metadata,
 )
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalDecision,
@@ -403,6 +404,7 @@ from cayu.sessions._terminal_evidence import (
     classify_current_terminal_evidence,
 )
 from cayu.sessions.checkpoints import (
+    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     BROWSER_CONTROLS_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
     COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
@@ -31745,7 +31747,9 @@ def _model_failover_selection_event(
     admission = prepared.failover_admission
     if admission is None or admission.transition not in {"initial", "fallback"}:
         return None
-    from cayu.runtime.execution_profiles import event_with_execution_profile_authority
+    from cayu.execution_profiles import (
+        event_with_execution_profile_authority,
+    )
 
     progress = admission.successor
     target = progress.plan.candidates[progress.candidate_index]

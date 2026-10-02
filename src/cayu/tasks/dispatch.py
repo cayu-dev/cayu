@@ -44,6 +44,11 @@ from cayu.context.structured_output import (
 )
 from cayu.context.thinking import ThinkingConfig
 from cayu.events import Event, EventType
+from cayu.execution_profiles import (
+    ExecutionProfileAdoptionIntent,
+    ExecutionProfileIdentity,
+    copy_execution_profile_adoption_intent,
+)
 from cayu.messages import Message, detach_message
 from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.runtime._diagnostics import ExceptionDiagnostic
@@ -75,11 +80,8 @@ from cayu.runtime.application_lifecycle import (
     ApplicationLifecycleState,
 )
 from cayu.runtime.execution_profiles import (
-    ExecutionProfileAdoptionIntent,
-    ExecutionProfileIdentity,
     ExecutionProfileMismatchError,
     _ExecutionProfileAdmissionRequestRejected,
-    copy_execution_profile_adoption_intent,
 )
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy

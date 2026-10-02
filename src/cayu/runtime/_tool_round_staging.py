@@ -33,6 +33,11 @@ from cayu.events import (
     event_with_runtime_nested_payload_authority,
     event_with_runtime_payload_authority,
 )
+from cayu.execution_profiles import (
+    EXECUTION_PROFILE_FINGERPRINT_FIELD,
+    ExecutionProfileIdentity,
+    event_with_execution_profile_fingerprint_authority,
+)
 from cayu.failure_evidence import FailureEvidence
 from cayu.mcp.tools import McpToolAdapter
 from cayu.observability.hooks import RuntimeHookPhase, _runtime_hook_supports_phase
@@ -52,11 +57,6 @@ from cayu.runtime._tool_effect_state import (
     ToolEffectStateOwner,
     ToolEffectTerminal,
     is_command_policy_refusal_terminal,
-)
-from cayu.runtime.execution_profiles import (
-    EXECUTION_PROFILE_FINGERPRINT_FIELD,
-    ExecutionProfileIdentity,
-    event_with_execution_profile_fingerprint_authority,
 )
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.sessions.base import Session, SessionStore, runtime_publication_checkpoint_mutation

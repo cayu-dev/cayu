@@ -27,7 +27,9 @@ from cayu.collaboration.participants import CollaborationUnavailable
 from cayu.collaboration.prepared_admission import FreshRecipientAdmissionTarget
 from cayu.collaboration.request_access import RequestReceivingAuthorization
 from cayu.collaboration.requests import RequestControlCommand, RequestControlReceipt
-from cayu.runtime.execution_profiles import ExecutionProfileIdentity
+from cayu.execution_profiles import (
+    ExecutionProfileIdentity,
+)
 from cayu.sessions._participant_execution_identity import (
     participant_execution_identity,
     require_execution_creation,

@@ -10,6 +10,8 @@ from cayu.agents import Agent as Agent
 from cayu.agents import AgentAuthoringState as AgentAuthoringState
 from cayu.agents import AgentSpec as AgentSpec
 from cayu.applications import CayuApp as CayuApp
+from cayu.approvals.actors import ResolutionActor as ResolutionActor
+from cayu.approvals.actors import ResolutionActorSource as ResolutionActorSource
 from cayu.approvals.business import (
     BUSINESS_APPROVAL_RESOLUTION_METADATA_KEY as BUSINESS_APPROVAL_RESOLUTION_METADATA_KEY,
 )
@@ -48,8 +50,6 @@ from cayu.approvals.tools import PendingToolCallApproval as PendingToolCallAppro
 from cayu.approvals.tools import (
     PendingToolCallApprovalEventView as PendingToolCallApprovalEventView,
 )
-from cayu.approvals.tools import ResolutionActor as ResolutionActor
-from cayu.approvals.tools import ResolutionActorSource as ResolutionActorSource
 from cayu.approvals.tools import ToolApprovalDecision as ToolApprovalDecision
 from cayu.approvals.tools import ToolApprovalRecoveryOutcome as ToolApprovalRecoveryOutcome
 from cayu.approvals.tools import ToolApprovalRecoveryRequest as ToolApprovalRecoveryRequest
@@ -2306,6 +2306,41 @@ from cayu.exceptions import (
     InteractionLifecyclePublicationRejected as InteractionLifecyclePublicationRejected,
 )
 from cayu.exceptions import TerminalEventPublicationUncertain as TerminalEventPublicationUncertain
+from cayu.execution_profiles import (
+    EXECUTION_PROFILE_FINGERPRINT_FIELD as EXECUTION_PROFILE_FINGERPRINT_FIELD,
+)
+from cayu.execution_profiles import (
+    EXECUTION_PROFILE_SCHEMA_VERSION as EXECUTION_PROFILE_SCHEMA_VERSION,
+)
+from cayu.execution_profiles import ExecutionProfileAdoptionIntent as ExecutionProfileAdoptionIntent
+from cayu.execution_profiles import (
+    ExecutionProfileAuthorityDecision as ExecutionProfileAuthorityDecision,
+)
+from cayu.execution_profiles import ExecutionProfileComponentClass as ExecutionProfileComponentClass
+from cayu.execution_profiles import (
+    ExecutionProfileComponentIdentity as ExecutionProfileComponentIdentity,
+)
+from cayu.execution_profiles import ExecutionProfileDecision as ExecutionProfileDecision
+from cayu.execution_profiles import ExecutionProfileDecisionKind as ExecutionProfileDecisionKind
+from cayu.execution_profiles import ExecutionProfileIdentity as ExecutionProfileIdentity
+from cayu.execution_profiles import (
+    ExecutionProfileIdentityAvailability as ExecutionProfileIdentityAvailability,
+)
+from cayu.execution_profiles import (
+    ExecutionProfileIdentityStrength as ExecutionProfileIdentityStrength,
+)
+from cayu.execution_profiles import ExecutionProfilePolicyAction as ExecutionProfilePolicyAction
+from cayu.execution_profiles import ExecutionProfilePolicyRequest as ExecutionProfilePolicyRequest
+from cayu.execution_profiles import ExecutionProfilePolicyResult as ExecutionProfilePolicyResult
+from cayu.execution_profiles import (
+    ExecutionProfileRejectionResult as ExecutionProfileRejectionResult,
+)
+from cayu.execution_profiles import (
+    execution_profile_egress_authority_change as execution_profile_egress_authority_change,
+)
+from cayu.execution_profiles import (
+    execution_profile_with_egress_authority as execution_profile_with_egress_authority,
+)
 from cayu.failure_evidence import FailureEvidence as FailureEvidence
 from cayu.immutable_inputs import (
     DEFAULT_IMMUTABLE_INPUT_MAX_FILE_BYTES as DEFAULT_IMMUTABLE_INPUT_MAX_FILE_BYTES,
@@ -3506,39 +3541,7 @@ from cayu.runtime.execution_identity import (
     ExecutionProfileBehaviorIdentity as ExecutionProfileBehaviorIdentity,
 )
 from cayu.runtime.execution_profiles import (
-    EXECUTION_PROFILE_FINGERPRINT_FIELD as EXECUTION_PROFILE_FINGERPRINT_FIELD,
-)
-from cayu.runtime.execution_profiles import (
-    EXECUTION_PROFILE_METADATA_KEY as EXECUTION_PROFILE_METADATA_KEY,
-)
-from cayu.runtime.execution_profiles import (
-    EXECUTION_PROFILE_SCHEMA_VERSION as EXECUTION_PROFILE_SCHEMA_VERSION,
-)
-from cayu.runtime.execution_profiles import (
-    ExecutionProfileAdoptionIntent as ExecutionProfileAdoptionIntent,
-)
-from cayu.runtime.execution_profiles import (
     ExecutionProfileAdoptionRejected as ExecutionProfileAdoptionRejected,
-)
-from cayu.runtime.execution_profiles import (
-    ExecutionProfileAuthorityDecision as ExecutionProfileAuthorityDecision,
-)
-from cayu.runtime.execution_profiles import (
-    ExecutionProfileComponentClass as ExecutionProfileComponentClass,
-)
-from cayu.runtime.execution_profiles import (
-    ExecutionProfileComponentIdentity as ExecutionProfileComponentIdentity,
-)
-from cayu.runtime.execution_profiles import ExecutionProfileDecision as ExecutionProfileDecision
-from cayu.runtime.execution_profiles import (
-    ExecutionProfileDecisionKind as ExecutionProfileDecisionKind,
-)
-from cayu.runtime.execution_profiles import ExecutionProfileIdentity as ExecutionProfileIdentity
-from cayu.runtime.execution_profiles import (
-    ExecutionProfileIdentityAvailability as ExecutionProfileIdentityAvailability,
-)
-from cayu.runtime.execution_profiles import (
-    ExecutionProfileIdentityStrength as ExecutionProfileIdentityStrength,
 )
 from cayu.runtime.execution_profiles import (
     ExecutionProfileMigrationRequired as ExecutionProfileMigrationRequired,
@@ -3548,28 +3551,10 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.runtime.execution_profiles import ExecutionProfilePolicy as ExecutionProfilePolicy
 from cayu.runtime.execution_profiles import (
-    ExecutionProfilePolicyAction as ExecutionProfilePolicyAction,
-)
-from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyError as ExecutionProfilePolicyError,
 )
 from cayu.runtime.execution_profiles import (
-    ExecutionProfilePolicyRequest as ExecutionProfilePolicyRequest,
-)
-from cayu.runtime.execution_profiles import (
-    ExecutionProfilePolicyResult as ExecutionProfilePolicyResult,
-)
-from cayu.runtime.execution_profiles import (
-    ExecutionProfileRejectionResult as ExecutionProfileRejectionResult,
-)
-from cayu.runtime.execution_profiles import (
     build_execution_profile_identity as build_execution_profile_identity,
-)
-from cayu.runtime.execution_profiles import (
-    execution_profile_egress_authority_change as execution_profile_egress_authority_change,
-)
-from cayu.runtime.execution_profiles import (
-    execution_profile_with_egress_authority as execution_profile_with_egress_authority,
 )
 from cayu.runtime.execution_units import BudgetLimitIdentity as BudgetLimitIdentity
 from cayu.runtime.execution_units import ModelAttemptIdentity as ModelAttemptIdentity
@@ -3822,6 +3807,9 @@ from cayu.runtime.tool_effects import (
 )
 from cayu.runtime.tool_effects import (
     ToolEffectReconciliationTarget as ToolEffectReconciliationTarget,
+)
+from cayu.sessions._execution_profile_checkpoint import (
+    EXECUTION_PROFILE_METADATA_KEY as EXECUTION_PROFILE_METADATA_KEY,
 )
 from cayu.sessions._participant_discovery import (
     ParticipantSessionCursor as ParticipantSessionCursor,

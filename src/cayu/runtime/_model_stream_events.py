@@ -27,6 +27,9 @@ from cayu.budgets.usage import (
 )
 from cayu.context.base import ContextInputCoverage, ContextPressureEstimate
 from cayu.events import Event, EventType, event_with_runtime_payload_authority
+from cayu.execution_profiles import (
+    event_with_execution_profile_fingerprint_authority,
+)
 from cayu.messages import (
     CitationPart,
     CitationProvenance,
@@ -51,7 +54,6 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._completion_projection import portable_model_completion_projection
 from cayu.runtime._model_event_authority import _event_with_model_identity_authority
-from cayu.runtime.execution_profiles import event_with_execution_profile_fingerprint_authority
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     ToolRoundIdentity,

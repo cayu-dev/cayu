@@ -29,6 +29,9 @@ from cayu.events import (
     event_with_runtime_generated_id,
     event_with_runtime_payload_authority,
 )
+from cayu.execution_profiles import (
+    event_with_execution_profile_fingerprint_authority,
+)
 from cayu.providers.base import (
     EXACT_MODEL_STREAM_RECOVERY_DISPOSITION,
     ModelProviderError,
@@ -46,9 +49,6 @@ from cayu.providers.operations import (
     ProviderOperationStatus,
 )
 from cayu.runtime._model_errors import model_provider_error_from_payload
-from cayu.runtime.execution_profiles import (
-    event_with_execution_profile_fingerprint_authority,
-)
 from cayu.runtime.execution_units import ModelAttemptIdentity
 from cayu.sessions.base import (
     EventOrder,

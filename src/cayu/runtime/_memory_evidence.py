@@ -13,6 +13,10 @@ from typing import Any
 
 from cayu._validation import canonical_durable_json_bytes, require_durable_clean_nonblank
 from cayu.context.footprints import RequestFootprintConfig
+from cayu.execution_profiles import (
+    ExecutionProfileComponentClass,
+    ExecutionProfileIdentity,
+)
 from cayu.memory.base import AutomaticRecallContribution, AutomaticRecallPolicy
 from cayu.memory.evidence import (
     ContextExposure,
@@ -44,10 +48,6 @@ from cayu.memory.recall import RecallResult, RecallSituation, RecallSourceStatus
 from cayu.messages import MessageRole
 from cayu.providers.base import ModelRequest
 from cayu.runtime._session_control import SessionInterruptedByRequest
-from cayu.runtime.execution_profiles import (
-    ExecutionProfileComponentClass,
-    ExecutionProfileIdentity,
-)
 from cayu.runtime.execution_units import ModelAttemptIdentity
 from cayu.sessions.base import SessionStore
 from cayu.tools.exposure import ResolvedToolExposure

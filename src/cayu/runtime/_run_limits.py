@@ -100,15 +100,15 @@ from cayu.events import (
     event_with_runtime_nested_payload_authority,
     event_with_runtime_payload_authority,
 )
+from cayu.execution_profiles import (
+    event_with_execution_profile_fingerprint_authority,
+)
 from cayu.providers import ModelProviderError
 from cayu.providers._credential_boundary import provider_cancellation_failures
 from cayu.runtime._cost_accounting import CostAccountingSnapshot
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._run_limit_accounting import RunBudgetAccountingAuthority
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot
-from cayu.runtime.execution_profiles import (
-    event_with_execution_profile_fingerprint_authority,
-)
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     ModelStepIdentity,

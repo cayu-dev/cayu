@@ -50,6 +50,11 @@ from cayu.evals.models import (
 from cayu.evals.promotion import _validated_trajectory_for_promotion
 from cayu.evals.trajectory import final_output_text
 from cayu.events import Event, EventType
+from cayu.execution_profiles import (
+    ExecutionProfileComponentClass,
+    ExecutionProfileIdentity,
+    changed_execution_profile_components,
+)
 from cayu.messages import (
     Message,
     MessageRole,
@@ -67,10 +72,7 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime._runtime_replay_profile import bind_runtime_replay_profile_source
 from cayu.runtime._tool_identity import tool_idempotency_key
-from cayu.runtime.execution_profiles import (
-    ExecutionProfileComponentClass,
-    ExecutionProfileIdentity,
-    changed_execution_profile_components,
+from cayu.sessions._execution_profile_checkpoint import (
     execution_profile_from_session_metadata,
 )
 from cayu.sessions.base import (

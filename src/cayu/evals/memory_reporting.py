@@ -63,6 +63,9 @@ from cayu.evals.published import (
     PublishedOutcome,
     PublishedStructuredModelJudgeDetail,
 )
+from cayu.execution_profiles import (
+    ExecutionProfileComponentClass,
+)
 from cayu.memory.execution import (
     MemoryInterventionExecutionRecord,
     MemoryInterventionExecutionStatus,
@@ -73,9 +76,6 @@ from cayu.memory.interventions import (
     MemoryInterventionKind,
     MemoryInterventionSpec,
     MemoryInterventionTrialBinding,
-)
-from cayu.runtime.execution_profiles import (
-    ExecutionProfileComponentClass,
 )
 
 MEMORY_EXPERIMENT_REPORT_SCHEMA_VERSION = 1

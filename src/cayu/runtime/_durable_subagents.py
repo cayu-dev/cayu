@@ -17,10 +17,12 @@ from cayu._validation import (
     copy_durable_metadata,
     require_durable_clean_nonblank,
 )
+from cayu.execution_profiles import (
+    ExecutionProfileIdentity,
+)
 from cayu.messages import Message
 from cayu.runtime._child_session_identity import ChildSessionKind, generate_child_session_id
 from cayu.runtime.build_provenance import RuntimeBuildProvenance
-from cayu.runtime.execution_profiles import ExecutionProfileIdentity
 from cayu.sessions.base import RunRequest, copy_run_request
 from cayu.vaults import SecretRedactor
 

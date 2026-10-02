@@ -1,6 +1,8 @@
 """Same-producer epoch evidence; never a grant to start or disclose work."""
 
-from cayu.runtime.execution_profiles import ActiveInvocationExecutionProfile
+from cayu.sessions._execution_profile_checkpoint import (
+    ActiveInvocationExecutionProfile,
+)
 
 
 def require_producer_epoch(index, checkpoint, profile, run_epoch):

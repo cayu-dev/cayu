@@ -11,20 +11,22 @@ from typing import Any
 from cayu._validation import canonical_durable_json_bytes
 from cayu.approvals.tools import ResolutionActor
 from cayu.context.structured_output import require_secret_free_structured_output_spec
+from cayu.execution_profiles import (
+    ExecutionProfileAdoptionIntent,
+    ExecutionProfileIdentity,
+)
 from cayu.messages import Message
 from cayu.runtime._message_redaction import (
     redact_runtime_message_for_boundary,
     redact_untrusted_message_for_boundary,
 )
-from cayu.runtime.execution_profiles import (
-    EXECUTION_PROFILE_METADATA_KEY,
-    ActiveInvocationExecutionProfile,
-    ExecutionProfileAdoptionIntent,
-    ExecutionProfileIdentity,
-)
 from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     public_authority_alias_is_reserved,
+)
+from cayu.sessions._execution_profile_checkpoint import (
+    EXECUTION_PROFILE_METADATA_KEY,
+    ActiveInvocationExecutionProfile,
 )
 from cayu.sessions._model_failover import ModelFailoverPolicy
 from cayu.sessions.base import (

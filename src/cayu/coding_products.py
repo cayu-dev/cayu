@@ -56,8 +56,10 @@ from cayu.runtime.completion_verifiers import (
     DeterministicCompletionVerifier,
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
+from cayu.sessions._execution_profile_checkpoint import (
+    active_invocation_execution_profile_from_checkpoint,
+)
 from cayu.sessions.base import (
     RunRequest,
     SessionStatus,

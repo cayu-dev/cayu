@@ -74,6 +74,10 @@ from cayu.evals.models import (
 )
 from cayu.evals.revisions import eval_trial_result_revision
 from cayu.events import EventType, event_durable_sequence
+from cayu.execution_profiles import (
+    ExecutionProfileComponentClass,
+    ExecutionProfileIdentity,
+)
 from cayu.knowledge.scopes import (
     KnowledgeAccessScope,
     copy_knowledge_access_scope,
@@ -107,10 +111,6 @@ from cayu.runtime._memory_attribution import (
     project_memory_attribution,
 )
 from cayu.runtime._memory_evidence import memory_evidence_key
-from cayu.runtime.execution_profiles import (
-    ExecutionProfileComponentClass,
-    ExecutionProfileIdentity,
-)
 from cayu.sessions.base import (
     CompactSessionRequest,
     IncompleteSessionRecoveryRequest,

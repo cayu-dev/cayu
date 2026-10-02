@@ -43,6 +43,9 @@ from cayu.events import (
     event_with_runtime_generated_id,
     event_with_runtime_payload_authority,
 )
+from cayu.execution_profiles import (
+    event_with_execution_profile_fingerprint_authority,
+)
 from cayu.providers._credential_boundary import copy_provider_cancellation_failures
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
@@ -61,7 +64,6 @@ from cayu.runtime._terminal_finalization_lifetime import (
     InterruptionFinalization,
 )
 from cayu.runtime._tool_completion import recorded_terminal_tool_completion_payload
-from cayu.runtime.execution_profiles import event_with_execution_profile_fingerprint_authority
 from cayu.sessions._terminal_evidence import (
     TERMINAL_EVIDENCE_EVENT_TYPES,
     TERMINAL_EVIDENCE_QUERY_LIMIT,

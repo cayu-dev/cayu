@@ -153,6 +153,10 @@ from cayu.events import (
     event_with_runtime_payload_authority,
 )
 from cayu.exceptions import InteractionLifecyclePublicationRejected
+from cayu.execution_profiles import (
+    ExecutionProfileIdentity,
+    event_with_execution_profile_authority,
+)
 from cayu.failure_evidence import FailureEvidence, exception_evidence
 from cayu.memory.evidence import ContextExposureEvidenceKind, ContextExposureState
 from cayu.messages import Message, MessageRole, ToolCallPart, ToolResultPart, detach_message
@@ -343,17 +347,6 @@ from cayu.runtime._tool_round_staging import (
 )
 from cayu.runtime._work_attempt_invocation import WorkAttemptInvocationAuthority
 from cayu.runtime._work_attempt_session_mutation import record_work_attempt_execution_stop
-from cayu.runtime.execution_profiles import (
-    EXECUTION_PROFILE_METADATA_KEY,
-    ActiveInvocationExecutionProfile,
-    ExecutionProfileIdentity,
-    active_invocation_execution_profile_from_checkpoint,
-    active_invocation_execution_profile_is_released,
-    active_invocation_execution_profile_matches_session_epoch,
-    checkpoint_with_active_invocation_execution_profile,
-    event_with_execution_profile_authority,
-    execution_profile_from_session_metadata,
-)
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     ModelStepIdentity,
@@ -399,6 +392,15 @@ from cayu.runtime.tool_effects import (
     tool_effect_receipt_digest,
 )
 from cayu.sessions import _model_completion_publication as model_completion_publication
+from cayu.sessions._execution_profile_checkpoint import (
+    EXECUTION_PROFILE_METADATA_KEY,
+    ActiveInvocationExecutionProfile,
+    active_invocation_execution_profile_from_checkpoint,
+    active_invocation_execution_profile_is_released,
+    active_invocation_execution_profile_matches_session_epoch,
+    checkpoint_with_active_invocation_execution_profile,
+    execution_profile_from_session_metadata,
+)
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalOutcome,
     invocation_terminal_decision_from_checkpoint,

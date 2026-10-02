@@ -35,13 +35,15 @@ def release_read_target(command):
 
 def release_from_snapshot(command, session, checkpoint, raw_attachment):
     """Caller must own a single backend snapshot containing all three inputs."""
+    from cayu.execution_profiles import (
+        ExecutionProfileIdentity,
+    )
     from cayu.runtime._invocation_lifecycle import (
         _require_released_invocation_command_receipt,
         require_invocation_rebind_lineage,
     )
-    from cayu.runtime.execution_profiles import (
+    from cayu.sessions._execution_profile_checkpoint import (
         ActiveInvocationExecutionProfile,
-        ExecutionProfileIdentity,
         active_invocation_execution_profile_from_checkpoint,
     )
 

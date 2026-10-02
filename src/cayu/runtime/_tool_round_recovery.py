@@ -57,10 +57,12 @@ from cayu.runtime._run_limit_accounting import (
     RunLimitAccountingContext,
     has_run_limit_accounting_authority,
 )
-from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
+from cayu.sessions._execution_profile_checkpoint import (
+    active_invocation_execution_profile_from_checkpoint,
+)
 from cayu.sessions.base import Session, SessionStatus, SessionStore
 from cayu.sessions.checkpoints import WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY
 from cayu.tools.base import ToolEffect, ToolResult

@@ -49,12 +49,14 @@ from cayu.environments.factory import (
     EnvironmentFactoryResult,
 )
 from cayu.events import Event, EventType, event_with_runtime_generated_id
-from cayu.runtime._event_projection import prepare_new_runtime_event
-from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime.execution_profiles import (
+from cayu.execution_profiles import (
     ExecutionProfileAuthorityDecision,
     ExecutionProfileDecision,
     ExecutionProfileDecisionKind,
+)
+from cayu.runtime._event_projection import prepare_new_runtime_event
+from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime.execution_profiles import (
     _has_runtime_execution_profile_decision_authority,
 )
 from cayu.sessions.base import Session, SessionStatus, SessionStore

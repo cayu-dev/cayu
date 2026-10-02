@@ -154,6 +154,10 @@ from cayu.events import (
     event_with_runtime_generated_id,
     event_with_runtime_payload_authority,
 )
+from cayu.execution_profiles import (
+    ExecutionProfileIdentity,
+    event_with_execution_profile_authority,
+)
 from cayu.memory.evidence import ContextExposure, ContextExposureEvidenceKind, ContextExposureState
 from cayu.messages import (
     FilePart,
@@ -440,10 +444,6 @@ from cayu.runtime._session_control import (
 from cayu.runtime._structured_output_tool_round import (
     _redact_structured_output_validation,
     _validate_structured_output_tool_round,
-)
-from cayu.runtime.execution_profiles import (
-    ExecutionProfileIdentity,
-    event_with_execution_profile_authority,
 )
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,

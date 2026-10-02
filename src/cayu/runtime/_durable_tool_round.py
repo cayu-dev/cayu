@@ -20,6 +20,10 @@ from cayu._validation import MAX_DURABLE_JSON_INTEGER, MIN_DURABLE_JSON_INTEGER
 from cayu.approvals.tools import PendingToolCallApproval, ToolPolicyEvidence
 from cayu.context.structured_output import StructuredOutputSpec, StructuredOutputValidation
 from cayu.events import Event, EventType, copy_event
+from cayu.execution_profiles import (
+    ExecutionProfileIdentity,
+    event_with_execution_profile_authority,
+)
 from cayu.messages import Message
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _invocation_secrets as invocation_secrets
@@ -57,10 +61,6 @@ from cayu.runtime._tool_round_staging import (
     _terminal_publication_work_estimate,
     _tool_terminal_payload_limits,
     _ToolRoundPublicationCoordinator,
-)
-from cayu.runtime.execution_profiles import (
-    ExecutionProfileIdentity,
-    event_with_execution_profile_authority,
 )
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.runtime.stop_policy import StopDecision

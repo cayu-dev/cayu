@@ -9,6 +9,9 @@ from typing import Any
 
 from cayu._validation import canonical_durable_json_bytes, copy_durable_metadata, copy_json_value
 from cayu.events import Event
+from cayu.execution_profiles import (
+    ExecutionProfileIdentity,
+)
 from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._checkpoint_store import load_runtime_session_checkpoint_snapshot
@@ -43,8 +46,7 @@ from cayu.runtime._durable_subagents import (
     require_durable_subagent_rejection_receipt_matches_seed,
 )
 from cayu.runtime.build_provenance import RuntimeBuildProvenance
-from cayu.runtime.execution_profiles import (
-    ExecutionProfileIdentity,
+from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
     execution_profile_from_session_metadata,
 )

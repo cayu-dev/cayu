@@ -243,7 +243,9 @@ async def admit_native_producer(store, registration: ProducerOutputRecord, comma
     index = attachment_index(attachment)
     prepared = registration.command.admission.prepared
     assert prepared is not None and isinstance(prepared.target, FreshRecipientAdmissionTarget)
-    from cayu.runtime.execution_profiles import ExecutionProfileIdentity
+    from cayu.execution_profiles import (
+        ExecutionProfileIdentity,
+    )
 
     profile = ExecutionProfileIdentity.model_validate_json(prepared.execution_profile_json)
     if (
@@ -570,7 +572,9 @@ async def retain_native_output(store, session_id, *, invocation, stage_id):
     if invocation.profile.fingerprint != binding.profile_commitment.removeprefix("sha256:"):
         raise PermissionError("Producer output profile conflicts.")
     from cayu.runtime._invocation_lifecycle import require_invocation_rebind_lineage
-    from cayu.runtime.execution_profiles import ActiveInvocationExecutionProfile
+    from cayu.sessions._execution_profile_checkpoint import (
+        ActiveInvocationExecutionProfile,
+    )
 
     require_invocation_rebind_lineage(
         checkpoint,
@@ -774,10 +778,12 @@ async def read_retained_native_output(store, command):
     invocation = index.invocation
     if invocation is None or output.interaction_id != invocation.interaction_id:
         raise ValueError("Retained producer output invocation conflicts.")
-    from cayu.runtime._invocation_lifecycle import require_invocation_rebind_lineage
-    from cayu.runtime.execution_profiles import (
-        ActiveInvocationExecutionProfile,
+    from cayu.execution_profiles import (
         ExecutionProfileIdentity,
+    )
+    from cayu.runtime._invocation_lifecycle import require_invocation_rebind_lineage
+    from cayu.sessions._execution_profile_checkpoint import (
+        ActiveInvocationExecutionProfile,
     )
 
     profile = ExecutionProfileIdentity.model_validate_json(prepared.execution_profile_json)

@@ -16,8 +16,10 @@ from cayu.vaults.redaction import SecretRedactor
 
 def progress_from_snapshot(command, kind, session, checkpoint, raw_attachment):
     """Caller owns a single backend snapshot; no separately loaded status inference."""
-    from cayu.runtime.execution_profiles import (
+    from cayu.execution_profiles import (
         ExecutionProfileIdentity,
+    )
+    from cayu.sessions._execution_profile_checkpoint import (
         active_invocation_execution_profile_from_checkpoint,
     )
 
@@ -108,8 +110,10 @@ def progress_from_snapshot(command, kind, session, checkpoint, raw_attachment):
 
 async def published_progress(store, command):
     """A published milestone needs exact retained output or terminal failure evidence."""
+    from cayu.execution_profiles import (
+        ExecutionProfileIdentity,
+    )
     from cayu.runtime._producer_output_store import read_retained_native_output
-    from cayu.runtime.execution_profiles import ExecutionProfileIdentity
 
     command, session_id, _ = release_read_target(command)
     output = await read_retained_native_output(store, command)

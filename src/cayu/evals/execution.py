@@ -93,8 +93,10 @@ from cayu.evals.workflow_target import (
     WorkflowEvalResultProjector,
     WorkflowEvalTargetIdentityV1,
 )
+from cayu.execution_profiles import (
+    ExecutionProfileIdentity,
+)
 from cayu.messages import Message, MessageRole, TextPart, detach_message
-from cayu.runtime.execution_profiles import ExecutionProfileIdentity
 from cayu.runtime.manifest import AppManifest, _app_manifest_fingerprint
 from cayu.sessions.base import RunRequest, copy_run_request
 from cayu.workflows.base import WorkflowSpec, copy_workflow_spec

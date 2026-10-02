@@ -333,6 +333,16 @@ guards use the same definitions and scope; the former runtime imports remain
 compatible. Admission, output publication, cleanup and recovery execution retain
 their existing owners and native transaction boundaries.
 
+`execution_profiles.py` owns shared profile identities, decision records,
+validation, comparisons and pure identity projections. Shared operator identities
+and redacted audit payloads live in `approvals/actors.py`. The session component
+`sessions/_execution_profile_checkpoint.py` owns persisted profile records and
+metadata/checkpoint readers and writers. Both work without runtime or store
+implementations. Runtime composes these components for profile construction and
+admission, and retains policy execution, diagnostics and decision attestation.
+Public exports and the former runtime imports resolve to the same definitions;
+native stores retain their existing atomic publication and fencing checks.
+
 ## Multi-Agent Shape
 
 Cayu must support systems where multiple agents collaborate through shared state.
@@ -428,7 +438,7 @@ live in `tasks/completion_verifier_profiles.py`. Task stores and scheduling
 code import these owners directly. The former runtime module paths forward
 existing imports, including persisted pickle class names. Profile contracts
 still use the execution-profile value types in `runtime/execution_identity.py`
-and `runtime/execution_profiles.py`; the completion coordinators remain separate
+and `execution_profiles.py`; the completion coordinators remain separate
 orchestration owners.
 
 `verification/_verified_completion.py` owns completion composition for one

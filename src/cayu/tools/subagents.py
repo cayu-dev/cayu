@@ -46,8 +46,10 @@ from cayu.runtime._durable_subagents import (
     require_durable_subagent_receipt_matches_seed,
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
+from cayu.sessions._execution_profile_checkpoint import (
+    execution_profile_from_session_metadata,
+)
 from cayu.sessions.base import (
     InterruptSessionRequest,
     RunRequest,

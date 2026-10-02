@@ -8,7 +8,9 @@ from cayu.collaboration._preparation import contract_bytes, require_exact_contra
 from cayu.collaboration._producer_store import read_request_output
 from cayu.collaboration.participants import CollaborationUnavailable
 from cayu.collaboration.prepared_admission import FreshRecipientAdmissionTarget
-from cayu.runtime.execution_profiles import ExecutionProfileIdentity
+from cayu.execution_profiles import (
+    ExecutionProfileIdentity,
+)
 
 _SEAL = object()
 

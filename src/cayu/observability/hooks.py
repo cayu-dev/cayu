@@ -28,7 +28,9 @@ from cayu.tasks.records import Task, copy_task
 from cayu.tools.base import ToolResult
 
 if TYPE_CHECKING:
-    from cayu.runtime.execution_profiles import ExecutionProfileIdentity
+    from cayu.execution_profiles import (
+        ExecutionProfileIdentity,
+    )
 
 
 class RuntimeHookPhase(StrEnum):

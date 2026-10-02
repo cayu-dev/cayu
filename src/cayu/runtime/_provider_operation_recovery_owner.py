@@ -32,6 +32,9 @@ from cayu.events import (
     event_with_runtime_nested_payload_authority,
     event_with_runtime_payload_authority,
 )
+from cayu.execution_profiles import (
+    event_with_execution_profile_fingerprint_authority,
+)
 from cayu.memory.evidence import ContextExposureEvidenceKind, ContextExposureState
 from cayu.messages import Message
 from cayu.providers._credential_boundary import aclosing_provider_stream
@@ -119,7 +122,6 @@ from cayu.runtime._structured_output_tool_round import (
     _redact_structured_output_validation,
     _validate_structured_output_tool_round,
 )
-from cayu.runtime.execution_profiles import event_with_execution_profile_fingerprint_authority
 from cayu.runtime.execution_units import ModelAttemptIdentity
 from cayu.runtime.model_steps import AssistantStepResult, classify_assistant_step
 from cayu.runtime.provider_operations import (

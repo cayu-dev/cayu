@@ -17,6 +17,19 @@ from cayu.approvals.user_input import user_input_lifecycle_authority_from_checkp
 from cayu.artifacts._store_identity import local_artifact_store_identity
 from cayu.artifacts.local import LocalArtifactStore
 from cayu.egress.authority import EgressAuthorityIdentity, _copy_egress_authority_identity
+from cayu.execution_profiles import (
+    ExecutionProfileComponentClass,
+    ExecutionProfileComponentIdentity,
+    ExecutionProfileIdentity,
+    ExecutionProfileIdentityAvailability,
+    ExecutionProfileIdentityStrength,
+    ModelFailoverCandidateProfile,
+    ModelFailoverProfileBinding,
+    changed_execution_profile_components,
+    execution_profile_provider_target_component,
+    execution_profile_with_component,
+    execution_profile_with_model_failover,
+)
 from cayu.providers.deadlines import _provider_deadline_material
 from cayu.providers.operations import ProviderOperationMode
 from cayu.runtime import _approval_support as approval_support
@@ -26,26 +39,17 @@ from cayu.runtime._runtime_replay_profile import runtime_replay_profile_source
 from cayu.runtime.build_provenance import RuntimeBuildProvenance
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import (
-    ActiveInvocationExecutionProfile,
-    ExecutionProfileComponentClass,
-    ExecutionProfileComponentIdentity,
-    ExecutionProfileIdentity,
-    ExecutionProfileIdentityAvailability,
-    ExecutionProfileIdentityStrength,
-    ModelFailoverCandidateProfile,
-    ModelFailoverProfileBinding,
-    active_invocation_execution_profile_from_checkpoint,
-    active_invocation_execution_profile_matches_session_epoch,
     build_execution_profile_identity,
-    changed_execution_profile_components,
     execution_profile_provider_adapter_component,
-    execution_profile_provider_target_component,
-    execution_profile_with_component,
-    execution_profile_with_model_failover,
 )
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.tool_completion import ToolCompletionPolicy, copy_tool_completion_policy
+from cayu.sessions._execution_profile_checkpoint import (
+    ActiveInvocationExecutionProfile,
+    active_invocation_execution_profile_from_checkpoint,
+    active_invocation_execution_profile_matches_session_epoch,
+)
 from cayu.sessions._model_failover import (
     ModelFailoverCandidate,
     ModelFailoverPlan,
@@ -2178,7 +2182,12 @@ def require_historical_artifact_environment(
     redactor: SecretRedactor,
 ) -> None:
     """Authenticate static artifact resolution without launching the source."""
-    from cayu.runtime.execution_profiles import _aggregate_identity_strength, _available_component
+    from cayu.execution_profiles import (
+        _available_component,
+    )
+    from cayu.runtime.execution_profiles import (
+        _aggregate_identity_strength,
+    )
 
     if (
         registered_environment is None

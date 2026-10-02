@@ -1,0 +1,1310 @@
+"""Shared execution-profile values, validation and pure identity projections."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from enum import StrEnum
+from hashlib import sha256
+from typing import Any, Literal, cast
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    field_validator,
+    model_validator,
+)
+
+from cayu._validation import (
+    canonical_durable_json_bytes,
+    require_durable_clean_nonblank,
+    require_durable_nonblank,
+    revalidate_model_input,
+)
+from cayu.approvals.actors import (
+    ResolutionActor,
+    copy_resolution_actor,
+    resolution_actor_payload,
+)
+from cayu.build_provenance import (
+    RuntimeBuildProvenance,
+    RuntimeBuildProvenanceAvailability,
+    RuntimeBuildProvenanceStrength,
+    legacy_runtime_build_provenance,
+    runtime_build_provenance_identity,
+)
+from cayu.egress.authority import (
+    EgressAuthorityChangeKind,
+    EgressAuthorityIdentity,
+    compare_egress_authority,
+)
+from cayu.events import Event, copy_event, event_with_runtime_payload_authority
+from cayu.sessions._model_failover import ModelFailoverCandidate, ModelFailoverPlan
+
+EXECUTION_PROFILE_SCHEMA_VERSION = 6
+EXECUTION_PROFILE_FINGERPRINT_FIELD = "execution_profile_fingerprint"
+EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS = 4096
+EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS = 256
+
+
+class ExecutionProfileComponentClass(StrEnum):
+    """Stable classes of execution authority represented by a profile."""
+
+    RUNTIME = "runtime"
+    PROVIDER_TARGET = "provider_target"
+    DURABLE_SYSTEM_PROJECTION = "durable_system_projection"
+    DIRECT_TOOLS = "direct_tools"
+    TOOL_IMPLEMENTATIONS = "tool_implementations"
+    TOOL_VIEW_GRANTS = "tool_view_grants"
+    EXECUTION_POLICIES = "execution_policies"
+    INVOCATION_POLICIES = "invocation_policies"
+    RUNTIME_HOOKS = "runtime_hooks"
+    EXECUTION_ENVIRONMENT = "execution_environment"
+    EFFECT_AUTHORITY = "effect_authority"
+    EGRESS_AUTHORITY = "egress_authority"
+    CONTEXT_SELECTION = "context_selection"
+    AUTOMATIC_RECALL = "automatic_recall"
+    CONTEXT_COMPACTION = "context_compaction"
+    LIVE_STATE_PROJECTION = "live_state_projection"
+    PROVIDER_ADAPTER = "provider_adapter"
+    PROVIDER_REQUEST_POLICY = "provider_request_policy"
+    APPLICATION_BUDGET_POLICY = "application_budget_policy"
+    INVOCATION_BUDGET_POLICY = "invocation_budget_policy"
+    STRUCTURED_OUTPUT = "structured_output"
+    FINALIZATION = "finalization"
+
+
+_SCHEMA_V1_COMPONENT_CLASSES = frozenset(
+    {
+        ExecutionProfileComponentClass.RUNTIME,
+        ExecutionProfileComponentClass.PROVIDER_TARGET,
+        ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION,
+        ExecutionProfileComponentClass.DIRECT_TOOLS,
+    }
+)
+_SCHEMA_V2_COMPONENT_CLASSES = frozenset(
+    {
+        *_SCHEMA_V1_COMPONENT_CLASSES,
+        ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
+        ExecutionProfileComponentClass.TOOL_VIEW_GRANTS,
+        ExecutionProfileComponentClass.EXECUTION_POLICIES,
+        ExecutionProfileComponentClass.INVOCATION_POLICIES,
+        ExecutionProfileComponentClass.RUNTIME_HOOKS,
+        ExecutionProfileComponentClass.EXECUTION_ENVIRONMENT,
+        ExecutionProfileComponentClass.EFFECT_AUTHORITY,
+    }
+)
+_SCHEMA_V4_COMPONENT_CLASSES = frozenset(
+    {
+        *_SCHEMA_V2_COMPONENT_CLASSES,
+        ExecutionProfileComponentClass.CONTEXT_SELECTION,
+        ExecutionProfileComponentClass.AUTOMATIC_RECALL,
+        ExecutionProfileComponentClass.CONTEXT_COMPACTION,
+        ExecutionProfileComponentClass.LIVE_STATE_PROJECTION,
+        ExecutionProfileComponentClass.PROVIDER_ADAPTER,
+        ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY,
+        ExecutionProfileComponentClass.APPLICATION_BUDGET_POLICY,
+        ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY,
+        ExecutionProfileComponentClass.STRUCTURED_OUTPUT,
+        ExecutionProfileComponentClass.FINALIZATION,
+    }
+)
+_SCHEMA_V5_COMPONENT_CLASSES = frozenset(
+    {
+        *_SCHEMA_V4_COMPONENT_CLASSES,
+        ExecutionProfileComponentClass.EGRESS_AUTHORITY,
+    }
+)
+_SCHEMA_V6_COMPONENT_CLASSES = _SCHEMA_V5_COMPONENT_CLASSES
+_SCHEMA_COMPONENT_CLASSES = {
+    1: _SCHEMA_V1_COMPONENT_CLASSES,
+    2: _SCHEMA_V2_COMPONENT_CLASSES,
+    4: _SCHEMA_V4_COMPONENT_CLASSES,
+    5: _SCHEMA_V5_COMPONENT_CLASSES,
+    6: _SCHEMA_V6_COMPONENT_CLASSES,
+    7: _SCHEMA_V6_COMPONENT_CLASSES,
+}
+
+
+class ExecutionProfileIdentityStrength(StrEnum):
+    """How strongly one component is identified."""
+
+    APPLICATION_VERSIONED = "application_versioned"
+    STRUCTURAL = "structural"
+    PROCESS_LOCAL = "process_local"
+    UNAVAILABLE = "unavailable"
+
+
+_AUTHORITY_COMPONENT_CLASSES = frozenset(
+    {
+        ExecutionProfileComponentClass.DIRECT_TOOLS,
+        ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
+        ExecutionProfileComponentClass.TOOL_VIEW_GRANTS,
+        ExecutionProfileComponentClass.EXECUTION_POLICIES,
+        ExecutionProfileComponentClass.INVOCATION_POLICIES,
+        ExecutionProfileComponentClass.RUNTIME_HOOKS,
+        ExecutionProfileComponentClass.EXECUTION_ENVIRONMENT,
+        ExecutionProfileComponentClass.EFFECT_AUTHORITY,
+        ExecutionProfileComponentClass.EGRESS_AUTHORITY,
+        ExecutionProfileComponentClass.CONTEXT_SELECTION,
+        ExecutionProfileComponentClass.AUTOMATIC_RECALL,
+        ExecutionProfileComponentClass.CONTEXT_COMPACTION,
+        ExecutionProfileComponentClass.LIVE_STATE_PROJECTION,
+        ExecutionProfileComponentClass.PROVIDER_ADAPTER,
+        ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY,
+        ExecutionProfileComponentClass.APPLICATION_BUDGET_POLICY,
+        ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY,
+        ExecutionProfileComponentClass.STRUCTURED_OUTPUT,
+        ExecutionProfileComponentClass.FINALIZATION,
+    }
+)
+
+
+def execution_profile_changes_authority(
+    component_classes: Iterable[ExecutionProfileComponentClass],
+) -> bool:
+    """Return whether a difference can change governed execution authority."""
+
+    return any(component in _AUTHORITY_COMPONENT_CLASSES for component in component_classes)
+
+
+def event_with_execution_profile_authority(
+    event: Event,
+    profile: ExecutionProfileIdentity | None,
+) -> Event:
+    """Bind runtime evidence to the exact admitted invocation profile."""
+
+    if profile is None:
+        return event
+    if type(profile) is not ExecutionProfileIdentity:
+        raise TypeError("profile must be an ExecutionProfileIdentity or None.")
+    return event_with_execution_profile_fingerprint_authority(event, profile.fingerprint)
+
+
+def event_with_execution_profile_fingerprint_authority(
+    event: Event,
+    fingerprint: str | None,
+) -> Event:
+    """Bind runtime evidence when only a validated profile reference remains."""
+
+    if fingerprint is None:
+        return event
+    if (
+        type(fingerprint) is not str
+        or len(fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in fingerprint)
+    ):
+        raise ValueError("fingerprint must be a lowercase SHA-256 digest.")
+    payload = dict(event.payload)
+    payload[EXECUTION_PROFILE_FINGERPRINT_FIELD] = fingerprint
+    return event_with_runtime_payload_authority(
+        event.model_copy(update={"payload": payload}),
+        EXECUTION_PROFILE_FINGERPRINT_FIELD,
+    )
+
+
+class ExecutionProfileIdentityAvailability(StrEnum):
+    """Whether a component can be compared at the admission boundary."""
+
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+
+
+class ExecutionProfileDecisionKind(StrEnum):
+    """Typed outcome of one execution-profile admission decision."""
+
+    EXACT_REUSE = "exact_reuse"
+    COMPATIBLE_REUSE = "compatible_reuse"
+    ADOPTED = "adopted"
+    MIGRATION_REQUIRED = "migration_required"
+    REJECTED = "rejected"
+
+
+class ExecutionProfilePolicyAction(StrEnum):
+    """Application decision for one non-equal execution profile."""
+
+    COMPATIBLE_REUSE = "compatible_reuse"
+    ADOPT = "adopt"
+    MIGRATION_REQUIRED = "migration_required"
+    REJECT = "reject"
+
+
+class ExecutionProfileAuthorityDecision(StrEnum):
+    """Distinct authorization for a potentially authority-broadening change."""
+
+    NOT_REQUIRED = "not_required"
+    AUTHORIZED = "authorized"
+    DENIED = "denied"
+
+
+class ExecutionProfileAdoptionIntent(BaseModel):
+    """Explicit caller intent to adopt the current application's profile."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    idempotency_key: str = Field(max_length=EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS)
+    reason: str = Field(max_length=EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS)
+    requested_by: ResolutionActor
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def validate_idempotency_key(cls, value: str) -> str:
+        return require_durable_clean_nonblank(value, "idempotency_key")
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        return require_durable_nonblank(value, "reason")
+
+    @field_validator("requested_by")
+    @classmethod
+    def copy_requested_by(cls, value: ResolutionActor) -> ResolutionActor:
+        copied = copy_resolution_actor(value)
+        if copied is None:
+            raise ValueError("requested_by is required for execution-profile adoption.")
+        if copied.source is None:
+            raise ValueError(
+                "requested_by.source is required for execution-profile adoption provenance."
+            )
+        return copied
+
+
+def copy_execution_profile_adoption_intent(
+    intent: ExecutionProfileAdoptionIntent,
+) -> ExecutionProfileAdoptionIntent:
+    """Copy caller-owned adoption intent without serializing unvalidated fields."""
+
+    if type(intent) is not ExecutionProfileAdoptionIntent:
+        raise TypeError("Execution-profile adoption requires ExecutionProfileAdoptionIntent.")
+    requested_by = copy_resolution_actor(intent.requested_by)
+    if requested_by is None:
+        raise ValueError("requested_by is required for execution-profile adoption.")
+    return ExecutionProfileAdoptionIntent(
+        idempotency_key=intent.idempotency_key,
+        reason=intent.reason,
+        requested_by=requested_by,
+    )
+
+
+class ExecutionProfilePolicyRequest(BaseModel):
+    """Bounded application-policy input for one profile difference."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    session_id: str
+    expected_profile: ExecutionProfileIdentity
+    candidate_profile: ExecutionProfileIdentity
+    changed_component_classes: tuple[ExecutionProfileComponentClass, ...]
+    intent: ExecutionProfileAdoptionIntent | None = None
+    authority_review_required: StrictBool = False
+    egress_authority_change: EgressAuthorityChangeKind | None = None
+    source_provider_name: str
+    source_model: str
+    target_provider_name: str
+    target_model: str
+
+    @field_validator(
+        "session_id",
+        "source_provider_name",
+        "source_model",
+        "target_provider_name",
+        "target_model",
+    )
+    @classmethod
+    def validate_identity_text(cls, value: str, info) -> str:
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("expected_profile", "candidate_profile", mode="before")
+    @classmethod
+    def copy_profile(cls, value: object) -> ExecutionProfileIdentity:
+        if isinstance(value, ExecutionProfileIdentity):
+            value = value.model_dump(mode="json")
+        return ExecutionProfileIdentity.model_validate(value)
+
+    @field_validator("intent", mode="before")
+    @classmethod
+    def copy_intent(cls, value: object) -> ExecutionProfileAdoptionIntent | None:
+        if value is None:
+            return None
+        if isinstance(value, ExecutionProfileAdoptionIntent):
+            return copy_execution_profile_adoption_intent(value)
+        return ExecutionProfileAdoptionIntent.model_validate(value)
+
+    @model_validator(mode="after")
+    def validate_changed_components(self) -> ExecutionProfilePolicyRequest:
+        expected = changed_execution_profile_components(
+            self.expected_profile,
+            self.candidate_profile,
+        )
+        if self.changed_component_classes != expected:
+            raise ValueError("changed_component_classes do not match the supplied profiles.")
+        if execution_profile_changes_authority(expected) and not self.authority_review_required:
+            raise ValueError(
+                "Authority-changing components require execution-profile authority review."
+            )
+        egress_change = execution_profile_egress_authority_change(
+            self.expected_profile,
+            self.candidate_profile,
+            changed_component_classes=expected,
+        )
+        if self.egress_authority_change is None:
+            object.__setattr__(self, "egress_authority_change", egress_change)
+        elif self.egress_authority_change is not egress_change:
+            raise ValueError("egress_authority_change does not match the supplied profiles.")
+        return self
+
+
+class ExecutionProfilePolicyResult(BaseModel):
+    """Defensively copied result returned by an application policy."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    action: ExecutionProfilePolicyAction
+    reason: str = Field(max_length=EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS)
+    authority_decision: ExecutionProfileAuthorityDecision = (
+        ExecutionProfileAuthorityDecision.NOT_REQUIRED
+    )
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        return require_durable_nonblank(value, "reason")
+
+
+class ExecutionProfileDecision(BaseModel):
+    """Complete runtime-owned decision committed at profile admission."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    kind: ExecutionProfileDecisionKind
+    expected_profile: ExecutionProfileIdentity
+    candidate_profile: ExecutionProfileIdentity
+    changed_component_classes: tuple[ExecutionProfileComponentClass, ...]
+    policy_identity: str = Field(max_length=EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS)
+    policy_reason: str = Field(max_length=EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS)
+    authority_decision: ExecutionProfileAuthorityDecision
+    egress_authority_change: EgressAuthorityChangeKind | None = None
+    idempotency_identity: str = Field(max_length=EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS)
+    adoption_request_fingerprint: str | None = None
+    actor: ResolutionActor | None = None
+    reason: str = Field(max_length=EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS)
+    event: Event
+
+    @field_validator("policy_identity", "idempotency_identity")
+    @classmethod
+    def validate_identity_text(cls, value: str, info) -> str:
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("adoption_request_fingerprint")
+    @classmethod
+    def validate_adoption_request_fingerprint(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError("adoption_request_fingerprint must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("policy_reason", "reason")
+    @classmethod
+    def validate_reason_text(cls, value: str, info) -> str:
+        return require_durable_nonblank(value, info.field_name)
+
+    @field_validator("expected_profile", "candidate_profile", mode="before")
+    @classmethod
+    def copy_decision_profile(cls, value: object) -> ExecutionProfileIdentity:
+        if isinstance(value, ExecutionProfileIdentity):
+            value = value.model_dump(mode="json")
+        return ExecutionProfileIdentity.model_validate(value)
+
+    @field_validator("actor")
+    @classmethod
+    def copy_actor(cls, value: ResolutionActor | None) -> ResolutionActor | None:
+        return copy_resolution_actor(value)
+
+    @field_validator("event", mode="before")
+    @classmethod
+    def copy_decision_event(cls, value: object) -> Event:
+        if isinstance(value, Event):
+            return copy_event(value)
+        return Event.model_validate(value)
+
+    @model_validator(mode="after")
+    def validate_decision(self) -> ExecutionProfileDecision:
+        changed = changed_execution_profile_components(
+            self.expected_profile,
+            self.candidate_profile,
+        )
+        if changed != self.changed_component_classes:
+            raise ValueError("Execution-profile decision changed components are inconsistent.")
+        egress_change = execution_profile_egress_authority_change(
+            self.expected_profile,
+            self.candidate_profile,
+            changed_component_classes=changed,
+        )
+        if self.egress_authority_change is None:
+            object.__setattr__(self, "egress_authority_change", egress_change)
+        elif self.egress_authority_change is EgressAuthorityChangeKind.REFUSED:
+            if self.kind is not ExecutionProfileDecisionKind.REJECTED or egress_change is None:
+                raise ValueError("Only a rejected egress proposal can be classified refused.")
+        elif self.egress_authority_change is not egress_change:
+            raise ValueError("Execution-profile decision egress comparison is inconsistent.")
+        if self.kind is ExecutionProfileDecisionKind.EXACT_REUSE and changed:
+            raise ValueError("Exact profile reuse cannot contain changed components.")
+        unmodeled_authority_decision = self.kind in {
+            ExecutionProfileDecisionKind.MIGRATION_REQUIRED,
+            ExecutionProfileDecisionKind.REJECTED,
+        } or (
+            self.kind is ExecutionProfileDecisionKind.ADOPTED
+            and self.authority_decision is ExecutionProfileAuthorityDecision.AUTHORIZED
+        )
+        if (
+            self.kind is not ExecutionProfileDecisionKind.EXACT_REUSE
+            and not changed
+            and not unmodeled_authority_decision
+        ):
+            raise ValueError("A non-exact profile decision requires changed components.")
+        if (
+            self.kind is ExecutionProfileDecisionKind.EXACT_REUSE
+            and self.authority_decision is not ExecutionProfileAuthorityDecision.NOT_REQUIRED
+        ):
+            raise ValueError("Exact profile reuse cannot carry an authority decision.")
+        if (
+            self.kind
+            in {
+                ExecutionProfileDecisionKind.COMPATIBLE_REUSE,
+                ExecutionProfileDecisionKind.ADOPTED,
+            }
+            and self.authority_decision is ExecutionProfileAuthorityDecision.DENIED
+        ):
+            raise ValueError("A denied authority decision cannot admit an execution profile.")
+        if self.kind is ExecutionProfileDecisionKind.COMPATIBLE_REUSE and any(
+            component in _AUTHORITY_COMPONENT_CLASSES
+            or component is ExecutionProfileComponentClass.PROVIDER_TARGET
+            for component in changed
+        ):
+            raise ValueError(
+                "Compatible reuse cannot change execution or persistent provider authority."
+            )
+        if (
+            self.kind is ExecutionProfileDecisionKind.ADOPTED
+            and (
+                any(
+                    component in _AUTHORITY_COMPONENT_CLASSES
+                    for component in changed
+                    if component is not ExecutionProfileComponentClass.EGRESS_AUTHORITY
+                )
+                or self.egress_authority_change
+                in {
+                    EgressAuthorityChangeKind.WIDER,
+                    EgressAuthorityChangeKind.INCOMPARABLE,
+                    EgressAuthorityChangeKind.REFUSED,
+                }
+            )
+            and self.authority_decision is not ExecutionProfileAuthorityDecision.AUTHORIZED
+        ):
+            raise ValueError("Execution-authority adoption requires explicit authority.")
+        if self.kind is ExecutionProfileDecisionKind.ADOPTED:
+            if self.actor is None:
+                raise ValueError("Adopted execution profiles require an attributable actor.")
+            if self.actor.source is None:
+                raise ValueError("Adopted execution profiles require an actor provenance source.")
+        expected_type = (
+            "session.execution_profile.rejected"
+            if self.kind is ExecutionProfileDecisionKind.REJECTED
+            else "session.execution_profile.decided"
+        )
+        if str(self.event.type) != expected_type:
+            raise ValueError("Execution-profile decision event has the wrong type.")
+        if self.event.interaction_id is not None:
+            raise ValueError("Execution-profile decisions cannot belong to an interaction.")
+        if self.event.payload != execution_profile_decision_payload(
+            kind=self.kind,
+            expected_profile=self.expected_profile,
+            candidate_profile=self.candidate_profile,
+            changed_component_classes=self.changed_component_classes,
+            policy_identity=self.policy_identity,
+            policy_reason=self.policy_reason,
+            authority_decision=self.authority_decision,
+            egress_authority_change=self.egress_authority_change,
+            idempotency_identity=self.idempotency_identity,
+            adoption_request_fingerprint=self.adoption_request_fingerprint,
+            actor=self.actor,
+            reason=self.reason,
+        ):
+            raise ValueError("Execution-profile decision event payload is inconsistent.")
+        return self
+
+
+class ExecutionProfileComponentIdentity(BaseModel):
+    """Redacted identity for one typed execution-profile component."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    component_class: ExecutionProfileComponentClass
+    strength: ExecutionProfileIdentityStrength
+    availability: ExecutionProfileIdentityAvailability
+    fingerprint: str | None
+
+    @field_validator("fingerprint")
+    @classmethod
+    def validate_fingerprint(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError("fingerprint must be a lowercase SHA-256 digest.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_availability(self) -> ExecutionProfileComponentIdentity:
+        unavailable = self.availability is ExecutionProfileIdentityAvailability.UNAVAILABLE
+        if unavailable != (self.fingerprint is None):
+            raise ValueError("Unavailable components must omit their fingerprint.")
+        if unavailable != (self.strength is ExecutionProfileIdentityStrength.UNAVAILABLE):
+            raise ValueError("Unavailable components must use unavailable identity strength.")
+        return self
+
+
+class ModelFailoverCandidateProfile(BaseModel):
+    """Nonrecursive, digest-only reconstruction of one unbound candidate."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    schema_version: Literal[6] = 6
+    fingerprint: str
+    components: tuple[ExecutionProfileComponentIdentity, ...]
+    egress_authority: EgressAuthorityIdentity | None = None
+    runtime_build_provenance: RuntimeBuildProvenance
+
+    @model_validator(mode="after")
+    def validate_profile(self) -> ModelFailoverCandidateProfile:
+        self.as_profile()
+        return self
+
+    def as_profile(self) -> ExecutionProfileIdentity:
+        # One canonical validator owns component/fingerprint/egress consistency.
+        # This shape deliberately has no model_failover field, so nested plans
+        # cannot recursively inflate a durable candidate binding.
+        return ExecutionProfileIdentity(
+            schema_version=6,
+            fingerprint=self.fingerprint,
+            components=self.components,
+            egress_authority=self.egress_authority,
+            runtime_build_provenance=self.runtime_build_provenance,
+        )
+
+
+class ModelFailoverProfileBinding(BaseModel):
+    """Reconstructable immutable candidate plan, not mutable selection authority."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    plan: ModelFailoverPlan
+    candidate_profiles: tuple[ModelFailoverCandidateProfile, ...] = Field(
+        min_length=2, max_length=8
+    )
+    primary_request_policy: ExecutionProfileComponentIdentity
+    strength: ExecutionProfileIdentityStrength
+
+    @field_validator("plan", mode="before")
+    @classmethod
+    def copy_plan(cls, value: object) -> ModelFailoverPlan:
+        return ModelFailoverPlan.model_validate(value)
+
+    @field_validator("candidate_profiles", mode="before")
+    @classmethod
+    def copy_candidate_profiles(cls, value: object) -> tuple[ModelFailoverCandidateProfile, ...]:
+        if type(value) not in (list, tuple):
+            raise ValueError("Failover requires two to eight candidate profile identities.")
+        items = cast("list[object] | tuple[object, ...]", value)
+        if not 2 <= len(items) <= 8:
+            raise ValueError("Failover requires two to eight candidate profile identities.")
+        return tuple(
+            ModelFailoverCandidateProfile.model_validate(
+                revalidate_model_input(item, ModelFailoverCandidateProfile)
+            )
+            for item in items
+        )
+
+    @field_validator("primary_request_policy", mode="before")
+    @classmethod
+    def copy_primary_policy(cls, value: object) -> ExecutionProfileComponentIdentity:
+        return ExecutionProfileComponentIdentity.model_validate(
+            revalidate_model_input(value, ExecutionProfileComponentIdentity)
+        )
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> ModelFailoverProfileBinding:
+        if len(self.candidate_profiles) != len(self.plan.candidates):
+            raise ValueError("Failover requires one profile identity per candidate.")
+        for target, stored in zip(self.plan.candidates, self.candidate_profiles, strict=True):
+            profile = stored.as_profile()
+            if profile.fingerprint != target.execution_profile_fingerprint or profile.component(
+                ExecutionProfileComponentClass.PROVIDER_TARGET
+            ) != execution_profile_provider_target_component(target.provider_name, target.model):
+                raise ValueError("Failover candidate profile conflicts with its plan.")
+        if (
+            self.primary_request_policy.component_class
+            is not ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY
+            or self.primary_request_policy.availability
+            is not ExecutionProfileIdentityAvailability.AVAILABLE
+            or self.strength is ExecutionProfileIdentityStrength.UNAVAILABLE
+        ):
+            raise ValueError("Failover binding requires available provider request authority.")
+        return self
+
+    def component(self) -> ExecutionProfileComponentIdentity:
+        binding = ModelFailoverProfileBinding.model_validate(
+            revalidate_model_input(self, ModelFailoverProfileBinding)
+        )
+        return ExecutionProfileComponentIdentity(
+            component_class=ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY,
+            strength=binding.strength,
+            availability=ExecutionProfileIdentityAvailability.AVAILABLE,
+            fingerprint=sha256(
+                canonical_durable_json_bytes(
+                    {
+                        "kind": "cayu:model-failover-request-policy:v1",
+                        "primary_request_policy": binding.primary_request_policy.model_dump(
+                            mode="json"
+                        ),
+                        "plan": binding.plan.payload(),
+                    },
+                    "model failover request policy",
+                )
+            ).hexdigest(),
+        )
+
+
+class ExecutionProfileIdentity(BaseModel):
+    """Versioned, redacted identity frozen before a session can execute."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    schema_version: Literal[1, 2, 4, 5, 6, 7] = EXECUTION_PROFILE_SCHEMA_VERSION
+    fingerprint: str
+    components: tuple[ExecutionProfileComponentIdentity, ...]
+    model_failover: ModelFailoverProfileBinding | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    egress_authority: EgressAuthorityIdentity | None = None
+    runtime_build_provenance: RuntimeBuildProvenance = Field(
+        default_factory=legacy_runtime_build_provenance
+    )
+
+    @field_validator("model_failover", mode="before")
+    @classmethod
+    def copy_model_failover(cls, value: object) -> ModelFailoverProfileBinding | None:
+        if value is None:
+            return None
+        return ModelFailoverProfileBinding.model_validate(
+            revalidate_model_input(value, ModelFailoverProfileBinding)
+        )
+
+    @field_validator("runtime_build_provenance", mode="before")
+    @classmethod
+    def copy_runtime_build_provenance(cls, value: object) -> RuntimeBuildProvenance:
+        if isinstance(value, RuntimeBuildProvenance):
+            value = value.model_dump(mode="json")
+        return runtime_build_provenance_identity(RuntimeBuildProvenance.model_validate(value))
+
+    @field_validator("egress_authority", mode="before")
+    @classmethod
+    def copy_egress_authority(cls, value: object) -> EgressAuthorityIdentity | None:
+        if value is None:
+            return None
+        if isinstance(value, EgressAuthorityIdentity):
+            value = value.model_dump(mode="json")
+        return EgressAuthorityIdentity.model_validate(value)
+
+    @field_validator("fingerprint")
+    @classmethod
+    def validate_fingerprint(cls, value: str) -> str:
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError("fingerprint must be a lowercase SHA-256 digest.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_components(self) -> ExecutionProfileIdentity:
+        if (self.schema_version == 7) != (self.model_failover is not None):
+            raise ValueError("Routed execution profiles require schema 7 and a failover binding.")
+        classes = tuple(component.component_class for component in self.components)
+        required_classes = tuple(sorted(_SCHEMA_COMPONENT_CLASSES[self.schema_version], key=str))
+        if classes != required_classes:
+            raise ValueError(
+                "Execution-profile components must contain every required class exactly once "
+                "in sorted order."
+            )
+        if self.schema_version < 5 and self.egress_authority is not None:
+            raise ValueError("Legacy execution profiles cannot carry egress authority details.")
+        if self.schema_version < 6 and self.runtime_build_provenance != (
+            legacy_runtime_build_provenance()
+        ):
+            raise ValueError("Legacy execution profiles cannot carry runtime build provenance.")
+        runtime_component = self.component(ExecutionProfileComponentClass.RUNTIME)
+        if self.schema_version >= 6 and (
+            runtime_component.availability is ExecutionProfileIdentityAvailability.UNAVAILABLE
+        ) != (
+            self.runtime_build_provenance.availability
+            is RuntimeBuildProvenanceAvailability.UNAVAILABLE
+        ):
+            raise ValueError(
+                "Execution-profile runtime availability conflicts with build provenance."
+            )
+        if self.schema_version >= 5:
+            expected_egress_component = _egress_authority_component(self.egress_authority)
+            if self.component(ExecutionProfileComponentClass.EGRESS_AUTHORITY) != (
+                expected_egress_component
+            ):
+                raise ValueError(
+                    "Execution-profile egress authority does not match its component identity."
+                )
+        expected = _profile_fingerprint(
+            self.components,
+            schema_version=self.schema_version,
+            runtime_build_provenance=self.runtime_build_provenance,
+        )
+        if self.fingerprint != expected:
+            raise ValueError("Execution-profile fingerprint does not match its components.")
+        if self.model_failover is not None:
+            binding = self.model_failover
+            if (
+                self.component(ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY)
+                != binding.component()
+            ):
+                raise ValueError(
+                    "Execution-profile failover material conflicts with its component."
+                )
+            primary_components = tuple(
+                binding.primary_request_policy
+                if item.component_class is ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY
+                else item
+                for item in self.components
+            )
+            primary = ExecutionProfileIdentity(
+                fingerprint=_profile_fingerprint(
+                    primary_components,
+                    schema_version=6,
+                    runtime_build_provenance=self.runtime_build_provenance,
+                ),
+                components=primary_components,
+                egress_authority=self.egress_authority,
+                runtime_build_provenance=self.runtime_build_provenance,
+            )
+            if primary != binding.candidate_profiles[0].as_profile():
+                raise ValueError("Execution-profile failover material conflicts with its primary.")
+            target = binding.plan.candidates[0]
+            if primary.fingerprint != target.execution_profile_fingerprint or primary.component(
+                ExecutionProfileComponentClass.PROVIDER_TARGET
+            ) != execution_profile_provider_target_component(target.provider_name, target.model):
+                raise ValueError("Execution-profile failover material conflicts with its primary.")
+        return self
+
+    def component(
+        self,
+        component_class: ExecutionProfileComponentClass,
+    ) -> ExecutionProfileComponentIdentity:
+        for component in self.components:
+            if component.component_class is component_class:
+                return component
+        raise KeyError(f"Execution profile has no {component_class.value} component.")
+
+
+class ExecutionProfileRejectionResult(BaseModel):
+    """Durable rejection event plus whether an exact prior write was replayed."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    event: Event
+    replayed: StrictBool = False
+
+    @field_validator("event", mode="before")
+    @classmethod
+    def copy_rejection_event(cls, value: Event) -> Event:
+        return copy_event(value)
+
+
+def copy_execution_profile_policy_result(
+    result: ExecutionProfilePolicyResult,
+) -> ExecutionProfilePolicyResult:
+    """Defensively validate one result returned across the policy trust boundary."""
+
+    if type(result) is not ExecutionProfilePolicyResult:
+        raise TypeError("Execution-profile policies must return ExecutionProfilePolicyResult.")
+    return ExecutionProfilePolicyResult(
+        action=result.action,
+        reason=result.reason,
+        authority_decision=result.authority_decision,
+    )
+
+
+def copy_execution_profile_decision(
+    decision: ExecutionProfileDecision,
+) -> ExecutionProfileDecision:
+    """Copy a runtime decision without erasing its event authority provenance."""
+
+    if type(decision) is not ExecutionProfileDecision:
+        raise TypeError("decision must be an ExecutionProfileDecision.")
+    return ExecutionProfileDecision(
+        kind=decision.kind,
+        expected_profile=decision.expected_profile,
+        candidate_profile=decision.candidate_profile,
+        changed_component_classes=decision.changed_component_classes,
+        policy_identity=decision.policy_identity,
+        policy_reason=decision.policy_reason,
+        authority_decision=decision.authority_decision,
+        egress_authority_change=decision.egress_authority_change,
+        idempotency_identity=decision.idempotency_identity,
+        adoption_request_fingerprint=decision.adoption_request_fingerprint,
+        actor=decision.actor,
+        reason=decision.reason,
+        event=copy_event(decision.event),
+    )
+
+
+def execution_profile_decision_payload(
+    *,
+    kind: ExecutionProfileDecisionKind,
+    expected_profile: ExecutionProfileIdentity,
+    candidate_profile: ExecutionProfileIdentity,
+    changed_component_classes: tuple[ExecutionProfileComponentClass, ...],
+    policy_identity: str,
+    policy_reason: str,
+    authority_decision: ExecutionProfileAuthorityDecision,
+    idempotency_identity: str,
+    adoption_request_fingerprint: str | None = None,
+    actor: ResolutionActor | None,
+    reason: str,
+    egress_authority_change: EgressAuthorityChangeKind | None = None,
+) -> dict[str, Any]:
+    """Build the complete bounded durable evidence payload for one decision."""
+
+    payload = {
+        "decision": kind.value,
+        "expected_profile": expected_profile.model_dump(mode="json"),
+        "candidate_profile": candidate_profile.model_dump(mode="json"),
+        "changed_component_classes": [component.value for component in changed_component_classes],
+        "actor": resolution_actor_payload(actor),
+        "policy_identity": policy_identity,
+        "policy_reason": policy_reason,
+        "authority_decision": authority_decision.value,
+        "reason": reason,
+        "idempotency_identity": idempotency_identity,
+    }
+    if egress_authority_change is not None:
+        payload["egress_authority_change"] = egress_authority_change.value
+    if adoption_request_fingerprint is not None:
+        payload["adoption_request_fingerprint"] = adoption_request_fingerprint
+    return payload
+
+
+def direct_tool_capability_ceiling_component(
+    tool_names: Iterable[str],
+) -> ExecutionProfileComponentIdentity:
+    """Build the canonical profile component for one direct-tool ceiling."""
+
+    names = tuple(require_durable_clean_nonblank(name, "tool_name") for name in tool_names)
+    if len(names) != len(set(names)):
+        raise ValueError("tool_names must contain unique values.")
+    return _available_component(
+        ExecutionProfileComponentClass.TOOL_VIEW_GRANTS,
+        ExecutionProfileIdentityStrength.STRUCTURAL,
+        {
+            "view_kind": "direct",
+            "generation": 1,
+            "grant_baseline": list(names),
+        },
+    )
+
+
+def execution_profile_provider_target_component(
+    provider_name: str,
+    model: str,
+) -> ExecutionProfileComponentIdentity:
+    """Return the canonical provider/model component used by profile construction."""
+
+    return _available_component(
+        ExecutionProfileComponentClass.PROVIDER_TARGET,
+        ExecutionProfileIdentityStrength.STRUCTURAL,
+        {
+            "provider_name": require_durable_clean_nonblank(provider_name, "provider_name"),
+            "model": require_durable_clean_nonblank(model, "model"),
+        },
+    )
+
+
+def execution_profile_runtime_component(
+    runtime_name: str,
+    runtime_version: str | None,
+    runtime_build_provenance: RuntimeBuildProvenance | None = None,
+) -> ExecutionProfileComponentIdentity:
+    """Return the canonical runtime component used by profile construction."""
+
+    runtime_name = require_durable_clean_nonblank(runtime_name, "runtime_name")
+    if runtime_build_provenance is not None and (
+        type(runtime_build_provenance) is not RuntimeBuildProvenance
+    ):
+        raise TypeError("runtime_build_provenance must be RuntimeBuildProvenance or None.")
+    if runtime_build_provenance is None or (
+        runtime_build_provenance.availability is RuntimeBuildProvenanceAvailability.UNAVAILABLE
+    ):
+        return _unavailable_component(ExecutionProfileComponentClass.RUNTIME)
+    strength = {
+        RuntimeBuildProvenanceStrength.STRUCTURAL: ExecutionProfileIdentityStrength.STRUCTURAL,
+        RuntimeBuildProvenanceStrength.APPLICATION_VERSIONED: (
+            ExecutionProfileIdentityStrength.APPLICATION_VERSIONED
+        ),
+    }.get(runtime_build_provenance.strength)
+    if strength is None:
+        raise ValueError("Available runtime build provenance has invalid identity strength.")
+    return _available_component(
+        ExecutionProfileComponentClass.RUNTIME,
+        strength,
+        {
+            "kind": "cayu:runtime-build-identity",
+            "schema_version": 1,
+            "runtime_name": runtime_name,
+            "runtime_version": (
+                None
+                if runtime_version is None
+                else require_durable_clean_nonblank(runtime_version, "runtime_version")
+            ),
+            "runtime_build_fingerprint": runtime_build_provenance.fingerprint,
+            "runtime_build_origin": runtime_build_provenance.origin.value,
+        },
+    )
+
+
+def changed_execution_profile_components(
+    expected: ExecutionProfileIdentity,
+    candidate: ExecutionProfileIdentity,
+) -> tuple[ExecutionProfileComponentClass, ...]:
+    """Return bounded component classes that changed or cannot be verified."""
+
+    expected_by_class = {item.component_class: item for item in expected.components}
+    candidate_by_class = {item.component_class: item for item in candidate.components}
+    classes = sorted(set(expected_by_class) | set(candidate_by_class), key=str)
+    return tuple(
+        component_class
+        for component_class in classes
+        if (
+            expected_by_class.get(component_class) != candidate_by_class.get(component_class)
+            or (
+                expected_by_class.get(component_class) is not None
+                and expected_by_class[component_class].availability
+                is ExecutionProfileIdentityAvailability.UNAVAILABLE
+            )
+            or (
+                candidate_by_class.get(component_class) is not None
+                and candidate_by_class[component_class].availability
+                is ExecutionProfileIdentityAvailability.UNAVAILABLE
+            )
+        )
+    )
+
+
+def inherited_execution_profile_component_changes(
+    expected: ExecutionProfileIdentity,
+    candidate: ExecutionProfileIdentity,
+) -> tuple[ExecutionProfileComponentClass, ...]:
+    """Compare inherited authority beneath an unchanged candidate plan.
+
+    A bound request-policy digest also changes when a permitted component is
+    replaced on a candidate. Inspect every candidate instead of treating that
+    aggregate change as either unconditional drift or unconditional permission.
+    This does not change the general profile-adoption comparison.
+    """
+
+    expected = ExecutionProfileIdentity.model_validate(
+        revalidate_model_input(expected, ExecutionProfileIdentity)
+    )
+    candidate = ExecutionProfileIdentity.model_validate(
+        revalidate_model_input(candidate, ExecutionProfileIdentity)
+    )
+    before, after = expected.model_failover, candidate.model_failover
+    if before is None or after is None:
+        return changed_execution_profile_components(expected, candidate)
+    changes: set[ExecutionProfileComponentClass] = set()
+    if (
+        before.plan.max_total_attempts != after.plan.max_total_attempts
+        or before.strength != after.strength
+        or tuple(
+            (item.provider_name, item.model, item.execution_mode) for item in before.plan.candidates
+        )
+        != tuple(
+            (item.provider_name, item.model, item.execution_mode) for item in after.plan.candidates
+        )
+    ):
+        changes.add(ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY)
+    # A different candidate count is already a plan change, but all common
+    # entries must still expose their actual component differences.
+    for source, target in zip(before.candidate_profiles, after.candidate_profiles, strict=False):
+        changes.update(
+            changed_execution_profile_components(source.as_profile(), target.as_profile())
+        )
+    return tuple(sorted(changes, key=str))
+
+
+def execution_profile_egress_authority_change(
+    expected: ExecutionProfileIdentity,
+    candidate: ExecutionProfileIdentity,
+    *,
+    changed_component_classes: tuple[ExecutionProfileComponentClass, ...] | None = None,
+) -> EgressAuthorityChangeKind | None:
+    """Return the conservative semantic classification for an egress difference."""
+
+    changed = (
+        changed_execution_profile_components(expected, candidate)
+        if changed_component_classes is None
+        else changed_component_classes
+    )
+    if ExecutionProfileComponentClass.EGRESS_AUTHORITY not in changed:
+        return None
+    if expected.egress_authority is None or candidate.egress_authority is None:
+        return EgressAuthorityChangeKind.INCOMPARABLE
+    return compare_egress_authority(expected.egress_authority, candidate.egress_authority)
+
+
+def unavailable_execution_profile_components(
+    profile: ExecutionProfileIdentity,
+) -> tuple[ExecutionProfileComponentClass, ...]:
+    """Return required component classes with no deterministic identity."""
+
+    return tuple(
+        component.component_class
+        for component in profile.components
+        if component.availability is ExecutionProfileIdentityAvailability.UNAVAILABLE
+    )
+
+
+def execution_profile_with_model_failover(
+    profile: ExecutionProfileIdentity,
+    binding: ModelFailoverProfileBinding,
+) -> ExecutionProfileIdentity:
+    """Bind once, after ordinary candidate profile resolution has completed."""
+
+    profile = ExecutionProfileIdentity.model_validate(
+        revalidate_model_input(profile, ExecutionProfileIdentity)
+    )
+    if profile.schema_version != 6 or profile.model_failover is not None:
+        raise ValueError("Failover requires an unbound current execution profile.")
+    component = binding.component()
+    components = tuple(
+        component if item.component_class is component.component_class else item
+        for item in profile.components
+    )
+    return ExecutionProfileIdentity(
+        schema_version=7,
+        fingerprint=_profile_fingerprint(
+            components, schema_version=7, runtime_build_provenance=profile.runtime_build_provenance
+        ),
+        components=components,
+        model_failover=binding,
+        egress_authority=profile.egress_authority,
+        runtime_build_provenance=profile.runtime_build_provenance,
+    )
+
+
+def execution_profile_with_component(
+    profile: ExecutionProfileIdentity,
+    component: ExecutionProfileComponentIdentity,
+) -> ExecutionProfileIdentity:
+    """Return a profile with one durable component identity replaced."""
+
+    by_class = {item.component_class: item for item in profile.components}
+    if (
+        component.component_class is ExecutionProfileComponentClass.RUNTIME
+        and component != profile.component(ExecutionProfileComponentClass.RUNTIME)
+    ):
+        raise ValueError("Runtime components cannot be replaced without exact build provenance.")
+    by_class[component.component_class] = component
+    components = tuple(sorted(by_class.values(), key=lambda item: item.component_class))
+    egress_authority = profile.egress_authority
+    if (
+        component.component_class is ExecutionProfileComponentClass.EGRESS_AUTHORITY
+        and component != _egress_authority_component(egress_authority)
+    ):
+        raise ValueError("Use execution_profile_with_egress_authority to replace egress authority.")
+    return ExecutionProfileIdentity(
+        schema_version=profile.schema_version,
+        fingerprint=_profile_fingerprint(
+            components,
+            schema_version=profile.schema_version,
+            runtime_build_provenance=profile.runtime_build_provenance,
+        ),
+        components=components,
+        model_failover=profile.model_failover,
+        egress_authority=egress_authority,
+        runtime_build_provenance=profile.runtime_build_provenance,
+    )
+
+
+def execution_profile_with_tool_capability_ceiling(
+    profile: ExecutionProfileIdentity,
+    tool_names: Iterable[str],
+) -> ExecutionProfileIdentity:
+    """Project a ceiling through all frozen candidates, without resolving providers.
+
+    The caller owns permission to narrow the ceiling. This pure identity
+    projection grants neither tool access nor permission to adopt a profile.
+    """
+
+    profile = ExecutionProfileIdentity.model_validate(
+        revalidate_model_input(profile, ExecutionProfileIdentity)
+    )
+    component = direct_tool_capability_ceiling_component(tool_names)
+    binding = profile.model_failover
+    if binding is None:
+        return execution_profile_with_component(profile, component)
+    profiles = tuple(
+        execution_profile_with_component(item.as_profile(), component)
+        for item in binding.candidate_profiles
+    )
+    plan = ModelFailoverPlan(
+        max_total_attempts=binding.plan.max_total_attempts,
+        candidates=tuple(
+            ModelFailoverCandidate(
+                provider_name=target.provider_name,
+                model=target.model,
+                execution_mode=target.execution_mode,
+                execution_profile_fingerprint=updated.fingerprint,
+            )
+            for target, updated in zip(binding.plan.candidates, profiles, strict=True)
+        ),
+    )
+    return execution_profile_with_model_failover(
+        profiles[0],
+        ModelFailoverProfileBinding(
+            plan=plan,
+            candidate_profiles=tuple(
+                ModelFailoverCandidateProfile.model_validate(item.model_dump(mode="json"))
+                for item in profiles
+            ),
+            primary_request_policy=binding.primary_request_policy,
+            # The replaced component is always structural. Every other
+            # candidate component, including the weakest one, is unchanged.
+            strength=binding.strength,
+        ),
+    )
+
+
+def execution_profile_with_egress_authority(
+    profile: ExecutionProfileIdentity,
+    authority: EgressAuthorityIdentity | None,
+) -> ExecutionProfileIdentity:
+    """Return a schema-v5 profile with one typed egress authority replacement."""
+
+    if profile.schema_version < 5:
+        raise ValueError("Legacy execution profiles cannot replace egress authority in place.")
+    authority = (
+        None
+        if authority is None
+        else EgressAuthorityIdentity.model_validate(authority.model_dump(mode="json"))
+    )
+    by_class = {item.component_class: item for item in profile.components}
+    by_class[ExecutionProfileComponentClass.EGRESS_AUTHORITY] = _egress_authority_component(
+        authority
+    )
+    components = tuple(sorted(by_class.values(), key=lambda item: item.component_class))
+    return ExecutionProfileIdentity(
+        schema_version=profile.schema_version,
+        fingerprint=_profile_fingerprint(
+            components,
+            schema_version=profile.schema_version,
+            runtime_build_provenance=profile.runtime_build_provenance,
+        ),
+        components=components,
+        model_failover=profile.model_failover,
+        egress_authority=authority,
+        runtime_build_provenance=profile.runtime_build_provenance,
+    )
+
+
+def execution_profile_with_durable_system_projection_digest(
+    profile: ExecutionProfileIdentity,
+    digest: str,
+) -> ExecutionProfileIdentity:
+    """Bind a canonical durable-system message digest without raw prompt text."""
+
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError("durable system projection digest must be a lowercase SHA-256 digest.")
+    return execution_profile_with_component(
+        profile,
+        ExecutionProfileComponentIdentity(
+            component_class=ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION,
+            strength=ExecutionProfileIdentityStrength.STRUCTURAL,
+            availability=ExecutionProfileIdentityAvailability.AVAILABLE,
+            fingerprint=digest,
+        ),
+    )
+
+
+def _available_component(
+    component_class: ExecutionProfileComponentClass,
+    strength: ExecutionProfileIdentityStrength,
+    material: Any,
+) -> ExecutionProfileComponentIdentity:
+    fingerprint = sha256(
+        canonical_durable_json_bytes(material, f"execution_profile.{component_class.value}")
+    ).hexdigest()
+    return ExecutionProfileComponentIdentity(
+        component_class=component_class,
+        strength=strength,
+        availability=ExecutionProfileIdentityAvailability.AVAILABLE,
+        fingerprint=fingerprint,
+    )
+
+
+def _egress_authority_component(
+    authority: EgressAuthorityIdentity | None,
+) -> ExecutionProfileComponentIdentity:
+    if authority is None:
+        return _available_component(
+            ExecutionProfileComponentClass.EGRESS_AUTHORITY,
+            ExecutionProfileIdentityStrength.STRUCTURAL,
+            {"kind": "none", "version": 1},
+        )
+    # Public-web policies have a canonical identity even though changed policies
+    # cannot be ordered by finite permission-set comparison. Opaque extensions
+    # still lack the authority contract needed for profile admission.
+    if any(policy.kind == "opaque" for policy in authority.policies):
+        return _unavailable_component(ExecutionProfileComponentClass.EGRESS_AUTHORITY)
+    return _available_component(
+        ExecutionProfileComponentClass.EGRESS_AUTHORITY,
+        ExecutionProfileIdentityStrength.APPLICATION_VERSIONED,
+        authority.model_dump(mode="json"),
+    )
+
+
+def _unavailable_component(
+    component_class: ExecutionProfileComponentClass,
+) -> ExecutionProfileComponentIdentity:
+    return ExecutionProfileComponentIdentity(
+        component_class=component_class,
+        strength=ExecutionProfileIdentityStrength.UNAVAILABLE,
+        availability=ExecutionProfileIdentityAvailability.UNAVAILABLE,
+        fingerprint=None,
+    )
+
+
+def _profile_fingerprint(
+    components: tuple[ExecutionProfileComponentIdentity, ...],
+    *,
+    schema_version: int,
+    runtime_build_provenance: RuntimeBuildProvenance | None = None,
+) -> str:
+    material = {
+        "schema_version": schema_version,
+        "components": [component.model_dump(mode="json") for component in components],
+    }
+    if schema_version >= 6:
+        provenance = (
+            legacy_runtime_build_provenance()
+            if runtime_build_provenance is None
+            else runtime_build_provenance
+        )
+        material["runtime_build_provenance"] = provenance.model_dump(
+            mode="json",
+            exclude={"source_revision"},
+        )
+    return sha256(canonical_durable_json_bytes(material, "execution_profile")).hexdigest()

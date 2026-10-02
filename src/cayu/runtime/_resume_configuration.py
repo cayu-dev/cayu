@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
-from cayu.runtime._execution_profile_admission import model_finalization_material
-from cayu.runtime._model_step_executor import model_completion_recovery_context_from_stage
-from cayu.runtime.execution_profiles import (
+from cayu.execution_profiles import (
     ExecutionProfileComponentClass,
     ExecutionProfileIdentityStrength,
     _available_component,
+)
+from cayu.runtime._execution_profile_admission import model_finalization_material
+from cayu.runtime._model_step_executor import model_completion_recovery_context_from_stage
+from cayu.runtime.retry_policy import RetryPolicy
+from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_matches_session_epoch,
     execution_profile_from_session_metadata,
 )
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
 from cayu.sessions.base import ResumeRequest, Session, SessionStore
 

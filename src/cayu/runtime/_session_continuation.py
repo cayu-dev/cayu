@@ -633,7 +633,9 @@ def continuation_admission_digest(command: Any) -> str:
 
 def continuation_admission_inputs(command: AdmitInvocationCommand) -> tuple[str, str, str]:
     """Derive input/profile/budget attribution from the exact receiving command."""
-    from cayu.runtime.execution_profiles import ExecutionProfileComponentClass
+    from cayu.execution_profiles import (
+        ExecutionProfileComponentClass,
+    )
 
     continuation_admission_digest(command)  # Reject untyped lookalikes before serialization.
     input_digest = sha256(

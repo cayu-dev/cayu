@@ -127,6 +127,11 @@ from cayu.events import (
     event_with_runtime_generated_id,
     event_with_runtime_payload_authority,
 )
+from cayu.execution_profiles import (
+    ExecutionProfileIdentity,
+    event_with_execution_profile_authority,
+    event_with_execution_profile_fingerprint_authority,
+)
 from cayu.runners.base import Runner, RunnerExecutionAdmissionObserver
 from cayu.runtime import _environment_operation_boundary as environment_operation_boundary
 from cayu.runtime import _invocation_secrets as invocation_secrets
@@ -188,13 +193,10 @@ from cayu.runtime._invocation_lifecycle import (
     invocation_lifecycle_receipt_history_present,
 )
 from cayu.runtime._tool_execution_requirements import effective_execution_requirements
-from cayu.runtime.execution_profiles import (
-    ExecutionProfileIdentity,
-    active_invocation_execution_profile_from_checkpoint,
-    event_with_execution_profile_authority,
-    event_with_execution_profile_fingerprint_authority,
-)
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
+from cayu.sessions._execution_profile_checkpoint import (
+    active_invocation_execution_profile_from_checkpoint,
+)
 from cayu.sessions._terminal_evidence import (
     TERMINAL_EVIDENCE_EVENT_TYPES,
     TERMINAL_EVIDENCE_QUERY_LIMIT,

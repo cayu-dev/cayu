@@ -8,7 +8,9 @@ from pydantic import BaseModel, ConfigDict, StrictInt, field_validator
 
 from cayu.configuration import CayuConfigSource
 from cayu.context.thinking import ThinkingConfig
-from cayu.runtime.execution_profiles import ExecutionProfileIdentity
+from cayu.execution_profiles import (
+    ExecutionProfileIdentity,
+)
 from cayu.runtime.retry_policy import RetryPolicy
 
 _ValueT = TypeVar("_ValueT")

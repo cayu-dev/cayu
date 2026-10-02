@@ -9,7 +9,9 @@ from cayu.runtime._invocation_lifecycle import (
     require_invocation_rebind_lineage,
 )
 from cayu.runtime._session_continuation_store import ROOT_KEY, ContinuationRoot
-from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
+from cayu.sessions._execution_profile_checkpoint import (
+    active_invocation_execution_profile_from_checkpoint,
+)
 from cayu.vaults.redaction import SecretRedactor
 
 

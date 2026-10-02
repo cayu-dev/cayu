@@ -93,9 +93,11 @@ from cayu.evals.store import (
 )
 from cayu.evals.trial_policy import EvalSuiteRunExposureV1
 from cayu.events import Event, EventType
+from cayu.execution_profiles import (
+    ExecutionProfileIdentity,
+)
 from cayu.messages import FilePart, Message, MessageRole, TextPart
 from cayu.runtime.execution_profiles import (
-    ExecutionProfileIdentity,
     ExecutionProfileMismatchError,
 )
 from cayu.runtime.stop_policy import RunLimits

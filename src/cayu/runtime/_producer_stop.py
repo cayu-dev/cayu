@@ -126,8 +126,10 @@ async def accept_native_producer_stop(store, registration, closure, *, authority
         raise ValueError("Producer stop attachment commitment conflicts.")
     from cayu.runtime._producer_lineage import require_producer_epoch
     from cayu.runtime._session_steering import require_steering_receipt, steering_operation_key
-    from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
     from cayu.runtime.session_steering import SessionSteeringConflict
+    from cayu.sessions._execution_profile_checkpoint import (
+        active_invocation_execution_profile_from_checkpoint,
+    )
 
     def require_current(session, current_checkpoint):
         active = active_invocation_execution_profile_from_checkpoint(current_checkpoint)

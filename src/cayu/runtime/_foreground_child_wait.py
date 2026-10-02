@@ -43,11 +43,11 @@ from cayu.runtime._run_limit_accounting import (
 )
 from cayu.runtime._tool_effect_state import ToolEffectIntent, ToolEffectRecord, ToolEffectStateOwner
 from cayu.runtime._tool_round_recovery import PENDING_TOOL_ROUND_CHECKPOINT_KEY, PendingToolRound
-from cayu.runtime.execution_profiles import (
+from cayu.runtime.tool_effects import _bounded_text
+from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_is_released,
 )
-from cayu.runtime.tool_effects import _bounded_text
 from cayu.sessions.base import (
     MAX_SESSION_ID_BYTES,
     EventOrder,

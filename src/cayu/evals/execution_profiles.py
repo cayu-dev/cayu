@@ -37,7 +37,9 @@ from cayu.evals.execution import (
     CorpusTarget,
     WorkflowEvalTarget,
 )
-from cayu.runtime.execution_profiles import ExecutionProfileIdentity
+from cayu.execution_profiles import (
+    ExecutionProfileIdentity,
+)
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.sessions.base import copy_run_request
 

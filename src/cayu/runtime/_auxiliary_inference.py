@@ -33,6 +33,10 @@ from cayu.events import (
     event_with_runtime_nested_payload_authority,
     event_with_runtime_payload_authority,
 )
+from cayu.execution_profiles import (
+    event_with_execution_profile_authority,
+    execution_profile_with_component,
+)
 from cayu.providers import (
     ModelProviderError,
     ModelRequest,
@@ -84,8 +88,6 @@ from cayu.runtime._run_limits import (
 from cayu.runtime._runtime_records import RegisteredTool
 from cayu.runtime.execution_profiles import (
     ExecutionProfileMismatchError,
-    event_with_execution_profile_authority,
-    execution_profile_with_component,
 )
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,

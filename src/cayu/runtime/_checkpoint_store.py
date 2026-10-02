@@ -7,6 +7,9 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any, cast, overload
 
 if TYPE_CHECKING:
+    from cayu.execution_profiles import (
+        ExecutionProfileRejectionResult,
+    )
     from cayu.runtime._invocation_lifecycle import (
         AdmitInvocationCommand,
         CreateInvocationCommand,
@@ -18,11 +21,12 @@ if TYPE_CHECKING:
         ReleaseInvocationCommand,
         SettleInvocationCommand,
     )
-    from cayu.runtime.execution_profiles import ExecutionProfileRejectionResult
     from cayu.sessions.base import InteractionTransitionResult
 
 from cayu._validation import copy_durable_json_object
-from cayu.runtime.execution_profiles import ExecutionProfileIdentity
+from cayu.execution_profiles import (
+    ExecutionProfileIdentity,
+)
 from cayu.sessions.base import (
     CheckpointRootFieldGuard,
     CheckpointTransform,

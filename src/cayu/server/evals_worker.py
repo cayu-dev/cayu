@@ -49,8 +49,10 @@ from cayu.evals.store import (
 from cayu.evals.suite_authoring import EvalSuiteDocument
 from cayu.evals.suite_execution import corpus_for_authored_scenario_case
 from cayu.evals.trial_policy import EvalCandidateCostBudgetV1
-from cayu.runtime.execution_profiles import (
+from cayu.execution_profiles import (
     ExecutionProfileIdentity,
+)
+from cayu.runtime.execution_profiles import (
     ExecutionProfileMismatchError,
 )
 from cayu.server.config import EvalsConfig

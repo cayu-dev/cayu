@@ -293,6 +293,10 @@ from cayu.events import (
     event_with_durable_sequence,
     validate_public_custom_event_type,
 )
+from cayu.execution_profiles import (
+    ExecutionProfileIdentity,
+    unavailable_execution_profile_components,
+)
 from cayu.knowledge._publication import KnowledgePublicationScope
 from cayu.knowledge.scopes import (
     KnowledgeAccessScope,
@@ -515,15 +519,7 @@ from cayu.runtime.execution_identity import (
     copy_execution_profile_behavior_identity,
 )
 from cayu.runtime.execution_profiles import (
-    ActiveInvocationExecutionProfile,
-    ExecutionProfileIdentity,
     ExecutionProfilePolicy,
-    active_invocation_execution_profile_from_checkpoint,
-    active_invocation_execution_profile_is_released,
-    active_invocation_execution_profile_matches_session_epoch,
-    checkpoint_with_active_invocation_execution_profile,
-    execution_profile_from_session_metadata,
-    unavailable_execution_profile_components,
 )
 from cayu.runtime.human_attention import (
     HumanAttentionObservation,
@@ -598,6 +594,14 @@ from cayu.runtime.tool_effects import (
     ToolEffectReconciliationRegistration,
     ToolEffectReconciliationRequest,
     ToolEffectReconciliationTarget,
+)
+from cayu.sessions._execution_profile_checkpoint import (
+    ActiveInvocationExecutionProfile,
+    active_invocation_execution_profile_from_checkpoint,
+    active_invocation_execution_profile_is_released,
+    active_invocation_execution_profile_matches_session_epoch,
+    checkpoint_with_active_invocation_execution_profile,
+    execution_profile_from_session_metadata,
 )
 from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,

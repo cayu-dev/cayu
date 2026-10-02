@@ -6,6 +6,12 @@ from enum import Enum, auto
 from typing import Any
 
 from cayu.events import EventType
+from cayu.execution_profiles import (
+    ExecutionProfileComponentClass,
+    ExecutionProfileIdentity,
+    ExecutionProfileIdentityStrength,
+    _available_component,
+)
 from cayu.messages import MessageRole, ToolCallPart, ToolResultPart
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._execution_profile_admission import model_finalization_material
@@ -18,16 +24,12 @@ from cayu.runtime._tool_round_recovery import (
     pending_tool_round_from_checkpoint,
     pending_tool_round_identity,
 )
-from cayu.runtime.execution_profiles import (
-    ExecutionProfileComponentClass,
-    ExecutionProfileIdentity,
-    ExecutionProfileIdentityStrength,
-    _available_component,
-    active_invocation_execution_profile_from_checkpoint,
-)
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.tool_completion import ToolCompletionPolicy, ToolCompletionResult
+from cayu.sessions._execution_profile_checkpoint import (
+    active_invocation_execution_profile_from_checkpoint,
+)
 from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
 from cayu.sessions.base import EventOrder, EventQuery, Session, SessionStore
 from cayu.sessions.interactions import INTERACTION_LIFECYCLE_EVENT_TYPES

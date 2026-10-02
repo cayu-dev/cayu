@@ -91,7 +91,7 @@ from cayu.runtime._task_store_operation_boundary import (
 )
 from cayu.runtime.application_lifecycle import ApplicationAdmissionsSealed
 from cayu.runtime.authority import SessionRunFenced
-from cayu.runtime.execution_profiles import (
+from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
 from cayu.sessions._invocation_terminal_decision import (

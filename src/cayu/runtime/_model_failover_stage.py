@@ -10,6 +10,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
+from cayu.execution_profiles import (
+    ExecutionProfileIdentity,
+)
 from cayu.providers.base import ModelProviderError
 from cayu.runtime._execution_profile_admission import bind_model_failover_execution_profile
 from cayu.runtime._invocation_lifecycle import AdmittedInvocationBinding, InvocationContext
@@ -18,12 +21,11 @@ from cayu.runtime._model_failover import (
     FailoverObservation,
     decide_model_failover,
 )
-from cayu.runtime.execution_profiles import (
-    ExecutionProfileIdentity,
+from cayu.runtime.retry_policy import RetryDecision
+from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
     execution_profile_from_session_metadata,
 )
-from cayu.runtime.retry_policy import RetryDecision
 from cayu.sessions._model_failover import (
     MODEL_FAILOVER_CHECKPOINT_KEY,
     ModelFailoverProgress,

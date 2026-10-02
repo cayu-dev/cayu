@@ -78,7 +78,9 @@ async def prepare_producer_completion_replay(store, session, checkpoint, invocat
     This does not elect an answer or create a work-attempt/admission grant.
     """
     from cayu.runtime._invocation_lifecycle import require_invocation_rebind_lineage
-    from cayu.runtime.execution_profiles import ActiveInvocationExecutionProfile
+    from cayu.sessions._execution_profile_checkpoint import (
+        ActiveInvocationExecutionProfile,
+    )
 
     raw = None if checkpoint is None else checkpoint.get(ROOT_KEY)
     if raw is None or invocation is None:

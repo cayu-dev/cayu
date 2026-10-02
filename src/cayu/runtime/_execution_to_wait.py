@@ -147,8 +147,10 @@ async def _build_execution_wait(
     """Construct exact data; callers separately authorize execution or cleanup."""
     from cayu.collaboration._capabilities import CapabilityDescriptor
     from cayu.collaboration._request_coordinator import _initiator
+    from cayu.execution_profiles import (
+        ExecutionProfileIdentity,
+    )
     from cayu.runtime._session_continuation_owner import LATCH_FAMILY, SessionContinuationOwner
-    from cayu.runtime.execution_profiles import ExecutionProfileIdentity
     from cayu.sessions._participant_execution_identity import participant_execution_identity
 
     wait = prepare_contract(CollaborationWait, wait, redactor=app._secret_redactor)

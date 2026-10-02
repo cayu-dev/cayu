@@ -25,8 +25,10 @@ from cayu.runtime._foreground_child_wait import (
     foreground_child_state_from_checkpoint,
     post_action_continuation_round_from_checkpoint,
 )
-from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
 from cayu.runtime.loop_policies import LoopPolicy
+from cayu.sessions._execution_profile_checkpoint import (
+    active_invocation_execution_profile_from_checkpoint,
+)
 from cayu.sessions.base import (
     Session,
     SessionOperationPublication,

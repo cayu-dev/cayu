@@ -29,9 +29,11 @@ from cayu.runtime import _environment_operation_boundary as environment_operatio
 from cayu.vaults.redaction import SecretRedactor
 
 if TYPE_CHECKING:
+    from cayu.execution_profiles import (
+        ExecutionProfileIdentity,
+    )
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime._invocation_lifecycle import InvocationContext
-    from cayu.runtime.execution_profiles import ExecutionProfileIdentity
     from cayu.sessions.base import Session
 
 
@@ -97,9 +99,11 @@ def expose_registered_environment(
 ) -> runtime_records.RegisteredEnvironment:
     """Mint the only runtime-owned admitted/exposed form of a live environment."""
 
+    from cayu.execution_profiles import (
+        ExecutionProfileIdentity,
+    )
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime._invocation_lifecycle import InvocationContext
-    from cayu.runtime.execution_profiles import ExecutionProfileIdentity
     from cayu.sessions.base import Session
 
     if type(registered_environment) is not runtime_records.RegisteredEnvironment:
@@ -179,9 +183,11 @@ def _environment_exposure(
 ) -> _EnvironmentExposure | None:
     """Return the exact lifecycle-minted authority after structural validation."""
 
+    from cayu.execution_profiles import (
+        ExecutionProfileIdentity,
+    )
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime._invocation_lifecycle import InvocationContext
-    from cayu.runtime.execution_profiles import ExecutionProfileIdentity
     from cayu.sessions.base import Session
 
     if registered_environment is None:

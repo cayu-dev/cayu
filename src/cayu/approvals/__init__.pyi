@@ -1,5 +1,7 @@
 """Static declarations for the lazy public API."""
 
+from cayu.approvals.actors import ResolutionActor as ResolutionActor
+from cayu.approvals.actors import ResolutionActorSource as ResolutionActorSource
 from cayu.approvals.business import (
     BUSINESS_APPROVAL_RESOLUTION_METADATA_KEY as BUSINESS_APPROVAL_RESOLUTION_METADATA_KEY,
 )
@@ -38,8 +40,6 @@ from cayu.approvals.tools import PendingToolCallApproval as PendingToolCallAppro
 from cayu.approvals.tools import (
     PendingToolCallApprovalEventView as PendingToolCallApprovalEventView,
 )
-from cayu.approvals.tools import ResolutionActor as ResolutionActor
-from cayu.approvals.tools import ResolutionActorSource as ResolutionActorSource
 from cayu.approvals.tools import ToolApprovalDecision as ToolApprovalDecision
 from cayu.approvals.tools import ToolApprovalRecoveryOutcome as ToolApprovalRecoveryOutcome
 from cayu.approvals.tools import ToolApprovalRecoveryRequest as ToolApprovalRecoveryRequest

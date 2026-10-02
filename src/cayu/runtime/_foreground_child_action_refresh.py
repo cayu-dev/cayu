@@ -22,7 +22,7 @@ from cayu.runtime._foreground_child_wait import (
     observe_foreground_child_wait,
 )
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
-from cayu.runtime.execution_profiles import (
+from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_is_released,
 )

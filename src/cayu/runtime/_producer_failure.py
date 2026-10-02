@@ -5,9 +5,11 @@ from hashlib import sha256
 from cayu._validation import canonical_durable_json_bytes
 from cayu.collaboration._producer_contracts import ProducerNativeFailure
 from cayu.events import EventType
-from cayu.runtime.execution_profiles import (
-    ActiveInvocationExecutionProfile,
+from cayu.execution_profiles import (
     ExecutionProfileIdentity,
+)
+from cayu.sessions._execution_profile_checkpoint import (
+    ActiveInvocationExecutionProfile,
     active_invocation_execution_profile_from_checkpoint,
 )
 from cayu.sessions.base import (

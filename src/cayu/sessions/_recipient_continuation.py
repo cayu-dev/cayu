@@ -70,7 +70,7 @@ def select_continuation(snapshot: CompletedTurnSnapshot) -> RecipientContinuatio
         require_continuation_selection_quiescence,
     )
     from cayu.runtime._tool_round_recovery import pending_tool_round_from_checkpoint
-    from cayu.runtime.execution_profiles import (
+    from cayu.sessions._execution_profile_checkpoint import (
         active_invocation_execution_profile_from_checkpoint,
         execution_profile_from_session_metadata,
     )

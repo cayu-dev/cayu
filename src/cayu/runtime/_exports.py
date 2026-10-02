@@ -54,7 +54,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "AVAILABLE_CHECK_TAGS": ("cayu.runtime.checks", "AVAILABLE_CHECK_TAGS"),
     "ActiveInvocationExecutionProfile": (
-        "cayu.runtime.execution_profiles",
+        "cayu.sessions._execution_profile_checkpoint",
         "ActiveInvocationExecutionProfile",
     ),
     "ActiveModelCompletionStage": ("cayu.sessions.base", "ActiveModelCompletionStage"),
@@ -475,15 +475,15 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "EGRESS_AUTHORITY_TRANSITION_SCHEMA_VERSION",
     ),
     "EXECUTION_PROFILE_FINGERPRINT_FIELD": (
-        "cayu.runtime.execution_profiles",
+        "cayu.execution_profiles",
         "EXECUTION_PROFILE_FINGERPRINT_FIELD",
     ),
     "EXECUTION_PROFILE_METADATA_KEY": (
-        "cayu.runtime.execution_profiles",
+        "cayu.sessions._execution_profile_checkpoint",
         "EXECUTION_PROFILE_METADATA_KEY",
     ),
     "EXECUTION_PROFILE_SCHEMA_VERSION": (
-        "cayu.runtime.execution_profiles",
+        "cayu.execution_profiles",
         "EXECUTION_PROFILE_SCHEMA_VERSION",
     ),
     "EffectiveConfigurationField": (
@@ -530,7 +530,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "ExecutionDeadline": ("cayu.deadlines", "ExecutionDeadline"),
     "ExecutionDeadlineExceeded": ("cayu.deadlines", "ExecutionDeadlineExceeded"),
     "ExecutionProfileAdoptionIntent": (
-        "cayu.runtime.execution_profiles",
+        "cayu.execution_profiles",
         "ExecutionProfileAdoptionIntent",
     ),
     "ExecutionProfileAdoptionRejected": (
@@ -538,29 +538,29 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "ExecutionProfileAdoptionRejected",
     ),
     "ExecutionProfileAuthorityDecision": (
-        "cayu.runtime.execution_profiles",
+        "cayu.execution_profiles",
         "ExecutionProfileAuthorityDecision",
     ),
     "ExecutionProfileComponentClass": (
-        "cayu.runtime.execution_profiles",
+        "cayu.execution_profiles",
         "ExecutionProfileComponentClass",
     ),
     "ExecutionProfileComponentIdentity": (
-        "cayu.runtime.execution_profiles",
+        "cayu.execution_profiles",
         "ExecutionProfileComponentIdentity",
     ),
-    "ExecutionProfileDecision": ("cayu.runtime.execution_profiles", "ExecutionProfileDecision"),
+    "ExecutionProfileDecision": ("cayu.execution_profiles", "ExecutionProfileDecision"),
     "ExecutionProfileDecisionKind": (
-        "cayu.runtime.execution_profiles",
+        "cayu.execution_profiles",
         "ExecutionProfileDecisionKind",
     ),
-    "ExecutionProfileIdentity": ("cayu.runtime.execution_profiles", "ExecutionProfileIdentity"),
+    "ExecutionProfileIdentity": ("cayu.execution_profiles", "ExecutionProfileIdentity"),
     "ExecutionProfileIdentityAvailability": (
-        "cayu.runtime.execution_profiles",
+        "cayu.execution_profiles",
         "ExecutionProfileIdentityAvailability",
     ),
     "ExecutionProfileIdentityStrength": (
-        "cayu.runtime.execution_profiles",
+        "cayu.execution_profiles",
         "ExecutionProfileIdentityStrength",
     ),
     "ExecutionProfileMigrationRequired": (
@@ -573,7 +573,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "ExecutionProfilePolicy": ("cayu.runtime.execution_profiles", "ExecutionProfilePolicy"),
     "ExecutionProfilePolicyAction": (
-        "cayu.runtime.execution_profiles",
+        "cayu.execution_profiles",
         "ExecutionProfilePolicyAction",
     ),
     "ExecutionProfilePolicyError": (
@@ -581,15 +581,15 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "ExecutionProfilePolicyError",
     ),
     "ExecutionProfilePolicyRequest": (
-        "cayu.runtime.execution_profiles",
+        "cayu.execution_profiles",
         "ExecutionProfilePolicyRequest",
     ),
     "ExecutionProfilePolicyResult": (
-        "cayu.runtime.execution_profiles",
+        "cayu.execution_profiles",
         "ExecutionProfilePolicyResult",
     ),
     "ExecutionProfileRejectionResult": (
-        "cayu.runtime.execution_profiles",
+        "cayu.execution_profiles",
         "ExecutionProfileRejectionResult",
     ),
     "FRAMEWORK_TOOL_NAMES": ("cayu.tools.catalogue", "FRAMEWORK_TOOL_NAMES"),
@@ -1092,8 +1092,8 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "RequestVariant": ("cayu.context.footprints", "RequestVariant"),
     "RequiredAllowlistRule": ("cayu.tools.policy", "RequiredAllowlistRule"),
     "RequiredFieldRule": ("cayu.tools.policy", "RequiredFieldRule"),
-    "ResolutionActor": ("cayu.approvals.tools", "ResolutionActor"),
-    "ResolutionActorSource": ("cayu.approvals.tools", "ResolutionActorSource"),
+    "ResolutionActor": ("cayu.approvals.actors", "ResolutionActor"),
+    "ResolutionActorSource": ("cayu.approvals.actors", "ResolutionActorSource"),
     "ResolvedBillingIdentity": ("cayu.budgets.billing", "ResolvedBillingIdentity"),
     "ResolvedToolExposure": ("cayu.tools.exposure", "ResolvedToolExposure"),
     "ResumeRequest": ("cayu.sessions.base", "ResumeRequest"),
@@ -1867,11 +1867,11 @@ EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "execution_deadline_scope": ("cayu.deadlines", "execution_deadline_scope"),
     "execution_profile_egress_authority_change": (
-        "cayu.runtime.execution_profiles",
+        "cayu.execution_profiles",
         "execution_profile_egress_authority_change",
     ),
     "execution_profile_with_egress_authority": (
-        "cayu.runtime.execution_profiles",
+        "cayu.execution_profiles",
         "execution_profile_with_egress_authority",
     ),
     "fail_managed_task": ("cayu.tasks.worker", "fail_managed_task"),
