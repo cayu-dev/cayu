@@ -2903,11 +2903,20 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.knowledge.maintenance",
         "KnowledgeMaintenanceCandidateSignal",
     ),
-    "KnowledgeMaintenanceConflict": ("cayu.storage.memory", "KnowledgeMaintenanceConflict"),
-    "KnowledgeMaintenanceDecision": ("cayu.storage.memory", "KnowledgeMaintenanceDecision"),
-    "KnowledgeMaintenanceDecisionKind": ("cayu.storage.memory", "KnowledgeMaintenanceDecisionKind"),
+    "KnowledgeMaintenanceConflict": (
+        "cayu.knowledge.maintenance_contracts",
+        "KnowledgeMaintenanceConflict",
+    ),
+    "KnowledgeMaintenanceDecision": (
+        "cayu.knowledge.maintenance_contracts",
+        "KnowledgeMaintenanceDecision",
+    ),
+    "KnowledgeMaintenanceDecisionKind": (
+        "cayu.knowledge.maintenance_contracts",
+        "KnowledgeMaintenanceDecisionKind",
+    ),
     "KnowledgeMaintenanceDecisionReceipt": (
-        "cayu.storage.memory",
+        "cayu.knowledge.maintenance_contracts",
         "KnowledgeMaintenanceDecisionReceipt",
     ),
     "KnowledgeMaintenanceEvaluationFinding": (
@@ -2978,7 +2987,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.knowledge.maintenance_planning",
         "KnowledgeMaintenanceInferenceUsage",
     ),
-    "KnowledgeMaintenanceOutcome": ("cayu.storage.memory", "KnowledgeMaintenanceOutcome"),
+    "KnowledgeMaintenanceOutcome": (
+        "cayu.knowledge.maintenance_contracts",
+        "KnowledgeMaintenanceOutcome",
+    ),
     "KnowledgeMaintenancePlanDraft": (
         "cayu.knowledge.maintenance_planning",
         "KnowledgeMaintenancePlanDraft",
@@ -3039,7 +3051,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.knowledge.maintenance_planning",
         "KnowledgeMaintenancePlanningWorkflow",
     ),
-    "KnowledgeMaintenanceProposal": ("cayu.storage.memory", "KnowledgeMaintenanceProposal"),
+    "KnowledgeMaintenanceProposal": (
+        "cayu.knowledge.maintenance_contracts",
+        "KnowledgeMaintenanceProposal",
+    ),
     "KnowledgeMaintenanceProposalPublication": (
         "cayu.knowledge.maintenance_persistence",
         "KnowledgeMaintenanceProposalPublication",
@@ -3113,7 +3128,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.knowledge.maintenance_planning",
         "KnowledgeMaintenanceStageBudget",
     ),
-    "KnowledgeMaintenanceStale": ("cayu.storage.memory", "KnowledgeMaintenanceStale"),
+    "KnowledgeMaintenanceStale": (
+        "cayu.knowledge.maintenance_contracts",
+        "KnowledgeMaintenanceStale",
+    ),
     "KnowledgePublicationConflict": ("cayu.storage.memory", "KnowledgePublicationConflict"),
     "KnowledgePublicationReceipt": ("cayu.storage.memory", "KnowledgePublicationReceipt"),
     "KnowledgeQuery": ("cayu.storage.memory", "KnowledgeQuery"),
@@ -3472,7 +3490,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.storage.memory",
         "MAX_KNOWLEDGE_INDEX_READINESS_LIMIT",
     ),
-    "MAX_KNOWLEDGE_MAINTENANCE_BYTES": ("cayu.storage.memory", "MAX_KNOWLEDGE_MAINTENANCE_BYTES"),
+    "MAX_KNOWLEDGE_MAINTENANCE_BYTES": (
+        "cayu.knowledge.maintenance_contracts",
+        "MAX_KNOWLEDGE_MAINTENANCE_BYTES",
+    ),
     "MAX_KNOWLEDGE_MAINTENANCE_COST_MICRO_USD": (
         "cayu.knowledge.maintenance_planning",
         "MAX_KNOWLEDGE_MAINTENANCE_COST_MICRO_USD",
@@ -3494,7 +3515,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "MAX_KNOWLEDGE_MAINTENANCE_GOVERNANCE_REQUEST_BYTES",
     ),
     "MAX_KNOWLEDGE_MAINTENANCE_METADATA_BYTES": (
-        "cayu.storage.memory",
+        "cayu.knowledge.maintenance_contracts",
         "MAX_KNOWLEDGE_MAINTENANCE_METADATA_BYTES",
     ),
     "MAX_KNOWLEDGE_MAINTENANCE_MODEL_CALLS": (
@@ -3530,11 +3551,11 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "MAX_KNOWLEDGE_MAINTENANCE_ROUTING_TIMEOUT_SECONDS",
     ),
     "MAX_KNOWLEDGE_MAINTENANCE_SOURCES": (
-        "cayu.storage.memory",
+        "cayu.knowledge.maintenance_contracts",
         "MAX_KNOWLEDGE_MAINTENANCE_SOURCES",
     ),
     "MAX_KNOWLEDGE_MAINTENANCE_TEXT_BYTES": (
-        "cayu.storage.memory",
+        "cayu.knowledge.maintenance_contracts",
         "MAX_KNOWLEDGE_MAINTENANCE_TEXT_BYTES",
     ),
     "MAX_KNOWLEDGE_MAINTENANCE_TOKEN_COUNT": (
@@ -6139,7 +6160,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "prepare_knowledge_activation_request",
     ),
     "prepare_knowledge_maintenance_decision": (
-        "cayu.storage.memory",
+        "cayu.knowledge.maintenance_contracts",
         "prepare_knowledge_maintenance_decision",
     ),
     "prepare_knowledge_maintenance_governance_request": (

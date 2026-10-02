@@ -2469,6 +2469,42 @@ from cayu.knowledge.maintenance import (
 from cayu.knowledge.maintenance import (
     KnowledgeMaintenanceSignalKind as KnowledgeMaintenanceSignalKind,
 )
+from cayu.knowledge.maintenance_contracts import (
+    MAX_KNOWLEDGE_MAINTENANCE_BYTES as MAX_KNOWLEDGE_MAINTENANCE_BYTES,
+)
+from cayu.knowledge.maintenance_contracts import (
+    MAX_KNOWLEDGE_MAINTENANCE_METADATA_BYTES as MAX_KNOWLEDGE_MAINTENANCE_METADATA_BYTES,
+)
+from cayu.knowledge.maintenance_contracts import (
+    MAX_KNOWLEDGE_MAINTENANCE_SOURCES as MAX_KNOWLEDGE_MAINTENANCE_SOURCES,
+)
+from cayu.knowledge.maintenance_contracts import (
+    MAX_KNOWLEDGE_MAINTENANCE_TEXT_BYTES as MAX_KNOWLEDGE_MAINTENANCE_TEXT_BYTES,
+)
+from cayu.knowledge.maintenance_contracts import (
+    KnowledgeMaintenanceConflict as KnowledgeMaintenanceConflict,
+)
+from cayu.knowledge.maintenance_contracts import (
+    KnowledgeMaintenanceDecision as KnowledgeMaintenanceDecision,
+)
+from cayu.knowledge.maintenance_contracts import (
+    KnowledgeMaintenanceDecisionKind as KnowledgeMaintenanceDecisionKind,
+)
+from cayu.knowledge.maintenance_contracts import (
+    KnowledgeMaintenanceDecisionReceipt as KnowledgeMaintenanceDecisionReceipt,
+)
+from cayu.knowledge.maintenance_contracts import (
+    KnowledgeMaintenanceOutcome as KnowledgeMaintenanceOutcome,
+)
+from cayu.knowledge.maintenance_contracts import (
+    KnowledgeMaintenanceProposal as KnowledgeMaintenanceProposal,
+)
+from cayu.knowledge.maintenance_contracts import (
+    KnowledgeMaintenanceStale as KnowledgeMaintenanceStale,
+)
+from cayu.knowledge.maintenance_contracts import (
+    prepare_knowledge_maintenance_decision as prepare_knowledge_maintenance_decision,
+)
 from cayu.knowledge.maintenance_governance import (
     MAX_KNOWLEDGE_MAINTENANCE_GOVERNANCE_ANNOTATION_BYTES as MAX_KNOWLEDGE_MAINTENANCE_GOVERNANCE_ANNOTATION_BYTES,
 )
@@ -4287,16 +4323,6 @@ from cayu.storage.memory import (
 from cayu.storage.memory import (
     MAX_KNOWLEDGE_INDEX_READINESS_LIMIT as MAX_KNOWLEDGE_INDEX_READINESS_LIMIT,
 )
-from cayu.storage.memory import MAX_KNOWLEDGE_MAINTENANCE_BYTES as MAX_KNOWLEDGE_MAINTENANCE_BYTES
-from cayu.storage.memory import (
-    MAX_KNOWLEDGE_MAINTENANCE_METADATA_BYTES as MAX_KNOWLEDGE_MAINTENANCE_METADATA_BYTES,
-)
-from cayu.storage.memory import (
-    MAX_KNOWLEDGE_MAINTENANCE_SOURCES as MAX_KNOWLEDGE_MAINTENANCE_SOURCES,
-)
-from cayu.storage.memory import (
-    MAX_KNOWLEDGE_MAINTENANCE_TEXT_BYTES as MAX_KNOWLEDGE_MAINTENANCE_TEXT_BYTES,
-)
 from cayu.storage.memory import InMemoryEmbeddingKnowledgeStore as InMemoryEmbeddingKnowledgeStore
 from cayu.storage.memory import InMemoryKnowledgeStore as InMemoryKnowledgeStore
 from cayu.storage.memory import KnowledgeActivationAuthority as KnowledgeActivationAuthority
@@ -4336,15 +4362,6 @@ from cayu.storage.memory import KnowledgeListGroup as KnowledgeListGroup
 from cayu.storage.memory import KnowledgeListItem as KnowledgeListItem
 from cayu.storage.memory import KnowledgeListQuery as KnowledgeListQuery
 from cayu.storage.memory import KnowledgeListResult as KnowledgeListResult
-from cayu.storage.memory import KnowledgeMaintenanceConflict as KnowledgeMaintenanceConflict
-from cayu.storage.memory import KnowledgeMaintenanceDecision as KnowledgeMaintenanceDecision
-from cayu.storage.memory import KnowledgeMaintenanceDecisionKind as KnowledgeMaintenanceDecisionKind
-from cayu.storage.memory import (
-    KnowledgeMaintenanceDecisionReceipt as KnowledgeMaintenanceDecisionReceipt,
-)
-from cayu.storage.memory import KnowledgeMaintenanceOutcome as KnowledgeMaintenanceOutcome
-from cayu.storage.memory import KnowledgeMaintenanceProposal as KnowledgeMaintenanceProposal
-from cayu.storage.memory import KnowledgeMaintenanceStale as KnowledgeMaintenanceStale
 from cayu.storage.memory import KnowledgePublicationConflict as KnowledgePublicationConflict
 from cayu.storage.memory import KnowledgePublicationReceipt as KnowledgePublicationReceipt
 from cayu.storage.memory import KnowledgeQuery as KnowledgeQuery
@@ -4357,9 +4374,6 @@ from cayu.storage.memory import (
 )
 from cayu.storage.memory import (
     prepare_knowledge_activation_request as prepare_knowledge_activation_request,
-)
-from cayu.storage.memory import (
-    prepare_knowledge_maintenance_decision as prepare_knowledge_maintenance_decision,
 )
 from cayu.storage.memory import prepare_knowledge_publication as prepare_knowledge_publication
 from cayu.storage.postgres import PostgresAgentWorkContextStore as PostgresAgentWorkContextStore

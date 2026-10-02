@@ -1,4 +1,11 @@
 {
+    "tests/core/test_knowledge_maintenance_contracts.py::test_maintenance_authoring_modules_do_not_load_storage_implementations[maintenance]": 0.193,
+    "tests/core/test_knowledge_maintenance_contracts.py::test_maintenance_authoring_modules_do_not_load_storage_implementations[maintenance_planning]": 0.173,
+    "tests/core/test_knowledge_maintenance_contracts.py::test_maintenance_contracts_preserve_exports_stubs_and_runtime_annotations": 0.024,
+    "tests/core/test_knowledge_maintenance_contracts.py::test_maintenance_contracts_work_without_storage_implementations[cayu.knowledge.maintenance_contracts]": 0.11,
+    "tests/core/test_knowledge_maintenance_contracts.py::test_maintenance_contracts_work_without_storage_implementations[cayu.storage]": 0.109,
+    "tests/core/test_knowledge_maintenance_contracts.py::test_maintenance_contracts_work_without_storage_implementations[cayu]": 0.117,
+    "tests/core/test_knowledge_maintenance_contracts.py::test_maintenance_values_round_trip_through_the_canonical_pickle_path": 0.006,
     "tests/core/test_knowledge_package_layout.py::test_relation_contracts_do_not_load_storage_implementations[cayu.knowledge.relations]": 0.099,
     "tests/core/test_knowledge_package_layout.py::test_relation_contracts_do_not_load_storage_implementations[cayu.storage]": 0.1,
     "tests/core/test_knowledge_package_layout.py::test_relation_contracts_do_not_load_storage_implementations[cayu]": 0.099,

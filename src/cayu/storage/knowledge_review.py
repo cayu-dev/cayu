@@ -9,6 +9,12 @@ from cayu._validation import (
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
+from cayu.knowledge.maintenance_contracts import (
+    KnowledgeMaintenanceDecision,
+    KnowledgeMaintenanceDecisionKind,
+    KnowledgeMaintenanceDecisionReceipt,
+    KnowledgeMaintenanceProposal,
+)
 from cayu.knowledge.records import (
     DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
@@ -33,10 +39,6 @@ from cayu.storage.memory import (
     KnowledgeGovernanceMode,
     KnowledgeListQuery,
     KnowledgeListResult,
-    KnowledgeMaintenanceDecision,
-    KnowledgeMaintenanceDecisionKind,
-    KnowledgeMaintenanceDecisionReceipt,
-    KnowledgeMaintenanceProposal,
     KnowledgePublicationReceipt,
     KnowledgeReviewApproval,
     _replay_review_approval_from_receipts,

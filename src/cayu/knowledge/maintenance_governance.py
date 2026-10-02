@@ -25,6 +25,17 @@ from cayu._validation import (
     copy_durable_json_object,
     require_durable_clean_nonblank,
 )
+from cayu.knowledge.maintenance_contracts import (
+    KnowledgeMaintenanceConflict,
+    KnowledgeMaintenanceDecision,
+    KnowledgeMaintenanceDecisionKind,
+    KnowledgeMaintenanceDecisionReceipt,
+    KnowledgeMaintenanceOutcome,
+    KnowledgeMaintenanceProposal,
+    copy_knowledge_maintenance_decision,
+    copy_knowledge_maintenance_decision_receipt,
+    copy_knowledge_maintenance_proposal,
+)
 from cayu.knowledge.maintenance_persistence import (
     KnowledgeMaintenanceAcceptedPlan,
     KnowledgeMaintenanceProposalPublication,
@@ -39,16 +50,7 @@ from cayu.storage.memory import (
     KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY,
     KnowledgeGovernanceConfig,
     KnowledgeGovernanceMode,
-    KnowledgeMaintenanceConflict,
-    KnowledgeMaintenanceDecision,
-    KnowledgeMaintenanceDecisionKind,
-    KnowledgeMaintenanceDecisionReceipt,
-    KnowledgeMaintenanceOutcome,
-    KnowledgeMaintenanceProposal,
     KnowledgeStore,
-    copy_knowledge_maintenance_decision,
-    copy_knowledge_maintenance_decision_receipt,
-    copy_knowledge_maintenance_proposal,
     knowledge_access_scope_sha256,
 )
 

@@ -35,6 +35,7 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_finite,
 )
+from cayu.knowledge.maintenance_contracts import MAX_KNOWLEDGE_MAINTENANCE_SOURCES
 from cayu.knowledge.records import (
     KnowledgeEntry,
     KnowledgeEntryReadLimitExceeded,
@@ -55,9 +56,6 @@ from cayu.knowledge.relations import (
 from cayu.knowledge.scopes import (
     KnowledgeAccessScope,
     copy_knowledge_access_scope,
-)
-from cayu.storage.memory import (
-    MAX_KNOWLEDGE_MAINTENANCE_SOURCES,
 )
 
 KNOWLEDGE_MAINTENANCE_ROUTING_SCHEMA_VERSION = 1

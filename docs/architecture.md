@@ -386,9 +386,12 @@ Context policies are runtime projections over transcript messages, not storage. 
 Knowledge records and access scopes live in `knowledge/records.py` and
 `knowledge/scopes.py`. `knowledge/relations.py` owns exact-revision relation and
 lineage contracts, detached copies, page validation and relation publication
-preparation/replay validation. These contracts can be used without loading a
-storage implementation. Memory, SQLite and PostgreSQL stores compose the same
-contracts with their own access checks and atomic persistence operations.
+preparation/replay validation. `knowledge/maintenance_contracts.py` owns reviewed
+maintenance proposals, decisions, receipts and their deterministic preparation,
+consistency and replay checks. These contracts and the maintenance router/planner
+can be used without loading a storage implementation. Memory, SQLite and
+PostgreSQL stores compose the same contracts with their own access checks and
+atomic persistence operations.
 The existing `cayu`, `cayu.storage` and `cayu.storage.memory` imports resolve to
 the same canonical types, including persisted legacy pickle class paths.
 

@@ -35,6 +35,11 @@ from cayu.knowledge.maintenance import (
     KnowledgeMaintenanceRoutingRequest,
     KnowledgeMaintenanceRoutingResult,
 )
+from cayu.knowledge.maintenance_contracts import (
+    MAX_KNOWLEDGE_MAINTENANCE_BYTES,
+    KnowledgeMaintenanceProposal,
+    copy_knowledge_maintenance_proposal,
+)
 from cayu.knowledge.maintenance_planning import (
     KNOWLEDGE_MAINTENANCE_DETERMINISTIC_EVALUATOR_VERSION,
     KnowledgeMaintenanceEvaluationVerdict,
@@ -71,9 +76,6 @@ from cayu.storage.knowledge_indexer import (
     KnowledgeIndexResult,
 )
 from cayu.storage.memory import (
-    MAX_KNOWLEDGE_MAINTENANCE_BYTES,
-    KnowledgeMaintenanceProposal,
-    copy_knowledge_maintenance_proposal,
     prepare_knowledge_publication,
 )
 

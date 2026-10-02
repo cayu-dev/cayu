@@ -45,6 +45,11 @@ from cayu.knowledge.maintenance import (
     KnowledgeMaintenanceRoutingRequest,
     KnowledgeMaintenanceRoutingResult,
 )
+from cayu.knowledge.maintenance_contracts import (
+    MAX_KNOWLEDGE_MAINTENANCE_BYTES,
+    MAX_KNOWLEDGE_MAINTENANCE_SOURCES,
+    MAX_KNOWLEDGE_MAINTENANCE_TEXT_BYTES,
+)
 from cayu.knowledge.records import (
     BUILTIN_KNOWLEDGE_KINDS,
     MAX_KNOWLEDGE_REVISION,
@@ -58,11 +63,6 @@ from cayu.knowledge.relations import KnowledgeRelationKind
 from cayu.knowledge.scopes import (
     KnowledgeAccessScope,
     copy_knowledge_access_scope,
-)
-from cayu.storage.memory import (
-    MAX_KNOWLEDGE_MAINTENANCE_BYTES,
-    MAX_KNOWLEDGE_MAINTENANCE_SOURCES,
-    MAX_KNOWLEDGE_MAINTENANCE_TEXT_BYTES,
 )
 
 KNOWLEDGE_MAINTENANCE_PLANNING_SCHEMA_VERSION = 1
