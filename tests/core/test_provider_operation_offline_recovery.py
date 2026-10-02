@@ -71,6 +71,7 @@ from cayu.providers.operations import (
     ProviderOperationStatus,
 )
 from cayu.runtime import _model_step_executor as model_step_executor
+from cayu.runtime import _provider_operation_cancellation_owner as cancellation_owner
 from cayu.runtime import _recovery_coordinator as recovery_coordinator_module
 from cayu.runtime import _session_engine as session_engine_module
 from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
@@ -7608,12 +7609,12 @@ def test_cancellation_claim_heartbeat_failure_stops_the_active_owner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        model_step_executor,
+        cancellation_owner,
         "_PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE",
         timedelta(milliseconds=500),
     )
     monkeypatch.setattr(
-        model_step_executor,
+        cancellation_owner,
         "_PROVIDER_OPERATION_CANCELLATION_CLAIM_HEARTBEAT_SECONDS",
         0.005,
     )
@@ -7658,12 +7659,12 @@ def test_cancellation_claim_acknowledgement_expiry_prevents_provider_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        model_step_executor,
+        cancellation_owner,
         "_PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE",
         timedelta(milliseconds=50),
     )
     monkeypatch.setattr(
-        model_step_executor,
+        cancellation_owner,
         "_PROVIDER_OPERATION_CANCELLATION_CLAIM_HEARTBEAT_SECONDS",
         0.005,
     )
@@ -7706,12 +7707,12 @@ def test_successful_claim_release_does_not_trigger_heartbeat_ownership_loss(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        model_step_executor,
+        cancellation_owner,
         "_PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE",
         timedelta(milliseconds=500),
     )
     monkeypatch.setattr(
-        model_step_executor,
+        cancellation_owner,
         "_PROVIDER_OPERATION_CANCELLATION_CLAIM_HEARTBEAT_SECONDS",
         0.005,
     )
@@ -7810,12 +7811,12 @@ def test_recovery_reuses_completed_cancellation_resolution_before_retrieval(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        model_step_executor,
+        cancellation_owner,
         "_PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE",
         timedelta(seconds=120),
     )
     monkeypatch.setattr(
-        model_step_executor,
+        cancellation_owner,
         "_PROVIDER_OPERATION_CANCELLATION_CLAIM_HEARTBEAT_SECONDS",
         60.0,
     )
@@ -7994,12 +7995,12 @@ def test_recovery_does_not_repeat_an_uncertain_provider_cancellation_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        model_step_executor,
+        cancellation_owner,
         "_PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE",
         timedelta(seconds=120),
     )
     monkeypatch.setattr(
-        model_step_executor,
+        cancellation_owner,
         "_PROVIDER_OPERATION_CANCELLATION_CLAIM_HEARTBEAT_SECONDS",
         60.0,
     )
@@ -8277,12 +8278,12 @@ def test_expired_cancellation_claim_allows_worker_loss_takeover(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        model_step_executor,
+        cancellation_owner,
         "_PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE",
         timedelta(seconds=120),
     )
     monkeypatch.setattr(
-        model_step_executor,
+        cancellation_owner,
         "_PROVIDER_OPERATION_CANCELLATION_CLAIM_HEARTBEAT_SECONDS",
         60.0,
     )

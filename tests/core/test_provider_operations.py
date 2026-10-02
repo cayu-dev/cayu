@@ -2403,7 +2403,7 @@ def test_timed_out_provider_cancellation_remains_owned_until_drained(
 ) -> None:
     async def scenario() -> tuple[bool, int]:
         monkeypatch.setattr(
-            "cayu.runtime._model_step_executor._PROVIDER_OPERATION_START_CLEANUP_TIMEOUT_SECONDS",
+            "cayu.runtime._provider_operation_cancellation_owner._PROVIDER_OPERATION_START_CLEANUP_TIMEOUT_SECONDS",
             0.0,
         )
         store = _FailBeforeCommitOnEventStore(
@@ -2452,7 +2452,7 @@ def test_runtime_shutdown_drains_concurrent_definite_absence_cancellations_befor
     async def scenario() -> None:
         operation_count = 12
         monkeypatch.setattr(
-            "cayu.runtime._model_step_executor._PROVIDER_OPERATION_START_CLEANUP_TIMEOUT_SECONDS",
+            "cayu.runtime._provider_operation_cancellation_owner._PROVIDER_OPERATION_START_CLEANUP_TIMEOUT_SECONDS",
             0.0,
         )
         database_path = tmp_path / "provider-cancellation-shutdown.sqlite3"

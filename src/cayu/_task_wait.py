@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 _ResultT = TypeVar("_ResultT")
 
@@ -272,3 +273,10 @@ async def await_shielded_task_outcome(
                 raise
             break
     return completed_task_outcome()
+
+
+def _consume_detached_task_outcome(task: asyncio.Task[Any]) -> None:
+    """Retrieve a timed-out task's eventual result after requesting cancellation."""
+
+    with contextlib.suppress(asyncio.CancelledError):
+        task.exception()

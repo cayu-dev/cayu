@@ -189,6 +189,16 @@ continuations, manual outcome reconciliation, incomplete-session repair, and
 abandoned-run finalization. Model, tool, environment, limit, control, and event
 modules own their complete lower-level behavior slices.
 
+`ProviderOperationCancellationOwner` owns durable provider cancellation claims,
+lease renewal, cancellation evidence, accounting handoff and exact claim release.
+Live execution and recovered interruption share this owner through
+`ModelStepExecutor`. It composes the existing `ProviderOperationCancellationLifecycle`,
+which retains process-local task admission, deduplication and shutdown ownership.
+The durable owner receives explicit store, event writer, budget controller and
+recovery-context reader dependencies. The reader validates the stage on each use;
+the owner does not cache authority or change backend transaction boundaries.
+Provider start/reconnect and stream-progress recovery remain with the executor.
+
 `TerminalEvidenceFinalization` owns terminal-evidence inspection and crash repair,
 as well as live claim transfer, exact renewal, heartbeat-monitored preparation and
 streamed completion. Recovery and the engine share one instance. It borrows
