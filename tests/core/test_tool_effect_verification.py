@@ -332,7 +332,7 @@ def test_verify_tool_effect_rejects_process_isolated_tool_portably(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "cayu.applications.validate_process_isolated_tool_registration",
+        "cayu._application_registration.validate_process_isolated_tool_registration",
         lambda *_args, **_kwargs: None,
     )
     tool = ProcessIsolatedTool(

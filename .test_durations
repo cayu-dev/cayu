@@ -1,4 +1,6 @@
 {
+    "tests/core/test_application_registration_components.py::test_registration_components_compose_without_application_controllers": 0.856,
+    "tests/core/test_application_registration_components.py::test_registration_helpers_preserve_legacy_import_and_pickle_identity": 0.0,
     "tests/core/test_live_model_attempt.py::test_closing_live_attempt_at_event_boundary_closes_stream_once[model.completed]": 0.385,
     "tests/core/test_live_model_attempt.py::test_closing_live_attempt_at_event_boundary_closes_stream_once[model.text.delta]": 0.664,
     "tests/core/test_live_model_attempt.py::test_existing_attempt_imports_keep_exact_identity": 0.0,

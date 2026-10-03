@@ -169,6 +169,13 @@ requests, owns registrations and configuration, constructs the runtime
 collaborators, and delegates execution. Deep runtime modules do not import or
 accept the complete application object.
 
+`_application_registration.py` owns validation of agent/environment declarations
+and provider model patterns, registered-tool validation and copying, and tool
+descriptor construction. These functions take explicit inputs and can be used
+without loading `CayuApp`. Registration, MCP refresh and public inspection compose
+the same functions; the application retains registry mutation, MCP ownership and
+atomic publication, shutdown, and capture of the public registration call site.
+
 ```text
 CayuApp
   -> RuntimeEventWriter
