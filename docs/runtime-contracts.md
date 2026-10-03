@@ -12130,6 +12130,15 @@ session continues in a fresh container; lookup failures raise. It does not
 compare configuration, so re-pinning the image does not strand completed
 sessions. Factories with immutable inputs keep exact reconnect.
 
+Failed and interrupted invocations also retain a durable binding-finalization
+obligation before completion-critical cleanup begins. That obligation preserves
+the original terminal outcome, binding generation, source revisions and frozen
+execution profile. Registered recovery retries only that binding's finalization
+and disposal; it does not turn an interrupted session into a completed one or
+redispatch model/tool work. The recovery plan's `environment_recovery` exposes
+`completion_finalization_pending` together with `finalization_outcome` to distinguish
+these obligations. A terminal session alone is not proof that cleanup succeeded.
+
 ### Maintained coding-product settlement
 
 `CodingProductRunner` is the product layer above an ordinary Cayu app and the

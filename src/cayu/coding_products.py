@@ -1057,6 +1057,50 @@ class CodingProductCandidate(_FrozenCodingModel):
 
 
 @dataclass(frozen=True)
+class CodingProductExecutionInspection:
+    """Read-only exact-release projection, not caller-supplied cleanup authority."""
+
+    request_fingerprint: str
+    release_fingerprint: str
+    events: tuple[Event, ...]
+    tool_call_ordinals: tuple[int | None, ...]
+
+
+def _inspection_tool_call_ordinals(
+    events: Sequence[Event], *, session_id: str
+) -> tuple[int | None, ...]:
+    """Correlate private dispatch tuples without exporting their identifiers.
+
+    These ordinals are meaningful only alongside this exact inspected transcript;
+    they do not prove quiescence and are not public execution authority.
+    """
+    identities: dict[tuple[str, ...], int] = {}
+    ordinals: list[int | None] = []
+    for event in events:
+        if (
+            event.type
+            not in {
+                EventType.TOOL_CALL_STARTED,
+                EventType.TOOL_CALL_COMPLETED,
+                EventType.TOOL_CALL_FAILED,
+            }
+            or event.session_id != session_id
+        ):
+            ordinals.append(None)
+            continue
+        fields = tuple(
+            event.payload.get(name)
+            for name in ("model_step_id", "model_attempt_id", "tool_round_id", "tool_call_id")
+        )
+        if any(type(value) is not str or not value.strip() for value in fields):
+            ordinals.append(None)
+            continue
+        identity = cast("tuple[str, ...]", fields)
+        ordinals.append(identities.setdefault(identity, len(identities)))
+    return tuple(ordinals)
+
+
+@dataclass(frozen=True)
 class CodingProductPublication:
     candidate: CodingProductCandidate
     result_reference: CompletionResultReference
@@ -3843,6 +3887,39 @@ class CodingProductRunner:
                     request, publication, list(receipts), list(artifact_ids)
                 )
                 return publication
+        inspection = await self.inspect_settled_execution(request)
+        return await self._compile_and_publish(
+            request,
+            inspection.events,
+            initial=initial,
+            receipt_list=list(receipts),
+            artifact_list=list(artifact_ids),
+            review_settlement=review_settlement,
+        )
+
+    async def inspect_settled_execution(
+        self, request: CodingProductRequest
+    ) -> CodingProductExecutionInspection:
+        """Read an exact original invocation with durable Runtime release evidence.
+
+        This does not publish a product, resume execution, or establish that an
+        enclosing application worker has stopped. Consumers must separately
+        reconcile that owner and any ambiguous external effects. An interrupted
+        invocation is not evidence of a successful coding result.
+        """
+        if type(request) is not CodingProductRequest:
+            raise TypeError("Inspection requires CodingProductRequest.")
+        request = CodingProductRequest.model_validate(
+            request.model_dump(mode="python", warnings=False)
+        )
+        await self.repository.load_initial_source_observation(request)
+        if (
+            self.source_workspace.id != request.source.workspace_id
+            or self.observation_limits != request.source.observation_limits
+        ):
+            raise CodingProductAdmissionError(
+                "Inspection source conflicts with admitted authority."
+            )
         binding = await self.app.session_invocation_for_dispatch(request.session_id)
         anchor = await self.repository._load_execution_anchor(request)
         if anchor.binding != binding:
@@ -3915,7 +3992,7 @@ class CodingProductRunner:
                 original=active.model_copy(update={"run_epoch": anchor.run_epoch}),
                 current=active,
             )
-            released_invocation_evidence(
+            release = released_invocation_evidence(
                 session,
                 checkpoint,
                 session_id=binding.id,
@@ -3937,13 +4014,20 @@ class CodingProductRunner:
             or public_starts[0].interaction_id != anchor.interaction_id
         ):
             raise CodingProductReconstructionRequiredError("Recovery execution anchor changed.")
-        return await self._compile_and_publish(
-            request,
-            events,
-            initial=initial,
-            receipt_list=list(receipts),
-            artifact_list=list(artifact_ids),
-            review_settlement=review_settlement,
+        if len(events) > request.settlement.max_events:
+            raise CodingProductReconstructionRequiredError("Inspection event bound exceeded.")
+        return CodingProductExecutionInspection(
+            request_fingerprint=request.fingerprint,
+            release_fingerprint="sha256:"
+            + sha256(
+                canonical_durable_json_bytes(
+                    release.model_dump(mode="json"), "coding_product_invocation_release"
+                )
+            ).hexdigest(),
+            events=events,
+            tool_call_ordinals=_inspection_tool_call_ordinals(
+                tuple(record.event for record in snapshot.events), session_id=binding.id
+            ),
         )
 
     @staticmethod

@@ -500,12 +500,14 @@ from cayu.tasks.dispatch import (
 )
 from cayu.tasks.records import Task, TaskStatus, copy_task
 from cayu.tools._operation_boundary import BoundedInvocationOperationRegistry
-from cayu.tools._runner import durable_runner_recovery_authority
+from cayu.tools._runner import durable_runner_receipt_observer, durable_runner_recovery_authority
 from cayu.tools.base import (
     _TOOL_POLICY_DENIAL_SOURCE,
     DurableToolOperationConflict,
     DurableToolRecoveryAuthority,
     DurableToolRecoveryEvidence,
+    DurableToolRecoveryIdentity,
+    DurableToolRecoveryInspection,
     ToolEffect,
     ToolResult,
 )
@@ -14857,6 +14859,82 @@ class RecoveryCoordinator:
             and pending_round.structured_output_validation is not None
         )
 
+    async def has_recoverable_durable_tool_result(
+        self,
+        *,
+        session: Session,
+        tool_round_id: str,
+        tool_call_id: str,
+    ) -> bool:
+        """Advisory, read-only readiness; actual recovery repeats all checks under its fence."""
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        pending = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        if (
+            pending is None
+            or pending.tool_round_id != tool_round_id
+            or pending.source_run_epoch is None
+            or pending.execution_profile_fingerprint is None
+        ):
+            return False
+        call = next(
+            (item for item in pending.tool_calls if item.tool_call_id == tool_call_id), None
+        )
+        if (
+            call is None
+            or call.policy_decision != ToolPolicyDecision.ALLOW.value
+            or approval_support.effective_tool_policy_evidence(call)
+            is not ToolPolicyEvidence.AUTHORITATIVE
+        ):
+            return False
+        agent = self._resolve_registered_agent(session.agent_name)
+        registered = agent.executable_tool(call.tool_name)
+        if registered is None or not isinstance(
+            registered.durable_tool_recovery, DurableToolRecoveryInspection
+        ):
+            return False
+        environment = self._resolve_registered_environment(session.environment_name)
+        allocation = None
+        observer = None
+        if environment is not None:
+            allocation = (
+                await self._environment_lifecycle.durable_live_allocation_fingerprint(
+                    session_id=session.id, environment_name=environment.spec.name
+                )
+                if environment.factory_backed
+                else environment.live_allocation_fingerprint
+            )
+            source = (
+                environment.factory
+                if environment.factory_backed
+                else environment.environment.runner
+            )
+            observer = durable_runner_receipt_observer(source, redactor=self._secret_redactor)
+
+        async def load_operation(key: str) -> dict[str, Any] | None:
+            return await self._session_store.load_session_operation(session.id, key)
+
+        request = approval_support.tool_call_request_from_pending(call)
+        identity = DurableToolRecoveryIdentity(
+            parent_session_id=session.id,
+            parent_run_epoch=pending.source_run_epoch,
+            execution_profile_fingerprint=pending.execution_profile_fingerprint,
+            environment_name=session.environment_name,
+            environment_allocation_fingerprint=allocation,
+            model_step_id=pending.model_step_id,
+            model_attempt_id=pending.model_attempt_id,
+            tool_round_id=pending.tool_round_id,
+            tool_call_id=call.tool_call_id,
+            idempotency_key=tool_execution.tool_idempotency_key(
+                session_id=session.id,
+                tool_round_id=pending.tool_round_id,
+                tool_call_id=call.tool_call_id,
+            ),
+            arguments=copy_json_value(request.arguments, "durable_recovery_inspection.arguments"),
+        )
+        return await registered.durable_tool_recovery.inspect_durable_tool_call(
+            identity=identity, load_operation=load_operation, observe_receipt=observer
+        )
+
     async def has_completed_tool_round_results(
         self,
         *,
@@ -15979,6 +16057,9 @@ class RecoveryCoordinator:
                 compare_and_set_operation=compare_and_set_durable_tool_operation,
                 runner_resource_identity=runner_resource_identity,
                 reconcile_runner_operation=reconcile_runner_operation,
+                reconcile_runner_receipt=durable_runner_receipt_observer(
+                    recovery_runner, redactor=self._secret_redactor
+                ),
             )
 
             evidence = await registered_tool.durable_tool_recovery.reconcile_durable_tool_call(
@@ -17553,6 +17634,7 @@ class RecoveryCoordinator:
             session.id
         )
         terminal_repair_required = False
+        terminal_binding_finalization = None
         if session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES:
             terminal_repair = await self.terminal_finalization.repair_required(
                 session=session,
@@ -17571,6 +17653,27 @@ class RecoveryCoordinator:
                 or unsettled_environment_lifecycle
                 or bool(pending_allocations)
             )
+            if (
+                not has_pending_work
+                and active_invocation_profile is not None
+                and not active_invocation_execution_profile_is_released(
+                    active_invocation_profile,
+                    session_id=session.id,
+                    run_epoch=session.run_epoch,
+                )
+            ):
+                terminal_binding_finalization = (
+                    await self._environment_lifecycle.prepare_terminal_binding_finalization(
+                        session=session,
+                        execution_profile=active_invocation_profile.profile,
+                        registered_environment=self._resolve_registered_environment(
+                            session.environment_name
+                        ),
+                    )
+                )
+                if terminal_binding_finalization is not None:
+                    pending_completion_finalization = terminal_binding_finalization.marker()
+                    has_pending_work = True
             if not terminal_repair and not has_pending_work:
                 if active_invocation_profile is not None and not (
                     active_invocation_execution_profile_is_released(
@@ -17774,9 +17877,14 @@ class RecoveryCoordinator:
                     record_rejection=record_profile_rejection,
                 )
             if pending_completion_finalization is not None:
-                if session.status not in {SessionStatus.RUNNING, SessionStatus.FAILED}:
+                expected_terminal_status = (
+                    SessionStatus.INTERRUPTED
+                    if pending_completion_finalization["outcome"] == "interrupted"
+                    else SessionStatus.FAILED
+                )
+                if session.status not in {SessionStatus.RUNNING, expected_terminal_status}:
                     raise RuntimeError(
-                        "Pending completion finalization requires a running or failed session."
+                        "Pending finalization conflicts with the original terminal outcome."
                     )
                 if registered_environment is None or (
                     registered_environment.spec.name
@@ -17794,6 +17902,7 @@ class RecoveryCoordinator:
         invocation_context: InvocationContext | None = None
         authoritative_failure: BaseException | None = None
         provider_execution_transfer: CheckpointTransform | None = None
+        command_recovery_context: InvocationContext | None = None
         if provider_disposition_task_id is not None:
             if pending_provider_disposition is None:
                 raise ProviderOperationEvidenceError(
@@ -17869,7 +17978,22 @@ class RecoveryCoordinator:
             if provider_disposition_after_admission is not None:
                 await provider_disposition_after_admission()
 
+            def retain_cleanup_context(context: InvocationContext) -> None:
+                nonlocal invocation_context
+                invocation_context = context
+
             async def recover_claimed_session() -> IncompleteSessionRecoveryResult:
+                nonlocal registered_environment, invocation_context, command_recovery_context
+                assert claim is not None
+                recovery_session = claim.session
+                if terminal_binding_finalization is not None:
+                    if invocation_context is None:
+                        raise RuntimeError("Terminal binding cleanup lost invocation authority.")
+                    await self._environment_lifecycle.checkpoint_terminal_binding_finalization(
+                        session=claim.session,
+                        invocation_context=invocation_context,
+                        expected=terminal_binding_finalization,
+                    )
                 if post_action_round is not None and post_action is not None:
                     if invocation_context is None:
                         raise RuntimeError("Post-action continuation lost invocation authority.")
@@ -17949,16 +18073,156 @@ class RecoveryCoordinator:
                                 "recover_incomplete_session. " + diagnostic.message
                             ),
                         )
-                lifecycle_events = await self._environment_lifecycle.reconcile_orphaned_progress(
-                    session_id=claim.session.id,
-                    interaction_id=(
-                        None
-                        if active_invocation_profile is None
-                        else active_invocation_profile.interaction_id
-                    ),
-                    observed_at=self._clock(),
+                lifecycle_events = list(
+                    await self._environment_lifecycle.reconcile_orphaned_progress(
+                        session_id=claim.session.id,
+                        interaction_id=(
+                            None
+                            if active_invocation_profile is None
+                            else active_invocation_profile.interaction_id
+                        ),
+                        observed_at=self._clock(),
+                    )
                 )
+                # Factory registrations have no live runner/workspace. Reuse the
+                # round owner's exact recorded/staged evidence before inspecting
+                # missing command results. Completed sibling tools need not
+                # implement command recovery; unknown effects remain fenced.
+                pending = tool_round_recovery.pending_tool_round_from_checkpoint(
+                    await self._session_store.load_checkpoint(claim.session.id)
+                )
+                settled_call_ids: set[str] = set()
+                if (
+                    not interrupt_for_manual_tool_recovery
+                    and registered_environment is not None
+                    and registered_environment.factory_backed
+                    and invocation_context is not None
+                    and pending is not None
+                    and pending.source_run_epoch is not None
+                    and pending.tool_calls
+                ):
+                    lifecycle_events_for_round = await self._load_tool_round_lifecycle_events(
+                        session_id=claim.session.id, pending_round=pending
+                    )
+                    recorded_outcomes, _ = tool_round_recovery.recorded_tool_outcomes(
+                        events=lifecycle_events_for_round, pending_round=pending
+                    )
+                    terminal_events = [
+                        *lifecycle_events_for_round,
+                        *(
+                            item.event
+                            for item in tool_round_recovery.staged_terminal_records(pending)
+                        ),
+                    ]
+                    settled_call_ids = {
+                        call_id
+                        for call_id in recorded_outcomes
+                        if self._tool_terminals_are_settled(
+                            [
+                                event
+                                for event in terminal_events
+                                if event.payload.get("tool_call_id") == call_id
+                            ],
+                            [call_id],
+                        )
+                    }
+                if (
+                    not interrupt_for_manual_tool_recovery
+                    and registered_environment is not None
+                    and registered_environment.factory_backed
+                    and invocation_context is not None
+                    and pending is not None
+                    and pending.source_run_epoch is not None
+                    and pending.tool_calls
+                    # Fully settled rounds need only native evidence repair,
+                    # not a runner reconnect or Docker binding authority.
+                    and any(
+                        call.tool_call_id not in settled_call_ids for call in pending.tool_calls
+                    )
+                    and all(
+                        [
+                            call.tool_call_id in settled_call_ids
+                            or await self.has_recoverable_durable_tool_result(
+                                session=recovery_session,
+                                tool_round_id=pending.tool_round_id,
+                                tool_call_id=call.tool_call_id,
+                            )
+                            for call in pending.tool_calls
+                        ]
+                    )
+                ):
+                    try:
+                        command_binding_authority = (
+                            await self._environment_lifecycle.authorize_command_binding_recovery(
+                                session=claim.session,
+                                invocation_context=invocation_context,
+                                source_run_epoch=pending.source_run_epoch,
+                            )
+                        )
+                        factory_started = await self._environment_lifecycle.emit_factory_started(
+                            session=claim.session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            execution_profile=invocation_context.profile,
+                            invocation_context=invocation_context,
+                        )
+                        if factory_started is not None:
+                            lifecycle_events.append(factory_started)
+                        resolution = await self._environment_lifecycle.resolve_factory(
+                            session=claim.session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            started_event=factory_started,
+                            operation=EnvironmentFactoryOperation.RECONNECT,
+                            execution_profile=invocation_context.profile,
+                            invocation_context=invocation_context,
+                            command_recovery=command_binding_authority,
+                        )
+                        lifecycle_events.extend(resolution.events)
+                        registered_environment = resolution.registered_environment
+                        if registered_environment is not None:
+                            invocation_context = invocation_context.with_registered_environment(
+                                registered_environment, validated_profile=invocation_context.profile
+                            )
+                        if resolution.error is not None:
+                            raise resolution.error
+                        binding_started = await self._environment_lifecycle.emit_binding_started(
+                            session=claim.session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            execution_profile=invocation_context.profile,
+                            invocation_context=invocation_context,
+                        )
+                        if binding_started is not None:
+                            lifecycle_events.append(binding_started)
+                        bound = await self._environment_lifecycle.bind(
+                            session=claim.session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            started_event=binding_started,
+                            execution_profile=invocation_context.profile,
+                            invocation_context=invocation_context,
+                            command_recovery=command_binding_authority,
+                        )
+                        lifecycle_events.extend(bound.events)
+                        registered_environment = bound.registered_environment
+                        if registered_environment is not None:
+                            invocation_context = invocation_context.with_registered_environment(
+                                registered_environment, validated_profile=invocation_context.profile
+                            )
+                        if bound.error is not None:
+                            raise bound.error
+                        command_recovery_context = invocation_context
+                    except BaseException as error:
+                        await self._environment_lifecycle.abort_environment_setup(
+                            session_id=claim.session.id,
+                            original_error=error,
+                            execution_profile=invocation_context.profile,
+                            invocation_context=invocation_context,
+                        )
+                        raise
                 recovered = await self._recover_incomplete_session(
+                    retain_cleanup_context=retain_cleanup_context,
                     preserve_interaction_id=preserve_interaction_id,
                     participant_context=participant_context,
                     session=claim.session,
@@ -18021,6 +18285,17 @@ class RecoveryCoordinator:
             )
         except BaseException as exc:
             authoritative_failure = exc
+            if command_recovery_context is not None:
+                try:
+                    await self._environment_lifecycle.abort_environment_setup(
+                        session_id=session.id,
+                        original_error=exc,
+                        execution_profile=command_recovery_context.profile,
+                        invocation_context=command_recovery_context,
+                    )
+                except BaseException as cleanup_error:
+                    authoritative_failure = cleanup_error
+                    raise
             raise
         finally:
             if claim is not None:
@@ -20628,10 +20903,22 @@ class RecoveryCoordinator:
         registered_environment: runtime_records.RegisteredEnvironment,
         execution_profile: ExecutionProfileIdentity,
         invocation_context: InvocationContext,
+        retain_cleanup_context: Callable[[InvocationContext], None],
     ) -> IncompleteSessionRecoveryResult:
-        """Reconnect and retry only the retained workspace commit boundary."""
+        """Reconnect and retry finalization without changing its terminal outcome."""
 
-        if invocation_context.work_attempt is not None:
+        completing = marker["outcome"] == "completed"
+        terminal_status = (
+            SessionStatus.INTERRUPTED
+            if marker["outcome"] == "interrupted"
+            else SessionStatus.FAILED
+        )
+        terminal_event_type = {
+            "completed": EventType.SESSION_COMPLETED,
+            "failed": EventType.SESSION_FAILED,
+            "interrupted": EventType.SESSION_INTERRUPTED,
+        }[marker["outcome"]]
+        if completing and invocation_context.work_attempt is not None:
             await self._require_governed_completion_task(
                 session=session, marker=marker, invocation_context=invocation_context
             )
@@ -20671,11 +20958,11 @@ class RecoveryCoordinator:
             session = await self._session_store.transition_status_and_checkpoint(
                 session.id,
                 from_statuses={SessionStatus.RUNNING},
-                to_status=SessionStatus.FAILED,
+                to_status=terminal_status,
                 store_time_checkpoint_transform=fail_pending_completion,
             )
-        elif session.status is not SessionStatus.FAILED:
-            raise RuntimeError("Pending completion finalization requires a failed session.")
+        elif session.status is not terminal_status:
+            raise RuntimeError("Pending finalization conflicts with the session terminal outcome.")
 
         completion_recovery = await self._environment_lifecycle.authorize_completion_recovery(
             session=session, invocation_context=invocation_context, marker=marker
@@ -20722,6 +21009,7 @@ class RecoveryCoordinator:
                     resolved_environment,
                     validated_profile=execution_profile,
                 )
+                retain_cleanup_context(resolved_context)
                 if factory_resolution.error is not None:
                     raise factory_resolution.error
                 binding_started = await self._environment_lifecycle.emit_binding_started(
@@ -20752,11 +21040,12 @@ class RecoveryCoordinator:
                     resolved_environment,
                     validated_profile=execution_profile,
                 )
+                retain_cleanup_context(resolved_context)
                 if binding_result.error is not None:
                     raise binding_result.error
                 finalized = await self._environment_lifecycle.finalize_terminal_event(
                     event=Event(
-                        type=EventType.SESSION_COMPLETED,
+                        type=terminal_event_type,
                         session_id=session.id,
                         agent_name=registered_agent.spec.name,
                         environment_name=resolved_environment.spec.name,
@@ -20782,19 +21071,20 @@ class RecoveryCoordinator:
                         actions=(IncompleteSessionRecoveryAction.FAILED,),
                         events=tuple(events),
                         message=(
-                            "Workspace completion finalization remains pending; the failed "
+                            "Workspace finalization remains pending; the terminal "
                             "session was not re-executed."
                         ),
                     )
-            task_failed_event = await self._settle_recovered_completion_task(
-                session=session,
-                marker=marker,
-                registered_agent=registered_agent,
-                registered_environment=resolved_environment,
-                invocation_context=resolved_context,
-            )
-            if task_failed_event is not None:
-                events.append(task_failed_event)
+            if completing:
+                task_failed_event = await self._settle_recovered_completion_task(
+                    session=session,
+                    marker=marker,
+                    registered_agent=registered_agent,
+                    registered_environment=resolved_environment,
+                    invocation_context=resolved_context,
+                )
+                if task_failed_event is not None:
+                    events.append(task_failed_event)
             terminal_repair = await self.terminal_finalization.repair(
                 session=session,
                 terminal_run_epoch=session_before_fence.run_epoch,
@@ -20846,6 +21136,7 @@ class RecoveryCoordinator:
     async def _recover_incomplete_session(
         self,
         *,
+        retain_cleanup_context: Callable[[InvocationContext], None],
         session: Session,
         session_before_fence: Session,
         previous_status: SessionStatus,
@@ -20927,6 +21218,7 @@ class RecoveryCoordinator:
                     "Pending completion finalization conflicts with other recovery work."
                 )
             return await self._recover_pending_completion_finalization(
+                retain_cleanup_context=retain_cleanup_context,
                 session=session,
                 session_before_fence=session_before_fence,
                 previous_status=previous_status,

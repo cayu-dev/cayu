@@ -4,7 +4,7 @@ import asyncio
 from contextlib import asynccontextmanager
 
 import pytest
-from tests.core.producer_pruning_observation import prune_to_receipt
+from tests.core.producer_pruning_observation import prune_to_receipt, retire_to_receipt
 from tests.core.test_collaboration_namespace import rotate
 from tests.core.test_participant_identity import CONTEXT
 from tests.core.test_prepared_admission_public import native_stores as native_stores
@@ -47,14 +47,14 @@ async def test_public_producer_pruning_failure_replays_exact_batch(
     )
     store = native_stores[0]
     _, rotated = await rotate(store, initialized)
-    await app.retire_collaboration_namespace(
+    await retire_to_receipt(
+        app,
         NamespaceRetire(
             operation=rotated.successor.reference.operation("retire-for-pruning-failure"),
             namespace=rotated.namespace.reference,
             expected_revision=rotated.namespace.revision,
             expected_retired_through=0,
         ),
-        context=CONTEXT,
     )
     key = operation_key(admission.expected.operation)
     for index in range(32):
@@ -74,7 +74,7 @@ async def test_public_producer_pruning_failure_replays_exact_batch(
             and cursor["next_producer_index"] < len(cursor["producer_items"])
         ):
             break
-        await app.prune_collaboration_namespace(batch, context=CONTEXT)
+        await prune_to_receipt(app, batch)
     else:
         pytest.fail("Producer pruning never reached its durable inventory phase")
 
@@ -115,9 +115,9 @@ async def test_public_producer_pruning_failure_replays_exact_batch(
     with monkeypatch.context() as patch:
         patch.setattr(store, "_transaction", inject)
         if failure == "deadline":
-            # The request coordinator shares this store owner; setup gave it a
-            # 60-second functional allowance. Exercise the real 10-second
-            # observation deadline explicitly, without changing mutation work.
+            # Request and store observations have separate bounds. Exercise
+            # the store's real 10-second observation deadline explicitly,
+            # without changing mutation work or the app's allowance.
             patch.setattr(store._owners, "observation_timeout", 10)
             pending_observed = asyncio.Event()
             owner = asyncio.create_task(

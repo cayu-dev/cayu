@@ -84,3 +84,34 @@ Cayu's normal execution-profile contract.
 Named checks execute repository-controlled code. They do not make a local
 runner or an ordinary Docker container safe for hostile repositories, grant
 network or credentials, install dependencies, or authorize source publication.
+
+## Worker-loss recovery
+
+Toolchain-backed checks use the same private command journal as `run_command`.
+For admitted Linux Docker runners with Python 3, sandbox cancellation/timeout
+cleanup, no runner-owned secrets and capture limits of at most 1 MiB per stream,
+the journal saves exact private launch authority before dispatch. A guest-owned
+supervisor retains bounded output independently of the worker and signs a
+terminal receipt only after its command descendants and output streams settle.
+The independent deadline bounds the command even if the worker dies. This
+requires the admitted dropped-capabilities boundary; it is not hostile-code
+isolation. Other runners and larger captures retain their existing recovery
+capabilities, without claiming worker-independent receipts.
+
+Registered recovery planning may read and authenticate that receipt from the
+original allocation. Planning neither reconnects the workspace nor publishes a
+tool result. Execution revalidates the exact call, request, allocation and
+receipt under the existing run fence before reconstructing the named-check
+result. Docker coding bindings retain their initial source-baseline ownership
+before tool dispatch; recovery restores it without repeating source copy-in or
+erasing guest changes. This binding state is not a completion receipt.
+Recovery does not rerun the check or call the model. Task ownership, workspace
+reconciliation and allocation disposal remain with their existing recovery
+owners; a command receipt alone does not authorize source publication.
+
+Missing, changed, malformed or unauthenticated receipts remain unknown outcomes.
+An exited process, a removed container, a dispatch journal or a previously ready
+plan is not proof of command completion. Retain the fenced state until supported
+reconciliation is possible. Private launch authority and raw guest receipts are
+not model-facing output; recovered output passes the configured redaction and
+bounded result-projection paths before publication.

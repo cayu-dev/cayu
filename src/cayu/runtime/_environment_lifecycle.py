@@ -88,7 +88,10 @@ from cayu.environments.bindings import (
     _runtime_owned_workspace_observer_name,
     copy_workspace_snapshot,
 )
-from cayu.environments.docker_coding import DockerCodingWorkspaceBinding
+from cayu.environments.docker_coding import (
+    DockerCodingEnvironmentFactory,
+    DockerCodingWorkspaceBinding,
+)
 from cayu.environments.factory import (
     EnvironmentAllocationScope,
     EnvironmentAllocationState,
@@ -214,6 +217,7 @@ from cayu.sessions.base import (
     RuntimePublicationMutation,
     Session,
     SessionMessageDeliveryBatch,
+    SessionOperationPublication,
     SessionRunFenced,
     SessionStatus,
     SessionStore,
@@ -536,7 +540,7 @@ class EnvironmentBindingFinalizeResult:
 def pending_completion_finalization_from_checkpoint(
     checkpoint: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """Return one validated private completion-finalization recovery marker."""
+    """Return private finalization retry state for an invocation's terminal outcome."""
 
     if checkpoint is None:
         return None
@@ -546,7 +550,11 @@ def pending_completion_finalization_from_checkpoint(
     if type(raw) is not dict:
         raise ValueError("Pending completion finalization checkpoint must be an object.")
     marker = copy_durable_json_object(raw, "pending completion finalization")
-    if marker.get("version") != 1 or marker.get("outcome") != "completed":
+    if (
+        type(marker.get("version")) is not int
+        or marker["version"] != 1
+        or marker.get("outcome") not in ("completed", "failed", "interrupted")
+    ):
         raise ValueError("Pending completion finalization checkpoint has an unsupported format.")
     for field_name in (
         "environment_name",
@@ -599,6 +607,29 @@ class _CompletionRecoveryAuthority:
     profile: ExecutionProfileIdentity = field(repr=False)
     recovery_claim_id: str = field(repr=False)
     marker_bytes: bytes = field(repr=False)
+
+
+@dataclass(frozen=True)
+class _CommandBindingRecoveryAuthority:
+    issuer: object = field(repr=False)
+    binding: object = field(repr=False)
+    profile: ExecutionProfileIdentity = field(repr=False)
+    record_bytes: bytes = field(repr=False)
+
+
+@dataclass(frozen=True)
+class _TerminalBindingFinalization:
+    """Private prepared transfer of one saved binding to terminal cleanup."""
+
+    record_bytes: bytes = field(repr=False)
+    marker_bytes: bytes = field(repr=False)
+
+    def marker(self) -> dict[str, Any]:
+        return json.loads(self.marker_bytes)
+
+
+def _command_binding_key(environment_name: str) -> str:
+    return "command-binding:v1:" + sha256(environment_name.encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -947,6 +978,261 @@ class EnvironmentLifecycle:
         )
         return authority
 
+    async def authorize_command_binding_recovery(
+        self,
+        *,
+        session: Session,
+        invocation_context: InvocationContext,
+        source_run_epoch: int,
+    ) -> _CommandBindingRecoveryAuthority:
+        """Restore saved binding ownership, never repeat its initial source copy."""
+        environment = invocation_context.registered_environment
+        if environment is None or invocation_context.recovery_claim_id is None:
+            raise SessionRunFenced("Command binding recovery requires its claimed invocation.")
+        record = await self._session_store.load_session_operation(
+            session.id, _command_binding_key(environment.spec.name)
+        )
+        if record is None or record.get("source_run_epoch") != source_run_epoch:
+            raise RuntimeError("Command binding recovery has no matching source generation.")
+        authority = _CommandBindingRecoveryAuthority(
+            issuer=self,
+            binding=invocation_context.binding,
+            profile=invocation_context.profile,
+            record_bytes=canonical_durable_json_bytes(record, "command binding state"),
+        )
+        await self._validate_command_binding_recovery(
+            authority, session=session, invocation_context=invocation_context
+        )
+        return authority
+
+    async def prepare_terminal_binding_finalization(
+        self,
+        *,
+        session: Session,
+        execution_profile: ExecutionProfileIdentity,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+    ) -> _TerminalBindingFinalization | None:
+        """Inspect saved Docker binding ownership without reconnecting or writing."""
+        if session.status not in {SessionStatus.FAILED, SessionStatus.INTERRUPTED}:
+            return None
+        name = session.environment_name
+        if name is None:
+            return None
+        record = await self._session_store.load_session_operation(
+            session.id, _command_binding_key(name)
+        )
+        if record is None:
+            if registered_environment is not None and isinstance(
+                registered_environment.factory, DockerCodingEnvironmentFactory
+            ):
+                checkpoint = await self._session_store.load_checkpoint(session.id)
+                if (
+                    self._allocation_coordinator.receipt_from_checkpoint(
+                        checkpoint, environment_name=name
+                    )
+                    is not None
+                ):
+                    raise RuntimeError("Terminal Docker allocation lost its saved binding owner.")
+            return None
+        generation = record.get("binding_generation_id")
+        if (
+            record.get("record_type") != "cayu.command_binding.v1"
+            or record.get("session_instance_id") != session.instance_id
+            or type(record.get("execution_profile")) is not str
+            or record.get("environment") != name
+            or type(record.get("source_run_epoch")) is not int
+            or not 0 < record["source_run_epoch"] <= session.run_epoch
+            or type(generation) is not str
+            or not generation.strip()
+            or type(record.get("binding_state")) is not dict
+        ):
+            raise RuntimeError("Terminal binding recovery conflicts with durable ownership.")
+        releases = await self._session_store.query_events(
+            EventQuery(
+                session_id=session.id,
+                environment_name=name,
+                event_types=(EventType.ENVIRONMENT_LIFECYCLE_TRANSITION,),
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=5000,
+            )
+        )
+        released = any(
+            item.event.environment_name == name
+            and item.event.payload.get("binding_generation_id") == generation
+            and item.event.payload.get("execution_profile_fingerprint")
+            == record["execution_profile"]
+            and item.event.payload.get("phase") == "release"
+            and item.event.payload.get("outcome") == "released"
+            and item.event.payload.get("release_action") == "discard"
+            for item in releases
+        )
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        if (
+            released
+            and self._allocation_coordinator.receipt_from_checkpoint(
+                checkpoint, environment_name=name
+            )
+            is None
+        ):
+            reconnect, owner = _factory_reconnect_state_from_checkpoint(
+                checkpoint, environment_name=name
+            )
+            if not reconnect and owner is None:
+                return None
+        allocation = await self.durable_live_allocation_fingerprint(
+            session_id=session.id, environment_name=name
+        )
+        if allocation is None or record.get("allocation") != allocation:
+            raise RuntimeError("Terminal binding recovery conflicts with its live allocation.")
+        if released:
+            return None
+        if record["execution_profile"] != execution_profile.fingerprint:
+            raise RuntimeError("Terminal binding recovery conflicts with its invocation profile.")
+        marker = {
+            "version": 1,
+            "outcome": "interrupted" if session.status is SessionStatus.INTERRUPTED else "failed",
+            "task_id": None,
+            "environment_name": name,
+            "binding_generation_id": generation,
+            "execution_profile_fingerprint": execution_profile.fingerprint,
+            "binding_state": record["binding_state"],
+        }
+        pending_completion_finalization_from_checkpoint(
+            {PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY: marker}
+        )
+        if len(releases) == 5000:
+            raise RuntimeError("Terminal binding release evidence exceeds the inspection bound.")
+        return _TerminalBindingFinalization(
+            record_bytes=canonical_durable_json_bytes(record, "terminal binding record"),
+            marker_bytes=canonical_durable_json_bytes(marker, "terminal binding marker"),
+        )
+
+    async def checkpoint_terminal_binding_finalization(
+        self,
+        *,
+        session: Session,
+        invocation_context: InvocationContext,
+        expected: _TerminalBindingFinalization,
+    ) -> None:
+        """Transfer to the existing finalization owner before any external action."""
+        current = await self.prepare_terminal_binding_finalization(
+            session=session,
+            execution_profile=invocation_context.profile,
+            registered_environment=invocation_context.registered_environment,
+        )
+        if current != expected:
+            raise RuntimeError("Terminal binding changed before cleanup admission.")
+        source = json.loads(expected.record_bytes)
+        authority = await self.authorize_command_binding_recovery(
+            session=session,
+            invocation_context=invocation_context,
+            source_run_epoch=source["source_run_epoch"],
+        )
+        if authority.record_bytes != expected.record_bytes:
+            raise RuntimeError("Terminal binding changed before cleanup transfer.")
+        marker = expected.marker()
+
+        def transfer(current_session, checkpoint, previous, store_now):
+            claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
+            active = active_invocation_execution_profile_from_checkpoint(checkpoint)
+            if (
+                current_session.instance_id != session.instance_id
+                or current_session.run_epoch != session.run_epoch
+                or current_session.status is not session.status
+                or previous != source
+                or claim is None
+                or claim[0] != invocation_context.recovery_claim_id
+                or claim[1] <= store_now
+                or active != invocation_context.active_profile
+            ):
+                raise SessionRunFenced("Terminal binding cleanup lost its exact owner.")
+            copied = copy_durable_record(checkpoint, "checkpoint")
+            existing = pending_completion_finalization_from_checkpoint(copied)
+            if existing is not None and existing != marker:
+                raise RuntimeError("Terminal binding conflicts with pending finalization.")
+            copied[PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY] = marker
+            return SessionOperationPublication(checkpoint=copied, operation_records={})
+
+        with _invocation_lifecycle_authority_read_scope():
+            await self._session_store.publish_session_operation_guarded_with_store_time(
+                session.id,
+                idempotency_key=_command_binding_key(source["environment"]),
+                operation_transform=transfer,
+                commit_guard=lambda: None,
+                commit_time_guard=lambda _store_now: None,
+                events=[],
+                expected_statuses={session.status},
+                expected_run_epoch=session.run_epoch,
+            )
+
+    async def _validate_command_binding_recovery(
+        self,
+        authority: _CommandBindingRecoveryAuthority,
+        *,
+        session: Session,
+        invocation_context: InvocationContext | None,
+    ) -> dict[str, Any]:
+        if (
+            type(authority) is not _CommandBindingRecoveryAuthority
+            or authority.issuer is not self
+            or invocation_context is None
+            or authority.binding is not invocation_context.binding
+            or authority.profile is not invocation_context.profile
+            or invocation_context.recovery_claim_id is None
+            or invocation_context.binding.session_id != session.id
+            or invocation_context.binding.session_instance_id != session.instance_id
+            or invocation_context.binding.run_epoch != session.run_epoch
+            or invocation_context.registered_environment is None
+        ):
+            raise SessionRunFenced("Command binding recovery lost invocation authority.")
+        environment = invocation_context.registered_environment
+        record = json.loads(authority.record_bytes)
+        persisted = await self._session_store.load_session_operation(
+            session.id, _command_binding_key(environment.spec.name)
+        )
+        allocation = await self.durable_live_allocation_fingerprint(
+            session_id=session.id, environment_name=environment.spec.name
+        )
+        if (
+            persisted != record
+            or record.get("record_type") != "cayu.command_binding.v1"
+            or record.get("session_instance_id") != session.instance_id
+            or record.get("execution_profile") != invocation_context.profile.fingerprint
+            or record.get("environment") != environment.spec.name
+            or record.get("allocation") != allocation
+            or type(record.get("source_run_epoch")) is not int
+            or not 0 < record["source_run_epoch"] < session.run_epoch
+            or type(record.get("binding_state")) is not dict
+            or type(record.get("binding_generation_id")) is not str
+            or not record["binding_generation_id"].strip()
+        ):
+            raise RuntimeError("Command binding recovery conflicts with durable ownership.")
+
+        def validate_owner(current: Session, checkpoint: dict[str, Any] | None, now: datetime):
+            claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
+            active = active_invocation_execution_profile_from_checkpoint(checkpoint)
+            if (
+                current.instance_id != session.instance_id
+                or current.run_epoch != session.run_epoch
+                or current.status != session.status
+                or claim is None
+                or claim[0] != invocation_context.recovery_claim_id
+                or claim[1] <= now
+                or active is None
+                or active.profile.fingerprint != authority.profile.fingerprint
+                or active.session_id != session.id
+                or active.run_epoch != session.run_epoch
+                or active.interaction_id != invocation_context.binding.interaction_id
+            ):
+                raise SessionRunFenced("Command binding recovery lost its current store owner.")
+            return checkpoint
+
+        with _invocation_lifecycle_authority_read_scope():
+            await self._session_store.transform_checkpoint_with_store_time(
+                session.id, validate_owner
+            )
+        return record
+
     async def _validate_completion_recovery(
         self,
         authority: _CompletionRecoveryAuthority,
@@ -975,7 +1261,12 @@ class EnvironmentLifecycle:
             if (
                 current.instance_id != session.instance_id
                 or current.run_epoch != session.run_epoch
-                or current.status is not SessionStatus.FAILED
+                or current.status
+                is not (
+                    SessionStatus.INTERRUPTED
+                    if marker is not None and marker["outcome"] == "interrupted"
+                    else SessionStatus.FAILED
+                )
             ):
                 raise SessionRunFenced("Completion recovery lost its session epoch or status.")
             if (
@@ -2645,7 +2936,20 @@ class EnvironmentLifecycle:
         adopted_factory_result: EnvironmentFactoryResult | None = None,
         new_terminal_invocation: bool = False,
         completion_recovery: _CompletionRecoveryAuthority | None = None,
+        command_recovery: _CommandBindingRecoveryAuthority | None = None,
     ) -> EnvironmentFactoryResolutionResult:
+        recovered_binding_generation = None
+        if command_recovery is not None:
+            if completion_recovery is not None or (
+                operation is not EnvironmentFactoryOperation.RECONNECT
+                or adopted_factory_result is not None
+                or new_terminal_invocation
+            ):
+                raise RuntimeError("Command binding cleanup permits only exact reconnect.")
+            command_marker = await self._validate_command_binding_recovery(
+                command_recovery, session=session, invocation_context=invocation_context
+            )
+            recovered_binding_generation = command_marker["binding_generation_id"]
         if completion_recovery is not None:
             await self._validate_completion_recovery(
                 completion_recovery, session=session, invocation_context=invocation_context
@@ -2654,6 +2958,9 @@ class EnvironmentLifecycle:
                 adopted_factory_result is not None or new_terminal_invocation
             ):
                 raise RuntimeError("Completion cleanup permits only exact reconnect.")
+            recovered_binding_generation = json.loads(completion_recovery.marker_bytes)[
+                "binding_generation_id"
+            ]
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
             or registered_agent is not invocation_context.registered_agent
@@ -3200,6 +3507,11 @@ class EnvironmentLifecycle:
                     registered_environment.workspace_mutation_fence.child_fence()
                 ),
             )
+            if recovered_binding_generation is not None:
+                resolved_environment = replace(
+                    resolved_environment,
+                    binding_generation_id=recovered_binding_generation,
+                )
             self._promote_environment_owner_admission(
                 session.id,
                 _ActiveEnvironmentSetup(
@@ -3600,21 +3912,44 @@ class EnvironmentLifecycle:
             nonlocal pending_disposal, disposal_context
             checkpoint = await self._session_store.load_checkpoint(session_id)
             expected = pending_completion_finalization_from_checkpoint(checkpoint)
-            if expected is None:
-                if outcome == "completed":
-                    raise RuntimeError("Completion disposal lost its durable marker.")
+            if expected is None and outcome == "completed":
+                raise RuntimeError("Completion disposal lost its durable marker.")
+            if (
+                expected is not None
+                and expected["environment_name"] != registered_environment.spec.name
+            ):
+                raise RuntimeError("Disposal checkpoint names another environment.")
+            owner = self._active_environment_setups.get(session_id)
+            context = None if owner is None else owner.invocation_context
+            factory = None if owner is None else owner.disposal_recovery_factory
+            if context is None or factory is None:
+                raise RuntimeError("Allocation disposal lost its invocation owner.")
+            if (
+                type(factory).recover_finalization_disposal
+                is EnvironmentFactory.recover_finalization_disposal
+            ):
+                raise RuntimeError("Allocation disposal requires a factory recovery hook.")
+            state = copy_durable_json_object(state, "completion disposal state")
+
+            def advance(current: dict[str, Any] | None) -> dict[str, Any]:
+                updated = copy_durable_record(current or {}, "checkpoint")
+                if expected is not None:
+                    marker = pending_completion_finalization_from_checkpoint(current)
+                    if not _same_completion_marker(marker, expected):
+                        raise RuntimeError("Disposal checkpoint lost its finalization authority.")
+                    assert marker is not None
+                    existing = marker.get("disposal_state")
+                    if existing is not None and existing != state:
+                        raise RuntimeError("Completion disposal authority changed.")
+                    marker["disposal_state"] = state
+                    updated[PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY] = marker
+                    pending_completion_finalization_from_checkpoint(updated)
+                return updated
+
+            if expected is None or expected["outcome"] != "completed":
                 # Non-completion teardown must retire live reconnect authority.
-                # Retain an exact recovery marker before the destructive step.
-                owner = self._active_environment_setups.get(session_id)
-                context = None if owner is None else owner.invocation_context
-                factory = None if owner is None else owner.disposal_recovery_factory
-                if context is None or factory is None:
-                    raise RuntimeError("Allocation disposal lost its invocation owner.")
-                if (
-                    type(factory).recover_finalization_disposal
-                    is EnvironmentFactory.recover_finalization_disposal
-                ):
-                    raise RuntimeError("Allocation disposal requires a factory recovery hook.")
+                # A terminal binding marker does not replace allocation retirement:
+                # retain both exact authorities atomically before physical disposal.
                 environment_name = registered_environment.spec.name
                 reconnect, allocation_owner = _factory_reconnect_state_from_checkpoint(
                     checkpoint,
@@ -3647,7 +3982,7 @@ class EnvironmentLifecycle:
                     )
                     if current_reconnect != reconnect or current_owner != session_id:
                         raise RuntimeError("Allocation disposal reconnect authority changed.")
-                    copied = copy_durable_record(current or {}, "checkpoint")
+                    copied = advance(current)
                     values = copied.setdefault(_PENDING_ALLOCATION_DISPOSAL_KEY, {})
                     if environment_name in values and values[environment_name] != pending:
                         raise RuntimeError("Allocation disposal marker changed.")
@@ -3658,40 +3993,18 @@ class EnvironmentLifecycle:
                 pending_disposal = pending
                 disposal_context = context
                 return
-            if expected["environment_name"] != registered_environment.spec.name:
-                raise RuntimeError("Disposal checkpoint names another environment.")
-            owner = self._active_environment_setups.get(session_id)
-            factory = None if owner is None else owner.disposal_recovery_factory
-            if factory is None or (
-                type(factory).recover_finalization_disposal
-                is EnvironmentFactory.recover_finalization_disposal
-            ):
-                raise RuntimeError("Completion disposal requires a factory disposal-recovery hook.")
-            state = copy_durable_json_object(state, "completion disposal state")
-            context = None if owner is None else owner.invocation_context
-            if context is None:
-                raise RuntimeError("Completion disposal lost its invocation owner.")
 
-            def advance(_session: Session, current: dict[str, Any] | None) -> dict[str, Any]:
+            def retain_completion(
+                _session: Session, current: dict[str, Any] | None
+            ) -> dict[str, Any]:
                 if (
                     _session.instance_id != context.binding.session_instance_id
                     or _session.run_epoch != context.binding.run_epoch
                 ):
                     raise SessionRunFenced("Completion disposal lost its session generation.")
-                marker = pending_completion_finalization_from_checkpoint(current)
-                if not _same_completion_marker(marker, expected):
-                    raise RuntimeError("Disposal checkpoint lost its finalization authority.")
-                assert marker is not None
-                existing = marker.get("disposal_state")
-                if existing is not None and existing != state:
-                    raise RuntimeError("Completion disposal authority changed.")
-                marker["disposal_state"] = state
-                updated = copy_durable_record(current, "checkpoint")
-                updated[PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY] = marker
-                pending_completion_finalization_from_checkpoint(updated)
-                return updated
+                return advance(current)
 
-            await self._session_store.transform_checkpoint(session_id, advance)
+            await self._session_store.transform_checkpoint(session_id, retain_completion)
 
         token = finalization_disposal_checkpoint.set(checkpoint_disposal)
         try:
@@ -3785,6 +4098,34 @@ class EnvironmentLifecycle:
             checkpoint,
             environment_name=registered_environment.spec.name,
         )
+        environment_name = registered_environment.spec.name
+        pending_disposal = (
+            (checkpoint or {}).get(_PENDING_ALLOCATION_DISPOSAL_KEY, {}).get(environment_name)
+        )
+        if marker["outcome"] != "completed":
+            retired = (
+                (checkpoint or {}).get(_RETIRED_ALLOCATION_DISPOSAL_KEY, {}).get(environment_name)
+            )
+            if retired is not None and retired.get("state") == state:
+                # Physical disposal and exact retirement already committed. A
+                # lost acknowledgement must not reconnect the released lifetime.
+                if (
+                    pending_disposal is not None
+                    or allocation_owner is not None
+                    or reconnect_metadata
+                    or self._allocation_coordinator.record_from_checkpoint(
+                        checkpoint, environment_name=environment_name
+                    )
+                    is not None
+                    or self._allocation_coordinator.receipt_from_checkpoint(
+                        checkpoint, environment_name=environment_name
+                    )
+                    is not None
+                ):
+                    raise RuntimeError("Retired completion disposal conflicts with live authority.")
+                return True
+            if pending_disposal != {"reconnect_metadata": reconnect_metadata, "state": state}:
+                raise RuntimeError("Completion disposal lost its pending allocation retirement.")
         if allocation_owner != session.id:
             raise RuntimeError("Completion disposal recovery lost its allocation owner.")
         record = self._allocation_coordinator.record_from_checkpoint(
@@ -3822,6 +4163,15 @@ class EnvironmentLifecycle:
             operation_name="Environment completion disposal recovery",
             redactor=self._secret_redactor,
         )
+        if marker["outcome"] != "completed":
+            assert pending_disposal is not None
+            await self._retire_disposed_allocation(
+                session.id,
+                environment_name,
+                pending_disposal,
+                session_instance_id=session.instance_id,
+                run_epoch=session.run_epoch,
+            )
         return True
 
     async def checkpoint_completion_finalization(
@@ -3831,6 +4181,7 @@ class EnvironmentLifecycle:
         registered_environment: runtime_records.RegisteredEnvironment,
         execution_profile: ExecutionProfileIdentity,
         task_id: str | None,
+        outcome: Literal["completed", "failed", "interrupted"] = "completed",
     ) -> dict[str, Any]:
         """Persist exact private retry state before completion can be published."""
 
@@ -3838,6 +4189,7 @@ class EnvironmentLifecycle:
             registered_environment=registered_environment,
             execution_profile=execution_profile,
             task_id=task_id,
+            outcome=outcome,
         )
 
         binding = registered_environment.environment.binding
@@ -3917,6 +4269,7 @@ class EnvironmentLifecycle:
         registered_environment: runtime_records.RegisteredEnvironment,
         execution_profile: ExecutionProfileIdentity,
         task_id: str | None,
+        outcome: Literal["completed", "failed", "interrupted"] = "completed",
     ) -> dict[str, Any]:
         binding = registered_environment.environment.binding
         bound = registered_environment.bound_workspace
@@ -3929,7 +4282,7 @@ class EnvironmentLifecycle:
             )
         marker = {
             "version": 1,
-            "outcome": "completed",
+            "outcome": outcome,
             "task_id": None if task_id is None else require_clean_nonblank(task_id, "task_id"),
             "environment_name": require_clean_nonblank(
                 registered_environment.spec.name,
@@ -4634,7 +4987,14 @@ class EnvironmentLifecycle:
         execution_profile: ExecutionProfileIdentity | None = None,
         invocation_context: InvocationContext | None = None,
         completion_recovery: _CompletionRecoveryAuthority | None = None,
+        command_recovery: _CommandBindingRecoveryAuthority | None = None,
     ) -> EnvironmentBindingResult:
+        if command_recovery is not None:
+            if completion_recovery is not None:
+                raise RuntimeError("Binding recovery cannot combine distinct authorities.")
+            await self._validate_command_binding_recovery(
+                command_recovery, session=session, invocation_context=invocation_context
+            )
         if completion_recovery is not None:
             await self._validate_completion_recovery(
                 completion_recovery, session=session, invocation_context=invocation_context
@@ -4647,6 +5007,7 @@ class EnvironmentLifecycle:
             execution_profile=execution_profile,
             invocation_context=invocation_context,
             completion_recovery=completion_recovery,
+            command_recovery=command_recovery,
         )
         if (
             result.error is None
@@ -4861,6 +5222,7 @@ class EnvironmentLifecycle:
         execution_profile: ExecutionProfileIdentity | None = None,
         invocation_context: InvocationContext | None = None,
         completion_recovery: _CompletionRecoveryAuthority | None = None,
+        command_recovery: _CommandBindingRecoveryAuthority | None = None,
     ) -> EnvironmentBindingResult:
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
@@ -4950,11 +5312,17 @@ class EnvironmentLifecycle:
                 EnvironmentLifecyclePhase.OWNERSHIP_ADMISSION,
                 EnvironmentLifecycleProgressStatus.COMPLETED,
             )
-            if completion_recovery is not None:
+            recovery_marker = None
+            if command_recovery is not None:
+                recovery_marker = await self._validate_command_binding_recovery(
+                    command_recovery, session=session, invocation_context=invocation_context
+                )
+            elif completion_recovery is not None:
                 await self._validate_completion_recovery(
                     completion_recovery, session=session, invocation_context=invocation_context
                 )
                 recovery_marker = json.loads(completion_recovery.marker_bytes)
+            if recovery_marker is not None:
                 bound = await _await_with_environment_lifecycle_reporter(
                     progress_reporter,
                     lambda: environment_operation_boundary.await_environment_operation(
@@ -5223,6 +5591,56 @@ class EnvironmentLifecycle:
         # leave cleanup using the stale pre-bound value.
         setup_owner.release_failed_binding_reservations = None
         _advance_cleanup_environment(setup_owner, bound_registered_environment)
+        # Capture the initial source baseline before tools can mutate the guest.
+        # This is private recovery state, not a completion or publication receipt.
+        from cayu.environments.docker_coding import DockerCodingWorkspaceBinding
+
+        if (
+            type(binding) is DockerCodingWorkspaceBinding
+            and command_recovery is None
+            and completion_recovery is None
+            and execution_profile is not None
+            and registered_environment.factory_backed
+        ):
+            key = _command_binding_key(registered_environment.spec.name)
+            record = {
+                "record_type": "cayu.command_binding.v1",
+                "session_instance_id": session.instance_id,
+                "source_run_epoch": session.run_epoch,
+                "binding_generation_id": registered_environment.binding_generation_id,
+                "execution_profile": execution_profile.fingerprint,
+                "environment": registered_environment.spec.name,
+                "allocation": registered_environment.live_allocation_fingerprint,
+                "binding_state": binding._completion_finalization_recovery_state(bound),
+            }
+
+            def publish_binding(current, checkpoint, previous):
+                if (
+                    current.instance_id != session.instance_id
+                    or current.run_epoch != session.run_epoch
+                ):
+                    raise SessionRunFenced("Command binding publication lost its invocation.")
+                if (
+                    previous is not None
+                    and previous != record
+                    and (
+                        type(previous.get("source_run_epoch")) is not int
+                        or previous["source_run_epoch"] >= session.run_epoch
+                    )
+                ):
+                    raise RuntimeError("Command binding source generation conflicts.")
+                return SessionOperationPublication(
+                    checkpoint=checkpoint or {}, operation_records={key: record}
+                )
+
+            await self._session_store.publish_session_operation(
+                session.id,
+                idempotency_key=key,
+                operation_transform=publish_binding,
+                events=[],
+                expected_statuses={session.status},
+                expected_run_epoch=session.run_epoch,
+            )
         await _report_environment_lifecycle(
             progress_reporter,
             EnvironmentLifecyclePhase.EXECUTION_READY_PUBLICATION,
@@ -5652,7 +6070,29 @@ class EnvironmentLifecycle:
 
         final_revision: WorkspaceRevisionObservation | None = None
         finalization_delta: dict[str, Any] | None = None
+        terminal_marker: dict[str, Any] | None = None
         try:
+            if (
+                terminal_outcome in ("failed", "interrupted")
+                and not preserve_factory_allocation
+                and not park_for_egress_adoption
+                and execution_profile is not None
+                and binding._completion_requires_successful_finalization(bound_workspace)
+            ):
+                existing_marker = pending_completion_finalization_from_checkpoint(
+                    await self._session_store.load_checkpoint(session.id)
+                )
+                if existing_marker is None:
+                    # Failed/interrupted copy-back owns output just as completed
+                    # copy-back does. Retain its original binding before effects;
+                    # process-local retry flags cannot survive a worker restart.
+                    terminal_marker = await self.checkpoint_completion_finalization(
+                        session=session,
+                        registered_environment=registered_environment,
+                        execution_profile=execution_profile,
+                        task_id=None,
+                        outcome="failed" if terminal_outcome == "failed" else "interrupted",
+                    )
             await _report_environment_lifecycle(
                 progress_reporter,
                 EnvironmentLifecyclePhase.FINAL_TARGET_OBSERVATION,
@@ -6115,6 +6555,16 @@ class EnvironmentLifecycle:
                 finalization_delta=finalization_delta,
             )
             event = _copy_event_with_payload(event, terminal_payload)
+        if terminal_marker is not None and not publication_failures:
+            if setup_owner is not None:
+                # A lost clear acknowledgement must retry the clear, not finalize
+                # an already disposed binding a second time.
+                setup_owner.pending_completion_marker_clear = terminal_marker
+            await self.clear_completion_finalization(
+                session_id=session.id, expected_marker=terminal_marker
+            )
+            if setup_owner is not None:
+                setup_owner.pending_completion_marker_clear = None
         return EnvironmentBindingFinalizeResult(
             event=event,
             events=events,

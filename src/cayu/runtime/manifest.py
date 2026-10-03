@@ -932,6 +932,14 @@ def _optional_type_name(value: object | None) -> str | None:
 def _parameter_policy_decision(
     policy: ToolPolicy, tool_name: str
 ) -> Literal["deny", "require_approval"] | None:
+    from cayu.tools.structured_commands import StructuredCommandToolPolicy
+
+    seen: set[int] = set()
+    while type(policy) is StructuredCommandToolPolicy:
+        if id(policy) in seen or policy._base_policy is None:
+            return None
+        seen.add(id(policy))
+        policy = policy._base_policy
     # Do not project built-in semantics onto an overriding extension subclass.
     if type(policy) is GuardedToolPolicy:
         return _parameter_policy_decision(policy.then, tool_name)
@@ -959,7 +967,26 @@ def _tool_policy_coverage(
     policy: ToolPolicy,
     tool_name: str,
     schema: Mapping[str, object],
+    *,
+    _seen: frozenset[int] = frozenset(),
 ) -> Literal["allowed", "denied", "approval_required", "conditional", "unknown"]:
+    from cayu.tools.structured_commands import StructuredCommandToolPolicy
+
+    if type(policy) is StructuredCommandToolPolicy:
+        if id(policy) in _seen:
+            return "unknown"
+        base = (
+            "allowed"
+            if policy._base_policy is None
+            else _tool_policy_coverage(
+                policy._base_policy, tool_name, schema, _seen=_seen | {id(policy)}
+            )
+        )
+        # authorize() consumes the base decision first. Never turn an opaque
+        # base into trusted coverage, even though the outer wrapper is built in.
+        if base in {"unknown", "denied", "approval_required"}:
+            return base
+        return "conditional" if tool_name == "run_command" else base
     # These descriptions are static facts about Cayu's concrete built-ins. A
     # subclass can override authorize(), so treating it as its parent would
     # turn an unknown custom policy into trusted coverage.

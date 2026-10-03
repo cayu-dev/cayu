@@ -30,6 +30,7 @@ from cayu.tools._errors import structured_invalid_arguments, tool_argument_valid
 from cayu.tools.base import (
     DurableToolRecoveryAuthority,
     DurableToolRecoveryEvidence,
+    DurableToolRecoveryIdentity,
     Tool,
     ToolContext,
     ToolEffect,
@@ -71,7 +72,7 @@ _COMMAND_MANIFEST_MAX_PATHS = 10_000
 _COMMAND_MANIFEST_MAX_FILE_BYTES = 8 * 1024 * 1024
 _COMMAND_MANIFEST_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 _COMMAND_JOURNAL_RECORD_TYPE = "cayu.run_command.journal"
-_COMMAND_JOURNAL_SCHEMA_VERSION = 1
+_COMMAND_JOURNAL_SCHEMA_VERSION = 2
 _DURABLE_RUNNER_OPERATION_SCHEMA = "cayu.durable_runner_operation.v1"
 
 
@@ -686,7 +687,11 @@ class RunCommandTool(Tool):
                 before_manifest=before_manifest,
             )
             if journal is not None:
-                _bind_durable_runner_operation(ctx.runner, journal.record.get("runner_operation"))
+                _bind_durable_runner_operation(
+                    ctx.runner,
+                    journal.record.get("runner_operation"),
+                    journal.record.get("runner_receipt"),
+                )
                 await journal.mark_dispatching()
         except _CommandJournalError:
             return self._error_result(
@@ -925,7 +930,7 @@ class RunCommandTool(Tool):
         record = await load_operation(storage_key)
         if record is None:
             return None
-        return await _recover_command_journal_result(
+        result = await _recover_command_journal_result(
             record,
             tool=self,
             parent_session_id=parent_session_id,
@@ -941,6 +946,44 @@ class RunCommandTool(Tool):
             arguments=arguments,
             recovery_authority=recovery_authority,
         )
+        if type(result) is not DurableToolRecoveryEvidence:
+            raise AssertionError("Recovery returned inspection-only evidence.")
+        return result
+
+    async def inspect_durable_tool_call(
+        self, *, identity: DurableToolRecoveryIdentity, load_operation, observe_receipt
+    ) -> bool:
+        from dataclasses import asdict
+
+        record = await load_operation(
+            _command_journal_key(identity.parent_session_id, identity.idempotency_key)
+        )
+        if record is None:
+            return False
+
+        async def prohibit_publication(*args, **kwargs):
+            raise AssertionError("Recovery inspection cannot publish.")
+
+        operation = record.get("runner_operation")
+        authority = DurableToolRecoveryAuthority(
+            agent_name="inspection",
+            environment_name=identity.environment_name,
+            workspace=None,
+            artifact_reader=None,
+            compare_and_set_operation=prohibit_publication,
+            runner_resource_identity=None
+            if type(operation) is not dict
+            else operation.get("runner_resource_identity"),
+            reconcile_runner_receipt=observe_receipt,
+        )
+        result = await _recover_command_journal_result(
+            record,
+            tool=self,
+            **asdict(identity),
+            recovery_authority=authority,
+            inspection_only=True,
+        )
+        return result is True
 
     def _resolve_arguments(
         self,
@@ -1452,7 +1495,9 @@ def _command_runner_operation_identity(
     }
 
 
-def _bind_durable_runner_operation(runner: object, identity: object) -> None:
+def _bind_durable_runner_operation(
+    runner: object, identity: object, receipt: object = None
+) -> None:
     if identity is None:
         return
     binder = getattr(runner, "bind_durable_command_operation", None)
@@ -1461,7 +1506,13 @@ def _bind_durable_runner_operation(runner: object, identity: object) -> None:
             "Structured-command runner cannot bind its durable operation identity."
         )
     try:
-        binder(copy_json_value(identity, "runner_operation"))
+        if receipt is None:
+            binder(copy_json_value(identity, "runner_operation"))
+        else:
+            binder(
+                copy_json_value(identity, "runner_operation"),
+                receipt=copy_json_value(receipt, "private_runner_receipt"),
+            )
     except (RuntimeError, TypeError, ValueError) as exc:
         raise _CommandJournalError(
             "Structured-command runner rejected its durable operation identity."
@@ -1482,12 +1533,13 @@ async def _start_command_journal(
     timeout_seconds: int,
     output_mode: str,
     before_manifest: _WorkspaceCommandManifest,
+    tool_name: str = "run_command",
 ) -> _StructuredCommandJournal | None:
     runtime_authority = _runtime_tool_invocation_authority(ctx)
     if runtime_authority is None:
         return None
     if (
-        runtime_authority.tool_name != "run_command"
+        runtime_authority.tool_name != tool_name
         or ctx.idempotency_key != runtime_authority.idempotency_key
     ):
         raise _CommandJournalError(
@@ -1505,9 +1557,24 @@ async def _start_command_journal(
         environment_identity=_environment_identity(authority),
         timeout_seconds=timeout_seconds,
     )
+    receipt = None
+    prepare_receipt = getattr(ctx.runner, "prepare_command_receipt", None)
+    if runner_operation is not None and callable(prepare_receipt):
+        try:
+            receipt = prepare_receipt(
+                runner_operation,
+                command=ExecCommand.process(*command_argv),
+                cwd=None if working_directory == "." else working_directory,
+                env=authority.environment,
+                timeout_s=timeout_seconds,
+                output_limit_bytes=authority.max_output_bytes,
+            )
+        except (TypeError, ValueError, RuntimeError) as exc:
+            raise _CommandJournalError("Runner durable preparation failed.") from exc
     record: dict[str, Any] = {
         "record_type": _COMMAND_JOURNAL_RECORD_TYPE,
         "schema_version": _COMMAND_JOURNAL_SCHEMA_VERSION,
+        "tool_name": tool_name,
         "state": "prepared",
         "parent_session_id": ctx.session_id,
         "parent_run_epoch": runtime_authority.parent_run_epoch,
@@ -1541,6 +1608,7 @@ async def _start_command_journal(
         "before_manifest_total_bytes": before_manifest.total_bytes,
         "before_manifest_entries": [list(entry) for entry in before_manifest.entries],
         "runner_operation": runner_operation,
+        "runner_receipt": receipt,
         "runner_terminal_result": None,
         "runner_terminal_timing": None,
         "runner_terminal_identity": None,
@@ -1587,7 +1655,8 @@ async def _recover_command_journal_result(
     idempotency_key: str,
     arguments: dict[str, Any],
     recovery_authority: DurableToolRecoveryAuthority | None,
-) -> DurableToolRecoveryEvidence:
+    inspection_only: bool = False,
+) -> DurableToolRecoveryEvidence | bool:
     try:
         record = _copy_command_journal_record(raw_record)
     except (TypeError, ValueError, _CommandJournalError):
@@ -1605,6 +1674,11 @@ async def _recover_command_journal_result(
         "idempotency_key": idempotency_key,
     }
     if any(record.get(field) != expected for field, expected in expected_identity.items()):
+        return _command_recovery_refusal("durable_command_journal_identity_mismatch")
+    recorded_tool_name = record.get("tool_name")
+    if (recorded_tool_name is not None and recorded_tool_name != tool.spec.name) or (
+        tool.spec.name == "run_check" and recorded_tool_name != "run_check"
+    ):
         return _command_recovery_refusal("durable_command_journal_identity_mismatch")
     if (
         execution_profile_fingerprint is None
@@ -1642,11 +1716,12 @@ async def _recover_command_journal_result(
         return _command_recovery_refusal("durable_command_journal_argument_mismatch")
     state = record.get("state")
     if state == "terminal":
-        return _recover_terminal_command_result(
+        terminal = _recover_terminal_command_result(
             record,
             authority=authority,
             profile=tool._profile,
         )
+        return terminal.disposition == "confirmed" if inspection_only else terminal
     if state == "prepared":
         result = tool._error_result(
             authority,
@@ -1677,12 +1752,30 @@ async def _recover_command_journal_result(
         and recovery_authority is not None
         and recovery_authority.runner_resource_identity
         == runner_operation.get("runner_resource_identity")
-        and recovery_authority.reconcile_runner_operation is not None
+        and (
+            recovery_authority.reconcile_runner_operation is not None
+            or recovery_authority.reconcile_runner_receipt is not None
+        )
     ):
         try:
-            observation = await recovery_authority.reconcile_runner_operation(
-                copy_json_value(runner_operation, "runner_operation")
-            )
+            if record.get("runner_receipt") is not None:
+                observer = recovery_authority.reconcile_runner_receipt
+                observation = (
+                    None
+                    if observer is None
+                    else await observer(
+                        copy_json_value(runner_operation, "runner_operation"),
+                        copy_json_value(record["runner_receipt"], "private_runner_receipt"),
+                    )
+                )
+            else:
+                observation = (
+                    None
+                    if recovery_authority.reconcile_runner_operation is None
+                    else await recovery_authority.reconcile_runner_operation(
+                        copy_json_value(runner_operation, "runner_operation")
+                    )
+                )
         except Exception:
             observation = None
         if type(observation) is dict and observation.get("identity") == runner_operation:
@@ -1701,6 +1794,22 @@ async def _recover_command_journal_result(
                     "duration_ms": None,
                 }
     if runner_terminal_result is not None:
+        if inspection_only:
+            try:
+                raw = ToolResult.model_validate(runner_terminal_result)
+                expected_terminal = record.get("runner_terminal_identity")
+                if expected_terminal is not None and expected_terminal != _sha256_identity(
+                    raw.model_dump(mode="json"), purpose="structured_command_runner_terminal"
+                ):
+                    return False
+                return (
+                    raw.structured is not None
+                    and raw.structured.get("workspace_mutation_settlement")
+                    in {"complete", "runner_quiescent"}
+                    and _recover_before_command_manifest(record) is not None
+                )
+            except (TypeError, ValueError):
+                return False
         return await _recover_runner_terminal_command_result(
             record,
             raw_result=runner_terminal_result,
@@ -1720,6 +1829,8 @@ async def _recover_command_journal_result(
             recovery_authority=recovery_authority,
         )
 
+    if inspection_only:
+        return False
     after_manifest: _WorkspaceCommandManifest | None = None
     workspace_identity_matches = False
     if recovery_authority is not None and recovery_authority.workspace is not None:
@@ -2055,14 +2166,21 @@ def _command_terminal_recovery_evidence(result: ToolResult) -> DurableToolRecove
         and type(structured.get("status")) is str
         and structured["status"]
         in {
+            "passed",
             "succeeded",
             "nonzero",
             "timed_out",
             "cancelled",
             "failed",
             "partial",
+            "execution_failed",
+            "malformed_execution",
             "denied",
             "approval_required",
+            "policy_denied",
+            "runner_unavailable",
+            "toolchain_unavailable",
+            "stale_toolchain",
             "unavailable",
         }
         and type(structured.get("workspace_mutation_settlement")) is str

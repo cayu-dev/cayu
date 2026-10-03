@@ -980,6 +980,16 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         self._validate_request(request)
         return self._configured_candidate(request.execution_requirements)
 
+    async def observe_command_receipt(self, identity: dict[str, Any], receipt: dict[str, Any]):
+        """Read authenticated command evidence without allocating or attaching."""
+        from cayu.runners._docker_command_receipt import descriptor
+
+        owned = descriptor(receipt)
+        observer = DockerRunner(
+            owned["container_id"], _container_id=owned["container_id"], docker_path=self.docker_path
+        )
+        return await observer.observe_command_receipt(identity, owned)
+
     def create_workspace_binding(
         self,
         request: EnvironmentFactoryRequest,

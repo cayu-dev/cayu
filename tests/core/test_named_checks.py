@@ -31,7 +31,12 @@ from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._runner import InvocationRunnerHandle
-from cayu.tools.base import ToolContext, ToolEffect
+from cayu.tools.base import (
+    DurableToolRecoveryAuthority,
+    ToolContext,
+    ToolEffect,
+    _bind_runtime_tool_invocation_authority,
+)
 from cayu.tools.command_policy import ProcessCommandPolicy
 from cayu.tools.commands import CommandPolicyDecision
 from cayu.tools.named_checks import NamedCheck, RunCheckTool
@@ -316,6 +321,126 @@ def test_run_check_reuses_exact_command_preflight_policy_and_runner_boundary() -
     }
     assert preflight_options == expected_options
     assert executed_options == expected_options
+
+
+def test_run_check_persists_and_reconciles_durable_dispatch_evidence(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = ExecCommand.process(sys.executable, "-c", "print('ok')")
+    authority = DockerCodingCommandAuthority(
+        selector="test",
+        revision="1",
+        description="Run the named test check.",
+        exposure="named_check",
+        executable=sys.executable,
+        fixed_arguments=("-c", "print('ok')"),
+        max_arguments=0,
+        dependency_sensitive=False,
+    )
+    profile = DockerCodingToolchainProfile(
+        profile_id="test-profile",
+        revision="1",
+        image_identity=DockerImageIdentity(
+            reference="test-image@sha256:" + ("a" * 64),
+        ),
+        platform_architecture="arm64",
+        command_authorities=(authority,),
+    )
+    workspace = LocalWorkspace(tmp_path, workspace_id="durable-check-workspace")
+    runner = LocalRunner(tmp_path, inherit_env=False)
+
+    async def admitted(_runner, **_kwargs):
+        return None
+
+    monkeypatch.setattr(named_checks, "ensure_docker_coding_toolchain_runner_admission", admitted)
+    records: dict[str, dict[str, object]] = {}
+
+    async def load_operation(storage_key: str):
+        return records.get(storage_key)
+
+    async def compare_and_set_operation(storage_key, expected, desired, secondary):
+        assert records.get(storage_key) == expected
+        assert secondary == {}
+        records[storage_key] = desired
+        return desired
+
+    ctx = ToolContext(
+        session_id="durable-check-session",
+        agent_name="agent",
+        environment_name="coding",
+        workspace_id=workspace.id,
+        idempotency_key="durable-check-invocation",
+        workspace=workspace,
+        runner=runner,
+    )
+    _bind_runtime_tool_invocation_authority(
+        ctx,
+        parent_task_id="task",
+        parent_run_epoch=1,
+        model_step_id="mstep_20000000000000000000000000000000",
+        model_attempt_id="mattempt_20000000000000000000000000000000",
+        tool_round_id="tround_20000000000000000000000000000000",
+        tool_call_id="check-call",
+        tool_name="run_check",
+        idempotency_key="durable-check-invocation",
+        effective_arguments={"check": "test"},
+        execution_profile_fingerprint="profile",
+        environment_allocation_fingerprint="allocation",
+        load_durable_operation=load_operation,
+        compare_and_set_durable_operation=compare_and_set_operation,
+        seal_durable_output=lambda record: record,
+        secret_publication_sealer=lambda: None,
+    )
+    tool = RunCheckTool(
+        checks=[_check(command=command)],
+        command_policy=ProcessCommandPolicy(
+            allowed_executables=(sys.executable,),
+            allowed_cwds=(str(tmp_path),),
+        ),
+        toolchain_profile=profile,
+    )
+    result = asyncio.run(tool.run(ctx, {"check": "test"}))
+
+    assert result.structured["status"] == "passed"
+    journal = next(iter(records.values()))
+    assert journal["tool_name"] == "run_check"
+    assert journal["state"] == "terminal"
+    assert journal["terminal_result"] is not None
+    # Model a worker loss after the runner settled but before projection and
+    # terminal acknowledgement; recovery must preserve the named-check schema.
+    journal["state"] = "dispatching"
+    journal["terminal_result"] = None
+
+    recovery_authority = DurableToolRecoveryAuthority(
+        agent_name="agent",
+        environment_name="coding",
+        workspace=workspace,
+        artifact_reader=None,
+        compare_and_set_operation=compare_and_set_operation,
+    )
+    recovered = asyncio.run(
+        tool.reconcile_durable_tool_call(
+            parent_session_id=ctx.session_id,
+            parent_run_epoch=1,
+            execution_profile_fingerprint="profile",
+            environment_name="coding",
+            environment_allocation_fingerprint="allocation",
+            model_step_id="mstep_20000000000000000000000000000000",
+            model_attempt_id="mattempt_20000000000000000000000000000000",
+            tool_round_id="tround_20000000000000000000000000000000",
+            tool_call_id="check-call",
+            idempotency_key="durable-check-invocation",
+            arguments={"check": "test"},
+            started=True,
+            load_operation=load_operation,
+            recovery_authority=recovery_authority,
+        )
+    )
+    assert recovered is not None
+    assert recovered.disposition == "confirmed"
+    assert recovered.result.structured["status"] == "passed"
+    assert recovered.result.structured["recovered"] is True
 
 
 def test_run_check_binds_a_pass_to_the_complete_post_check_workspace_revision(

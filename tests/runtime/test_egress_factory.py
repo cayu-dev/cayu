@@ -4521,7 +4521,26 @@ def test_app_retains_failed_unadopted_cleanup_until_later_retry_succeeds() -> No
         ]
         assert len(adapter.prepare_calls) == 1
 
+        cleanup = app._environment_lifecycle._deferred_factory_cleanup_tasks[
+            "sess_retained_unadopted_cleanup"
+        ]
+        # The held runner cannot settle inside a drain's observation window.
+        # Expiry must retain the same owner, not cancel it or free its capacity.
+        assert await app.drain_environment_cleanups(timeout_s=0.01) is False
+        assert not cleanup.done()
+        assert (
+            app._environment_lifecycle._deferred_factory_cleanup_tasks[
+                "sess_retained_unadopted_cleanup"
+            ]
+            is cleanup
+        )
+        assert "sess_retained_unadopted_cleanup" in (
+            app._environment_lifecycle._pending_environment_owner_admissions
+        )
         adapter.allow_third_finalize.set()
+        # Synchronize with positive native settlement; propagate its real error
+        # immediately and never cancel the owner merely because observation ends.
+        await asyncio.wait_for(asyncio.shield(cleanup), 5)
         assert await app.drain_environment_cleanups(timeout_s=0.2) is True
         return first, contender, adapter, provider, app, egress_events
 

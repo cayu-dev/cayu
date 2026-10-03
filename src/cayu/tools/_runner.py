@@ -54,6 +54,11 @@ from cayu.runners._diagnostics import (
     trusted_runner_error_type_name,
     trusted_runner_exception_type_name,
 )
+from cayu.runners._durable_commands import (
+    DurableCommandObserver,
+    DurableCommandRunner,
+    redact_command_receipt_result,
+)
 from cayu.runners._redacted_output import redact_completed_exec_result
 from cayu.runners._subprocess import (
     copy_runner_env,
@@ -124,6 +129,7 @@ class InvocationRunnerHandle:
 
     __slots__ = (
         "__ambiguous_capture_observer",
+        "__durable_command_receipt",
         "__durable_operation_identity",
         "__execution_observer",
         "__mutation_owner",
@@ -159,6 +165,7 @@ class InvocationRunnerHandle:
             raise TypeError("publish_execution_arguments must be a bool.")
         self.__runner = runner
         self.__durable_operation_identity: dict[str, Any] | None = None
+        self.__durable_command_receipt: dict[str, Any] | None = None
         self.__redactor_snapshot_provider = redactor_snapshot_provider
         self.__ambiguous_capture_observer = ambiguous_capture_observer
         self.__mutation_owner = mutation_owner
@@ -354,7 +361,33 @@ class InvocationRunnerHandle:
 
         return _durable_runner_resource_identity(self.__runner)
 
-    def bind_durable_command_operation(self, identity: dict[str, Any]) -> None:
+    def prepare_command_receipt(
+        self,
+        identity: dict[str, Any],
+        *,
+        command: ExecCommand,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        timeout_s: int,
+        output_limit_bytes: int,
+    ) -> dict[str, Any] | None:
+        if not isinstance(self.__runner, DurableCommandRunner):
+            return None
+        owned = _validate_durable_runner_operation_identity(identity)
+        if owned["runner_resource_identity"] != self.durable_resource_identity():
+            raise ValueError("Durable command preparation names another allocation.")
+        return self.__runner.prepare_command_receipt(
+            owned,
+            command=command,
+            cwd=cwd,
+            env=env,
+            timeout_s=timeout_s,
+            output_limit_bytes=output_limit_bytes,
+        )
+
+    def bind_durable_command_operation(
+        self, identity: dict[str, Any], *, receipt: dict[str, Any] | None = None
+    ) -> None:
         """Bind the next dispatch to one pre-published durable operation identity."""
 
         owned = _validate_durable_runner_operation_identity(identity)
@@ -363,6 +396,11 @@ class InvocationRunnerHandle:
             raise RuntimeError("Durable runner operation does not match this allocation.")
         if self.__durable_operation_identity is not None:
             raise RuntimeError("Invocation runner already has a bound durable operation.")
+        owned_receipt = (
+            None if receipt is None else copy_durable_json_object(receipt, "private_runner_receipt")
+        )
+        if owned_receipt is not None and owned_receipt.get("identity") != owned:
+            raise ValueError("Durable command receipt does not match this operation.")
         _publish_durable_runner_operation(
             self.__runner,
             owned,
@@ -370,6 +408,7 @@ class InvocationRunnerHandle:
             result=None,
         )
         self.__durable_operation_identity = owned
+        self.__durable_command_receipt = owned_receipt
 
     async def exec(
         self,
@@ -495,6 +534,8 @@ class InvocationRunnerHandle:
             raise AssertionError("Runner preflight completed without an owned command.")
         durable_operation_identity = self.__durable_operation_identity
         self.__durable_operation_identity = None
+        durable_command_receipt = self.__durable_command_receipt
+        self.__durable_command_receipt = None
         if durable_operation_identity is not None:
             _publish_durable_runner_operation(
                 self.__runner,
@@ -587,6 +628,7 @@ class InvocationRunnerHandle:
                 publish_execution_arguments=publish_execution_arguments,
                 private_output=private_output,
                 command_evidence_revision=command_evidence_revision,
+                durable_command_receipt=durable_command_receipt,
             )
 
         operation = None
@@ -1031,6 +1073,27 @@ def _publish_durable_runner_operation(
         )
 
 
+def durable_runner_receipt_observer(runner: object, *, redactor: SecretRedactor):
+    """Read authenticated terminal evidence without issuing the original command."""
+    if runner is None or not isinstance(runner, DurableCommandObserver):
+        return None
+    resource_identity = (
+        _durable_runner_resource_identity(runner) if isinstance(runner, Runner) else None
+    )
+
+    async def observe(identity: dict[str, Any], receipt: dict[str, Any]) -> dict[str, Any] | None:
+        owned = _validate_durable_runner_operation_identity(identity)
+        if resource_identity is not None and owned["runner_resource_identity"] != resource_identity:
+            return None
+        result = await runner.observe_command_receipt(owned, receipt)
+        if result is None:
+            return None
+        result = redact_command_receipt_result(result, redactor, DEFAULT_EXEC_OUTPUT_LIMIT_BYTES)
+        return {"identity": owned, "state": "terminal", "result": result.model_dump(mode="json")}
+
+    return observe
+
+
 def durable_runner_recovery_authority(
     runner: Runner | None,
 ) -> tuple[
@@ -1094,6 +1157,7 @@ async def _capture_runner_dispatch_outcome(
     publish_execution_arguments: bool,
     private_output: bool,
     command_evidence_revision: int,
+    durable_command_receipt: dict[str, Any] | None = None,
 ) -> _RunnerDispatchOutcome:
     """Freeze settlement evidence before an extension can mutate its outcome."""
 
@@ -1127,7 +1191,13 @@ async def _capture_runner_dispatch_outcome(
     result: object | None = None
     error: BaseException | None = None
     try:
-        if private_output:
+        if durable_command_receipt is not None:
+            if private_output or not isinstance(runner, DurableCommandRunner):
+                raise ValueError("Runner cannot consume this durable command authority.")
+            result = await runner.exec_with_receipt(
+                command, receipt=durable_command_receipt, **kwargs
+            )
+        elif private_output:
             private_kwargs = dict(kwargs)
             private_kwargs.pop("redactor", None)
             result = await runner.exec(command, **private_kwargs)

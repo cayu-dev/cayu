@@ -371,6 +371,20 @@ Recovery provides bounded observation and fenced journal settlement authority;
 the extension must not dispatch the protected mutation. A stored state label
 alone is insufficient when its result still describes an ambiguous operation.
 
+Keep the retained allocation and journal available to this owner until the
+selected result and required cleanup are durably settled. Deleting a Docker
+guest before reconciliation can remove the only terminal receipt or workspace
+that a fresh process can reconnect. Physical absence alone proves neither the
+tool outcome nor native session/task settlement.
+
+Manual `ToolRoundRecoveryRequest` is a continuation entrance, not a generic
+observation-only cleanup API. Omitted controls restore the recorded invocation;
+an explicit lower `max_steps` can still conflict with its exact finalization
+profile. After the round is settled, model execution may continue. Use the
+registered plan's supported failure/interruption disposition when no further
+execution is authorized, and retain unresolved ownership if that disposition
+cannot settle the effect. Do not weaken profile validation to make cleanup run.
+
 ## Check a `NONE` declaration before deployment
 
 `verify_tool_effect(...)` is an explicit deployment-readiness test seam. It

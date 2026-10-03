@@ -179,6 +179,16 @@ inventing a publication snapshot. Call `drain_environment_cleanups()` before clo
 the session store to settle retained cleanup. A stopped, detached, or merely fenced
 runner is not evidence of container removal; its recoverable target remains owned.
 
+After worker loss during tool-policy planning, registered recovery can retain a
+non-executable approval gate. Explicit operator interruption closes that gate;
+it does not itself prove the retained Docker workspace was released. A subsequent
+registered recovery transfers the saved binding to completion-finalization recovery
+before reconnecting. It preserves the interrupted outcome and original source
+baseline, finalizes and releases the exact allocation, and does not replay model
+or tool effects. Missing or conflicting binding evidence remains fenced. The
+application's task/source reservation still requires its own supported settlement
+using the resulting cleanup evidence; session interruption alone is insufficient.
+
 
 ## Writable home and tool caches
 

@@ -815,6 +815,22 @@ class RecoveryPlanCoordinator:
                     # Preparation is positive non-dispatch evidence: recovery
                     # competes with dispatch using the same exact revision CAS.
                     continue
+                if effect is not None and registration_status is RecoveryRegistrationStatus.READY:
+                    try:
+                        async with asyncio.timeout(15):
+                            ready = await self._recovery_coordinator.has_recoverable_durable_tool_result(
+                                session=session,
+                                tool_round_id=action.round_id,
+                                tool_call_id=action.tool_call_id,
+                            )
+                    except Exception:
+                        ready = False
+                    if ready:
+                        # This only removes the unknown-effect blocker. Other
+                        # claims, approvals, and profile gates still apply; the
+                        # executor reloads and authenticates evidence under its
+                        # mutation fence before publishing any terminal result.
+                        continue
                 blockers.append(
                     RecoveryPlanBlocker(
                         code=RecoveryBlockerCode.TOOL_EFFECT_OUTCOME_UNKNOWN,
@@ -1557,11 +1573,11 @@ class RecoveryPlanCoordinator:
             if type(payload) is not dict:
                 raise ValueError("Environment allocation intent is invalid.")
             allocation_states.append(EnvironmentAllocationRecord.from_payload(payload).state)
+        finalization = pending_completion_finalization_from_checkpoint(dict(checkpoint))
         return RecoveryEnvironmentEvidence(
             allocation_states=tuple(sorted(allocation_states, key=lambda state: state.value)),
-            completion_finalization_pending=(
-                pending_completion_finalization_from_checkpoint(dict(checkpoint)) is not None
-            ),
+            completion_finalization_pending=finalization is not None,
+            finalization_outcome=None if finalization is None else finalization["outcome"],
         )
 
     @staticmethod

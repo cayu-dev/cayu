@@ -401,6 +401,9 @@ from cayu.coding_products import CodingProductArtifactRepository as CodingProduc
 from cayu.coding_products import CodingProductCandidate as CodingProductCandidate
 from cayu.coding_products import CodingProductCompletionVerifier as CodingProductCompletionVerifier
 from cayu.coding_products import CodingProductEvidenceError as CodingProductEvidenceError
+from cayu.coding_products import (
+    CodingProductExecutionInspection as CodingProductExecutionInspection,
+)
 from cayu.coding_products import CodingProductPublication as CodingProductPublication
 from cayu.coding_products import (
     CodingProductReconstructionRequiredError as CodingProductReconstructionRequiredError,
@@ -6303,6 +6306,7 @@ __all__ = [
     "CodingProductCandidate",
     "CodingProductCompletionVerifier",
     "CodingProductEvidenceError",
+    "CodingProductExecutionInspection",
     "CodingProductPublication",
     "CodingProductReconstructionRequiredError",
     "CodingProductRequest",

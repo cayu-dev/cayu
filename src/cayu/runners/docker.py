@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import hashlib
 import json
 import os
 import posixpath
 import re
+import secrets
 import shlex
 import shutil
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from typing import TYPE_CHECKING, BinaryIO, Literal, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, Literal, cast
 from uuid import uuid4
 
 from cayu._validation import (
@@ -24,6 +26,7 @@ from cayu._validation import (
 from cayu.capabilities import CapabilityDetail
 from cayu.credentials import CredentialMode, CredentialModeInput, normalize_credential_mode
 from cayu.immutable_inputs import DockerImmutableInputMount
+from cayu.runners import _docker_command_receipt as command_receipt
 from cayu.runners._admission_probes import EXECUTABLE_AVAILABILITY_SCRIPT
 from cayu.runners._cleanup import (
     DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
@@ -48,6 +51,7 @@ from cayu.runners._creation_cleanup import (
 )
 from cayu.runners._diagnostics import runner_failure_fields
 from cayu.runners._docker_cli import docker_cli_env, normalize_docker_cli_env_allowlist
+from cayu.runners._durable_commands import DurableCommandRunner, redact_command_receipt_result
 from cayu.runners._secrets import (
     merge_secret_env_values,
     normalize_runner_secret_env,
@@ -1644,7 +1648,7 @@ class _DockerRemoteWorkspaceBranchCapability(RemoteWorkspaceBranchCapability):
         return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
-class DockerRunner(Runner, RunnerBinaryStreamCapability):
+class DockerRunner(Runner, RunnerBinaryStreamCapability, DurableCommandRunner):
     """Executes commands inside a plain Docker container via the ``docker`` CLI.
 
     Isolation is a parameter: pass ``runtime="runsc"`` (gVisor) or ``"kata"``
@@ -1736,6 +1740,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                     if "python3" in evidence.required_executables
                     else "shell_supervisor"
                 ),
+                "durable_command_receipt": "cayu.docker_command_receipt.v1",
             }
         return {
             "name": self.name,
@@ -2873,6 +2878,176 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
 
         return bool(self.secret_env) or self._env_overlay_secret_values_present
 
+    def _receipt_connection_identity(self) -> str:
+        return sha256(
+            command_receipt.canonical(
+                {
+                    "docker_path": self.docker_path,
+                    "environment": docker_cli_env(self.docker_cli_env_allowlist),
+                }
+            )
+        ).hexdigest()
+
+    def _receipt_request_identity(self, prepared: tuple) -> str:
+        command, cwd, env, overlay, removed, _secrets, _resolver, timeout, stdin, limit = prepared
+        return sha256(
+            command_receipt.canonical(
+                {
+                    "command": command.model_dump(mode="json"),
+                    "cwd": cwd,
+                    "env": env,
+                    "overlay": overlay,
+                    "removed": list(removed),
+                    "timeout": timeout,
+                    "stdin": stdin,
+                    "limit": limit,
+                }
+            )
+        ).hexdigest()
+
+    def prepare_command_receipt(
+        self,
+        identity: dict[str, Any],
+        *,
+        command: ExecCommand,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        timeout_s: int,
+        output_limit_bytes: int,
+    ) -> dict[str, Any] | None:
+        if (
+            self._runtime_evidence is None
+            or not self.container_id
+            or "python3" not in self._runtime_evidence.required_executables
+            or self.cancellation_cleanup != "sandbox"
+            or self.timeout_cleanup != "sandbox"
+            or self.output_secret_values_present()
+            or command.kind != "process"
+            or type(output_limit_bytes) is not int
+            or not 0 <= output_limit_bytes <= command_receipt.MAX_OUTPUT_BYTES
+        ):
+            return None
+        prepared = self._prepare_exec_request(
+            command,
+            cwd=cwd,
+            env=env,
+            env_remove=(),
+            timeout_s=timeout_s,
+            stdin=None,
+            output_limit_bytes=output_limit_bytes,
+        )
+        return command_receipt.descriptor(
+            {
+                "schema": "cayu.docker_command_authority.v1",
+                "identity": identity,
+                "key": secrets.token_hex(32),
+                "container_id": self.container_id,
+                "connection_sha256": self._receipt_connection_identity(),
+                "request_sha256": self._receipt_request_identity(prepared),
+                "timeout_seconds": timeout_s,
+                "output_limit": output_limit_bytes,
+            }
+        )
+
+    async def exec_with_receipt(
+        self,
+        command: ExecCommand,
+        *,
+        receipt: dict[str, Any],
+        redactor: SecretRedactor,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None,
+        stdin: str | None,
+        output_limit_bytes: int | None,
+    ) -> ExecResult:
+        return await self._exec(
+            command,
+            output_redactor=redactor,
+            cwd=cwd,
+            env=env,
+            env_remove=env_remove,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+            receipt=command_receipt.descriptor(receipt),
+        )
+
+    async def observe_command_receipt(
+        self,
+        identity: dict[str, Any],
+        receipt: dict[str, Any],
+    ) -> ExecResult | None:
+        owned = command_receipt.descriptor(receipt)
+        if (
+            owned["identity"] != command_receipt.validate_identity(identity)
+            or owned["container_id"] != self.container_id
+            or owned["connection_sha256"] != self._receipt_connection_identity()
+        ):
+            return None
+        path = f"{DOCKER_COMMAND_STATE_DIR}/receipt-{identity['operation_id'][7:]}/receipt.json"
+        # This trusted read command cannot launch the original command. File
+        # identity is not evidence: only the authenticated exact receipt is.
+        script = (
+            "import os,sys; "
+            "fd=os.open(sys.argv[1],os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK); "
+            "data=os.read(fd,3145729); os.close(fd); "
+            "sys.stdout.buffer.write(data)"
+        )
+        result = await run_subprocess(
+            SubprocessCommand(
+                argv=[
+                    self.docker_path,
+                    "exec",
+                    self.container_reference,
+                    "python3",
+                    "-I",
+                    "-S",
+                    "-c",
+                    script,
+                    path,
+                ]
+            ),
+            env=docker_cli_env(self.docker_cli_env_allowlist),
+            timeout_s=10,
+            output_limit_bytes=command_receipt.MAX_RECEIPT_BYTES + 1,
+        )
+        if result.exit_code or result.timed_out or result.stdout_truncated:
+            return None
+        try:
+            payload = command_receipt.verify(
+                result.stdout.encode("utf-8"),
+                identity=owned["identity"],
+                key=bytes.fromhex(owned["key"]),
+                output_limit=owned["output_limit"],
+                timeout_seconds=owned["timeout_seconds"],
+                request_sha256=owned["request_sha256"],
+            )
+        except ValueError:
+            return None
+        return ExecResult(
+            stdout=base64.b64decode(payload["stdout"]).decode("utf-8", errors="replace"),
+            stderr=base64.b64decode(payload["stderr"]).decode("utf-8", errors="replace"),
+            exit_code=payload["exit_code"],
+            timed_out=payload["timed_out"],
+            stdout_bytes=payload["stdout_bytes"],
+            stderr_bytes=payload["stderr_bytes"],
+            stdout_truncated=payload["stdout_bytes"] > owned["output_limit"],
+            stderr_truncated=payload["stderr_bytes"] > owned["output_limit"],
+            artifacts=[]
+            if not payload["timed_out"]
+            else [
+                {
+                    "type": "cayu.runner_cleanup.v1",
+                    "adapter": "docker",
+                    "action": "kill_command",
+                    "status": "completed",
+                    "evidence": "authenticated_command_receipt",
+                }
+            ],
+        )
+
     async def exec(
         self,
         command: ExecCommand,
@@ -3052,6 +3227,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
         stdin_stream: BinaryIO | None = None,
         stdout_stream: BinaryIO | None = None,
         stdout_limit_bytes: int | None = None,
+        receipt: dict[str, Any] | None = None,
     ) -> ExecResult:
         binary_input = validate_binary_input_stream(stdin_stream)
         binary_output = validate_binary_output_stream(stdout_stream)
@@ -3100,6 +3276,35 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             raise
         finally:
             del command
+        if receipt is not None:
+            receipt = command_receipt.descriptor(receipt)
+            if (
+                binary_input is not None
+                or binary_output is not None
+                or standard_input is not None
+                or receipt["container_id"] != self.container_id
+                or receipt["connection_sha256"] != self._receipt_connection_identity()
+                or receipt["request_sha256"]
+                != self._receipt_request_identity(
+                    (
+                        owned_command,
+                        working_dir,
+                        environment,
+                        env_overlay,
+                        validated_env_remove,
+                        declared_secret_env,
+                        secret_resolver,
+                        timeout,
+                        standard_input,
+                        output_limit,
+                    )
+                )
+                or self.output_secret_values_present()
+                or self._runtime_evidence is None
+                or self.cancellation_cleanup != "sandbox"
+                or self.timeout_cleanup != "sandbox"
+            ):
+                raise ValueError("Durable command conflicts with its prepared authority.")
         env = None
         stdin = None
         resolved_secrets = (
@@ -3139,6 +3344,37 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                     and owned_command.kind == "process"
                 ),
             )
+            if receipt is not None:
+                prefix = [self.docker_path, "exec", "-i", "-w", working_dir]
+                if env_file is not None:
+                    prefix.extend(["--env-file", env_file])
+                argv = [
+                    *prefix,
+                    self.container_reference,
+                    "python3",
+                    "-I",
+                    "-S",
+                    "-c",
+                    command_receipt.guest_program(),
+                ]
+                _validate_docker_exec_argv(argv)
+                standard_input = (
+                    json.dumps(
+                        {
+                            "identity": receipt["identity"],
+                            "key": receipt["key"],
+                            "request_sha256": receipt["request_sha256"],
+                            "argv": list(owned_command.argv or ()),
+                            "directory": f"{DOCKER_COMMAND_STATE_DIR}/receipt-{receipt['identity']['operation_id'][7:]}",
+                            "timeout_seconds": receipt["timeout_seconds"],
+                            "output_limit": receipt["output_limit"],
+                        }
+                    )
+                    + "\n"
+                )
+                invocation_redactor = invocation_redactor.merged_with(
+                    SecretRedactor((receipt["key"],))
+                )
             # The trusted host docker process receives only the bounded operational
             # allowlist. Container env values ride in --env-file,
             # never in the CLI's own environment, so a model-controlled env cannot hijack
@@ -3148,7 +3384,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                 result = await run_subprocess(
                     SubprocessCommand(argv=argv),
                     env=host_env,
-                    timeout_s=timeout,
+                    timeout_s=timeout if receipt is None else receipt["timeout_seconds"] + 5,
                     stdin=standard_input,
                     stdin_stream=binary_input,
                     stdout_stream=binary_output,
@@ -3156,6 +3392,13 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                     output_limit_bytes=output_limit,
                     output_redactor=invocation_redactor,
                 )
+                if receipt is not None and not result.timed_out:
+                    observed = await self.observe_command_receipt(receipt["identity"], receipt)
+                    if observed is None:
+                        raise RuntimeError("Durable command terminal evidence is unavailable.")
+                    result = redact_command_receipt_result(
+                        observed, invocation_redactor, receipt["output_limit"]
+                    )
             except SubprocessLaunchRefused:
                 # The local exec syscall refused the CLI before guest dispatch.
                 raise

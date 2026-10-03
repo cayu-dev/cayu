@@ -389,6 +389,7 @@ class RecoveryEnvironmentEvidence(BaseModel):
         max_length=64,
     )
     completion_finalization_pending: StrictBool = False
+    finalization_outcome: Literal["completed", "failed", "interrupted"] | None = None
 
 
 class RecoveryInterruptionCascadeEvidence(BaseModel):

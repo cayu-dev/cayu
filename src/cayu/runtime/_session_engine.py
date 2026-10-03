@@ -11538,7 +11538,16 @@ class SessionEngine:
                     == admission.source_execution_profile_fingerprint
                 )
             )
-        if stop.request.reason not in {"budget_limit", "elapsed_limit"} or marker is not None:
+        if stop.request.reason not in {"budget_limit", "elapsed_limit"}:
+            return False
+        # A native non-success marker retains binding cleanup, not permission
+        # to continue execution. Completed governed work has a different owner.
+        if marker is not None and not (
+            marker["outcome"] in {"failed", "interrupted"}
+            and marker["execution_profile_fingerprint"]
+            == admission.source_execution_profile_fingerprint
+            and marker.get("task_id") is None
+        ):
             return False
         # Stop intent is not quiescence. Model-stage publication and the existing
         # checkpoint guards retain uncertain external work with its current owner.

@@ -214,6 +214,24 @@ Reconstruct the application with the same persistent stores and pass the origina
 instead of starting a new run. The workflow delegates reconstruction to Runtime;
 it does not parse checkpoints or create its own recovery owner.
 
+`CodingProductRunner.inspect_settled_execution(request)` performs the original
+invocation, source-authority, lineage, and release checks without publishing a
+product or executing the source-publication validator. It returns a
+`CodingProductExecutionInspection` containing the request fingerprint, the exact
+release-evidence fingerprint, and bounded, defensively projected events,
+including for interrupted invocations. Its `tool_call_ordinals` tuple aligns
+with those events and correlates the full original private model-step, attempt,
+tool-round and call identity without exposing those identifiers. Non-tool or
+unresolvable records have `None`; consumers must not infer a call identity from
+that absence. Ordinals are local to this exact transcript, not execution or
+cleanup authority. They permit consumers to distinguish batched starts from
+missing or duplicate terminal evidence without comparing presentation aliases.
+These
+events are not a successful result, nor proof that an enclosing application
+worker or an ambiguous external effect has stopped. Application-owned task
+reconciliation must establish those facts separately. Resumed or recreated
+invocations are rejected even when a product publication already exists.
+
 ## Extending the product
 
 Keep product policy in the generated domain and workflow files. Custom language

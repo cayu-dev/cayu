@@ -64,6 +64,7 @@ only when the requested behavior requires it.
 | An HTTP control plane | `cayu[server]`, authenticated FastAPI application | `cayu guide references#server` |
 | A public or multi-user agent product | `cayu new NAME --preset service`, maintained tenant-safe service factory | `cayu guide references#server` |
 | A maintained repository-coding starter | `cayu new NAME --preset coding`, explicit workspace, knowledge, reviewer, and input composition | `cayu guide authoring#coding-composition` |
+| A product API around repository coding | application-owned authentication, durable intake, workers and independent acceptance | `cayu guide authoring#coding-product-host` |
 | Advanced authority, isolation, caching, or speculation | composed runtime strategies with explicit evidence boundaries | `cayu guide references#advanced-runtime` |
 
 This map is a menu, not a checklist. A conversational, classification,
@@ -124,6 +125,11 @@ workspace and runner are not a sandbox. Keep the default scaffold for jobs that
 do not need these capabilities, and do not combine the coding composition with
 the multi-user service template.
 
+This is a restriction on combining generated templates, not a prohibition on
+hosting a coding application behind an application-owned API. For that advanced
+composition, use `cayu guide authoring#coding-product-host`; it does not inherit
+the service template's authentication or verification just by adding routes.
+
 Selecting this composition chooses implementations; it does not grant authority.
 Its exposure policy separately controls model-visible tools, and its ordinary
 tool policy, approval policy, and runtime gates independently authorize calls.
@@ -144,6 +150,266 @@ A tool-backed slice is optional. Add one only when the agent needs a real
 capability outside the model. Prefer a narrow domain tool; when command
 execution is necessary, use an explicit runner and enforcing command/tool
 policy.
+
+## Coding product host
+
+Start with one generated coding project and retain its actual scaffold metadata.
+Do not overlay a second generated service project, relabel its preset, or expose
+the operator control plane as a customer API. Build the product host explicitly
+using public Cayu APIs and the following existing owners:
+
+| Boundary | Application home and implementation responsibility |
+| --- | --- |
+| Construction | `app.py` constructs and registers the same application graph in each process; it does not start workers, migrate stores or perform model calls. |
+| Durable state | `configuration/` constructs shared session/task/artifact backends. Application-owned business reservations need their own durable transaction owner; a hash of an intake request is not an atomic reservation. |
+| Spending authority | `policies/` configures matching budget scopes, explicit pricing and conservative reservations against a shared durable ledger. A per-operation causal limit is not a deployment-wide total cap; verify the actual run identity and refusal before provider dispatch with `cayu guide references#cost-control`. |
+| Product intake | `operations/` authenticates the customer, obtains tenant/subject from that authentication, captures the admitted source and configuration, and reserves stable public/product/session/task identities under an idempotency key. Resolve reads by authenticated tenant and public ID; return an allow-listed product projection, not raw Runtime records. |
+| Task handoff | After reserving identity, use `CayuApp.create_task(TaskCreate(...))`. Reservation and task insertion can commit separately: retry the same reservation and task identity, read back an ambiguous insertion, and reject conflicting contents rather than allocating replacement work. |
+| Worker lifetime | A separate `operations/` role uses `run_task_worker` with `TaskQuery` for its phase. Reconstruct the original reservation from the store-owned claim and validate its current ownership before executing. Use `complete_managed_task` after independent acceptance; do not create another lease or retry engine. |
+| Coding result | `workflows/` coordinates the maintained coding product; `domain/` checks the admitted revision, permitted changes, required checks and independent verifier against retained artifact evidence. `CodingProductArtifactRepository` provides request/publication readback. Model text, successful project tests or task completion alone are not independent acceptance. |
+| Operator host | Mount the control plane with `cayu.server.mount_cayu` and explicit `AuthenticatedAccess`. Protect application operator routes separately; customer authentication neither grants operator access nor authorizes another tenant's resources. |
+| Delivery | `integrations/` owns separately approved Git/GitHub handoffs. Keep patch readiness, exact reviewed change/destination approval, publication, hosted checks and final delivery distinct. No approval is implied by producing a patch. |
+
+First test the assembled HTTP application with injected providers and stores:
+authentication refusal, cross-tenant lookup, duplicate intake, conflicting retry,
+independent acceptance and truthful pending/failed responses. Then exercise the
+same application with its installed distribution and persistent deployment.
+Keep source, Runtime/artifact state and delivery state separate; credentials
+stay outside the admitted coding guest. Prepare schemas explicitly and run
+homogeneous application versions with coordinated backup and restart.
+
+Check the actual factory before building the deployment image: run `cayu check`
+from the generated project with its intended configuration. Keep environment
+reads, collection-building calls and other construction inside the synchronous
+factory or runtime functions, not module import expressions. An importable module
+can still violate the scaffold's import-side-effect contract. Preserve the
+generated enforcing policies where possible; a custom policy returning "allow"
+does not establish inspectable external-tool coverage. Resolve
+`cayu guide diagnostics#external-tool-coverage-unknown` rather than suppressing
+that error or treating HTTP startup as a passing deployment check.
+
+For narrower coding authority, extend the generated concrete
+`ParameterConstrainedToolPolicy` rules in `policies/` and wire that policy at
+the existing construction seam. Preserve the existing path and selector rules;
+append a `RequiredAllowlistRule("path", values=[...])` to restrict writes to
+specific paths. Do not replace those rules with a custom delegating `ToolPolicy`
+or subclass merely to add a restriction: inspection cannot prove that arbitrary
+Python calls its underlying enforcement. An `execution_profile_identity` binds
+behavior for reconstruction; it does not certify static policy coverage.
+Give the changed policy its own explicit, versioned behavior identity and
+advance that identity when its enforcement changes; do not reuse the original
+generated policy's identity for different behavior.
+The maintained `StructuredCommandToolPolicy` preserves known base coverage,
+but cannot make an unknown custom base statically trusted. Run `cayu check`
+again after composition changes, before deployment or worker dispatch.
+
+### Queue reserved work
+
+A business reservation may choose a future session ID, but that is not a native
+task attachment. Leave `TaskCreate.session_id` unset when enqueueing ordinary
+work: `run_task_worker` claims only unattached pending tasks. Setting that field
+early makes the task ineligible even if the named session does not exist. Keep
+the intended session ID in the durable business reservation; the claimed worker
+resolves it there, and Runtime admission owns any native task/session attachment.
+Never clear an existing attachment merely to make a task claimable.
+
+For example, after authenticating and resolving the original durable reservation:
+
+```python
+from cayu import TaskCreate
+
+
+async def enqueue_reserved_coding_task(app, reservation):
+    return await app.create_task(
+        TaskCreate(
+            task_id=reservation.task_id,
+            type="coding_product",
+            assigned_agent_name="coding",
+            input={"public_id": reservation.public_id},
+        )
+    )
+```
+
+The worker must load that same reservation and validate its task, tenant, source
+and execution authority before using its intended session ID. On ambiguous task
+insertion, read back and compare the original task instead of choosing new IDs.
+
+For a detached coding product, a worker handler can finish through this existing
+managed boundary. Here `verify_product_for_claim` is an application-owned function
+that must resolve the original reservation, run or recover the maintained product,
+and independently validate its exact artifact and cleanup evidence. It is not an
+agent-text parser or a substitute for an independent verifier:
+
+```python
+from cayu import complete_managed_task
+
+
+async def handle_coding_task(app, claimed, worker_id):
+    verified = await verify_product_for_claim(app, claimed)
+    await complete_managed_task(
+        app.task_store,
+        claimed,
+        worker_id,
+        {
+            "product_run_id": verified.product_run_id,
+            "result_digest": verified.result_digest,
+        },
+    )
+```
+
+`run_task_worker` owns the heartbeat while this handler executes.
+`complete_managed_task` uses its latest acknowledged lease and returns a durable
+`Task`; it does not create a caller-keyed `TaskTerminalizationReceipt`. Do not
+load a lease and construct a raw `TaskTerminalizationRequest` alongside that
+heartbeat merely to obtain such a receipt. Extending the lease duration does not
+remove the race. Use the original claimed task with the managed helper.
+
+If completion's reply is lost, read the original task through `TaskStore.load_task`
+and validate its type, session, completed status and exact result against the
+saved reservation and independently verified product artifact. That durable
+task/result is normal-completion evidence; it need not have a separately keyed
+terminal receipt. Do not rerun coding, manufacture a receipt, or complete a still
+claimed task from a read-only screen. Cancellation reconciliation uses a different
+explicit receipt, as described below and in `cayu guide references#background-work`.
+
+Run schema creation and validation with the same pinned Python runtime as the
+API and workers, preferably from their deployment image. Matching Cayu versions
+alone is insufficient: durable transcript indexes also bind Python's Unicode
+tokenizer identity. A host-created database can therefore reject a container
+using a different Python runtime. Preserve an incompatible database and its
+evidence; do not rewrite its tokenizer metadata or erase accounting to pass
+startup. Choose the matching runtime or separately initialize a new disposable
+database with the intended runtime before a fresh trial.
+
+For worker loss, use registered recovery through `cayu recovery plan` and
+`cayu recovery execute` with the original application and admitted workspace.
+A dead worker, expired lease or cancelled await does not prove an external
+effect stopped. Require authoritative effect and invocation-release evidence
+before reconciling the outer task. Unknown effects remain fenced; cleanup-only
+recovery must not redispatch the model. Prove native resource disposal or a
+supported retained recovery owner separately from session/task terminal status.
+Do not label cancellation settlement as a verified repair.
+
+Observe and reconcile the retained native allocation and command journal before
+destructive disposal. Removing a guest first can destroy the only reconnectable
+workspace or terminal-command receipt needed by registered recovery. Use the
+registered resource owner and its allowed disposition; an unrelated Docker
+cleanup script cannot substitute for native recovery settlement.
+
+Recovery must retain the original invocation controls, not just the same agent
+and workspace. In `ToolRoundRecoveryRequest`, omitted continuation controls use
+the recorded invocation. Changing `max_steps` from eight to one still changes
+the execution profile; it is not an observation-only switch. Ordinary manual
+tool-round recovery may continue the model after settling the round. If execution
+must not continue, select a supported interruption or failure disposition whose
+owner can settle the retained effect and resources; do not invent tool success,
+delete its recovery evidence, or relax profile validation. See
+`cayu guide tool-effects#native-durable-recovery-evidence`.
+
+Keep application-owned recovery diagnostics provisional rather than storing
+`recovery_required` as an immutable final result. The application needs an exact
+transaction that consumes the validated native terminal task/result or explicit
+cancellation-reconciliation receipt, settles the original business reservation,
+and releases its source fence only after effect settlement and required resource cleanup are positively
+verified. Unresolved work retains its fence and a supported recovery owner.
+Preserve prior diagnostics and reject changed task/session/source or evidence.
+When consuming an explicit receipt, make replay of the same receipt idempotent.
+Native session recovery alone does not perform this application transaction;
+do not replace it with a scenario-specific script
+that edits business rows or assumes process death proves quiescence.
+
+This composition remains application-owned. A successful `cayu check` or a
+declared extension is structural evidence, not proof of its authentication,
+acceptance, deployment or recovery behavior. See `cayu guide references#server`,
+`cayu guide references#background-work`, and `cayu guide tool-effects` for the
+reusable boundaries; preserve the generated convention rather than adding a
+parallel orchestration framework.
+
+## coding-host-settlement-example
+
+The installed example `cayu.guides.coding_host` extends the generated coding
+application rather than implementing another recovery engine. Its SQLite
+`BusinessStore` is application state, separate from the Runtime task/session
+stores. It is a single-tenant, bounded local-host recipe, not a production
+multi-host database adapter or an HTTP authentication layer.
+
+From a generated coding project, wrap its normal factory result before starting
+the API or task worker. This deployment must already have its reviewed priced
+budget policy configured:
+
+```python
+from pathlib import Path
+
+from app import build_coding_product_application
+from cayu.guides.coding_host import BusinessStore, extend_generated_application
+
+business = BusinessStore(Path(".cayu/coding-business.sqlite"))
+configured = build_coding_product_application()
+pricing = configured.app.budget_policy.limits[0].pricing
+product = extend_generated_application(
+    configured, business=business, tenant="disposable-example",
+    pricing=pricing, cost_basis="observed",
+)
+```
+
+The extension uses the generated, project-owned preparation method to reserve the
+source before execution. Recovery checks the existing reservation and never
+synthesizes missing intake provenance. Retain the complete original
+`CodingProductTask`, including its instruction and controls, in the existing
+authenticated intake/task payload; a native request fingerprint cannot reconstruct
+that input. Keep the original product/task/session IDs.
+The managed handler still owns ordinary task completion: record exactly
+`{"product_run_id": publication.candidate.product_run_id,
+"result_digest": publication.result_reference.digest}` using
+`complete_managed_task`. Then call `product.settle_completed(task,
+result_digest=..., pricing=..., cost_basis="observed")`. The same method handles
+completion acknowledgement loss after reading the exact completed task; it never
+reruns the handler. Patch readiness is not independent application acceptance,
+human approval, or successful external delivery.
+
+For cancelled work, first execute supported registered native recovery. The
+example's `product.settle_cancelled` requires an authenticated `ResolutionActor`,
+the original task, a stable reconciliation ID, pricing and an explicit cost basis.
+Its default worker observer uses the existing maintained Docker-host owner:
+run the trusted `maintenance.coding` worker with `maintenance_worker_id` from
+`cayu.guides.coding_host_owner` and `CAYU_MAINTENANCE_WORKER_OWNER=docker`.
+Pass `await maintenance_worker_id("maintenance.coding")` as the native
+`run_task_worker` worker ID. This observer's supported container command is
+`cayu worker coding --shutdown-grace-seconds 30`; its trusted service image needs
+`/usr/local/bin/docker` and authorized access to the local Docker socket. A
+different supervisor needs its own reviewed generation observer, not a boolean
+or an inference from PID absence.
+It inspects the exact container lifetime on the local daemon; no missing-container
+or lease-expiry inference substitutes for a stopped generation. The native
+inspector must independently prove invocation release, and the maintained
+file/check effect validator rejects unknown/custom effects. This recipe neither
+disposes guests nor authorizes recovery actions that native planning refuses.
+Keep the source fenced when any evidence is unavailable.
+This example settles patch-ready completion and owner-lost cancellation, not
+arbitrary failed tasks or unsupported custom effects. Those remain explicitly
+reserved for the application's operator/recovery owner; do not reset the task or
+use the internal transaction method as a substitute for positive evidence.
+
+The complete native reconciliation request is saved before its store call.
+Retries reuse its actor, evidence, timestamps and idempotency key. The application
+then records the native receipt and result in the same transaction that releases
+its source reservation. A lost reply at either boundary is reconciled without a
+new task or model invocation. Do not expose `BusinessStore.prepare/settle` directly
+as HTTP operations: they are internal application transaction primitives.
+
+Both terminal paths use `project_result`. Select `synthetic` only in explicitly
+controlled fixtures; missing usage never implies free work. Cost is a recorded
+estimate under the identified price book, not complete billing. Historical reads
+use `business.read(reservation)` and remain valid after later source changes.
+Before a **new delivery**, use `require_current_source` under the application's
+exclusive source/delivery owner: it compares a bounded byte-level observation to
+the authenticated retained result, not just Git status. Keep that owner and the
+delivery's own exact approval checks through publication. This observation alone
+does not authorize any Git or GitHub action.
+
+The reservation pins the complete price book and cost basis. Reconciliation
+rejects a changed pricing/basis configuration rather than relabeling a synthetic
+trial as observed provider spending after restart.
 
 ## 2. Use the project factory
 

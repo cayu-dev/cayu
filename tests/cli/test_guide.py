@@ -554,7 +554,7 @@ def test_domain_tool_reference_documents_the_public_authoring_interface(capsys) 
 
 
 def test_every_cayu_map_row_routes_to_a_package_shipped_local_guide(capsys) -> None:
-    assert main(["guide", "authoring"]) == 0
+    assert main(["guide", "authoring#cayu-map"]) == 0
     authoring = capsys.readouterr().out
     rows = [line for line in authoring.splitlines() if line.startswith("|")][2:]
 

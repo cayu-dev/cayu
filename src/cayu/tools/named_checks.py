@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from hashlib import sha256
 from itertools import islice
 from time import perf_counter_ns
-from typing import TYPE_CHECKING, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from cayu._validation import (
     canonical_durable_json_bytes,
@@ -31,6 +32,10 @@ from cayu.runtime.execution_identity import (
 )
 from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
 from cayu.tools.base import (
+    DurableToolRecovery,
+    DurableToolRecoveryAuthority,
+    DurableToolRecoveryEvidence,
+    DurableToolRecoveryIdentity,
     Tool,
     ToolContext,
     ToolEffect,
@@ -49,6 +54,16 @@ from cayu.tools.commands import (
     _command_output_encoding,
     _command_output_label,
     _command_output_preview_encoding,
+)
+from cayu.tools.structured_commands import (
+    RunCommandTool,
+    _argv_digest,
+    _bind_durable_runner_operation,
+    _capture_workspace_command_manifest,
+    _CommandJournalError,
+    _start_command_journal,
+    _timing_evidence,
+    _WorkspaceManifestError,
 )
 from cayu.workspaces.revisions import (
     WorkspaceRevisionObservation,
@@ -177,7 +192,63 @@ class NamedCheck:
         }
 
 
-class RunCheckTool(Tool):
+class _RunCheckRecoveryCommandTool(RunCommandTool):
+    """Structured-command recovery adapter for the named-check argument shape."""
+
+    def _resolve_arguments(self, args: dict):
+        if type(args) is dict and set(args) == {"check"}:
+            check = args["check"]
+            if type(check) is str:
+                args = {"selector": check}
+        return super()._resolve_arguments(args)
+
+    def __init__(
+        self, *, toolchain_profile: DockerCodingToolchainProfile, owner: RunCheckTool
+    ) -> None:
+        if type(toolchain_profile) is not DockerCodingToolchainProfile:
+            raise TypeError("toolchain_profile must be an exact DockerCodingToolchainProfile.")
+        self._profile = DockerCodingToolchainProfile.model_validate(
+            toolchain_profile.model_dump(mode="python", by_alias=True)
+        )
+        self._authorities = {item.selector: item for item in self._profile.named_check_authorities}
+        self.spec = self.spec.model_copy(update={"name": "run_check"})
+        self._owner = owner
+        Tool.__init__(self, self.spec)
+
+    async def _project_result(self, ctx, **kwargs):
+        owner = self._owner
+        workspace = ctx.workspace
+        workspace_id = None if workspace is None else getattr(workspace, "id", None)
+        workspace_observation = None
+        if workspace is not None and type(workspace_id) is str and workspace_id == ctx.workspace_id:
+            workspace_observation = await observe_deterministic_workspace(
+                cast("Workspace", workspace),
+                observer="cayu-run-check-recovery",
+                limits=owner._workspace_observation_limits,
+            )
+        result = await owner._project_result(
+            ctx,
+            check=owner._checks_by_name[kwargs["authority"].selector],
+            raw_result=kwargs["raw_result"],
+            workspace_observation=workspace_observation,
+        )
+        authority = kwargs["authority"]
+        result = owner._attach_toolchain_evidence(owner._checks_by_name[authority.selector], result)
+        return result.model_copy(
+            update={
+                "structured": {
+                    **(result.structured or {}),
+                    "selector": authority.selector,
+                    "selector_fingerprint": authority.fingerprint,
+                    "toolchain_profile_fingerprint": self._profile.fingerprint,
+                    "argv_sha256": _argv_digest(kwargs["command_argv"]),
+                    "duration_ms": kwargs["timing"].get("duration_ms"),
+                }
+            }
+        )
+
+
+class RunCheckTool(Tool, DurableToolRecovery):
     """Run one application-owned check selected by its finite public name."""
 
     spec = ToolSpec(
@@ -285,6 +356,11 @@ class RunCheckTool(Tool):
         self._executor = ExecCommandTool(policy=command_policy)
         self._max_model_output_bytes = owned_model_limit
         self._toolchain_profile = owned_toolchain
+        self._recovery_tool = (
+            None
+            if owned_toolchain is None
+            else _RunCheckRecoveryCommandTool(toolchain_profile=owned_toolchain, owner=self)
+        )
         if (
             workspace_observation_limits is not None
             and type(workspace_observation_limits) is not WorkspaceRevisionObservationLimits
@@ -294,6 +370,52 @@ class RunCheckTool(Tool):
             )
         self._workspace_observation_limits = (
             workspace_observation_limits or WorkspaceRevisionObservationLimits()
+        )
+
+    async def inspect_durable_tool_call(
+        self, *, identity: DurableToolRecoveryIdentity, load_operation, observe_receipt
+    ) -> bool:
+        if self._recovery_tool is None:
+            return False
+        return await self._recovery_tool.inspect_durable_tool_call(
+            identity=identity, load_operation=load_operation, observe_receipt=observe_receipt
+        )
+
+    async def reconcile_durable_tool_call(
+        self,
+        *,
+        parent_session_id: str,
+        parent_run_epoch: int,
+        execution_profile_fingerprint: str | None,
+        environment_name: str | None,
+        environment_allocation_fingerprint: str | None,
+        model_step_id: str,
+        model_attempt_id: str,
+        tool_round_id: str,
+        tool_call_id: str,
+        idempotency_key: str,
+        arguments: dict[str, Any],
+        started: bool,
+        load_operation: Callable[[str], Awaitable[dict[str, Any] | None]],
+        recovery_authority: DurableToolRecoveryAuthority | None = None,
+    ) -> DurableToolRecoveryEvidence | None:
+        if self._recovery_tool is None:
+            return None
+        return await self._recovery_tool.reconcile_durable_tool_call(
+            parent_session_id=parent_session_id,
+            parent_run_epoch=parent_run_epoch,
+            execution_profile_fingerprint=execution_profile_fingerprint,
+            environment_name=environment_name,
+            environment_allocation_fingerprint=environment_allocation_fingerprint,
+            model_step_id=model_step_id,
+            model_attempt_id=model_attempt_id,
+            tool_round_id=tool_round_id,
+            tool_call_id=tool_call_id,
+            idempotency_key=idempotency_key,
+            arguments=arguments,
+            started=started,
+            load_operation=load_operation,
+            recovery_authority=recovery_authority,
         )
 
     @property
@@ -421,7 +543,86 @@ class RunCheckTool(Tool):
                     started_ns=started_ns,
                 )
 
+        journal = None
+        command_argv = tuple(check.command.argv or ())
+        if self._toolchain_profile is not None:
+            if authority.command_argv() != command_argv:
+                raise AssertionError("Named check authority does not match its declaration.")
+            workspace_for_journal = ctx.workspace
+            if workspace_for_journal is None:  # pragma: no cover - guarded above
+                raise AssertionError("Named check workspace disappeared before journaling.")
+            try:
+                before_manifest = await _capture_workspace_command_manifest(workspace_for_journal)
+                journal = await _start_command_journal(
+                    ctx,
+                    profile=self._toolchain_profile,
+                    authority=authority,
+                    command_argv=command_argv,
+                    working_directory=authority.default_working_directory,
+                    timeout_seconds=check.timeout_s,
+                    output_mode="summary",
+                    before_manifest=before_manifest,
+                    tool_name="run_check",
+                )
+                if journal is not None:
+                    _bind_durable_runner_operation(
+                        ctx.runner,
+                        journal.record.get("runner_operation"),
+                        journal.record.get("runner_receipt"),
+                    )
+                    await journal.mark_dispatching()
+            except _CommandJournalError:
+                return self._complete_result(
+                    check,
+                    ToolResult(
+                        content="Named check durable dispatch evidence was unavailable.",
+                        structured={
+                            **_base_error_evidence(check, status="toolchain_unavailable"),
+                            "error": "durable_command_journal_unavailable",
+                        },
+                        is_error=True,
+                    ),
+                    started_ns=started_ns,
+                )
+            except _WorkspaceManifestError:
+                return self._complete_result(
+                    check,
+                    ToolResult(
+                        content="Named check requires a complete workspace observation before dispatch.",
+                        structured={
+                            **_base_error_evidence(check, status="toolchain_unavailable"),
+                            "error": "workspace_observation_unavailable",
+                        },
+                        is_error=True,
+                    ),
+                    started_ns=started_ns,
+                )
+
+            runner_failure = await ensure_docker_coding_toolchain_runner_admission(
+                ctx.runner,
+                profile=self._toolchain_profile,
+            )
+            if runner_failure is not None:
+                result = self._complete_result(
+                    check,
+                    ToolResult(
+                        content=(
+                            f"Check {check.name!r} admission changed at dispatch; no check was run."
+                        ),
+                        structured={
+                            **_base_error_evidence(check, status="toolchain_unavailable"),
+                            "error": runner_failure,
+                            "workspace_mutation_settlement": "complete",
+                            "cleanup_uncertain": False,
+                        },
+                        is_error=True,
+                    ),
+                    started_ns=started_ns,
+                )
+                return await self._finish_durable_result(journal, result)
+
         try:
+            process_started_at = datetime.now(UTC)
             raw_result = await self._executor._execute_resolved_command(
                 ctx,
                 command=check.command,
@@ -435,19 +636,42 @@ class RunCheckTool(Tool):
                 include_runner_evidence=True,
             )
         except RunnerExecutionError as exc:
-            return self._complete_result(
+            result = self._complete_result(
                 check,
                 _execution_failure_result(check, exc),
                 started_ns=started_ns,
             )
+            return await self._finish_durable_result(journal, result)
         except TypeError as exc:
             if str(exc) != "Runner returned invalid result type.":
                 raise
-            return self._complete_result(
+            result = self._complete_result(
                 check,
                 _malformed_execution_result(check),
                 started_ns=started_ns,
             )
+            return await self._finish_durable_result(journal, result)
+        if journal is not None:
+            try:
+                await journal.checkpoint_runner_terminal(
+                    raw_result,
+                    timing=_timing_evidence(process_started_at, datetime.now(UTC)),
+                )
+            except _CommandJournalError:
+                result = self._complete_result(
+                    check,
+                    ToolResult(
+                        content="Named check runner terminal evidence was not durably settled.",
+                        structured={
+                            **_base_error_evidence(check, status="ambiguous"),
+                            "error": "durable_runner_terminal_unsettled",
+                            "reconstruction_required": True,
+                        },
+                        is_error=True,
+                    ),
+                    started_ns=started_ns,
+                )
+                return await self._finish_durable_result(journal, result)
         workspace_observation: WorkspaceRevisionObservation | None = None
         workspace = ctx.workspace
         workspace_id = None if workspace is None else getattr(workspace, "id", None)
@@ -483,15 +707,32 @@ class RunCheckTool(Tool):
                         exc,
                         result=projected,
                     )
-            return self._complete_result(check, projected, started_ns=started_ns)
+            result = self._complete_result(check, projected, started_ns=started_ns)
+            return await self._finish_durable_result(journal, result)
         except TypeError as exc:
             if str(exc) != "Runner returned invalid result type.":
                 raise
-            return self._complete_result(
+            result = self._complete_result(
                 check,
                 _malformed_execution_result(check),
                 started_ns=started_ns,
             )
+            return await self._finish_durable_result(journal, result)
+
+    async def _finish_durable_result(self, journal, result: ToolResult) -> ToolResult:
+        if journal is None or self._recovery_tool is None:
+            return result
+        structured = {} if result.structured is None else dict(result.structured)
+        structured.update(
+            {
+                "selector": journal.record["selector"],
+                "selector_fingerprint": journal.record["selector_fingerprint"],
+                "toolchain_profile_fingerprint": journal.record["toolchain_profile_fingerprint"],
+                "argv_sha256": journal.record["argv_sha256"],
+            }
+        )
+        result = result.model_copy(update={"structured": structured})
+        return await self._recovery_tool._finish_durable_result(journal, result)
 
     def _complete_result(
         self,

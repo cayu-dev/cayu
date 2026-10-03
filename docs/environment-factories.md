@@ -535,6 +535,13 @@ fails the task/session with `workspace_output_committed=false`, and can be retri
 binding policy and, when `source_conflict_policy="require_revision"`, the original revision baseline;
 it does not repeat model or tool execution.
 
+Completion-critical bindings retain the same durable retry ownership when an
+invocation fails or is interrupted. Recovery preserves that original outcome
+and retries finalization only; it does not report a successful application result.
+Inspect the recovery plan's `environment_recovery.finalization_outcome` alongside
+`completion_finalization_pending`. A failed publication or disposal remains pending
+until its exact owner settles, including after process restart.
+
 ### Shared immutable Docker inputs
 
 Use an immutable input projection for large runtime or support trees that many

@@ -8,8 +8,20 @@ from cayu.collaboration.participants import CollaborationUnavailable
 
 
 async def prune_to_receipt(app, batch, *, pending_observed=None):
+    return await _maintenance_to_receipt(
+        app, app.prune_collaboration_namespace, batch, pending_observed=pending_observed
+    )
+
+
+async def retire_to_receipt(app, request, *, pending_observed=None):
+    return await _maintenance_to_receipt(
+        app, app.retire_collaboration_namespace, request, pending_observed=pending_observed
+    )
+
+
+async def _maintenance_to_receipt(app, operation, request, *, pending_observed):
     try:
-        return await app.prune_collaboration_namespace(batch, context=CONTEXT)
+        return await operation(request, context=CONTEXT)
     except CollaborationUnavailable:
         store, _ = app._participant_coordinator._ready()
         pending = tuple(store._owners.pending)
@@ -22,6 +34,6 @@ async def prune_to_receipt(app, batch, *, pending_observed=None):
         if pending_observed is not None:
             pending_observed.set()
         original = await asyncio.wait_for(asyncio.shield(pending[0]), 60)
-        receipt = await app.prune_collaboration_namespace(batch, context=CONTEXT)
+        receipt = await operation(request, context=CONTEXT)
         assert receipt == original
         return receipt

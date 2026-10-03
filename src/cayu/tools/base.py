@@ -884,6 +884,70 @@ class DurableToolRecoveryAuthority:
     reconcile_runner_operation: (
         Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]] | None
     ) = None
+    reconcile_runner_receipt: (
+        Callable[[dict[str, Any], dict[str, Any]], Awaitable[dict[str, Any] | None]] | None
+    ) = None
+
+
+@dataclass(frozen=True, slots=True)
+class DurableToolRecoveryIdentity:
+    """Runtime-resolved expected call identity for read-only recovery inspection."""
+
+    parent_session_id: str
+    parent_run_epoch: int
+    execution_profile_fingerprint: str | None
+    environment_name: str | None
+    environment_allocation_fingerprint: str | None
+    model_step_id: str
+    model_attempt_id: str
+    tool_round_id: str
+    tool_call_id: str
+    idempotency_key: str
+    arguments: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        for name in (
+            "parent_session_id",
+            "model_step_id",
+            "model_attempt_id",
+            "tool_round_id",
+            "tool_call_id",
+            "idempotency_key",
+        ):
+            require_durable_clean_nonblank(getattr(self, name), name)
+        for name in (
+            "execution_profile_fingerprint",
+            "environment_name",
+            "environment_allocation_fingerprint",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                require_durable_clean_nonblank(value, name)
+        if type(self.parent_run_epoch) is not int or self.parent_run_epoch < 1:
+            raise ValueError("Recovery inspection requires a positive source run epoch.")
+        object.__setattr__(
+            self, "arguments", copy_durable_json_object(self.arguments, "recovery.arguments")
+        )
+
+
+@runtime_checkable
+class DurableToolRecoveryInspection(Protocol):
+    """Advisory positive-evidence probe; cannot dispatch or publish a result.
+
+    The execution owner must repeat validation after acquiring its run fence.
+    Inspection supplies neither a compare-and-set nor a writable workspace.
+    """
+
+    async def inspect_durable_tool_call(
+        self,
+        *,
+        identity: DurableToolRecoveryIdentity,
+        load_operation: Callable[[str], Awaitable[dict[str, Any] | None]],
+        observe_receipt: Callable[
+            [dict[str, Any], dict[str, Any]], Awaitable[dict[str, Any] | None]
+        ]
+        | None,
+    ) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -1058,9 +1122,15 @@ def _bind_runtime_tool_invocation_authority(
     )
 
     def discard(expired: ReferenceType[Any]) -> None:
-        registered = _RUNTIME_TOOL_INVOCATION_AUTHORITIES.get(context_id)
+        # Weak-reference callbacks may run during interpreter/module teardown,
+        # after module globals have been cleared.  Keep cleanup best-effort and
+        # never let that late callback surface as an unraisable exception.
+        registry = globals().get("_RUNTIME_TOOL_INVOCATION_AUTHORITIES")
+        if not isinstance(registry, dict):
+            return
+        registered = registry.get(context_id)
         if registered is not None and registered[0] is expired:
-            _RUNTIME_TOOL_INVOCATION_AUTHORITIES.pop(context_id, None)
+            registry.pop(context_id, None)
 
     context_reference = ref(context, discard)
     _RUNTIME_TOOL_INVOCATION_AUTHORITIES[context_id] = (context_reference, authority)

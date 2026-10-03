@@ -188,7 +188,11 @@ def test_preview_and_run_calibrate_fixed_evidence_without_candidate_execution(tm
 
         reopened = SQLiteEvalStore(path)
         try:
-            with TestClient(_server(target, reopened)) as restarted_client:
+            # A new server lifespan owns a fresh app, while exact replay uses
+            # the same durable evaluation identity and must dispatch no model.
+            restarted_judge, restarted_judge_provider = _judge_with_trials(0)
+            restarted_target, restarted_candidate_provider = _target(restarted_judge)
+            with TestClient(_server(restarted_target, reopened)) as restarted_client:
                 recovered = restarted_client.post(
                     "/api/evals/judge-calibrations",
                     headers=_AUTH_HEADERS,
@@ -202,6 +206,8 @@ def test_preview_and_run_calibrate_fixed_evidence_without_candidate_execution(tm
                 assert recovered.json()["report"] == report
                 assert len(judge_provider.requests) == 2
                 assert candidate_provider.requests == []
+                assert restarted_judge_provider.requests == []
+                assert restarted_candidate_provider.requests == []
         finally:
             asyncio.run(reopened.close())
     finally:

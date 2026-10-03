@@ -1372,6 +1372,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "CodingProductCandidate": ("cayu.coding_products", "CodingProductCandidate"),
     "CodingProductCompletionVerifier": ("cayu.coding_products", "CodingProductCompletionVerifier"),
     "CodingProductEvidenceError": ("cayu.coding_products", "CodingProductEvidenceError"),
+    "CodingProductExecutionInspection": (
+        "cayu.coding_products",
+        "CodingProductExecutionInspection",
+    ),
     "CodingProductPublication": ("cayu.coding_products", "CodingProductPublication"),
     "CodingProductReconstructionRequiredError": (
         "cayu.coding_products",
@@ -7220,6 +7224,7 @@ PUBLIC_NAMES = [
     "CodingProductCandidate",
     "CodingProductCompletionVerifier",
     "CodingProductEvidenceError",
+    "CodingProductExecutionInspection",
     "CodingProductPublication",
     "CodingProductReconstructionRequiredError",
     "CodingProductRequest",

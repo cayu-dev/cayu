@@ -791,6 +791,25 @@ def test_recover_settled_execution_without_provider_redispatch(
         try:
             recovered_app = build_app(store)
             recovered_runner = build_runner(recovered_app)
+            # The read-only entrance authenticates release independently of any
+            # selected publication. It neither writes lifecycle/artifacts nor
+            # executes a provider; returned event mutation cannot alter storage.
+            before_inspection = await recovered_runner.repository.store.list(
+                session_id=admitted.session_id
+            )
+            inspected = await recovered_runner.inspect_settled_execution(admitted)
+            assert inspected.events
+            assert inspected.request_fingerprint == admitted.fingerprint
+            assert inspected.release_fingerprint.startswith("sha256:")
+            inspected.events[0].payload["inspection_canary"] = "caller mutation"
+            repeated = await recovered_runner.inspect_settled_execution(admitted)
+            assert "inspection_canary" not in repeated.events[0].payload
+            assert inspected.release_fingerprint == repeated.release_fingerprint
+            assert (
+                await recovered_runner.repository.store.list(session_id=admitted.session_id)
+                == before_inspection
+            )
+            assert len(provider.requests) == 1
             if intervening_operation in {
                 "cancelled_after_selection",
                 "source_conflict_after_selection",
@@ -819,6 +838,8 @@ def test_recover_settled_execution_without_provider_redispatch(
                     pass
                 assert len(provider.requests) == 2
                 with pytest.raises(CodingProductReconstructionRequiredError, match="incarnation"):
+                    await recovered_runner.inspect_settled_execution(admitted)
+                with pytest.raises(CodingProductReconstructionRequiredError, match="incarnation"):
                     await recovered_runner.recover_settled_execution(admitted)
                 assert len(provider.requests) == 2
             elif intervening_operation == "resume":
@@ -830,6 +851,8 @@ def test_recover_settled_execution_without_provider_redispatch(
                 ):
                     pass
                 assert len(provider.requests) == 2
+                with pytest.raises(CodingProductReconstructionRequiredError):
+                    await recovered_runner.inspect_settled_execution(admitted)
                 with pytest.raises(CodingProductReconstructionRequiredError):
                     await recovered_runner.recover_settled_execution(admitted)
                 assert len(provider.requests) == 2

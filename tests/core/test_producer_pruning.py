@@ -6,7 +6,7 @@ import sys
 
 import pytest
 from tests.core.producer_export_scenario import completed_export_scenario
-from tests.core.producer_pruning_observation import prune_to_receipt
+from tests.core.producer_pruning_observation import prune_to_receipt, retire_to_receipt
 from tests.core.test_collaboration_namespace import rotate
 from tests.core.test_participant_identity import CONTEXT
 from tests.core.test_participant_identity import app as make_app
@@ -145,14 +145,14 @@ async def test_public_producer_pruning_restarts_between_bounded_batches(
     _, rotated = await rotate(store, initialized)
     with pytest.raises(CollaborationUnavailable):
         await app.reclaim_producer_cleanup(rotated.namespace.reference, context=CONTEXT)
-    await app.retire_collaboration_namespace(
+    await retire_to_receipt(
+        app,
         NamespaceRetire(
             operation=rotated.successor.reference.operation("retire-producer"),
             namespace=rotated.namespace.reference,
             expected_revision=rotated.namespace.revision,
             expected_retired_through=0,
         ),
-        context=CONTEXT,
     )
     owner_registration = app._participant_coordinator._registration
     cursor_seen = False
