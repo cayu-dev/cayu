@@ -45,6 +45,12 @@ from cayu.knowledge.governance import (
     KnowledgeActivationPolicyError,
     decide_knowledge_activation,
 )
+from cayu.knowledge.publication_contracts import (
+    KnowledgePublicationConflict,
+    KnowledgePublicationReceipt,
+    copy_knowledge_publication_receipt,
+    prepare_knowledge_publication,
+)
 from cayu.knowledge.records import (
     DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
@@ -87,11 +93,7 @@ from cayu.storage.knowledge_indexer import (
     knowledge_source_hash,
 )
 from cayu.storage.memory import (
-    KnowledgePublicationConflict,
-    KnowledgePublicationReceipt,
     KnowledgeStore,
-    copy_knowledge_publication_receipt,
-    prepare_knowledge_publication,
 )
 from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
 from cayu.tools._operation_boundary import (

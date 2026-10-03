@@ -49,6 +49,7 @@ from cayu.knowledge.maintenance_planning import (
     KnowledgeMaintenancePlanningOutcome,
     KnowledgeMaintenancePlanningResult,
 )
+from cayu.knowledge.publication_contracts import prepare_knowledge_publication
 from cayu.knowledge.records import (
     MAX_KNOWLEDGE_REVISION,
     KnowledgeActorType,
@@ -74,9 +75,6 @@ from cayu.storage.knowledge_indexer import (
     KnowledgeIndexer,
     KnowledgeIndexRequest,
     KnowledgeIndexResult,
-)
-from cayu.storage.memory import (
-    prepare_knowledge_publication,
 )
 
 KNOWLEDGE_MAINTENANCE_PROPOSAL_PUBLICATION_SCHEMA_VERSION = 1

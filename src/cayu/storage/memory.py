@@ -16,7 +16,7 @@ from math import sqrt
 from typing import TYPE_CHECKING, Any, Literal, TypedDict
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from cayu._clock import utc_clock
 from cayu._validation import (
@@ -35,6 +35,12 @@ from cayu.embeddings import (
     copy_text_embedding_result,
 )
 from cayu.knowledge.access import runtime_knowledge_operation
+from cayu.knowledge.activation_contracts import (
+    _MAX_KNOWLEDGE_ACTIVATION_RETIREMENT_BYTES as _MAX_KNOWLEDGE_ACTIVATION_RETIREMENT_BYTES,
+)
+from cayu.knowledge.activation_contracts import (
+    _MAX_KNOWLEDGE_ACTIVATION_RETIREMENT_TIME as _MAX_KNOWLEDGE_ACTIVATION_RETIREMENT_TIME,
+)
 from cayu.knowledge.activation_contracts import (
     MAX_KNOWLEDGE_ACTIVATION_ANNOTATION_BYTES as MAX_KNOWLEDGE_ACTIVATION_ANNOTATION_BYTES,
 )
@@ -83,10 +89,25 @@ from cayu.knowledge.activation_contracts import (
     _knowledge_activation_receipt_json as _knowledge_activation_receipt_json,
 )
 from cayu.knowledge.activation_contracts import (
+    _knowledge_activation_retirement as _knowledge_activation_retirement,
+)
+from cayu.knowledge.activation_contracts import (
+    _knowledge_activation_retirement_json as _knowledge_activation_retirement_json,
+)
+from cayu.knowledge.activation_contracts import (
     _knowledge_activation_revision as _knowledge_activation_revision,
 )
 from cayu.knowledge.activation_contracts import (
     _knowledge_activation_schema_version as _knowledge_activation_schema_version,
+)
+from cayu.knowledge.activation_contracts import (
+    _KnowledgeActivationRetirement as _KnowledgeActivationRetirement,
+)
+from cayu.knowledge.activation_contracts import (
+    _parse_knowledge_activation_retirement_json as _parse_knowledge_activation_retirement_json,
+)
+from cayu.knowledge.activation_contracts import (
+    _require_knowledge_activation_retirement_capacity as _require_knowledge_activation_retirement_capacity,
 )
 from cayu.knowledge.activation_contracts import (
     copy_knowledge_activation_authority as copy_knowledge_activation_authority,
@@ -282,6 +303,33 @@ from cayu.knowledge.maintenance_contracts import (
 from cayu.knowledge.maintenance_contracts import (
     prepare_knowledge_maintenance_decision as prepare_knowledge_maintenance_decision,
 )
+from cayu.knowledge.publication_contracts import (
+    KnowledgePublicationConflict as KnowledgePublicationConflict,
+)
+from cayu.knowledge.publication_contracts import (
+    KnowledgePublicationReceipt as KnowledgePublicationReceipt,
+)
+from cayu.knowledge.publication_contracts import (
+    _knowledge_publication_request_sha256 as _knowledge_publication_request_sha256,
+)
+from cayu.knowledge.publication_contracts import (
+    _knowledge_publication_v1_request_sha256 as _knowledge_publication_v1_request_sha256,
+)
+from cayu.knowledge.publication_contracts import (
+    _validate_activation_publication_material as _validate_activation_publication_material,
+)
+from cayu.knowledge.publication_contracts import (
+    _validate_knowledge_publication_replay as _validate_knowledge_publication_replay,
+)
+from cayu.knowledge.publication_contracts import (
+    _validate_revision_append as _validate_revision_append,
+)
+from cayu.knowledge.publication_contracts import (
+    copy_knowledge_publication_receipt as copy_knowledge_publication_receipt,
+)
+from cayu.knowledge.publication_contracts import (
+    prepare_knowledge_publication as prepare_knowledge_publication,
+)
 from cayu.knowledge.records import BUILTIN_KNOWLEDGE_KINDS as BUILTIN_KNOWLEDGE_KINDS
 from cayu.knowledge.records import DEFAULT_KNOWLEDGE_KIND as DEFAULT_KNOWLEDGE_KIND
 from cayu.knowledge.records import DEFAULT_KNOWLEDGE_LIMIT as DEFAULT_KNOWLEDGE_LIMIT
@@ -389,6 +437,12 @@ from cayu.knowledge.relations import prepare_knowledge_relations as prepare_know
 from cayu.knowledge.scopes import KnowledgeAccessDenied as KnowledgeAccessDenied
 from cayu.knowledge.scopes import KnowledgeAccessScope as KnowledgeAccessScope
 from cayu.knowledge.scopes import _knowledge_access_scope_sha256 as _knowledge_access_scope_sha256
+from cayu.knowledge.scopes import _knowledge_access_snapshot as _knowledge_access_snapshot
+from cayu.knowledge.scopes import _knowledge_access_snapshot_json as _knowledge_access_snapshot_json
+from cayu.knowledge.scopes import _KnowledgeAccessSnapshot as _KnowledgeAccessSnapshot
+from cayu.knowledge.scopes import (
+    _parse_knowledge_access_snapshot_json as _parse_knowledge_access_snapshot_json,
+)
 from cayu.knowledge.scopes import copy_knowledge_access_scope as copy_knowledge_access_scope
 from cayu.knowledge.scopes import knowledge_access_scope_sha256 as knowledge_access_scope_sha256
 from cayu.knowledge.search import _SEARCH_TOKEN_RE as _SEARCH_TOKEN_RE
@@ -454,17 +508,6 @@ if TYPE_CHECKING:
     )
 
 KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY = "cayu_knowledge_maintenance_governance"
-_MAX_KNOWLEDGE_ACTIVATION_RETIREMENT_BYTES = 1_048_576
-_MAX_KNOWLEDGE_ACTIVATION_RETIREMENT_TIME = datetime(
-    9999,
-    12,
-    31,
-    23,
-    59,
-    59,
-    999999,
-    tzinfo=UTC,
-)
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}\Z")
 _KNOWLEDGE_EMBEDDING_BACKFILL_CURSOR_VERSION = 1
 
@@ -485,89 +528,6 @@ _KNOWLEDGE_REJECTED_REPLACEMENT_RETIREMENT_TRANSITIONS = frozenset(
         (KnowledgeStatus.ARCHIVED, KnowledgeStatus.DELETED),
     }
 )
-
-
-class _KnowledgeAccessSnapshot(BaseModel):
-    """Immutable authorization projection retained beside publication receipts."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    namespace: str
-    labels: dict[str, str]
-    visibility: KnowledgeVisibility
-    source_type: str | None
-    source_id: str | None
-    status: KnowledgeStatus
-    expires_at: datetime | None
-
-    @field_validator("namespace")
-    @classmethod
-    def validate_namespace(cls, value: str) -> str:
-        return require_clean_nonblank(value, "namespace")
-
-    @field_validator("source_type", "source_id")
-    @classmethod
-    def validate_optional_identity(cls, value: str | None, info) -> str | None:
-        if value is None:
-            return None
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("labels", mode="before")
-    @classmethod
-    def copy_labels(cls, value) -> dict[str, str]:
-        return copy_label_map(value, "labels")
-
-
-class _KnowledgeActivationRetirement(BaseModel):
-    """Content-free final authority retained when governed knowledge is pruned."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    entry_id: str
-    entry_revision: int
-    access_snapshot: _KnowledgeAccessSnapshot
-    retired_at: datetime
-
-    @field_validator("entry_id")
-    @classmethod
-    def validate_entry_id(cls, value: str) -> str:
-        return _knowledge_entry_id(value)
-
-    @field_validator("entry_revision")
-    @classmethod
-    def validate_entry_revision(cls, value: int) -> int:
-        _validate_knowledge_revision(value, "entry_revision")
-        return value
-
-    @field_validator("access_snapshot", mode="before")
-    @classmethod
-    def copy_access_snapshot(cls, value: object) -> object:
-        if type(value) is _KnowledgeAccessSnapshot:
-            return value.model_copy(deep=True)
-        return value
-
-    @field_validator("retired_at")
-    @classmethod
-    def validate_retired_at(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("`retired_at` must be timezone-aware.")
-        return value.astimezone(UTC)
-
-    @model_validator(mode="after")
-    def validate_document_size(self) -> _KnowledgeActivationRetirement:
-        if (
-            len(
-                canonical_durable_json_bytes(
-                    self.model_dump(mode="json"),
-                    "knowledge activation retirement",
-                )
-            )
-            > _MAX_KNOWLEDGE_ACTIVATION_RETIREMENT_BYTES
-        ):
-            raise ValueError(
-                "Knowledge activation retirement authority exceeds its canonical byte limit."
-            )
-        return self
 
 
 class _KnowledgeRelationAccessSnapshot(BaseModel):
@@ -736,92 +696,6 @@ class _KnowledgeEmbeddingBackfillCursor(BaseModel):
     @classmethod
     def validate_chunk_id(cls, value: str) -> str:
         return _knowledge_chunk_id(value, "chunk_id")
-
-
-class KnowledgePublicationConflict(RuntimeError):
-    """An idempotent knowledge publication conflicts with durable state."""
-
-    def __init__(self, reason: str) -> None:
-        self.reason = require_clean_nonblank(reason, "reason")
-        super().__init__("Knowledge publication conflicts with durable state.")
-
-
-class KnowledgePublicationReceipt(BaseModel):
-    """Bounded immutable evidence for one atomic entry-and-chunks publication."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    operation_id: str = Field(max_length=256)
-    entry_id: str
-    entry_revision: int
-    expected_revision: int | None
-    request_sha256: str
-    entry_created_at: datetime
-    entry_updated_at: datetime
-    committed_at: datetime
-    replayed: bool = False
-
-    @field_validator("operation_id")
-    @classmethod
-    def validate_clean_ids(cls, value: str, info) -> str:
-        value = require_clean_nonblank(value, info.field_name)
-        if len(value.encode("utf-8")) > 256:
-            raise ValueError(f"`{info.field_name}` must be at most 256 UTF-8 bytes.")
-        return value
-
-    @field_validator("entry_id")
-    @classmethod
-    def validate_entry_id(cls, value: str) -> str:
-        return _knowledge_entry_id(value)
-
-    @field_validator("request_sha256")
-    @classmethod
-    def validate_request_sha256(cls, value: str) -> str:
-        if type(value) is not str or _SHA256_HEX_RE.fullmatch(value) is None:
-            raise ValueError("`request_sha256` must be a lowercase SHA-256 digest.")
-        return value
-
-    @field_validator("entry_revision")
-    @classmethod
-    def validate_entry_revision(cls, value: int) -> int:
-        _validate_knowledge_revision(value, "entry_revision")
-        return value
-
-    @field_validator("expected_revision")
-    @classmethod
-    def validate_expected_revision(cls, value: int | None) -> int | None:
-        if value is not None:
-            _validate_knowledge_revision(value, "expected_revision")
-        return value
-
-    @model_validator(mode="after")
-    def validate_revision_transition(self) -> KnowledgePublicationReceipt:
-        expected_entry_revision = (
-            1 if self.expected_revision is None else self.expected_revision + 1
-        )
-        if self.entry_revision != expected_entry_revision:
-            raise ValueError("`entry_revision` must follow `expected_revision`.")
-        return self
-
-    @field_validator("entry_created_at", "entry_updated_at", "committed_at")
-    @classmethod
-    def validate_receipt_datetime(cls, value: datetime, info) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError(f"`{info.field_name}` must be timezone-aware.")
-        return value.astimezone(UTC)
-
-    @field_validator("replayed")
-    @classmethod
-    def validate_replayed(cls, value: bool) -> bool:
-        if type(value) is not bool:
-            raise ValueError("`replayed` must be a boolean.")
-        return value
-
-    @model_validator(mode="after")
-    def validate_entry_timestamp_order(self) -> KnowledgePublicationReceipt:
-        if self.entry_updated_at < self.entry_created_at:
-            raise ValueError("`entry_updated_at` cannot precede `entry_created_at`.")
-        return self
 
 
 def _intersect_resource_knowledge_scope(scope):
@@ -5603,18 +5477,6 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         )
 
 
-def _knowledge_access_snapshot(entry: KnowledgeEntry) -> _KnowledgeAccessSnapshot:
-    return _KnowledgeAccessSnapshot(
-        namespace=entry.namespace,
-        labels=entry.labels,
-        visibility=entry.visibility,
-        source_type=entry.source_type,
-        source_id=entry.source_id,
-        status=entry.status,
-        expires_at=entry.expires_at,
-    )
-
-
 def _knowledge_relation_access_snapshot(
     *,
     subject_exact: KnowledgeEntry,
@@ -5646,24 +5508,6 @@ def _knowledge_maintenance_access_snapshot(
     )
 
 
-def _knowledge_access_snapshot_json(snapshot: _KnowledgeAccessSnapshot) -> str:
-    if type(snapshot) is not _KnowledgeAccessSnapshot:
-        raise TypeError("snapshot must be a _KnowledgeAccessSnapshot.")
-    return canonical_durable_json_bytes(
-        snapshot.model_dump(mode="json"),
-        "knowledge access snapshot",
-    ).decode("utf-8")
-
-
-def _knowledge_activation_retirement_json(retirement: _KnowledgeActivationRetirement) -> str:
-    if type(retirement) is not _KnowledgeActivationRetirement:
-        raise TypeError("retirement must be a _KnowledgeActivationRetirement.")
-    return canonical_durable_json_bytes(
-        retirement.model_dump(mode="json"),
-        "knowledge activation retirement",
-    ).decode("utf-8")
-
-
 def _knowledge_relation_access_snapshot_json(
     snapshot: _KnowledgeRelationAccessSnapshot,
 ) -> str:
@@ -5684,18 +5528,6 @@ def _knowledge_maintenance_access_snapshot_json(
         snapshot.model_dump(mode="json"),
         "knowledge maintenance access snapshot",
     ).decode("utf-8")
-
-
-def _parse_knowledge_access_snapshot_json(value: str) -> _KnowledgeAccessSnapshot:
-    if type(value) is not str:
-        raise TypeError("Knowledge access snapshot must be JSON text.")
-    return _KnowledgeAccessSnapshot.model_validate_json(value)
-
-
-def _parse_knowledge_activation_retirement_json(value: str) -> _KnowledgeActivationRetirement:
-    if type(value) is not str:
-        raise TypeError("Knowledge activation retirement must be JSON text.")
-    return _KnowledgeActivationRetirement.model_validate_json(value)
 
 
 def _parse_knowledge_relation_access_snapshot_json(
@@ -5759,28 +5591,6 @@ def _knowledge_scope_allows_activation_receipt(
     return scope.include_expired and _knowledge_scope_allows_snapshot_dimensions(
         scope,
         retirement.access_snapshot,
-    )
-
-
-def _knowledge_activation_retirement(
-    entry: KnowledgeEntry,
-    *,
-    retired_at: datetime,
-) -> _KnowledgeActivationRetirement:
-    return _KnowledgeActivationRetirement(
-        entry_id=entry.id,
-        entry_revision=entry.revision,
-        access_snapshot=_knowledge_access_snapshot(entry),
-        retired_at=retired_at,
-    )
-
-
-def _require_knowledge_activation_retirement_capacity(entry: KnowledgeEntry) -> None:
-    """Prove one governed successor can always preserve final access authority."""
-
-    _knowledge_activation_retirement(
-        entry,
-        retired_at=_MAX_KNOWLEDGE_ACTIVATION_RETIREMENT_TIME,
     )
 
 
@@ -6043,163 +5853,6 @@ def _knowledge_scope_allows_lineage_endpoint(
         }
     )
     return _knowledge_scope_allows_entry(archived_scope, current, now=cutoff)
-
-
-def copy_knowledge_publication_receipt(
-    receipt: KnowledgePublicationReceipt,
-    *,
-    replayed: bool | None = None,
-) -> KnowledgePublicationReceipt:
-    if type(receipt) is not KnowledgePublicationReceipt:
-        raise TypeError("KnowledgePublicationReceipt instances must not be subclasses.")
-    return KnowledgePublicationReceipt(
-        operation_id=receipt.operation_id,
-        entry_id=receipt.entry_id,
-        entry_revision=receipt.entry_revision,
-        expected_revision=receipt.expected_revision,
-        request_sha256=receipt.request_sha256,
-        entry_created_at=receipt.entry_created_at,
-        entry_updated_at=receipt.entry_updated_at,
-        committed_at=receipt.committed_at,
-        replayed=receipt.replayed if replayed is None else replayed,
-    )
-
-
-def prepare_knowledge_publication(
-    entry: KnowledgeEntry,
-    chunks: list[KnowledgeChunk],
-    *,
-    evidence: list[KnowledgeEvidence] | None = None,
-    operation_id: str,
-    expected_revision: int | None = None,
-    activation_authority: KnowledgeActivationAuthority | None = None,
-) -> tuple[
-    str,
-    KnowledgeEntry,
-    list[KnowledgeChunk],
-    list[KnowledgeEvidence],
-    str,
-]:
-    """Copy and bind one complete revision-publication authority tuple."""
-
-    clean_operation_id = _knowledge_publication_operation_id(operation_id)
-    copied_entry = copy_knowledge_entry(entry)
-    _validate_revision_append(copied_entry, expected_revision=expected_revision)
-    copied_chunks = _copy_entry_chunks(
-        copied_entry.id,
-        copied_entry.revision,
-        chunks,
-    )
-    copied_evidence = _copy_entry_evidence(
-        copied_entry.id,
-        copied_entry.revision,
-        evidence or [],
-        chunks=copied_chunks,
-    )
-    copied_authority = (
-        None
-        if activation_authority is None
-        else copy_knowledge_activation_authority(activation_authority)
-    )
-    if copied_authority is not None:
-        _validate_activation_publication_material(
-            copied_authority,
-            operation_id=clean_operation_id,
-            entry=copied_entry,
-            chunks=copied_chunks,
-            evidence=copied_evidence,
-            expected_revision=expected_revision,
-        )
-    request_sha256 = _knowledge_publication_request_sha256(
-        copied_entry,
-        copied_chunks,
-        copied_evidence,
-        expected_revision=expected_revision,
-        activation_authority=copied_authority,
-    )
-    return (
-        clean_operation_id,
-        copied_entry,
-        copied_chunks,
-        copied_evidence,
-        request_sha256,
-    )
-
-
-def _validate_knowledge_publication_replay(
-    receipt: KnowledgePublicationReceipt,
-    *,
-    entry: KnowledgeEntry,
-    chunks: list[KnowledgeChunk],
-    evidence: list[KnowledgeEvidence],
-    expected_revision: int | None,
-    request_sha256: str,
-    activation_authority: KnowledgeActivationAuthority | None = None,
-) -> None:
-    receipt = copy_knowledge_publication_receipt(receipt)
-    accepted_request_sha256s = {request_sha256}
-    if not evidence and activation_authority is None:
-        # Revision 42 receipts bind the same entry-and-chunks authority tuple
-        # under the v1 digest contract. Revision 43 preserves those receipts,
-        # so an exact empty-evidence retry must remain idempotent after migration.
-        # Never permit the weaker digest when the new request carries evidence.
-        accepted_request_sha256s.add(
-            _knowledge_publication_v1_request_sha256(
-                entry,
-                chunks,
-                expected_revision=expected_revision,
-            )
-        )
-    if (
-        receipt.entry_id != entry.id
-        or receipt.entry_revision != entry.revision
-        or receipt.request_sha256 not in accepted_request_sha256s
-        or receipt.entry_created_at != entry.created_at
-        or receipt.entry_updated_at != entry.updated_at
-    ):
-        raise KnowledgePublicationConflict("operation_mismatch")
-
-
-def _validate_activation_publication_material(
-    authority: KnowledgeActivationAuthority,
-    *,
-    operation_id: str,
-    entry: KnowledgeEntry,
-    chunks: list[KnowledgeChunk],
-    evidence: list[KnowledgeEvidence],
-    expected_revision: int | None,
-    access_scope: KnowledgeAccessScope | None = None,
-) -> None:
-    authority = copy_knowledge_activation_authority(authority)
-    _require_knowledge_activation_retirement_capacity(entry)
-    request = authority.request
-    decision = authority.decision
-    if request.source is KnowledgeActivationSource.REVIEW_APPROVAL:
-        raise ValueError("Review approval cannot use generated revision publication.")
-    if (
-        request.operation_id != operation_id
-        or request.expected_revision != expected_revision
-        or request.target_revision != entry.revision
-    ):
-        raise ValueError("Activation authority does not bind the publication operation.")
-    candidate_entry = entry.model_copy(update={"status": KnowledgeStatus.PENDING})
-    if request.candidate_entry != candidate_entry:
-        raise ValueError("Activation authority does not bind the publication entry material.")
-    if list(request.chunks) != chunks or list(request.evidence) != evidence:
-        raise ValueError("Activation authority does not bind publication chunks and evidence.")
-    if access_scope is not None and request.access_scope_sha256 != knowledge_access_scope_sha256(
-        access_scope
-    ):
-        raise ValueError("Activation authority does not bind the publication access scope.")
-    required_status = (
-        KnowledgeStatus.ACTIVE
-        if decision.disposition is KnowledgeActivationDisposition.ACTIVATE
-        else KnowledgeStatus.PENDING
-    )
-    if decision.disposition is KnowledgeActivationDisposition.REJECT:
-        raise ValueError("Rejected activation requests cannot be published.")
-    if entry.status is not required_status:
-        raise ValueError("Publication status conflicts with activation disposition.")
 
 
 def _validate_review_approval_authority(
@@ -6857,76 +6510,6 @@ def _bounded_knowledge_lineage_result(
         truncated=truncated,
         next_cursor=next_cursor,
     )
-
-
-def _knowledge_publication_request_sha256(
-    entry: KnowledgeEntry,
-    chunks: list[KnowledgeChunk],
-    evidence: list[KnowledgeEvidence],
-    *,
-    expected_revision: int | None,
-    activation_authority: KnowledgeActivationAuthority | None = None,
-) -> str:
-    if activation_authority is None:
-        material = {
-            "contract": "cayu-knowledge-revision-publication-v2",
-            "expected_revision": expected_revision,
-            "entry": entry.model_dump(mode="json"),
-            "chunks": [chunk.model_dump(mode="json") for chunk in chunks],
-            "evidence": [item.model_dump(mode="json") for item in evidence],
-        }
-    else:
-        material = {
-            "contract": "cayu-knowledge-revision-publication-v3",
-            "expected_revision": expected_revision,
-            "entry": entry.model_dump(mode="json"),
-            "chunks": [chunk.model_dump(mode="json") for chunk in chunks],
-            "evidence": [item.model_dump(mode="json") for item in evidence],
-            "activation_authority": activation_authority.model_dump(mode="json"),
-        }
-    return sha256(
-        canonical_durable_json_bytes(
-            material,
-            "knowledge publication",
-        )
-    ).hexdigest()
-
-
-def _knowledge_publication_v1_request_sha256(
-    entry: KnowledgeEntry,
-    chunks: list[KnowledgeChunk],
-    *,
-    expected_revision: int | None,
-) -> str:
-    """Reproduce the revision-42 receipt digest for migration-safe replay."""
-
-    return sha256(
-        canonical_durable_json_bytes(
-            {
-                "contract": "cayu-knowledge-revision-publication-v1",
-                "expected_revision": expected_revision,
-                "entry": entry.model_dump(mode="json"),
-                "chunks": [chunk.model_dump(mode="json") for chunk in chunks],
-            },
-            "knowledge publication",
-        )
-    ).hexdigest()
-
-
-def _validate_revision_append(
-    entry: KnowledgeEntry,
-    *,
-    expected_revision: int | None,
-) -> None:
-    target_revision = (
-        1 if expected_revision is None else _next_knowledge_revision(expected_revision)
-    )
-    _validate_knowledge_revision(entry.revision, "entry.revision")
-    if entry.revision != target_revision:
-        raise ValueError(
-            f"Knowledge revision must be {target_revision} for expected_revision "
-            f"{expected_revision!r}."
-        )
 
 
 def _validate_revision_successor(

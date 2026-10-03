@@ -194,6 +194,11 @@ from cayu.knowledge.activation_contracts import (
     KnowledgeActivationSource,
     KnowledgeReviewApproval,
     _knowledge_activation_receipt_json,
+    _knowledge_activation_retirement,
+    _knowledge_activation_retirement_json,
+    _KnowledgeActivationRetirement,
+    _parse_knowledge_activation_retirement_json,
+    _require_knowledge_activation_retirement_capacity,
     copy_knowledge_activation_authority,
     copy_knowledge_activation_receipt,
 )
@@ -261,6 +266,15 @@ from cayu.knowledge.maintenance_contracts import (
     copy_knowledge_maintenance_proposal,
     prepare_knowledge_maintenance_decision,
 )
+from cayu.knowledge.publication_contracts import (
+    KnowledgePublicationConflict,
+    KnowledgePublicationReceipt,
+    _validate_activation_publication_material,
+    _validate_knowledge_publication_replay,
+    _validate_revision_append,
+    copy_knowledge_publication_receipt,
+    prepare_knowledge_publication,
+)
 from cayu.knowledge.records import (
     DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
@@ -314,6 +328,9 @@ from cayu.knowledge.scopes import (
     KnowledgeAccessDenied,
     KnowledgeAccessScope,
     _knowledge_access_scope_sha256,
+    _knowledge_access_snapshot,
+    _knowledge_access_snapshot_json,
+    _parse_knowledge_access_snapshot_json,
     copy_knowledge_access_scope,
 )
 from cayu.knowledge.search import (
@@ -821,8 +838,6 @@ from cayu.storage._task_scheduling_schema import POSTGRES_SCHEDULING_DDL
 from cayu.storage.knowledge_transition import require_empty_knowledge_revision_transition
 from cayu.storage.memory import (
     KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY,
-    KnowledgePublicationConflict,
-    KnowledgePublicationReceipt,
     KnowledgeStore,
     _activation_receipt_matches,
     _bounded_knowledge_evidence,
@@ -834,10 +849,6 @@ from cayu.storage.memory import (
     _decode_knowledge_lineage_cursor,
     _decode_knowledge_relation_cursor,
     _encode_knowledge_embedding_backfill_cursor,
-    _knowledge_access_snapshot,
-    _knowledge_access_snapshot_json,
-    _knowledge_activation_retirement,
-    _knowledge_activation_retirement_json,
     _knowledge_change_audiences,
     _knowledge_change_now,
     _knowledge_embedding_backfill_fingerprint,
@@ -857,17 +868,13 @@ from cayu.storage.memory import (
     _knowledge_scope_allows_relation_access_snapshot,
     _knowledge_scope_allows_snapshot,
     _knowledge_semantic_watch_identity,
-    _KnowledgeActivationRetirement,
     _KnowledgeMaintenanceAccessSnapshot,
     _KnowledgeRelationAccessSnapshot,
-    _parse_knowledge_access_snapshot_json,
-    _parse_knowledge_activation_retirement_json,
     _parse_knowledge_maintenance_access_snapshot_json,
     _parse_knowledge_relation_access_snapshot_json,
     _prepare_review_approval_receipts,
     _replay_review_approval_from_receipts,
     _require_knowledge_activation_retirement_access,
-    _require_knowledge_activation_retirement_capacity,
     _require_knowledge_entry_access,
     _require_knowledge_maintenance_current_entries,
     _require_knowledge_maintenance_current_replacement,
@@ -877,15 +884,10 @@ from cayu.storage.memory import (
     _score_entry,
     _search_result_from_scored_embeddings,
     _semantic_query_text,
-    _validate_activation_publication_material,
-    _validate_knowledge_publication_replay,
     _validate_knowledge_search_frontier,
     _validate_review_approval_authority,
     _validate_review_approval_scope,
-    _validate_revision_append,
     _validate_revision_successor,
-    copy_knowledge_publication_receipt,
-    prepare_knowledge_publication,
 )
 from cayu.tasks import _verified_work_policy as verified_work_support
 from cayu.tasks._scheduling import (

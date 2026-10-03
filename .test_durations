@@ -1,4 +1,9 @@
 {
+    "tests/core/test_knowledge_publication_contracts.py::test_publication_contracts_compose_without_storage_implementations[cayu.knowledge.publication_contracts]": 0.18703391822054982,
+    "tests/core/test_knowledge_publication_contracts.py::test_publication_contracts_compose_without_storage_implementations[cayu.storage]": 0.18794741621240973,
+    "tests/core/test_knowledge_publication_contracts.py::test_publication_contracts_compose_without_storage_implementations[cayu]": 0.19395262538455427,
+    "tests/core/test_knowledge_publication_contracts.py::test_publication_contracts_preserve_aliases_stubs_and_annotations": 0.1878412920050323,
+    "tests/core/test_knowledge_publication_contracts.py::test_retirement_contracts_compose_with_scope_snapshots_and_round_trip": 0.0016014589928090572,
     "tests/core/test_application_registration_components.py::test_registration_components_compose_without_application_controllers": 0.856,
     "tests/core/test_application_registration_components.py::test_registration_helpers_preserve_legacy_import_and_pickle_identity": 0.0,
     "tests/core/test_live_model_attempt.py::test_closing_live_attempt_at_event_boundary_closes_stream_once[model.completed]": 0.385,

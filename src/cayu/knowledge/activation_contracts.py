@@ -30,6 +30,8 @@ from cayu.knowledge.records import (
 )
 from cayu.knowledge.scopes import (
     KnowledgeAccessScope,
+    _knowledge_access_snapshot,
+    _KnowledgeAccessSnapshot,
     copy_knowledge_access_scope,
     knowledge_access_scope_sha256,
 )
@@ -672,4 +674,108 @@ def prepare_knowledge_activation_request(
         evaluator_result=evaluator_result,
         evaluator_decision_sha256=evaluator_decision_sha256,
         forbidden_authority_identities=forbidden_authority_identities,
+    )
+
+
+_MAX_KNOWLEDGE_ACTIVATION_RETIREMENT_BYTES = 1_048_576
+
+
+_MAX_KNOWLEDGE_ACTIVATION_RETIREMENT_TIME = datetime(
+    9999,
+    12,
+    31,
+    23,
+    59,
+    59,
+    999999,
+    tzinfo=UTC,
+)
+
+
+class _KnowledgeActivationRetirement(BaseModel):
+    """Content-free final authority retained when governed knowledge is pruned."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    entry_id: str
+    entry_revision: int
+    access_snapshot: _KnowledgeAccessSnapshot
+    retired_at: datetime
+
+    @field_validator("entry_id")
+    @classmethod
+    def validate_entry_id(cls, value: str) -> str:
+        return _knowledge_entry_id(value)
+
+    @field_validator("entry_revision")
+    @classmethod
+    def validate_entry_revision(cls, value: int) -> int:
+        _validate_knowledge_revision(value, "entry_revision")
+        return value
+
+    @field_validator("access_snapshot", mode="before")
+    @classmethod
+    def copy_access_snapshot(cls, value: object) -> object:
+        if type(value) is _KnowledgeAccessSnapshot:
+            return value.model_copy(deep=True)
+        return value
+
+    @field_validator("retired_at")
+    @classmethod
+    def validate_retired_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("`retired_at` must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_document_size(self) -> _KnowledgeActivationRetirement:
+        if (
+            len(
+                canonical_durable_json_bytes(
+                    self.model_dump(mode="json"),
+                    "knowledge activation retirement",
+                )
+            )
+            > _MAX_KNOWLEDGE_ACTIVATION_RETIREMENT_BYTES
+        ):
+            raise ValueError(
+                "Knowledge activation retirement authority exceeds its canonical byte limit."
+            )
+        return self
+
+
+def _knowledge_activation_retirement_json(retirement: _KnowledgeActivationRetirement) -> str:
+    if type(retirement) is not _KnowledgeActivationRetirement:
+        raise TypeError("retirement must be a _KnowledgeActivationRetirement.")
+    return canonical_durable_json_bytes(
+        retirement.model_dump(mode="json"),
+        "knowledge activation retirement",
+    ).decode("utf-8")
+
+
+def _parse_knowledge_activation_retirement_json(value: str) -> _KnowledgeActivationRetirement:
+    if type(value) is not str:
+        raise TypeError("Knowledge activation retirement must be JSON text.")
+    return _KnowledgeActivationRetirement.model_validate_json(value)
+
+
+def _knowledge_activation_retirement(
+    entry: KnowledgeEntry,
+    *,
+    retired_at: datetime,
+) -> _KnowledgeActivationRetirement:
+    return _KnowledgeActivationRetirement(
+        entry_id=entry.id,
+        entry_revision=entry.revision,
+        access_snapshot=_knowledge_access_snapshot(entry),
+        retired_at=retired_at,
+    )
+
+
+def _require_knowledge_activation_retirement_capacity(entry: KnowledgeEntry) -> None:
+    """Prove one governed successor can always preserve final access authority."""
+
+    _knowledge_activation_retirement(
+        entry,
+        retired_at=_MAX_KNOWLEDGE_ACTIVATION_RETIREMENT_TIME,
     )

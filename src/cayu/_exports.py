@@ -3182,8 +3182,14 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.knowledge.maintenance_contracts",
         "KnowledgeMaintenanceStale",
     ),
-    "KnowledgePublicationConflict": ("cayu.storage.memory", "KnowledgePublicationConflict"),
-    "KnowledgePublicationReceipt": ("cayu.storage.memory", "KnowledgePublicationReceipt"),
+    "KnowledgePublicationConflict": (
+        "cayu.knowledge.publication_contracts",
+        "KnowledgePublicationConflict",
+    ),
+    "KnowledgePublicationReceipt": (
+        "cayu.knowledge.publication_contracts",
+        "KnowledgePublicationReceipt",
+    ),
     "KnowledgeQuery": ("cayu.knowledge.search", "KnowledgeQuery"),
     "KnowledgeRecallSource": ("cayu.memory.recall", "KnowledgeRecallSource"),
     "KnowledgeRelation": ("cayu.knowledge.relations", "KnowledgeRelation"),
@@ -6220,7 +6226,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.knowledge.maintenance_governance",
         "prepare_knowledge_maintenance_governance_request",
     ),
-    "prepare_knowledge_publication": ("cayu.storage.memory", "prepare_knowledge_publication"),
+    "prepare_knowledge_publication": (
+        "cayu.knowledge.publication_contracts",
+        "prepare_knowledge_publication",
+    ),
     "prepare_knowledge_relations": ("cayu.knowledge.relations", "prepare_knowledge_relations"),
     "prepare_knowledge_semantic_watch_invocation": (
         "cayu.knowledge.semantic_watch",

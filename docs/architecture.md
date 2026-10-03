@@ -455,8 +455,9 @@ preparation/replay validation. `knowledge/maintenance_contracts.py` owns reviewe
 maintenance proposals, decisions, receipts and their deterministic preparation,
 consistency and replay checks. `knowledge/activation_contracts.py` owns governance
 configuration, activation requests, decisions, authority, receipts and their
-deterministic preparation and validation. Shared exact entry material and revision
-helpers live with records; access-scope fingerprints live with scopes.
+deterministic preparation and validation, including bounded activation-retirement
+records. Shared exact entry material and revision helpers live with records;
+access-scope fingerprints and retained access snapshots live with scopes.
 `knowledge/changes.py` owns change records, bounded pages, consumer claims and
 progress, including detached copies, claim fingerprints and deterministic
 validation and initialization. `knowledge/indexing.py` owns embedding identities
@@ -465,6 +466,10 @@ their deterministic construction, copying, fingerprints and transition checks.
 `knowledge/search.py` owns search/list queries, hits, results and facets, with
 detached copies, validation and shared search-term normalization. Ranking,
 access checks and search execution remain with the storage implementations.
+`knowledge/publication_contracts.py` owns revision-publication preparation,
+receipts, request fingerprints and replay validation. It composes record, scope
+and activation contracts without reading ambient authority or writing storage.
+Retained asynchronous publication tasks remain owned by `knowledge/_publication.py`.
 These contracts, application activation policies and the maintenance
 router/planner can be used without loading a storage implementation.
 Memory, SQLite and PostgreSQL stores compose the same contracts

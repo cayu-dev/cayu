@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from hashlib import sha256
 from typing import Any
 
@@ -9,7 +10,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from cayu._validation import canonical_durable_json_bytes, copy_json_value, copy_label_map
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
-from cayu.knowledge.records import KnowledgeStatus, KnowledgeVisibility, _dedupe_strings
+from cayu.knowledge.records import (
+    KnowledgeEntry,
+    KnowledgeStatus,
+    KnowledgeVisibility,
+    _dedupe_strings,
+)
 
 
 class KnowledgeAccessDenied(PermissionError):
@@ -177,3 +183,61 @@ def knowledge_access_scope_sha256(scope: KnowledgeAccessScope) -> str:
     """Return the canonical public identity of one enforced knowledge access scope."""
 
     return _knowledge_access_scope_sha256(scope)
+
+
+class _KnowledgeAccessSnapshot(BaseModel):
+    """Immutable authorization projection retained beside publication receipts."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    namespace: str
+    labels: dict[str, str]
+    visibility: KnowledgeVisibility
+    source_type: str | None
+    source_id: str | None
+    status: KnowledgeStatus
+    expires_at: datetime | None
+
+    @field_validator("namespace")
+    @classmethod
+    def validate_namespace(cls, value: str) -> str:
+        return require_clean_nonblank(value, "namespace")
+
+    @field_validator("source_type", "source_id")
+    @classmethod
+    def validate_optional_identity(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("labels", mode="before")
+    @classmethod
+    def copy_labels(cls, value) -> dict[str, str]:
+        return copy_label_map(value, "labels")
+
+
+def _knowledge_access_snapshot(entry: KnowledgeEntry) -> _KnowledgeAccessSnapshot:
+    return _KnowledgeAccessSnapshot(
+        namespace=entry.namespace,
+        labels=entry.labels,
+        visibility=entry.visibility,
+        source_type=entry.source_type,
+        source_id=entry.source_id,
+        status=entry.status,
+        expires_at=entry.expires_at,
+    )
+
+
+def _knowledge_access_snapshot_json(snapshot: _KnowledgeAccessSnapshot) -> str:
+    if type(snapshot) is not _KnowledgeAccessSnapshot:
+        raise TypeError("snapshot must be a _KnowledgeAccessSnapshot.")
+    return canonical_durable_json_bytes(
+        snapshot.model_dump(mode="json"),
+        "knowledge access snapshot",
+    ).decode("utf-8")
+
+
+def _parse_knowledge_access_snapshot_json(value: str) -> _KnowledgeAccessSnapshot:
+    if type(value) is not str:
+        raise TypeError("Knowledge access snapshot must be JSON text.")
+    return _KnowledgeAccessSnapshot.model_validate_json(value)

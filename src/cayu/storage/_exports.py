@@ -168,8 +168,14 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.knowledge.maintenance_contracts",
         "KnowledgeMaintenanceStale",
     ),
-    "KnowledgePublicationConflict": ("cayu.storage.memory", "KnowledgePublicationConflict"),
-    "KnowledgePublicationReceipt": ("cayu.storage.memory", "KnowledgePublicationReceipt"),
+    "KnowledgePublicationConflict": (
+        "cayu.knowledge.publication_contracts",
+        "KnowledgePublicationConflict",
+    ),
+    "KnowledgePublicationReceipt": (
+        "cayu.knowledge.publication_contracts",
+        "KnowledgePublicationReceipt",
+    ),
     "KnowledgeQuery": ("cayu.knowledge.search", "KnowledgeQuery"),
     "KnowledgeRelation": ("cayu.knowledge.relations", "KnowledgeRelation"),
     "KnowledgeRelationConflict": ("cayu.knowledge.relations", "KnowledgeRelationConflict"),
@@ -328,7 +334,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.knowledge.maintenance_contracts",
         "prepare_knowledge_maintenance_decision",
     ),
-    "prepare_knowledge_publication": ("cayu.storage.memory", "prepare_knowledge_publication"),
+    "prepare_knowledge_publication": (
+        "cayu.knowledge.publication_contracts",
+        "prepare_knowledge_publication",
+    ),
     "prepare_knowledge_relations": ("cayu.knowledge.relations", "prepare_knowledge_relations"),
     "require_empty_knowledge_revision_transition": (
         "cayu.storage.knowledge_transition",

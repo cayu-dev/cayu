@@ -41,6 +41,11 @@ from cayu.knowledge.activation_contracts import (
     KnowledgeActivationSource,
     KnowledgeReviewApproval,
     _knowledge_activation_receipt_json,
+    _knowledge_activation_retirement,
+    _knowledge_activation_retirement_json,
+    _KnowledgeActivationRetirement,
+    _parse_knowledge_activation_retirement_json,
+    _require_knowledge_activation_retirement_capacity,
     copy_knowledge_activation_authority,
     copy_knowledge_activation_receipt,
 )
@@ -93,6 +98,15 @@ from cayu.knowledge.maintenance_contracts import (
     copy_knowledge_maintenance_proposal,
     prepare_knowledge_maintenance_decision,
 )
+from cayu.knowledge.publication_contracts import (
+    KnowledgePublicationConflict,
+    KnowledgePublicationReceipt,
+    _validate_activation_publication_material,
+    _validate_knowledge_publication_replay,
+    _validate_revision_append,
+    copy_knowledge_publication_receipt,
+    prepare_knowledge_publication,
+)
 from cayu.knowledge.records import (
     DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
@@ -142,6 +156,9 @@ from cayu.knowledge.scopes import (
     KnowledgeAccessDenied,
     KnowledgeAccessScope,
     _knowledge_access_scope_sha256,
+    _knowledge_access_snapshot,
+    _knowledge_access_snapshot_json,
+    _parse_knowledge_access_snapshot_json,
     copy_knowledge_access_scope,
 )
 from cayu.knowledge.search import (
@@ -167,8 +184,6 @@ from cayu.storage._knowledge_closure import (
 from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage.memory import (
     KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY,
-    KnowledgePublicationConflict,
-    KnowledgePublicationReceipt,
     KnowledgeStore,
     _activation_receipt_matches,
     _bounded_knowledge_evidence,
@@ -178,10 +193,6 @@ from cayu.storage.memory import (
     _copy_evidence_for_revision,
     _decode_knowledge_lineage_cursor,
     _decode_knowledge_relation_cursor,
-    _knowledge_access_snapshot,
-    _knowledge_access_snapshot_json,
-    _knowledge_activation_retirement,
-    _knowledge_activation_retirement_json,
     _knowledge_change_audiences,
     _knowledge_change_now,
     _knowledge_lineage_link,
@@ -200,32 +211,23 @@ from cayu.storage.memory import (
     _knowledge_scope_allows_relation_access_snapshot,
     _knowledge_scope_allows_snapshot,
     _knowledge_semantic_watch_identity,
-    _KnowledgeActivationRetirement,
     _KnowledgeMaintenanceAccessSnapshot,
     _KnowledgeRelationAccessSnapshot,
-    _parse_knowledge_access_snapshot_json,
-    _parse_knowledge_activation_retirement_json,
     _parse_knowledge_maintenance_access_snapshot_json,
     _parse_knowledge_relation_access_snapshot_json,
     _prepare_review_approval_receipts,
     _replay_review_approval_from_receipts,
     _require_knowledge_activation_retirement_access,
-    _require_knowledge_activation_retirement_capacity,
     _require_knowledge_entry_access,
     _require_knowledge_maintenance_current_entries,
     _require_knowledge_maintenance_current_replacement,
     _require_knowledge_maintenance_publication_boundary,
     _require_knowledge_maintenance_source_evidence,
     _require_knowledge_successor_access,
-    _validate_activation_publication_material,
-    _validate_knowledge_publication_replay,
     _validate_knowledge_search_frontier,
     _validate_review_approval_authority,
     _validate_review_approval_scope,
-    _validate_revision_append,
     _validate_revision_successor,
-    copy_knowledge_publication_receipt,
-    prepare_knowledge_publication,
 )
 from cayu.storage.targets import require_sqlite_store_allowed
 

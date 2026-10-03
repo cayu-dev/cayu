@@ -29,6 +29,7 @@ from cayu.knowledge.maintenance_contracts import (
     KnowledgeMaintenanceDecisionReceipt,
     KnowledgeMaintenanceProposal,
 )
+from cayu.knowledge.publication_contracts import KnowledgePublicationReceipt
 from cayu.knowledge.records import (
     DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
@@ -44,7 +45,6 @@ from cayu.knowledge.scopes import (
 )
 from cayu.knowledge.search import KnowledgeListQuery, KnowledgeListResult
 from cayu.storage.memory import (
-    KnowledgePublicationReceipt,
     _replay_review_approval_from_receipts,
 )
 

@@ -65,6 +65,11 @@ from cayu.knowledge.governance import (
     KnowledgeActivationPolicyError,
     decide_knowledge_activation,
 )
+from cayu.knowledge.publication_contracts import (
+    KnowledgePublicationConflict,
+    KnowledgePublicationReceipt,
+    prepare_knowledge_publication,
+)
 from cayu.knowledge.records import (
     BUILTIN_KNOWLEDGE_KINDS,
     DEFAULT_KNOWLEDGE_NAMESPACE,
@@ -95,11 +100,6 @@ from cayu.storage.knowledge_indexer import (
     MIN_KNOWLEDGE_TEXT_BYTES,
     KnowledgeIndexer,
     KnowledgeIndexRequest,
-)
-from cayu.storage.memory import (
-    KnowledgePublicationConflict,
-    KnowledgePublicationReceipt,
-    prepare_knowledge_publication,
 )
 
 LEARNING_SCHEMA_VERSION = 1
