@@ -1,5 +1,7 @@
 """One protected server surface over the application's browser control owner."""
 
+import asyncio
+
 from fastapi import APIRouter
 
 from cayu.runtime._browser_control_input_tickets import BrowserInputTickets
@@ -70,8 +72,17 @@ class BrowserControlServer:
     async def drain(self) -> bool:
         self.views.close()
         self.inputs.close()
-        if not await self.runtime.service.drain():
-            # Guest cleanup may still need to publish its exact fence. Do not
-            # seal that publisher while the native/channel owner remains live.
-            return False
-        return await self.runtime.coordinator.drain()
+        # A concurrent application shutdown waits for this drain's result, which
+        # is unsettled unless proven, including when it fails or is cancelled.
+        result: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        self.runtime.host_drain = result
+        settled = False
+        try:
+            if not await self.runtime.service.drain():
+                # Guest cleanup may still need to publish its exact fence. Do not
+                # seal that publisher while the native/channel owner remains live.
+                return False
+            settled = await self.runtime.coordinator.drain()
+            return settled
+        finally:
+            result.set_result(settled)

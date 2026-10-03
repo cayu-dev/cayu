@@ -40,6 +40,7 @@ from cayu._application_registration import (
 from cayu._application_registration import (
     _validate_registered_tool as _validate_registered_tool,
 )
+from cayu._task_wait import collect_failures, combine_drain_results
 from cayu._validation import (
     canonical_bounded_durable_json_bytes,
     canonical_durable_json_bytes,
@@ -507,6 +508,7 @@ from cayu.runtime._work_attempt_session_mutation import (
 from cayu.runtime.application_lifecycle import (
     DEFAULT_APPLICATION_SHUTDOWN_TIMEOUT_SECONDS,
     ApplicationAdmission,
+    ApplicationAdmissionsSealed,
     ApplicationLifecycleState,
     ApplicationShutdown,
     ApplicationShutdownOutcome,
@@ -1167,6 +1169,10 @@ class _ParticipantExecutionSettlementReader(PermitSettlementReader):
         )
 
 
+# The share of the remaining shutdown deadline that late provider starts may use.
+_PROVIDER_RECONCILIATION_BUDGET_SHARE = 0.5
+
+
 class CayuApp:
     """Application runtime for registered agents, providers, and session state."""
 
@@ -1550,6 +1556,8 @@ class CayuApp:
         self._mcp_refresh_owner = object()
         self._mcp_publication_lock = asyncio.Lock()
         self._refreshable_mcp_toolsets: dict[int, McpToolset] = {}
+        self._static_mcp_toolsets: dict[int, McpToolset] = {}
+        self._released_mcp_refreshes: set[asyncio.Task[None]] = set()
         self._knowledge_publication_scope = KnowledgePublicationScope()
         self._providers: dict[str, runtime_records.RegisteredProvider] = {}
         self._environments: dict[str, runtime_records.RegisteredEnvironment] = {}
@@ -2897,6 +2905,71 @@ class CayuApp:
     ) -> SessionExportReconciliation:
         """Settle published admission or exclude a retained unpublished preparation."""
         return await self._session_export_coordinator.reconcile(request, context=context)
+
+    async def drain_browser_control(self, *, timeout_s: float = 5.0) -> bool:
+        """Stop browser-control issuance and settle its guest channels and publications.
+
+        Returns True when browser control is not configured. When a Cayu server
+        hosts browser control, the server drains it before the application.
+        """
+
+        if type(timeout_s) not in {int, float} or not isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("timeout_s must be a finite positive number.")
+        runtime = self._browser_control_runtime
+        if runtime is None:
+            return True
+        return await runtime.drain(timeout_s=float(timeout_s))
+
+    async def drain_session_operations(self, *, timeout_s: float = 10.0) -> bool:
+        """Wait for session store writes that outlived the call that started them.
+
+        A store write that exceeds its bounded wait is cancelled and kept until
+        it settles, and a provider-operation reconciliation runs past the model
+        step that started it. This waits for that work without cancelling it,
+        and returns False if any is still running. A cancelled write is not
+        reported: its caller already received a timeout and either reconciles it
+        from durable state or treats it as best-effort. A reconciliation or final
+        session accounting that fails, or a late provider cancellation that
+        fails, raises ``RuntimeError`` naming the failure types, or an
+        ``ExceptionGroup`` of them, once. A drain cancelled before it reports
+        consumes no failure.
+        """
+
+        if type(timeout_s) not in {int, float} or not isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("timeout_s must be a finite positive number.")
+        engine, executor = self._session_engine, self._model_step_executor
+        waits = await asyncio.gather(
+            engine.wait_for_session_operations(timeout_s=float(timeout_s)),
+            executor.drain_detached_writes(timeout_s=float(timeout_s)),
+            executor.wait_for_provider_reconciliations(timeout_s=float(timeout_s)),
+            return_exceptions=True,
+        )
+        # Failures are collected only after every wait, with no await in between,
+        # so cancelling this drain leaves them for the next drain or shutdown.
+        failures = collect_failures(
+            (
+                engine.raise_session_operation_failures,
+                executor.raise_provider_reconciliation_failures,
+            )
+        )
+        return combine_drain_results([*waits, *failures])
+
+    async def drain_event_watchers(self, *, timeout_s: float = 10.0) -> bool:
+        """Wait for event watcher deliveries still running after their caller left.
+
+        When a ``run_event_watchers()`` call is cancelled, its delivery keeps its
+        lease until the handler settles and then records the outcome; a
+        synchronous handler runs until it returns. This waits for that work
+        without cancelling it, and returns False if any is still running. A
+        delivery whose outcome could not be recorded raises ``RuntimeError``
+        naming its status, once, including one a cancelled
+        ``run_event_watchers()`` call had collected but never returned; a
+        later drain or shutdown attempt does not report it again.
+        """
+
+        if type(timeout_s) not in {int, float} or not isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("timeout_s must be a finite positive number.")
+        return await self._event_watcher_supervisor.drain(timeout_s=float(timeout_s))
 
     async def drain_verified_completions(self, *, timeout_s: float = 10.0) -> bool:
         """Wait for completion verification and result resolution still running.
@@ -5274,9 +5347,10 @@ class CayuApp:
         return await step()
 
     def _shutdown_stages(self) -> tuple[ShutdownStage, ...]:
-        # Each step drains through the app's public drain, looked up on the
+        # Most steps drain through the app's public drain, looked up on the
         # instance so it stays individually replaceable; a few steps also seal
-        # internal owners that have no public seal.
+        # internal owners that have no public seal, and the provider
+        # reconciliation, session operation and MCP steps use internal owners.
         async def background_interruptions(budget: float) -> bool:
             # Sealed only now: admitted operations that just finished may still
             # have started cascades and deliveries, which this step drains.
@@ -5310,10 +5384,52 @@ class CayuApp:
             # Policy workers call providers in the background; stop them first.
             await self.stop_model_policy()
 
+        async def provider_reconciliations(budget: float) -> bool:
+            # A hung provider start must not starve the independent cleanup
+            # after it; one that finishes after the seal is reported as
+            # unowned_cancellations.
+            return await self._model_step_executor.drain_provider_reconciliations(
+                timeout_s=budget * _PROVIDER_RECONCILIATION_BUDGET_SHARE
+            )
+
+        async def session_operations(budget: float) -> bool:
+            engine = self._session_engine
+            waits = await asyncio.gather(
+                engine.wait_for_session_operations(timeout_s=budget),
+                self._model_step_executor.drain_detached_writes(timeout_s=budget),
+                return_exceptions=True,
+            )
+            # No await from here, so an interrupted wait consumes no failure.
+            return combine_drain_results(
+                [*waits, *collect_failures((engine.raise_session_operation_failures,))]
+            )
+
+        async def browser_control(budget: float) -> bool:
+            runtime = self._browser_control_runtime
+            if runtime is None:
+                return True
+            host = runtime.host_drain
+            if host is not None:
+                # A server drains it first: report that drain once, waiting for
+                # it if it still runs, instead of repeating it; a retry drains here.
+                try:
+                    await asyncio.wait_for(asyncio.shield(host), budget)
+                except TimeoutError:
+                    return False
+                if runtime.host_drain is host:
+                    runtime.host_drain = None
+                return host.result()
+            return await self.drain_browser_control(timeout_s=budget)
+
         return (
             # Floor-protected: hosts leave stopping policy workers to aclose(),
             # so it must run even when in-flight work used up the deadline.
             (ShutdownStepSpec("model_policy", model_policy, floor_protected=True),),
+            # Like a server, which drains browser control before the application.
+            (ShutdownStepSpec("browser_control", browser_control),),
+            # A late provider start found here needs a cancellation owner, so
+            # this runs before provider cancellation is sealed.
+            (ShutdownStepSpec("provider_reconciliations", provider_reconciliations),),
             (
                 ShutdownStepSpec(
                     "background_interruptions", background_interruptions, floor_protected=True
@@ -5358,6 +5474,14 @@ class CayuApp:
                     "verified_completions",
                     lambda budget: self.drain_verified_completions(timeout_s=budget),
                 ),
+                ShutdownStepSpec(
+                    "event_watchers",
+                    lambda budget: self.drain_event_watchers(timeout_s=budget),
+                ),
+                ShutdownStepSpec("session_operations", session_operations),
+                # Runs even after the deadline is used up: otherwise a host that
+                # never retries would keep the caller's toolsets owned.
+                ShutdownStepSpec("mcp_toolsets", self._release_mcp_toolsets, floor_protected=True),
             ),
             (ShutdownStepSpec("runtime_timing", runtime_timing, floor_protected=True),),
         )
@@ -5369,7 +5493,10 @@ class CayuApp:
             or self._foreground_child_delivery_owner.pending
         ):
             late["background_interruptions"] = "late_work"
-        if self.recovery_cleanup_status().active_tasks:
+        if (
+            self.recovery_cleanup_status().active_tasks
+            or self._session_control.execution_presence.releasing
+        ):
             late["recovery_cleanups"] = "late_work"
         if self._knowledge_publication_scope.pending:
             late["knowledge_publications"] = "late_work"
@@ -5379,6 +5506,17 @@ class CayuApp:
             late["session_exports"] = "late_work"
         if self._verified_completion.pending:
             late["verified_completions"] = "late_work"
+        if self._event_watcher_supervisor.pending:
+            late["event_watchers"] = "late_work"
+        if self._released_mcp_refreshes:
+            late["mcp_toolsets"] = "late_work"
+        if self._model_step_executor.provider_reconciliations_pending:
+            late["provider_reconciliations"] = "late_work"
+        if (
+            self._session_engine.session_operations_pending
+            or self._model_step_executor.detached_writes_pending
+        ):
+            late["session_operations"] = "late_work"
         provider = self.provider_operation_cancellation_status()
         # A rejection after sealing is a provider operation left without a
         # cancellation owner; report each one in the attempt that saw it.
@@ -6042,6 +6180,12 @@ class CayuApp:
             registration_symbol=registration_symbol,
             child_session_context_contributor=stored_child_session_context,
         )
+        if (static_mcp_toolsets or stored_mcp_toolsets) and self._admission.sealed:
+            # Shutdown hands MCP toolsets back to their caller; a closing app
+            # must not take them again.
+            raise ApplicationAdmissionsSealed(
+                "A closing application cannot take ownership of MCP toolsets."
+            )
         newly_claimed_static: list[McpToolset] = []
         newly_claimed_refreshable: list[McpToolset] = []
         try:
@@ -6071,11 +6215,48 @@ class CayuApp:
         self._agent_thinking_sources[stored_spec.name] = thinking_source
         for toolset in stored_mcp_toolsets:
             self._refreshable_mcp_toolsets[_mcp_refresh_source_key(toolset)] = toolset
+        for toolset in newly_claimed_static:
+            self._static_mcp_toolsets[_mcp_refresh_source_key(toolset)] = toolset
         return spec
 
+    async def _release_mcp_toolsets(self, timeout_s: float) -> bool:
+        """Hand caller-owned MCP toolsets back so another app can own them.
+
+        Releasing refresh ownership removes this app's notification handler and
+        cancels its pending notification refresh; a refresh already running is
+        an admitted operation that shutdown waited for.
+        """
+
+        # A running operation still relies on this app's list-changed fence;
+        # releasing it then would let that operation dispatch stale tools.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while self._admission.in_flight:
+            remaining = deadline - loop.time()
+            if remaining <= 0 or not await self._admission.wait_idle(remaining):
+                return False
+        # No await from the check above to the release below.
+        for toolset in self._refreshable_mcp_toolsets.values():
+            task = toolset._refresh_source.release_refresh_owner(self._mcp_refresh_owner)
+            if task is not None:
+                self._released_mcp_refreshes.add(task)
+                task.add_done_callback(self._released_mcp_refreshes.discard)
+        for toolset in self._static_mcp_toolsets.values():
+            toolset._refresh_source.release_static_owner(self._mcp_refresh_owner)
+        if not self._released_mcp_refreshes:
+            return True
+        _done, pending = await asyncio.wait(
+            set(self._released_mcp_refreshes), timeout=max(0.0, deadline - loop.time())
+        )
+        return not pending
+
     async def _refresh_mcp_toolset_after_notification(self, source_key: int) -> None:
+        if self._admission.sealed:
+            # Fail rather than return: the toolset retries a refresh that returns
+            # while its source is still dirty, and that retry never yields.
+            raise ApplicationAdmissionsSealed("The application is shutting down.")
         current = self._refreshable_mcp_toolsets.get(source_key)
-        if current is None or self._admission.sealed:
+        if current is None:
             return
         await self.refresh_mcp_toolset(current)
 
@@ -10878,6 +11059,22 @@ class CayuApp:
                 )
         if type(limit) is not int or limit < 1:
             raise ValueError("limit must be an integer greater than or equal to 1.")
+        undelivered: list[EventWatcherDelivery] = []
+        try:
+            return await self._deliver_event_watchers(watcher_list, limit, undelivered)
+        except BaseException:
+            # The caller never receives these results, so shutdown must report
+            # any whose outcome could not be recorded. The delivery running
+            # when this call ended is not among them; it reports itself.
+            self._event_watcher_supervisor.record_undelivered(undelivered)
+            raise
+
+    async def _deliver_event_watchers(
+        self,
+        watcher_list: tuple[EventWatcher, ...],
+        limit: int,
+        undelivered: list[EventWatcherDelivery],
+    ) -> list[EventWatcherRunResult]:
         remaining = limit
         results: list[EventWatcherRunResult] = []
         for watcher in watcher_list:
@@ -10975,6 +11172,7 @@ class CayuApp:
                                 deep=True,
                             )
                         )
+                        undelivered.append(deliveries[-1])
                         remaining -= 1
                         if delivery.status in {
                             EventWatcherDeliveryStatus.SUCCEEDED,

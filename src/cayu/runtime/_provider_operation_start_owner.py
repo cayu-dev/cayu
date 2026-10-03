@@ -8,11 +8,12 @@ from contextvars import Context
 from dataclasses import dataclass
 from typing import Any, Never
 
-from cayu._exception_groups import iter_exception_tree
+from cayu._exception_groups import exception_cause, iter_exception_tree
 from cayu._task_wait import (
-    _consume_detached_task_outcome,
+    LateFailures,
     await_shielded_task_outcome,
     restore_task_cancellation_requests,
+    retained_task_failure,
     unexpected_child_cancellation_error,
 )
 from cayu._validation import copy_durable_record
@@ -53,7 +54,10 @@ from cayu.runtime._provider_operation_cancellation_owner import (
 from cayu.runtime._provider_stream import _close_async_iterator
 from cayu.runtime._session_control import SessionInterruptedByRequest
 from cayu.runtime.execution_units import ModelAttemptIdentity
-from cayu.runtime.provider_operation_cancellation import ProviderOperationCancellationLifecycle
+from cayu.runtime.provider_operation_cancellation import (
+    ProviderOperationCancellationAdmissionsSealed,
+    ProviderOperationCancellationLifecycle,
+)
 from cayu.runtime.provider_operations import provider_operation_started_event_id
 from cayu.sessions.base import (
     EventQuery,
@@ -89,6 +93,22 @@ def is_ambiguous_provider_operation_start_error(failure: BaseException) -> bool:
         and candidate.error_code == "provider_operation_start_ambiguous"
         for candidate in iter_exception_tree(failure)
     )
+
+
+def _late_cancellation_failure(failure: BaseException) -> BaseException | None:
+    """Return why cancelling a late-started operation failed, if it did.
+
+    Sealed admission is not reported here: shutdown already reports it as an
+    unowned cancellation.
+    """
+
+    cause = exception_cause(failure)
+    if not isinstance(cause, BaseExceptionGroup) or not cause.exceptions:
+        return None
+    cleanup_error = cause.exceptions[-1]
+    if isinstance(cleanup_error, ProviderOperationCancellationAdmissionsSealed):
+        return None
+    return cleanup_error
 
 
 @dataclass
@@ -128,13 +148,24 @@ class ProviderOperationStartOwner:
         self._event_writer = event_writer
         self._provider_operation_cancellation_lifecycle = cancellation_lifecycle
         self._reconciliation_tasks: set[asyncio.Task[None]] = set()
+        self.reconciliation_failures = LateFailures("A provider-operation reconciliation")
+
+    def running_reconciliations(self) -> set[asyncio.Future[Any]]:
+        """Late-start reconciliations still running after their model step."""
+
+        return set(self._reconciliation_tasks)
+
+    def _record_reconciliation_failure(self, failure: BaseException) -> None:
+        self.reconciliation_failures.record(type(failure).__qualname__)
 
     def _retain_reconciliation(self, task: asyncio.Task[None]) -> None:
         self._reconciliation_tasks.add(task)
 
         def settled(completed: asyncio.Task[None]) -> None:
             self._reconciliation_tasks.discard(completed)
-            _consume_detached_task_outcome(completed)
+            failure = retained_task_failure(completed)
+            if failure is not None:
+                self._record_reconciliation_failure(failure)
 
         task.add_done_callback(settled)
 
@@ -324,6 +355,10 @@ class ProviderOperationStartOwner:
                     async with aclosing_provider_stream(raw_late_operation.events):
                         raise
                 raise
+            # The helper attaches a failed cancellation to this exception's cause.
+            late_start_failure = RuntimeError(
+                "Caller cancellation preceded provider start acknowledgement."
+            )
             try:
                 (
                     late_cleanup_cancellation,
@@ -333,9 +368,8 @@ class ProviderOperationStartOwner:
                     lifecycle=self._provider_operation_cancellation_lifecycle,
                     adapter=provider_operation_adapter,
                     state=late_operation.state,
-                    failure=RuntimeError(
-                        "Caller cancellation preceded provider start acknowledgement."
-                    ),
+                    failure=late_start_failure,
+                    on_unobserved_failure=self._record_reconciliation_failure,
                 )
                 if late_cleanup_cancellation is not None:
                     restore_task_cancellation_requests(
@@ -411,6 +445,11 @@ class ProviderOperationStartOwner:
                     )
                 await self._event_writer.fan_out_persisted([persisted[0].event])
             finally:
+                # On every exit, before closing the stream can raise, so shutdown
+                # reports a failed cancel once even when publication fails too.
+                failed_cancellation = _late_cancellation_failure(late_start_failure)
+                if failed_cancellation is not None:
+                    self._record_reconciliation_failure(failed_cancellation)
                 await _close_async_iterator(raw_late_operation.events)
 
         if start_outcome.timed_out:

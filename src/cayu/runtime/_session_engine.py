@@ -59,12 +59,15 @@ from cayu._exception_groups import (
 from cayu._exception_state import exception_state, pop_exception_state, set_exception_state
 from cayu._task_wait import (
     CapturedAwaitableOutcome,
+    LateFailures,
     ShieldedTaskOutcome,
     await_shielded_task_outcome,
     capture_awaitable_outcome,
     consume_pending_task_cancellation,
     restore_task_cancellation_requests,
+    retained_task_failure,
     unexpected_child_cancellation_error,
+    wait_until_idle,
 )
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
@@ -5148,6 +5151,7 @@ class SessionEngine:
             execution_profile_admission.ProcessLocalBehaviorIdentityRegistry()
         )
         self._detached_session_operation_tasks: set[asyncio.Task[Any]] = set()
+        self._session_operation_failures = LateFailures("Final session accounting")
 
     async def _run_cleanup_steps(
         self,
@@ -6356,8 +6360,35 @@ class SessionEngine:
     def _record_workflow_structured_output(self, session_id: str, output: Any) -> None:
         self._workflow_structured_output_handoff.record(session_id, output)
 
-    def _track_detached_session_operation_task(self, task: asyncio.Task[Any]) -> None:
-        """Retain and observe best-effort work that cannot block its caller."""
+    def _running_session_operations(self) -> set[asyncio.Future[Any]]:
+        return set(self._detached_session_operation_tasks)
+
+    @property
+    def session_operations_pending(self) -> bool:
+        """Whether detached session work still runs, or final accounting failed unreported."""
+
+        return self._session_operation_failures.pending or any(
+            not task.done() for task in self._detached_session_operation_tasks
+        )
+
+    async def wait_for_session_operations(self, *, timeout_s: float) -> bool:
+        """Wait up to ``timeout_s`` for detached session work, without cancelling it."""
+
+        return await wait_until_idle(self._running_session_operations, timeout_s=timeout_s)
+
+    def raise_session_operation_failures(self) -> None:
+        """Raise, once, for final session accounting that failed unreported."""
+
+        self._session_operation_failures.raise_once()
+
+    def _track_detached_session_operation_task(
+        self, task: asyncio.Task[Any], *, report_failure: bool
+    ) -> None:
+        """Retain and observe best-effort work that cannot block its caller.
+
+        ``report_failure`` says whether nobody else owns how the task ends, so a
+        failure is reported once at shutdown.
+        """
 
         if task in self._detached_session_operation_tasks:
             return
@@ -6365,7 +6396,15 @@ class SessionEngine:
 
         def observe(completed: asyncio.Task[Any]) -> None:
             self._detached_session_operation_tasks.discard(completed)
-            _consume_detached_session_operation_task(completed)
+            if not report_failure:
+                _consume_detached_session_operation_task(completed)
+                return
+            # Reading a cancelled task would consume the cancellation its owning
+            # heartbeat classifies; a cancellation is not a failure either.
+            failure = retained_task_failure(completed)
+            # A superseded attempt now belongs to the owner that took it over.
+            if failure is not None and not isinstance(failure, SessionCompactionAttemptSuperseded):
+                self._session_operation_failures.record(type(failure).__qualname__)
 
         task.add_done_callback(observe)
 
@@ -6384,7 +6423,8 @@ class SessionEngine:
         )
         if outcome.timed_out:
             task.cancel()
-            self._track_detached_session_operation_task(task)
+            # Cancelled with an unknown outcome, which its caller reconciles.
+            self._track_detached_session_operation_task(task, report_failure=False)
         return outcome
 
     async def _fan_out_reconciled_session_operation_events(
@@ -15920,7 +15960,8 @@ class SessionEngine:
         async def stop_claim_heartbeat_and_track() -> None:
             blocker = await stop_claim_heartbeat()
             if blocker is not None:
-                self._track_detached_session_operation_task(blocker)
+                # Work of the stopped heartbeat, which nothing still depends on.
+                self._track_detached_session_operation_task(blocker, report_failure=False)
 
         initial_event_delivered = False
         initial_delivery_failure: BaseException | None = None
@@ -17794,7 +17835,8 @@ class SessionEngine:
                     return
 
                 deferred = asyncio.create_task(finalize_after_pending_store_writes())
-                self._track_detached_session_operation_task(deferred)
+                # Nobody else observes how this final accounting ends.
+                self._track_detached_session_operation_task(deferred, report_failure=True)
 
             await self._run_cleanup_steps(
                 authoritative_failure=authoritative_failure,

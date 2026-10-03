@@ -958,6 +958,8 @@ def _validate_positive_seconds(value: float, field_name: str) -> float:
 _SHUTDOWN_STEP_LOG_SUBJECTS = {
     "open_operations": "Runs and other admitted operations",
     "model_policy": "Model policy workers",
+    "browser_control": "Browser control",
+    "provider_reconciliations": "Provider-operation reconciliations",
     "background_interruptions": "Background interruption cascades",
     "recovery_cleanups": "Supervised recovery cleanups",
     "provider_operation_cancellations": "Provider-operation cancellations",
@@ -966,6 +968,9 @@ _SHUTDOWN_STEP_LOG_SUBJECTS = {
     "collaboration_requests": "Collaboration requests",
     "session_exports": "Session exports",
     "verified_completions": "Completion verification and result resolution",
+    "event_watchers": "Event watcher deliveries",
+    "session_operations": "Detached session writes",
+    "mcp_toolsets": "MCP toolset refreshes",
     "runtime_timing": "Runtime timing delivery",
     "owned_resources": "Application-owned resources",
 }

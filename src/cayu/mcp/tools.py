@@ -221,12 +221,16 @@ class _McpToolSource:
             return
         self._clear_notification_refresh_owner()
 
-    def release_refresh_owner(self, owner: object) -> None:
-        if self.refresh_owner is owner:
-            self._clear_notification_refresh_owner()
-            self.refresh_owner = None
+    def release_refresh_owner(self, owner: object) -> asyncio.Task[None] | None:
+        """Release ``owner``; return its notification refresh task, now cancelled."""
 
-    def _clear_notification_refresh_owner(self) -> None:
+        if self.refresh_owner is not owner:
+            return None
+        task = self._clear_notification_refresh_owner()
+        self.refresh_owner = None
+        return task
+
+    def _clear_notification_refresh_owner(self) -> asyncio.Task[None] | None:
         if self._notification_handler_installed:
             self.session._set_tools_list_changed_handler(None)
             self._notification_handler_installed = False
@@ -246,8 +250,10 @@ class _McpToolSource:
         self._notification_refresh = None
         task = self._notification_refresh_task
         self._notification_refresh_task = None
-        if task is not None and not task.done():
-            task.cancel()
+        if task is None or task.done():
+            return None
+        task.cancel()
+        return task
 
     def _observe_tools_list_changed(self) -> None:
         """Fence the source synchronously, then coalesce refresh ownership."""

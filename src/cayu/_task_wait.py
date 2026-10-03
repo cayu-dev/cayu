@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
@@ -280,3 +280,93 @@ def _consume_detached_task_outcome(task: asyncio.Task[Any]) -> None:
 
     with contextlib.suppress(asyncio.CancelledError):
         task.exception()
+
+
+async def wait_until_idle(
+    running: Callable[[], set[asyncio.Future[Any]]], *, timeout_s: float
+) -> bool:
+    """Wait up to ``timeout_s`` until ``running()`` is empty, without cancelling.
+
+    ``running()`` is re-read after each completion, so work started meanwhile is
+    also waited for. Returns False if work is still running at the deadline.
+    """
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while pending := {future for future in running() if not future.done()}:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        await asyncio.wait(pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+    return True
+
+
+class RetainedWorkFailed(RuntimeError):
+    """Work kept past its caller failed; only the failures' types are reported."""
+
+
+def retained_task_failure(task: asyncio.Task[Any]) -> BaseException | None:
+    """Return how a retained task failed after its caller stopped waiting.
+
+    A cancellation, including the one that detached the task, is not a failure.
+    """
+
+    if task.cancelled():
+        return None
+    error = task.exception()
+    if error is None or isinstance(error, asyncio.CancelledError):
+        return None
+    return error
+
+
+class LateFailures:
+    """Failures of retained work that no caller observed, each reported once."""
+
+    def __init__(self, work: str) -> None:
+        self._work = work
+        self._failures: dict[str, int] = {}
+
+    @property
+    def pending(self) -> bool:
+        return bool(self._failures)
+
+    def record(self, failure: str) -> None:
+        """Record a failure by its type or status name, never its content."""
+
+        self._failures[failure] = self._failures.get(failure, 0) + 1
+
+    def raise_once(self) -> None:
+        if not self._failures:
+            return
+        failures, self._failures = self._failures, {}
+        summary = ", ".join(
+            name if count == 1 else f"{name} x{count}" for name, count in failures.items()
+        )
+        raise RetainedWorkFailed(f"{self._work} failed after its caller left ({summary}).")
+
+
+def combine_drain_results(results: Sequence[bool | BaseException]) -> bool:
+    """Report every failure of concurrent drains; otherwise whether all settled."""
+
+    failures = [result for result in results if isinstance(result, BaseException)]
+    if len(failures) == 1:
+        raise failures[0]
+    if failures:
+        raise BaseExceptionGroup("Retained work drains failed.", failures)
+    return all(results)
+
+
+def collect_failures(raisers: Iterable[Callable[[], None]]) -> list[BaseException]:
+    """Run each owner's synchronous failure report and return what it raised.
+
+    Combined drains call this only after every wait finished, with no await in
+    between, so a cancelled drain consumes no owner's failures.
+    """
+
+    failures: list[BaseException] = []
+    for raise_failures in raisers:
+        try:
+            raise_failures()
+        except BaseException as failure:
+            failures.append(failure)
+    return failures

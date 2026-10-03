@@ -37,6 +37,7 @@ from cayu._task_wait import (
     await_shielded_task_outcome,
     consume_pending_task_cancellation,
     unexpected_child_cancellation_error,
+    wait_until_idle,
 )
 from cayu._validation import (
     DurableValueError,
@@ -1175,6 +1176,7 @@ class ModelStepExecutor:
             event_writer=event_writer,
             cancellation_lifecycle=provider_operation_cancellation_lifecycle,
         )
+        self._detached_tasks: set[asyncio.Task[Any]] = set()
         self._provider_operation_cancellation = ProviderOperationCancellationOwner(
             session_store=session_store,
             event_writer=event_writer,
@@ -1200,6 +1202,64 @@ class ModelStepExecutor:
             provider_operation_cancellation=self._provider_operation_cancellation,
             provider_operation_recovery=self._provider_operation_recovery,
         )
+
+    def _retain_detached_task(self, task: asyncio.Task[Any]) -> None:
+        """Keep a cancelled store write that outlived its bounded wait until it settles.
+
+        Its caller already received a timeout and either reconciles the write
+        from durable state or treats it as best-effort, so how it ends is not
+        reported again.
+        """
+
+        self._detached_tasks.add(task)
+
+        def settled(completed: asyncio.Task[Any]) -> None:
+            self._detached_tasks.discard(completed)
+            _consume_detached_task_outcome(completed)
+
+        task.add_done_callback(settled)
+
+    def _running_detached_writes(self) -> set[asyncio.Future[Any]]:
+        return set(self._detached_tasks)
+
+    def _running_provider_reconciliations(self) -> set[asyncio.Future[Any]]:
+        return self._provider_operation_start.running_reconciliations()
+
+    @property
+    def detached_writes_pending(self) -> bool:
+        """Whether a kept store write still runs."""
+
+        return any(not task.done() for task in self._detached_tasks)
+
+    @property
+    def provider_reconciliations_pending(self) -> bool:
+        """Whether a reconciliation still runs or failed without being reported."""
+
+        return self._provider_operation_start.reconciliation_failures.pending or any(
+            not task.done() for task in self._running_provider_reconciliations()
+        )
+
+    async def drain_detached_writes(self, *, timeout_s: float) -> bool:
+        """Wait up to ``timeout_s`` for detached store writes, without cancelling them."""
+
+        return await wait_until_idle(self._running_detached_writes, timeout_s=timeout_s)
+
+    async def wait_for_provider_reconciliations(self, *, timeout_s: float) -> bool:
+        """Wait up to ``timeout_s`` for provider-operation reconciliations to settle."""
+
+        return await wait_until_idle(self._running_provider_reconciliations, timeout_s=timeout_s)
+
+    def raise_provider_reconciliation_failures(self) -> None:
+        """Raise, once, for reconciliations that failed unreported."""
+
+        self._provider_operation_start.reconciliation_failures.raise_once()
+
+    async def drain_provider_reconciliations(self, *, timeout_s: float) -> bool:
+        """Wait for provider-operation reconciliations, then raise once for failures."""
+
+        idle = await self.wait_for_provider_reconciliations(timeout_s=timeout_s)
+        self.raise_provider_reconciliation_failures()
+        return idle
 
     async def cancel_provider_operation_for_interruption(
         self,
@@ -5360,7 +5420,7 @@ class ModelStepRun:
         )
         if outcome.timed_out:
             reconciliation_task.cancel()
-            reconciliation_task.add_done_callback(_consume_detached_task_outcome)
+            self._executor._retain_detached_task(reconciliation_task)
             reconciliation_error = TimeoutError(
                 f"{operation} reconciliation exceeded "
                 f"{_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S:g} seconds."
@@ -5394,7 +5454,7 @@ class ModelStepRun:
         )
         if outcome.timed_out:
             fan_out_task.cancel()
-            fan_out_task.add_done_callback(_consume_detached_task_outcome)
+            self._executor._retain_detached_task(fan_out_task)
             return (
                 TimeoutError(
                     f"{operation} side-effect delivery exceeded "
@@ -5493,7 +5553,7 @@ class ModelStepRun:
             cancellation = outcome.cancellation
             if outcome.timed_out:
                 persistence_task.cancel()
-                persistence_task.add_done_callback(_consume_detached_task_outcome)
+                self._executor._retain_detached_task(persistence_task)
                 publication_error: BaseException | None = TimeoutError(
                     "Automatic compaction pre-dispatch publication exceeded "
                     f"{_AUTOMATIC_COMPACTION_PREDISPATCH_EVENT_STORE_WAIT_TIMEOUT_S:g} "
@@ -5527,7 +5587,7 @@ class ModelStepRun:
                 cancellation = fan_out_outcome.cancellation
                 if fan_out_outcome.timed_out:
                     fan_out_task.cancel()
-                    fan_out_task.add_done_callback(_consume_detached_task_outcome)
+                    self._executor._retain_detached_task(fan_out_task)
                     publication_error = TimeoutError(
                         "Automatic compaction pre-dispatch side-effect delivery exceeded "
                         f"{_AUTOMATIC_COMPACTION_PREDISPATCH_EVENT_STORE_WAIT_TIMEOUT_S:g} "
@@ -5732,7 +5792,7 @@ class ModelStepRun:
         cancellation = outcome.cancellation
         if outcome.timed_out:
             persistence_task.cancel()
-            persistence_task.add_done_callback(_consume_detached_task_outcome)
+            self._executor._retain_detached_task(persistence_task)
             publication_error: BaseException = TimeoutError(
                 "Compaction start publication exceeded "
                 f"{_AUTOMATIC_COMPACTION_PREDISPATCH_EVENT_STORE_WAIT_TIMEOUT_S:g} seconds."
@@ -7067,7 +7127,7 @@ class ModelStepRun:
             else None
         )
         if outcome.timed_out:
-            task.add_done_callback(_consume_detached_task_outcome)
+            self._executor._retain_detached_task(task)
             task.cancel()
             error.add_note(
                 "Context compaction termination telemetry persistence exceeded "

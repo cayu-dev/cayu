@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Iterable
 from typing import Any, TypeVar
 
-from cayu._task_wait import await_shielded_task_outcome
+from cayu._task_wait import LateFailures, await_shielded_task_outcome, wait_until_idle
 from cayu.observability.watchers import (
     EventWatcher,
     EventWatcherClaim,
@@ -25,6 +25,11 @@ from cayu.vaults import SecretRedactor
 
 _T = TypeVar("_T")
 
+# A delivery that ended so could not record its outcome durably.
+_UNSETTLED_DELIVERY = frozenset(
+    {EventWatcherDeliveryStatus.PUBLICATION_FAILED, EventWatcherDeliveryStatus.LEASE_LOST}
+)
+
 
 class EventWatcherSupervisor:
     """Retain handler ownership even when the caller stops waiting for cleanup."""
@@ -32,10 +37,53 @@ class EventWatcherSupervisor:
     def __init__(self) -> None:
         self._active: dict[str, asyncio.Task[None]] = {}
         self._store_tasks: set[asyncio.Future[Any]] = set()
+        self._late_failures = LateFailures("An event watcher delivery")
 
     def active(self, watcher_name: str) -> bool:
         task = self._active.get(watcher_name)
         return task is not None and not task.done()
+
+    def _running(self) -> set[asyncio.Future[Any]]:
+        return {
+            *(task for task in self._active.values() if not task.done()),
+            *(task for task in self._store_tasks if not task.done()),
+        }
+
+    @property
+    def pending(self) -> bool:
+        """Whether delivery work still runs, or failed without being reported."""
+
+        return self._late_failures.pending or bool(self._running())
+
+    def record_undelivered(self, deliveries: Iterable[EventWatcherDelivery]) -> None:
+        """Record outcomes a cancelled caller collected but never received."""
+
+        for delivery in deliveries:
+            if delivery.status in _UNSETTLED_DELIVERY:
+                self._late_failures.record(delivery.status.value)
+
+    def _record_unobserved_outcome(self, done: asyncio.Future[EventWatcherDelivery]) -> None:
+        # Its caller left, so nobody else sees whether the delivery settled.
+        if done.cancelled():
+            return
+        error = done.exception()
+        if error is not None:
+            self._late_failures.record(type(error).__qualname__)
+        elif done.result().status in _UNSETTLED_DELIVERY:
+            self._late_failures.record(done.result().status.value)
+
+    async def drain(self, *, timeout_s: float) -> bool:
+        """Wait up to ``timeout_s`` for deliveries to finish, without cancelling them.
+
+        A delivery whose caller was cancelled keeps renewing its lease until its
+        handler settles, then publishes its outcome; a synchronous handler runs
+        until it returns. Returns False if any work is still running, and raises,
+        once, for a delivery whose caller left and whose outcome was not recorded.
+        """
+
+        idle = await wait_until_idle(self._running, timeout_s=timeout_s)
+        self._late_failures.raise_once()
+        return idle
 
     async def store_call(self, work: Awaitable[_T]) -> _T:
         # Discovery/admission may initialize a database connection before any
@@ -116,7 +164,7 @@ class EventWatcherSupervisor:
             cancel.set()
             # The worker retains renewal until cooperative cancellation or a
             # synchronous callback actually settles. No caller wait is unbounded.
-            result.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+            result.add_done_callback(self._record_unobserved_outcome)
             raise
 
     async def _drive(

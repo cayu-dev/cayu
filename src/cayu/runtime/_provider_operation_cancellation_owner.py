@@ -14,6 +14,7 @@ from cayu._task_wait import (
     _consume_detached_task_outcome,
     await_shielded_task_outcome,
     restore_task_cancellation_requests,
+    retained_task_failure,
     unexpected_child_cancellation_error,
 )
 from cayu._validation import require_durable_clean_nonblank
@@ -111,7 +112,14 @@ async def _cancel_provider_operation_after_definite_absence(
     failure: BaseException,
     cancellation: asyncio.CancelledError | None = None,
     ownership_lost: asyncio.Event | None = None,
+    on_unobserved_failure: Callable[[BaseException], None] | None = None,
 ) -> tuple[asyncio.CancelledError | None, ProviderOperationSnapshot | None, int]:
+    """Cancel a provider operation whose start evidence is definitely absent.
+
+    ``on_unobserved_failure`` receives how a cancellation that outlived both of
+    its bounded waits ends, if it fails; nobody else observes that outcome.
+    """
+
     async def cancel():
         return await adapter.cancel(copy_provider_operation_state(state))
 
@@ -147,7 +155,17 @@ async def _cancel_provider_operation_after_definite_absence(
         )
         cancellation_requests_consumed += drain_outcome.cancellation_requests_consumed
         if drain_outcome.timed_out:
-            cleanup_task.add_done_callback(_consume_detached_task_outcome)
+            if on_unobserved_failure is None:
+                cleanup_task.add_done_callback(_consume_detached_task_outcome)
+            else:
+                report = on_unobserved_failure
+
+                def settled(completed: asyncio.Task[Any]) -> None:
+                    late_failure = retained_task_failure(completed)
+                    if late_failure is not None:
+                        report(late_failure)
+
+                cleanup_task.add_done_callback(settled)
             failure.add_note(
                 "Provider operation cancellation remained in flight after local task "
                 "cancellation; the Runtime retained lifecycle ownership with uncertain "

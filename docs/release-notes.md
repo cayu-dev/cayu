@@ -28,6 +28,28 @@
   still running after their call returned (`app.drain_verified_completions()`),
   and reports such work that then failed instead of settling.
 
+- `CayuApp.aclose()` now also waits for background work that outlives the call
+  that started it: event watcher deliveries whose caller was cancelled
+  (`app.drain_event_watchers()`), session store writes and provider-operation
+  reconciliations kept past their call (`app.drain_session_operations()`), and
+  browser control (`app.drain_browser_control()`; under a Cayu server, which
+  drains it first, the step waits for that drain and reports whether it settled,
+  and a retry drains again). It also
+  releases the app's ownership of caller-supplied MCP toolsets and stops their
+  pending notification refreshes once no operation is in flight, even after the
+  deadline is used up, so a closed app no longer keeps a toolset from
+  being registered with another app, and a closing app refuses to take MCP
+  toolsets again. A toolset whose tools changed after its last refresh stays
+  stale: another app cannot register it as a refreshable toolset, and its tools
+  are not dispatched until it is refreshed. A tools-changed notification that
+  arrives while shutdown waits for a run no longer stalls the event loop, and an
+  execution-presence release still running after the recovery cleanup step now
+  leaves shutdown incomplete. Retained work whose outcome nobody else owns and
+  that then fails, such as a watcher delivery whose settlement could not be
+  published, a late provider cancellation that failed, or final session
+  accounting that failed, makes one shutdown attempt report its step as failed
+  instead of settling over it.
+
 - Record provider rejections during automatic compaction as failures. Each
   rejected compactor attempt now also publishes `model.error` with the same
   `status_code`, `provider_error_type`, `provider_error_code`, `retryable`, and

@@ -1947,7 +1947,10 @@ def test_attached_worker_recovers_interrupted_model_judge_under_a_new_fence(tmp_
         assert released.attempt_count == 1
         assert released.ownership is None
 
-        with TestClient(_server(target, recovery_store)) as client:
+        # A restarted server runs a new application, which a closed one cannot
+        # serve; it shares the same providers so their requests stay counted.
+        restarted = _target(candidate_provider, model_judges=(judge,))
+        with TestClient(_server(restarted, recovery_store)) as client:
             terminal = _wait_for_terminal(client, run_id)
             assert terminal["status"] == "completed"
             assert terminal["attempt_count"] == 2

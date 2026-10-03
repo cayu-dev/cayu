@@ -88,7 +88,10 @@ SHUTDOWN_PARTS = frozenset(
         "drain_provider_operation_cancellations",
         "drain_recovery_cleanups",
         "drain_session_exports",
+        "drain_session_operations",
         "drain_session_recovery_cleanups",
+        "drain_browser_control",
+        "drain_event_watchers",
         "drain_verified_completions",
         "flush_runtime_timing",
         "stop_model_policy",
@@ -170,6 +173,8 @@ def test_idle_app_settles_and_the_context_manager_is_aclose() -> None:
         assert [step.subsystem for step in outcome.steps] == [
             "open_operations",
             "model_policy",
+            "browser_control",
+            "provider_reconciliations",
             "background_interruptions",
             "recovery_cleanups",
             "provider_operation_cancellations",
@@ -178,6 +183,9 @@ def test_idle_app_settles_and_the_context_manager_is_aclose() -> None:
             "collaboration_requests",
             "session_exports",
             "verified_completions",
+            "event_watchers",
+            "session_operations",
+            "mcp_toolsets",
             "runtime_timing",
         ]
         assert await app.aclose() is outcome

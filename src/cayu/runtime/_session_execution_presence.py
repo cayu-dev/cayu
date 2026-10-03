@@ -148,6 +148,12 @@ class SessionExecutionPresence:
             if failure is not None:
                 raise failure
 
+    @property
+    def releasing(self) -> bool:
+        """Whether a stopped owner's release is still running."""
+
+        return any(group.stop.is_set() and not group.task.done() for group in self.groups.values())
+
     async def drain(self, *, timeout_s: float) -> bool:
         """Observe stopped owners only; never stop live execution or cancel writes."""
         if type(timeout_s) not in {int, float} or not isfinite(timeout_s) or timeout_s <= 0:
