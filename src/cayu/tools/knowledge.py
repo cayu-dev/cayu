@@ -69,6 +69,15 @@ from cayu.knowledge.scopes import (
     copy_knowledge_access_scope,
     knowledge_access_scope_sha256,
 )
+from cayu.knowledge.search import (
+    KnowledgeFacet,
+    KnowledgeHit,
+    KnowledgeListGroup,
+    KnowledgeListItem,
+    KnowledgeListQuery,
+    KnowledgeQuery,
+    KnowledgeSearchMode,
+)
 from cayu.storage.knowledge_indexer import (
     DEFAULT_KNOWLEDGE_CHUNK_OVERLAP_BYTES,
     KnowledgeIndexer,
@@ -78,15 +87,8 @@ from cayu.storage.knowledge_indexer import (
     knowledge_source_hash,
 )
 from cayu.storage.memory import (
-    KnowledgeFacet,
-    KnowledgeHit,
-    KnowledgeListGroup,
-    KnowledgeListItem,
-    KnowledgeListQuery,
     KnowledgePublicationConflict,
     KnowledgePublicationReceipt,
-    KnowledgeQuery,
-    KnowledgeSearchMode,
     KnowledgeStore,
     copy_knowledge_publication_receipt,
     prepare_knowledge_publication,

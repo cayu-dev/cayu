@@ -52,6 +52,12 @@ from cayu.knowledge.scopes import (
     KnowledgeAccessScope,
     copy_knowledge_access_scope,
 )
+from cayu.knowledge.search import (
+    KnowledgeHit,
+    KnowledgeQuery,
+    KnowledgeSearchMode,
+    KnowledgeSearchResult,
+)
 from cayu.memory.retrieval import (
     FusedRetrievalCandidate,
     RankedRetrievalChannel,
@@ -73,10 +79,6 @@ from cayu.sessions.base import (
     encode_transcript_search_cursor,
 )
 from cayu.storage.memory import (
-    KnowledgeHit,
-    KnowledgeQuery,
-    KnowledgeSearchMode,
-    KnowledgeSearchResult,
     KnowledgeStore,
 )
 

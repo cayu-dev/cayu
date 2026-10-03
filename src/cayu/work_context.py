@@ -1310,9 +1310,9 @@ class AgentRecallSubscription(_WorkContextModel):
 
     @model_validator(mode="after")
     def validate_authority(self) -> AgentRecallSubscription:
+        from cayu.knowledge.search import KnowledgeQuery, KnowledgeSearchMode
         from cayu.memory.base import AutomaticRecallPolicy
         from cayu.memory.recall import RECALL_MAX_QUERY_BYTES
-        from cayu.storage.memory import KnowledgeQuery, KnowledgeSearchMode
 
         policy = AutomaticRecallPolicy.model_validate_json(
             canonical_durable_json_bytes(self.admission_policy, "admission_policy")

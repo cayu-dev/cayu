@@ -144,6 +144,19 @@ from cayu.knowledge.scopes import (
     _knowledge_access_scope_sha256,
     copy_knowledge_access_scope,
 )
+from cayu.knowledge.search import (
+    KnowledgeFacet,
+    KnowledgeHit,
+    KnowledgeListGroup,
+    KnowledgeListItem,
+    KnowledgeListQuery,
+    KnowledgeListResult,
+    KnowledgeQuery,
+    KnowledgeSearchMode,
+    KnowledgeSearchResult,
+    copy_knowledge_list_query,
+    copy_knowledge_query,
+)
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 from cayu.storage._knowledge_closure import (
@@ -154,17 +167,8 @@ from cayu.storage._knowledge_closure import (
 from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage.memory import (
     KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY,
-    KnowledgeFacet,
-    KnowledgeHit,
-    KnowledgeListGroup,
-    KnowledgeListItem,
-    KnowledgeListQuery,
-    KnowledgeListResult,
     KnowledgePublicationConflict,
     KnowledgePublicationReceipt,
-    KnowledgeQuery,
-    KnowledgeSearchMode,
-    KnowledgeSearchResult,
     KnowledgeStore,
     _activation_receipt_matches,
     _bounded_knowledge_evidence,
@@ -220,9 +224,7 @@ from cayu.storage.memory import (
     _validate_review_approval_scope,
     _validate_revision_append,
     _validate_revision_successor,
-    copy_knowledge_list_query,
     copy_knowledge_publication_receipt,
-    copy_knowledge_query,
     prepare_knowledge_publication,
 )
 from cayu.storage.targets import require_sqlite_store_allowed

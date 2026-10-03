@@ -42255,5 +42255,10 @@
     "tests/core/test_execution_profile_contracts.py::test_legacy_pickled_profile_classes_resolve_to_the_canonical_owner[ModelFailoverProfileBinding]": 0.0001387912780046463,
     "tests/core/test_execution_profile_contracts.py::test_profile_consumers_share_the_canonical_contracts_and_checkpoint_rules": 0.002331207972019911,
     "tests/core/test_execution_profile_contracts.py::test_profile_contracts_and_checkpoint_rules_work_without_runtime_or_stores": 0.14574108296073973,
-    "tests/core/test_execution_profile_contracts.py::test_runtime_decision_attestation_uses_canonical_values_without_copying_authority": 0.043959125177934766
+    "tests/core/test_execution_profile_contracts.py::test_runtime_decision_attestation_uses_canonical_values_without_copying_authority": 0.043959125177934766,
+    "tests/core/test_knowledge_search_contracts.py::test_search_contracts_compose_without_storage_implementations[cayu.knowledge.search]": 0.19,
+    "tests/core/test_knowledge_search_contracts.py::test_search_contracts_compose_without_storage_implementations[cayu.storage]": 0.166,
+    "tests/core/test_knowledge_search_contracts.py::test_search_contracts_compose_without_storage_implementations[cayu]": 0.217,
+    "tests/core/test_knowledge_search_contracts.py::test_search_contracts_preserve_aliases_stubs_and_annotations": 0.14,
+    "tests/core/test_knowledge_search_contracts.py::test_search_values_round_trip_through_canonical_pickle_paths": 0.002
 }

@@ -122,6 +122,7 @@ from cayu.knowledge.records import (
     KnowledgeRevisionConflict,
     KnowledgeVisibility,
 )
+from cayu.knowledge.search import KnowledgeListItem
 from cayu.messages import Message, MessageRole
 from cayu.project_control_plane import ResolvedProjectControlPlaneContext
 from cayu.runtime._binding_cleanup import is_containable_cleanup_error
@@ -355,9 +356,6 @@ from cayu.sessions.invocation import (
 )
 from cayu.sessions.recovery import StartupRecoveryResult
 from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
-from cayu.storage.memory import (
-    KnowledgeListItem,
-)
 from cayu.tasks.base import TaskCreate, TaskOrder, TaskQuery, task_create_with_runtime_invocation
 from cayu.tasks.records import Task, TaskStatus
 from cayu.tasks.scheduling import (

@@ -2877,6 +2877,15 @@ from cayu.knowledge.relations import KnowledgeRelationResult as KnowledgeRelatio
 from cayu.knowledge.relations import prepare_knowledge_relations as prepare_knowledge_relations
 from cayu.knowledge.scopes import KnowledgeAccessDenied as KnowledgeAccessDenied
 from cayu.knowledge.scopes import KnowledgeAccessScope as KnowledgeAccessScope
+from cayu.knowledge.search import KnowledgeFacet as KnowledgeFacet
+from cayu.knowledge.search import KnowledgeHit as KnowledgeHit
+from cayu.knowledge.search import KnowledgeListGroup as KnowledgeListGroup
+from cayu.knowledge.search import KnowledgeListItem as KnowledgeListItem
+from cayu.knowledge.search import KnowledgeListQuery as KnowledgeListQuery
+from cayu.knowledge.search import KnowledgeListResult as KnowledgeListResult
+from cayu.knowledge.search import KnowledgeQuery as KnowledgeQuery
+from cayu.knowledge.search import KnowledgeSearchMode as KnowledgeSearchMode
+from cayu.knowledge.search import KnowledgeSearchResult as KnowledgeSearchResult
 from cayu.knowledge.semantic_watch import (
     MAX_KNOWLEDGE_SEMANTIC_WATCH_ANNOTATION_BYTES as MAX_KNOWLEDGE_SEMANTIC_WATCH_ANNOTATION_BYTES,
 )
@@ -4401,17 +4410,8 @@ from cayu.storage.memory import (
 )
 from cayu.storage.memory import InMemoryEmbeddingKnowledgeStore as InMemoryEmbeddingKnowledgeStore
 from cayu.storage.memory import InMemoryKnowledgeStore as InMemoryKnowledgeStore
-from cayu.storage.memory import KnowledgeFacet as KnowledgeFacet
-from cayu.storage.memory import KnowledgeHit as KnowledgeHit
-from cayu.storage.memory import KnowledgeListGroup as KnowledgeListGroup
-from cayu.storage.memory import KnowledgeListItem as KnowledgeListItem
-from cayu.storage.memory import KnowledgeListQuery as KnowledgeListQuery
-from cayu.storage.memory import KnowledgeListResult as KnowledgeListResult
 from cayu.storage.memory import KnowledgePublicationConflict as KnowledgePublicationConflict
 from cayu.storage.memory import KnowledgePublicationReceipt as KnowledgePublicationReceipt
-from cayu.storage.memory import KnowledgeQuery as KnowledgeQuery
-from cayu.storage.memory import KnowledgeSearchMode as KnowledgeSearchMode
-from cayu.storage.memory import KnowledgeSearchResult as KnowledgeSearchResult
 from cayu.storage.memory import KnowledgeStore as KnowledgeStore
 from cayu.storage.memory import prepare_knowledge_publication as prepare_knowledge_publication
 from cayu.storage.postgres import PostgresAgentWorkContextStore as PostgresAgentWorkContextStore

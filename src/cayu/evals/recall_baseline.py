@@ -24,6 +24,7 @@ from cayu.knowledge.records import (
     KnowledgeStatus,
 )
 from cayu.knowledge.scopes import KnowledgeAccessScope
+from cayu.knowledge.search import KnowledgeListQuery
 from cayu.memory.base import AutomaticRecallPolicy, admit_recall
 from cayu.memory.recall import (
     KNOWLEDGE_LEXICAL_CHANNEL,
@@ -56,7 +57,6 @@ from cayu.sessions.base import (
     SessionStore,
 )
 from cayu.storage.memory import (
-    KnowledgeListQuery,
     KnowledgeStore,
 )
 

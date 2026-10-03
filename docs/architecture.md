@@ -443,9 +443,12 @@ progress, including detached copies, claim fingerprints and deterministic
 validation and initialization. `knowledge/indexing.py` owns embedding identities
 and projections, index readiness and coverage, bounded indexing outcomes, and
 their deterministic construction, copying, fingerprints and transition checks.
+`knowledge/search.py` owns search/list queries, hits, results and facets, with
+detached copies, validation and shared search-term normalization. Ranking,
+access checks and search execution remain with the storage implementations.
 These contracts, application activation policies and the maintenance
-router/planner can be used without loading a storage
-implementation. Memory, SQLite and PostgreSQL stores compose the same contracts
+router/planner can be used without loading a storage implementation.
+Memory, SQLite and PostgreSQL stores compose the same contracts
 with their own access checks and atomic persistence operations.
 The existing `cayu`, `cayu.storage` and `cayu.storage.memory` imports resolve to
 the same canonical types, including persisted legacy pickle class paths.

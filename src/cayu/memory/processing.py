@@ -39,6 +39,7 @@ from cayu.knowledge.scopes import (
     copy_knowledge_access_scope,
     knowledge_access_scope_sha256,
 )
+from cayu.knowledge.search import KnowledgeSearchMode
 from cayu.memory.recall import (
     RECALL_MAX_LINEAGE_BYTES_PER_RECORD,
     RECALL_MAX_LINEAGE_CANDIDATES,
@@ -56,7 +57,6 @@ from cayu.memory.recall import (
 )
 from cayu.memory.retrieval import WeightedReciprocalRankFusionConfig
 from cayu.storage.memory import (
-    KnowledgeSearchMode,
     KnowledgeStore,
 )
 from cayu.work_context import (

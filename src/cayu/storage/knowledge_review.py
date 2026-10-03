@@ -42,9 +42,8 @@ from cayu.knowledge.scopes import (
     KnowledgeAccessScope,
     copy_knowledge_access_scope,
 )
+from cayu.knowledge.search import KnowledgeListQuery, KnowledgeListResult
 from cayu.storage.memory import (
-    KnowledgeListQuery,
-    KnowledgeListResult,
     KnowledgePublicationReceipt,
     _replay_review_approval_from_receipts,
 )
