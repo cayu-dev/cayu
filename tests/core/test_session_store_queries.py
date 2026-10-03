@@ -44,7 +44,7 @@ from cayu.runtime import (
     SessionStatus,
     SessionStore,
 )
-from cayu.runtime import _resume_ledger as resume_ledger
+from cayu.sessions import _tool_call_evidence as tool_call_evidence
 from cayu.sessions.base import (
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
     MAX_SESSION_ID_BYTES,
@@ -351,7 +351,7 @@ def test_pending_tool_start_projection_retains_quarantined_argument_evidence() -
     )
 
     projected = project_pending_action_event_record(EventRecord(sequence=1, event=started)).event
-    ledger = resume_ledger.scan_projected_tool_call_evidence(
+    ledger = tool_call_evidence.scan_projected_tool_call_evidence(
         events=[projected],
         pending_calls=[
             PendingToolCallApproval(

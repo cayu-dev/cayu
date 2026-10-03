@@ -130,7 +130,6 @@ from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _shared_artifact_results as shared_artifact_results
-from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
@@ -247,6 +246,7 @@ from cayu.sessions.base import (
     resolve_interaction_attribution,
     runtime_publication_checkpoint_value_digest,
 )
+from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools._operation_boundary import (
     BoundedInvocationOperationRegistry,
     await_invocation_operation,

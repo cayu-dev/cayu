@@ -32,7 +32,6 @@ from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.events import Event, EventType, copy_event
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
-from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _transcript as transcript_support
 from cayu.runtime._durable_subagents import (
@@ -58,6 +57,7 @@ from cayu.sessions.base import (
     runtime_publication_checkpoint_value_digest,
     runtime_publication_event_reference,
 )
+from cayu.tools import _argument_publication as tool_argument_publication
 
 _TOOL_ROUND_TERMINAL_EVENT_TYPES = frozenset(
     {

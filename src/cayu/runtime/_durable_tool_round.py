@@ -30,7 +30,6 @@ from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _structured_output_tool_round as structured_output_tool_round
-from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_publication as tool_round_publication
@@ -65,6 +64,7 @@ from cayu.runtime._tool_round_staging import (
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.runtime.stop_policy import StopDecision
 from cayu.sessions.base import Session, SessionStatus, SessionStore
+from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools.base import ToolEffect, ToolResult
 from cayu.tools.catalogue import ToolExecutionContract

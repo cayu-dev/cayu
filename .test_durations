@@ -1,4 +1,6 @@
 {
+    "tests/core/test_tool_evidence_boundaries.py::test_tool_evidence_components_work_without_execution_or_stores[arguments]": 0.09851716691628098,
+    "tests/core/test_tool_evidence_boundaries.py::test_tool_evidence_components_work_without_execution_or_stores[evidence]": 0.3146544578485191,
     "tests/core/test_application_agent_registry.py::test_refresh_preserves_registrations_completed_during_discovery_publication[False]": 0.01,
     "tests/core/test_application_agent_registry.py::test_refresh_preserves_registrations_completed_during_discovery_publication[True]": 0.012,
     "tests/core/test_application_agent_registry.py::test_agent_registry_composes_without_application_controllers": 1.232,

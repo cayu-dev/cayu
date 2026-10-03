@@ -29,7 +29,6 @@ from cayu.events import (
     event_with_runtime_payload_authority,
 )
 from cayu.runtime import _runtime_records as runtime_records
-from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime.execution_units import (
@@ -39,6 +38,7 @@ from cayu.runtime.execution_units import (
     copy_tool_round_identity,
 )
 from cayu.sessions.base import RuntimePublicationRequest, Session
+from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools.base import ToolResult
 from cayu.vaults.redaction import SecretRedactor
 

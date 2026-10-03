@@ -28,10 +28,10 @@ from cayu.approvals.user_input import (
 )
 from cayu.events import Event, EventType
 from cayu.runtime import _approval_support as approval_support
-from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._event_projection import private_event_linkage_value
 from cayu.runtime.execution_units import ToolRoundIdentity
+from cayu.sessions import _tool_call_evidence as tool_call_evidence
 from cayu.sessions.base import (
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
     MAX_PENDING_ACTION_RESULT_BYTES,
@@ -85,7 +85,7 @@ _PENDING_ACTION_EVENT_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
             "tool_name",
             "approval",
             "user_input",
-            resume_ledger.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY,
+            tool_call_evidence.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY,
         }
     )
     | _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
@@ -111,7 +111,7 @@ _PENDING_ACTION_EVENT_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "session.failed": frozenset(
         {
             "tool_call_id",
-            resume_ledger.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY,
+            tool_call_evidence.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY,
         }
     )
     | _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
@@ -981,9 +981,9 @@ def _pending_tool_round_checkpoint_call(
 def _pending_tool_round_evidence(
     records_desc: list[EventRecord],
     pending_round: tool_round_recovery.PendingToolRound,
-) -> resume_ledger.ToolCallEvidenceLedger:
+) -> tool_call_evidence.ToolCallEvidenceLedger:
     identity = tool_round_recovery.pending_tool_round_identity(pending_round)
-    return resume_ledger.scan_projected_tool_call_evidence(
+    return tool_call_evidence.scan_projected_tool_call_evidence(
         events=(record.event for record in reversed(records_desc)),
         pending_calls=pending_round.tool_calls,
         in_scope=lambda event: identity.matches_payload(event.payload),
@@ -1358,7 +1358,7 @@ def pending_action_source_is_invalid(
     if not checkpoint_has_pending_action_candidate(checkpoint):
         return False
     if any(
-        record.event.payload.get(resume_ledger.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY) is True
+        record.event.payload.get(tool_call_evidence.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY) is True
         for record in records_desc
     ):
         return True

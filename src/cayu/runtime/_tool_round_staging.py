@@ -44,7 +44,6 @@ from cayu.observability.hooks import RuntimeHookPhase, _runtime_hook_supports_ph
 from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _shared_artifact_results as shared_artifact_results
-from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _web_access_results as web_access_results
@@ -60,6 +59,7 @@ from cayu.runtime._tool_effect_state import (
 )
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.sessions.base import Session, SessionStore, runtime_publication_checkpoint_mutation
+from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools.base import ToolResult, _bound_policy_denial_result, _bound_policy_denial_text
 from cayu.tools.catalogue import ToolExecutionContract
 from cayu.tools.exposure import ResolvedToolExposureAuthority, copy_resolved_tool_exposure_authority

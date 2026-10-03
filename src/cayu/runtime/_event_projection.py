@@ -34,7 +34,6 @@ from cayu.events import (
 from cayu.providers._credential_boundary import copy_provider_cancellation_failures
 from cayu.providers.base import ModelFinishReason
 from cayu.providers.operations import ProviderOperationStatus
-from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime._shared_artifact_results import (
     SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD,
@@ -60,6 +59,7 @@ from cayu.runtime.public_authority import (
     parse_public_authority_alias,
 )
 from cayu.runtime.retry_policy import RetryDecision, RetryDisposition, RetryReason, RetrySuppression
+from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools.base import (
     _COMMAND_POLICY_DENIAL_SOURCE,
     _POLICY_DENIAL_TRUNCATION_MARKER,

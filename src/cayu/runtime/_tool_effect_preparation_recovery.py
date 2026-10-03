@@ -14,7 +14,6 @@ from cayu.execution_profiles import (
 )
 from cayu.runtime._approval_support import tool_call_request_from_pending
 from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime._tool_argument_publication import unavailable_argument_projection
 from cayu.runtime._tool_effect_state import (
     ToolEffectRecord,
     ToolEffectStateOwner,
@@ -29,6 +28,7 @@ from cayu.runtime._tool_round_staging import _event_with_tool_round_authority
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.tool_effects import ToolEffectConflict
 from cayu.sessions.base import Session, SessionStore
+from cayu.tools._argument_publication import unavailable_argument_projection
 from cayu.tools.base import ToolResult
 
 

@@ -601,6 +601,7 @@ from cayu.runtime.tool_completion import (
 from cayu.runtime.work_attempt_semantics import WorkAttemptRunSemantics
 from cayu.runtime.work_attempt_source import WorkAttemptSourceRequest, work_attempt_source_digest
 from cayu.sessions import _model_completion_publication as model_completion_publication
+from cayu.sessions import _tool_call_evidence as tool_call_evidence
 from cayu.sessions._execution_profile_checkpoint import (
     EXECUTION_PROFILE_METADATA_KEY,
     ActiveInvocationExecutionProfile,
@@ -27498,7 +27499,7 @@ class SessionEngine:
                         )
                     )
                 if isinstance(error, resume_ledger.ToolCallEvidenceConflict):
-                    failure_payload[resume_ledger.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY] = True
+                    failure_payload[tool_call_evidence.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY] = True
                 compaction_failure = automatic_compaction_failure_payload(
                     error, redactor=self._secret_redactor
                 )

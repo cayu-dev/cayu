@@ -175,7 +175,6 @@ from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _structured_output_tool_round as structured_output_tool_round
-from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
@@ -386,6 +385,7 @@ from cayu.runtime.tool_effects import (
     tool_effect_receipt_digest,
 )
 from cayu.sessions import _model_completion_publication as model_completion_publication
+from cayu.sessions import _tool_call_evidence as tool_call_evidence
 from cayu.sessions._durable_operation_ownership import DurableOperationOwnership
 from cayu.sessions._execution_profile_checkpoint import (
     EXECUTION_PROFILE_METADATA_KEY,
@@ -499,6 +499,7 @@ from cayu.tasks.dispatch import (
     _task_matches_queued_dispatch,
 )
 from cayu.tasks.records import Task, TaskStatus, copy_task
+from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools._operation_boundary import BoundedInvocationOperationRegistry
 from cayu.tools._runner import durable_runner_receipt_observer, durable_runner_recovery_authority
 from cayu.tools.base import (
@@ -9666,7 +9667,7 @@ class RecoveryCoordinator:
                         payload["tool_call_id"] = exc.tool_call_id
                         payload["tool_name"] = exc.tool_name
                     if isinstance(exc, resume_ledger.ToolCallEvidenceConflict):
-                        payload[resume_ledger.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY] = True
+                        payload[tool_call_evidence.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY] = True
                 session = await self._session_store.update_status(
                     session.id, SessionStatus.INTERRUPTED
                 )
@@ -11074,7 +11075,7 @@ class RecoveryCoordinator:
                                 ),
                                 **(
                                     {
-                                        resume_ledger.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY: True,
+                                        tool_call_evidence.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY: True,
                                     }
                                     if isinstance(exc, resume_ledger.ToolCallEvidenceConflict)
                                     else {}

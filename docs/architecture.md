@@ -351,6 +351,15 @@ single composition root.
 
 ### Session checkpoint evidence
 
+`sessions/_tool_call_evidence.py` owns the shared event scan used by pending-action
+queries and runtime recovery. It matches pending calls, classifies starts and
+terminal evidence, and detects conflicting or manually reconciled history.
+Callers supply scope predicates and terminal validation; runtime retains outcome
+reconstruction and recovery decisions. `tools/_argument_publication.py` owns the
+argument quarantine and projection rules shared by this scan, approval records,
+runtime publication and evaluation replay. Both components work without session
+stores or execution owners.
+
 `sessions/checkpoints.py` owns root checkpoint decoding and schema migrations.
 The adjacent private modules `_model_completion_publication`, `_terminal_evidence`,
 `_invocation_terminal_decision`, and `_provider_operation_cancellation_claim` own

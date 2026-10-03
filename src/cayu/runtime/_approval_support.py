@@ -33,7 +33,6 @@ from cayu.events import (
 )
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
-from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
@@ -43,6 +42,7 @@ from cayu.sessions.base import (
     SessionStore,
     runtime_publication_checkpoint_value_digest,
 )
+from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools.base import ToolResult
 from cayu.tools.policy import ToolPolicyDecision, ToolPolicyResult
 from cayu.vaults.redaction import SecretRedactor, contains_redacted_secret

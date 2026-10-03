@@ -69,7 +69,6 @@ from cayu.providers.base import (
     ProviderOperationMode,
 )
 from cayu.runtime import _runtime_records as runtime_records
-from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime._runtime_replay_profile import bind_runtime_replay_profile_source
 from cayu.runtime._tool_identity import tool_idempotency_key
 from cayu.sessions._execution_profile_checkpoint import (
@@ -83,6 +82,7 @@ from cayu.sessions.base import (
     session_input_messages_sha256,
     session_user_metadata,
 )
+from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.exposure import (
     AllRegisteredToolsExposurePolicy,

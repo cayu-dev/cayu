@@ -42,11 +42,11 @@ from cayu.runtime._run_limit_accounting import (
     RunLimitAccountingContext,
     has_run_limit_accounting_authority,
 )
-from cayu.runtime._tool_argument_publication import pause_checkpoint_validation_view
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
+from cayu.tools._argument_publication import pause_checkpoint_validation_view
 from cayu.tools.grants import (
     TARGETED_TOOL_DIGEST_PATTERN,
     TARGETED_TOOL_TRANSCRIPT_REFERENCE,
