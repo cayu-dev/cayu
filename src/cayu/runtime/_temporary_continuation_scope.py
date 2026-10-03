@@ -36,8 +36,8 @@ def temporary_admission_scope(
     require_temporary_service_command(admission, command)
     token = _ADMISSION.set(admission)
     try:
-        from cayu.runtime._temporary_service_target import target_service_key
         from cayu.sessions._session_continuation import CONTINUATION_NAMESPACE_KEY
+        from cayu.sessions._temporary_service_target import target_service_key
 
         if admission.dispatch.intent.mode == "side_session":
             with service_publication_scope(

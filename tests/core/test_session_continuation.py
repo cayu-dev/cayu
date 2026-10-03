@@ -1820,7 +1820,7 @@ async def _test_continuation_admission_uses_typed_lifecycle_boundary(
                 )
                 assert pending is not None and pending.consumption is not None
                 assert pending.consumption.receipt_stage == "prepared"
-                from cayu.runtime._session_continuation_store import ROOT_KEY
+                from cayu.sessions._session_continuation_store import ROOT_KEY
                 from cayu.sessions.base import _invocation_lifecycle_authority_read_scope
 
                 def generic_read(_session, current):
@@ -2153,7 +2153,7 @@ async def _test_continuation_admission_uses_typed_lifecycle_boundary(
                 )
                 with pytest.raises(ContinuationConflict):
                     await owner.admit(changed_consumption, changed_command, invocation=invocation)
-                from cayu.runtime._session_continuation_store import require_history
+                from cayu.sessions._session_continuation_store import require_history
 
                 try:
                     require_history(retained)

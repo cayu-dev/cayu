@@ -22,7 +22,7 @@ from cayu.runtime._session_continuation import (
 )
 from cayu.runtime._session_continuation_scope import authenticated_latch_scope
 from cayu.runtime._temporary_continuation import TemporaryServiceRecord, temporary_service_key
-from cayu.runtime._temporary_continuation_store import require_service_deadline
+from cayu.sessions._temporary_continuation_store import require_service_deadline
 from cayu.sessions.base import InMemorySessionStore, RunRequest
 
 
@@ -207,7 +207,7 @@ def test_erasure_collects_children_beyond_ticket_only_bound(store_factory):
     from cayu.collaboration._permits import ReceivingSettlementReceipt
     from cayu.runtime._session_continuation import ContinuationRetirement
     from cayu.runtime._session_continuation_owner import LATCH_FAMILY, SessionContinuationOwner
-    from cayu.runtime._session_continuation_store import MAX_RETAINED_TICKETS
+    from cayu.sessions._session_continuation_store import MAX_RETAINED_TICKETS
     from cayu.vaults.redaction import SecretRedactor
 
     async def run(store):

@@ -17,7 +17,7 @@ from cayu.collaboration._permits import ReceivingSettlementReceipt
 from cayu.messages import Message
 from cayu.runtime._session_continuation import ContinuationConflict, continuation_digest
 from cayu.runtime._temporary_continuation import TemporaryServiceExecution, TemporaryServiceRecord
-from cayu.runtime._temporary_service_target import (
+from cayu.sessions._temporary_service_target import (
     TemporaryServiceTarget,
     acknowledge_side_target,
     exclude_side_target,

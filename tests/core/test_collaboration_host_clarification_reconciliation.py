@@ -32,8 +32,8 @@ async def test_host_clarification_ack_loss_drains_exact_return(
         )
 
         from cayu.collaboration import _host as host_adapter
-        from cayu.runtime import _session_continuation_store as native_store
         from cayu.runtime._temporary_continuation import temporary_service_key
+        from cayu.sessions import _session_continuation_store as native_store
 
         original = app._clarification_coordinator._service_owned
         primary = ExceptionGroup("clarification acknowledgement lost", [OSError("lost ack")])

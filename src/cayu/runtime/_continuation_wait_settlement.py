@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from cayu.runtime._session_continuation_store import require_history
 from cayu.sessions._session_continuation import (
     ContinuationConflict,
     ContinuationRecord,
     continuation_digest,
     continuation_operation_key,
 )
+from cayu.sessions._session_continuation_store import require_history
 from cayu.sessions.base import SessionOperationPublication
 
 if TYPE_CHECKING:

@@ -1,7 +1,6 @@
 """Restrict native recovery to an authenticated consumed-ticket invocation."""
 
 from cayu.collaboration._preparation import prepare_contract
-from cayu.runtime._session_continuation_store import ROOT_KEY, ContinuationRoot
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
@@ -12,6 +11,7 @@ from cayu.sessions._invocation_lifecycle import (
     reconcile_invocation_admission_from_state,
     require_invocation_rebind_lineage,
 )
+from cayu.sessions._session_continuation_store import ROOT_KEY, ContinuationRoot
 from cayu.vaults.redaction import SecretRedactor
 
 

@@ -389,7 +389,7 @@ def test_latch_winner_prevents_native_service_admission_atomically(store_factory
 
 
 def test_service_admission_failure_rolls_back_invocation_and_owner(store_factory, monkeypatch):
-    from cayu.runtime import _temporary_continuation_store as owner
+    from cayu.sessions import _temporary_continuation_store as owner
 
     async def run(store):
         admission, command = await native_command(store)
@@ -425,7 +425,7 @@ def test_service_admission_failure_rolls_back_invocation_and_owner(store_factory
 def test_admission_commit_is_recoverable_after_observer_interruption(
     store_factory, interruption, monkeypatch
 ):
-    from cayu.runtime._session_continuation_store import pending_admission_receipt_identities
+    from cayu.sessions._session_continuation_store import pending_admission_receipt_identities
 
     async def run(store):
         admission, command = await native_command(store)
@@ -492,8 +492,8 @@ def test_native_release_returns_service_and_preserves_original_latch(store_facto
     from tests.core._execution_profile_fixtures import interrupt_and_release_test_invocation
 
     from cayu.collaboration._contracts import ExactMatch, ExactUnavailable
-    from cayu.runtime._session_continuation_store import pending_admission_receipt_identities
     from cayu.runtime._temporary_continuation_permits import TemporaryServiceSettlementReader
+    from cayu.sessions._session_continuation_store import pending_admission_receipt_identities
     from cayu.vaults.redaction import SecretRedactor
 
     async def run(store):

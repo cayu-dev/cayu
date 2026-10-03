@@ -47,7 +47,7 @@ from cayu.collaboration._session_export_store import (
 )
 from cayu.events import Event, EventType
 from cayu.messages import Message
-from cayu.runtime._session_continuation_store import (
+from cayu.sessions._session_continuation_store import (
     import_history_checkpoint as import_continuation_history_checkpoint,
 )
 from cayu.sessions.base import (

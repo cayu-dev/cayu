@@ -5065,10 +5065,10 @@ def _replace_checkpoint_preserving_completion_result_event_publications(
     """Replace caller state while retaining decoded runtime-owned checkpoint authority."""
 
     from cayu.collaboration import _session_export_store as session_exports
+    from cayu.sessions import _producer_checkpoint as producers
 
     # Validate before decoding can normalize caller-controlled authority.
-    from cayu.runtime import _session_continuation_store as continuations
-    from cayu.sessions import _producer_checkpoint as producers
+    from cayu.sessions import _session_continuation_store as continuations
 
     producer_root = producers.project_checkpoint_root(current, replacement, session_id=session_id)
     continuation_root = (
@@ -5206,8 +5206,8 @@ def _copy_checkpoint_for_transform(
     """Validate and detach callback-visible state from store-owned authority."""
 
     from cayu.collaboration import _session_export_store as session_exports
-    from cayu.runtime import _session_continuation_store as continuations
     from cayu.sessions import _producer_checkpoint as producers
+    from cayu.sessions import _session_continuation_store as continuations
 
     if checkpoint is None:
         return None
@@ -12413,8 +12413,8 @@ class SessionStore(ABC):
         events: list[Event],
     ) -> Session:
         """Enclose only a session-owned transform, never a receiving callback."""
-        from cayu.runtime._session_continuation_store import index_publication
         from cayu.sessions._session_continuation_scope import publication_scope
+        from cayu.sessions._session_continuation_store import index_publication
 
         def indexed_transform(session, checkpoint, current):
             publication = operation_transform(session, checkpoint, current)
@@ -12441,10 +12441,6 @@ class SessionStore(ABC):
         before calling it; it cannot wrap foreign callbacks in publication scope.
         """
         from cayu.collaboration._preparation import prepare_contract
-        from cayu.runtime._temporary_continuation_store import (
-            publish_service_record,
-            require_service_deadline,
-        )
         from cayu.sessions._session_continuation import (
             ContinuationUnavailable,
             continuation_operation_key,
@@ -12453,6 +12449,10 @@ class SessionStore(ABC):
         from cayu.sessions._temporary_continuation import (
             TemporaryServiceRecord,
             temporary_service_key,
+        )
+        from cayu.sessions._temporary_continuation_store import (
+            publish_service_record,
+            require_service_deadline,
         )
         from cayu.vaults.redaction import SecretRedactor
 
@@ -12503,16 +12503,16 @@ class SessionStore(ABC):
     async def _publish_temporary_service_target(self, *, previous, proposed):
         """Private registered-owner compare under the target's native transaction."""
         from cayu.collaboration._preparation import prepare_contract
-        from cayu.runtime._temporary_service_target import (
-            TemporaryServiceTarget,
-            publish_target_record,
-            target_service_key,
-        )
         from cayu.sessions._session_continuation import (
             CONTINUATION_NAMESPACE_KEY,
             ContinuationUnavailable,
         )
         from cayu.sessions._session_continuation_scope import service_publication_scope
+        from cayu.sessions._temporary_service_target import (
+            TemporaryServiceTarget,
+            publish_target_record,
+            target_service_key,
+        )
         from cayu.vaults.redaction import SecretRedactor
 
         proposed = prepare_contract(TemporaryServiceTarget, proposed, redactor=SecretRedactor())
@@ -12558,20 +12558,20 @@ class SessionStore(ABC):
     async def _load_temporary_service_target(self, expected):
         """Read an exact indexed target, retaining ambiguity across concurrent changes."""
         from cayu.collaboration._preparation import prepare_contract
-        from cayu.runtime._session_continuation_store import ROOT_KEY, ContinuationRoot
-        from cayu.runtime._temporary_service_target import (
-            TemporaryServiceTarget,
-            target_reference,
-            target_service_key,
-        )
         from cayu.sessions._session_continuation import (
             ContinuationConflict,
             ContinuationUnavailable,
         )
         from cayu.sessions._session_continuation_scope import publication_scope
+        from cayu.sessions._session_continuation_store import ROOT_KEY, ContinuationRoot
         from cayu.sessions._temporary_continuation import (
             TemporaryServiceAdmission,
             TemporaryServicePreparation,
+        )
+        from cayu.sessions._temporary_service_target import (
+            TemporaryServiceTarget,
+            target_reference,
+            target_service_key,
         )
         from cayu.vaults.redaction import SecretRedactor
 
@@ -12683,9 +12683,9 @@ class SessionStore(ABC):
     ) -> TemporaryServiceRecord | None:
         """Read exact native admission/release; absence never proves exclusion."""
         from cayu.collaboration._preparation import prepare_contract
-        from cayu.runtime._temporary_continuation_store import native_service_outcome
         from cayu.sessions._session_continuation import ContinuationUnavailable
         from cayu.sessions._temporary_continuation import TemporaryServiceAdmission
+        from cayu.sessions._temporary_continuation_store import native_service_outcome
         from cayu.vaults.redaction import SecretRedactor
 
         expected = prepare_contract(TemporaryServiceAdmission, expected, redactor=SecretRedactor())
@@ -12725,7 +12725,7 @@ class SessionStore(ABC):
                 raise ContinuationUnavailable("Side-session receiving fence is unavailable.")
         if previous.state in {"returned", "excluded"}:
             if target_record is not None:
-                from cayu.runtime._temporary_service_target import acknowledge_side_target
+                from cayu.sessions._temporary_service_target import acknowledge_side_target
 
                 await self._publish_temporary_service_target(
                     previous=target_record,
@@ -12740,7 +12740,7 @@ class SessionStore(ABC):
                 )
             return previous
         if target_record is not None and observed.state == "returned":
-            from cayu.runtime._temporary_service_target import return_side_target
+            from cayu.sessions._temporary_service_target import return_side_target
 
             target_record = await self._publish_temporary_service_target(
                 previous=target_record,
@@ -12752,7 +12752,7 @@ class SessionStore(ABC):
             previous=previous, proposed=observed
         )
         if target_record is not None and settled.state == "returned":
-            from cayu.runtime._temporary_service_target import acknowledge_side_target
+            from cayu.sessions._temporary_service_target import acknowledge_side_target
 
             await self._publish_temporary_service_target(
                 previous=target_record,
@@ -12836,7 +12836,7 @@ class SessionStore(ABC):
         )
 
         require_preparation(command)
-        from cayu.runtime._session_continuation_store import require_reserved_capacity
+        from cayu.sessions._session_continuation_store import require_reserved_capacity
 
         require_reserved_capacity(command)
         ticket = command.intent
@@ -12980,7 +12980,7 @@ class SessionStore(ABC):
         if raw is None:
             return None
         record = ContinuationRecord.model_validate(raw)
-        from cayu.runtime._session_continuation_store import require_history
+        from cayu.sessions._session_continuation_store import require_history
 
         require_history(record)
         if (
@@ -13638,7 +13638,7 @@ class SessionStore(ABC):
                 raise ContinuationConflict("Temporary service must settle before retirement.")
             released_evidence = record.released_retirement
             if isinstance(retirement_authority, ContinuationReleasedRetirement):
-                from cayu.runtime._session_continuation_store import (
+                from cayu.sessions._session_continuation_store import (
                     require_released_wait_invocation,
                 )
 
@@ -18904,8 +18904,8 @@ class InMemorySessionStore(MemorySessionExecutionMixin, MemoryCreationFenceMixin
     def _require_session_erasure_quiescence_unlocked(self, session: Session) -> None:
         """Shared admission for closure and final deletion; no mutations."""
         from cayu.collaboration import _session_export_store as session_exports
-        from cayu.runtime import _session_continuation_store as continuations
         from cayu.runtime._session_closure_records import require_terminal_protected_effect
+        from cayu.sessions import _session_continuation_store as continuations
 
         session_id = session.id
         continuations.require_erasure_quiescence(
@@ -19743,16 +19743,16 @@ class InMemorySessionStore(MemorySessionExecutionMixin, MemoryCreationFenceMixin
                 )
             temporary_records: dict[str, dict[str, Any]] = {}
             if temporary_service_admission is not None:
-                from cayu.runtime._temporary_continuation_store import (
-                    compose_temporary_service_admission,
-                )
                 from cayu.sessions._session_continuation import continuation_operation_key
                 from cayu.sessions._temporary_continuation import temporary_service_key
+                from cayu.sessions._temporary_continuation_store import (
+                    compose_temporary_service_admission,
+                )
 
                 parent_key = continuation_operation_key(
                     temporary_service_admission.dispatch.intent.ticket
                 )
-                from cayu.runtime._temporary_service_target import target_service_key
+                from cayu.sessions._temporary_service_target import target_service_key
 
                 intent = temporary_service_admission.dispatch.intent
                 child_key = (
@@ -23270,7 +23270,7 @@ class InMemorySessionStore(MemorySessionExecutionMixin, MemoryCreationFenceMixin
         )
 
     async def _prepare_temporary_side_service(self, preparation):
-        from cayu.runtime._side_service_preparation import (
+        from cayu.sessions._side_service_preparation import (
             SidePreparationSnapshot,
             plan_preparation,
             preparation_record_keys,
@@ -23381,8 +23381,8 @@ class InMemorySessionStore(MemorySessionExecutionMixin, MemoryCreationFenceMixin
                 idempotency_key
             )
             from cayu.collaboration import _session_export_store as session_exports
-            from cayu.runtime import _session_continuation_store as continuations
             from cayu.sessions import _producer_checkpoint as producers
+            from cayu.sessions import _session_continuation_store as continuations
 
             callback_session = session.model_copy(deep=True)
             callback_checkpoint = (

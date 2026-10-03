@@ -513,7 +513,7 @@ async def test_host_discovers_and_recovers_public_park_after_reopen(
             assert len(provider.requests) == 2
         if not cancel_observer and not disable_before_reconcile:
             from cayu import ContinuationRecoveryExpectation
-            from cayu.runtime._session_continuation_store import digest
+            from cayu.sessions._session_continuation_store import digest
             from cayu.sessions.recovery import RecoveryPlanRequest, RecoveryPlanSelection
 
             consumption = consumed.consumption

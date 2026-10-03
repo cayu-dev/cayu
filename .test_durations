@@ -1,4 +1,8 @@
 {
+    "tests/core/test_continuation_persistence_boundaries.py::test_persistence_records_and_projection_work_without_runtime_or_backends[_session_continuation_store]": 0.502,
+    "tests/core/test_continuation_persistence_boundaries.py::test_persistence_records_and_projection_work_without_runtime_or_backends[_temporary_continuation_store]": 0.486,
+    "tests/core/test_continuation_persistence_boundaries.py::test_persistence_records_and_projection_work_without_runtime_or_backends[_temporary_service_target]": 0.476,
+    "tests/core/test_continuation_persistence_boundaries.py::test_persistence_records_and_projection_work_without_runtime_or_backends[_side_service_preparation]": 0.475,
     "tests/core/test_knowledge_access_rules.py::test_access_rule_legacy_imports_pickles_and_annotations_remain_compatible": 0.022,
     "tests/core/test_knowledge_access_rules.py::test_access_snapshots_copy_inputs_and_preserve_json_and_pickle_round_trips": 0.002,
     "tests/core/test_knowledge_access_rules.py::test_activation_history_requires_current_or_explicit_retirement_authority": 0.001,

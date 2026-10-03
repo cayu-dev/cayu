@@ -9,7 +9,7 @@ from cayu.collaboration.peer_content import (
 
 def parked_delivery_key(checkpoint, *, session_id: str, instance_id: str):
     """Select a native waiting owner, never infer permission from interruption."""
-    from cayu.runtime._session_continuation_store import ROOT_KEY, ContinuationRoot
+    from cayu.sessions._session_continuation_store import ROOT_KEY, ContinuationRoot
     from cayu.sessions.checkpoints import decode_runtime_checkpoint
 
     checkpoint = decode_runtime_checkpoint(checkpoint, session_id=session_id)
@@ -36,7 +36,6 @@ def permits_parked_delivery_append(
     Neither grants execution or bypasses ordinary peer disclosure authority.
     """
     from cayu.collaboration.peer_content import PeerContentUnavailable
-    from cayu.runtime._session_continuation_store import ROOT_KEY, ContinuationRoot
     from cayu.sessions._invocation_lifecycle import (
         _invocation_lifecycle_receipt_from_checkpoint,
     )
@@ -46,6 +45,7 @@ def permits_parked_delivery_append(
         continuation_operation_key,
         require_record_writer_generation,
     )
+    from cayu.sessions._session_continuation_store import ROOT_KEY, ContinuationRoot
     from cayu.sessions.base import PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY
     from cayu.sessions.checkpoints import decode_runtime_checkpoint
 

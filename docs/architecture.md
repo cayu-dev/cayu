@@ -398,6 +398,16 @@ current-writer checks inside the native publication boundary. The shared module
 keeps a type-only reference to that runtime context; it does not construct one.
 Nested scopes, task context and cancellation preserve their existing lifetimes.
 
+Continuation persistence rules live alongside those contracts in
+`sessions/_session_continuation_store.py`, `_temporary_continuation_store.py`,
+`_temporary_service_target.py` and `_side_service_preparation.py`. They own the
+bounded checkpoint index, record/history comparisons, native receipt projection,
+and preparation of source/receiving-session updates. Each component remains
+independently importable from its session module.
+Native stores invoke these rules inside their existing lock or transaction.
+Joint preparation validates both sessions before either update is applied;
+runtime dispatch and collaboration permit registration retain their own owners.
+
 ## Multi-Agent Shape
 
 Cayu must support systems where multiple agents collaborate through shared state.

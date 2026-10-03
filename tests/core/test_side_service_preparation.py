@@ -13,7 +13,7 @@ from cayu.runtime._temporary_continuation import (
     TemporaryServiceRecord,
     temporary_service_invocation_id,
 )
-from cayu.runtime._temporary_service_target import MAX_TARGET_SERVICES, TemporaryServiceTarget
+from cayu.sessions._temporary_service_target import MAX_TARGET_SERVICES, TemporaryServiceTarget
 from cayu.sessions.base import InMemorySessionStore
 
 
@@ -183,7 +183,7 @@ def test_two_store_preparation_replay(store_factory):
 
 def test_second_preparation_failure_has_no_partial_write(store_factory, monkeypatch):
     async def run(store):
-        from cayu.runtime import _temporary_service_target
+        from cayu.sessions import _temporary_service_target
 
         admission, _ = await native_command(store, side_session=True)
         preparation = admission.preparation

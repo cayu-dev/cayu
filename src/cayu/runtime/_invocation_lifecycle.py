@@ -972,7 +972,7 @@ def checkpoint_with_invocation_lifecycle_receipt(
                     "Invocation release conflicts with its retained receipt capacity."
                 )
         release_capacity_command_identity = None
-    from cayu.runtime._session_continuation_store import pending_admission_receipt_identities
+    from cayu.sessions._session_continuation_store import pending_admission_receipt_identities
 
     pending_admissions = pending_admission_receipt_identities(result_session, updated)
     compacted_receipts = _compact_invocation_lifecycle_receipts(
@@ -1087,8 +1087,8 @@ def invocation_checkpoint_state_sha256(
     if checkpoint is not None:
         checkpoint = copy_durable_json_object(checkpoint, "invocation lifecycle checkpoint")
         from cayu.collaboration._session_export_store import ROOT_KEY as EXPORT_ROOT_KEY
-        from cayu.runtime._session_continuation_store import ROOT_KEY
         from cayu.sessions._producer_checkpoint import ROOT_KEY as PRODUCER_ROOT_KEY
+        from cayu.sessions._session_continuation_store import ROOT_KEY
 
         checkpoint.pop(ROOT_KEY, None)
         # Export ownership is projected separately by native stores and is not
@@ -1285,7 +1285,7 @@ async def apply_invocation_lifecycle_command(
 
         def admit_checkpoint(session: Session, checkpoint: dict[str, Any] | None, now: datetime):
             from cayu.runtime._producer_output_store import require_native_admission
-            from cayu.runtime._session_continuation_store import require_admission_claim
+            from cayu.sessions._session_continuation_store import require_admission_claim
 
             require_native_admission(checkpoint, copied, now=now)
             require_admission_claim(session, checkpoint, copied)

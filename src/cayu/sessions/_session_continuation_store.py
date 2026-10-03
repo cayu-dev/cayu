@@ -9,10 +9,6 @@ from pydantic import Field, StrictInt, StrictStr, model_validator
 
 from cayu._validation import canonical_durable_json_bytes
 from cayu.collaboration._contracts import MAX_ENVELOPE_BYTES, ContractValue
-from cayu.runtime._temporary_service_target import (
-    MAX_TARGET_SERVICES,
-    TemporaryServiceTargetReference,
-)
 from cayu.sessions._session_continuation import (
     CONTINUATION_MAX_CONSUMPTION_EVIDENCE_BYTES,
     CONTINUATION_MAX_EVENT_BYTES,
@@ -36,6 +32,10 @@ from cayu.sessions._session_continuation import (
 from cayu.sessions._session_continuation_scope import (
     continuation_authority_visible,
     current_publication_key,
+)
+from cayu.sessions._temporary_service_target import (
+    MAX_TARGET_SERVICES,
+    TemporaryServiceTargetReference,
 )
 
 if TYPE_CHECKING:
@@ -598,7 +598,7 @@ def require_erasure_quiescence(*, session: Session, checkpoint, records: dict[st
     if owned.pop(CONTINUATION_NAMESPACE_KEY, None) != namespace.model_dump(mode="json"):
         raise ContinuationConflict("Continuation namespace evidence is unavailable.")
     expected_keys = {entry.ticket_key for entry in root.entries}
-    from cayu.runtime._temporary_service_target import TemporaryServiceTarget, target_reference
+    from cayu.sessions._temporary_service_target import TemporaryServiceTarget, target_reference
 
     for reference in root.target_services:
         expected_keys.add(reference.key)

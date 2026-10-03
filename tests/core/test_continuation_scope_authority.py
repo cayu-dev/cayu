@@ -27,7 +27,6 @@ from tests.core.test_temporary_continuation_contracts import admission
 import cayu
 from cayu.runtime import _session_continuation_scope as runtime
 from cayu.runtime import _temporary_continuation_scope as temporary_runtime
-from cayu.runtime._temporary_service_target import target_service_key
 from cayu.sessions import _session_continuation_scope as shared
 from cayu.sessions import _temporary_continuation_scope as temporary_shared
 from cayu.sessions._session_continuation import (
@@ -37,6 +36,7 @@ from cayu.sessions._session_continuation import (
     continuation_operation_key,
 )
 from cayu.sessions._temporary_continuation import temporary_service_key
+from cayu.sessions._temporary_service_target import target_service_key
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.base import InMemorySessionStore
 

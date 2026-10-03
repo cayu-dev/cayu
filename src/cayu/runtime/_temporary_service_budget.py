@@ -14,9 +14,6 @@ from cayu.runtime._checkpoint_store import (
     load_runtime_session_checkpoint_snapshot,
     runtime_checkpoint_session_store,
 )
-from cayu.runtime._session_continuation_store import ROOT_KEY, ContinuationRoot
-from cayu.runtime._temporary_continuation_store import native_service_execution
-from cayu.runtime._temporary_service_target import TARGET_PREFIX, TemporaryServiceTarget
 from cayu.sessions._invocation_lifecycle import (
     _invocation_lifecycle_receipt_from_checkpoint,
 )
@@ -25,11 +22,14 @@ from cayu.sessions._session_continuation import (
     ContinuationConflict,
     continuation_digest,
 )
+from cayu.sessions._session_continuation_store import ROOT_KEY, ContinuationRoot
 from cayu.sessions._temporary_continuation import (
     TemporaryServiceAdmission,
     TemporaryServiceIntent,
     TemporaryServiceRecord,
 )
+from cayu.sessions._temporary_continuation_store import native_service_execution
+from cayu.sessions._temporary_service_target import TARGET_PREFIX, TemporaryServiceTarget
 from cayu.sessions.base import SessionStore
 from cayu.vaults.redaction import SecretRedactor
 

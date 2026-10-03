@@ -36,12 +36,12 @@ from cayu.vaults.redaction import SecretRedactor
 
 def test_retained_record_collection_includes_source_and_target_children():
     from cayu.runtime._session_continuation import CONTINUATION_MAX_SERVICES
-    from cayu.runtime._session_continuation_store import (
+    from cayu.sessions._session_continuation_store import (
         MAX_RETAINED_CONTINUATION_RECORDS,
         MAX_RETAINED_TICKETS,
         collect_retained_record,
     )
-    from cayu.runtime._temporary_service_target import MAX_TARGET_SERVICES
+    from cayu.sessions._temporary_service_target import MAX_TARGET_SERVICES
 
     keys = ["namespace"]
     for ticket in range(MAX_RETAINED_TICKETS):

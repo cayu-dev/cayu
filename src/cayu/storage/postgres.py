@@ -30418,8 +30418,8 @@ class PostgresSessionStore(
         """Shared admission for closure and final deletion; no mutations."""
         from cayu._validation import DURABLE_DOCUMENT_LIMITS
         from cayu.collaboration import _session_export_store as session_exports
-        from cayu.runtime import _session_continuation_store as continuations
         from cayu.runtime._session_closure_records import require_terminal_protected_effect
+        from cayu.sessions import _session_continuation_store as continuations
 
         session_id = session.id
         export_records: dict[str, dict[str, Any]] = {}
@@ -31266,15 +31266,15 @@ class PostgresSessionStore(
                             session_id=session_id,
                         )
                     if temporary_service_admission is not None:
-                        from cayu.runtime._temporary_continuation_store import (
-                            compose_temporary_service_admission,
-                        )
                         from cayu.sessions._session_continuation import continuation_operation_key
                         from cayu.sessions._temporary_continuation import temporary_service_key
+                        from cayu.sessions._temporary_continuation_store import (
+                            compose_temporary_service_admission,
+                        )
 
                         intent = temporary_service_admission.dispatch.intent
                         parent_key = continuation_operation_key(intent.ticket)
-                        from cayu.runtime._temporary_service_target import target_service_key
+                        from cayu.sessions._temporary_service_target import target_service_key
 
                         child_key = (
                             temporary_service_key(intent.operation)
@@ -37112,7 +37112,7 @@ class PostgresSessionStore(
         )
 
     async def _prepare_temporary_side_service(self, preparation):
-        from cayu.runtime._side_service_preparation import (
+        from cayu.sessions._side_service_preparation import (
             SidePreparationSnapshot,
             plan_preparation,
             preparation_record_keys,

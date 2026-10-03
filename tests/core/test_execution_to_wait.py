@@ -519,7 +519,7 @@ async def test_public_execution_wait_authenticates_and_binds_the_complete_wait(
                     raise AssertionError("Exact retirement replay must use its retained proof")
 
                 overrides.setattr(
-                    "cayu.runtime._session_continuation_store.require_released_wait_invocation",
+                    "cayu.sessions._session_continuation_store.require_released_wait_invocation",
                     unavailable_original_ledger,
                 )
                 assert await handoff.owner.retire_released(command) == retired

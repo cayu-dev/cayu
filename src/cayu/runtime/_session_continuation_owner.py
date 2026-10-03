@@ -824,7 +824,7 @@ class SessionContinuationOwner:
                 raise ContinuationUnavailable("Temporary service has no reserved receiving fence.")
             target_record = None
             if intent.mode == "side_session":
-                from cayu.runtime._temporary_service_target import (
+                from cayu.sessions._temporary_service_target import (
                     exclude_side_target,
                 )
 
@@ -874,7 +874,7 @@ class SessionContinuationOwner:
             elif retained.state != "excluded":
                 raise ContinuationConflict("Temporary service was admitted and cannot be excluded.")
             if target_record is not None:
-                from cayu.runtime._temporary_service_target import acknowledge_side_target
+                from cayu.sessions._temporary_service_target import acknowledge_side_target
 
                 await self.store._publish_temporary_service_target(
                     previous=target_record,

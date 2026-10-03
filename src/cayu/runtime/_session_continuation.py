@@ -118,7 +118,7 @@ def require_operation_record_owner(key: str, record: object) -> None:
 
     if type(record) is not dict:
         raise ContinuationConflict("Continuation operation record is not an object.")
-    from cayu.runtime._temporary_service_target import (
+    from cayu.sessions._temporary_service_target import (
         TARGET_PREFIX,
         TemporaryServiceTarget,
         target_service_key,

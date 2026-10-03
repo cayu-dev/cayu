@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Any
 
 from cayu._validation import copy_durable_json_object
 from cayu.collaboration._preparation import prepare_contract
-from cayu.runtime._temporary_service_target import TemporaryServiceTarget, target_service_key
 from cayu.sessions._session_continuation import (
     CONTINUATION_NAMESPACE_KEY,
     ContinuationConflict,
@@ -23,6 +22,7 @@ from cayu.sessions._temporary_continuation import (
     TemporaryServiceRecord,
     temporary_service_key,
 )
+from cayu.sessions._temporary_service_target import TemporaryServiceTarget, target_service_key
 from cayu.vaults.redaction import SecretRedactor
 
 if TYPE_CHECKING:
@@ -62,9 +62,9 @@ def plan_preparation(
     snapshots: dict[str, SidePreparationSnapshot],
     now: datetime,
 ) -> dict[str, SessionOperationPublication]:
-    from cayu.runtime._session_continuation_store import ROOT_KEY
-    from cayu.runtime._temporary_continuation_store import publish_service_record
-    from cayu.runtime._temporary_service_target import publish_target_record
+    from cayu.sessions._session_continuation_store import ROOT_KEY
+    from cayu.sessions._temporary_continuation_store import publish_service_record
+    from cayu.sessions._temporary_service_target import publish_target_record
     from cayu.sessions.base import (
         SessionOperationPublication,
         _checkpoint_transform_result_preserving_completion_result_event_publications,
