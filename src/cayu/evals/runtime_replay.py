@@ -1271,7 +1271,7 @@ def _require_candidate_boundary(
     *,
     provider_name: str,
 ) -> runtime_records.RegisteredAgentState:
-    registered_agent = app._agents.get(agent_name)
+    registered_agent = app._agent_registry.registrations.get(agent_name)
     if registered_agent is None:
         raise _ReplayUnavailable(RuntimeReplayReason.CANDIDATE_AGENT_UNAVAILABLE)
     if provider_name not in app._providers:
@@ -1495,12 +1495,12 @@ def _isolated_app(
         for name, registered in app._providers.items()
     }
     if provider_batches is None:
-        isolated._agents = dict(app._agents)
+        isolated._agent_registry.replace_for_replay(dict(app._agent_registry.registrations))
         return isolated
     if tool_tracker is None:
         raise AssertionError("Replay execution requires a tool tracker.")
     replay_agents: dict[str, runtime_records.RegisteredAgentState] = {}
-    for name, registered_agent in app._agents.items():
+    for name, registered_agent in app._agent_registry.registrations.items():
         replay_tools = {
             tool_name: replace(
                 registered_tool,
@@ -1519,7 +1519,7 @@ def _isolated_app(
             runtime_tools=MappingProxyType({}),
             mcp_toolsets=(),
         )
-    isolated._agents = replay_agents
+    isolated._agent_registry.replace_for_replay(replay_agents)
     return isolated
 
 

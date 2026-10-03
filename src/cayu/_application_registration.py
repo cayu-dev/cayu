@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from copy import deepcopy
+from types import MappingProxyType
 
 from cayu._validation import copy_durable_metadata, copy_json_value, require_clean_nonblank
 from cayu.agents import AgentSpec
+from cayu.context.base import ContextPolicy
 from cayu.environments.base import EnvironmentSpec
 from cayu.mcp.tools import McpToolAdapter
+from cayu.observability.hooks import RuntimeHook
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._execution_profile_identity_validation import (
     copy_secret_free_execution_profile_behavior_identity,
@@ -18,7 +21,10 @@ from cayu.runtime._isolated_tool_process import (
     isolated_tool_execution_contract,
     validate_process_isolated_tool_registration,
 )
-from cayu.runtime.execution_identity import copy_execution_profile_behavior_identity
+from cayu.runtime.execution_identity import (
+    ExecutionProfileBehaviorIdentity,
+    copy_execution_profile_behavior_identity,
+)
 from cayu.tools.base import DurableToolRecovery, Tool, ToolSpec
 from cayu.tools.catalogue import (
     SEARCH_TOOLS_NAME,
@@ -249,3 +255,112 @@ def _validate_environment_spec(
         lifecycle_policy=spec.lifecycle_policy,
         workspace_checkpoint_policy=spec.workspace_checkpoint_policy,
     )
+
+
+def _validate_runtime_hooks(
+    hooks: Iterable[RuntimeHook] | None,
+    *,
+    field_name: str,
+    redactor: SecretRedactor,
+) -> tuple[runtime_records.RegisteredRuntimeHook, ...]:
+    if hooks is None:
+        return ()
+    if isinstance(hooks, str | bytes):
+        raise TypeError(f"{field_name} must be an iterable of RuntimeHook instances.")
+    try:
+        hook_list = list(hooks)
+    except TypeError as exc:
+        raise TypeError(f"{field_name} must be an iterable of RuntimeHook instances.") from exc
+    registered_hooks: list[runtime_records.RegisteredRuntimeHook] = []
+    for index, hook in enumerate(hook_list):
+        if not isinstance(hook, RuntimeHook):
+            raise TypeError(f"{field_name} must contain RuntimeHook instances.")
+        registered_hooks.append(
+            runtime_records.RegisteredRuntimeHook(
+                name=hook.name,
+                execution_profile_identity=copy_secret_free_execution_profile_behavior_identity(
+                    hook.execution_profile_identity,
+                    redactor=redactor,
+                    field_name=(f"{field_name}[{index}].execution_profile_identity"),
+                ),
+                hook=hook,
+            )
+        )
+    return tuple(registered_hooks)
+
+
+def _snapshot_context_behavior_execution_profile_identities(
+    context_policy: ContextPolicy,
+    context_overflow_policy: ContextPolicy | None,
+    *,
+    redactor: SecretRedactor,
+) -> Mapping[int, ExecutionProfileBehaviorIdentity | None]:
+    """Copy declarations reachable through Cayu-owned context wrappers."""
+
+    from cayu.context.base import (
+        CheckpointCompactionContextPolicy,
+        ModelCompactor,
+        PromptCacheCompactor,
+        UsageTriggeredContextPolicy,
+    )
+    from cayu.memory.context import AutomaticRecallContextPolicy
+
+    snapshots: dict[int, ExecutionProfileBehaviorIdentity | None] = {}
+
+    def visit(policy: ContextPolicy, *, field_name: str) -> None:
+        policy_id = id(policy)
+        if policy_id in snapshots:
+            return
+        snapshots[policy_id] = copy_secret_free_execution_profile_behavior_identity(
+            policy.execution_profile_identity,
+            redactor=redactor,
+            field_name=f"{field_name}.execution_profile_identity",
+        )
+        if type(policy) is AutomaticRecallContextPolicy:
+            visit(policy.base_policy, field_name=f"{field_name}.base_policy")
+            return
+        if type(policy) is UsageTriggeredContextPolicy:
+            visit(policy.base_policy, field_name=f"{field_name}.base_policy")
+            visit(policy.triggered_policy, field_name=f"{field_name}.triggered_policy")
+            return
+        if type(policy) is not CheckpointCompactionContextPolicy:
+            return
+
+        visit_compactor(
+            policy.compactor,
+            field_name=f"{field_name}.compactor",
+        )
+
+    def visit_compactor(compactor: object, *, field_name: str) -> None:
+        compactor_id = id(compactor)
+        if compactor_id in snapshots:
+            return
+        snapshots[compactor_id] = copy_secret_free_execution_profile_behavior_identity(
+            getattr(compactor, "execution_profile_identity", None),
+            redactor=redactor,
+            field_name=f"{field_name}.execution_profile_identity",
+        )
+        if type(compactor) is ModelCompactor:
+            provider = compactor.provider
+            snapshots[id(provider)] = copy_secret_free_execution_profile_behavior_identity(
+                provider.execution_profile_identity,
+                redactor=redactor,
+                field_name=f"{field_name}.provider.execution_profile_identity",
+            )
+            return
+        if type(compactor) is PromptCacheCompactor:
+            provider = compactor.provider
+            snapshots[id(provider)] = copy_secret_free_execution_profile_behavior_identity(
+                provider.execution_profile_identity,
+                redactor=redactor,
+                field_name=f"{field_name}.provider.execution_profile_identity",
+            )
+            visit_compactor(
+                compactor._fallback,
+                field_name=f"{field_name}.fallback_compactor",
+            )
+
+    visit(context_policy, field_name="context_policy")
+    if context_overflow_policy is not None:
+        visit(context_overflow_policy, field_name="context_overflow_policy")
+    return MappingProxyType(snapshots)

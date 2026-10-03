@@ -499,7 +499,7 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
     )
     agents = tuple(
         _describe_agent(app, name=name, registration=registration, project_root=root)
-        for name, registration in sorted(app._agents.items())
+        for name, registration in sorted(app._agent_registry.registrations.items())
     )
     environments = tuple(
         _describe_environment(app, name=name, registration=registration, project_root=root)

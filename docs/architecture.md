@@ -172,9 +172,26 @@ accept the complete application object.
 `_application_registration.py` owns validation of agent/environment declarations
 and provider model patterns, registered-tool validation and copying, and tool
 descriptor construction. These functions take explicit inputs and can be used
-without loading `CayuApp`. Registration, MCP refresh and public inspection compose
-the same functions; the application retains registry mutation, MCP ownership and
-atomic publication, shutdown, and capture of the public registration call site.
+without loading `CayuApp`. Agent registration, MCP refresh and public inspection
+compose the same functions through the registry described below. Environment
+and provider registration also reuse these validators.
+
+`ApplicationAgentRegistry` owns agent declarations, their thinking-source
+metadata, MCP source claims and the lock used to publish refreshed catalogues.
+It also releases static and refreshable MCP sources after in-flight work drains,
+and tracks notification refreshes still settling after release.
+Registration claims every source before publishing the agent; refresh validates
+every affected agent before replacing the shared catalogue. It composes the
+registration validators above. `CayuApp` captures the public registration site,
+supplies configuration defaults and keeps application admission around refresh.
+The registry shares the application admission gate so shutdown prevents new MCP
+claims and waits for admitted work before releasing existing claims. Notification
+refreshes enter through that same admission boundary. Manifest and
+isolated replay readers use the registry's current publication; replay installs
+its isolated declarations without claiming live MCP sources. The registry can
+also be composed directly without importing the application or execution
+controllers by supplying an admission gate and its other explicit dependencies.
+Provider and environment registration retain their existing owners.
 
 ```text
 CayuApp

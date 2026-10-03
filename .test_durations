@@ -1,4 +1,7 @@
 {
+    "tests/core/test_application_agent_registry.py::test_agent_registry_composes_without_application_controllers": 1.232,
+    "tests/core/test_application_agent_registry.py::test_refresh_preserves_public_registration_site_and_updates_manifest": 0.392,
+    "tests/core/test_application_agent_registry.py::test_registry_helpers_preserve_legacy_import_and_pickle_identity": 0.0,
     "tests/core/test_knowledge_revision_rules.py::test_default_revision_chunk_recognition_checks_every_persisted_field": 0.001,
     "tests/core/test_knowledge_revision_rules.py::test_revision_chunk_copies_preserve_content_order_and_detach_metadata": 0.001,
     "tests/core/test_knowledge_revision_rules.py::test_revision_evidence_copies_rebind_chunks_and_preserve_provenance": 0.002,
