@@ -30901,7 +30901,7 @@ class PostgresSessionStore(
         require_no_active_model_completion_dispatch: bool = False,
         temporary_service_admission: TemporaryServiceAdmission | None = None,
     ) -> Session:
-        from cayu.runtime._temporary_continuation_scope import prepare_temporary_transition
+        from cayu.sessions._temporary_continuation_scope import prepare_temporary_transition
         from cayu.sessions.pending_actions import pending_action_event_storage_values
 
         temporary_service_admission = prepare_temporary_transition(temporary_service_admission)

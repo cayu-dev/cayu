@@ -77,11 +77,11 @@ def admit_side_target(
     now: datetime,
 ) -> TemporaryServiceTarget:
     """Compose a target fence with positive native admission in one transaction."""
-    from cayu.runtime._temporary_continuation_scope import require_temporary_transition
     from cayu.runtime._temporary_continuation_store import (
         native_service_execution,
         require_service_deadline,
     )
+    from cayu.sessions._temporary_continuation_scope import require_temporary_transition
 
     require_temporary_transition(admission)
     intent = admission.dispatch.intent
@@ -162,7 +162,6 @@ def acknowledge_side_target(
 def publish_target_record(session, checkpoint, current, previous, proposed, now):
     """Atomic native target compare, bounded index and receipt-retention update."""
     from cayu.collaboration._preparation import prepare_contract
-    from cayu.runtime._session_continuation_scope import require_publication
     from cayu.runtime._session_continuation_store import ROOT_KEY, ContinuationRoot
     from cayu.runtime._temporary_continuation_store import (
         native_service_outcome,
@@ -173,6 +172,7 @@ def publish_target_record(session, checkpoint, current, previous, proposed, now)
         ContinuationNamespace,
         continuation_namespace_id,
     )
+    from cayu.sessions._session_continuation_scope import require_publication
     from cayu.sessions.base import SessionOperationPublication
     from cayu.vaults.redaction import SecretRedactor
 

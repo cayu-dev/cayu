@@ -1,24 +1,31 @@
-"""Exact private receiving scope; registered foreign authentication occurs outside."""
+"""Runtime temporary-admission scope producer and compatible imports."""
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from contextvars import ContextVar
 
 from cayu.collaboration._preparation import prepare_contract
-from cayu.runtime._session_continuation_scope import service_publication_scope
 from cayu.sessions._session_continuation import continuation_operation_key
+from cayu.sessions._session_continuation_scope import service_publication_scope
 from cayu.sessions._temporary_continuation import (
     TemporaryServiceAdmission,
     require_temporary_service_command,
     temporary_service_key,
 )
-from cayu.vaults.redaction import SecretRedactor
 
-_ADMISSION: ContextVar[TemporaryServiceAdmission | None] = ContextVar(
-    "temporary_continuation_admission", default=None
+# Runtime producers and store validators share the exact same authority objects.
+from cayu.sessions._temporary_continuation_scope import _ADMISSION as _ADMISSION
+from cayu.sessions._temporary_continuation_scope import (
+    prepare_temporary_transition as prepare_temporary_transition,
 )
+from cayu.sessions._temporary_continuation_scope import (
+    require_temporary_admission as require_temporary_admission,
+)
+from cayu.sessions._temporary_continuation_scope import (
+    require_temporary_transition as require_temporary_transition,
+)
+from cayu.vaults.redaction import SecretRedactor
 
 
 @contextmanager
@@ -45,34 +52,3 @@ def temporary_admission_scope(
             yield
     finally:
         _ADMISSION.reset(token)
-
-
-def require_temporary_admission(command) -> TemporaryServiceAdmission | None:
-    admission = _ADMISSION.get()
-    if command.temporary_service_operation_key is None:
-        if admission is not None:
-            raise PermissionError("Temporary service cannot omit its native command identity.")
-        return None
-    if admission is None:
-        raise PermissionError("Temporary service requires its registered receiving owner.")
-    require_temporary_service_command(admission, command)
-    return admission
-
-
-def require_temporary_transition(admission: TemporaryServiceAdmission) -> None:
-    if _ADMISSION.get() != admission:
-        raise PermissionError(
-            "Temporary service transition lacks exact native admission authority."
-        )
-
-
-def prepare_temporary_transition(value: object | None) -> TemporaryServiceAdmission | None:
-    if value is None:
-        if _ADMISSION.get() is not None:
-            raise PermissionError(
-                "Temporary service transition cannot drop its receiving identity."
-            )
-        return None
-    admission = prepare_contract(TemporaryServiceAdmission, value, redactor=SecretRedactor())
-    require_temporary_transition(admission)
-    return admission

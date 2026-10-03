@@ -384,9 +384,19 @@ identity and digest helpers, and deterministic validation.
 selection, transition and capacity checks. Record construction works without
 loading runtime or store implementations; admission-command validation composes
 the shared invocation contracts. Existing runtime imports and public exports
-resolve to the same definitions. Runtime retains authenticated publication
-guards, admission and dispatch, scope authority, and checkpoint publication;
-native stores retain their transaction boundaries.
+resolve to the same definitions. Runtime retains authenticated operation-record
+guarding, admission and dispatch, and checkpoint publication; native stores
+retain their transaction boundaries.
+
+`sessions/_session_continuation_scope.py` and `_temporary_continuation_scope.py`
+own the shared authority contexts and store-facing checks. Runtime producers and
+transactional validators use the same context objects through both canonical and
+legacy imports. Runtime retains live invocation authentication and preparation,
+parking, retirement and temporary-admission scope creation. Preparation validation
+retains the authenticated invocation by identity and repeats its authority and
+current-writer checks inside the native publication boundary. The shared module
+keeps a type-only reference to that runtime context; it does not construct one.
+Nested scopes, task context and cancellation preserve their existing lifetimes.
 
 ## Multi-Agent Shape
 

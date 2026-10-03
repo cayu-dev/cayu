@@ -1213,7 +1213,7 @@ async def apply_invocation_lifecycle_command(
     copied = copy_invocation_lifecycle_command(command)
     temporary_service = None
     if type(copied) is AdmitInvocationCommand:
-        from cayu.runtime._temporary_continuation_scope import require_temporary_admission
+        from cayu.sessions._temporary_continuation_scope import require_temporary_admission
 
         temporary_service = require_temporary_admission(copied)
     if type(copied) is ReleaseInvocationCommand:

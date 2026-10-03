@@ -5295,8 +5295,8 @@ class SessionInvocationAdmission:
     def __post_init__(self) -> None:
         if self.temporary_service_admission is not None:
             from cayu.collaboration._preparation import prepare_contract
-            from cayu.runtime._temporary_continuation_scope import require_temporary_transition
             from cayu.sessions._temporary_continuation import TemporaryServiceAdmission
+            from cayu.sessions._temporary_continuation_scope import require_temporary_transition
             from cayu.vaults.redaction import SecretRedactor
 
             prepared_service = prepare_contract(
@@ -12413,8 +12413,8 @@ class SessionStore(ABC):
         events: list[Event],
     ) -> Session:
         """Enclose only a session-owned transform, never a receiving callback."""
-        from cayu.runtime._session_continuation_scope import publication_scope
         from cayu.runtime._session_continuation_store import index_publication
+        from cayu.sessions._session_continuation_scope import publication_scope
 
         def indexed_transform(session, checkpoint, current):
             publication = operation_transform(session, checkpoint, current)
@@ -12441,7 +12441,6 @@ class SessionStore(ABC):
         before calling it; it cannot wrap foreign callbacks in publication scope.
         """
         from cayu.collaboration._preparation import prepare_contract
-        from cayu.runtime._session_continuation_scope import service_publication_scope
         from cayu.runtime._temporary_continuation_store import (
             publish_service_record,
             require_service_deadline,
@@ -12450,6 +12449,7 @@ class SessionStore(ABC):
             ContinuationUnavailable,
             continuation_operation_key,
         )
+        from cayu.sessions._session_continuation_scope import service_publication_scope
         from cayu.sessions._temporary_continuation import (
             TemporaryServiceRecord,
             temporary_service_key,
@@ -12503,7 +12503,6 @@ class SessionStore(ABC):
     async def _publish_temporary_service_target(self, *, previous, proposed):
         """Private registered-owner compare under the target's native transaction."""
         from cayu.collaboration._preparation import prepare_contract
-        from cayu.runtime._session_continuation_scope import service_publication_scope
         from cayu.runtime._temporary_service_target import (
             TemporaryServiceTarget,
             publish_target_record,
@@ -12513,6 +12512,7 @@ class SessionStore(ABC):
             CONTINUATION_NAMESPACE_KEY,
             ContinuationUnavailable,
         )
+        from cayu.sessions._session_continuation_scope import service_publication_scope
         from cayu.vaults.redaction import SecretRedactor
 
         proposed = prepare_contract(TemporaryServiceTarget, proposed, redactor=SecretRedactor())
@@ -12558,7 +12558,6 @@ class SessionStore(ABC):
     async def _load_temporary_service_target(self, expected):
         """Read an exact indexed target, retaining ambiguity across concurrent changes."""
         from cayu.collaboration._preparation import prepare_contract
-        from cayu.runtime._session_continuation_scope import publication_scope
         from cayu.runtime._session_continuation_store import ROOT_KEY, ContinuationRoot
         from cayu.runtime._temporary_service_target import (
             TemporaryServiceTarget,
@@ -12569,6 +12568,7 @@ class SessionStore(ABC):
             ContinuationConflict,
             ContinuationUnavailable,
         )
+        from cayu.sessions._session_continuation_scope import publication_scope
         from cayu.sessions._temporary_continuation import (
             TemporaryServiceAdmission,
             TemporaryServicePreparation,
@@ -12774,7 +12774,7 @@ class SessionStore(ABC):
         from cayu.vaults.redaction import SecretRedactor
 
         namespace = prepare_contract(ContinuationNamespace, namespace, redactor=SecretRedactor())
-        from cayu.runtime._session_continuation_scope import (
+        from cayu.sessions._session_continuation_scope import (
             require_namespace_preparation,
             require_preparation_writer,
         )
@@ -12830,7 +12830,7 @@ class SessionStore(ABC):
         from cayu.vaults.redaction import SecretRedactor
 
         command = prepare_contract(ContinuationPreparation, command, redactor=SecretRedactor())
-        from cayu.runtime._session_continuation_scope import (
+        from cayu.sessions._session_continuation_scope import (
             require_preparation,
             require_preparation_writer,
         )
@@ -12996,7 +12996,6 @@ class SessionStore(ABC):
         """Publish the ARMING-to-WAITING transition under the ticket's CAS."""
 
         from cayu.collaboration._preparation import prepare_contract
-        from cayu.runtime._session_continuation_scope import require_park
         from cayu.sessions._session_continuation import (
             ContinuationConflict,
             ContinuationRecord,
@@ -13006,6 +13005,7 @@ class SessionStore(ABC):
             require_ticket_identity,
             require_writer_generation,
         )
+        from cayu.sessions._session_continuation_scope import require_park
         from cayu.vaults.redaction import SecretRedactor
 
         ticket = prepare_contract(ContinuationTicket, ticket, redactor=SecretRedactor())
@@ -13065,7 +13065,6 @@ class SessionStore(ABC):
     ) -> ContinuationRecord:
         """Publish one immutable readiness latch, including an ARMING latch."""
 
-        from cayu.runtime._session_continuation_scope import require_authenticated_latch
         from cayu.sessions._session_continuation import (
             ContinuationConflict,
             ContinuationRecord,
@@ -13075,6 +13074,7 @@ class SessionStore(ABC):
             require_record_writer_generation,
             require_ticket_identity,
         )
+        from cayu.sessions._session_continuation_scope import require_authenticated_latch
 
         require_authenticated_latch(latch)
 
@@ -13147,7 +13147,7 @@ class SessionStore(ABC):
     ) -> ContinuationRecord:
         """Atomically elect one inline or queued continuation and replay it."""
 
-        from cayu.runtime._session_continuation_scope import require_consumption
+        from cayu.sessions._session_continuation_scope import require_consumption
 
         require_consumption(consumption)
 
@@ -13159,7 +13159,6 @@ class SessionStore(ABC):
         """Fence retirement before dispatching the typed admission mutation."""
 
         from cayu.collaboration._preparation import prepare_contract
-        from cayu.runtime._session_continuation_scope import require_consumption
         from cayu.sessions._session_continuation import (
             ContinuationConflict,
             ContinuationConsumption,
@@ -13169,6 +13168,7 @@ class SessionStore(ABC):
             require_latch_identity,
             require_ticket_identity,
         )
+        from cayu.sessions._session_continuation_scope import require_consumption
         from cayu.vaults.redaction import SecretRedactor
 
         consumption = prepare_contract(
@@ -13254,7 +13254,6 @@ class SessionStore(ABC):
         """Fence an uncommitted claim, or exclude it from positive supersession evidence."""
 
         from cayu.collaboration._preparation import prepare_contract
-        from cayu.runtime._session_continuation_scope import require_consumption
         from cayu.sessions._session_continuation import (
             ContinuationConflict,
             ContinuationConsumption,
@@ -13264,6 +13263,7 @@ class SessionStore(ABC):
             require_latch_identity,
             require_ticket_identity,
         )
+        from cayu.sessions._session_continuation_scope import require_consumption
         from cayu.vaults.redaction import SecretRedactor
 
         consumption = prepare_contract(
@@ -13410,7 +13410,7 @@ class SessionStore(ABC):
     ) -> ContinuationRecord:
         """Commit the admitted stage only from the typed lifecycle boundary."""
 
-        from cayu.runtime._session_continuation_scope import require_consumption
+        from cayu.sessions._session_continuation_scope import require_consumption
 
         require_consumption(consumption)
 
@@ -13603,7 +13603,6 @@ class SessionStore(ABC):
         """Atomically retire a ticket, losing only to an already committed consume."""
 
         from cayu.collaboration._preparation import prepare_contract
-        from cayu.runtime._session_continuation_scope import require_retirement
         from cayu.sessions._session_continuation import (
             ContinuationConflict,
             ContinuationRecord,
@@ -13615,6 +13614,7 @@ class SessionStore(ABC):
             require_record_writer_generation,
             require_ticket_identity,
         )
+        from cayu.sessions._session_continuation_scope import require_retirement
         from cayu.vaults.redaction import SecretRedactor
 
         retirement = prepare_contract(ContinuationRetirement, retirement, redactor=SecretRedactor())
@@ -19526,7 +19526,7 @@ class InMemorySessionStore(MemorySessionExecutionMixin, MemoryCreationFenceMixin
         require_no_active_model_completion_dispatch: bool = False,
         temporary_service_admission: TemporaryServiceAdmission | None = None,
     ) -> Session:
-        from cayu.runtime._temporary_continuation_scope import prepare_temporary_transition
+        from cayu.sessions._temporary_continuation_scope import prepare_temporary_transition
 
         temporary_service_admission = prepare_temporary_transition(temporary_service_admission)
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -29699,13 +29699,13 @@ def _reject_reserved_runtime_publication_key(
     value: str, field_name: str, *, browser_control_read: bool = False
 ) -> str:
     from cayu.collaboration._session_export_store import require_operation_key_access
-    from cayu.runtime._session_continuation_scope import (
-        require_operation_key_access as require_continuation_key_access,
-    )
     from cayu.sessions._argument_continuity import require_private_key_access
     from cayu.sessions._browser_control_checkpoint import require_browser_control_operation_owner
     from cayu.sessions._producer_checkpoint import (
         require_operation_key_access as require_producer_key_access,
+    )
+    from cayu.sessions._session_continuation_scope import (
+        require_operation_key_access as require_continuation_key_access,
     )
 
     value = require_clean_nonblank(value, field_name)

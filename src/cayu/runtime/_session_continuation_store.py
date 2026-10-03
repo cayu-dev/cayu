@@ -9,10 +9,6 @@ from pydantic import Field, StrictInt, StrictStr, model_validator
 
 from cayu._validation import canonical_durable_json_bytes
 from cayu.collaboration._contracts import MAX_ENVELOPE_BYTES, ContractValue
-from cayu.runtime._session_continuation_scope import (
-    continuation_authority_visible,
-    current_publication_key,
-)
 from cayu.runtime._temporary_service_target import (
     MAX_TARGET_SERVICES,
     TemporaryServiceTargetReference,
@@ -36,6 +32,10 @@ from cayu.sessions._session_continuation import (
     ContinuationReleasedExecution,
     ContinuationTicket,
     continuation_operation_key,
+)
+from cayu.sessions._session_continuation_scope import (
+    continuation_authority_visible,
+    current_publication_key,
 )
 
 if TYPE_CHECKING:
@@ -526,9 +526,9 @@ def pending_admission_receipt_identities(session: Session, checkpoint) -> frozen
 
 def require_admission_claim(session: Session, checkpoint, command) -> None:
     """Compare the exact claim in the same transaction that admits the session."""
-    from cayu.runtime._session_continuation_scope import current_admission_claim
-    from cayu.runtime._temporary_continuation_scope import require_temporary_admission
     from cayu.sessions._session_continuation import continuation_admission_digest
+    from cayu.sessions._session_continuation_scope import current_admission_claim
+    from cayu.sessions._temporary_continuation_scope import require_temporary_admission
 
     raw = None if checkpoint is None else checkpoint.get(ROOT_KEY)
     if raw is not None:

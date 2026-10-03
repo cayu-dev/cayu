@@ -11,7 +11,6 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from cayu.collaboration._preparation import prepare_contract
-from cayu.runtime._session_continuation_scope import current_publication_key
 from cayu.runtime._session_continuation_store import (
     ROOT_KEY,
     ContinuationRoot,
@@ -27,6 +26,7 @@ from cayu.sessions._session_continuation import (
     continuation_writer_frontier,
     require_ticket_identity,
 )
+from cayu.sessions._session_continuation_scope import current_publication_key
 from cayu.sessions._temporary_continuation import (
     TemporaryServiceAdmission,
     TemporaryServiceExecution,
@@ -279,7 +279,7 @@ def compose_same_session_admission(
     now: datetime,
 ) -> SessionOperationPublication:
     """Compose service ownership with the native invocation transaction result."""
-    from cayu.runtime._temporary_continuation_scope import require_temporary_transition
+    from cayu.sessions._temporary_continuation_scope import require_temporary_transition
     from cayu.sessions.base import SessionStatus
 
     require_temporary_transition(admission)

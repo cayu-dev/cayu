@@ -11,13 +11,13 @@ from typing import TYPE_CHECKING, Any
 
 from cayu._validation import copy_durable_json_object
 from cayu.collaboration._preparation import prepare_contract
-from cayu.runtime._session_continuation_scope import service_publication_scope
 from cayu.runtime._temporary_service_target import TemporaryServiceTarget, target_service_key
 from cayu.sessions._session_continuation import (
     CONTINUATION_NAMESPACE_KEY,
     ContinuationConflict,
     continuation_operation_key,
 )
+from cayu.sessions._session_continuation_scope import service_publication_scope
 from cayu.sessions._temporary_continuation import (
     TemporaryServicePreparation,
     TemporaryServiceRecord,

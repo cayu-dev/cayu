@@ -114,7 +114,7 @@ def require_operation_record_owner(key: str, record: object) -> None:
 
     if not key.startswith(CONTINUATION_OPERATION_PREFIX):
         return
-    from cayu.runtime._session_continuation_scope import require_publication
+    from cayu.sessions._session_continuation_scope import require_publication
 
     if type(record) is not dict:
         raise ContinuationConflict("Continuation operation record is not an object.")
@@ -215,7 +215,7 @@ async def admit_continuation(
         return result, prepared
     if retained.receipt_stage != "prepared":
         raise ContinuationConflict("Continuation responsibility is no longer admissible.")
-    from cayu.runtime._session_continuation_scope import admission_claim_scope
+    from cayu.sessions._session_continuation_scope import admission_claim_scope
 
     claimed, _ = await store._claim_continuation_admission(consumption)
     claim_consumption = claimed.consumption

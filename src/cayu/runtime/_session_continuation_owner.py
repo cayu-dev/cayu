@@ -32,8 +32,6 @@ from cayu.runtime._invocation_lifecycle import (
 )
 from cayu.runtime._session_continuation import admit_continuation
 from cayu.runtime._session_continuation_scope import (
-    authenticated_latch_scope,
-    consumption_scope,
     park_scope,
     preparation_scope,
     require_ticket_invocation,
@@ -75,6 +73,7 @@ from cayu.sessions._session_continuation import (
     require_latch_identity,
     require_ticket_identity,
 )
+from cayu.sessions._session_continuation_scope import authenticated_latch_scope, consumption_scope
 from cayu.sessions._temporary_continuation import (
     TemporaryServiceAdmission,
     TemporaryServiceDispatch,
@@ -498,7 +497,7 @@ class SessionContinuationOwner:
         self, candidate: ContinuationReleasedRetirement
     ) -> ContinuationRecord:
         """Retire only through native release and acknowledged service evidence."""
-        from cayu.runtime._session_continuation_scope import released_retirement_scope
+        from cayu.sessions._session_continuation_scope import released_retirement_scope
         from cayu.sessions._temporary_continuation import (
             TemporaryServiceRecord,
             reference_for_service,
