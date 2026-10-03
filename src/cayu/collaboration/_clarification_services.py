@@ -8,8 +8,8 @@ from pydantic import model_validator
 
 from cayu.collaboration._contracts import ContractValue
 from cayu.collaboration._permits import PermitReceipt, ReceivingSettlementReceipt
-from cayu.runtime._session_continuation import continuation_digest
-from cayu.runtime._temporary_continuation import TemporaryServiceDispatch
+from cayu.sessions._session_continuation import continuation_digest
+from cayu.sessions._temporary_continuation import TemporaryServiceDispatch
 
 
 class ClarificationServiceRecord(ContractValue):

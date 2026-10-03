@@ -8,7 +8,7 @@ from cayu.collaboration._native_output import (
     read_native_output,
     validate_output_selection,
 )
-from cayu.runtime._temporary_continuation import TemporaryServiceRecord
+from cayu.sessions._temporary_continuation import TemporaryServiceRecord
 from cayu.sessions.base import SessionStore
 
 

@@ -19,14 +19,14 @@ from cayu.collaboration._preparation import prepare_contract, require_exact_cont
 from cayu.collaboration.clarifications import MAX_CLARIFICATION_TEXT_BYTES, MAX_CLARIFICATION_TURNS
 from cayu.collaboration.exports import SessionExportAccessContext
 from cayu.messages import Message
-from cayu.runtime._session_continuation import (
+from cayu.sessions._session_continuation import (
     ContinuationConflict,
     ContinuationTicket,
     ContinuationUnavailable,
     continuation_digest,
     require_ticket_identity,
 )
-from cayu.runtime._temporary_continuation import (
+from cayu.sessions._temporary_continuation import (
     ServiceReleasedSessionStatus,
     TemporaryServiceIntent,
     TemporaryServiceRecord,

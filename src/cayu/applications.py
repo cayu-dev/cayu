@@ -455,7 +455,6 @@ from cayu.runtime._session_closure_projection import (
     project_closure_manifest,
     project_closure_report,
 )
-from cayu.runtime._session_continuation import ContinuationTicket
 from cayu.runtime._session_control import (
     ActiveSessionRun,
     SessionControl,
@@ -621,6 +620,7 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,
     settled_invocation_terminal_decision_from_checkpoint,
 )
+from cayu.sessions._session_continuation import ContinuationTicket
 from cayu.sessions._terminal_evidence import (
     SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
     TERMINAL_EVENT_TYPES,
@@ -948,12 +948,12 @@ if TYPE_CHECKING:
         ContinuationRecovery,
     )
     from cayu.runtime._producer_retirement import ProducerCleanupReclamation
-    from cayu.runtime._session_continuation import ContinuationRecord
     from cayu.runtime._session_continuation_resume import _ResumeAdmissionHandoff
     from cayu.sessions._participant_discovery import (
         ParticipantSessionCursor,
         ParticipantSessionReference,
     )
+    from cayu.sessions._session_continuation import ContinuationRecord
     from cayu.tasks.groups import (
         TaskGroupCreate,
         TaskGroupCreationReceipt,

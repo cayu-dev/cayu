@@ -1,15 +1,15 @@
 """Lazy public participant-administration exports."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
-    "ContinuationConflict": ("cayu.runtime._session_continuation", "ContinuationConflict"),
-    "ContinuationUnavailable": ("cayu.runtime._session_continuation", "ContinuationUnavailable"),
+    "ContinuationConflict": ("cayu.sessions._session_continuation", "ContinuationConflict"),
+    "ContinuationUnavailable": ("cayu.sessions._session_continuation", "ContinuationUnavailable"),
     "ContinuationDiscoveryPage": (
         "cayu.runtime._host_continuation_discovery",
         "ContinuationDiscoveryPage",
     ),
     "ContinuationRecovery": ("cayu.runtime._host_continuation_discovery", "ContinuationRecovery"),
-    "ContinuationRecord": ("cayu.runtime._session_continuation", "ContinuationRecord"),
-    "ContinuationService": ("cayu.runtime._session_continuation", "ContinuationService"),
+    "ContinuationRecord": ("cayu.sessions._session_continuation", "ContinuationRecord"),
+    "ContinuationService": ("cayu.sessions._session_continuation", "ContinuationService"),
     "ParticipantSessionCursor": (
         "cayu.sessions._participant_discovery",
         "ParticipantSessionCursor",

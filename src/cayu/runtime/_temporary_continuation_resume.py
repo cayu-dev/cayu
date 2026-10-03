@@ -11,13 +11,13 @@ from uuid import NAMESPACE_URL, uuid5
 from cayu.runtime._invocation_lifecycle import (
     InvocationContext,
 )
-from cayu.runtime._session_continuation import continuation_digest
-from cayu.runtime._temporary_continuation import TemporaryServiceIntent
 from cayu.sessions._invocation_lifecycle import (
     AdmitInvocationCommand,
     AdmittedInvocationBinding,
     InvocationMutationResult,
 )
+from cayu.sessions._session_continuation import continuation_digest
+from cayu.sessions._temporary_continuation import TemporaryServiceIntent
 
 if TYPE_CHECKING:
     from cayu.runtime._session_continuation_owner import SessionContinuationOwner

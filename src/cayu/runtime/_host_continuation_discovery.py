@@ -12,14 +12,6 @@ from pydantic import Field, StrictInt, StrictStr
 from cayu.collaboration._contracts import ContractValue, Identifier
 from cayu.collaboration._preparation import contract_bytes, prepare_contract
 from cayu.collaboration.access import CollaborationAccessContext
-from cayu.runtime._session_continuation import (
-    CONTINUATION_NAMESPACE_KEY,
-    ContinuationConflict,
-    ContinuationRecord,
-    ContinuationUnavailable,
-    continuation_digest,
-    continuation_operation_key,
-)
 from cayu.runtime._session_continuation_scope import publication_scope
 from cayu.runtime._session_continuation_store import (
     ROOT_KEY,
@@ -28,6 +20,14 @@ from cayu.runtime._session_continuation_store import (
     require_history,
 )
 from cayu.sessions._participant_discovery import ParticipantSessionReference
+from cayu.sessions._session_continuation import (
+    CONTINUATION_NAMESPACE_KEY,
+    ContinuationConflict,
+    ContinuationRecord,
+    ContinuationUnavailable,
+    continuation_digest,
+    continuation_operation_key,
+)
 from cayu.sessions.base import _invocation_lifecycle_authority_read_scope
 from cayu.sessions.context_views import ParticipantSessionCreationReceipt
 

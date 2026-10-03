@@ -8,8 +8,11 @@ from pydantic import Field, StrictBool, StrictInt, StrictStr, model_validator
 
 from cayu.collaboration._contracts import ContractValue
 from cayu.collaboration._permits import ReceivingSettlementReceipt
-from cayu.runtime._session_continuation import ContinuationConflict, continuation_digest
-from cayu.runtime._temporary_continuation import (
+from cayu.sessions._session_continuation import (
+    ContinuationConflict,
+    continuation_digest,
+)
+from cayu.sessions._temporary_continuation import (
     TemporaryServiceAdmission,
     TemporaryServicePreparation,
     TemporaryServiceRecord,
@@ -159,16 +162,16 @@ def acknowledge_side_target(
 def publish_target_record(session, checkpoint, current, previous, proposed, now):
     """Atomic native target compare, bounded index and receipt-retention update."""
     from cayu.collaboration._preparation import prepare_contract
-    from cayu.runtime._session_continuation import (
-        CONTINUATION_NAMESPACE_KEY,
-        ContinuationNamespace,
-        continuation_namespace_id,
-    )
     from cayu.runtime._session_continuation_scope import require_publication
     from cayu.runtime._session_continuation_store import ROOT_KEY, ContinuationRoot
     from cayu.runtime._temporary_continuation_store import (
         native_service_outcome,
         require_service_deadline,
+    )
+    from cayu.sessions._session_continuation import (
+        CONTINUATION_NAMESPACE_KEY,
+        ContinuationNamespace,
+        continuation_namespace_id,
     )
     from cayu.sessions.base import SessionOperationPublication
     from cayu.vaults.redaction import SecretRedactor
@@ -203,7 +206,7 @@ def publish_target_record(session, checkpoint, current, previous, proposed, now)
             raise ContinuationConflict("Side-session receiving starts with exact preparation.")
         if len(refs) >= MAX_TARGET_SERVICES:
             raise ContinuationConflict("Side-session receiving capacity is exhausted.")
-        from cayu.runtime._temporary_continuation import require_temporary_service_capacity
+        from cayu.sessions._temporary_continuation import require_temporary_service_capacity
 
         require_temporary_service_capacity(
             proposed.service, envelope_overhead=TARGET_WRAPPER_RESERVED_BYTES

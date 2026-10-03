@@ -25,9 +25,12 @@ from cayu.collaboration.clarifications import ClarificationReply, Commitment, In
 from cayu.collaboration.exports import SessionExportAccessContext, SessionExportRequest
 from cayu.collaboration.participants import CollaborationUnavailable
 from cayu.collaboration.requests import RequestCommand
-from cayu.runtime._session_continuation import continuation_digest
-from cayu.runtime._temporary_continuation import TemporaryServiceRecord, temporary_service_key
 from cayu.runtime._temporary_continuation_permits import TemporaryServicePermitAuthority
+from cayu.sessions._session_continuation import continuation_digest
+from cayu.sessions._temporary_continuation import (
+    TemporaryServiceRecord,
+    temporary_service_key,
+)
 
 
 class ClarificationReplyRequest(ContractValue):

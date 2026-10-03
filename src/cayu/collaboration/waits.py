@@ -26,7 +26,7 @@ from cayu.collaboration._contracts import (
 )
 from cayu.collaboration._preparation import contract_bytes
 from cayu.collaboration.requests import RequestCommand, RequestRef
-from cayu.runtime._session_continuation import ContinuationTicket
+from cayu.sessions._session_continuation import ContinuationTicket
 from cayu.vaults.redaction import SecretRedactor
 
 _CONTRACT_REDACTOR = SecretRedactor()

@@ -9,7 +9,15 @@ from pydantic import Field, StrictInt, StrictStr, model_validator
 
 from cayu._validation import canonical_durable_json_bytes
 from cayu.collaboration._contracts import MAX_ENVELOPE_BYTES, ContractValue
-from cayu.runtime._session_continuation import (
+from cayu.runtime._session_continuation_scope import (
+    continuation_authority_visible,
+    current_publication_key,
+)
+from cayu.runtime._temporary_service_target import (
+    MAX_TARGET_SERVICES,
+    TemporaryServiceTargetReference,
+)
+from cayu.sessions._session_continuation import (
     CONTINUATION_MAX_CONSUMPTION_EVIDENCE_BYTES,
     CONTINUATION_MAX_EVENT_BYTES,
     CONTINUATION_MAX_EVENTS,
@@ -28,14 +36,6 @@ from cayu.runtime._session_continuation import (
     ContinuationReleasedExecution,
     ContinuationTicket,
     continuation_operation_key,
-)
-from cayu.runtime._session_continuation_scope import (
-    continuation_authority_visible,
-    current_publication_key,
-)
-from cayu.runtime._temporary_service_target import (
-    MAX_TARGET_SERVICES,
-    TemporaryServiceTargetReference,
 )
 
 if TYPE_CHECKING:
@@ -526,9 +526,9 @@ def pending_admission_receipt_identities(session: Session, checkpoint) -> frozen
 
 def require_admission_claim(session: Session, checkpoint, command) -> None:
     """Compare the exact claim in the same transaction that admits the session."""
-    from cayu.runtime._session_continuation import continuation_admission_digest
     from cayu.runtime._session_continuation_scope import current_admission_claim
     from cayu.runtime._temporary_continuation_scope import require_temporary_admission
+    from cayu.sessions._session_continuation import continuation_admission_digest
 
     raw = None if checkpoint is None else checkpoint.get(ROOT_KEY)
     if raw is not None:
@@ -640,8 +640,8 @@ def require_erasure_quiescence(*, session: Session, checkpoint, records: dict[st
             raise ContinuationConflict("Session still owns a continuation responsibility.")
         if record.released_retirement is not None and not record.retirement_acknowledged:
             raise ContinuationConflict("Continuation exclusion acknowledgement is pending.")
-        from cayu.runtime._session_continuation import require_ticket_identity
-        from cayu.runtime._temporary_continuation import (
+        from cayu.sessions._session_continuation import require_ticket_identity
+        from cayu.sessions._temporary_continuation import (
             TemporaryServiceRecord,
             reference_for_service,
         )

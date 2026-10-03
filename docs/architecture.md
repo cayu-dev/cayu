@@ -376,9 +376,17 @@ and portable release evidence. Runtime retains live invocation context, cleanup
 admission, command dispatch, and receipt publication that composes continuation
 state. Both layers share the same release-authority tokens and validated command
 copies. Existing imports remain compatible, and native stores retain their
-transaction boundaries. The lifecycle contracts still use session models and
-the existing continuation service-key validation; continuation ownership remains
-a separate boundary.
+transaction boundaries. The lifecycle contracts still use session models.
+
+`sessions/_session_continuation.py` owns durable continuation records, limits,
+identity and digest helpers, and deterministic validation.
+`sessions/_temporary_continuation.py` owns temporary-service records and their
+selection, transition and capacity checks. Record construction works without
+loading runtime or store implementations; admission-command validation composes
+the shared invocation contracts. Existing runtime imports and public exports
+resolve to the same definitions. Runtime retains authenticated publication
+guards, admission and dispatch, scope authority, and checkpoint publication;
+native stores retain their transaction boundaries.
 
 ## Multi-Agent Shape
 

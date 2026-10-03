@@ -12,7 +12,7 @@ from cayu.vaults.redaction import SecretRedactor
 
 if TYPE_CHECKING:
     from cayu.runtime._invocation_lifecycle import InvocationContext
-    from cayu.runtime._session_continuation import (
+    from cayu.sessions._session_continuation import (
         ContinuationConsumption,
         ContinuationLatch,
         ContinuationNamespace,
@@ -164,7 +164,7 @@ def continuation_authority_visible() -> bool:
 
 
 def require_operation_key_access(key: str, *, read: bool) -> None:
-    from cayu.runtime._session_continuation import CONTINUATION_OPERATION_PREFIX
+    from cayu.sessions._session_continuation import CONTINUATION_OPERATION_PREFIX
 
     if not read and key.startswith(CONTINUATION_OPERATION_PREFIX):
         require_publication(key)
@@ -206,7 +206,7 @@ def retirement_scope(
 def released_retirement_scope(expected: ContinuationReleasedRetirement) -> Iterator[None]:
     """Enclose a receiving proof check, not a manufactured InvocationContext."""
     from cayu.collaboration._preparation import prepare_contract
-    from cayu.runtime._session_continuation import ContinuationReleasedRetirement
+    from cayu.sessions._session_continuation import ContinuationReleasedRetirement
 
     expected = prepare_contract(ContinuationReleasedRetirement, expected, redactor=SecretRedactor())
     token = _RETIREMENT.set(

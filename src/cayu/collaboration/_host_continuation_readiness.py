@@ -17,7 +17,10 @@ from cayu.collaboration.base import REQUEST_FAMILY
 from cayu.collaboration.participants import CollaborationUnavailable
 from cayu.collaboration.waits import WaitSnapshot, request_object_ref, wait_operation_key
 from cayu.runtime._host_continuation_discovery import recover_session_continuation
-from cayu.runtime._session_continuation import require_latch_identity, require_ticket_identity
+from cayu.sessions._session_continuation import (
+    require_latch_identity,
+    require_ticket_identity,
+)
 from cayu.sessions.creation_fence import SessionCreationDecision
 
 

@@ -158,7 +158,7 @@ class ClarificationCoordinator:
             PreparationProgress,
             PreparationReadFailure,
         )
-        from cayu.runtime._session_continuation import ContinuationConflict
+        from cayu.sessions._session_continuation import ContinuationConflict
 
         requests = self.requests
         request = prepare_contract(
@@ -225,7 +225,10 @@ class ClarificationCoordinator:
     async def _inspect_service_owned(self, app, request, *, context):
         """Retain one authenticated read through its exact native outcome."""
         from cayu.collaboration._clarification_recovery import inspect_settled_service
-        from cayu.runtime._session_continuation import ContinuationConflict, ContinuationUnavailable
+        from cayu.sessions._session_continuation import (
+            ContinuationConflict,
+            ContinuationUnavailable,
+        )
 
         requests = self.requests
         request = prepare_contract(
@@ -307,7 +310,10 @@ class ClarificationCoordinator:
             ServiceRecoveryInput,
             reconcile_service,
         )
-        from cayu.runtime._session_continuation import ContinuationConflict, ContinuationUnavailable
+        from cayu.sessions._session_continuation import (
+            ContinuationConflict,
+            ContinuationUnavailable,
+        )
 
         requests = self.requests
         request = prepare_contract(
@@ -494,7 +500,7 @@ class ClarificationCoordinator:
         from cayu.collaboration._clarification_recovery_types import (
             ClarificationPendingServiceQuery,
         )
-        from cayu.runtime._session_continuation import (
+        from cayu.sessions._session_continuation import (
             ContinuationConflict,
             ContinuationTicket,
             ContinuationUnavailable,

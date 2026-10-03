@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from cayu.collaboration._preparation import prepare_contract
 from cayu.collaboration.mandates import MandateAccessContext
 from cayu.collaboration.waits import CollaborationWait, request_object_ref
-from cayu.runtime._session_continuation import (
+from cayu.sessions._session_continuation import (
     ContinuationRecord,
     ContinuationWait,
     continuation_digest,
@@ -83,8 +83,11 @@ class _ExecutionToWait:
 
     async def parked_replay(self, *, permit_operation: str, permit_commitment: str) -> bool:
         """Recognize the exact released invocation, not a terminal status guess."""
-        from cayu.runtime._session_continuation import ContinuationConflict, ContinuationUnavailable
         from cayu.runtime._session_continuation_store import require_released_wait_invocation
+        from cayu.sessions._session_continuation import (
+            ContinuationConflict,
+            ContinuationUnavailable,
+        )
         from cayu.sessions.base import _invocation_lifecycle_authority_read_scope
 
         record = await self.owner.store.load_continuation_ticket(

@@ -12,15 +12,15 @@ from cayu._validation import canonical_durable_json_bytes
 from cayu.runtime._invocation_lifecycle import (
     InvocationContext,
 )
-from cayu.runtime._session_continuation import (
+from cayu.sessions._invocation_lifecycle import (
+    AdmitInvocationCommand,
+    InvocationMutationResult,
+)
+from cayu.sessions._session_continuation import (
     ContinuationConsumption,
     ContinuationService,
     continuation_admission_digest,
     continuation_admission_inputs,
-)
-from cayu.sessions._invocation_lifecycle import (
-    AdmitInvocationCommand,
-    InvocationMutationResult,
 )
 
 if TYPE_CHECKING:

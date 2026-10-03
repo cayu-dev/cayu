@@ -3486,10 +3486,6 @@ from cayu.runtime._producer_retirement import ProducerCleanupRetirement as Produ
 from cayu.runtime._recovery_coordinator import (
     ModelCompletionManualRecoveryRequired as ModelCompletionManualRecoveryRequired,
 )
-from cayu.runtime._session_continuation import ContinuationConflict as ContinuationConflict
-from cayu.runtime._session_continuation import ContinuationRecord as ContinuationRecord
-from cayu.runtime._session_continuation import ContinuationService as ContinuationService
-from cayu.runtime._session_continuation import ContinuationUnavailable as ContinuationUnavailable
 from cayu.runtime._task_group_invocation import (
     TaskGroupInvocationSettlementPending as TaskGroupInvocationSettlementPending,
 )
@@ -3885,6 +3881,10 @@ from cayu.sessions._participant_discovery import (
 from cayu.sessions._recipient_continuation import (
     RecipientContinuationSelection as RecipientContinuationSelection,
 )
+from cayu.sessions._session_continuation import ContinuationConflict as ContinuationConflict
+from cayu.sessions._session_continuation import ContinuationRecord as ContinuationRecord
+from cayu.sessions._session_continuation import ContinuationService as ContinuationService
+from cayu.sessions._session_continuation import ContinuationUnavailable as ContinuationUnavailable
 from cayu.sessions.access import SessionAccessRule as SessionAccessRule
 from cayu.sessions.access import SessionAccessScope as SessionAccessScope
 from cayu.sessions.access import SessionAccessSelector as SessionAccessSelector

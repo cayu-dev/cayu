@@ -31,8 +31,8 @@ from cayu.collaboration.base import CollaborationStore, _Anchor, _Repository
 from cayu.collaboration.clarifications import ClarificationDueCursor, ClarificationLineageUsage
 from cayu.collaboration.participants import CollaborationInitialization, CollaborationUnavailable
 from cayu.collaboration.waits import request_object_ref
-from cayu.runtime._session_continuation import continuation_digest
-from cayu.runtime._temporary_continuation import (
+from cayu.sessions._session_continuation import continuation_digest
+from cayu.sessions._temporary_continuation import (
     TemporaryServiceDispatch,
     TemporaryServicePreparation,
 )

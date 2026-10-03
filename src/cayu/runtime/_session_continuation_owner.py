@@ -30,30 +30,7 @@ from cayu.collaboration.participants import CollaborationCapacityExceeded, Colla
 from cayu.runtime._invocation_lifecycle import (
     InvocationContext,
 )
-from cayu.runtime._session_continuation import (
-    ContinuationConflict,
-    ContinuationConsumption,
-    ContinuationLatch,
-    ContinuationLatchReceiver,
-    ContinuationNamespace,
-    ContinuationPreparation,
-    ContinuationRecord,
-    ContinuationReleasedRetirement,
-    ContinuationRetirement,
-    ContinuationService,
-    ContinuationTicket,
-    ContinuationUnavailable,
-    ContinuationWait,
-    admit_continuation,
-    continuation_admission_digest,
-    continuation_admission_inputs,
-    continuation_digest,
-    continuation_namespace_id,
-    continuation_operation_key,
-    continuation_registration_operation,
-    require_latch_identity,
-    require_ticket_identity,
-)
+from cayu.runtime._session_continuation import admit_continuation
 from cayu.runtime._session_continuation_scope import (
     authenticated_latch_scope,
     consumption_scope,
@@ -61,16 +38,6 @@ from cayu.runtime._session_continuation_scope import (
     preparation_scope,
     require_ticket_invocation,
     retirement_scope,
-)
-from cayu.runtime._temporary_continuation import (
-    TemporaryServiceAdmission,
-    TemporaryServiceDispatch,
-    TemporaryServiceIntent,
-    TemporaryServicePreparation,
-    TemporaryServiceRecord,
-    require_temporary_service_command,
-    temporary_admission_payload_sha256,
-    temporary_service_key,
 )
 from cayu.runtime._temporary_continuation_permits import (
     TemporaryServicePermitAuthority,
@@ -84,6 +51,39 @@ from cayu.sessions._invocation_lifecycle import (
     PreparedInvocationBinding,
     copy_invocation_lifecycle_command,
     invocation_admission_command_sha256,
+)
+from cayu.sessions._session_continuation import (
+    ContinuationConflict,
+    ContinuationConsumption,
+    ContinuationLatch,
+    ContinuationLatchReceiver,
+    ContinuationNamespace,
+    ContinuationPreparation,
+    ContinuationRecord,
+    ContinuationReleasedRetirement,
+    ContinuationRetirement,
+    ContinuationService,
+    ContinuationTicket,
+    ContinuationUnavailable,
+    ContinuationWait,
+    continuation_admission_digest,
+    continuation_admission_inputs,
+    continuation_digest,
+    continuation_namespace_id,
+    continuation_operation_key,
+    continuation_registration_operation,
+    require_latch_identity,
+    require_ticket_identity,
+)
+from cayu.sessions._temporary_continuation import (
+    TemporaryServiceAdmission,
+    TemporaryServiceDispatch,
+    TemporaryServiceIntent,
+    TemporaryServicePreparation,
+    TemporaryServiceRecord,
+    require_temporary_service_command,
+    temporary_admission_payload_sha256,
+    temporary_service_key,
 )
 from cayu.sessions.base import ResumeRequest, SessionStore, copy_resume_request
 from cayu.vaults.redaction import SecretRedactor
@@ -499,7 +499,7 @@ class SessionContinuationOwner:
     ) -> ContinuationRecord:
         """Retire only through native release and acknowledged service evidence."""
         from cayu.runtime._session_continuation_scope import released_retirement_scope
-        from cayu.runtime._temporary_continuation import (
+        from cayu.sessions._temporary_continuation import (
             TemporaryServiceRecord,
             reference_for_service,
         )

@@ -64,11 +64,11 @@ from cayu.storage._session_execution import SQLiteSessionExecutionMixin
 from cayu.storage.targets import require_sqlite_store_allowed
 
 if TYPE_CHECKING:
-    from cayu.runtime._temporary_continuation import TemporaryServiceAdmission
     from cayu.runtime._zero_work_interruption import (
         ZeroWorkInterruptionPublication,
         ZeroWorkInterruptionRequest,
     )
+    from cayu.sessions._temporary_continuation import TemporaryServiceAdmission
     from cayu.sessions.access import _SessionAccessBounds
     from cayu.sessions.exports import SessionExportLimits, SessionExportSnapshot
 
@@ -7078,11 +7078,11 @@ class SQLiteSessionStore(
                         session_id=session_id,
                     )
                 if temporary_service_admission is not None:
-                    from cayu.runtime._session_continuation import continuation_operation_key
-                    from cayu.runtime._temporary_continuation import temporary_service_key
                     from cayu.runtime._temporary_continuation_store import (
                         compose_temporary_service_admission,
                     )
+                    from cayu.sessions._session_continuation import continuation_operation_key
+                    from cayu.sessions._temporary_continuation import temporary_service_key
 
                     intent = temporary_service_admission.dispatch.intent
                     parent_key = continuation_operation_key(intent.ticket)

@@ -382,7 +382,7 @@ class WaitCoordinator:
             raise CollaborationUnavailable("Wait has no elected result.")
         if wait.delivery_ticket is None:
             raise CollaborationUnavailable("Wait has no session delivery binding.")
-        from cayu.runtime._session_continuation import require_latch_identity
+        from cayu.sessions._session_continuation import require_latch_identity
 
         latch = _elected_latch(current, self._redactor)
         record = await (
@@ -441,7 +441,7 @@ class WaitCoordinator:
             raise CollaborationConflict("Wait is not eligible for exclusion.")
         if wait.delivery_ticket is None:
             raise CollaborationUnavailable("Wait has no session delivery binding.")
-        from cayu.runtime._session_continuation import ContinuationRetirement
+        from cayu.sessions._session_continuation import ContinuationRetirement
 
         reason = (
             "expired"
@@ -464,7 +464,7 @@ class WaitCoordinator:
         if _released_permit is None:
             record = await continuation_owner.exclude(retirement, invocation=invocation)
         else:
-            from cayu.runtime._session_continuation import (
+            from cayu.sessions._session_continuation import (
                 ContinuationReleasedRetirement,
                 require_ticket_identity,
             )
@@ -557,7 +557,7 @@ class WaitCoordinator:
 
 def _elected_latch(snapshot: WaitSnapshot, redactor):
     """Derive the complete receiving command solely from retained election state."""
-    from cayu.runtime._session_continuation import ContinuationLatch
+    from cayu.sessions._session_continuation import ContinuationLatch
 
     election = snapshot.election
     ticket = snapshot.registration.wait.delivery_ticket
@@ -595,7 +595,7 @@ class CollaborationWaitLatchReceiver:
 
     async def authenticate_continuation_retirement(self, wait, record):
         """Authenticate settlement from the exact durable wait, never caller receipts."""
-        from cayu.runtime._session_continuation import (
+        from cayu.sessions._session_continuation import (
             ContinuationRecord,
             continuation_digest,
             require_ticket_identity,
@@ -647,7 +647,7 @@ class CollaborationWaitLatchReceiver:
         return await self._receive_latch(latch, wait_for_settlement=True)
 
     async def _receive_latch(self, latch, *, wait_for_settlement):
-        from cayu.runtime._session_continuation import ContinuationLatch
+        from cayu.sessions._session_continuation import ContinuationLatch
 
         latch = prepare_contract(ContinuationLatch, latch, redactor=self._redactor)
         if latch.wait_operation is None:
@@ -669,7 +669,7 @@ class CollaborationWaitLatchReceiver:
 
     async def _authenticate_latch(self, latch):
         from cayu.collaboration.waits import WaitSnapshot, wait_operation_key
-        from cayu.runtime._session_continuation import require_latch_identity
+        from cayu.sessions._session_continuation import require_latch_identity
 
         async with self._store._transaction(
             self._initialized.binding.application_scope, write=False

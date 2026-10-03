@@ -25,8 +25,11 @@ from cayu.collaboration._request_store import operation_key
 from cayu.collaboration.base import CollaborationStore
 from cayu.collaboration.participants import CollaborationInitialization, CollaborationUnavailable
 from cayu.deadlines import ExecutionDeadline
-from cayu.runtime._session_continuation import ContinuationConflict, continuation_digest
-from cayu.runtime._temporary_continuation import (
+from cayu.sessions._session_continuation import (
+    ContinuationConflict,
+    continuation_digest,
+)
+from cayu.sessions._temporary_continuation import (
     TemporaryServiceAdmission,
     TemporaryServiceDispatch,
     TemporaryServiceIntent,

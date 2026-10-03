@@ -5,8 +5,8 @@ from hashlib import sha256
 from cayu.collaboration._preparation import contract_bytes
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime._continuation_recovery_selection import read_consumed_continuation_release
-from cayu.runtime._session_continuation import ContinuationUnavailable
 from cayu.runtime._session_continuation_store import digest
+from cayu.sessions._session_continuation import ContinuationUnavailable
 from cayu.sessions.recovery import (
     ContinuationRecoveryExpectation,
     RecoveryExecutionRequest,

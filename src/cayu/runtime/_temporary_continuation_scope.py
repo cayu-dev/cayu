@@ -7,9 +7,9 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 
 from cayu.collaboration._preparation import prepare_contract
-from cayu.runtime._session_continuation import continuation_operation_key
 from cayu.runtime._session_continuation_scope import service_publication_scope
-from cayu.runtime._temporary_continuation import (
+from cayu.sessions._session_continuation import continuation_operation_key
+from cayu.sessions._temporary_continuation import (
     TemporaryServiceAdmission,
     require_temporary_service_command,
     temporary_service_key,
@@ -29,8 +29,8 @@ def temporary_admission_scope(
     require_temporary_service_command(admission, command)
     token = _ADMISSION.set(admission)
     try:
-        from cayu.runtime._session_continuation import CONTINUATION_NAMESPACE_KEY
         from cayu.runtime._temporary_service_target import target_service_key
+        from cayu.sessions._session_continuation import CONTINUATION_NAMESPACE_KEY
 
         if admission.dispatch.intent.mode == "side_session":
             with service_publication_scope(

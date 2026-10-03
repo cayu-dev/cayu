@@ -11,14 +11,6 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from cayu.collaboration._preparation import prepare_contract
-from cayu.runtime._session_continuation import (
-    CONTINUATION_MAX_SERVICES,
-    ContinuationConflict,
-    ContinuationRecord,
-    continuation_operation_key,
-    continuation_writer_frontier,
-    require_ticket_identity,
-)
 from cayu.runtime._session_continuation_scope import current_publication_key
 from cayu.runtime._session_continuation_store import (
     ROOT_KEY,
@@ -27,7 +19,15 @@ from cayu.runtime._session_continuation_store import (
     require_history,
     service_receipt_epochs,
 )
-from cayu.runtime._temporary_continuation import (
+from cayu.sessions._session_continuation import (
+    CONTINUATION_MAX_SERVICES,
+    ContinuationConflict,
+    ContinuationRecord,
+    continuation_operation_key,
+    continuation_writer_frontier,
+    require_ticket_identity,
+)
+from cayu.sessions._temporary_continuation import (
     TemporaryServiceAdmission,
     TemporaryServiceExecution,
     TemporaryServiceRecord,

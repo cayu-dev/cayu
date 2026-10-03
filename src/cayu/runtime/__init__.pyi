@@ -412,22 +412,6 @@ from cayu.runtime._policy_evidence import ToolPolicyEvidence as ToolPolicyEviden
 from cayu.runtime._recovery_coordinator import (
     ModelCompletionManualRecoveryRequired as ModelCompletionManualRecoveryRequired,
 )
-from cayu.runtime._session_continuation import ContinuationConflict as ContinuationConflict
-from cayu.runtime._session_continuation import ContinuationConsumption as ContinuationConsumption
-from cayu.runtime._session_continuation import ContinuationLatch as ContinuationLatch
-from cayu.runtime._session_continuation import (
-    ContinuationLatchReceiver as ContinuationLatchReceiver,
-)
-from cayu.runtime._session_continuation import ContinuationNamespace as ContinuationNamespace
-from cayu.runtime._session_continuation import ContinuationPreparation as ContinuationPreparation
-from cayu.runtime._session_continuation import ContinuationRecord as ContinuationRecord
-from cayu.runtime._session_continuation import ContinuationRetirement as ContinuationRetirement
-from cayu.runtime._session_continuation import ContinuationService as ContinuationService
-from cayu.runtime._session_continuation import ContinuationTicket as ContinuationTicket
-from cayu.runtime._session_continuation import (
-    ContinuationUnavailable as ContinuationUnavailable,
-)
-from cayu.runtime._session_continuation import ContinuationWait as ContinuationWait
 from cayu.runtime._session_continuation_owner import (
     SessionContinuationOwner as SessionContinuationOwner,
 )
@@ -887,6 +871,20 @@ from cayu.sessions._invocation_lifecycle import (
 from cayu.sessions._invocation_lifecycle import (
     copy_invocation_lifecycle_command as copy_invocation_lifecycle_command,
 )
+from cayu.sessions._session_continuation import ContinuationConflict as ContinuationConflict
+from cayu.sessions._session_continuation import ContinuationConsumption as ContinuationConsumption
+from cayu.sessions._session_continuation import ContinuationLatch as ContinuationLatch
+from cayu.sessions._session_continuation import (
+    ContinuationLatchReceiver as ContinuationLatchReceiver,
+)
+from cayu.sessions._session_continuation import ContinuationNamespace as ContinuationNamespace
+from cayu.sessions._session_continuation import ContinuationPreparation as ContinuationPreparation
+from cayu.sessions._session_continuation import ContinuationRecord as ContinuationRecord
+from cayu.sessions._session_continuation import ContinuationRetirement as ContinuationRetirement
+from cayu.sessions._session_continuation import ContinuationService as ContinuationService
+from cayu.sessions._session_continuation import ContinuationTicket as ContinuationTicket
+from cayu.sessions._session_continuation import ContinuationUnavailable as ContinuationUnavailable
+from cayu.sessions._session_continuation import ContinuationWait as ContinuationWait
 from cayu.sessions.authority import SessionRunFenced as SessionRunFenced
 from cayu.sessions.base import (
     DEFAULT_PENDING_ACTION_RESULT_MAX_BYTES as DEFAULT_PENDING_ACTION_RESULT_MAX_BYTES,

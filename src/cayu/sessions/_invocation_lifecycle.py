@@ -491,7 +491,7 @@ class AdmitInvocationCommand(_InvocationCommandModel):
     @model_validator(mode="after")
     def validate_admission_authority(self) -> AdmitInvocationCommand:
         if self.temporary_service_operation_key is not None:
-            from cayu.runtime._session_continuation import CONTINUATION_SERVICE_PREFIX
+            from cayu.sessions._session_continuation import CONTINUATION_SERVICE_PREFIX
 
             key = self.temporary_service_operation_key
             suffix = key.removeprefix(CONTINUATION_SERVICE_PREFIX)

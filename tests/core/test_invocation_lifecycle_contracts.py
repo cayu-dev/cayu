@@ -115,6 +115,7 @@ blocked = {
     "cayu.runtime._invocation_lifecycle", "cayu.runtime._checkpoint_store",
     "cayu.runtime._session_engine", "cayu.runtime._recovery_coordinator",
     "cayu.runtime._runtime_records", "cayu.storage.sqlite", "cayu.storage.postgres",
+    "cayu.runtime._session_continuation", "cayu.runtime._temporary_continuation",
 }
 class RejectLiveExecution(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
@@ -124,6 +125,9 @@ sys.meta_path.insert(0, RejectLiveExecution())
 from cayu.runtime import AdmitInvocationCommand
 from cayu.sessions import _invocation_lifecycle as contracts
 from cayu.sessions._execution_profile_checkpoint import ActiveInvocationExecutionProfile
+from cayu.sessions._session_continuation import (
+    continuation_admission_digest, continuation_admission_inputs,
+)
 from cayu.events import Event, EventType
 from cayu.tools.exposure import ToolCapabilityCeiling
 
@@ -143,6 +147,9 @@ command = AdmitInvocationCommand(
 )
 assert type(command) is contracts.AdmitInvocationCommand
 assert contracts.copy_invocation_lifecycle_command(command) == command
+assert continuation_admission_digest(command) == (
+    contracts.invocation_admission_command_sha256(command))
+assert continuation_admission_inputs(command)[1] == active.profile.fingerprint
 assert contracts.invocation_admission_command_sha256(command) == (
     contracts.invocation_admission_command_sha256(
         contracts.copy_invocation_lifecycle_command(command)))
