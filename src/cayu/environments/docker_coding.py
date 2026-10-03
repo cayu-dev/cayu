@@ -88,8 +88,8 @@ from cayu.workspaces.revisions import (
 from cayu.workspaces.runner import RunnerWorkspace
 
 if TYPE_CHECKING:
+    from cayu.knowledge.base import KnowledgeStore
     from cayu.knowledge.scopes import KnowledgeAccessScope
-    from cayu.storage.memory import KnowledgeStore
 
 DOCKER_CODING_PROTECTED_DIRECTORY_NAMES = (".cayu", ".git", ".runtime")
 _DOCKER_CODING_RUNTIME_EXECUTABLES = ("git", "python3", "rm", "sh", "sleep")

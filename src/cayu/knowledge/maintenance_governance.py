@@ -26,6 +26,7 @@ from cayu._validation import (
     require_durable_clean_nonblank,
 )
 from cayu.knowledge.activation_contracts import KnowledgeGovernanceConfig, KnowledgeGovernanceMode
+from cayu.knowledge.base import KnowledgeStore
 from cayu.knowledge.maintenance_contracts import (
     KnowledgeMaintenanceConflict,
     KnowledgeMaintenanceDecision,
@@ -48,10 +49,7 @@ from cayu.knowledge.scopes import (
     copy_knowledge_access_scope,
     knowledge_access_scope_sha256,
 )
-from cayu.storage.memory import (
-    KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY,
-    KnowledgeStore,
-)
+from cayu.storage.memory import KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY
 
 MAX_KNOWLEDGE_MAINTENANCE_GOVERNANCE_ANNOTATION_BYTES = 4_096
 MAX_KNOWLEDGE_MAINTENANCE_GOVERNANCE_REQUEST_BYTES = 512_000

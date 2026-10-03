@@ -314,6 +314,7 @@ from cayu.execution_profiles import (
     unavailable_execution_profile_components,
 )
 from cayu.knowledge._publication import KnowledgePublicationScope
+from cayu.knowledge.base import KnowledgeStore
 from cayu.knowledge.scopes import (
     KnowledgeAccessScope,
     copy_knowledge_access_scope,
@@ -730,9 +731,6 @@ from cayu.sessions.recovery import (
     RecoveryPlanRequest,
     RecoveryReceipt,
     StartupRecoveryResult,
-)
-from cayu.storage.memory import (
-    KnowledgeStore,
 )
 from cayu.tasks._scheduling import schedule_creation_digest
 from cayu.tasks._verified_work_authority import (

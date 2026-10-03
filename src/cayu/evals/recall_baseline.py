@@ -18,6 +18,7 @@ from cayu._validation import (
     require_durable_nonblank,
 )
 from cayu.evals.memory_baseline import MemoryRetrievalAccessSpec
+from cayu.knowledge.base import KnowledgeStore
 from cayu.knowledge.records import (
     KnowledgeChunk,
     KnowledgeEntry,
@@ -55,9 +56,6 @@ from cayu.sessions.base import (
     SessionIdentity,
     SessionQuery,
     SessionStore,
-)
-from cayu.storage.memory import (
-    KnowledgeStore,
 )
 
 RECALL_BASELINE_CORPUS_SCHEMA_VERSION = "cayu.recall_baseline_corpus.v2"

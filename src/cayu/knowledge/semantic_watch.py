@@ -37,6 +37,7 @@ from cayu._validation import (
     require_durable_nonblank,
     thaw_json_value,
 )
+from cayu.knowledge.base import KnowledgeStore
 from cayu.knowledge.records import (
     DEFAULT_KNOWLEDGE_NAMESPACE,
     KnowledgeChunk,
@@ -63,9 +64,6 @@ from cayu.memory.recall import (
     RecallSourceUnavailable,
 )
 from cayu.memory.retrieval import RetrievalFusionDiagnostics
-from cayu.storage.memory import (
-    KnowledgeStore,
-)
 
 MAX_KNOWLEDGE_SEMANTIC_WATCH_OBSERVATION_BYTES = RECALL_MAX_QUERY_BYTES
 MAX_KNOWLEDGE_SEMANTIC_WATCH_ANNOTATION_BYTES = 4_096

@@ -35,6 +35,7 @@ from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
 from cayu._validation import require_durable_nonblank as require_nonblank
+from cayu.knowledge.base import KnowledgeStore
 from cayu.knowledge.changes import MAX_KNOWLEDGE_CHANGE_SEQUENCE
 from cayu.knowledge.indexing import KnowledgeIndexCoverage
 from cayu.knowledge.records import (
@@ -77,9 +78,6 @@ from cayu.sessions.base import (
     SessionStore,
     TranscriptSearchQuery,
     encode_transcript_search_cursor,
-)
-from cayu.storage.memory import (
-    KnowledgeStore,
 )
 
 RECALL_ENGINE_VERSION = "cayu.recall.v1"

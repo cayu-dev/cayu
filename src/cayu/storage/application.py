@@ -21,12 +21,12 @@ from cayu.storage.targets import (
 )
 
 if TYPE_CHECKING:
+    from cayu.knowledge.base import KnowledgeStore
     from cayu.knowledge.scopes import KnowledgeAccessScope
     from cayu.runtime._policy_storage import ModelPolicyStore
     from cayu.runtime.public_authority import PublicAuthorityAliasCodec
     from cayu.server import ProductOperationStore
     from cayu.sessions.base import SessionStore
-    from cayu.storage.memory import KnowledgeStore
     from cayu.tasks.base import TaskStore
 
 

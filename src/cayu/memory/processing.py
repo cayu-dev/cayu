@@ -20,6 +20,7 @@ from cayu._validation import (
     canonical_durable_json_bytes,
     require_durable_clean_nonblank,
 )
+from cayu.knowledge.base import KnowledgeStore
 from cayu.knowledge.changes import KnowledgeChange, KnowledgeChangeBatch, copy_knowledge_change
 from cayu.knowledge.indexing import (
     KnowledgeEmbeddingIdentity,
@@ -56,9 +57,6 @@ from cayu.memory.recall import (
     RecallSourceStatus,
 )
 from cayu.memory.retrieval import WeightedReciprocalRankFusionConfig
-from cayu.storage.memory import (
-    KnowledgeStore,
-)
 from cayu.work_context import (
     MAX_AGENT_WORK_CONTEXT_ID_BYTES,
     AgentRecallCheckpoint,

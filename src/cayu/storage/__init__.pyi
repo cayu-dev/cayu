@@ -47,6 +47,7 @@ from cayu.knowledge.activation_contracts import KnowledgeReviewApproval as Knowl
 from cayu.knowledge.activation_contracts import (
     prepare_knowledge_activation_request as prepare_knowledge_activation_request,
 )
+from cayu.knowledge.base import KnowledgeStore as KnowledgeStore
 from cayu.knowledge.changes import MAX_KNOWLEDGE_CHANGE_LIMIT as MAX_KNOWLEDGE_CHANGE_LIMIT
 from cayu.knowledge.changes import MAX_KNOWLEDGE_CHANGE_SEQUENCE as MAX_KNOWLEDGE_CHANGE_SEQUENCE
 from cayu.knowledge.changes import KnowledgeChange as KnowledgeChange
@@ -260,7 +261,6 @@ from cayu.storage.knowledge_transition import (
 )
 from cayu.storage.memory import InMemoryEmbeddingKnowledgeStore as InMemoryEmbeddingKnowledgeStore
 from cayu.storage.memory import InMemoryKnowledgeStore as InMemoryKnowledgeStore
-from cayu.storage.memory import KnowledgeStore as KnowledgeStore
 from cayu.storage.postgres import PostgresAgentWorkContextStore as PostgresAgentWorkContextStore
 from cayu.storage.postgres import PostgresBudgetLedger as PostgresBudgetLedger
 from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore as PostgresEmbeddingKnowledgeStore

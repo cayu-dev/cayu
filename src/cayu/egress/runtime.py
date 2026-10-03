@@ -133,6 +133,7 @@ from cayu.events import Event, EventType
 from cayu.execution_profiles import (
     event_with_execution_profile_fingerprint_authority,
 )
+from cayu.knowledge.base import KnowledgeStore
 from cayu.knowledge.scopes import KnowledgeAccessScope
 from cayu.runners._subprocess import (
     copy_runner_env,
@@ -173,9 +174,6 @@ from cayu.runtime.execution_identity import (
     copy_execution_profile_behavior_identity,
 )
 from cayu.sessions.base import _current_session_interaction_id
-from cayu.storage.memory import (
-    KnowledgeStore,
-)
 from cayu.tools.base import ToolRunnerCapabilityRequirement
 from cayu.vaults import SecretRedactor, SecretRef, SecretResolver
 from cayu.workspaces import LocalWorkspace, RunnerBoundWorkspace, Workspace

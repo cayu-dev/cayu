@@ -206,7 +206,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "KnowledgeSearchMode": ("cayu.knowledge.search", "KnowledgeSearchMode"),
     "KnowledgeSearchResult": ("cayu.knowledge.search", "KnowledgeSearchResult"),
     "KnowledgeStatus": ("cayu.knowledge.records", "KnowledgeStatus"),
-    "KnowledgeStore": ("cayu.storage.memory", "KnowledgeStore"),
+    "KnowledgeStore": ("cayu.knowledge.base", "KnowledgeStore"),
     "KnowledgeVisibility": ("cayu.knowledge.records", "KnowledgeVisibility"),
     "MAX_KNOWLEDGE_ACTIVATION_ANNOTATION_BYTES": (
         "cayu.knowledge.activation_contracts",

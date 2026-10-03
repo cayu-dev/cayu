@@ -31,10 +31,8 @@ from cayu.workspaces import Workspace
 from cayu.workspaces.checkpoints import WorkspaceCheckpointPolicy
 
 if TYPE_CHECKING:
+    from cayu.knowledge.base import KnowledgeStore
     from cayu.knowledge.scopes import KnowledgeAccessScope
-    from cayu.storage.memory import (
-        KnowledgeStore,
-    )
 else:
     KnowledgeAccessScope = Any
     KnowledgeStore = Any

@@ -16,6 +16,7 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_durable_nonblank,
 )
+from cayu.knowledge.base import KnowledgeStore
 from cayu.storage import (
     KnowledgeAccessScope,
     KnowledgeChunk,
@@ -24,7 +25,6 @@ from cayu.storage import (
     KnowledgeQuery,
     KnowledgeSearchMode,
     KnowledgeStatus,
-    KnowledgeStore,
     KnowledgeVisibility,
 )
 

@@ -38,6 +38,7 @@ from cayu.knowledge.activation_contracts import (
     copy_knowledge_activation_receipt,
     prepare_knowledge_activation_request,
 )
+from cayu.knowledge.base import KnowledgeStore
 from cayu.knowledge.governance import (
     REVIEWED_ROUTING_POLICY_IDENTITY,
     REVIEWED_ROUTING_POLICY_VERSION,
@@ -91,9 +92,6 @@ from cayu.storage.knowledge_indexer import (
     content_knowledge_entry_id,
     copy_knowledge_index_result,
     knowledge_source_hash,
-)
-from cayu.storage.memory import (
-    KnowledgeStore,
 )
 from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
 from cayu.tools._operation_boundary import (

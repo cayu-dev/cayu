@@ -3266,7 +3266,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "KnowledgeSemanticWatchRequest",
     ),
     "KnowledgeStatus": ("cayu.knowledge.records", "KnowledgeStatus"),
-    "KnowledgeStore": ("cayu.storage.memory", "KnowledgeStore"),
+    "KnowledgeStore": ("cayu.knowledge.base", "KnowledgeStore"),
     "KnowledgeStoreHandle": ("cayu.tools.base", "KnowledgeStoreHandle"),
     "KnowledgeVisibility": ("cayu.knowledge.records", "KnowledgeVisibility"),
     "LLMJudge": ("cayu.evals.judges", "LLMJudge"),

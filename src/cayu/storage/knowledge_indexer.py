@@ -17,6 +17,7 @@ from cayu._validation import (
     require_finite,
     require_nonblank,
 )
+from cayu.knowledge.base import KnowledgeStore
 from cayu.knowledge.records import (
     DEFAULT_KNOWLEDGE_KIND,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
@@ -33,9 +34,6 @@ from cayu.knowledge.records import (
 from cayu.knowledge.scopes import (
     KnowledgeAccessScope,
     copy_knowledge_access_scope,
-)
-from cayu.storage.memory import (
-    KnowledgeStore,
 )
 
 DEFAULT_KNOWLEDGE_CHUNK_TARGET_BYTES = 4_000

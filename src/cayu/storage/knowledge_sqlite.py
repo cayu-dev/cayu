@@ -49,6 +49,7 @@ from cayu.knowledge.activation_contracts import (
     copy_knowledge_activation_authority,
     copy_knowledge_activation_receipt,
 )
+from cayu.knowledge.base import KnowledgeStore
 from cayu.knowledge.changes import (
     KnowledgeChange,
     KnowledgeChangeBatch,
@@ -184,7 +185,6 @@ from cayu.storage._knowledge_closure import (
 from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage.memory import (
     KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY,
-    KnowledgeStore,
     _activation_receipt_matches,
     _bounded_knowledge_evidence,
     _bounded_knowledge_lineage_result,

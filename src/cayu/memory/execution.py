@@ -78,6 +78,7 @@ from cayu.execution_profiles import (
     ExecutionProfileComponentClass,
     ExecutionProfileIdentity,
 )
+from cayu.knowledge.base import KnowledgeStore
 from cayu.knowledge.scopes import (
     KnowledgeAccessScope,
     copy_knowledge_access_scope,
@@ -146,9 +147,6 @@ from cayu.snapshots.base import (
     AgentSnapshotTerminalDisposition,
     AgentSnapshotTrialBinding,
     execution_profile_snapshot_ref,
-)
-from cayu.storage.memory import (
-    KnowledgeStore,
 )
 from cayu.storage.targets import require_sqlite_store_allowed
 

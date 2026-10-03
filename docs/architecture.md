@@ -480,8 +480,11 @@ and activation contracts without reading ambient authority or writing storage.
 Retained asynchronous publication tasks remain owned by `knowledge/_publication.py`.
 These contracts, application activation policies and the maintenance
 router/planner can be used without loading a storage implementation.
-Memory, SQLite and PostgreSQL stores compose the same contracts
-with their own access checks and atomic persistence operations.
+`knowledge/base.py` owns the `KnowledgeStore` interface, default scope handling
+and optional-operation refusals. Custom stores can implement it without loading
+a built-in backend. Resource constraints still intersect through `knowledge/access.py`;
+backend access checks and atomic persistence operations remain with each store.
+Memory, SQLite and PostgreSQL stores compose this interface and the same contracts.
 The existing `cayu`, `cayu.storage` and `cayu.storage.memory` imports resolve to
 the same canonical types, including persisted legacy pickle class paths.
 

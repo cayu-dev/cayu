@@ -2,6 +2,7 @@
 
 Import capabilities from their owning modules, for example::
 
+    from cayu.knowledge.base import KnowledgeStore
     from cayu.knowledge.records import KnowledgeEntry, KnowledgeRevisionRef
     from cayu.knowledge.relations import KnowledgeRelation, KnowledgeLineageQuery
     from cayu.knowledge.maintenance_contracts import KnowledgeMaintenanceProposal

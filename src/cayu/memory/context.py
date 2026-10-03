@@ -36,6 +36,7 @@ from cayu.context.base import (
     _publish_or_record_recall_telemetry,
 )
 from cayu.events import EventType
+from cayu.knowledge.base import KnowledgeStore
 from cayu.knowledge.changes import KnowledgeChangeBatch
 from cayu.knowledge.indexing import KnowledgeIndexReadinessBatch, KnowledgeIndexState
 from cayu.knowledge.records import (
@@ -122,9 +123,6 @@ from cayu.sessions.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_KEY,
     RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_VERSION,
-)
-from cayu.storage.memory import (
-    KnowledgeStore,
 )
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 

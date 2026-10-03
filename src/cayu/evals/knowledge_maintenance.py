@@ -22,6 +22,7 @@ from cayu._validation import (
     require_durable_nonblank,
     require_finite,
 )
+from cayu.knowledge.base import KnowledgeStore
 from cayu.knowledge.maintenance import (
     KnowledgeMaintenanceCandidateSignal,
     KnowledgeMaintenanceRouter,
@@ -92,7 +93,6 @@ from cayu.storage import (
     KnowledgeReviewWorkflow,
     KnowledgeRevisionRef,
     KnowledgeStatus,
-    KnowledgeStore,
     KnowledgeVisibility,
     prepare_knowledge_maintenance_decision,
 )

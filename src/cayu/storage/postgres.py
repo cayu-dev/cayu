@@ -202,6 +202,7 @@ from cayu.knowledge.activation_contracts import (
     copy_knowledge_activation_authority,
     copy_knowledge_activation_receipt,
 )
+from cayu.knowledge.base import KnowledgeStore
 from cayu.knowledge.changes import (
     KnowledgeChange,
     KnowledgeChangeBatch,
@@ -838,7 +839,6 @@ from cayu.storage._task_scheduling_schema import POSTGRES_SCHEDULING_DDL
 from cayu.storage.knowledge_transition import require_empty_knowledge_revision_transition
 from cayu.storage.memory import (
     KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY,
-    KnowledgeStore,
     _activation_receipt_matches,
     _bounded_knowledge_evidence,
     _bounded_knowledge_lineage_result,
