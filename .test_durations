@@ -1,4 +1,12 @@
 {
+    "tests/core/test_knowledge_access_rules.py::test_access_rule_legacy_imports_pickles_and_annotations_remain_compatible": 0.022,
+    "tests/core/test_knowledge_access_rules.py::test_access_snapshots_copy_inputs_and_preserve_json_and_pickle_round_trips": 0.002,
+    "tests/core/test_knowledge_access_rules.py::test_activation_history_requires_current_or_explicit_retirement_authority": 0.001,
+    "tests/core/test_knowledge_access_rules.py::test_change_audiences_preserve_removal_visibility_and_require_every_relation_endpoint": 0.001,
+    "tests/core/test_knowledge_access_rules.py::test_knowledge_access_rules_compose_without_storage_implementations": 0.112,
+    "tests/core/test_knowledge_access_rules.py::test_relation_and_maintenance_checks_share_one_expiration_cutoff": 0.001,
+    "tests/core/test_knowledge_access_rules.py::test_retirement_and_lineage_do_not_grant_access_to_archived_content": 0.001,
+    "tests/core/test_knowledge_access_rules.py::test_shared_access_rules_preserve_scope_and_resource_predicates": 0.641,
     "tests/core/test_continuation_scope_authority.py::test_legacy_scopes_share_contexts_callables_and_historical_pickle_paths[_session_continuation_scope]": 0.0,
     "tests/core/test_continuation_scope_authority.py::test_legacy_scopes_share_contexts_callables_and_historical_pickle_paths[_temporary_continuation_scope]": 0.0,
     "tests/core/test_continuation_scope_authority.py::test_publication_scope_binds_exact_parent_child_and_restores_nested_authority[runtime]": 0.0,

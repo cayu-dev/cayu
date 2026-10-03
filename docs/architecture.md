@@ -494,7 +494,11 @@ router/planner can be used without loading a storage implementation.
 and optional-operation refusals. Custom stores can implement it without loading
 a built-in backend. Resource constraints still intersect through `knowledge/access.py`;
 backend access checks and atomic persistence operations remain with each store.
-Memory, SQLite and PostgreSQL stores compose this interface and the same contracts.
+`knowledge/_access_rules.py` owns shared authorization snapshots, change audiences
+and access decisions for entries, relations, maintenance and activation history.
+Memory, SQLite and PostgreSQL call these rules inside their existing storage
+operations; each backend retains its transaction and mutation boundaries.
+The stores compose this interface, these rules and the same contracts.
 The existing `cayu`, `cayu.storage` and `cayu.storage.memory` imports resolve to
 the same canonical types, including persisted legacy pickle class paths.
 
