@@ -1,4 +1,12 @@
 {
+    "tests/core/test_knowledge_revision_rules.py::test_default_revision_chunk_recognition_checks_every_persisted_field": 0.001,
+    "tests/core/test_knowledge_revision_rules.py::test_revision_chunk_copies_preserve_content_order_and_detach_metadata": 0.001,
+    "tests/core/test_knowledge_revision_rules.py::test_revision_evidence_copies_rebind_chunks_and_preserve_provenance": 0.002,
+    "tests/core/test_knowledge_revision_rules.py::test_revision_evidence_rejects_missing_chunk_references_and_duplicate_identity": 0.001,
+    "tests/core/test_knowledge_revision_rules.py::test_revision_rules_compose_without_storage_implementations": 0.1,
+    "tests/core/test_knowledge_revision_rules.py::test_revision_rules_have_one_owner_and_resolvable_annotations": 0.069,
+    "tests/core/test_knowledge_revision_rules.py::test_revision_successor_preserves_identity_and_timestamp_order": 0.001,
+    "tests/core/test_knowledge_revision_rules.py::test_revision_successor_relabel_requires_admitted_and_current_permission": 0.721,
     "tests/core/test_continuation_persistence_boundaries.py::test_persistence_records_and_projection_work_without_runtime_or_backends[_session_continuation_store]": 0.502,
     "tests/core/test_continuation_persistence_boundaries.py::test_persistence_records_and_projection_work_without_runtime_or_backends[_temporary_continuation_store]": 0.486,
     "tests/core/test_continuation_persistence_boundaries.py::test_persistence_records_and_projection_work_without_runtime_or_backends[_temporary_service_target]": 0.476,

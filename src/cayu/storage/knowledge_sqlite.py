@@ -54,6 +54,11 @@ from cayu.knowledge._access_rules import (
     _require_knowledge_entry_access,
     _require_knowledge_successor_access,
 )
+from cayu.knowledge._revision_rules import (
+    _copy_chunks_for_revision,
+    _copy_evidence_for_revision,
+    _validate_revision_successor,
+)
 from cayu.knowledge.access import runtime_knowledge_operation
 from cayu.knowledge.activation_contracts import (
     KnowledgeActivationAuthority,
@@ -210,8 +215,6 @@ from cayu.storage.memory import (
     _bounded_knowledge_evidence,
     _bounded_knowledge_lineage_result,
     _bounded_knowledge_relation_result,
-    _copy_chunks_for_revision,
-    _copy_evidence_for_revision,
     _decode_knowledge_lineage_cursor,
     _decode_knowledge_relation_cursor,
     _knowledge_change_now,
@@ -229,7 +232,6 @@ from cayu.storage.memory import (
     _validate_knowledge_search_frontier,
     _validate_review_approval_authority,
     _validate_review_approval_scope,
-    _validate_revision_successor,
 )
 from cayu.storage.targets import require_sqlite_store_allowed
 

@@ -508,7 +508,10 @@ backend access checks and atomic persistence operations remain with each store.
 and access decisions for entries, relations, maintenance and activation history.
 Memory, SQLite and PostgreSQL call these rules inside their existing storage
 operations; each backend retains its transaction and mutation boundaries.
-The stores compose this interface, these rules and the same contracts.
+`knowledge/_revision_rules.py` owns shared revision preparation: successor
+invariants, chunk construction and evidence identity and chunk remapping.
+The stores compose these rules inside the same operations, including ambient
+resource relabel checks, while retaining their clocks and persistence owners.
 The existing `cayu`, `cayu.storage` and `cayu.storage.memory` imports resolve to
 the same canonical types, including persisted legacy pickle class paths.
 

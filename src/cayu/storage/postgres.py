@@ -208,6 +208,11 @@ from cayu.knowledge._access_rules import (
     _require_knowledge_entry_access,
     _require_knowledge_successor_access,
 )
+from cayu.knowledge._revision_rules import (
+    _copy_chunks_for_revision,
+    _copy_evidence_for_revision,
+    _validate_revision_successor,
+)
 from cayu.knowledge.activation_contracts import (
     KnowledgeActivationAuthority,
     KnowledgeActivationConflict,
@@ -864,8 +869,6 @@ from cayu.storage.memory import (
     _bounded_knowledge_evidence,
     _bounded_knowledge_lineage_result,
     _bounded_knowledge_relation_result,
-    _copy_chunks_for_revision,
-    _copy_evidence_for_revision,
     _decode_knowledge_embedding_backfill_cursor,
     _decode_knowledge_lineage_cursor,
     _decode_knowledge_relation_cursor,
@@ -889,7 +892,6 @@ from cayu.storage.memory import (
     _validate_knowledge_search_frontier,
     _validate_review_approval_authority,
     _validate_review_approval_scope,
-    _validate_revision_successor,
 )
 from cayu.tasks import _verified_work_policy as verified_work_support
 from cayu.tasks._scheduling import (

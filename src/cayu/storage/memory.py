@@ -33,6 +33,7 @@ from cayu.embeddings import (
     TextEmbeddingRequest,
     copy_text_embedding_result,
 )
+from cayu.knowledge import _revision_rules
 from cayu.knowledge._access_rules import (
     _KNOWLEDGE_RETIREMENT_STATUSES as _KNOWLEDGE_RETIREMENT_STATUSES,
 )
@@ -845,7 +846,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 self._entries[copied.id] = {1: copied}
                 self._entry_payload_bytes[(copied.id, 1)] = payload_bytes
                 self._current_revisions[copied.id] = 1
-                self._chunks[(copied.id, 1)] = [_default_chunk_for_entry(copied)]
+                self._chunks[(copied.id, 1)] = [_revision_rules._default_chunk_for_entry(copied)]
                 self._evidence[(copied.id, 1)] = []
                 change = self._prepare_change(copied, kind=KnowledgeChangeKind.CREATED)
                 self._record_change(change, before_entry=None, after_entry=copied)
@@ -1286,7 +1287,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 successor=copied_entry,
                 operation="publish_entry_revision",
             )
-            _validate_revision_successor(existing_entry, copied_entry)
+            _revision_rules._validate_revision_successor(existing_entry, copied_entry)
             if copied_authority is None and copied_entry.id in self._activation_entry_ids:
                 _require_knowledge_activation_retirement_capacity(copied_entry)
         self._require_chunk_ids_available(
@@ -1649,7 +1650,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             successor=entry,
             operation=operation,
         )
-        _validate_revision_successor(current, entry)
+        _revision_rules._validate_revision_successor(current, entry)
         _require_knowledge_successor_access(access_scope, entry, operation=operation)
         if entry.id in self._activation_entry_ids:
             _require_knowledge_activation_retirement_capacity(entry)
@@ -1658,7 +1659,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         if inherit_evidence:
             if evidence is not None:
                 raise ValueError("Lifecycle evidence inheritance cannot accept evidence.")
-            copied_evidence = _copy_evidence_for_revision(
+            copied_evidence = _revision_rules._copy_evidence_for_revision(
                 self._evidence.get((current.id, current.revision), []),
                 entry=entry,
                 previous_chunks=previous_chunks,
@@ -1890,11 +1891,11 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         if chunks is not None:
             return _copy_entry_chunks(entry.id, entry.revision, chunks)
         if previous is None:
-            return [_default_chunk_for_entry(entry)]
+            return [_revision_rules._default_chunk_for_entry(entry)]
         previous_chunks = self._chunks.get((previous.id, previous.revision), [])
-        if _has_only_default_chunk(previous, previous_chunks):
-            return [_default_chunk_for_entry(entry)]
-        return _copy_chunks_for_revision(previous_chunks, entry)
+        if _revision_rules._has_only_default_chunk(previous, previous_chunks):
+            return [_revision_rules._default_chunk_for_entry(entry)]
+        return _revision_rules._copy_chunks_for_revision(previous_chunks, entry)
 
     def _load_activation_receipt_in_scope(
         self,
@@ -2053,7 +2054,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             operation="approve_pending_entry",
         )
         target_chunks = self._revision_chunks(activated, None, previous=current)
-        target_evidence = _copy_evidence_for_revision(
+        target_evidence = _revision_rules._copy_evidence_for_revision(
             current_evidence,
             entry=activated,
             previous_chunks=current_chunks,
@@ -2939,7 +2940,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             current = current_entries[successor.id]
             previous_chunks = self._chunks.get((current.id, current.revision), [])
             chunks = self._revision_chunks(successor, None, previous=current)
-            evidence = _copy_evidence_for_revision(
+            evidence = _revision_rules._copy_evidence_for_revision(
                 self._evidence.get((current.id, current.revision), []),
                 entry=successor,
                 previous_chunks=previous_chunks,
@@ -5054,11 +5055,11 @@ def _replay_review_approval_from_receipts(
             }
         )
         target_chunks = (
-            [_default_chunk_for_entry(after)]
-            if _has_only_default_chunk(before, before_chunks)
-            else _copy_chunks_for_revision(before_chunks, after)
+            [_revision_rules._default_chunk_for_entry(after)]
+            if _revision_rules._has_only_default_chunk(before, before_chunks)
+            else _revision_rules._copy_chunks_for_revision(before_chunks, after)
         )
-        target_evidence = _copy_evidence_for_revision(
+        target_evidence = _revision_rules._copy_evidence_for_revision(
             before_evidence,
             entry=after,
             previous_chunks=before_chunks,
@@ -5213,7 +5214,7 @@ def _knowledge_maintenance_successors(
             "updated_at": max(committed_at, replacement.created_at, replacement.updated_at),
         }
     )
-    _validate_revision_successor(replacement, active_replacement)
+    _revision_rules._validate_revision_successor(replacement, active_replacement)
     _require_knowledge_successor_access(
         access_scope,
         active_replacement,
@@ -5235,7 +5236,7 @@ def _knowledge_maintenance_successors(
                 "updated_at": max(committed_at, source.created_at, source.updated_at),
             }
         )
-        _validate_revision_successor(source, archived)
+        _revision_rules._validate_revision_successor(source, archived)
         _require_knowledge_successor_access(access_scope, archived, operation=operation)
         archived_sources.append(archived)
     archived_sources.sort(key=lambda entry: entry.id)
@@ -5536,103 +5537,6 @@ def _bounded_knowledge_lineage_result(
         truncated=truncated,
         next_cursor=next_cursor,
     )
-
-
-def _validate_revision_successor(
-    current: KnowledgeEntry,
-    successor: KnowledgeEntry,
-) -> None:
-    from cayu.knowledge.access import require_relabel
-
-    require_relabel(current.labels, successor.labels)
-    if successor.id != current.id:
-        raise ValueError("Knowledge revision must preserve the logical entry id.")
-    if successor.namespace != current.namespace:
-        raise ValueError("Knowledge revision must preserve the logical namespace.")
-    if successor.created_at != current.created_at:
-        raise ValueError("Knowledge revision must preserve the logical creation time.")
-    if successor.updated_at < current.updated_at:
-        raise ValueError("Knowledge revision `updated_at` cannot move backwards.")
-
-
-def _copy_evidence_for_revision(
-    evidence: list[KnowledgeEvidence],
-    *,
-    entry: KnowledgeEntry,
-    previous_chunks: list[KnowledgeChunk],
-    chunks: list[KnowledgeChunk],
-) -> list[KnowledgeEvidence]:
-    previous_indexes = {chunk.id: chunk.chunk_index for chunk in previous_chunks}
-    next_chunks = {chunk.chunk_index: chunk.id for chunk in chunks}
-    copied: list[KnowledgeEvidence] = []
-    for item in evidence:
-        chunk_id: str | None = None
-        if item.chunk_id is not None:
-            chunk_index = previous_indexes.get(item.chunk_id)
-            if chunk_index is None or chunk_index not in next_chunks:
-                raise RuntimeError(
-                    "Stored knowledge evidence references an unavailable source chunk."
-                )
-            chunk_id = next_chunks[chunk_index]
-        evidence_id = (
-            "ke_"
-            + sha256(
-                canonical_durable_json_bytes(
-                    {
-                        "contract": "cayu-knowledge-evidence-successor-v1",
-                        "source_evidence_id": item.id,
-                        "entry_id": entry.id,
-                        "entry_revision": entry.revision,
-                    },
-                    "knowledge evidence successor identity",
-                )
-            ).hexdigest()
-        )
-        copied.append(
-            KnowledgeEvidence(
-                id=evidence_id,
-                entry_id=entry.id,
-                entry_revision=entry.revision,
-                chunk_id=chunk_id,
-                role=item.role,
-                source_type=item.source_type,
-                source_id=item.source_id,
-                source_uri=item.source_uri,
-                source_revision=item.source_revision,
-                source_hash=item.source_hash,
-                locator=item.locator,
-                disposition=item.disposition,
-                created_at=item.created_at,
-                metadata=item.metadata,
-            )
-        )
-    return _copy_entry_evidence(
-        entry.id,
-        entry.revision,
-        copied,
-        chunks=chunks,
-    )
-
-
-def _copy_chunks_for_revision(
-    chunks: list[KnowledgeChunk],
-    entry: KnowledgeEntry,
-) -> list[KnowledgeChunk]:
-    if not chunks:
-        return [_default_chunk_for_entry(entry)]
-    return [
-        KnowledgeChunk(
-            id=f"{entry.id}:r{entry.revision}:{chunk.chunk_index}",
-            entry_id=entry.id,
-            entry_revision=entry.revision,
-            text=chunk.text,
-            chunk_index=chunk.chunk_index,
-            content_hash=chunk.content_hash,
-            source_uri=chunk.source_uri,
-            metadata=chunk.metadata,
-        )
-        for chunk in chunks
-    ]
 
 
 def _center_chunk_window(
@@ -6080,37 +5984,8 @@ def _knowledge_facets(
     return facets[:limit], len(facets) > limit
 
 
-def _default_chunk_for_entry(entry: KnowledgeEntry) -> KnowledgeChunk:
-    return KnowledgeChunk(
-        id=f"{entry.id}:r{entry.revision}:0",
-        entry_id=entry.id,
-        entry_revision=entry.revision,
-        text=entry.text,
-        chunk_index=0,
-        content_hash=sha256(entry.text.encode("utf-8")).hexdigest(),
-        source_uri=entry.source_uri,
-    )
-
-
 def _next_updated_at(entry: KnowledgeEntry) -> datetime:
     return max(datetime.now(UTC), entry.created_at, entry.updated_at)
-
-
-def _has_only_default_chunk(entry: KnowledgeEntry, chunks: list[KnowledgeChunk]) -> bool:
-    if len(chunks) != 1:
-        return False
-    default_chunk = _default_chunk_for_entry(entry)
-    chunk = chunks[0]
-    return (
-        chunk.id == default_chunk.id
-        and chunk.entry_id == default_chunk.entry_id
-        and chunk.entry_revision == default_chunk.entry_revision
-        and chunk.text == default_chunk.text
-        and chunk.chunk_index == default_chunk.chunk_index
-        and chunk.content_hash == default_chunk.content_hash
-        and chunk.source_uri == default_chunk.source_uri
-        and chunk.metadata == default_chunk.metadata
-    )
 
 
 def _truncate_text_to_bytes(text: str, max_bytes: int) -> str:
