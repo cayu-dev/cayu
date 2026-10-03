@@ -29,6 +29,13 @@ from cayu.collaboration.peer_content import (
     PeerContentReceipt,
     PeerContentUnavailable,
 )
+from cayu.knowledge._activation_rules import (
+    _activation_receipt_matches,
+    _prepare_review_approval_receipts,
+    _replay_review_approval_from_receipts,
+    _validate_review_approval_authority,
+    _validate_review_approval_scope,
+)
 from cayu.knowledge.access import runtime_knowledge_operation
 from cayu.runtime import _session_message_queue as message_queue
 from cayu.runtime import event_side_effect_health as side_effect_health
@@ -865,7 +872,6 @@ from cayu.storage._task_scheduling_schema import POSTGRES_SCHEDULING_DDL
 from cayu.storage.knowledge_transition import require_empty_knowledge_revision_transition
 from cayu.storage.memory import (
     KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY,
-    _activation_receipt_matches,
     _bounded_knowledge_evidence,
     _bounded_knowledge_lineage_result,
     _bounded_knowledge_relation_result,
@@ -880,8 +886,6 @@ from cayu.storage.memory import (
     _knowledge_maintenance_successors,
     _knowledge_relation_query_fingerprint,
     _knowledge_semantic_watch_identity,
-    _prepare_review_approval_receipts,
-    _replay_review_approval_from_receipts,
     _require_knowledge_maintenance_current_entries,
     _require_knowledge_maintenance_current_replacement,
     _require_knowledge_maintenance_publication_boundary,
@@ -890,8 +894,6 @@ from cayu.storage.memory import (
     _search_result_from_scored_embeddings,
     _semantic_query_text,
     _validate_knowledge_search_frontier,
-    _validate_review_approval_authority,
-    _validate_review_approval_scope,
 )
 from cayu.tasks import _verified_work_policy as verified_work_support
 from cayu.tasks._scheduling import (

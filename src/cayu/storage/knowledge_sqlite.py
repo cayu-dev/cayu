@@ -54,6 +54,13 @@ from cayu.knowledge._access_rules import (
     _require_knowledge_entry_access,
     _require_knowledge_successor_access,
 )
+from cayu.knowledge._activation_rules import (
+    _activation_receipt_matches,
+    _prepare_review_approval_receipts,
+    _replay_review_approval_from_receipts,
+    _validate_review_approval_authority,
+    _validate_review_approval_scope,
+)
 from cayu.knowledge._revision_rules import (
     _copy_chunks_for_revision,
     _copy_evidence_for_revision,
@@ -211,7 +218,6 @@ from cayu.storage._knowledge_closure import (
 from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage.memory import (
     KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY,
-    _activation_receipt_matches,
     _bounded_knowledge_evidence,
     _bounded_knowledge_lineage_result,
     _bounded_knowledge_relation_result,
@@ -223,15 +229,11 @@ from cayu.storage.memory import (
     _knowledge_maintenance_successors,
     _knowledge_relation_query_fingerprint,
     _knowledge_semantic_watch_identity,
-    _prepare_review_approval_receipts,
-    _replay_review_approval_from_receipts,
     _require_knowledge_maintenance_current_entries,
     _require_knowledge_maintenance_current_replacement,
     _require_knowledge_maintenance_publication_boundary,
     _require_knowledge_maintenance_source_evidence,
     _validate_knowledge_search_frontier,
-    _validate_review_approval_authority,
-    _validate_review_approval_scope,
 )
 from cayu.storage.targets import require_sqlite_store_allowed
 

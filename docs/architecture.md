@@ -538,6 +538,10 @@ operations; each backend retains its transaction and mutation boundaries.
 invariants, chunk construction and evidence identity and chunk remapping.
 The stores compose these rules inside the same operations, including ambient
 resource relabel checks, while retaining their clocks and persistence owners.
+`knowledge/_activation_rules.py` owns shared approval authority and review-scope
+checks, activation receipt matching, and reviewed-approval receipt preparation
+and replay. The stores and review adapter compose these rules directly; clocks,
+access checks and atomic writes remain inside the existing store operations.
 The existing `cayu`, `cayu.storage` and `cayu.storage.memory` imports resolve to
 the same canonical types, including persisted legacy pickle class paths.
 

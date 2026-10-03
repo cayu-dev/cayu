@@ -9,6 +9,7 @@ from cayu._validation import (
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
+from cayu.knowledge._activation_rules import _replay_review_approval_from_receipts
 from cayu.knowledge.activation_contracts import (
     MAX_KNOWLEDGE_ACTIVATION_CHUNKS,
     MAX_KNOWLEDGE_ACTIVATION_EVIDENCE_RECORDS,
@@ -44,9 +45,6 @@ from cayu.knowledge.scopes import (
     copy_knowledge_access_scope,
 )
 from cayu.knowledge.search import KnowledgeListQuery, KnowledgeListResult
-from cayu.storage.memory import (
-    _replay_review_approval_from_receipts,
-)
 
 _KNOWLEDGE_REVIEW_STORE_METHODS = (
     "approve_pending_entry",
