@@ -9,10 +9,16 @@ import subprocess
 import sys
 from pathlib import Path
 
-from tests.core.test_mcp import _fake_tool_definitions, _fake_toolset
+import pytest
+from tests.core.test_mcp import (
+    BlockingPublicationMcpSession,
+    _fake_server_spec,
+    _fake_tool_definitions,
+    _fake_toolset,
+)
 
 import cayu
-from cayu import AgentSpec, CayuApp
+from cayu import AgentSpec, CayuApp, McpToolset
 
 
 def test_agent_registry_composes_without_application_controllers() -> None:
@@ -173,6 +179,57 @@ def test_refresh_preserves_public_registration_site_and_updates_manifest() -> No
             assert len(manifest_after.agents[0].tools) == 2
         finally:
             await toolset.close()
+            await app.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("independent_source", [False, True])
+def test_refresh_preserves_registrations_completed_during_discovery_publication(
+    independent_source: bool,
+) -> None:
+    async def run() -> None:
+        session = BlockingPublicationMcpSession(definitions=_fake_tool_definitions("echo"))
+        toolset = McpToolset(
+            server=_fake_server_spec().model_copy(update={"connection_id": "refreshing"}),
+            session=session,
+            definitions=session.definitions,
+        )
+        other = _fake_toolset(connection_id="independent") if independent_source else None
+        app = CayuApp(enable_logging=False)
+        refresh = None
+        try:
+            app.register_agent(AgentSpec(name="first", model="model"), mcp_toolsets=(toolset,))
+            session.definitions = _fake_tool_definitions("echo", "search")
+            refresh = asyncio.create_task(app.refresh_mcp_toolset(toolset))
+            await asyncio.wait_for(session.publication_started.wait(), timeout=5)
+            app.register_agent(
+                AgentSpec(name="during", model="model"),
+                mcp_toolsets=() if other is None else (other,),
+            )
+            registered_during = app._get_registered_agent("during")
+            assert app.list_agents() == ("during", "first")
+            session.release_publication.set()
+            result = await asyncio.wait_for(refresh, timeout=5)
+
+            assert result.status == "accepted"
+            assert app.list_agents() == ("during", "first")
+            assert app._get_registered_agent("during") is registered_during
+            assert len(app.get_agent("first").tools) == 2
+            assert tuple(agent.name for agent in app.describe().agents) == ("during", "first")
+            if other is not None:
+                # Its owner claim and the registry's source map must agree too.
+                unchanged = await app.refresh_mcp_toolset(other)
+                assert unchanged.status == "unchanged"
+                assert unchanged.toolset is other
+        finally:
+            session.release_publication.set()
+            if refresh is not None and not refresh.done():
+                refresh.cancel()
+                await asyncio.gather(refresh, return_exceptions=True)
+            await toolset.close()
+            if other is not None:
+                await other.close()
             await app.aclose()
 
     asyncio.run(run())

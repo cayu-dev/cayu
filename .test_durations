@@ -1,4 +1,6 @@
 {
+    "tests/core/test_application_agent_registry.py::test_refresh_preserves_registrations_completed_during_discovery_publication[False]": 0.01,
+    "tests/core/test_application_agent_registry.py::test_refresh_preserves_registrations_completed_during_discovery_publication[True]": 0.012,
     "tests/core/test_application_agent_registry.py::test_agent_registry_composes_without_application_controllers": 1.232,
     "tests/core/test_application_agent_registry.py::test_refresh_preserves_public_registration_site_and_updates_manifest": 0.392,
     "tests/core/test_application_agent_registry.py::test_registry_helpers_preserve_legacy_import_and_pickle_identity": 0.0,

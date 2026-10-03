@@ -624,9 +624,6 @@ class ApplicationAgentRegistry:
                     }
                     if not replacements:
                         raise RuntimeError("Refreshable MCP source lost its agent registrations.")
-                    next_agents = {**self._agents, **replacements}
-                    next_toolsets = dict(self._refreshable_mcp_toolsets)
-                    next_toolsets[source_key] = candidate
                     await staged_discovery.commit(
                         validate=lambda: source.require_refresh_current(
                             owner=self._mcp_refresh_owner,
@@ -634,6 +631,11 @@ class ApplicationAgentRegistry:
                             expected_dirty_epoch=refresh_dirty_epoch,
                         )
                     )
+                    # Synchronous registration can complete while discovery commits.
+                    # Merge the current maps without yielding again before publication.
+                    next_agents = {**self._agents, **replacements}
+                    next_toolsets = dict(self._refreshable_mcp_toolsets)
+                    next_toolsets[source_key] = candidate
                     self._agents = next_agents
                     self._refreshable_mcp_toolsets = next_toolsets
 
