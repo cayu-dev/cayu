@@ -91,7 +91,9 @@ async def test_pending_delivery_head_does_not_starve_settlement(
                     clarification_maintenance_sources=(
                         HostClarificationMaintenanceSource("deliveries", CONTEXT),
                     ),
-                    observation_timeout_s=0.1,
+                    # Leave time for page discovery and validation before dispatch.
+                    # The driver below still bounds fairness progress to 60 seconds.
+                    observation_timeout_s=1.0,
                 ),
             )
 
