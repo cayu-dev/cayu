@@ -535,7 +535,7 @@ def test_recovery_session_boundary_validates_full_active_profile_authority(
                 session=session,
                 execution_profile_snapshot=expected_profile,
                 registered_agent=app._agents["assistant"],
-                registered_provider=app._providers["fake"],
+                registered_provider=app._provider_registry.registrations["fake"],
                 registered_environment=None,
                 budget_policy=None,
             ),
@@ -3817,7 +3817,9 @@ async def _assert_provider_retry_keeps_process_local_resolution_after_mutation(
 
     def mutate_registration() -> None:
         app._agents["assistant"] = replacement_app._agents["assistant"]
-        app._providers["fake"] = replacement_app._providers["fake"]
+        app._provider_registry._providers["fake"] = (
+            replacement_app._provider_registry.registrations["fake"]
+        )
 
     provider.mutate_registration = mutate_registration
 
@@ -4906,7 +4908,7 @@ def test_model_reconciliation_uses_frozen_provider_after_registration_mutation()
         app.register_provider(original_provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
         frozen_agent = app._agents["assistant"]
-        frozen_provider = app._providers["fake"]
+        frozen_provider = app._provider_registry.registrations["fake"]
 
         run_task = asyncio.create_task(
             collect(
@@ -4925,7 +4927,9 @@ def test_model_reconciliation_uses_frozen_provider_after_registration_mutation()
         replacement_provider = BlockingBackgroundProvider(replacement_adapter)
         replacement_app = CayuApp(enable_logging=False)
         replacement_app.register_provider(replacement_provider, default=True)
-        app._providers["fake"] = replacement_app._providers["fake"]
+        app._provider_registry._providers["fake"] = (
+            replacement_app._provider_registry.registrations["fake"]
+        )
 
         try:
             session = await store.load(session_id)
@@ -5093,7 +5097,10 @@ async def _assert_snapshot_only_restart_profile_boundary(
         assert len(recovery_settlement_contexts) == 1
         recovery_context = recovery_settlement_contexts[0]
         assert recovery_context.registered_agent is replacement_app._agents["assistant"]
-        assert recovery_context.registered_provider is replacement_app._providers["fake"]
+        assert (
+            recovery_context.registered_provider
+            is replacement_app._provider_registry.registrations["fake"]
+        )
         assert recovery_hook.interrupted_execution_profiles[0] is recovery_context.profile
         recovered = await store.load(session_id)
         recovered_checkpoint = await store.load_checkpoint(session_id)

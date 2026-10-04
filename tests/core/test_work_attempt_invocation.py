@@ -603,7 +603,7 @@ def test_work_attempt_context_retains_exact_authority_without_exporting_provenan
             ),
             validated_profile=active.profile,
             registered_agent=app._agents["assistant"],
-            registered_provider=app._providers[provider.name],
+            registered_provider=app._provider_registry.registrations[provider.name],
             registered_environment=None,
             runtime_hooks=app._runtime_hooks,
             loop_policies=app._loop_policies,

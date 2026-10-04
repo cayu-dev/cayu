@@ -210,7 +210,7 @@ async def _publish_structured_model_step(
         max_steps=64,
         registered_agent=profile_app._agents["assistant"],
         provider_name=provider.name,
-        registered_provider=profile_app._providers[provider.name],
+        registered_provider=profile_app._provider_registry.registrations[provider.name],
         model="fake-model",
         durable_system_prompt=None,
         redactor=profile_app._secret_redactor,

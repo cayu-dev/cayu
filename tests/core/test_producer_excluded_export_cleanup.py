@@ -310,7 +310,7 @@ async def test_excluded_export_cleanup_survives_revocation_and_owner_reconstruct
     )
     try:
         await app.initialize_collaboration()
-        assert not app._providers
+        assert not app._provider_registry.registrations
         app._request_coordinator._owners.observation_timeout = 60
         app._session_export_coordinator.owners.observation_timeout = 60
         read = type(sessions).read_peer_content_attempt

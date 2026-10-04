@@ -99,7 +99,7 @@ async def test_progress_independent_workers_reconcile_commit_ack_loss(native_sto
         recovered = replacement(with_native=False)
         await recovered.initialize_collaboration()
         monkeypatch.setattr(recovered._request_coordinator._owners, "observation_timeout", 60)
-        assert not recovered._providers
+        assert not recovered._provider_registry.registrations
         assert await recovered.session_store.load(session.id) is None
         assert (
             await recovered.record_producer_progress(registration, occurrence, context=context)

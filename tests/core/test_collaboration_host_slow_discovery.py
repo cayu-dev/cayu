@@ -137,7 +137,7 @@ async def test_blocked_maintenance_source_preserves_unrelated_expiry(
                 ):
                     break
         assert not release.is_set() and blocked_reads == 1
-        assert not app._providers
+        assert not app._provider_registry.registrations
         assert (await host.aclose()).discovery_pending >= 1
         assert blocked_reads == 1
     finally:

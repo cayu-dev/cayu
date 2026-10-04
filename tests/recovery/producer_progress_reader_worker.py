@@ -42,7 +42,7 @@ async def main():
     try:
         await application.initialize_collaboration()
         application._request_coordinator._owners.observation_timeout = 60
-        assert not application._providers
+        assert not application._provider_registry.registrations
         assert (
             await application.session_store.load(expected.admission.prepared.target.session_id)
             is None

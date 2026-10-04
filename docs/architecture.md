@@ -191,7 +191,17 @@ isolated replay readers use the registry's current publication; replay installs
 its isolated declarations without claiming live MCP sources. The registry can
 also be composed directly without importing the application or execution
 controllers by supplying an admission gate and its other explicit dependencies.
-Provider and environment registration retain their existing owners.
+
+`ApplicationProviderRegistry` owns validated provider declarations, the default
+provider and model-pattern matching. Registration snapshots routing patterns,
+usage dialect and secret-free execution identity while retaining the live
+provider for execution. `CayuApp` supplies the public registration provenance
+and delegates registration and lookup. Manifests and scaffolding read the
+registry; manifests use its matching rules when describing ambiguous routing.
+Isolated replay installs copied declaration maps with recorded providers while
+preserving admitted identities and the default. The registry composes directly
+with a secret redactor, without importing application or execution controllers.
+Environment registration retains its existing owner.
 
 ```text
 CayuApp

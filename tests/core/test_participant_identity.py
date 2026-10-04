@@ -766,7 +766,7 @@ async def test_explicit_initialization_and_no_hidden_execution(stores):
     )
     assert first[1].participants[0].reference != second[1].participants[0].reference
     assert first[1].participants[0].configuration == second[1].participants[0].configuration
-    assert not application._agents and not application._providers
+    assert not application._agents and not application._provider_registry.registrations
     assert application.task_store is None
     assert not store._owners.pending
 

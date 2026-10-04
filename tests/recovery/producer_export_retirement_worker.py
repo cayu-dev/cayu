@@ -68,7 +68,7 @@ async def main():
     )
     try:
         await application.initialize_collaboration()
-        assert not application._providers
+        assert not application._provider_registry.registrations
         application._request_coordinator._owners.observation_timeout = 60
         if material.get("failure_resolution") is not None:
             from cayu.collaboration.exports import SessionExportAccessContext

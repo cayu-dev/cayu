@@ -124,7 +124,7 @@ async def _initial_admission(
             environment_name=None,
         ),
         registered_agent=app._agents["agent"],
-        registered_provider=app._providers["primary"],
+        registered_provider=app._provider_registry.registrations["primary"],
         registered_environment=None,
         validated_profile=active.profile,
         runtime_hooks=(),

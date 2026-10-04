@@ -208,7 +208,7 @@ async def test_public_producer_pruning_restarts_between_bounded_batches(
         )
         assert await native_app.initialize_collaboration() == initialized
         monkeypatch.setattr(native_app._request_coordinator._owners, "observation_timeout", 60)
-        assert not native_app._providers
+        assert not native_app._provider_registry.registrations
     reclaimed = await native_app.reclaim_producer_cleanup(
         rotated.namespace.reference, context=CONTEXT, limit=1
     )

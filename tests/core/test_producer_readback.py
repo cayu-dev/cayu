@@ -97,7 +97,7 @@ async def test_exact_producer_readback_recovers_with_independent_owner_and_curre
         monkeypatch.setattr(other._request_coordinator._owners, "observation_timeout", 60)
         # The new application has no providers or native source session. Recovery
         # uses the source owner's immutable registration, not a process-local handle.
-        assert not other._providers
+        assert not other._provider_registry.registrations
         assert await other.session_store.load(session.id) is None
         for expected in (command, token):
             found = await other.lookup_producer_registration(expected, context=CONTEXT)

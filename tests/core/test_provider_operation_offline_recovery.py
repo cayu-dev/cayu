@@ -7495,7 +7495,7 @@ def test_offline_interruption_keeps_provider_frozen_across_status_transition(
             AgentSpec(name="assistant", model="fake-model"),
             runtime_hooks=[hook],
         )
-        admitted_registered_provider = app._providers[provider.name]
+        admitted_registered_provider = app._provider_registry.registrations[provider.name]
         captured_contexts: list[Any] = []
         cancel_provider_operation = (
             app._recovery_coordinator.cancel_provider_operation_for_interruption
@@ -7528,7 +7528,9 @@ def test_offline_interruption_keeps_provider_frozen_across_status_transition(
 
         interrupt_task = asyncio.create_task(interrupt())
         await asyncio.wait_for(store.transition_entered.wait(), timeout=1)
-        app._providers[provider.name] = replacement_app._providers[provider.name]
+        app._provider_registry._providers[provider.name] = (
+            replacement_app._provider_registry.registrations[provider.name]
+        )
         store.transition_release.set()
 
         assert [event.type for event in await interrupt_task] == [

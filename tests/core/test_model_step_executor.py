@@ -543,7 +543,7 @@ def test_model_step_executor_retries_synchronous_stream_construction_failure() -
         user_message = Message.text("user", "hello")
         await store.append_transcript_messages(session.id, [user_message])
         registered_agent = app._agents["assistant"]
-        registered_provider = app._providers[provider.name]
+        registered_provider = app._provider_registry.registrations[provider.name]
         request = await app._model_step_executor.build_request(
             session=session,
             registered_agent=registered_agent,

@@ -387,7 +387,9 @@ def test_startup_isolates_registration_change_after_preflight(startup_store, mon
 
             async def change(session_id, inactive_for_seconds):
                 codes = await original(session_id, inactive_for_seconds)
-                app._providers["fake"] = changed._providers["fake"]
+                app._provider_registry._providers["fake"] = (
+                    changed._provider_registry.registrations["fake"]
+                )
                 return codes
 
             monkeypatch.setattr(

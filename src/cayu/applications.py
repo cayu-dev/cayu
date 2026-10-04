@@ -12,7 +12,6 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, 
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime
-from fnmatch import fnmatchcase
 from hashlib import sha256
 from itertools import islice
 from math import isfinite
@@ -35,6 +34,7 @@ from cayu._application_agent_registry import (
 from cayu._application_agent_registry import (
     _registered_agent_contains_mcp_source as _registered_agent_contains_mcp_source,
 )
+from cayu._application_provider_registry import ApplicationProviderRegistry
 from cayu._application_registration import (
     _copy_registered_tool as _copy_registered_tool,
 )
@@ -49,9 +49,6 @@ from cayu._application_registration import (
 )
 from cayu._application_registration import (
     _validate_environment_spec as _validate_environment_spec,
-)
-from cayu._application_registration import (
-    _validate_provider_model_patterns as _validate_provider_model_patterns,
 )
 from cayu._application_registration import (
     _validate_registered_tool as _validate_registered_tool,
@@ -370,7 +367,7 @@ from cayu.observability.watchers import (
     event_query_after_cursor,
     event_watcher_error_payload,
 )
-from cayu.providers.base import ModelProvider, ModelRequest, copy_usage_dialect
+from cayu.providers.base import ModelProvider, ModelRequest
 from cayu.providers.hosted import OpenAIWebSearch
 from cayu.providers.operations import ProviderOperationSnapshot
 from cayu.resource_access import ResourceAccessPolicy, runtime_stream_entrance
@@ -1497,12 +1494,11 @@ class CayuApp:
             admission=self._admission,
         )
         self._knowledge_publication_scope = KnowledgePublicationScope()
-        self._providers: dict[str, runtime_records.RegisteredProvider] = {}
+        self._provider_registry = ApplicationProviderRegistry(secret_redactor=self._secret_redactor)
         self._environments: dict[str, runtime_records.RegisteredEnvironment] = {}
         # Idle-resource releases still running after a drain or close deadline.
         self._idle_resource_releases: dict[str, tuple[bool, asyncio.Task[None]]] = {}
         self._artifact_store_registrations_by_id: dict[str, _ArtifactStoreRegistration] = {}
-        self._default_provider_name: str | None = None
         self._default_environment_name: str | None = None
         if session_execution is not None:
             if type(session_execution) is not SessionExecutionConfig:
@@ -6070,35 +6066,12 @@ class CayuApp:
         default: bool = False,
         model_patterns: Iterable[str] | None = None,
     ) -> ModelProvider:
-        if not isinstance(provider, ModelProvider):
-            raise TypeError("Provider registration requires a ModelProvider.")
-        if not isinstance(default, bool):
-            raise TypeError("Provider default flag must be a bool.")
-        stored_model_patterns = _validate_provider_model_patterns(model_patterns)
-        provider_name = require_clean_nonblank(provider.name, "provider.name")
-        usage_dialect = copy_usage_dialect(provider.usage_dialect, "provider.usage_dialect")
-        if provider_name in self._providers:
-            raise ValueError(f"Provider already registered: {provider_name}")
-
-        registration_source, registration_symbol = _registration_site()
-        self._providers[provider_name] = runtime_records.RegisteredProvider(
-            name=provider_name,
-            provider=provider,
-            execution_profile_identity=(
-                copy_secret_free_execution_profile_behavior_identity(
-                    provider.execution_profile_identity,
-                    redactor=self._secret_redactor,
-                    field_name="provider.execution_profile_identity",
-                )
-            ),
-            model_patterns=stored_model_patterns,
-            registration_source=registration_source,
-            registration_symbol=registration_symbol,
-            usage_dialect=usage_dialect,
+        return self._provider_registry.register(
+            provider,
+            default=default,
+            model_patterns=model_patterns,
+            registration_site=_registration_site(),
         )
-        if default or self._default_provider_name is None:
-            self._default_provider_name = provider_name
-        return provider
 
     def register_environment(
         self,
@@ -6417,7 +6390,7 @@ class CayuApp:
 
     def list_providers(self) -> tuple[str, ...]:
         """Return the names of all registered providers, sorted."""
-        return tuple(sorted(self._providers))
+        return self._provider_registry.names()
 
     def list_environments(self) -> tuple[str, ...]:
         """Return the names of all registered environments (concrete or factory), sorted."""
@@ -6764,35 +6737,14 @@ class CayuApp:
     def _get_registered_provider(
         self, name: str | None = None
     ) -> runtime_records.RegisteredProvider:
-        if name is not None:
-            provider_name = require_clean_nonblank(name, "provider.name")
-        else:
-            provider_name = self._default_provider_name
-        if provider_name is None:
-            raise RuntimeError("No model provider registered.")
-        try:
-            return self._providers[provider_name]
-        except KeyError as exc:
-            raise KeyError(f"Provider not registered: {provider_name}") from exc
+        return self._provider_registry.get(name)
 
     def _route_registered_provider_for_model(
         self,
         *,
         model: str,
     ) -> runtime_records.RegisteredProvider | None:
-        model = require_clean_nonblank(model, "model")
-        matches: list[runtime_records.RegisteredProvider] = []
-        for registered_provider in self._providers.values():
-            if any(fnmatchcase(model, pattern) for pattern in registered_provider.model_patterns):
-                matches.append(registered_provider)
-        if not matches:
-            return None
-        if len(matches) > 1:
-            match_names = ", ".join(provider.name for provider in matches)
-            raise ValueError(
-                f"Model matches multiple registered providers: {model} -> {match_names}"
-            )
-        return matches[0]
+        return self._provider_registry.route(model=model)
 
     def _get_registered_environment(
         self,

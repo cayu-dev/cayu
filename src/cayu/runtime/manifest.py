@@ -4,7 +4,6 @@ import hashlib
 import inspect
 import re
 from collections.abc import Mapping
-from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Annotated, Literal, cast
@@ -488,7 +487,7 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
         ProviderManifest(
             name=name,
             model_patterns=tuple(sorted(registration.model_patterns)),
-            is_default=name == app._default_provider_name,
+            is_default=name == app._provider_registry.default_name,
             implementation=_type_name(registration.provider),
             usage_dialect=str(registration.usage_dialect),
             supports_native_structured_output=bool(
@@ -502,7 +501,7 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
             ),
             implementation_provenance=_provenance(registration.provider, root),
         )
-        for name, registration in sorted(app._providers.items())
+        for name, registration in sorted(app._provider_registry.registrations.items())
     )
     agents = tuple(
         _describe_agent(app, name=name, registration=registration, project_root=root)
@@ -521,7 +520,7 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
         event_watcher=_type_name(app.event_watcher_store),
     )
     defaults = ApplicationDefaultsManifest(
-        provider=app._default_provider_name,
+        provider=app._provider_registry.default_name,
         environment=app._default_environment_name,
     )
     runtime = RuntimeManifest(
@@ -665,12 +664,14 @@ def _describe_agent(
         fallback=spec,
     )
     candidates = tuple(
-        provider_name
-        for provider_name, provider in sorted(app._providers.items())
-        if any(fnmatchcase(spec.model, pattern) for pattern in provider.model_patterns)
+        sorted(provider.name for provider in app._provider_registry.matching(model=spec.model))
     )
     if spec.provider_name is not None:
-        resolved = spec.provider_name if spec.provider_name in app._providers else None
+        resolved = (
+            spec.provider_name
+            if spec.provider_name in app._provider_registry.registrations
+            else None
+        )
         resolution = "explicit" if resolved is not None else "missing"
         candidates = (spec.provider_name,)
     elif len(candidates) == 1:
@@ -679,8 +680,8 @@ def _describe_agent(
     elif len(candidates) > 1:
         resolved = None
         resolution = "ambiguous"
-    elif app._default_provider_name is not None:
-        resolved = app._default_provider_name
+    elif app._provider_registry.default_name is not None:
+        resolved = app._provider_registry.default_name
         resolution = "default"
     else:
         resolved = None

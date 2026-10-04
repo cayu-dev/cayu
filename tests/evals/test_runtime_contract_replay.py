@@ -336,7 +336,7 @@ def test_runtime_contract_replay_matches_without_reinvoking_external_tool() -> N
         source_session_before = await app.session_store.load(trajectory.session.id)
         source_events_before = tuple(trajectory.events)
         source_transcript_before = await app.session_store.load_transcript(trajectory.session.id)
-        source_provider = app._providers["scripted"].provider
+        source_provider = app._provider_registry.registrations["scripted"].provider
         provider_requests_before = len(source_provider.requests)
         report = await app.replay_session(RuntimeReplayRequest(trajectory=trajectory))
         source_session_after = await app.session_store.load(trajectory.session.id)
@@ -445,7 +445,7 @@ def test_runtime_contract_replay_matches_every_sequential_multi_call() -> None:
         {"city": "Osh"},
     ]
     assert all(event.payload["arguments_exact"] is True for event in terminal_events)
-    assert len(app._providers["scripted"].provider.requests) == 2
+    assert len(app._provider_registry.registrations["scripted"].provider.requests) == 2
     assert "Bishkek" not in report.model_dump_json()
     assert "Osh" not in report.model_dump_json()
 
@@ -809,7 +809,7 @@ def test_runtime_contract_replay_does_not_invent_missing_invocation_semantics() 
         assert report.disposition is RuntimeReplayDisposition.UNAVAILABLE
         assert report.reason is RuntimeReplayReason.SOURCE_INVOCATION_EVIDENCE_UNAVAILABLE
         assert report.changed_execution_profile_components == (expected_component,)
-        provider = app._providers["scripted"].provider
+        provider = app._provider_registry.registrations["scripted"].provider
         assert isinstance(provider, ScriptedModelProvider)
         assert len(provider.requests) == 2
         assert tool.calls == 1

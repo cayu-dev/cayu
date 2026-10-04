@@ -44,7 +44,7 @@ async def main():
     )
     try:
         await application.initialize_collaboration()
-        assert not application._providers
+        assert not application._provider_registry.registrations
         retained = await application.lookup_producer_registration(command, context=CONTEXT)
         assert isinstance(retained, ExactMatch) and retained.receipt == command
         if material.get("successor", False):

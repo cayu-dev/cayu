@@ -129,7 +129,7 @@ def _profiled_identity_for_app(
     limits: RunLimits,
 ) -> SessionIdentity:
     registered_agent = app._agents["assistant"]
-    registered_provider = app._providers["fake"]
+    registered_provider = app._provider_registry.registrations["fake"]
     profile = session_engine_module._execution_profile_identity(
         max_steps=64,
         registered_agent=registered_agent,

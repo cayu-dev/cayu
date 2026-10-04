@@ -78,7 +78,7 @@ async def test_public_cancelled_cleanup_cannot_publish_after_native_retirement(
         )
         assert await other.initialize_collaboration() == initialized
         monkeypatch.setattr(other._request_coordinator._owners, "observation_timeout", 60)
-        assert not other._providers
+        assert not other._provider_registry.registrations
         await other.settle_producer_output(registration, context=CONTEXT)
         _, rotated = await rotate(store, initialized)
         await other.retire_collaboration_namespace(

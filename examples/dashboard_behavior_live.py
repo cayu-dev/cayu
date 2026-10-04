@@ -514,7 +514,7 @@ def _profiled_session_identity(
             runtime_hooks=engine._runtime_hooks,
             loop_policies=engine._loop_policies,
             loop_policy_identities=engine._loop_policy_execution_profile_identities,
-            registered_provider=app._providers.get(provider_name),
+            registered_provider=app._provider_registry.registrations.get(provider_name),
             finalization=execution_profile_admission.model_finalization_material(
                 max_steps=max_steps,
                 limits=RunLimits(),

@@ -1414,7 +1414,7 @@ def profiled_session_identity(
                     invocation_loop_policies
                 )
             ),
-            registered_provider=app._providers.get(provider_name),
+            registered_provider=app._provider_registry.registrations.get(provider_name),
             finalization=execution_profile_admission.model_finalization_material(
                 max_steps=app.config.run.max_steps,
                 limits=app.config.run.copy_limits(),

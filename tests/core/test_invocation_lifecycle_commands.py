@@ -3207,7 +3207,7 @@ def test_invocation_context_preserves_exact_live_authority_references() -> None:
         profile=_profile(),
     )
     registered_agent = app._agents["assistant"]
-    registered_provider = app._providers[provider.name]
+    registered_provider = app._provider_registry.registrations[provider.name]
     with pytest.raises(TypeError, match="runtime authority boundary"):
         InvocationContext(
             active_profile=active,

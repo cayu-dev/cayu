@@ -243,7 +243,7 @@ def _test_execution_profile(
         runtime_build_provenance=current_runtime_build_provenance(),
         redactor=profile_app._secret_redactor,
         process_identity=profile_app._execution_profile_process_identity,
-        registered_provider=profile_app._providers[provider_name],
+        registered_provider=profile_app._provider_registry.registrations[provider_name],
         finalization=execution_profile_admission.model_finalization_material(
             max_steps=max_steps,
             limits=RunLimits() if limits is None else limits,
@@ -819,7 +819,9 @@ def test_manual_model_recovery_validates_context_before_budget_mutation() -> Non
         replacement_app = CayuApp(enable_logging=False)
         replacement_app.register_provider(replacement, default=True)
         replacement_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-        app._providers[provider.name] = replacement_app._providers[provider.name]
+        app._provider_registry._providers[provider.name] = (
+            replacement_app._provider_registry.registrations[provider.name]
+        )
 
         budget_mutations = 0
 

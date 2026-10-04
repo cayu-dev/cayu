@@ -197,7 +197,7 @@ async def test_public_producer_future_target_orders_delivery_exclusion(
             session_exports=app._session_export_coordinator.registration,
         )
         await other.initialize_collaboration()
-        assert not other._providers
+        assert not other._provider_registry.registrations
         app = other
         settled = await app.reconcile_producer_delivery(recovery, context=CONTEXT, exclude=True)
         assert settled.state == ("excluded" if ordering == "exclusion-first" else "appended")

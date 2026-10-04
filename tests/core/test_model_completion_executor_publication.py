@@ -496,7 +496,7 @@ async def _create_model_run(
     )
     session = admitted.session
     registered_agent = app._agents["assistant"]
-    registered_provider = app._providers[provider.name]
+    registered_provider = app._provider_registry.registrations[provider.name]
     request = await app._model_step_executor.build_request(
         session=session,
         registered_agent=registered_agent,

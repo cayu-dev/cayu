@@ -222,7 +222,7 @@ async def create_admitted_session(
         invocation_loop_policies=prepared_request.loop_policies,
         execution_profile=execution_profile,
         provider=provider,
-        app=(app if execution_profile is None and app._providers else None),
+        app=(app if execution_profile is None and app._provider_registry.registrations else None),
         agent_name=prepared_request.agent_name,
         structured_output=prepared_request.structured_output,
         thinking=prepared_request.thinking,
@@ -353,7 +353,7 @@ def profiled_session_identity(
             resolved_profile = session_engine_module._execution_profile_identity(
                 registered_agent=registered_agent,
                 provider_name=provider_name,
-                registered_provider=app._providers.get(provider_name),
+                registered_provider=app._provider_registry.registrations.get(provider_name),
                 model=model,
                 durable_system_prompt=durable_system_prompt,
                 redactor=app._secret_redactor,
@@ -424,7 +424,7 @@ def profiled_session_identity(
             runtime_build_provenance=current_runtime_build_provenance(),
             redactor=profile_app._secret_redactor,
             process_identity=profile_app._execution_profile_process_identity,
-            registered_provider=profile_app._providers[provider_name],
+            registered_provider=profile_app._provider_registry.registrations[provider_name],
             thinking=None if thinking is None else thinking_config_payload(thinking),
             request_budget_limit_ids=(
                 ()

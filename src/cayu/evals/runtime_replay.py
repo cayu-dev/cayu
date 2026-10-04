@@ -1274,7 +1274,7 @@ def _require_candidate_boundary(
     registered_agent = app._agent_registry.registrations.get(agent_name)
     if registered_agent is None:
         raise _ReplayUnavailable(RuntimeReplayReason.CANDIDATE_AGENT_UNAVAILABLE)
-    if provider_name not in app._providers:
+    if provider_name not in app._provider_registry.registrations:
         raise _ReplayUnavailable(RuntimeReplayReason.CANDIDATE_MODEL_TARGET_UNAVAILABLE)
     if app._default_environment_name is not None or app._environments:
         raise _ReplayUnavailable(RuntimeReplayReason.CANDIDATE_ENVIRONMENT_UNSUPPORTED)
@@ -1327,7 +1327,7 @@ def _require_candidate_boundary(
     if any(
         registered.provider.provider_operation_mode is not ProviderOperationMode.SYNCHRONOUS
         or registered.provider.provider_operations is not None
-        for registered in app._providers.values()
+        for registered in app._provider_registry.registrations.values()
     ):
         raise _ReplayUnavailable(RuntimeReplayReason.CANDIDATE_PROVIDER_OPERATION_UNSUPPORTED)
     return registered_agent
@@ -1342,7 +1342,7 @@ def _require_candidate_billing_evidence(
     session = evidence.trajectory.session
     if session is None:  # pragma: no cover - evidence preflight owns this invariant
         raise AssertionError("Replay evidence lost its source session.")
-    registered_provider = app._providers.get(session.provider_name)
+    registered_provider = app._provider_registry.registrations.get(session.provider_name)
     if registered_provider is None:  # pragma: no cover - candidate preflight owns this invariant
         raise _ReplayUnavailable(RuntimeReplayReason.CANDIDATE_MODEL_TARGET_UNAVAILABLE)
     commercial_provider = (
@@ -1472,28 +1472,30 @@ def _isolated_app(
     isolated._session_engine._execution_profile_process_identity = (
         app._execution_profile_process_identity
     )
-    isolated._default_provider_name = app._default_provider_name
     isolated._default_environment_name = None
     if provider_batches is not None and (
         request_billing_identities is None or completion_billing_identities is None
     ):
         raise AssertionError("Replay execution requires recorded billing evidence.")
-    isolated._providers = {
-        name: (
-            registered
-            if provider_batches is None
-            else replace(
-                registered,
-                provider=_RecordedProvider(
-                    registered.provider,
-                    provider_batches,
-                    request_billing_identities or (),
-                    completion_billing_identities or (),
-                ),
+    isolated._provider_registry.replace_for_replay(
+        {
+            name: (
+                registered
+                if provider_batches is None
+                else replace(
+                    registered,
+                    provider=_RecordedProvider(
+                        registered.provider,
+                        provider_batches,
+                        request_billing_identities or (),
+                        completion_billing_identities or (),
+                    ),
+                )
             )
-        )
-        for name, registered in app._providers.items()
-    }
+            for name, registered in app._provider_registry.registrations.items()
+        },
+        default_name=app._provider_registry.default_name,
+    )
     if provider_batches is None:
         isolated._agent_registry.replace_for_replay(dict(app._agent_registry.registrations))
         return isolated

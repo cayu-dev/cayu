@@ -600,7 +600,7 @@ async def _context(store, session_id, *, admission=None, app=None, recovery_clai
         ),
         validated_profile=active.profile,
         registered_agent=app._agents[session.agent_name],
-        registered_provider=app._providers[session.provider_name],
+        registered_provider=app._provider_registry.registrations[session.provider_name],
         registered_environment=None,
         runtime_hooks=(),
         loop_policies=(),
