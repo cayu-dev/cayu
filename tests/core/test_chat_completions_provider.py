@@ -4193,3 +4193,52 @@ def test_cayu_app_preserves_chat_http_completion_before_real_tail_cancellation(
     assert completion.payload["usage_metrics"]["total_tokens"] == 3
     assert completion.payload["step_classification"]["type"] == "failed"
     assert [message.role for message in transcript] == ["user"]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("Nebula Compute", ("provider", "Nebula Compute")),
+        ("anthropic", ("provider", "Anthropic")),
+        ("sk-or-v1-0123456789abcdef0123", None),
+        ("Name\nwith control", None),
+        ("short-secret", None),
+    ],
+    ids=("new-plain-name", "known-canonical", "long-token", "control", "registered-secret"),
+)
+def test_openrouter_provider_names_pass_through_unless_unsafe(raw, expected) -> None:
+    from cayu.providers._http import (
+        bind_provider_error_workload_redactor,
+        reset_provider_error_workload_redactor,
+    )
+    from cayu.vaults import SecretRedactor
+
+    token = bind_provider_error_workload_redactor(SecretRedactor(["short-secret"]))
+    try:
+        evidence = chat_completions_module._openrouter_provider_evidence(raw)
+    finally:
+        reset_provider_error_workload_redactor(token)
+
+    if expected is None:
+        assert evidence is not None and evidence[0] == "provider_sha256"
+        assert raw not in repr(evidence)
+    else:
+        assert evidence == expected
+
+
+def test_openrouter_provider_name_checks_secrets_before_stripping() -> None:
+    from cayu.providers._http import (
+        bind_provider_error_workload_redactor,
+        reset_provider_error_workload_redactor,
+    )
+    from cayu.vaults import SecretRedactor
+
+    # Stripping the name would cut the registered secret's leading space.
+    token = bind_provider_error_workload_redactor(SecretRedactor([" Nebula Canary"]))
+    try:
+        evidence = chat_completions_module._openrouter_provider_evidence(" Nebula Canary ")
+    finally:
+        reset_provider_error_workload_redactor(token)
+
+    assert evidence is not None and evidence[0] == "provider_sha256"
+    assert "Canary" not in repr(evidence)

@@ -16,6 +16,7 @@ from hashlib import sha256
 from math import isfinite
 from typing import Any, BinaryIO, Final, cast
 from uuid import UUID, uuid4
+from weakref import WeakKeyDictionary
 
 from cayu._exception_groups import (
     exception_cause,
@@ -35,7 +36,7 @@ from cayu._validation import (
 )
 from cayu.runtime._isolated_tool_protocol import (
     ISOLATED_TOOL_TERMINAL_FRAME_HEADER_BYTES,
-    IsolatedToolChildErrorCode,
+    IsolatedToolChildFailure,
     IsolatedToolProtocolError,
     build_isolated_tool_request,
     decode_isolated_tool_response,
@@ -106,6 +107,29 @@ class IsolatedToolFailure(Exception):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(f"Isolated tool execution failed: {code}.")
+
+
+# The child's own exception text and stderr tail, keyed by the failure they
+# explain. Kept outside the exception; the tool boundary redacts with the
+# workload redactor and only then bounds what it shows.
+_ISOLATED_FAILURE_TEXT: WeakKeyDictionary[BaseException, tuple[str | None, str | None]] = (
+    WeakKeyDictionary()
+)
+
+
+def attach_isolated_failure_text(
+    failure: IsolatedToolFailure,
+    message: str | None,
+    stderr_tail: str | None,
+) -> None:
+    if message is not None or stderr_tail is not None:
+        _ISOLATED_FAILURE_TEXT[failure] = (message, stderr_tail)
+
+
+def isolated_failure_text(failure: BaseException) -> tuple[str | None, str | None]:
+    if not isinstance(failure, IsolatedToolFailure):
+        return None, None
+    return _ISOLATED_FAILURE_TEXT.get(failure, (None, None))
 
 
 class IsolatedToolPreDispatchFailure(IsolatedToolFailure):
@@ -1270,8 +1294,10 @@ class _IsolatedToolProcessOwner:
         try:
             await self._spawn(deadline=deadline)
             terminal = await self._exchange(deadline=deadline)
-            if isinstance(terminal, IsolatedToolChildErrorCode):
-                raise IsolatedToolFailure(f"child_{terminal.value}")
+            if isinstance(terminal, IsolatedToolChildFailure):
+                failure = IsolatedToolFailure(f"child_{terminal.code.value}")
+                attach_isolated_failure_text(failure, terminal.message, terminal.stderr_tail)
+                raise failure
             settlement_attempted = True
             post_terminal_failure = await self._settle()
             if post_terminal_failure is not None:
@@ -1540,7 +1566,7 @@ class _IsolatedToolProcessOwner:
         self,
         *,
         deadline: float,
-    ) -> ToolResult | IsolatedToolChildErrorCode:
+    ) -> ToolResult | IsolatedToolChildFailure:
         process = self._process
         if process is None or self._wait_task is None or self._result_read_fd is None:
             raise AssertionError("Isolated process exchange started before spawn completed.")
@@ -1551,7 +1577,7 @@ class _IsolatedToolProcessOwner:
             _write_request(process.stdin, self._request_bytes),
             name="cayu-isolated-tool-request-write",
         )
-        terminal_ready: asyncio.Future[ToolResult | IsolatedToolChildErrorCode] = (
+        terminal_ready: asyncio.Future[ToolResult | IsolatedToolChildFailure] = (
             asyncio.get_running_loop().create_future()
         )
         terminal_ready.add_done_callback(_consume_future_exception)
@@ -2075,7 +2101,7 @@ async def _read_terminal(
     *,
     max_bytes: int,
     expected_request_sha256: str,
-    terminal_ready: asyncio.Future[ToolResult | IsolatedToolChildErrorCode],
+    terminal_ready: asyncio.Future[ToolResult | IsolatedToolChildFailure],
 ) -> None:
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader(limit=max_bytes + ISOLATED_TOOL_TERMINAL_FRAME_HEADER_BYTES + 1)

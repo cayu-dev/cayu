@@ -1903,6 +1903,9 @@ def test_real_process_child_failures_are_typed_and_bounded(
 
     assert getattr(caught.value, "code", None) == expected_code
     assert "isolated failure" not in str(caught.value)
+    message, _stderr_tail = isolated_process.isolated_failure_text(caught.value)
+    # The child's own exception text travels beside the failure, never inside it.
+    assert message == ("RuntimeError: isolated failure" if mode == "exception" else None)
 
 
 @pytest.mark.process

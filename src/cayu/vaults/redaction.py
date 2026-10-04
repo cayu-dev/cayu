@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import codecs
+import json
 import re
 from bisect import bisect_right
 from collections import deque
@@ -104,6 +105,52 @@ class SecretRedactor:
         return SecretRedactor._from_values(
             tuple(sorted(set(self._values) | set(other._values), key=len, reverse=True))
         )
+
+    def with_python_repr_forms(self) -> SecretRedactor:
+        """Also match each secret in the escaped forms Python text commonly uses.
+
+        Exception messages quote values with ``repr`` (an ``OSError`` filename,
+        a ``KeyError`` key, ``f"{path!r}"`` inside another repr), ``ascii``,
+        ``repr`` of the UTF-8 bytes, or ``json.dumps``. Each form turns a
+        newline into ``\\n``, a backslash into ``\\\\`` and so on. Forms equal
+        to the secret itself are not added.
+        """
+
+        values = set(self._values)
+        for value in self._values:
+            values.update(_python_escaped_forms(value))
+        if len(values) == len(self._values):
+            return self
+        return SecretRedactor._from_values(tuple(sorted(values, key=len, reverse=True)))
+
+    def redact_cut_text(self, value: str, *, cut_head: bool = False, cut_tail: bool = False) -> str:
+        """Redact text cut from a longer source, dropping what a cut may have split.
+
+        Everything that starts within the longest secret's length of a cut edge
+        is discarded, redactions included, by position in *value*. A secret
+        split by the cut, and any shorter secret nested inside it, therefore
+        leave no visible remainder.
+        """
+
+        if type(value) is not str:
+            raise TypeError("SecretRedactor.redact_cut_text expects a string.")
+        if self._pattern is None:
+            return value
+        margin = self.max_secret_utf8_bytes
+        head = margin if cut_head else 0
+        tail = len(value) - margin if cut_tail else len(value)
+        pieces: list[str] = []
+        position = 0
+        for match in self._pattern.finditer(value):
+            if max(position, head) < min(match.start(), tail):
+                pieces.append(value[max(position, head) : min(match.start(), tail)])
+            if head <= match.start() < tail:
+                pieces.append(REDACTED_SECRET)
+            position = match.end()
+        if max(position, head) < tail:
+            pieces.append(value[max(position, head) : tail])
+        # Joining kept pieces could line up a registered secret again.
+        return self.redact_text("".join(pieces))
 
     def has_same_registry(self, other: SecretRedactor) -> bool:
         """Compare registries without exposing their secret values."""
@@ -1834,6 +1881,33 @@ def _marker_spans(value: bytes, marker: bytes) -> tuple[tuple[int, int], ...]:
         spans.append((start, start + len(marker)))
         start = value.find(marker, start + len(marker))
     return tuple(spans)
+
+
+def _quoted_inner_forms(rendered: str, prefix: int) -> set[str]:
+    """Inner text of a repr forced to single quotes, with and without ``\\'``.
+
+    *rendered* is the repr of the value followed by ``'"``, which makes Python
+    quote with ``'`` and escape it; the other style leaves ``'`` unescaped.
+    """
+
+    inner = rendered[prefix:-4]
+    return {inner, inner.replace("\\'", "'")}
+
+
+def _python_escaped_forms(value: str) -> set[str]:
+    forms = _quoted_inner_forms(repr(value + "'\""), 1)
+    # A repr inside another repr: f"missing {path!r}" raised as KeyError.
+    for form in tuple(forms):
+        forms |= _quoted_inner_forms(repr(form + "'\""), 1)
+    forms |= _quoted_inner_forms(ascii(value + "'\""), 1)
+    # surrogatepass matches how lone surrogates reach bytes in practice.
+    encoded = value.encode("utf-8", "surrogatepass")
+    forms |= _quoted_inner_forms(repr(encoded + b"'\""), 2)
+    for ensure_ascii in (True, False):
+        forms.add(json.dumps(value, ensure_ascii=ensure_ascii)[1:-1])
+    forms.discard("")
+    forms.discard(value)
+    return forms
 
 
 def _redaction_pattern(values: tuple[str, ...]) -> re.Pattern[str] | None:

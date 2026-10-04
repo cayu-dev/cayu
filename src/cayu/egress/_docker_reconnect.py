@@ -26,6 +26,7 @@ from cayu.egress._remote_adapter import run_enforcement_preflight
 from cayu.egress.adapter import EgressBinding, RunnerFinalizationResult, VirtualEgressRunnerRequest
 from cayu.egress.errors import DockerEgressReconnectError, InvalidEgressReconnectMetadataError
 from cayu.runners.docker import DockerRunner
+from cayu.vaults import SecretRedactor
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -406,11 +407,12 @@ class DockerReconnect:
         except (ValueError, TypeError):
             raise DockerEgressReconnectError("identity_mismatch") from None
 
-    async def run(self, args: Sequence[str]) -> None:
+    async def run(self, args: Sequence[str], *, redactor: SecretRedactor | None = None) -> None:
         """Persist dispatch uncertainty before any daemon mutation.
 
         A timeout never releases a claim while its command may still mutate Docker.
         A new process treats that journal as uncertain and fences the exact container.
+        ``redactor`` removes the preparation's own secrets from Docker's stderr.
         """
         claim = next(
             (
@@ -464,7 +466,8 @@ class DockerReconnect:
         claim.write(pending_mutation=False)
         if code:
             error = DockerEgressReconnectError("daemon_unavailable")
-            error.args = (f"{error} {docker_setup_failure(args, code, diagnostic)}",)
+            failure = docker_setup_failure(args, code, diagnostic, redactor=redactor)
+            error.args = (f"{error} {failure}",)
             raise error
 
     async def freeze(self, claim: _Claim) -> None:

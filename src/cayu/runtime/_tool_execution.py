@@ -20,7 +20,7 @@ from cayu.environments.admission import ExecutionAdmissionError
 from cayu.failure_evidence import exception_evidence
 from cayu.resource_access import model_data_access
 from cayu.runners._adapter_identity import trusted_runner_adapter_name
-from cayu.runners.base import RunnerExecutionError, RunnerUnavailableError
+from cayu.runners.base import RunnerExecutionError, RunnerUnavailableError, runner_error_text
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime._auxiliary_invocation import AuxiliaryInferenceScope
 from cayu.runtime._durable_subagents import (
@@ -36,8 +36,10 @@ from cayu.runtime._isolated_tool_process import (
     IsolatedToolPreDispatchFailure,
     IsolatedToolSettlementFailure,
     execute_process_isolated_tool,
+    isolated_failure_text,
     isolated_tool_execution_contract,
 )
+from cayu.runtime._isolated_tool_protocol import ISOLATED_TOOL_STDERR_WINDOW_CHARS
 from cayu.runtime._phase_timing import phase_scope
 from cayu.runtime._tool_identity import tool_idempotency_key as tool_idempotency_key
 from cayu.tools._invocation_lifetime import tool_invocation_lifetime
@@ -680,12 +682,13 @@ async def _run_tool(
         )
     except IsolatedToolFailure as exc:
         ctx._discard_policy_denials_for(tool)
+        active_redactor = _active_redactor(redactor)
         return _isolated_failure_outcome(
             terminal_outcome="tool_execution_error",
             effect=effect,
-            message="Isolated tool process execution failed.",
+            message=_isolated_failure_message(exc, active_redactor),
             failure_code=exc.code,
-            redactor=_active_redactor(redactor),
+            redactor=active_redactor,
         )
     except ExecutionDeadlineExceeded:
         raise
@@ -935,11 +938,7 @@ def _runner_failure_result(
     result, controls = tool_results.terminal_failure_result(
         terminal_outcome="tool_execution_error",
         effect=effect,
-        message=(
-            "Runner is unavailable."
-            if isinstance(error, RunnerUnavailableError)
-            else "Runner command execution failed."
-        ),
+        message=_runner_failure_message(error, redactor),
         redactor=redactor,
     )
     structured = dict(result.structured or {})
@@ -966,6 +965,77 @@ def _base_exception_namespace_value(error: BaseException, name: str) -> object:
     except BaseException:
         return None
     return dict.get(namespace, name) if type(namespace) is dict else None
+
+
+_ISOLATED_MESSAGE_BYTES = 2048
+_ISOLATED_STDERR_TAIL_BYTES = 1536
+
+
+def _isolated_failure_message(error: IsolatedToolFailure, redactor: SecretRedactor) -> str:
+    """Fixed headline plus the child's exception and stderr tail, redacted first."""
+
+    message, stderr_tail = isolated_failure_text(error)
+    # The child's text quotes fields with repr, so escaped secrets match too.
+    source_redactor = redactor.with_python_repr_forms()
+    parts = ["Isolated tool process execution failed."]
+    if message is not None:
+        # Redact the child's original text, then make it displayable; the
+        # bounded redaction also catches a secret the flattening formed.
+        displayable = _displayable_text(source_redactor.redact_text(message)).strip()
+        bounded, _truncated = redactor.redact_text_bounded_with_marker(
+            displayable, max_bytes=_ISOLATED_MESSAGE_BYTES, truncation_marker="...[truncated]"
+        )
+        if bounded:
+            parts.append(bounded)
+    if stderr_tail is not None:
+        # The child sends a window far larger than this tail and the whole window
+        # is redacted before slicing. A full window may start inside a secret,
+        # so its head is dropped by position before anything is shown.
+        redacted_window = (
+            source_redactor.redact_cut_text(stderr_tail, cut_head=True)
+            if len(stderr_tail) >= ISOLATED_TOOL_STDERR_WINDOW_CHARS
+            else source_redactor.redact_text(stderr_tail)
+        )
+        displayable = _displayable_text(redacted_window)
+        redacted = redactor.redact_text(displayable).encode("utf-8")
+        tail = redacted[-_ISOLATED_STDERR_TAIL_BYTES:].decode("utf-8", "ignore").strip()
+        if tail:
+            prefix = "..." if len(redacted) > _ISOLATED_STDERR_TAIL_BYTES else ""
+            parts.append(f"stderr: {prefix}{tail}")
+    return "\n".join(parts)
+
+
+def _runner_failure_message(
+    error: RunnerExecutionError | RunnerUnavailableError, redactor: SecretRedactor
+) -> str:
+    """Fixed headline plus the runner's own text, redacted before it is flattened.
+
+    The caller redacts again and then bounds, which also catches a registered
+    secret that flattening happened to form.
+    """
+
+    if isinstance(error, RunnerUnavailableError):
+        return "Runner is unavailable."
+    text = runner_error_text(error)
+    if text is None:
+        return "Runner command execution failed."
+    # Builtin formatters quote fields with repr, so escaped secrets match too.
+    printable = _flattened_text(redactor.with_python_repr_forms().redact_text(text))
+    return (
+        f"Runner command execution failed: {printable}"
+        if printable
+        else ("Runner command execution failed.")
+    )
+
+
+def _displayable_text(text: str) -> str:
+    """Keep line breaks and tabs; turn other controls (CR, escapes) into spaces."""
+
+    return "".join(c if c in "\n\t" or c.isprintable() else " " for c in text)
+
+
+def _flattened_text(text: str) -> str:
+    return " ".join("".join(c if c.isprintable() else " " for c in text).split())
 
 
 def _active_redactor(redactor: Callable[[], SecretRedactor]) -> SecretRedactor:

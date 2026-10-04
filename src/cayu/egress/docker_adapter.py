@@ -62,6 +62,7 @@ from cayu.environments.admission import (
 from cayu.runners._docker_cli import docker_cli_env, normalize_docker_cli_env_allowlist
 from cayu.runners.base import Runner
 from cayu.runners.docker import DockerRunner, validate_docker_seccomp_profile
+from cayu.vaults import SecretRedactor
 
 #: Where the per-session CA is mounted inside the container and trusted from.
 GUEST_CA_PATH = "/etc/cayu/ca.pem"
@@ -562,6 +563,9 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             if control_server_container_id is not None
             else _create_sidecar_transport_authorization()
         )
+        # The token this preparation created; removed from its Docker stderr
+        # before display. Scoped to this preparation so nothing accumulates.
+        diagnostic_redactor = SecretRedactor([transport_authorization.token.decode("ascii")])
         try:
             if certificate_authority is not None or not owns_certificate_authority:
                 server = TransparentEgressProxyServer(
@@ -590,7 +594,16 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             )
             if reconnect_network is None:
                 await self._run(
-                    ["network", "create", "--internal", "--label", label, *ownership_label, network]
+                    [
+                        "network",
+                        "create",
+                        "--internal",
+                        "--label",
+                        label,
+                        *ownership_label,
+                        network,
+                    ],
+                    redactor=diagnostic_redactor,
                 )
             if control_server_container_id is not None and self._reconnect is not None:
                 assert reconnect_token is not None
@@ -605,7 +618,8 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                             "cayu-control",
                             network,
                             control_server_container_id,
-                        ]
+                        ],
+                        redactor=diagnostic_redactor,
                     )
                 )
                 # Cancelling a Docker CLI waiter cannot prove that the daemon
@@ -652,7 +666,8 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                     _SIDECAR_CONNECTOR_PATH,
                     self._sidecar_image,
                     "listen",
-                ]
+                ],
+                redactor=diagnostic_redactor,
             )
             await self._run(
                 [
@@ -661,10 +676,15 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                     *([] if reconnect_token is None else ["--alias", PROXY_ALIAS]),
                     network,
                     sidecar,
-                ]
+                ],
+                redactor=diagnostic_redactor,
             )
-            await self._run(["exec", sidecar, "sh", "-c", _SIDECAR_READY_SCRIPT])
-            await self._probe_sidecar_broker(sidecar, bind_host=bind_host, broker=broker)
+            await self._run(
+                ["exec", sidecar, "sh", "-c", _SIDECAR_READY_SCRIPT], redactor=diagnostic_redactor
+            )
+            await self._probe_sidecar_broker(
+                sidecar, bind_host=bind_host, broker=broker, redactor=diagnostic_redactor
+            )
         except BaseException as original:
             _consume_accounted_task_cancellation(original)
             cleanup = _PreparationCleanup(
@@ -758,6 +778,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         *,
         bind_host: str,
         broker: TransparentEgressBroker,
+        redactor: SecretRedactor | None = None,
     ) -> None:
         argv = ["exec", sidecar, _SIDECAR_CONNECTOR_PATH, "probe"]
         stderr = ""
@@ -766,7 +787,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                 code, stderr = await self._docker_exec(argv)
             if code == 0:
                 return
-            diagnostic = docker_setup_failure(argv, code, stderr)
+            diagnostic = docker_setup_failure(argv, code, stderr, redactor=redactor)
         except TimeoutError:
             diagnostic = "Authenticated broker connection probe timed out."
         except Exception:
@@ -1170,13 +1191,15 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             allocation_preserved=True,
         )
 
-    async def _run(self, argv: Sequence[str]) -> None:
+    async def _run(self, argv: Sequence[str], *, redactor: SecretRedactor | None = None) -> None:
         if self._reconnect is not None:
-            await self._reconnect.run(argv)
+            await self._reconnect.run(argv, redactor=redactor)
             return
         exit_code, stderr = await self._docker_exec(argv)
         if exit_code != 0:
-            raise UnsupportedEgressError(docker_setup_failure(argv, exit_code, stderr))
+            raise UnsupportedEgressError(
+                docker_setup_failure(argv, exit_code, stderr, redactor=redactor)
+            )
 
     async def _container_id(self, name: str) -> str:
         exit_code, stdout = await self._docker_run(

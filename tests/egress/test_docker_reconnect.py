@@ -657,3 +657,29 @@ def test_setup_failure_retains_safe_diagnostics_and_settles_mutation(tmp_path, o
             claim.close()
 
     asyncio.run(scenario())
+
+
+def test_reconnect_setup_failure_removes_the_preparation_secret(tmp_path):
+    from cayu.vaults import SecretRedactor
+
+    async def scenario():
+        _, adapter, manager, _ = setup(tmp_path)
+        claim = manager.claim(TOKEN)
+        claim.read()
+        transport_token = "sidecar-transport-token-canary"
+
+        async def fail(args):
+            return 17, f"Error response from daemon: bind {transport_token} failed"
+
+        adapter._docker_exec = fail
+        try:
+            with pytest.raises(DockerEgressReconnectError) as raised:
+                await adapter._run(
+                    ["network", "create", NID], redactor=SecretRedactor([transport_token])
+                )
+            assert "bind" in str(raised.value)
+            assert transport_token not in str(raised.value)
+        finally:
+            claim.close()
+
+    asyncio.run(scenario())

@@ -8,12 +8,14 @@ import inspect
 import os
 import signal
 import sys
-from collections.abc import Awaitable
-from contextlib import suppress
+from collections.abc import Awaitable, Iterator
+from contextlib import contextmanager, suppress
 from typing import Any
 
 from cayu.deadlines import bind_execution_deadline
 from cayu.runtime._isolated_tool_protocol import (
+    ISOLATED_TOOL_STDERR_WINDOW_CHARS,
+    MAX_ISOLATED_TOOL_ERROR_MESSAGE_BYTES,
     IsolatedToolChildErrorCode,
     IsolatedToolInvocationEnvelope,
     decode_isolated_tool_request,
@@ -69,6 +71,76 @@ class _FactoryIdentityMismatch(Exception):
     pass
 
 
+# The parent shows only a bounded tail after redacting this whole window, and
+# drops the head of a full window, so a secret cut at its start never shows.
+_STDERR_TAIL_CHARS = ISOLATED_TOOL_STDERR_WINDOW_CHARS
+
+
+class _StderrTail:
+    """Pass stderr through unchanged while keeping its last characters.
+
+    Every attribute other than ``write`` (``fileno``, ``buffer``, ``isatty``,
+    ``encoding`` ...) is delegated, so tool code sees the real stream.
+    """
+
+    def __init__(self, target: Any) -> None:
+        self._target = target
+        self.tail = ""
+
+    def write(self, text: str) -> int:
+        written = self._target.write(text)
+        self.tail = (self.tail + text)[-_STDERR_TAIL_CHARS:]
+        return written
+
+    def flush(self) -> None:
+        self._target.flush()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._target, name)
+
+
+@contextmanager
+def _capture_stderr_tail() -> Iterator[_StderrTail]:
+    original = sys.stderr
+    tee = _StderrTail(original)
+    sys.stderr = tee
+    try:
+        yield tee
+    finally:
+        sys.stderr = original
+
+
+def _sendable_text(text: str) -> str | None:
+    """The text exactly as written, or None when the protocol cannot carry it.
+
+    It is never cleaned here: the parent redacts registered secrets from the
+    original text before flattening controls or whitespace, so a multi-line or
+    CRLF secret cannot survive as transformed fragments.
+    """
+
+    if not text.strip() or "\x00" in text:
+        return None
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return text
+
+
+def _failure_message(error: BaseException) -> str | None:
+    """The exception's type and text, or None when it is too large to send whole."""
+
+    try:
+        text = f"{type(error).__name__}: {error}"
+    except BaseException:
+        return None
+    sendable = _sendable_text(text)
+    if sendable is None or len(sendable.encode("utf-8")) > MAX_ISOLATED_TOOL_ERROR_MESSAGE_BYTES:
+        # Never cut before the parent redacts: oversized text is omitted.
+        return None
+    return sendable
+
+
 async def _await_result(awaitable: Awaitable[Any]) -> Any:
     return await awaitable
 
@@ -94,57 +166,84 @@ def _resolve_factory(envelope: IsolatedToolInvocationEnvelope) -> Any:
     return target
 
 
+_Failure = tuple[None, str, str | None, str | None]
+
+
 def _execute(
     envelope: IsolatedToolInvocationEnvelope,
     *,
     result_fd: int,
-) -> tuple[ToolResult | None, str | None]:
+) -> tuple[ToolResult, None, None, None] | _Failure:
+    with _capture_stderr_tail() as stderr:
+        outcome = _execute_captured(envelope, result_fd=result_fd)
+    if outcome[0] is None:
+        return None, outcome[1], outcome[2], _sendable_text(stderr.tail)
+    return outcome
+
+
+def _execute_captured(
+    envelope: IsolatedToolInvocationEnvelope,
+    *,
+    result_fd: int,
+) -> tuple[ToolResult, None, None, None] | tuple[None, str, str | None, None]:
     # macOS injects this process-local locale hint even when ``env`` is supplied
     # explicitly. It is not adapter authority, so remove it before checking and
     # before application code can observe the child environment.
     os.environ.pop("__CF_USER_TEXT_ENCODING", None)
     expected_environment = {**_REQUIRED_BASE_ENVIRONMENT, **envelope.environment}
     if dict(os.environ) != expected_environment:
-        return None, IsolatedToolChildErrorCode.ENVIRONMENT_INVALID.value
+        return None, IsolatedToolChildErrorCode.ENVIRONMENT_INVALID.value, None, None
     _close_ambient_file_descriptors(result_fd=result_fd)
     try:
         factory = _resolve_factory(envelope)
     except _FactoryIdentityMismatch:
-        return None, IsolatedToolChildErrorCode.FACTORY_IDENTITY_MISMATCH.value
-    except BaseException:
-        return None, IsolatedToolChildErrorCode.FACTORY_IMPORT_FAILED.value
+        return None, IsolatedToolChildErrorCode.FACTORY_IDENTITY_MISMATCH.value, None, None
+    except BaseException as error:
+        return (
+            None,
+            IsolatedToolChildErrorCode.FACTORY_IMPORT_FAILED.value,
+            _failure_message(error),
+            None,
+        )
     try:
         handler = factory(envelope.factory_config)
-    except BaseException:
-        return None, IsolatedToolChildErrorCode.FACTORY_CONSTRUCTION_FAILED.value
+    except BaseException as error:
+        return (
+            None,
+            IsolatedToolChildErrorCode.FACTORY_CONSTRUCTION_FAILED.value,
+            _failure_message(error),
+            None,
+        )
     if inspect.isawaitable(handler):
-        return None, IsolatedToolChildErrorCode.FACTORY_INVALID.value
+        return None, IsolatedToolChildErrorCode.FACTORY_INVALID.value, None, None
     try:
         run = handler.run
     except BaseException:
-        return None, IsolatedToolChildErrorCode.FACTORY_INVALID.value
+        return None, IsolatedToolChildErrorCode.FACTORY_INVALID.value, None, None
     if not callable(run):
-        return None, IsolatedToolChildErrorCode.FACTORY_INVALID.value
+        return None, IsolatedToolChildErrorCode.FACTORY_INVALID.value, None, None
     try:
         envelope.context.execution_deadline.require_admission("isolated_tool")
         with bind_execution_deadline(envelope.context.execution_deadline):
             result = run(envelope.context, envelope.arguments)
             if inspect.isawaitable(result):
                 result = asyncio.run(_await_result(result))
-    except BaseException:
-        return None, IsolatedToolChildErrorCode.CHILD_EXCEPTION.value
+    except BaseException as error:
+        return None, IsolatedToolChildErrorCode.CHILD_EXCEPTION.value, _failure_message(error), None
     if type(result) is not ToolResult:
-        return None, IsolatedToolChildErrorCode.INVALID_RESULT.value
-    return result, None
+        return None, IsolatedToolChildErrorCode.INVALID_RESULT.value, None, None
+    return result, None, None, None
 
 
 def _terminal_bytes(envelope: IsolatedToolInvocationEnvelope, *, result_fd: int) -> bytes:
-    result, error_code = _execute(envelope, result_fd=result_fd)
+    result, error_code, error_message, stderr_tail = _execute(envelope, result_fd=result_fd)
     if error_code is not None:
         return encode_isolated_tool_error(
             request_sha256=envelope.request_sha256,
             error_code=IsolatedToolChildErrorCode(error_code),
             max_bytes=envelope.limits.max_response_bytes,
+            error_message=error_message,
+            stderr_tail=stderr_tail,
         )
     if result is None:  # pragma: no cover - execution tuple invariant
         raise AssertionError("Isolated tool execution produced no terminal value.")

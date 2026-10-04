@@ -10372,7 +10372,9 @@ compatible endpoints.
 `api-key`; `endpoint_url` overrides the complete request URL;
 `stream_include_usage=False` supports servers that reject stream options; and
 `allow_http=True` is the explicit opt-in for local HTTP services such as
-Ollama or vLLM. `clean_schemas=True` removes schema keywords commonly rejected
+Ollama or vLLM. `OpenAIProvider` and `AnthropicProvider` take the same
+`allow_http` opt-in for local Responses or Messages servers; their default
+transports inherit it, and it is part of their execution-profile material. `clean_schemas=True` removes schema keywords commonly rejected
 by compatible services while preserving closed-object declarations where the
 target schema dialect supports them. The Gemini OpenAI-compatible endpoint is
 detected and additionally removes `additionalProperties`; set

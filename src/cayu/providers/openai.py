@@ -7,7 +7,8 @@ from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from dataclasses import replace
 from functools import cache
 from hashlib import sha256
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from itertools import islice
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 from urllib.parse import quote, urlencode
 
 from cayu._validation import (
@@ -72,6 +73,7 @@ from cayu.providers._http import (
     credential_sanitization_values,
     optional_error_string,
     post_json,
+    provider_error_text,
     request_json,
     response_json_object,
     retain_provider_error_metadata,
@@ -232,6 +234,20 @@ _OPENAI_POINTER_INDEX_RE = re.compile(r"0|[1-9][0-9]*")
 _OPENAI_SCHEMA_PREFLIGHT_MAX_DEPTH = 128
 _OPENAI_NATIVE_CAPABILITY_MAX_MODELS = 256
 _OPENAI_NATIVE_CAPABILITY_MODEL_MAX_BYTES = 1024
+# Hosted tool entries of the Responses ``tools`` array, and a ``param`` that
+# indexes one entry (``tools[2]``, ``tools[2].type``).
+_OPENAI_HOSTED_TOOL_TYPES = frozenset({"web_search"})
+_OPENAI_TOOL_PARAM_INDEX_RE = re.compile(r"tools\[(0|[1-9][0-9]*)\](?=$|[.\[])")
+# A backend message naming the hosted tool type as a tool, e.g. "Hosted tool
+# 'web_search_preview' is not supported with gpt-4.1-nano." The quotes keep a
+# function named web_search-v2 or a message that only mentions web_search out.
+_OPENAI_HOSTED_TOOL_NAME_RE = re.compile(r"(?i)\btool\s++(['\"`])web_search(?:_preview)?\1")
+# Or as an item of a comma-separated list after a colon, e.g. "The following
+# tools cannot be used with reasoning.effort 'minimal': web_search."
+_OPENAI_HOSTED_TOOL_LIST_ITEM_RE = re.compile(
+    r"(?i)(?<![\w.-])web_search(?:_preview)?(?=[^\S\n]*+(?:,|\.?[^\S\n]*+(?:$|\n)|\.\s))"
+)
+_OPENAI_TOOL_LIST_PREFIX_RE = re.compile(r"[^\S\n]*+(?:[^\s,:]++[^\S\n]*+,[^\S\n]*+)*+")
 
 
 @cache
@@ -248,15 +264,105 @@ def _copy_model_catalog(value: ModelCatalog | None) -> ModelCatalog | None:
     return ModelCatalog.model_validate(value.model_dump(mode="python"))
 
 
-def _openai_hosted_web_search_established(
+def _openai_hosted_web_search_support(
     model: str,
     model_catalog: ModelCatalog | None,
-) -> bool:
+) -> Literal["supported", "unsupported", "unknown"]:
+    """Read hosted web search support from the catalog.
+
+    A catalog record decides; a record without established support fails fast.
+    A model the catalog does not know is ``unknown``: the request is sent and the
+    backend decides, and a rejection becomes ``HostedToolCapabilityError``.
+    """
+
     catalog = _bundled_model_catalog() if model_catalog is None else model_catalog
     info = catalog.resolve(provider_name="openai", model=model)
     if info is not None:
-        return info.hosted_web_search
-    return model in _OPENAI_HOSTED_WEB_SEARCH_POINTER_MODELS
+        return "supported" if info.hosted_web_search else "unsupported"
+    if model in _OPENAI_HOSTED_WEB_SEARCH_POINTER_MODELS:
+        return "supported"
+    return "unknown"
+
+
+def is_openai_hosted_tool_rejection(
+    exc: OpenAIAPIError,
+    *,
+    sent_tools: Sequence[object],
+) -> bool:
+    """Whether a Responses API error rejects one of the request's hosted tools.
+
+    Function and hosted tools share one ``tools`` array, so the error must
+    point at a hosted tool:
+
+    - ``param`` indexes a hosted entry of the array that was sent;
+    - the error code names the hosted tool type;
+    - ``param`` is the bare ``tools`` array and the backend message names the
+      hosted tool type as a quoted tool (``Hosted tool 'web_search_preview'``); or
+    - only hosted tools were sent and ``param`` is ``tools`` (or absent with a
+      tool error code, or with a message naming the hosted tool).
+
+    In a request that also sends function tools, nothing else counts: a
+    function tool's error or a message that merely mentions web search is an
+    ordinary provider error.
+    """
+
+    if exc.status_code not in {400, 404, 422}:
+        return False
+    code = "" if exc.error_code is None else exc.error_code.lower()
+    if any(tool_type in code for tool_type in _OPENAI_HOSTED_TOOL_TYPES):
+        return True
+    param = "" if exc.param is None else exc.param.lower()
+    if param in {"", "tools"}:
+        hosted = [_is_openai_hosted_tool_entry(tool) for tool in sent_tools]
+        if not any(hosted):
+            return False
+        text = provider_error_text(exc)
+        names_hosted_tool = text is not None and _openai_message_names_hosted_tool(text)
+        if not all(hosted):
+            return param == "tools" and names_hosted_tool
+        # Only hosted tools were sent, so a tools-array rejection is about them.
+        # Without ``param`` that needs a tool error code or a message naming the
+        # hosted tool (not, say, an unknown model).
+        return param == "tools" or code in {"invalid_tool", "unsupported_tool"} or names_hosted_tool
+    match = _OPENAI_TOOL_PARAM_INDEX_RE.match(param)
+    if match is None:
+        return False
+    index = int(match.group(1))
+    return index < len(sent_tools) and _is_openai_hosted_tool_entry(sent_tools[index])
+
+
+def _openai_message_names_hosted_tool(text: str) -> bool:
+    """Whether a backend message names the hosted tool type as a tool.
+
+    Either quoted after "tool" (``Hosted tool 'web_search_preview'``) or as an
+    exact item of a comma-separated list that follows a colon on its line.
+    """
+
+    if _OPENAI_HOSTED_TOOL_NAME_RE.search(text) is not None:
+        return True
+    for match in islice(_OPENAI_HOSTED_TOOL_LIST_ITEM_RE.finditer(text), 16):
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        colon = text.rfind(":", line_start, match.start())
+        if colon != -1 and _OPENAI_TOOL_LIST_PREFIX_RE.fullmatch(text, colon + 1, match.start()):
+            return True
+    return False
+
+
+def _is_openai_hosted_tool_entry(tool: object) -> bool:
+    return isinstance(tool, Mapping) and tool.get("type") in _OPENAI_HOSTED_TOOL_TYPES
+
+
+def openai_hosted_tool_rejection_error(
+    model: str,
+    provider_error: ModelProviderError,
+) -> HostedToolCapabilityError:
+    """Name the capability failure and keep the credential-safe provider text."""
+
+    return HostedToolCapabilityError(
+        f"The OpenAI backend rejected hosted web search for model {model!r}, which the "
+        "model catalog does not list. Disable web search or use a model that supports "
+        f"it. Provider error: {provider_error}"
+    )
 
 
 def _copy_exact_model_allowlist(
@@ -497,7 +603,10 @@ class HttpxOpenAITransport:
     with :meth:`aclose` when the transport is no longer needed.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, allow_http: bool = False) -> None:
+        if type(allow_http) is not bool:
+            raise TypeError("allow_http must be a bool.")
+        self.allow_http = allow_http
         self._client = SharedAsyncClient()
 
     async def aclose(self) -> None:
@@ -511,7 +620,7 @@ class HttpxOpenAITransport:
         payload: Mapping[str, Any],
         timeout_s: float,
     ) -> Mapping[str, Any]:
-        url = _validate_url(url, "url")
+        url = _validate_url(url, "url", allow_http=self.allow_http)
         return await post_json(
             client=self._client.get(),
             url=url,
@@ -539,7 +648,7 @@ class HttpxOpenAITransport:
         semantic_progress_timeout_s: float,
         absolute_stream_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
-        url = _validate_url(url, "url")
+        url = _validate_url(url, "url", allow_http=self.allow_http)
         events = stream_sse_json_events(
             capture_response_structure=True,
             client=self._client.get(),
@@ -639,7 +748,7 @@ class HttpxOpenAITransport:
         return await request_json(
             client=self._client.get(),
             method=method,
-            url=_validate_url(url, "url"),
+            url=_validate_url(url, "url", allow_http=self.allow_http),
             headers=headers,
             payload=None,
             timeout_s=timeout_s,
@@ -1273,6 +1382,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         api_key: str | None = None,
         name: str = "openai",
         base_url: str = DEFAULT_OPENAI_BASE_URL,
+        allow_http: bool = False,
         timeout_s: float | None = None,
         stream_deadlines: ProviderStreamDeadlines | None = None,
         transport: OpenAITransport | None = None,
@@ -1296,7 +1406,10 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
                 "to OpenAIProvider(...)."
             ),
         )
-        self.base_url = _validate_base_url(base_url)
+        if type(allow_http) is not bool:
+            raise TypeError("allow_http must be a bool.")
+        self.allow_http = allow_http
+        self.base_url = _validate_base_url(base_url, allow_http=allow_http)
         if (
             hosted_web_search_supported is not None
             and type(hosted_web_search_supported) is not bool
@@ -1357,7 +1470,11 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             else timeout_s,
             "timeout_s",
         )
-        self.transport = transport if transport is not None else HttpxOpenAITransport()
+        # A caller-supplied transport manages its own scheme policy; the default
+        # transport inherits allow_http so a local http endpoint actually connects.
+        self.transport = (
+            transport if transport is not None else HttpxOpenAITransport(allow_http=allow_http)
+        )
         if self.background:
             missing_operations = [
                 operation
@@ -1390,13 +1507,16 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         cancellation: asyncio.CancelledError | None = None
         overflow_failure: OpenAIContextOverflowError | None = None
         post_completion_failure: ModelProviderError | None = None
+        capability_failure: HostedToolCapabilityError | None = None
         error_event: ModelStreamEvent | None = None
         completion_emitted = False
+        sent_tools: Sequence[object] = ()
         try:
             self._preflight_dynamic_tool_request(request)
             payload = build_openai_payload(
                 request, stream=self.streaming, reasoning_state=self.reasoning_state
             )
+            sent_tools = payload.get("tools", ())
             from cayu.providers.base import record_peer_serialization
 
             await record_peer_serialization(request)
@@ -1436,6 +1556,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             recovery_payload = build_openai_payload(
                 request, stream=self.streaming, reasoning_state=self.reasoning_state, chain=False
             )
+            sent_tools = recovery_payload.get("tools", ())
             events = self._consume(recovery_payload)
             async with aclosing_provider_stream(events):
                 async for event in events:
@@ -1542,7 +1663,28 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
                 self.api_key,
                 extra_headers=self.extra_headers,
             )
-            if completion_emitted:
+            if (
+                isinstance(exc, OpenAIAPIError)
+                and request.hosted_tools
+                and not completion_emitted
+                and _openai_hosted_web_search_support(request.model, self.model_catalog)
+                == "unknown"
+                and is_openai_hosted_tool_rejection(exc, sent_tools=sent_tools)
+            ):
+                # A model the catalog does not know was sent to the backend,
+                # which refused the hosted tool: a capability failure, not a retry.
+                # Catalog-known models were decided locally, so their errors stay
+                # ordinary provider errors.
+                capability_failure = openai_hosted_tool_rejection_error(
+                    request.model,
+                    credential_safe_provider_exception(
+                        exc,
+                        provider_label="OpenAI",
+                        provider_name="openai",
+                        credential_values=credential_values,
+                    ),
+                )
+            elif completion_emitted:
                 post_completion_failure = credential_safe_post_completion_failure(
                     exc,
                     provider_label="OpenAI",
@@ -1560,6 +1702,8 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             raise cancellation from None
         if overflow_failure is not None:
             raise overflow_failure from None
+        if capability_failure is not None:
+            raise capability_failure from None
         if post_completion_failure is not None:
             raise post_completion_failure from None
         if error_event is not None:
@@ -7396,7 +7540,7 @@ def _preflight_openai_hosted_tools(
             "OpenAI hosted web search is not established for this custom endpoint; "
             "set hosted_web_search_supported=True only after verifying its Responses contract."
         )
-    if not _openai_hosted_web_search_established(model, model_catalog):
+    if _openai_hosted_web_search_support(model, model_catalog) == "unsupported":
         raise HostedToolCapabilityError(
             f"OpenAI hosted web search support is not established for model {model!r}."
         )
@@ -7444,12 +7588,16 @@ def _copy_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
     return copy_headers(headers, protected=_PROTECTED_HEADER_NAMES)
 
 
-def _validate_base_url(base_url: str) -> str:
-    return validate_base_url(base_url, provider_label="OpenAI")
+def _validate_base_url(base_url: str, *, allow_http: bool = False) -> str:
+    return validate_base_url(
+        base_url, provider_label="OpenAI", allow_http=allow_http, allow_http_hint=True
+    )
 
 
-def _validate_url(url: str, field_name: str) -> str:
-    return validate_url(url, field_name, provider_label="OpenAI")
+def _validate_url(url: str, field_name: str, *, allow_http: bool = False) -> str:
+    return validate_url(
+        url, field_name, provider_label="OpenAI", allow_http=allow_http, allow_http_hint=True
+    )
 
 
 def _safe_error_response_text(response: httpx.Response) -> str:
@@ -7643,4 +7791,6 @@ def _execution_profile_material(provider: OpenAIProvider) -> dict[str, Any] | No
     }
     if not provider.streaming:
         material["streaming"] = False
+    if provider.allow_http:
+        material["allow_http"] = True
     return material

@@ -40,6 +40,7 @@ from cayu.providers._credential_boundary import (
     detach_provider_stream_traceback,
 )
 from cayu.providers._http import (
+    _PROVIDER_ERROR_WORKLOAD_REDACTOR,
     OMITTED_PROVIDER_ERROR_BODY,
     SharedAsyncClient,
     _trusted_sse_retry_after_s,
@@ -157,8 +158,9 @@ _OPENROUTER_ROUTER_STRATEGIES = frozenset(
     }
 )
 # Snapshot of public OpenRouter provider identities on 2026-08-22, plus
-# documented display aliases. Future identities are retained only as a
-# domain-separated digest until this allowlist is updated.
+# documented display aliases, used to canonicalize spelling. Other plain
+# provider names pass through (see _plain_openrouter_provider_name); anything
+# else is retained only as a domain-separated digest.
 _OPENROUTER_UPSTREAM_PROVIDER_IDENTITIES: dict[str, str] = {
     value.casefold(): value
     for value in (
@@ -927,11 +929,37 @@ def _router_evidence_sha256(value: Any, *, domain: str) -> str | None:
     return hashlib.sha256(encoded).hexdigest()
 
 
+_PLAIN_PROVIDER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._()&+/-]{0,63}\Z")
+_MAX_PROVIDER_NAME_WORD_CHARS = 24
+
+
+def _plain_openrouter_provider_name(raw: str, normalized: str) -> str | None:
+    """Pass a short display name through unless it could be a credential.
+
+    Names are a few short words; a long unbroken token (an API key, a session
+    value) or anything containing a registered workload secret is not shown.
+    The secret check runs on the raw value too, since stripping it could cut a
+    secret that starts or ends with whitespace.
+    """
+
+    if _PLAIN_PROVIDER_NAME.fullmatch(normalized) is None:
+        return None
+    if any(len(word) > _MAX_PROVIDER_NAME_WORD_CHARS for word in normalized.split()):
+        return None
+    workload = _PROVIDER_ERROR_WORKLOAD_REDACTOR.get()
+    if workload is not None and any(
+        workload.redact_text(value) != value for value in (raw, normalized)
+    ):
+        return None
+    return normalized
+
+
 def _safe_openrouter_provider_identity(value: Any) -> str | None:
     normalized = _router_evidence_string(value)
     if normalized is None:
         return None
-    return _OPENROUTER_UPSTREAM_PROVIDER_IDENTITIES.get(normalized.casefold())
+    known = _OPENROUTER_UPSTREAM_PROVIDER_IDENTITIES.get(normalized.casefold())
+    return known if known is not None else _plain_openrouter_provider_name(value, normalized)
 
 
 def _openrouter_provider_evidence(value: Any) -> tuple[str, str] | None:

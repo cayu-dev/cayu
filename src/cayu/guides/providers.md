@@ -110,6 +110,10 @@ has no mutable router, free, or paid default. `CAYU_PROVIDER=openrouter` selects
 the same preset in a neutral scaffold. Optional `OPENROUTER_HTTP_REFERER` and
 `OPENROUTER_APP_TITLE` add attribution, while
 `OPENROUTER_ROUTER_METADATA=enabled` retains only bounded routing evidence.
+The upstream provider is reported by name (`upstream_provider`) when it is a
+short plain name without a registered secret; other values become a digest. A
+short secret that was never registered can still pass as a name; see
+`docs/provider-error-diagnostics.md`.
 
 Put routing controls in `AgentSpec.provider_options["openrouter"]`. Streamed
 `reasoning_details` are concatenated in order and privately replayed unchanged,
@@ -261,7 +265,9 @@ together:
 | Ollama | Commonly `http://127.0.0.1:11434/v1`; placeholder key | Pulled model name |
 | vLLM | Commonly `http://127.0.0.1:8000/v1`; server key or placeholder | Served model name |
 
-For local HTTP endpoints such as Ollama or vLLM, pass `allow_http=True`. OpenCode
+For local HTTP endpoints such as Ollama or vLLM, pass `allow_http=True`;
+`OpenAIProvider` and `AnthropicProvider` accept the same opt-in for local
+Responses or Messages servers. OpenCode
 Go models span multiple protocols: use `ChatCompletionsProvider` for its Chat
 Completions models and the matching Cayu protocol adapter for its other models.
 Always use the raw API model ID.

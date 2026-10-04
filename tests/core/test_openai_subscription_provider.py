@@ -270,7 +270,7 @@ def test_subscription_provider_projects_native_hosted_web_search() -> None:
 
 
 def test_subscription_provider_hosted_web_search_preflight_uses_model_catalog() -> None:
-    def catalog(model: str) -> ModelCatalog:
+    def catalog(model: str, supported: bool = True) -> ModelCatalog:
         return ModelCatalog(
             catalog_version="app",
             generated_at="2026-09-30",
@@ -280,7 +280,7 @@ def test_subscription_provider_hosted_web_search_preflight_uses_model_catalog() 
                     model=model,
                     match="exact",
                     tool_calling=True,
-                    hosted_web_search=True,
+                    hosted_web_search=supported,
                     provenance=Provenance(
                         source="application",
                         url="https://example.test/models",
@@ -294,8 +294,15 @@ def test_subscription_provider_hosted_web_search_preflight_uses_model_catalog() 
     bundled.preflight_hosted_tools(
         model="gpt-5.6-luna", hosted_tools=(OpenAIWebSearch(),), options={}
     )
+    # Unknown to the bundled catalog: the backend decides.
+    bundled.preflight_hosted_tools(
+        model="gpt-6-app-catalog-test", hosted_tools=(OpenAIWebSearch(),), options={}
+    )
+    declared_false = OpenAISubscriptionProvider(
+        auth=StaticSubscriptionAuth(), model_catalog=catalog("gpt-6-app-catalog-test", False)
+    )
     with pytest.raises(HostedToolCapabilityError, match="not established for model"):
-        bundled.preflight_hosted_tools(
+        declared_false.preflight_hosted_tools(
             model="gpt-6-app-catalog-test", hosted_tools=(OpenAIWebSearch(),), options={}
         )
 
@@ -305,10 +312,10 @@ def test_subscription_provider_hosted_web_search_preflight_uses_model_catalog() 
     custom.preflight_hosted_tools(
         model="gpt-6-app-catalog-test", hosted_tools=(OpenAIWebSearch(),), options={}
     )
-    with pytest.raises(HostedToolCapabilityError, match="not established for model"):
-        custom.preflight_hosted_tools(
-            model="gpt-5.6-luna", hosted_tools=(OpenAIWebSearch(),), options={}
-        )
+    # Absent from the application catalog: the backend decides.
+    custom.preflight_hosted_tools(
+        model="gpt-5.6-luna", hosted_tools=(OpenAIWebSearch(),), options={}
+    )
 
 
 def test_subscription_provider_maps_backend_hosted_tool_rejection_to_capability_error() -> None:
@@ -322,7 +329,7 @@ def test_subscription_provider_maps_backend_hosted_tool_rejection_to_capability_
                         "type": "invalid_request_error",
                         "code": "unsupported_tool",
                         "param": "tools[0].type",
-                        "message": "raw backend detail must not escape",
+                        "message": "web_search is not available for this account",
                     }
                 },
             }
@@ -343,7 +350,8 @@ def test_subscription_provider_maps_backend_hosted_tool_rejection_to_capability_
             match="experimental OpenAI subscription backend rejected hosted web search",
         ) as raised:
             _ = [event async for event in provider.stream(request)]
-        assert "raw backend detail" not in str(raised.value)
+        # The backend's own explanation is kept, as for other provider errors.
+        assert "web_search is not available for this account" in str(raised.value)
 
     asyncio.run(collect())
 
@@ -352,6 +360,9 @@ def test_subscription_provider_maps_backend_hosted_tool_rejection_to_capability_
     ("param", "expect_capability_error"),
     [
         ("tools[0].type", True),
+        # Only the hosted tool was sent, so a bare tools rejection is about it.
+        ("tools", True),
+        ("tools[1].type", False),
         ("reasoning.effort", False),
     ],
 )

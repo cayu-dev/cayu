@@ -1194,3 +1194,51 @@ def test_custom_truncation_marker_and_redaction_marker_remain_atomic() -> None:
     assert "[REDA" not in projected
     assert "[tool trunc" not in projected
     assert len(projected.encode()) <= len("prefix-[REDA")
+
+
+def test_redact_cut_text_drops_nested_secrets_at_cut_edges() -> None:
+    from cayu.vaults import SecretRedactor
+    from cayu.vaults.redaction import REDACTED_SECRET
+
+    outer = "PREFIX_OUTER_INNER_SECRET_VALUE_1234_OUTER_SUFFIX_DATA_XYZ"
+    inner = "INNER_SECRET_VALUE_1234"
+    redactor = SecretRedactor([outer, inner])
+
+    head = redactor.redact_cut_text(outer[5:] + " keep " + outer + " end", cut_head=True)
+    tail = redactor.redact_cut_text("start " + outer + " mid " + outer[:40], cut_tail=True)
+
+    assert "OUTER" not in head and head.endswith(f"{REDACTED_SECRET} end")
+    assert tail == f"start {REDACTED_SECRET}"
+    assert redactor.redact_cut_text("plain", cut_head=True, cut_tail=True) == ""
+    assert SecretRedactor().redact_cut_text("plain", cut_head=True) == "plain"
+
+
+def test_python_repr_forms_match_escaped_secrets() -> None:
+    from cayu.vaults import SecretRedactor
+
+    for secret in ("line\nbreak-secret", "it's\\secret", 'quote"tab\tsecret'):
+        redactor = SecretRedactor([secret]).with_python_repr_forms()
+        for rendered in (repr(secret), repr(secret + "'\""), str(KeyError(secret))):
+            assert "secret" not in redactor.redact_text(rendered), rendered
+    plain = SecretRedactor(["plain-secret"])
+    assert plain.with_python_repr_forms() is plain
+
+
+def test_python_repr_forms_cover_nested_and_encoded_forms() -> None:
+    import json
+
+    from cayu.vaults import SecretRedactor
+
+    secret = 'c1\x85"\nsecret\U0001f600'
+    redactor = SecretRedactor([secret]).with_python_repr_forms()
+    renderings = (
+        repr(repr(secret)),
+        repr(secret.encode()),
+        ascii(secret),
+        json.dumps(secret),
+        json.dumps(secret, ensure_ascii=False),
+    )
+    for rendered in renderings:
+        assert "secret" not in redactor.redact_text(rendered), rendered
+    # Cut margins use the longest form, here the doubly escaped one.
+    assert redactor.max_secret_utf8_bytes >= len(repr(repr(secret))) - 4

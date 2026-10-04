@@ -121,11 +121,20 @@ unchanged. Bundled records carry it only under the `openai` provider key, where 
 the Responses `web_search` tool appears in the model page's supported-tools list; the
 record's `provenance` is that model page.
 
-`OpenAIProvider` and `OpenAISubscriptionProvider` admit `OpenAIWebSearch` only for a
-model that resolves, through the exact/alias/prefix matching above, to an `openai` record
-with `hosted_web_search=True`. The bundled catalog is used by default. Pass
+`OpenAIProvider` and `OpenAISubscriptionProvider` read `OpenAIWebSearch` support from the
+catalog. A model that resolves, through the exact/alias/prefix matching above, to an
+`openai` record decides locally: `hosted_web_search=True` is admitted and `False` fails
+fast in preflight. A model the catalog has no record for is sent to the backend with the
+hosted tool, and a backend rejection of that tool raises `HostedToolCapabilityError`
+instead of a retryable provider error. A rejection counts only when the error points at the
+hosted tool: its `tools[N]` entry, an error code naming `web_search`, a bare `tools` error
+whose message names it as a quoted tool (`Hosted tool 'web_search_preview' ...`) or as an
+item of a list after a colon (`... cannot be used with reasoning.effort 'minimal': web_search.`), or a
+`tools` error when only hosted tools were sent. Other tool errors, such as a function tool's schema error, stay
+ordinary provider errors, and the backend's own
+message is kept with known secrets removed. The bundled catalog is used by default. Pass
 `model_catalog=` to use one complete application-owned catalog instead; it is not merged
-with the bundled snapshot, so it must declare every model the application searches with:
+with the bundled snapshot, so declare every model whose support you want decided locally:
 
 ```python
 from cayu import ModelCatalog, ModelInfo, OpenAIProvider, Provenance

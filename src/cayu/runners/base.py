@@ -22,6 +22,7 @@ from typing import (
     TypeVar,
     cast,
 )
+from weakref import WeakKeyDictionary
 
 from pydantic import (
     BaseModel,
@@ -516,6 +517,87 @@ class RunnerUnavailableError(RuntimeError):
         super().__init__(require_nonblank(message, "message"))
 
 
+# Raw runner failure text keyed by the detached error it explains. It never
+# enters the error's message, attributes or traceback; the tool boundary
+# redacts it with the workload redactor and only then bounds it.
+_RUNNER_ERROR_TEXT: WeakKeyDictionary[BaseException, str] = WeakKeyDictionary()
+_MAX_RUNNER_ERROR_SOURCE_CHARS = 64 * 1024
+
+
+def runner_error_text(error: BaseException) -> str | None:
+    """Return the unredacted source text of a detached runner failure, if any."""
+
+    # Only detached failures are keys; some builtin exceptions are not weakref-able.
+    return _RUNNER_ERROR_TEXT.get(error) if type(error) is RunnerExecutionError else None
+
+
+def _source_error_text(error: BaseException) -> str | None:
+    if type(error) is RunnerExecutionError:
+        return _RUNNER_ERROR_TEXT.get(error)
+    try:
+        text = _builtin_error_text(error)
+    except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
+        # No application code runs above, so these are genuine interrupts.
+        raise
+    except BaseException:
+        return None
+    if type(text) is not str:
+        return None
+    # Kept exactly as raised: the tool boundary redacts registered secrets
+    # before any whitespace or control normalization.
+    if not text.strip() or len(text) > _MAX_RUNNER_ERROR_SOURCE_CHARS:
+        # Never truncate before redaction: oversized text stays omitted.
+        return None
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return text
+
+
+def _builtin_error_text(error: BaseException) -> str | None:
+    """Format *error* only when doing so cannot run application code.
+
+    The type's own ``__str__`` must be the builtin ``BaseException``, ``OSError``,
+    ``KeyError`` or ``ImportError`` slot, and every field that slot reads must be
+    a plain ``str`` or ``int``. Anything else leaves the text omitted: a Python ``__str__``
+    (``CalledProcessError`` formats its argv), an argument whose
+    ``__str__``/``__repr__`` would run, or a builtin slot that reads assignable
+    fields of any type (``SyntaxError.msg``, ``UnicodeError.reason`` and
+    similar).
+    """
+
+    mro = type.__getattribute__(type(error), "__mro__")
+    namespaces = [_TYPE_NAMESPACE.__get__(cls, type) for cls in mro]
+    formatter = next(
+        (namespace["__str__"] for namespace in namespaces if "__str__" in namespace), None
+    )
+    if not any(formatter is allowed for allowed in _PLAIN_FIELD_FORMATTERS):
+        return None
+    args = _BASE_EXCEPTION_ARGS.__get__(error, type(error))
+    if type(args) is not tuple or not all(type(arg) in {str, int} for arg in args):
+        return None
+    if isinstance(error, OSError):
+        # OSError.__str__ also reads these fields, which can be assigned later.
+        fields = [descriptor.__get__(error, OSError) for descriptor in _OS_ERROR_FIELDS]
+        if not all(field is None or type(field) in {str, int} for field in fields):
+            return None
+    return formatter(error)
+
+
+_TYPE_NAMESPACE = type.__dict__["__dict__"]
+# Builtin __str__ slots that read only args (and, for OSError, the checked
+# fields). ImportError's slot returns ``msg`` only when it is exactly a str and
+# otherwise formats args; ``name`` and ``path`` are never read.
+_PLAIN_FIELD_FORMATTERS = tuple(
+    error_type.__dict__["__str__"] for error_type in (BaseException, OSError, KeyError, ImportError)
+)
+_BASE_EXCEPTION_ARGS = BaseException.__dict__["args"]
+_OS_ERROR_FIELDS = tuple(
+    OSError.__dict__[name] for name in ("errno", "strerror", "filename", "filename2")
+)
+
+
 class RunnerExecutionError(RuntimeError):
     """A fixed-message command failure with typed, secret-safe evidence."""
 
@@ -571,7 +653,11 @@ def runner_execution_error(
         diagnostic["stdout_bytes"] = stdout_bytes
     if type(stderr_bytes) is int and stderr_bytes >= 0:
         diagnostic["stderr_bytes"] = stderr_bytes
-    return RunnerExecutionError(diagnostic=diagnostic)
+    detached = RunnerExecutionError(diagnostic=diagnostic)
+    text = _source_error_text(error)
+    if text is not None and text != "Runner command execution failed.":
+        _RUNNER_ERROR_TEXT[detached] = text
+    return detached
 
 
 def _safe_runner_execution_diagnostic(diagnostic: dict[str, Any]) -> dict[str, Any]:

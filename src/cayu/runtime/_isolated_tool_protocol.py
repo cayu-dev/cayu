@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from enum import StrEnum
 from hashlib import sha256
 from typing import Any, Literal, cast
@@ -14,6 +15,7 @@ from cayu._validation import (
     copy_bounded_durable_json_value,
     inspect_bounded_durable_json,
     require_durable_clean_nonblank,
+    require_durable_text,
 )
 from cayu.tools.base import ToolResult
 from cayu.tools.isolated import (
@@ -42,6 +44,24 @@ class IsolatedToolChildErrorCode(StrEnum):
     INVALID_RESULT = "invalid_result"
     INTERNAL_PROTOCOL_FAILURE = "internal_protocol_failure"
     ENVIRONMENT_INVALID = "environment_invalid"
+
+
+# Child failure text crosses the protocol unredacted and is bounded here only by
+# whole-field limits; the parent redacts with the workload redactor, then bounds.
+MAX_ISOLATED_TOOL_ERROR_MESSAGE_BYTES = 8 * 1024
+MAX_ISOLATED_TOOL_STDERR_TAIL_BYTES = 64 * 1024
+# The child keeps the last this-many characters of its stderr. A window of this
+# length may start mid-secret, so the parent drops its head before redacting.
+ISOLATED_TOOL_STDERR_WINDOW_CHARS = 16 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class IsolatedToolChildFailure:
+    """A child-reported failure: fixed code plus optional unredacted text."""
+
+    code: IsolatedToolChildErrorCode
+    message: str | None = None
+    stderr_tail: str | None = None
 
 
 class IsolatedToolProtocolError(ValueError):
@@ -166,6 +186,8 @@ class IsolatedToolTerminalEnvelope(BaseModel):
     status: Literal["ok", "error"]
     result: dict[str, Any] | None = None
     error_code: IsolatedToolChildErrorCode | None = None
+    error_message: str | None = None
+    stderr_tail: str | None = None
 
     @field_validator("protocol", mode="before")
     @classmethod
@@ -196,9 +218,28 @@ class IsolatedToolTerminalEnvelope(BaseModel):
             raise TypeError("result must be a JSON object.")
         return copied
 
+    @field_validator("error_message", "stderr_tail", mode="before")
+    @classmethod
+    def validate_failure_text(cls, value: object, info) -> str | None:
+        if value is None:
+            return None
+        limit = (
+            MAX_ISOLATED_TOOL_ERROR_MESSAGE_BYTES
+            if info.field_name == "error_message"
+            else MAX_ISOLATED_TOOL_STDERR_TAIL_BYTES
+        )
+        if type(value) is not str or len(value.encode("utf-8")) > limit:
+            raise ValueError("Isolated tool failure text is invalid.")
+        return require_durable_text(value, info.field_name)
+
     @model_validator(mode="after")
     def validate_terminal_shape(self) -> IsolatedToolTerminalEnvelope:
-        if self.status == "ok" and (self.result is None or self.error_code is not None):
+        if self.status == "ok" and (
+            self.result is None
+            or self.error_code is not None
+            or self.error_message is not None
+            or self.stderr_tail is not None
+        ):
             raise ValueError("Successful isolated tool output requires only result.")
         if self.status == "error" and (self.result is not None or self.error_code is None):
             raise ValueError("Failed isolated tool output requires only error_code.")
@@ -333,21 +374,30 @@ def encode_isolated_tool_error(
     request_sha256: str,
     error_code: IsolatedToolChildErrorCode,
     max_bytes: int,
+    error_message: str | None = None,
+    stderr_tail: str | None = None,
 ) -> bytes:
-    try:
-        document = IsolatedToolTerminalEnvelope(
-            request_sha256=request_sha256,
-            status="error",
-            error_code=error_code,
-        ).model_dump(mode="json")
-        return canonical_bounded_durable_json_bytes(
-            document,
-            "isolated_tool_response",
-            max_bytes=max_bytes,
-            max_nodes=MAX_ISOLATED_TOOL_JSON_NODES,
-        )
-    except Exception:
-        raise IsolatedToolProtocolError("error_response_invalid") from None
+    """Encode a child failure, dropping its text rather than failing the frame."""
+
+    attempts = ((error_message, stderr_tail), (error_message, None), (None, None))
+    for message, tail in attempts:
+        try:
+            document = IsolatedToolTerminalEnvelope(
+                request_sha256=request_sha256,
+                status="error",
+                error_code=error_code,
+                error_message=message,
+                stderr_tail=tail,
+            ).model_dump(mode="json")
+            return canonical_bounded_durable_json_bytes(
+                document,
+                "isolated_tool_response",
+                max_bytes=max_bytes,
+                max_nodes=MAX_ISOLATED_TOOL_JSON_NODES,
+            )
+        except Exception:
+            continue
+    raise IsolatedToolProtocolError("error_response_invalid") from None
 
 
 def encode_isolated_tool_terminal_frame(data: bytes, *, max_bytes: int) -> bytes:
@@ -384,7 +434,7 @@ def decode_isolated_tool_response(
     *,
     expected_request_sha256: str,
     max_bytes: int,
-) -> ToolResult | IsolatedToolChildErrorCode:
+) -> ToolResult | IsolatedToolChildFailure:
     """Decode one exact terminal frame and detach all peer-controlled failures."""
 
     if type(data) is not bytes or not data or len(data) > max_bytes:
@@ -409,7 +459,7 @@ def _decode_isolated_tool_response_unchecked(
     *,
     expected_request_sha256: str,
     max_bytes: int,
-) -> ToolResult | IsolatedToolChildErrorCode:
+) -> ToolResult | IsolatedToolChildFailure:
     document = json.loads(data.decode("utf-8"))
     if type(document) is not dict:
         raise ValueError
@@ -433,7 +483,11 @@ def _decode_isolated_tool_response_unchecked(
     if envelope.status == "error":
         if envelope.error_code is None:  # pragma: no cover - model invariant
             raise AssertionError
-        return envelope.error_code
+        return IsolatedToolChildFailure(
+            code=envelope.error_code,
+            message=envelope.error_message,
+            stderr_tail=envelope.stderr_tail,
+        )
     if envelope.result is None:  # pragma: no cover - model invariant
         raise AssertionError
     return ToolResult.model_validate(envelope.result)
@@ -442,6 +496,7 @@ def _decode_isolated_tool_response_unchecked(
 __all__ = [
     "ISOLATED_TOOL_TERMINAL_FRAME_HEADER_BYTES",
     "IsolatedToolChildErrorCode",
+    "IsolatedToolChildFailure",
     "IsolatedToolInvocationEnvelope",
     "IsolatedToolProtocolError",
     "build_isolated_tool_request",

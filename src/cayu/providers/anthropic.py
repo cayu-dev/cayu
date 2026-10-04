@@ -250,7 +250,10 @@ class HttpxAnthropicTransport:
     with :meth:`aclose` when the transport is no longer needed.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, allow_http: bool = False) -> None:
+        if type(allow_http) is not bool:
+            raise TypeError("allow_http must be a bool.")
+        self.allow_http = allow_http
         self._client = SharedAsyncClient()
 
     async def aclose(self) -> None:
@@ -298,7 +301,7 @@ class HttpxAnthropicTransport:
         semantic_progress_timeout_s: float,
         absolute_stream_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
-        url = _validate_url(url, "url")
+        url = _validate_url(url, "url", allow_http=self.allow_http)
         events = stream_sse_json_events(
             client=self._client.get(),
             url=url,
@@ -330,7 +333,7 @@ class HttpxAnthropicTransport:
         payload: Mapping[str, Any],
         timeout_s: float,
     ) -> Mapping[str, Any]:
-        url = _validate_url(url, "url")
+        url = _validate_url(url, "url", allow_http=self.allow_http)
         return await post_json(
             client=self._client.get(),
             url=url,
@@ -501,6 +504,7 @@ class AnthropicProvider(ModelProvider):
         credential_proxy: CredentialProxy | None = None,
         name: str = "anthropic",
         base_url: str = DEFAULT_ANTHROPIC_BASE_URL,
+        allow_http: bool = False,
         anthropic_version: str = DEFAULT_ANTHROPIC_VERSION,
         max_tokens: int = DEFAULT_ANTHROPIC_MAX_TOKENS,
         timeout_s: float = DEFAULT_ANTHROPIC_TIMEOUT_SECONDS,
@@ -533,7 +537,10 @@ class AnthropicProvider(ModelProvider):
             )
         self.api_key_ref = None if api_key_ref is None else copy_secret_ref(api_key_ref)
         self.credential_proxy = credential_proxy
-        self.base_url = _validate_base_url(base_url)
+        if type(allow_http) is not bool:
+            raise TypeError("allow_http must be a bool.")
+        self.allow_http = allow_http
+        self.base_url = _validate_base_url(base_url, allow_http=allow_http)
         validated_anthropic_version = require_clean_nonblank(
             anthropic_version,
             "anthropic_version",
@@ -552,7 +559,11 @@ class AnthropicProvider(ModelProvider):
         self._stream_deadlines = _resolve_provider_stream_deadlines(
             stream_deadlines=stream_deadlines,
         )
-        self.transport = transport if transport is not None else HttpxAnthropicTransport()
+        # A caller-supplied transport manages its own scheme policy; the default
+        # transport inherits allow_http so a local http endpoint actually connects.
+        self.transport = (
+            transport if transport is not None else HttpxAnthropicTransport(allow_http=allow_http)
+        )
         self.extra_headers = _copy_headers(extra_headers)
         if cache_policy is not None and type(cache_policy) is not CachePolicy:
             raise TypeError("cache_policy must be a CachePolicy.")
@@ -1897,12 +1908,16 @@ def _copy_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
     return copy_headers(headers, protected=_PROTECTED_HEADER_NAMES)
 
 
-def _validate_base_url(base_url: str) -> str:
-    return validate_base_url(base_url, provider_label="Anthropic")
+def _validate_base_url(base_url: str, *, allow_http: bool = False) -> str:
+    return validate_base_url(
+        base_url, provider_label="Anthropic", allow_http=allow_http, allow_http_hint=True
+    )
 
 
-def _validate_url(url: str, field_name: str) -> str:
-    return validate_url(url, field_name, provider_label="Anthropic")
+def _validate_url(url: str, field_name: str, *, allow_http: bool = False) -> str:
+    return validate_url(
+        url, field_name, provider_label="Anthropic", allow_http=allow_http, allow_http_hint=True
+    )
 
 
 def _max_tokens(value: Any) -> int:
@@ -2066,7 +2081,7 @@ def _execution_profile_material(provider: AnthropicProvider) -> dict[str, Any] |
         or provider.credential_proxy is not None
     ):
         return None
-    return {
+    material = {
         "base_url": provider.base_url,
         "default_route": provider.base_url == DEFAULT_ANTHROPIC_BASE_URL,
         "credential_mode": "brokered" if provider.api_key_ref is not None else "direct",
@@ -2078,3 +2093,6 @@ def _execution_profile_material(provider: AnthropicProvider) -> dict[str, Any] |
         if provider.cache_policy is None
         else provider.cache_policy.model_dump(mode="json"),
     }
+    if provider.allow_http:
+        material["allow_http"] = True
+    return material

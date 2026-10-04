@@ -419,9 +419,10 @@ at the configured price-book rate, or explicitly unpriced/unknown evidence.
 Preflight admits a model only when the provider's model catalog records
 `hosted_web_search=True` for it under the `openai` provider key (bundled:
 `gpt-5.6-luna`, `gpt-5.6-sol`/`gpt-5.6`, `gpt-5.6-terra`), plus OpenAI's
-`chat-latest` pointer when the catalog has no record for it. Other model names
-fail closed until their native Responses web-search support is established; see
-[hosted web search in the model catalog](model-catalog.md#hosted-web-search).
+`chat-latest` pointer when the catalog has no record for it. A catalog record without
+established support fails fast; a model the catalog does not know is sent to the
+backend, and a backend rejection of the hosted tool raises `HostedToolCapabilityError`;
+see [hosted web search in the model catalog](model-catalog.md#hosted-web-search).
 Pass `model_catalog=` to the provider to supply a complete application-owned
 catalog instead. `return_token_budget="unlimited"` remains restricted to GPT-5
 and later families.

@@ -400,10 +400,19 @@ def test_openai_hosted_web_search_accepts_application_catalog_declaration() -> N
     from cayu.providers.hosted import HostedToolCapabilityError, OpenAIWebSearch
 
     default_provider = OpenAIProvider(api_key="test-key", transport=RecordingTransport())
-    with pytest.raises(
-        HostedToolCapabilityError, match="not established for model 'gpt-6-app-catalog-test'"
-    ):
-        default_provider.preflight_hosted_tools(
+    # The bundled catalog does not know this model, so the backend decides.
+    default_provider.preflight_hosted_tools(
+        model="gpt-6-app-catalog-test",
+        hosted_tools=(OpenAIWebSearch(),),
+        options={},
+    )
+    declared_false = OpenAIProvider(
+        api_key="test-key",
+        transport=RecordingTransport(),
+        model_catalog=_hosted_search_catalog(("gpt-6-app-catalog-test", False)),
+    )
+    with pytest.raises(HostedToolCapabilityError, match="not established for model 'gpt-6-app-catalog-test'"):
+        declared_false.preflight_hosted_tools(
             model="gpt-6-app-catalog-test",
             hosted_tools=(OpenAIWebSearch(),),
             options={},
@@ -434,15 +443,21 @@ def test_openai_hosted_web_search_application_catalog_replaces_bundled_facts() -
         model_catalog=_hosted_search_catalog(("gpt-5.6-sol", False), ("chat-latest", False)),
     )
 
-    # No merge with the bundled catalog: a declared False record and an absent model both
-    # fail closed, and a catalog record overrides the chat-latest pointer fallback.
-    for model in ("gpt-5.6-sol", "gpt-5.6-luna", "chat-latest"):
+    # No merge with the bundled catalog: a declared False record fails fast, and a
+    # catalog record overrides the chat-latest pointer fallback.
+    for model in ("gpt-5.6-sol", "chat-latest"):
         with pytest.raises(HostedToolCapabilityError, match=f"not established for model {model!r}"):
             provider.preflight_hosted_tools(
                 model=model,
                 hosted_tools=(OpenAIWebSearch(),),
                 options={},
             )
+    # A model absent from the application catalog defers to the backend.
+    provider.preflight_hosted_tools(
+        model="gpt-5.6-luna",
+        hosted_tools=(OpenAIWebSearch(),),
+        options={},
+    )
 
 
 def test_openai_provider_rejects_non_catalog_model_catalog() -> None:
@@ -454,11 +469,15 @@ def test_openai_provider_rejects_non_catalog_model_catalog() -> None:
         )
 
 
-@pytest.mark.parametrize("model", ["gpt-4.1", "gpt-5.6-unverified", "gpt-5.7"])
-def test_openai_hosted_web_search_rejects_model_without_verified_support(model: str) -> None:
+@pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna", "gpt-6-astra"])
+def test_openai_hosted_web_search_rejects_catalog_models_without_support(model: str) -> None:
     from cayu.providers.hosted import HostedToolCapabilityError, OpenAIWebSearch
 
-    provider = OpenAIProvider(api_key="test-key", transport=RecordingTransport())
+    provider = OpenAIProvider(
+        api_key="test-key",
+        transport=RecordingTransport(),
+        model_catalog=_hosted_search_catalog((model, False)),
+    )
 
     with pytest.raises(HostedToolCapabilityError, match=f"not established for model {model!r}"):
         provider.preflight_hosted_tools(
@@ -466,6 +485,229 @@ def test_openai_hosted_web_search_rejects_model_without_verified_support(model: 
             hosted_tools=(OpenAIWebSearch(),),
             options={},
         )
+
+
+@pytest.mark.parametrize("model", ["gpt-4.1", "gpt-5.6-unverified", "gpt-5.7"])
+def test_openai_hosted_web_search_defers_unknown_models_to_the_backend(model: str) -> None:
+    from cayu.providers.hosted import OpenAIWebSearch
+
+    provider = OpenAIProvider(api_key="test-key", transport=RecordingTransport())
+
+    provider.preflight_hosted_tools(model=model, hosted_tools=(OpenAIWebSearch(),), options={})
+
+
+def _rejecting_openai_transport(*, param: str | None, error_code: str | None, text: str):
+    from cayu.providers._http import attach_provider_error_text
+
+    class RejectingTransport(RecordingTransport):
+        async def stream_response_events(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            error = OpenAIAPIError(
+                "OpenAI API request failed with HTTP 400: [provider response body omitted]",
+                status_code=400,
+                error_type="invalid_request_error",
+                error_code=error_code,
+                param=param,
+            )
+            attach_provider_error_text(error, text)
+            raise error
+            yield {}
+
+    return RejectingTransport()
+
+
+def _hosted_search_request(model: str, *, function_tool: bool = True) -> ModelRequest:
+    from cayu.providers.hosted import OpenAIWebSearch
+
+    echo = {
+        "name": "echo",
+        "description": "Echo text.",
+        "input_schema": {"type": "object"},
+    }
+    # With the function tool, it is tools[0] and the hosted web search is tools[1].
+    return ModelRequest(
+        model=model,
+        messages=[Message.text("user", "search")],
+        tools=[echo] if function_tool else [],
+        hosted_tools=(OpenAIWebSearch(),),
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("param", "error_code", "text", "function_tool"),
+    [
+        # The shape OpenAI is reported to use for an unsupported hosted tool:
+        # bare ``tools``, no code, and a message naming the tool.
+        (
+            "tools",
+            None,
+            "Hosted tool 'web_search_preview' is not supported with gpt-5.7.",
+            True,
+        ),
+        ("tools", None, "Tool 'web_search' is not supported with this model.", True),
+        (
+            "tools",
+            None,
+            "The following tools cannot be used with reasoning.effort 'minimal': web_search.",
+            True,
+        ),
+        (None, None, "Hosted tool 'web_search' is not supported with gpt-5.7.", False),
+        # Only hosted tools were sent, so a bare tools rejection is about them.
+        ("tools", None, "This tool is not supported with this model.", False),
+        (None, "unsupported_tool", "This tool is not supported.", False),
+    ],
+)
+async def test_openai_bare_tools_rejection_of_hosted_search_is_a_capability_error(
+    param: str | None, error_code: str | None, text: str, function_tool: bool
+) -> None:
+    from cayu.providers.hosted import HostedToolCapabilityError
+
+    transport = _rejecting_openai_transport(param=param, error_code=error_code, text=text)
+    provider = OpenAIProvider(api_key="test-key", transport=transport)
+    request = _hosted_search_request("gpt-5.7", function_tool=function_tool)
+
+    with pytest.raises(HostedToolCapabilityError, match="rejected hosted web search"):
+        [event async for event in provider.stream(request)]
+
+
+@pytest.mark.anyio
+async def test_openai_backend_rejection_of_hosted_web_search_is_a_capability_error() -> None:
+    from cayu.providers.hosted import HostedToolCapabilityError
+
+    transport = _rejecting_openai_transport(
+        param="tools[1].type",
+        error_code="invalid_value",
+        text="Tool 'web_search' is not supported with this model (key test-key).",
+    )
+    provider = OpenAIProvider(api_key="test-key", transport=transport)
+
+    with pytest.raises(HostedToolCapabilityError, match="rejected hosted web search") as raised:
+        [event async for event in provider.stream(_hosted_search_request("gpt-5.7"))]
+    message = str(raised.value)
+    assert "Tool 'web_search' is not supported with this model" in message
+    assert "test-key" not in message
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.anyio
+async def test_openai_hosted_tool_type_error_code_is_a_capability_error() -> None:
+    from cayu.providers.hosted import HostedToolCapabilityError
+
+    transport = _rejecting_openai_transport(
+        param="tools", error_code="web_search_not_supported", text="Not supported."
+    )
+    provider = OpenAIProvider(api_key="test-key", transport=transport)
+
+    with pytest.raises(HostedToolCapabilityError, match="rejected hosted web search"):
+        [event async for event in provider.stream(_hosted_search_request("gpt-5.7"))]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("model", "param", "error_code"),
+    [
+        # A function tool's schema error on a model the catalog does not know.
+        ("gpt-5.7", "tools[0].parameters", "invalid_function_parameters"),
+        # A bare ``tools`` error with function tools present that does not name the
+        # hosted tool is about the function tool.
+        ("gpt-5.7", "tools", "invalid_tool"),
+        ("gpt-5.7", None, "invalid_tool"),
+        # Catalog-known models were decided locally; a hosted-tool error is a provider error.
+        ("gpt-5.6-sol", "tools[1].type", "invalid_value"),
+        # A function tool's schema error on a catalog-supported model.
+        ("gpt-5.6-sol", "tools[0].parameters", "invalid_function_parameters"),
+    ],
+)
+async def test_openai_tool_errors_that_do_not_reject_hosted_search_stay_provider_errors(
+    model: str, param: str | None, error_code: str
+) -> None:
+    transport = _rejecting_openai_transport(
+        param=param,
+        error_code=error_code,
+        text="Invalid schema for function 'echo'.",
+    )
+    provider = OpenAIProvider(api_key="test-key", transport=transport)
+
+    events = [event async for event in provider.stream(_hosted_search_request(model))]
+
+    assert [event.type for event in events] == [ModelStreamEventType.ERROR]
+    assert "rejected hosted web search" not in events[0].payload["error"]
+
+
+def test_openai_hosted_tool_rejection_requires_a_hosted_tool_index() -> None:
+    from cayu.providers._http import attach_provider_error_text
+    from cayu.providers.openai import is_openai_hosted_tool_rejection
+
+    mixed = [{"type": "function", "name": "echo"}, {"type": "web_search"}]
+    hosted_only = [{"type": "web_search"}]
+
+    def rejected(
+        param: str | None,
+        code: str | None = "invalid_value",
+        *,
+        text: str | None = None,
+        sent: list[dict[str, str]] = mixed,
+        status: int = 400,
+    ) -> bool:
+        error = OpenAIAPIError("x", status_code=status, error_code=code, param=param)
+        attach_provider_error_text(error, text)
+        return is_openai_hosted_tool_rejection(error, sent_tools=sent)
+
+    assert rejected("tools[1]")
+    assert rejected("tools[1].type")
+    assert not rejected("tools[0].type")
+    assert not rejected("tools[10].type")
+    assert not rejected("tools[01].type")
+    assert not rejected("tools[1]x")
+    assert not rejected("tools")
+    assert not rejected(None, "unsupported_tool")
+    assert rejected(None, "unsupported_web_search")
+    # A bare tools error counts when the backend names the hosted tool.
+    assert rejected("tools", None, text="Hosted tool 'web_search_preview' is not supported.")
+    assert not rejected("tools", None, text="Invalid schema for function 'echo'.")
+    assert not rejected("tools", None, text="Unknown web_search_call item.")
+    # In a mixed request the message must name the hosted tool as a quoted tool.
+    assert not rejected("tools", None, text="Tool 'web_search-v2' has an invalid schema.")
+    assert not rejected("tools", None, text="Function 'echo' must not be named web_search.")
+    assert not rejected("tools", None, text="Invalid schema: 'web_search' is reserved.")
+    assert not rejected(None, None, text="Hosted tool 'web_search' is not supported.")
+    assert rejected("tools", None, text='Tool "web_search" is not supported.')
+    # Or as an exact item of a list after a colon.
+    minimal = "The following tools cannot be used with reasoning.effort 'minimal'"
+    assert rejected("tools", None, text=f"{minimal}: web_search.")
+    assert rejected("tools", None, text=f"{minimal}: echo, web_search_preview, other.")
+    assert rejected("tools", None, text=f"{minimal}: web_search")
+    assert not rejected("tools", None, text=f"{minimal}: web_search-v2.")
+    assert not rejected("tools", None, text=f"{minimal}: web_search_v2.")
+    assert not rejected("tools", None, text=f"{minimal}: web_search.v2")
+    assert not rejected("tools", None, text=f"{minimal}: echo")
+    assert not rejected("tools", None, text="Invalid schema: name web_search is reserved.")
+    assert not rejected("tools", None, text="Function echo is named web_search.")
+    assert not rejected("tools[0]", None, text=f"{minimal}: web_search.")
+    # With only hosted tools sent, a message naming the tool suffices without param.
+    assert rejected(None, None, text="Hosted tool 'web_search' is not supported.", sent=hosted_only)
+    # With only hosted tools sent, a bare tools error is about them.
+    assert rejected("tools", None, sent=hosted_only)
+    assert rejected(None, "unsupported_tool", sent=hosted_only)
+    # An unrelated error without param is not, even with only hosted tools.
+    assert not rejected(None, "model_not_found", sent=hosted_only, status=404)
+    assert not rejected("tools", None, sent=[{"type": "function", "name": "echo"}])
+
+
+def test_bare_tools_list_naming_web_search_is_an_accepted_capability_match() -> None:
+    # Known, accepted trade-off: a bare ``tools`` error that lists web_search
+    # after a colon is classified as a hosted-tool rejection even when the
+    # message is about something else, such as duplicate function names.
+    from cayu.providers._http import attach_provider_error_text
+    from cayu.providers.openai import is_openai_hosted_tool_rejection
+
+    error = OpenAIAPIError("x", status_code=400, error_code=None, param="tools")
+    attach_provider_error_text(error, "Function names must be unique: echo, web_search.")
+
+    assert is_openai_hosted_tool_rejection(
+        error, sent_tools=[{"type": "function", "name": "echo"}, {"type": "web_search"}]
+    )
 
 
 @pytest.mark.anyio

@@ -1191,6 +1191,15 @@ def attach_provider_error_text(failure: BaseException, text: str | None) -> None
         _PROVIDER_ERROR_TEXT[failure] = text
 
 
+def provider_error_text(failure: BaseException) -> str | None:
+    """Return the raw provider text carried beside *failure*, for classification only.
+
+    Callers must not publish it; the public boundary redacts and bounds it.
+    """
+
+    return _PROVIDER_ERROR_TEXT.get(failure) if isinstance(failure, ModelProviderError) else None
+
+
 def safe_error_json(decoded: Mapping[str, Any], *, include_request_id: bool = False) -> str:
     """Sanitize an OpenAI-shaped ``{"error": {...}}`` body to safe flat fields."""
     error = decoded.get("error")
@@ -1637,6 +1646,7 @@ __all__ = [
     "optional_error_string",
     "post_json",
     "provider_error_body_text",
+    "provider_error_text",
     "request_credential_redactor",
     "request_json",
     "reset_provider_error_workload_redactor",

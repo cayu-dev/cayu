@@ -18,7 +18,7 @@ import struct
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -88,6 +88,7 @@ from cayu.providers.openai import (
     _preflight_openai_hosted_tools,
     _validate_openai_tool_name,
     build_openai_payload,
+    is_openai_hosted_tool_rejection,
     openai_stream_events,
     preflight_openai_native_structured_output_schema,
 )
@@ -793,8 +794,10 @@ class OpenAISubscriptionProvider(ModelProvider):
         capability_failure: HostedToolCapabilityError | None = None
         error_event: ModelStreamEvent | None = None
         completion_emitted = False
+        sent_tools: Sequence[object] = ()
         try:
             payload = build_openai_payload(request, stream=True, reasoning_state="inline")
+            sent_tools = payload.get("tools", ())
             from cayu.providers.base import record_peer_serialization
 
             await record_peer_serialization(request)
@@ -844,10 +847,20 @@ class OpenAISubscriptionProvider(ModelProvider):
                     extra_header_values=tuple(self.extra_headers.values()),
                 )
         except OpenAIAPIError as exc:
-            if request.hosted_tools and _is_subscription_hosted_tool_rejection(exc):
+            if request.hosted_tools and is_openai_hosted_tool_rejection(exc, sent_tools=sent_tools):
+                public = credential_safe_provider_exception(
+                    exc,
+                    provider_label="OpenAI subscription",
+                    provider_name=self.name,
+                    credential_values=credential_sanitization_values(
+                        *_subscription_credential_values(credentials),
+                        extra_headers=self.extra_headers,
+                    ),
+                )
                 capability_failure = HostedToolCapabilityError(
                     "The experimental OpenAI subscription backend rejected hosted web search "
-                    "for this target. Disable it or verify the current backend capability."
+                    "for this target. Disable it or verify the current backend capability. "
+                    f"Provider error: {public}"
                 )
             elif completion_emitted:
                 post_completion_failure = credential_safe_post_completion_failure(
@@ -1262,19 +1275,6 @@ def _safe_subscription_error_event(
     if isinstance(exc, ProviderStreamCleanupError):
         payload["stream_cleanup_failed"] = True
     return ModelStreamEvent(type=ModelStreamEventType.ERROR, payload=payload)
-
-
-def _is_subscription_hosted_tool_rejection(exc: OpenAIAPIError) -> bool:
-    if exc.status_code not in {400, 404, 422}:
-        return False
-    param = "" if exc.param is None else exc.param.lower()
-    code = "" if exc.error_code is None else exc.error_code.lower()
-    tool_param = param == "tools" or param.startswith("tools[")
-    if code in {"invalid_tool", "unsupported_tool"}:
-        return True
-    if code in {"invalid_value", "unsupported_value"}:
-        return tool_param
-    return tool_param
 
 
 def _safe_subscription_context_overflow(

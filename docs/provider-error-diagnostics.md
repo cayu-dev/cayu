@@ -184,3 +184,49 @@ HTTP status, retry disposition, recovery authority, or dispatch count. A
 non-retryable 400 still stops after one dispatch. They cannot recover explanations
 from historical events that were already sanitized, and a recognized claim does
 not establish whether the provider or a gateway caused the rejection.
+
+## Runner, isolated-tool and Docker setup failures
+
+The same rule applies outside model providers: show the failure's own text after
+removing the secrets Cayu knows, and bound it only after redaction.
+
+- **Runner command failures.** A tool whose runner command fails gets
+  `Runner command execution failed: <runner text>`, for example a missing
+  executable or a lost sandbox connection. The text comes from the runner's
+  exception, is redacted with the session's workload redactor, and the whole
+  message is then bounded to the tool-failure diagnostic limit. The `RunnerExecutionError` itself keeps its fixed
+  message; the text travels beside it. Text is taken only when Cayu can format the
+  exception without running application code: a builtin `__str__` over plain string
+  or integer fields. Exceptions that format themselves in Python, such as
+  `subprocess.CalledProcessError` (which would print its argv), or whose arguments
+  are other objects, keep the fixed message.
+- **Process-isolated tools.** When the child raises, the tool result shows
+  `Isolated tool process execution failed.`, the exception's type and text, and
+  the last part of the child's Python `sys.stderr` output (up to 1.5 KiB). The
+  child sends an exception message only when it fits whole (8 KiB) and a 16 KiB
+  stderr window; the parent redacts the whole window before showing its tail,
+  so a secret cut at the window's start never appears. Output written straight
+  to file descriptor 2 by native code or subprocesses is not captured. The tool
+  result shows at most 2 KiB of exception text plus the 1.5 KiB stderr tail; these
+  are fixed display limits, so a larger tool-failure diagnostic limit does not
+  show more of the child's output.
+- **Docker egress setup.** `docker ... failed while preparing egress` now
+  includes Docker's stderr instead of a phrase allowlist. The adapter removes the
+  sidecar transport token it created and masks common credential shapes: URL
+  userinfo, `Authorization` and other secret header values (`X-Api-Key`,
+  `Private-Token`, cookies and similar), credential-named `KEY=value` pairs
+  (including `--env=TOKEN=x`), quoted `"key": "value"` and `'key': 'value'`
+  mappings (also escaped JSON), `password: x` lines, credential flags such as
+  `--password x` and `docker login -p x`, and PEM and PGP private keys. A value
+  with an unclosed quote is masked to the end of its line. It then flattens control characters
+  and bounds the result to 1 KiB. Command arguments are never copied.
+
+Remaining risk is the same as for providers: an unregistered secret that matches
+none of these shapes is shown if the failing component echoes it.
+
+OpenRouter upstream provider names follow the same rule. A short plain name
+(letters, digits, spaces and common punctuation, at most 64 characters, no word
+longer than 24) is reported as-is unless it contains a registered workload
+secret; anything else becomes a digest. An unregistered secret of 24 characters
+or fewer that fits that shape would therefore be shown if a router returned it
+as the provider name.
