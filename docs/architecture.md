@@ -549,6 +549,10 @@ resource relabel checks, while retaining their clocks and persistence owners.
 checks, activation receipt matching, and reviewed-approval receipt preparation
 and replay. The stores and review adapter compose these rules directly; clocks,
 access checks and atomic writes remain inside the existing store operations.
+`knowledge/_maintenance_rules.py` validates reviewed source and replacement
+revisions, publication boundaries and exact source evidence, and prepares the
+replacement and archived source revisions. Memory, SQLite and PostgreSQL compose
+these rules inside their existing access, lock and transaction boundaries.
 The existing `cayu`, `cayu.storage` and `cayu.storage.memory` imports resolve to
 the same canonical types, including persisted legacy pickle class paths.
 

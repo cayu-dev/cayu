@@ -61,6 +61,13 @@ from cayu.knowledge._activation_rules import (
     _validate_review_approval_authority,
     _validate_review_approval_scope,
 )
+from cayu.knowledge._maintenance_rules import (
+    _knowledge_maintenance_successors,
+    _require_knowledge_maintenance_current_entries,
+    _require_knowledge_maintenance_current_replacement,
+    _require_knowledge_maintenance_publication_boundary,
+    _require_knowledge_maintenance_source_evidence,
+)
 from cayu.knowledge._revision_rules import (
     _copy_chunks_for_revision,
     _copy_evidence_for_revision,
@@ -226,13 +233,8 @@ from cayu.storage.memory import (
     _knowledge_change_now,
     _knowledge_lineage_link,
     _knowledge_lineage_query_fingerprint,
-    _knowledge_maintenance_successors,
     _knowledge_relation_query_fingerprint,
     _knowledge_semantic_watch_identity,
-    _require_knowledge_maintenance_current_entries,
-    _require_knowledge_maintenance_current_replacement,
-    _require_knowledge_maintenance_publication_boundary,
-    _require_knowledge_maintenance_source_evidence,
     _validate_knowledge_search_frontier,
 )
 from cayu.storage.targets import require_sqlite_store_allowed

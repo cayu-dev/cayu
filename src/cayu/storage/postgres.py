@@ -215,6 +215,13 @@ from cayu.knowledge._access_rules import (
     _require_knowledge_entry_access,
     _require_knowledge_successor_access,
 )
+from cayu.knowledge._maintenance_rules import (
+    _knowledge_maintenance_successors,
+    _require_knowledge_maintenance_current_entries,
+    _require_knowledge_maintenance_current_replacement,
+    _require_knowledge_maintenance_publication_boundary,
+    _require_knowledge_maintenance_source_evidence,
+)
 from cayu.knowledge._revision_rules import (
     _copy_chunks_for_revision,
     _copy_evidence_for_revision,
@@ -883,13 +890,8 @@ from cayu.storage.memory import (
     _knowledge_embedding_backfill_fingerprint,
     _knowledge_lineage_link,
     _knowledge_lineage_query_fingerprint,
-    _knowledge_maintenance_successors,
     _knowledge_relation_query_fingerprint,
     _knowledge_semantic_watch_identity,
-    _require_knowledge_maintenance_current_entries,
-    _require_knowledge_maintenance_current_replacement,
-    _require_knowledge_maintenance_publication_boundary,
-    _require_knowledge_maintenance_source_evidence,
     _score_entry,
     _search_result_from_scored_embeddings,
     _semantic_query_text,
