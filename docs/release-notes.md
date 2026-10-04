@@ -1,5 +1,16 @@
 # Release notes
 
+## v0.8.1
+
+Improve collaboration-host fairness validation by allowing page discovery and
+validation to complete before dispatch, while retaining the overall progress
+deadline and delivery assertions.
+
+This release includes the v0.8.0 feature set and upgrade requirements. Before
+upgrading from v0.7.0, review the
+[features and upgrade guidance](https://github.com/cayu-dev/cayu/blob/v0.8.1/docs/release-notes.md#v080).
+Runtime APIs, storage revisions, and server contract are unchanged from v0.8.0.
+
 ## v0.8.0
 
 Cayu adds durable collaboration execution, safer session continuation, shared
