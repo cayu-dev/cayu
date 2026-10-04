@@ -1,21 +1,14 @@
 from __future__ import annotations
 
-import base64
-import binascii
-import json
-import re
 from bisect import bisect_right
 from collections import Counter
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
-from hashlib import sha256
 from itertools import chain
 from math import sqrt
 from typing import TYPE_CHECKING, TypedDict
 from uuid import uuid4
-
-from pydantic import BaseModel, ConfigDict, field_validator
 
 from cayu._clock import utc_clock
 from cayu._validation import (
@@ -33,7 +26,13 @@ from cayu.embeddings import (
     TextEmbeddingRequest,
     copy_text_embedding_result,
 )
-from cayu.knowledge import _activation_rules, _maintenance_rules, _relation_queries, _revision_rules
+from cayu.knowledge import (
+    _activation_rules,
+    _embedding_backfill,
+    _maintenance_rules,
+    _relation_queries,
+    _revision_rules,
+)
 from cayu.knowledge._access_rules import (
     _KNOWLEDGE_RETIREMENT_STATUSES as _KNOWLEDGE_RETIREMENT_STATUSES,
 )
@@ -580,8 +579,6 @@ if TYPE_CHECKING:
     )
 
 KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY = "cayu_knowledge_maintenance_governance"
-_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}\Z")
-_KNOWLEDGE_EMBEDDING_BACKFILL_CURSOR_VERSION = 1
 
 
 class _StoredChunkEmbedding(TypedDict):
@@ -599,67 +596,6 @@ _KNOWLEDGE_REJECTED_REPLACEMENT_RETIREMENT_TRANSITIONS = frozenset(
         (KnowledgeStatus.ARCHIVED, KnowledgeStatus.DELETED),
     }
 )
-
-
-class _KnowledgeEmbeddingBackfillCursor(BaseModel):
-    """Validated keyset state carried inside an opaque backfill cursor."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    version: int
-    fingerprint: str
-    importance: float
-    updated_at: datetime
-    entry_id: str
-    chunk_index: int
-    chunk_id: str
-
-    @field_validator("version")
-    @classmethod
-    def validate_version(cls, value: int) -> int:
-        if type(value) is not int or value != _KNOWLEDGE_EMBEDDING_BACKFILL_CURSOR_VERSION:
-            raise ValueError("Unsupported knowledge embedding backfill cursor version.")
-        return value
-
-    @field_validator("fingerprint")
-    @classmethod
-    def validate_fingerprint(cls, value: str) -> str:
-        value = require_clean_nonblank(value, "fingerprint")
-        if _SHA256_HEX_RE.fullmatch(value) is None:
-            raise ValueError("Backfill cursor fingerprint must be a SHA-256 digest.")
-        return value
-
-    @field_validator("importance", mode="before")
-    @classmethod
-    def validate_importance(cls, value) -> float:
-        return _validate_unit_float(value, "importance")
-
-    @field_validator("updated_at")
-    @classmethod
-    def validate_updated_at(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("`updated_at` must be timezone-aware.")
-        return value.astimezone(UTC)
-
-    @field_validator("entry_id")
-    @classmethod
-    def validate_entry_id(cls, value: str) -> str:
-        return _knowledge_entry_id(value, "entry_id")
-
-    @field_validator("chunk_index")
-    @classmethod
-    def validate_chunk_index(cls, value: int) -> int:
-        _validate_nonnegative_int(value, "chunk_index")
-        if value > MAX_KNOWLEDGE_CHUNK_INDEX:
-            raise ValueError(
-                f"`chunk_index` must be less than or equal to {MAX_KNOWLEDGE_CHUNK_INDEX}."
-            )
-        return value
-
-    @field_validator("chunk_id")
-    @classmethod
-    def validate_chunk_id(cls, value: str) -> str:
-        return _knowledge_chunk_id(value, "chunk_id")
 
 
 class InMemoryKnowledgeStore(KnowledgeStore):
@@ -4084,21 +4020,21 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             raise ValueError("`refresh_existing` must be a boolean.")
         scope = self._operation_access_scope(access_scope)
         knowledge_query = copy_knowledge_list_query(query or KnowledgeListQuery())
-        fingerprint = _knowledge_embedding_backfill_fingerprint(
+        fingerprint = _embedding_backfill._knowledge_embedding_backfill_fingerprint(
             knowledge_query,
             scope,
             refresh_existing=refresh_existing,
             embedding_model=self.embedding_model,
             embedding_dimensions=self.embedding_dimensions,
         )
-        after = _decode_knowledge_embedding_backfill_cursor(
+        after = _embedding_backfill._decode_knowledge_embedding_backfill_cursor(
             cursor,
             fingerprint=fingerprint,
         )
         after_key = (
             None
             if after is None
-            else _knowledge_embedding_backfill_sort_key(
+            else _embedding_backfill._knowledge_embedding_backfill_sort_key(
                 importance=after.importance,
                 updated_at=after.updated_at,
                 entry_id=after.entry_id,
@@ -4114,7 +4050,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             if _entry_matches_list_query(entry, knowledge_query)
         ]
         entries.sort(
-            key=lambda entry: _knowledge_embedding_backfill_sort_key(
+            key=lambda entry: _embedding_backfill._knowledge_embedding_backfill_sort_key(
                 importance=entry.importance or 0.0,
                 updated_at=entry.updated_at,
                 entry_id=entry.id,
@@ -4128,7 +4064,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
                 self._chunks.get((entry.id, entry.revision), []),
                 key=lambda item: (item.chunk_index, item.id),
             ):
-                candidate_key = _knowledge_embedding_backfill_sort_key(
+                candidate_key = _embedding_backfill._knowledge_embedding_backfill_sort_key(
                     importance=entry.importance or 0.0,
                     updated_at=entry.updated_at,
                     entry_id=entry.id,
@@ -4161,7 +4097,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         page = candidates[:limit]
         chunks = [chunk for _, chunk in page]
         next_cursor = (
-            _encode_knowledge_embedding_backfill_cursor(
+            _embedding_backfill._encode_knowledge_embedding_backfill_cursor(
                 fingerprint=fingerprint,
                 importance=page[-1][0].importance or 0.0,
                 updated_at=page[-1][0].updated_at,
@@ -5345,107 +5281,3 @@ def _knowledge_change_now(value: datetime | None) -> datetime:
     if result.tzinfo is None or result.utcoffset() is None:
         raise ValueError("`now` must be timezone-aware.")
     return result.astimezone(UTC)
-
-
-def _knowledge_embedding_backfill_fingerprint(
-    query: KnowledgeListQuery,
-    access_scope: KnowledgeAccessScope,
-    *,
-    refresh_existing: bool,
-    embedding_model: str,
-    embedding_dimensions: int,
-) -> str:
-    query = copy_knowledge_list_query(query)
-    access_scope = copy_knowledge_access_scope(access_scope)
-    material = {
-        "query": query.model_dump(mode="json"),
-        "access_scope_sha256": _knowledge_access_scope_sha256(access_scope),
-        "refresh_existing": refresh_existing,
-        "projection_type": KNOWLEDGE_CHUNK_TEXT_PROJECTION,
-        "embedding_model": require_clean_nonblank(embedding_model, "embedding_model"),
-        "dimensions": embedding_dimensions,
-        "preprocessing_version": KNOWLEDGE_CHUNK_TEXT_PREPROCESSING_VERSION,
-        "generator": KNOWLEDGE_CHUNK_TEXT_GENERATOR,
-        "generator_version": KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION,
-        "index_representation_version": KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION,
-    }
-    return sha256(
-        canonical_durable_json_bytes(material, "knowledge embedding backfill query")
-    ).hexdigest()
-
-
-def _encode_knowledge_embedding_backfill_cursor(
-    *,
-    fingerprint: str,
-    importance: float,
-    updated_at: datetime,
-    chunk: KnowledgeChunk,
-) -> str:
-    cursor = _KnowledgeEmbeddingBackfillCursor(
-        version=_KNOWLEDGE_EMBEDDING_BACKFILL_CURSOR_VERSION,
-        fingerprint=fingerprint,
-        importance=importance,
-        updated_at=updated_at,
-        entry_id=chunk.entry_id,
-        chunk_index=chunk.chunk_index,
-        chunk_id=chunk.id,
-    )
-    raw = canonical_durable_json_bytes(
-        cursor.model_dump(mode="json"),
-        "knowledge embedding backfill cursor",
-    )
-    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-    return _bounded_knowledge_embedding_backfill_cursor(encoded, "next_cursor")
-
-
-def _decode_knowledge_embedding_backfill_cursor(
-    cursor: str | None,
-    *,
-    fingerprint: str,
-) -> _KnowledgeEmbeddingBackfillCursor | None:
-    if cursor is None:
-        return None
-    cursor = _bounded_knowledge_embedding_backfill_cursor(cursor, "cursor")
-    try:
-        encoded = cursor.encode("ascii")
-        padding = b"=" * (-len(encoded) % 4)
-        raw = base64.b64decode(encoded + padding, altchars=b"-_", validate=True)
-        if base64.urlsafe_b64encode(raw).rstrip(b"=") != encoded:
-            raise ValueError("Non-canonical backfill cursor encoding.")
-        decoded = json.loads(raw.decode("utf-8"))
-        parsed = _KnowledgeEmbeddingBackfillCursor.model_validate(decoded)
-    except (
-        binascii.Error,
-        json.JSONDecodeError,
-        TypeError,
-        UnicodeError,
-        ValueError,
-    ) as exc:
-        raise ValueError("Invalid knowledge embedding backfill cursor.") from exc
-    if parsed.fingerprint != fingerprint:
-        raise ValueError(
-            "Knowledge embedding backfill cursor does not match this query, scope, "
-            "projection configuration, and refresh mode."
-        )
-    return parsed
-
-
-def _knowledge_embedding_backfill_sort_key(
-    *,
-    importance: float,
-    updated_at: datetime,
-    entry_id: str,
-    chunk_index: int,
-    chunk_id: str,
-) -> tuple[float, int, str, int, str]:
-    updated_at = updated_at.astimezone(UTC)
-    epoch = datetime(1970, 1, 1, tzinfo=UTC)
-    delta = updated_at - epoch
-    updated_at_microseconds = (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
-    return (
-        -importance,
-        -updated_at_microseconds,
-        entry_id,
-        chunk_index,
-        chunk_id,
-    )

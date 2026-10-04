@@ -215,6 +215,11 @@ from cayu.knowledge._access_rules import (
     _require_knowledge_entry_access,
     _require_knowledge_successor_access,
 )
+from cayu.knowledge._embedding_backfill import (
+    _decode_knowledge_embedding_backfill_cursor,
+    _encode_knowledge_embedding_backfill_cursor,
+    _knowledge_embedding_backfill_fingerprint,
+)
 from cayu.knowledge._maintenance_rules import (
     _knowledge_maintenance_successors,
     _require_knowledge_maintenance_current_entries,
@@ -889,10 +894,7 @@ from cayu.storage.knowledge_transition import require_empty_knowledge_revision_t
 from cayu.storage.memory import (
     KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY,
     _bounded_knowledge_evidence,
-    _decode_knowledge_embedding_backfill_cursor,
-    _encode_knowledge_embedding_backfill_cursor,
     _knowledge_change_now,
-    _knowledge_embedding_backfill_fingerprint,
     _knowledge_semantic_watch_identity,
     _score_entry,
     _search_result_from_scored_embeddings,

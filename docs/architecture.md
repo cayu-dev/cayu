@@ -579,6 +579,10 @@ these rules inside their existing access, lock and transaction boundaries.
 and access-scope fingerprints, cursor encoding and validation, and bounded result
 pages. Memory, SQLite and PostgreSQL supply authorized candidates from their
 existing snapshots and retain native filtering, ordering and transaction owners.
+`knowledge/_embedding_backfill.py` owns backfill query and access-scope binding,
+cursor encoding and validation, and the memory page-ordering key. Memory and
+PostgreSQL share the cursor rules while retaining candidate selection, native
+ordering, embedding-provider calls and transaction ownership.
 The existing `cayu`, `cayu.storage` and `cayu.storage.memory` imports resolve to
 the same canonical types, including persisted legacy pickle class paths.
 
