@@ -3024,7 +3024,7 @@ def test_transient_settlement_read_releases_valid_dispatch_for_retry(
     submitted = asyncio.run(
         h.app.dispatch(_dispatch_request(session_id, "d_transient_dispatch_settlement"))
     )
-    original_loader = h.app._load_queued_dispatch_terminal_event
+    original_loader = h.app._queued_dispatch_coordinator._load_terminal_event
     attempts = 0
 
     async def fail_once(*, private_session_id: str, envelope: _QueuedDispatchEnvelope):
@@ -3037,7 +3037,7 @@ def test_transient_settlement_read_releases_valid_dispatch_for_retry(
             envelope=envelope,
         )
 
-    monkeypatch.setattr(h.app, "_load_queued_dispatch_terminal_event", fail_once)
+    monkeypatch.setattr(h.app._queued_dispatch_coordinator, "_load_terminal_event", fail_once)
 
     with pytest.raises(ConnectionError, match="temporary terminal evidence"):
         asyncio.run(h.dispatcher.process_next(h.app, worker_id="worker_settlement_a"))

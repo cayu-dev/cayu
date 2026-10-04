@@ -205,6 +205,7 @@ CayuApp
   -> RecoveryCoordinator
   -> SessionEngine
   -> WorkAttemptCoordinator
+  -> QueuedDispatchCoordinator
 ```
 
 `SessionEngine` owns run, resume, fork, explicit compaction, queued-message
@@ -225,6 +226,16 @@ its public entrances. The verified worker can still acquire an acknowledged
 recovery claim, maintain its heartbeat, and resume recovery separately. The
 coordinator can be composed without importing the application or concrete engine;
 its collaborators provide the same execution and checkpoint contracts.
+
+`QueuedDispatchCoordinator` owns the session side of durable queued dispatch:
+request preparation, frozen profile and session-instance validation, execution
+or exact terminal replay, settlement classification, and receipt acknowledgement.
+`TaskStoreDispatcher` retains queue leases and task terminalization; session stores
+retain atomic checkpoint mutations. `SessionEngine` provides profile resolution
+and execution, and `DurableSubagentCoordinator` retains prepared-child authority.
+The coordinator takes explicit collaborators and can reconcile persisted queue
+receipts without importing the application or concrete engine. `CayuApp` composes
+these parts and keeps dispatch admission and stream cleanup at its entrance.
 
 `ProviderOperationCancellationOwner` owns durable provider cancellation claims,
 lease renewal, cancellation evidence, accounting handoff and exact claim release.

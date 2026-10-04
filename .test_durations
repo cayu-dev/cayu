@@ -1,4 +1,11 @@
 {
+    "tests/core/test_queued_dispatch_coordinator.py::test_queued_dispatch_reconciliation_composes_without_controllers": 2.963,
+    "tests/core/test_queued_dispatch_coordinator.py::test_queued_dispatch_stream_preserves_caller_signal_during_cleanup[False-cancellation]": 0.754,
+    "tests/core/test_queued_dispatch_coordinator.py::test_queued_dispatch_stream_preserves_caller_signal_during_cleanup[False-error]": 0.757,
+    "tests/core/test_queued_dispatch_coordinator.py::test_queued_dispatch_stream_preserves_caller_signal_during_cleanup[False-group]": 0.79,
+    "tests/core/test_queued_dispatch_coordinator.py::test_queued_dispatch_stream_preserves_caller_signal_during_cleanup[True-cancellation]": 0.714,
+    "tests/core/test_queued_dispatch_coordinator.py::test_queued_dispatch_stream_preserves_caller_signal_during_cleanup[True-error]": 0.713,
+    "tests/core/test_queued_dispatch_coordinator.py::test_queued_dispatch_stream_preserves_caller_signal_during_cleanup[True-group]": 0.708,
     "tests/core/test_knowledge_embedding_backfill.py::test_backfill_cursor_binds_query_scope_and_embedding_configuration": 0.004101375998288859,
     "tests/core/test_knowledge_embedding_backfill.py::test_backfill_cursor_preserves_exact_encoding_and_timestamp_precision": 0.0041279569995822385,
     "tests/core/test_knowledge_embedding_backfill.py::test_backfill_cursor_rejects_invalid_payloads[boolean-importance]": 0.0007621260010637343,
