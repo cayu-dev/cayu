@@ -244,6 +244,7 @@ from cayu.knowledge._revision_rules import (
     _copy_evidence_for_revision,
     _validate_revision_successor,
 )
+from cayu.knowledge._search_scoring import _score_entry
 from cayu.knowledge.activation_contracts import (
     KnowledgeActivationAuthority,
     KnowledgeActivationConflict,
@@ -899,7 +900,6 @@ from cayu.storage.memory import (
     _bounded_knowledge_evidence,
     _knowledge_change_now,
     _knowledge_semantic_watch_identity,
-    _score_entry,
     _search_result_from_scored_embeddings,
     _semantic_query_text,
     _validate_knowledge_search_frontier,

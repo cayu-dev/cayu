@@ -601,6 +601,10 @@ existing snapshots and retain native filtering, ordering and transaction owners.
 cursor encoding and validation, and the memory page-ordering key. Memory and
 PostgreSQL share the cursor rules while retaining candidate selection, native
 ordering, embedding-provider calls and transaction ownership.
+`knowledge/_search_scoring.py` owns shared keyword matching and entry/title/chunk
+scoring, including phrase field boundaries, exclusions and best-match selection.
+Memory and PostgreSQL compose these rules with the existing query tokenization;
+authorized candidate selection, native ranking and bounded results stay in the stores.
 The existing `cayu`, `cayu.storage` and `cayu.storage.memory` imports resolve to
 the same canonical types, including persisted legacy pickle class paths.
 
