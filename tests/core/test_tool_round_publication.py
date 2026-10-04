@@ -18,7 +18,6 @@ from cayu.context.structured_output import (
 from cayu.events import Event, EventType
 from cayu.messages import Message, ToolCallPart, ToolResultPart
 from cayu.observability.events import InMemoryEventSink
-from cayu.runtime._assistant_tool_round_publication import AssistantToolRoundPublication
 from cayu.runtime._event_projection import public_event_id
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._tool_execution import tool_idempotency_key
@@ -35,6 +34,7 @@ from cayu.runtime._tool_round_recovery import (
     PendingToolRound,
     pending_tool_round_identity,
 )
+from cayu.sessions._assistant_tool_round_publication import AssistantToolRoundPublication
 from cayu.sessions.base import (
     EventQuery,
     InMemorySessionStore,

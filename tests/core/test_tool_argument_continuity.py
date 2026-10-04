@@ -780,8 +780,8 @@ def test_targeted_grant_calls_do_not_retain_resolved_arguments():
 
 
 def test_unsealed_secret_scope_discards_private_continuity():
-    from cayu.runtime._assistant_tool_round_publication import AssistantToolRoundPublication
     from cayu.runtime._tool_round_recovery import _updated_assistant_publication
+    from cayu.sessions._assistant_tool_round_publication import AssistantToolRoundPublication
 
     message, continuity = _private_fixture()
     pending = AssistantToolRoundPublication(

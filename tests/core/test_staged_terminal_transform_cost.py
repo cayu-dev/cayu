@@ -7,7 +7,7 @@ import pytest
 from tests.core.test_tool_round_publication import _lifecycle_events, _pending_round
 
 import cayu.runtime._tool_round_recovery as recovery
-from cayu.runtime._assistant_tool_round_publication import StagedToolCallTerminal
+from cayu.sessions._assistant_tool_round_publication import StagedToolCallTerminal
 
 
 def state():

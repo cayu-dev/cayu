@@ -7,8 +7,8 @@ from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval, T
 from cayu.approvals.user_input import PendingUserInput
 from cayu.events import Event, EventType
 from cayu.runtime import _approval_support as approval_support
-from cayu.runtime._assistant_tool_round_publication import StagedToolCallTerminal
 from cayu.runtime._tool_round_recovery import PendingToolRound
+from cayu.sessions._assistant_tool_round_publication import StagedToolCallTerminal
 from cayu.tools.base import ToolResult
 from cayu.tools.catalogue import CALL_TOOL_NAME
 from cayu.tools.exposure import (

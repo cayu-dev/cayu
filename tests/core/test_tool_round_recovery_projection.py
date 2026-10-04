@@ -5,8 +5,8 @@ import pytest
 from cayu import Event, EventType
 from cayu.approvals.tools import PendingToolCallApproval
 from cayu.runtime import _tool_round_recovery as recovery
-from cayu.runtime._assistant_tool_round_publication import StagedToolCallTerminal
 from cayu.runtime.execution_units import new_model_step_identity
+from cayu.sessions._assistant_tool_round_publication import StagedToolCallTerminal
 from cayu.tools.base import ToolResult
 
 

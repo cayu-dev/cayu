@@ -12,7 +12,7 @@ import pytest
 import cayu
 
 
-@pytest.mark.parametrize("component", ["arguments", "evidence"])
+@pytest.mark.parametrize("component", ["arguments", "evidence", "publication"])
 def test_tool_evidence_components_work_without_execution_or_stores(component):
     script = """
 import importlib.abc
@@ -75,8 +75,46 @@ if component == "evidence":
     assert get_type_hints(evidence.scan_projected_tool_call_evidence)["return"] is type(ledger)
     values.append(ledger)
 
+if component == "publication":
+    from cayu import ToolPolicyEvidence
+    from cayu.approvals.tools import ToolPolicyEvidence as ApprovalEvidence
+    from cayu.events import Event, EventType
+    from cayu.messages import Message
+    from cayu.runtime import ToolPolicyEvidence as RuntimeEvidence
+    from cayu.sessions import _assistant_tool_round_publication as publication
+    from cayu.tools._policy_evidence import ToolPolicyEvidence as CanonicalEvidence
+
+    assert ToolPolicyEvidence is ApprovalEvidence is RuntimeEvidence is CanonicalEvidence
+    event = Event(
+        type=EventType.TOOL_CALL_COMPLETED, session_id="session-1", tool_name="echo",
+        payload={"tool_call_id": "call-1"},
+    )
+    staged = publication.StagedToolCallTerminal(tool_call_id="call-1", event=event)
+    assert staged.event is not event
+    publication.validate_staged_tool_exposure_terminal(
+        staged, policy_evidence=ToolPolicyEvidence.AUTHORITATIVE, tool_exposure=None,
+    )
+    message = Message.text("assistant", "Ready.")
+    saved = publication.AssistantToolRoundPublication(
+        state="ready", message=message, covered_tool_call_ids=["call-1"],
+    )
+    assert saved.message is not message
+    copied = publication.copy_assistant_tool_round_publication(saved)
+    assert copied == saved and copied is not saved and copied.message is not saved.message
+    assert type(saved).model_validate_json(saved.model_dump_json()) == saved
+    assert type(staged).model_validate_json(staged.model_dump_json()) == staged
+    assert get_type_hints(publication.copy_assistant_tool_round_publication)["publication"] == (
+        type(saved) | None
+    )
+    assert get_type_hints(publication.validate_staged_tool_exposure_terminal)["staged"] is (
+        type(staged)
+    )
+    values.extend([saved, staged, *ToolPolicyEvidence])
+
 for value in values:
-    for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
+    # Event's private validation stamp requires pickle protocol 2 or newer.
+    first_protocol = 2 if component == "publication" else 0
+    for protocol in range(first_protocol, pickle.HIGHEST_PROTOCOL + 1):
         restored = pickle.loads(pickle.dumps(value, protocol=protocol))
         assert type(restored) is type(value)
         assert restored == value

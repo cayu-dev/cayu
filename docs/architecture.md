@@ -360,6 +360,13 @@ argument quarantine and projection rules shared by this scan, approval records,
 runtime publication and evaluation replay. Both components work without session
 stores or execution owners.
 
+`sessions/_assistant_tool_round_publication.py` owns saved assistant publication
+state, staged tool-terminal records, and their identity, timing and exposure
+validation. Approval and pending-round checkpoints share these records with
+runtime staging and recovery. `tools/_policy_evidence.py` owns their tool-policy
+evidence classification. Both components work without execution or store owners;
+runtime retains publication, hook execution and secret-scope resolution.
+
 `sessions/checkpoints.py` owns root checkpoint decoding and schema migrations.
 The adjacent private modules `_model_completion_publication`, `_terminal_evidence`,
 `_invocation_terminal_decision`, and `_provider_operation_cancellation_claim` own

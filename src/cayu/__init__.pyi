@@ -3482,7 +3482,6 @@ from cayu.runtime._host_continuation_discovery import (
     ContinuationDiscoveryPage as ContinuationDiscoveryPage,
 )
 from cayu.runtime._host_continuation_discovery import ContinuationRecovery as ContinuationRecovery
-from cayu.runtime._policy_evidence import ToolPolicyEvidence as ToolPolicyEvidence
 from cayu.runtime._producer_retirement import (
     ProducerCleanupReclamation as ProducerCleanupReclamation,
 )
@@ -4703,6 +4702,7 @@ from cayu.tasks.worker import TaskHandlerOutcome as TaskHandlerOutcome
 from cayu.tasks.worker import complete_managed_task as complete_managed_task
 from cayu.tasks.worker import fail_managed_task as fail_managed_task
 from cayu.tasks.worker import run_task_worker as run_task_worker
+from cayu.tools._policy_evidence import ToolPolicyEvidence as ToolPolicyEvidence
 from cayu.tools.base import ArtifactStoreHandle as ArtifactStoreHandle
 from cayu.tools.base import CredentialProxyHandle as CredentialProxyHandle
 from cayu.tools.base import KnowledgeStoreHandle as KnowledgeStoreHandle

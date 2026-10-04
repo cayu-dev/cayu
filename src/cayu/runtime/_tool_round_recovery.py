@@ -44,11 +44,6 @@ from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _transcript as transcript_support
 from cayu.runtime import _web_access_results as web_access_results
 from cayu.runtime._argument_continuity import capture_arguments, redact_continuity
-from cayu.runtime._assistant_tool_round_publication import (
-    AssistantToolRoundPublication,
-    StagedToolCallTerminal,
-    validate_staged_tool_exposure_terminal,
-)
 from cayu.runtime._checkpoint_redaction import (
     durable_value_contains_secret,
     require_secret_free_durable_object,
@@ -60,6 +55,11 @@ from cayu.runtime._run_limit_accounting import (
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
+from cayu.sessions._assistant_tool_round_publication import (
+    AssistantToolRoundPublication,
+    StagedToolCallTerminal,
+    validate_staged_tool_exposure_terminal,
+)
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )

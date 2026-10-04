@@ -408,7 +408,6 @@ from cayu.runtime._durable_worker_loop import (
 )
 from cayu.runtime._environment_lifecycle import EnvironmentCapacityError as EnvironmentCapacityError
 from cayu.runtime._invocation_lifecycle import InvocationContext as InvocationContext
-from cayu.runtime._policy_evidence import ToolPolicyEvidence as ToolPolicyEvidence
 from cayu.runtime._recovery_coordinator import (
     ModelCompletionManualRecoveryRequired as ModelCompletionManualRecoveryRequired,
 )
@@ -1460,6 +1459,7 @@ from cayu.tasks.worker import TaskHandlerOutcome as TaskHandlerOutcome
 from cayu.tasks.worker import complete_managed_task as complete_managed_task
 from cayu.tasks.worker import fail_managed_task as fail_managed_task
 from cayu.tasks.worker import run_task_worker as run_task_worker
+from cayu.tools._policy_evidence import ToolPolicyEvidence as ToolPolicyEvidence
 from cayu.tools.browser_control import BrowserControlPolicy as BrowserControlPolicy
 from cayu.tools.browser_control import BrowserControlPolicyRequest as BrowserControlPolicyRequest
 from cayu.tools.browser_control import BrowserControlPolicyResult as BrowserControlPolicyResult
