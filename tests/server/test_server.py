@@ -8682,6 +8682,7 @@ def test_mount_cayu_closes_the_app_under_one_shutdown_deadline() -> None:
         "drain_recovery_cleanups",
         "drain_provider_operation_cancellations",
         "drain_environment_cleanups",
+        "close_idle_environment_resources",
         "drain_knowledge_publications",
         "drain_collaboration_requests",
         "drain_session_exports",
@@ -8703,19 +8704,20 @@ def test_mount_cayu_closes_the_app_under_one_shutdown_deadline() -> None:
         pass
 
     names = [name for name, _ in calls]
-    assert names[:4] == [
+    assert names[:5] == [
         "drain_background_interruptions",
         "drain_recovery_cleanups",
         "drain_provider_operation_cancellations",
         "drain_environment_cleanups",
+        "close_idle_environment_resources",
     ]
-    assert set(names[4:7]) == {
+    assert set(names[5:8]) == {
         "drain_knowledge_publications",
         "drain_collaboration_requests",
         "drain_session_exports",
     }
     # Timing delivery stops after the other shutdown owners have drained.
-    assert names[7:] == ["runtime_timing"]
+    assert names[8:] == ["runtime_timing"]
     # Every drain shares the one 4.0s deadline instead of a fresh grace each.
     assert all(0 < timeout <= 4.0 for _, timeout in calls if timeout is not None)
     assert all(timeout <= 3.7 for _, timeout in calls[1:] if timeout is not None)

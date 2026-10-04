@@ -88,6 +88,10 @@ from cayu.environments.bindings import (
     _runtime_owned_workspace_observer_name,
     copy_workspace_snapshot,
 )
+from cayu.environments.deferred import (
+    DeferredWorkspaceBinding,
+    current_materialization_trigger,
+)
 from cayu.environments.docker_coding import (
     DockerCodingEnvironmentFactory,
     DockerCodingWorkspaceBinding,
@@ -1932,6 +1936,60 @@ class EnvironmentLifecycle:
                 "Factory cleanup remains pending; retry incomplete-session recovery."
             )
 
+    async def release_deferred_materialization(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment,
+    ) -> bool:
+        """Remove a resource a crashed run materialized, under the recovery claim.
+
+        Only for deferred factories, and never while completion finalization is
+        pending: that resource still holds output the runtime has to publish.
+        The allocation and its reconnect metadata stay with the session.
+        """
+
+        factory = registered_environment.factory
+        if factory is None or getattr(factory, "deferred_materialization", False) is not True:
+            return False
+        name = registered_environment.spec.name
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        if pending_completion_finalization_from_checkpoint(checkpoint) is not None:
+            return False
+        reconnect, owner = _factory_reconnect_state_from_checkpoint(
+            checkpoint, environment_name=name
+        )
+        if not reconnect or owner != session.id:
+            return False
+        request = EnvironmentFactoryRequest(
+            session_id=session.id,
+            agent_name=registered_agent.spec.name,
+            environment_name=name,
+            operation=EnvironmentFactoryOperation.RECONNECT,
+            reconnect_metadata=reconnect,
+            execution_requirements=effective_execution_requirements(session, registered_agent),
+        )
+        try:
+            released = await environment_operation_boundary.await_environment_operation(
+                lambda: factory.release_deferred_materialization(request),
+                operation_name="Deferred environment crash cleanup",
+                redactor=self._secret_redactor,
+            )
+        except Exception:
+            # Best effort: the leftover holds no output to publish. It is never
+            # adopted: the next materialization in use mode removes it before
+            # creating a fresh resource, and finalization of a run that never
+            # materializes disposes it. A daemon outage must not make recovery
+            # fail on every retry.
+            logger.warning(
+                "Deferred environment crash cleanup failed; it is retried at the next "
+                "materialization or finalization.",
+                exc_info=True,
+            )
+            return False
+        return released is True
+
     async def has_unsettled_progress(
         self,
         *,
@@ -3368,6 +3426,16 @@ class EnvironmentLifecycle:
                     "Environment factory returned a different environment name: "
                     f"{environment.spec.name!r} != {environment_name!r}"
                 )
+            if (
+                isinstance(environment.binding, DeferredWorkspaceBinding)
+                and getattr(factory, "deferred_materialization", False) is not True
+            ):
+                # The declaration drives the manifest and crash-leftover release,
+                # which run without a factory result to inspect.
+                raise TypeError(
+                    "An environment factory that returns a DeferredMaterialization "
+                    "environment must declare deferred_materialization = True."
+                )
             reconnect_metadata = copy_json_value(
                 result.reconnect_metadata,
                 "reconnect_metadata",
@@ -4437,6 +4505,10 @@ class EnvironmentLifecycle:
         ):
             return None
         self._reserve_environment_owner_admission(session.id)
+        if isinstance(registered_environment.environment.binding, DeferredWorkspaceBinding):
+            # The deferred binding binds when its runner materializes; its
+            # binding events are emitted then, not for the session-start placeholder.
+            return None
         environment_name = _environment_name(registered_environment)
         try:
             return await self._event_writer.emit(
@@ -5261,8 +5333,11 @@ class EnvironmentLifecycle:
                 registered_environment=registered_environment,
                 events=[],
             )
-        if started_event is None:
+        deferred_binding = isinstance(binding, DeferredWorkspaceBinding)
+        if started_event is None and not deferred_binding:
             raise AssertionError("Registered workspace binding was not started.")
+        if started_event is not None and deferred_binding:
+            raise AssertionError("A deferred binding records its start at materialization.")
 
         environment_name = _environment_name(registered_environment)
         events: list[Event] = []
@@ -5646,32 +5721,47 @@ class EnvironmentLifecycle:
             EnvironmentLifecyclePhase.EXECUTION_READY_PUBLICATION,
             EnvironmentLifecycleProgressStatus.STARTED,
         )
-        events.append(
-            await self._event_writer.emit(
-                _event_with_binding_generation_authority(
-                    event_with_execution_profile_authority(
-                        Event(
-                            type=EventType.ENVIRONMENT_BINDING_COMPLETED,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            payload={
-                                **base_payload,
-                                **_bound_workspace_payload(
-                                    bound,
-                                    registered_environment=registered_environment,
-                                    session_id=session.id,
-                                    public_authority_alias_codec=(
-                                        self._session_store.public_authority_alias_codec
+        if not deferred_binding:
+            events.append(
+                await self._event_writer.emit(
+                    _event_with_binding_generation_authority(
+                        event_with_execution_profile_authority(
+                            Event(
+                                type=EventType.ENVIRONMENT_BINDING_COMPLETED,
+                                session_id=session.id,
+                                agent_name=registered_agent.spec.name,
+                                environment_name=environment_name,
+                                payload={
+                                    **base_payload,
+                                    **_bound_workspace_payload(
+                                        bound,
+                                        registered_environment=registered_environment,
+                                        session_id=session.id,
+                                        public_authority_alias_codec=(
+                                            self._session_store.public_authority_alias_codec
+                                        ),
                                     ),
-                                ),
-                            },
-                        ),
-                        execution_profile,
+                                },
+                            ),
+                            execution_profile,
+                        )
                     )
                 )
             )
-        )
+        if isinstance(binding, DeferredWorkspaceBinding):
+            events.append(
+                await self._attach_deferred_materialization(
+                    binding,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=bound_registered_environment,
+                    environment_name=environment_name,
+                    binding_generation_id=base_payload["binding_generation_id"],
+                    execution_profile=execution_profile,
+                    session_start_events=events,
+                    base_payload=base_payload,
+                )
+            )
         await _report_environment_lifecycle(
             progress_reporter,
             EnvironmentLifecyclePhase.EXECUTION_READY_PUBLICATION,
@@ -5685,6 +5775,213 @@ class EnvironmentLifecycle:
             registered_environment=bound_registered_environment,
             events=events,
         )
+
+    async def _attach_deferred_materialization(
+        self,
+        binding: DeferredWorkspaceBinding,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment,
+        environment_name: str,
+        binding_generation_id: str,
+        execution_profile: ExecutionProfileIdentity | None,
+        session_start_events: list[Event],
+        base_payload: dict[str, Any],
+    ) -> Event:
+        """Record that the runner is deferred, then own its materialization.
+
+        Materialization events reach the live run stream through the triggering
+        tool call's event sink, or through the session-start events when
+        session-start admission needs live evidence. The runtime's own live
+        admission runs on the created runner before copy-in.
+        """
+
+        agent_name = registered_agent.spec.name
+
+        def event(event_type: EventType, payload: dict[str, Any]) -> Event:
+            built = _event_with_binding_generation_authority(
+                event_with_execution_profile_authority(
+                    Event(
+                        type=event_type,
+                        session_id=session.id,
+                        agent_name=agent_name,
+                        environment_name=environment_name,
+                        payload={
+                            "environment_name": environment_name,
+                            "binding_generation_id": binding_generation_id,
+                            **payload,
+                        },
+                    ),
+                    execution_profile,
+                )
+            )
+            if built.payload.get("trigger_tool_call_id") is not None:
+                # The tool round, not provider output, names the triggering call.
+                built = event_with_runtime_payload_authority(built, "trigger_tool_call_id")
+            return built
+
+        event_types = {
+            "started": EventType.ENVIRONMENT_MATERIALIZATION_STARTED,
+            "completed": EventType.ENVIRONMENT_MATERIALIZATION_COMPLETED,
+            "failed": EventType.ENVIRONMENT_MATERIALIZATION_FAILED,
+        }
+
+        def publish(persisted: Event) -> None:
+            trigger = current_materialization_trigger()
+            if trigger is not None and trigger.event_sink is not None:
+                trigger.event_sink(persisted)
+            else:
+                session_start_events.append(persisted)
+
+        def binding_event(event_type: EventType, bound: BoundWorkspace | None) -> Event:
+            payload = copy_json_value(base_payload, "binding_payload")
+            if bound is not None:
+                payload.update(
+                    _bound_workspace_payload(
+                        bound,
+                        registered_environment=registered_environment,
+                        session_id=session.id,
+                        public_authority_alias_codec=(
+                            self._session_store.public_authority_alias_codec
+                        ),
+                    )
+                )
+            return _event_with_binding_generation_authority(
+                event_with_execution_profile_authority(
+                    Event(
+                        type=event_type,
+                        session_id=session.id,
+                        agent_name=agent_name,
+                        environment_name=environment_name,
+                        payload=payload,
+                    ),
+                    execution_profile,
+                )
+            )
+
+        async def observe(kind: str, payload: dict[str, Any], bound: BoundWorkspace | None) -> None:
+            if kind in {"binding_started", "binding_completed"}:
+                # The same binding events an eager bind records, now that the
+                # deferred binding really binds.
+                publish(
+                    await self._event_writer.emit(
+                        binding_event(
+                            EventType.ENVIRONMENT_BINDING_STARTED
+                            if kind == "binding_started"
+                            else EventType.ENVIRONMENT_BINDING_COMPLETED,
+                            bound,
+                        )
+                    )
+                )
+                return
+            publish(await self._event_writer.emit(event(event_types[kind], payload)))
+
+        async def admit(runner: Runner) -> None:
+            await self._admit_materialized_runner(
+                runner,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile,
+                publish=publish,
+            )
+
+        binding.materialization.attach_observer(observe)
+        binding.materialization.attach_admission(admit)
+        return await self._event_writer.emit(event(EventType.ENVIRONMENT_DEFERRED, {}))
+
+    async def _admit_materialized_runner(
+        self,
+        runner: Runner,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment,
+        execution_profile: ExecutionProfileIdentity | None,
+        publish: Callable[[Event], None],
+    ) -> None:
+        """Run the bind-time live admission check against a materialized runner."""
+
+        candidate = registered_environment.execution_candidate
+        if candidate is None:
+            raise RuntimeError("Deferred materialization lost its selected execution candidate.")
+        requirements = effective_execution_requirements(session, registered_agent)
+        final: ExecutionAdmissionCandidate | None = None
+        collected: ExecutionAdmissionCandidate | None = None
+        if registered_environment.execution_candidate_declared:
+            observer = runner.execution_admission_observer(requirements)
+            collected = await environment_operation_boundary.await_environment_operation(
+                observer.collect,
+                operation_name="Deferred environment admission evidence collection",
+                redactor=self._secret_redactor,
+            )
+            final = None if collected is None else _copy_execution_admission_candidate(collected)
+        selected_authority = registered_environment.execution_environment_authority
+        if not registered_environment.execution_candidate_declared:
+            # Same rule as an eager bind: an undeclared candidate has no live
+            # evidence to compare, so admission evaluates requirements alone.
+            decision = evaluate_execution_admission(
+                candidate=candidate,
+                requirements=requirements,
+                evidence=None,
+                stage="pre_exposure",
+            )
+        elif final is None:
+            decision = _structured_execution_refusal(
+                candidate=candidate,
+                requirements=requirements,
+                evidence=None,
+                code="missing_final_evidence" if collected is None else "malformed_evidence",
+            )
+        elif (
+            selected_authority is not None
+            and runner.execution_environment_authority() is not selected_authority
+        ):
+            decision = _structured_execution_refusal(
+                candidate=candidate,
+                requirements=requirements,
+                evidence=final.evidence,
+                code="environment_authority_mismatch",
+            )
+        else:
+            decision = evaluate_execution_admission(
+                candidate=candidate,
+                requirements=requirements,
+                evidence=final.evidence,
+                stage="pre_exposure",
+            )
+        transitions: list[Event] = []
+        await self._emit_transition(
+            session=session,
+            agent_name=registered_agent.spec.name,
+            registered_environment=registered_environment,
+            execution_profile=execution_profile,
+            phase=EnvironmentLifecycleTransitionPhase.FINAL_EVIDENCE,
+            outcome=EnvironmentLifecycleTransitionOutcome.OBSERVED,
+            candidate=candidate,
+            events=transitions,
+            evidence=None if final is None else final.evidence,
+        )
+        await self._emit_transition(
+            session=session,
+            agent_name=registered_agent.spec.name,
+            registered_environment=registered_environment,
+            execution_profile=execution_profile,
+            phase=EnvironmentLifecycleTransitionPhase.ADMISSION,
+            outcome=(
+                EnvironmentLifecycleTransitionOutcome.REFUSED
+                if decision.status == "refused"
+                else EnvironmentLifecycleTransitionOutcome.ADMITTED
+            ),
+            candidate=candidate,
+            events=transitions,
+            decision=decision,
+        )
+        for transition in transitions:
+            publish(transition)
+        if decision.status == "refused":
+            raise ExecutionAdmissionError(decision)
 
     async def drain_retained_cleanups(self, *, timeout_s: float = 10.0) -> bool:
         """Settle retained cleanup owners without cancelling dispatched work."""

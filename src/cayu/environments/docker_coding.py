@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import re
+import socket
+import subprocess
 import threading
 from collections.abc import AsyncIterator, Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path
@@ -47,6 +50,7 @@ from cayu.environments.bindings import (
     WorkspaceSnapshot,
     _should_sync_back,
 )
+from cayu.environments.deferred import DeferredMaterialization, EnvironmentMaterializationError
 from cayu.environments.docker_toolchains import (
     DockerCodingToolchainError,
     DockerCodingToolchainProfile,
@@ -62,6 +66,7 @@ from cayu.environments.factory import (
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
 )
+from cayu.environments.warm_spares import WarmSparePool, WarmSpareRequirementsUnsatisfied
 from cayu.immutable_inputs import (
     DockerImmutableInputMount,
     ImmutableInputAdapterCapability,
@@ -71,7 +76,7 @@ from cayu.immutable_inputs import (
     docker_immutable_input_capability,
 )
 from cayu.runners.base import ExecCommand, Runner
-from cayu.runners.docker import DockerRunner, validate_docker_seccomp_profile
+from cayu.runners.docker import DockerRunner, _require_docker, validate_docker_seccomp_profile
 from cayu.runners.docker_workload import DockerImageIdentity, DockerWorkloadRestrictions
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.tools.base import ToolContext
@@ -92,6 +97,12 @@ if TYPE_CHECKING:
     from cayu.knowledge.scopes import KnowledgeAccessScope
 
 DOCKER_CODING_PROTECTED_DIRECTORY_NAMES = (".cayu", ".git", ".runtime")
+MAX_DOCKER_WARM_SPARES = 8
+_DEFERRED_RECONNECT_KIND = "docker_coding_deferred"
+_CONTAINER_ID = re.compile(r"[0-9a-f]{64}\Z")
+_ALLOCATION_ID = re.compile(r"ealloc_[0-9a-f]{32}\Z")
+_SPARE_NAME_PREFIX = "cayu-coding-spare-"
+_WARM_SPARE_DOCKER_TIMEOUT_S = 30.0
 _DOCKER_CODING_RUNTIME_EXECUTABLES = ("git", "python3", "rm", "sh", "sleep")
 _GIT_HASH_PATH_CHUNK_BYTES = 24 * 1024
 _GIT_HASH_PATH_CHUNK_COUNT = 512
@@ -266,6 +277,66 @@ def _docker_coding_container_name(
         "cayu-coding-"
         + sha256(canonical_durable_json_bytes(material, "docker_coding_container_name")).hexdigest()
     )
+
+
+def _deferred_reserved_container_name(request: EnvironmentFactoryRequest) -> str:
+    """Return the exact container name well-formed deferred metadata reserves.
+
+    Every path that acts on the name (reconnect, use, disposal, discard,
+    release) goes through this check, so metadata naming any other container is
+    rejected before Docker sees it. The name must be exactly the reserved one:
+    ``cayu-coding-<allocation id>`` when the metadata records an ``ealloc_``
+    allocation ID, otherwise the name derived from this request's session and
+    environment and the recorded configuration fingerprint. Configuration and
+    image fingerprints are only checked for internal consistency here, so
+    cleanup still reaches a container recorded before an image re-pin.
+    """
+
+    metadata = request.reconnect_metadata
+    identity = {key: value for key, value in metadata.items() if key != "allocation_fingerprint"}
+    container_name = identity.get("container_name")
+    allocation_id = identity.get("allocation_id")
+    configuration_fingerprint = identity.get("configuration_fingerprint")
+    if allocation_id is not None:
+        expected_name: str | None = (
+            f"cayu-coding-{allocation_id}"
+            if type(allocation_id) is str and _ALLOCATION_ID.fullmatch(allocation_id)
+            else None
+        )
+    elif type(configuration_fingerprint) is str:
+        expected_name = _docker_coding_container_name(
+            request, configuration_fingerprint=configuration_fingerprint
+        )
+    else:
+        expected_name = None
+    well_formed = (
+        identity.get("version") == 1
+        and identity.get("kind") == _DEFERRED_RECONNECT_KIND
+        and type(container_name) is str
+        and container_name == expected_name
+        and not container_name.startswith(_SPARE_NAME_PREFIX)
+        and set(identity)
+        <= {
+            "version",
+            "kind",
+            "container_name",
+            "configuration_fingerprint",
+            "image_fingerprint",
+            "toolchain_profile_fingerprint",
+            "allocation_id",
+        }
+    )
+    if not well_formed:
+        raise ValueError("Deferred Docker release requires deferred allocation metadata.")
+    try:
+        expected = sha256(
+            canonical_durable_json_bytes(identity, "docker_coding_deferred_reconnect")
+        ).hexdigest()
+    except (TypeError, ValueError):
+        raise ValueError("Deferred Docker release metadata is malformed.") from None
+    if metadata.get("allocation_fingerprint") != expected:
+        raise ValueError("Deferred Docker release metadata is inconsistent.")
+    return cast("str", container_name)
 
 
 def _docker_allocation_identity(allocation: EnvironmentAllocationContext) -> str:
@@ -859,11 +930,28 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         git_baseline: bool = True,
         knowledge_store: KnowledgeStore | None = None,
         knowledge_access_scope: KnowledgeAccessScope | None = None,
+        deferred: bool = False,
+        warm_spares: int = 0,
     ) -> None:
         if not isinstance(source_workspace, LocalWorkspace):
             raise TypeError("source_workspace must be LocalWorkspace.")
         if type(git_baseline) is not bool:
             raise TypeError("git_baseline must be a bool.")
+        if type(deferred) is not bool:
+            raise TypeError("deferred must be a bool.")
+        if type(warm_spares) is not int or not 0 <= warm_spares <= MAX_DOCKER_WARM_SPARES:
+            raise ValueError(f"warm_spares must be an integer from 0 to {MAX_DOCKER_WARM_SPARES}.")
+        if warm_spares and not deferred:
+            raise ValueError(
+                "warm_spares requires deferred=True: an eager allocation's container must "
+                "carry its allocation identity from creation."
+            )
+        if deferred and immutable_inputs:
+            raise ValueError(
+                "deferred=True cannot be combined with immutable_inputs: immutable inputs are "
+                "attached and mounted when an allocation is created, before a deferred "
+                "container exists. Use deferred=False for factories with immutable inputs."
+            )
         if type(toolchain_profile) is not DockerCodingToolchainProfile:
             raise TypeError("toolchain_profile must be an exact DockerCodingToolchainProfile.")
         # Reuse the concrete environment's validation before any allocation.
@@ -887,6 +975,8 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         self.restrictions = self.toolchain_profile.restrictions
         self.image_identity = self.toolchain_profile.image_identity
         self.git_baseline = git_baseline
+        self.deferred = deferred
+        self.warm_spares = warm_spares
         runtime_executables = (
             _DOCKER_CODING_RUNTIME_EXECUTABLES
             if git_baseline
@@ -936,6 +1026,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 self.immutable_input_runtime_compatibility_fingerprint
             ),
             git_baseline=git_baseline,
+            deferred=deferred,
         )
         self._profile_identity = ExecutionProfileBehaviorIdentity(
             name="cayu.docker_coding_environment",
@@ -946,6 +1037,58 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             identity=f"docker_coding_{uuid4().hex}",
             profile_identity=self._configuration_fingerprint,
         )
+        self._warm_pool: WarmSparePool[_DockerWarmSpare] | None = (
+            WarmSparePool(
+                _DockerWarmSpareBackend(self),
+                size=warm_spares,
+                name_prefix=_DockerWarmSpareBackend.owner_prefix(),
+            )
+            if warm_spares
+            else None
+        )
+
+    @property
+    def deferred_materialization(self) -> bool:
+        """Whether sessions create their container on first runner use."""
+
+        return self.deferred
+
+    async def release_deferred_materialization(self, request: EnvironmentFactoryRequest) -> bool:
+        """Remove the container a crashed run created under this allocation's name."""
+
+        if not isinstance(request, EnvironmentFactoryRequest):
+            raise TypeError("Deferred release requires EnvironmentFactoryRequest.")
+        if not self.deferred or request.operation is not EnvironmentFactoryOperation.RECONNECT:
+            return False
+        # Shape only, like is_allocation_disposed: an image re-pin since the
+        # crash must not strand the old container or fail recovery.
+        container_name = _deferred_reserved_container_name(request)
+        async with self._allocation_lock(request):
+            existing = await DockerRunner.resolve_container_id(
+                container_name, docker_path=self.docker_path
+            )
+            if existing is None:
+                return False
+            await self._remove_named_container(container_name)
+            return True
+
+    @property
+    def warm_spare_pool(self) -> WarmSparePool[Any] | None:
+        """The warm spare pool behind ``warm_spares``, or ``None`` without one."""
+
+        return self._warm_pool
+
+    async def release_idle_resources(self) -> None:
+        """Remove idle warm spares; the next materialization refills the pool."""
+
+        if self._warm_pool is not None:
+            await self._warm_pool.release_idle()
+
+    async def close_idle_resources(self) -> None:
+        """Close the warm spare pool at shutdown; later sessions start cold."""
+
+        if self._warm_pool is not None:
+            await self._warm_pool.close()
 
     @property
     def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
@@ -1092,10 +1235,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             configuration_fingerprint=self._configuration_fingerprint,
             allocation_id=allocation.intent.allocation_id,
         )
-        expected_metadata = {
-            "container_name": expected_name,
-            "configuration_fingerprint": self._configuration_fingerprint,
-        }
+        expected_metadata = self._allocation_provider_metadata(expected_name)
         if allocation.state is EnvironmentAllocationState.UNPREPARED:
             await allocation.prepare(expected_metadata)
         if allocation.intent.provider_metadata != expected_metadata:
@@ -1140,15 +1280,35 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             configuration_fingerprint=self._configuration_fingerprint,
             allocation_id=intent.allocation_id,
         )
-        if intent.provider_metadata != {
-            "container_name": expected_name,
-            "configuration_fingerprint": self._configuration_fingerprint,
-        }:
+        if intent.provider_metadata != self._allocation_provider_metadata(expected_name):
             raise ValueError("Docker cleanup configuration changed.")
         if allocation.state is EnvironmentAllocationState.REAPED:
             return
         if allocation.state is EnvironmentAllocationState.PREPARED:
             await allocation.mark_reaping()
+        if self.deferred:
+            # A deferred allocation reserves its name; a container exists only
+            # once a run materialized it, so absence is a settled outcome.
+            acknowledged = allocation.acknowledged_reconnect_metadata
+            if acknowledged is not None:
+                self._validate_deferred_metadata(
+                    EnvironmentFactoryRequest(
+                        session_id=request.session_id,
+                        agent_name=request.agent_name,
+                        environment_name=request.environment_name,
+                        operation=EnvironmentFactoryOperation.RECONNECT,
+                        reconnect_metadata=acknowledged,
+                    )
+                )
+                if acknowledged.get("allocation_id") != intent.allocation_id:
+                    raise ValueError(
+                        "Docker cleanup acknowledgement belongs to another allocation."
+                    )
+            if not await allocation.mark_reaping():
+                return
+            await self._remove_named_container(expected_name)
+            await allocation.mark_reaped()
+            return
         acknowledged = allocation.acknowledged_reconnect_metadata
         if acknowledged is None and not allocation.dispatch_precluded:
             if allocation.state not in {
@@ -1229,6 +1389,16 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         if self.immutable_inputs:
             return False
         metadata = request.reconnect_metadata
+        if metadata.get("kind") == _DEFERRED_RECONNECT_KIND:
+            container_name = metadata.get("container_name")
+            if type(container_name) is not str:
+                return False
+            return (
+                await DockerRunner.resolve_container_id(
+                    container_name, docker_path=self.docker_path
+                )
+                is None
+            )
         container_id = metadata.get("container_id")
         if metadata.get("kind") != "docker_coding" or type(container_id) is not str:
             return False
@@ -1251,7 +1421,14 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         self._validate_request(request)
         if request.operation is not EnvironmentFactoryOperation.RECONNECT:
             raise ValueError("Docker disposal recovery requires reconnect authority.")
-        container_id = cast("str", request.reconnect_metadata["container_id"])
+        if request.reconnect_metadata.get("kind") == _DEFERRED_RECONNECT_KIND:
+            # The container was created at materialization; its exact ID is in
+            # the disposal checkpoint the binding recorded before removal.
+            container_id = state.get("container_id")
+            if type(container_id) is not str or _CONTAINER_ID.fullmatch(container_id) is None:
+                raise ValueError("Deferred Docker disposal state lacks an exact container ID.")
+        else:
+            container_id = cast("str", request.reconnect_metadata["container_id"])
         attachment_ids = [
             _immutable_input_attachment_id(request, source) for source in self.immutable_inputs
         ]
@@ -1302,6 +1479,12 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         )
         if _read_seccomp_sha256(self.seccomp_profile) != self._seccomp_sha256:
             raise RuntimeError("Docker coding seccomp profile changed after factory admission.")
+        if self.deferred:
+            return await self._create_deferred(
+                request,
+                allocation=allocation,
+                effective_requirements=effective_requirements,
+            )
 
         allocation_id = (
             allocation.intent.allocation_id
@@ -1382,34 +1565,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 runner,
                 self.toolchain_profile,
             )
-            # The factory records the runner's already-collected construction
-            # evidence for diagnostics only.  The common runtime lifecycle
-            # performs the authoritative live refresh after binding/setup.
-            final_candidate = runner.execution_admission_candidate()
-            if final_candidate is None:
-                raise RuntimeError("Docker coding runner omitted final environment evidence.")
-            final_evidence = final_candidate.evidence
-            if (
-                final_candidate.candidate != "docker"
-                or final_evidence.environment_fingerprint is None
-                or final_evidence.image_fingerprint != self.image_identity.fingerprint
-                or final_evidence.toolchain_profile_fingerprint
-                != self.toolchain_profile.fingerprint
-                or final_evidence.tool_requirements is None
-                or tuple(claim.executable for claim in final_evidence.tool_requirements.executables)
-                != effective_requirements.executable_names()
-                or (
-                    bool(self.immutable_inputs)
-                    and (
-                        final_evidence.claim_for("read_only_host_inputs") is None
-                        or final_evidence.claim_for("read_only_host_inputs").state
-                        != "live_verified"
-                    )
-                )
-            ):
-                raise RuntimeError(
-                    "Docker coding runner did not produce exact final environment evidence."
-                )
+            final_evidence = self._require_final_evidence(runner, effective_requirements)
             workspace = RunnerWorkspace(
                 runner,
                 cwd=None,
@@ -1707,12 +1863,287 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             return
         await _release_immutable_input_attachments(store, attachments)
 
+    def _allocation_provider_metadata(self, container_name: str) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            "container_name": container_name,
+            "configuration_fingerprint": self._configuration_fingerprint,
+        }
+        if self.deferred:
+            metadata["materialization"] = "deferred"
+        return metadata
+
+    def _deferred_reconnect_metadata(
+        self, container_name: str, allocation_id: str | None
+    ) -> dict[str, Any]:
+        identity: dict[str, Any] = {
+            "version": 1,
+            "kind": _DEFERRED_RECONNECT_KIND,
+            "container_name": require_durable_clean_nonblank(container_name, "container_name"),
+            "configuration_fingerprint": self._configuration_fingerprint,
+            "image_fingerprint": self.image_identity.fingerprint,
+            "toolchain_profile_fingerprint": self.toolchain_profile.fingerprint,
+        }
+        if allocation_id is not None:
+            identity["allocation_id"] = require_durable_clean_nonblank(
+                allocation_id, "allocation_id"
+            )
+        return {
+            **identity,
+            "allocation_fingerprint": sha256(
+                canonical_durable_json_bytes(identity, "docker_coding_deferred_reconnect")
+            ).hexdigest(),
+        }
+
+    def _validate_deferred_metadata(self, request: EnvironmentFactoryRequest) -> str:
+        """Require this factory's metadata naming exactly the session's reserved name."""
+
+        metadata = request.reconnect_metadata
+        if metadata.get("kind") != _DEFERRED_RECONNECT_KIND:
+            raise ValueError("Deferred Docker reconnect requires deferred allocation metadata.")
+        container_name = _deferred_reserved_container_name(request)
+        if metadata != self._deferred_reconnect_metadata(
+            container_name, metadata.get("allocation_id")
+        ):
+            raise ValueError("Deferred Docker reconnect metadata does not match this factory.")
+        return container_name
+
+    async def _remove_named_container(self, container_name: str) -> None:
+        container_id = await DockerRunner.resolve_container_id(
+            container_name, docker_path=self.docker_path
+        )
+        if container_id is not None:
+            await DockerRunner(
+                container_id,
+                close_action="remove",
+                docker_path=self.docker_path,
+                _container_id=container_id,
+            ).close()
+
+    def _require_final_evidence(
+        self, runner: DockerRunner, effective_requirements: ExecutionRequirements
+    ) -> Any:
+        # The factory records the runner's already-collected construction
+        # evidence for diagnostics only.  The common runtime lifecycle
+        # performs the authoritative live refresh after binding/setup.
+        final_candidate = runner.execution_admission_candidate()
+        if final_candidate is None:
+            raise RuntimeError("Docker coding runner omitted final environment evidence.")
+        final_evidence = final_candidate.evidence
+        if (
+            final_candidate.candidate != "docker"
+            or final_evidence.environment_fingerprint is None
+            or final_evidence.image_fingerprint != self.image_identity.fingerprint
+            or final_evidence.toolchain_profile_fingerprint != self.toolchain_profile.fingerprint
+            or final_evidence.tool_requirements is None
+            or tuple(claim.executable for claim in final_evidence.tool_requirements.executables)
+            != effective_requirements.executable_names()
+            or (
+                bool(self.immutable_inputs)
+                and (
+                    final_evidence.claim_for("read_only_host_inputs") is None
+                    or final_evidence.claim_for("read_only_host_inputs").state != "live_verified"
+                )
+            )
+        ):
+            raise RuntimeError(
+                "Docker coding runner did not produce exact final environment evidence."
+            )
+        return final_evidence
+
+    def _target_workspace(self, runner: Runner, workspace_id: str) -> RunnerWorkspace:
+        return RunnerWorkspace(
+            runner,
+            cwd=None,
+            workspace_id=workspace_id,
+            python_executable="python3",
+            default_read_limit_bytes=self.transfer_limits.max_file_bytes,
+            default_list_limit=self.transfer_limits.max_files,
+            excluded_directory_names=_merge_protected_directory_names(
+                self.source_workspace.excluded_directory_names
+            ),
+            excluded_path_patterns=self.source_workspace.excluded_path_patterns,
+        )
+
+    async def _create_deferred(
+        self,
+        request: EnvironmentFactoryRequest,
+        *,
+        allocation: EnvironmentAllocationContext | None,
+        effective_requirements: ExecutionRequirements,
+    ) -> EnvironmentFactoryResult:
+        """Reserve the allocation's container name; create the container on first use."""
+
+        if request.operation is EnvironmentFactoryOperation.RECONNECT:
+            # Exactly the session's reserved name: use, disposal and discard
+            # all remove whatever container carries it.
+            container_name = self._validate_deferred_metadata(request)
+            allocation_id = request.reconnect_metadata.get("allocation_id")
+        else:
+            allocation_id = None if allocation is None else allocation.intent.allocation_id
+            container_name = _docker_coding_container_name(
+                request,
+                configuration_fingerprint=self._configuration_fingerprint,
+                allocation_id=allocation_id,
+            )
+        reconnect_metadata = self._deferred_reconnect_metadata(container_name, allocation_id)
+        if allocation is not None:
+            if allocation.state is EnvironmentAllocationState.PREPARED:
+                await allocation.mark_dispatched()
+            if allocation.state is EnvironmentAllocationState.DISPATCHED:
+                await allocation.acknowledge(reconnect_metadata)
+            elif allocation.acknowledged_reconnect_metadata != reconnect_metadata:
+                raise RuntimeError("Recovered deferred Docker allocation changed its identity.")
+
+        async def materialize(mode):
+            return await self._materialize_deferred(
+                request,
+                container_name=container_name,
+                effective_requirements=effective_requirements,
+                mode=mode,
+            )
+
+        async def dispose_unmaterialized() -> None:
+            # A crashed process may have created, but never bound, the container.
+            async with self._allocation_lock(request):
+                await self._remove_named_container(container_name)
+
+        materialization = DeferredMaterialization(
+            materialize,
+            default_cwd="/workspace",
+            placeholder_workspace=lambda runner: self._target_workspace(
+                runner, f"docker:deferred:{container_name}:workspace"
+            ),
+            configured_candidate=self._configured_candidate,
+            environment_authority=self._execution_environment_authority,
+            dispose_unmaterialized=dispose_unmaterialized,
+            isolation="docker",
+        )
+        metadata = {
+            "kind": "docker_coding",
+            "materialization": "deferred",
+            "container_name": container_name,
+            "image_fingerprint": self.image_identity.fingerprint,
+            "configuration_fingerprint": self._configuration_fingerprint,
+            **self.toolchain_profile.evidence(),
+            "execution_requirements": effective_requirements.model_dump(mode="json"),
+            "protected_directory_names": list(DOCKER_CODING_PROTECTED_DIRECTORY_NAMES),
+            "source_excluded_directory_names": list(self.source_workspace.excluded_directory_names),
+            "source_excluded_path_patterns": list(self.source_workspace.excluded_path_patterns),
+        }
+        environment = Environment(
+            EnvironmentSpec(
+                name=request.environment_name,
+                metadata=metadata,
+                execution_profile_identity=self.execution_profile_identity,
+            ),
+            workspace=self.source_workspace,
+            artifact_store=self.configured_artifact_store,
+            knowledge_store=self._knowledge_store,
+            knowledge_access_scope=self._knowledge_access_scope,
+            runner=materialization.runner,
+            binding=materialization.binding,
+        )
+
+        async def release(action: EnvironmentFactoryReleaseAction) -> None:
+            if action is EnvironmentFactoryReleaseAction.DISCARD:
+                async with self._allocation_lock(request):
+                    live = materialization.materialized_runner
+                    if live is not None:
+                        await live.close()
+                    else:
+                        await self._remove_named_container(container_name)
+                    if (
+                        allocation is not None
+                        and allocation.state is EnvironmentAllocationState.REAPING
+                    ):
+                        await allocation.mark_reaped()
+
+        return EnvironmentFactoryResult(
+            environment=environment,
+            metadata=metadata,
+            reconnect_metadata=reconnect_metadata,
+            release=release,
+        )
+
+    async def _materialize_deferred(
+        self,
+        request: EnvironmentFactoryRequest,
+        *,
+        container_name: str,
+        effective_requirements: ExecutionRequirements,
+        mode: str,
+    ) -> tuple[DockerRunner, DockerCodingWorkspaceBinding]:
+        """Create a fresh container (``use``) or adopt the existing one (``recover``).
+
+        A clean run end, completed or paused, finalizes the binding and removes
+        the container. One found under the reserved name in ``use`` mode was
+        therefore left by a crash or a failed disposal; it is removed rather
+        than adopted, so its /tmp, HOME and processes never reach a new run.
+        Only completion recovery adopts, because that container holds output
+        the runtime still has to publish.
+        """
+
+        async with self._allocation_lock(request):
+            existing = await DockerRunner.resolve_container_id(
+                container_name, docker_path=self.docker_path
+            )
+            adopted = mode == "recover"
+            pooled = False
+            if adopted:
+                if existing is None:
+                    raise EnvironmentMaterializationError(
+                        "The deferred Docker container holding unpublished output is gone.",
+                        reason="deferred_resource_missing",
+                    )
+                runner = await self._reconnect_runner(
+                    existing, immutable_mounts=(), requirements=effective_requirements
+                )
+            else:
+                if existing is not None:
+                    await self._remove_named_container(container_name)
+                runner = None
+                if self._warm_pool is not None:
+                    # Never raises for a Docker failure: no spare means a cold start.
+                    spare = await self._warm_pool.take(container_name, effective_requirements)
+                    runner = None if spare is None else spare.runner
+                pooled = runner is not None
+                if runner is None:
+                    runner = await self._create_or_recover_runner(
+                        container_name,
+                        immutable_mounts=(),
+                        requirements=effective_requirements,
+                    )
+            try:
+                container_id = runner.container_id
+                if container_id is None:
+                    raise RuntimeError("Docker coding runner lost its exact container identity.")
+                if adopted or not pooled:
+                    # A spare already passed these probes on this exact container.
+                    await _run_toolchain_admission_probes(runner, self.toolchain_profile)
+                self._require_final_evidence(runner, effective_requirements)
+                binding = self.create_workspace_binding(
+                    request,
+                    target_workspace=self._target_workspace(
+                        runner, f"docker:{container_id}:workspace"
+                    ),
+                )
+            except BaseException:
+                if not adopted:
+                    await runner.close()
+                raise
+        if self._warm_pool is not None:
+            self._warm_pool.schedule_refill()
+        return runner, binding
+
     def _validate_request(self, request: EnvironmentFactoryRequest) -> None:
         if not isinstance(request, EnvironmentFactoryRequest):
             raise TypeError("Docker coding create requires EnvironmentFactoryRequest.")
         if request.operation is EnvironmentFactoryOperation.CREATE:
             if request.reconnect_metadata:
                 raise ValueError("Docker coding creation forbids reconnect metadata.")
+            return
+        if self.deferred:
+            self._validate_deferred_metadata(request)
             return
         container_id = request.reconnect_metadata.get("container_id")
         if (
@@ -2387,6 +2818,7 @@ def _docker_coding_configuration_fingerprint(
     immutable_input_projection_fingerprints: tuple[str, ...],
     immutable_input_runtime_compatibility_fingerprint: str | None,
     git_baseline: bool = True,
+    deferred: bool = False,
 ) -> str:
     material = {
         "schema": "cayu.docker_coding_environment.v3",
@@ -2416,6 +2848,9 @@ def _docker_coding_configuration_fingerprint(
         "sync_back": "revision_aware",
         "guest_git_baseline": "ephemeral" if git_baseline else "none",
     }
+    if deferred:
+        # Eager fingerprints stay byte-for-byte unchanged.
+        material["materialization"] = "deferred"
     return (
         "sha256:"
         + sha256(canonical_durable_json_bytes(material, "docker_coding_configuration")).hexdigest()
@@ -2547,3 +2982,155 @@ async def _run_toolchain_admission_probes(
                     "admission_probe_mismatch",
                     "Docker coding toolchain admission probe did not match its declaration.",
                 )
+
+
+def _unavailable_executables(runner: DockerRunner) -> tuple[str, ...]:
+    """Executables (or probes) the runner's live check found unavailable."""
+
+    evidence = runner.execution_capability_evidence()
+    requirements = None if evidence is None else evidence.tool_requirements
+    if requirements is None:
+        return ()
+    return tuple(
+        item.executable for item in requirements.executables if item.state == "unavailable"
+    )
+
+
+@dataclass(slots=True)
+class _DockerWarmSpare:
+    runner: DockerRunner
+    requirements_key: tuple[tuple[str, ...], tuple[str, ...]]
+
+
+def _requirements_key(
+    requirements: ExecutionRequirements,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    return (
+        tuple(requirements.executable_names()),
+        tuple(sorted(probe.fingerprint for probe in requirements.executable_probes())),
+    )
+
+
+class _DockerWarmSpareBackend:
+    """The Docker side of the factory's warm spare pool.
+
+    Spares come from the factory's exact cold-start call and pass the same
+    toolchain admission probes on their own container. A claimed spare is
+    renamed to the allocation's container name. When the session's tools need
+    executables or probes the spare was not created with, the claim verifies
+    them on that exact container through the strict reconnect that completion
+    recovery uses.
+    """
+
+    def __init__(self, factory: DockerCodingEnvironmentFactory) -> None:
+        self._factory = factory
+
+    @staticmethod
+    def owner_prefix() -> str:
+        host = sha256(socket.gethostname().encode("utf-8")).hexdigest()[:8]
+        return f"{_SPARE_NAME_PREFIX}{host}-"
+
+    def base_requirements(self) -> ExecutionRequirements:
+        return ExecutionRequirements.model_validate(
+            {
+                **ExecutionRequirements.trusted().model_dump(mode="python", warnings=False),
+                "required_executables": tuple(sorted(self._factory.required_executables)),
+            }
+        )
+
+    async def _docker(self, *arguments: str) -> tuple[int, str]:
+        process = await asyncio.create_subprocess_exec(
+            _require_docker(self._factory.docker_path),
+            *arguments,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            # A stalled daemon must not hold a refill, handout or shutdown forever.
+            async with asyncio.timeout(_WARM_SPARE_DOCKER_TIMEOUT_S):
+                stdout, _ = await process.communicate()
+        except BaseException:
+            with suppress(ProcessLookupError):
+                process.kill()
+            with suppress(Exception):
+                await asyncio.shield(process.wait())
+            raise
+        return process.returncode or 0, stdout.decode("utf-8", "replace")
+
+    async def create_spare(self, name: str) -> _DockerWarmSpare:
+        requirements = self.base_requirements()
+        runner = await self._factory._create_or_recover_runner(
+            name, immutable_mounts=(), requirements=requirements
+        )
+        try:
+            # Same admission probes a cold start runs, on this exact container.
+            await _run_toolchain_admission_probes(runner, self._factory.toolchain_profile)
+        except BaseException:
+            with suppress(Exception):
+                await runner.close()
+            raise
+        return _DockerWarmSpare(runner=runner, requirements_key=_requirements_key(requirements))
+
+    async def spare_is_alive(self, spare: _DockerWarmSpare) -> bool:
+        container_id = spare.runner.container_id
+        if container_id is None or spare.runner.is_closed:
+            return False
+        code, state = await self._docker("inspect", "--format", "{{.State.Running}}", container_id)
+        return code == 0 and state.strip() == "true"
+
+    async def claim_spare(
+        self, spare: _DockerWarmSpare, name: str, requirements: ExecutionRequirements
+    ) -> _DockerWarmSpare:
+        container_id = spare.runner.container_id
+        if container_id is None:
+            raise RuntimeError("The warm spare lost its exact container identity.")
+        code, _ = await self._docker("rename", container_id, name)
+        if code != 0:
+            raise RuntimeError("Docker could not rename the warm spare.")
+        key = _requirements_key(requirements)
+        if spare.requirements_key == key:
+            return spare
+        # The session's tools need executables or probes the spare was not
+        # created with: verify them on this exact container through the strict
+        # reconnect that completion recovery uses. Any error there (a daemon
+        # hiccup, a timeout) just raises; the pool removes this container and
+        # the session cold-starts. Only an executable the check found
+        # unavailable means the image cannot serve these requirements.
+        runner = await self._factory._reconnect_runner(
+            container_id, immutable_mounts=(), requirements=requirements
+        )
+        if _unavailable_executables(runner):
+            # The pool removes this container through the spare's own runner.
+            raise WarmSpareRequirementsUnsatisfied(
+                "The warm spare's image lacks executables the session requires."
+            )
+        return _DockerWarmSpare(runner=runner, requirements_key=key)
+
+    async def discard_spare(self, spare: _DockerWarmSpare) -> None:
+        await spare.runner.close()
+
+    async def list_spare_names(self, prefix: str) -> list[str]:
+        code, listed = await self._docker(
+            "ps", "-a", "--filter", f"name={prefix}", "--format", "{{.Names}}"
+        )
+        if code != 0:
+            raise RuntimeError("Docker could not list warm spares.")
+        return listed.split()
+
+    async def remove_spare_named(self, name: str) -> None:
+        await self._docker("rm", "-f", name)
+
+    def remove_spares_at_exit(self, spares: list[_DockerWarmSpare]) -> None:
+        """Remove idle spares synchronously at interpreter exit (bounded, best effort)."""
+
+        container_ids = [spare.runner.container_id for spare in spares if spare.runner.container_id]
+        if not container_ids:
+            return
+        subprocess.run(
+            [_require_docker(self._factory.docker_path), "rm", "-f", *container_ids],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+        )

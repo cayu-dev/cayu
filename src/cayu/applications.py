@@ -1078,6 +1078,39 @@ class _ParticipantExecutionSettlementReader(PermitSettlementReader):
 _PROVIDER_RECONCILIATION_BUDGET_SHARE = 0.5
 
 
+async def _release_after(
+    previous: asyncio.Task[None], release: Callable[[], Awaitable[None]]
+) -> None:
+    """Run ``release`` once ``previous`` settled, then report ``previous`` too.
+
+    The later release runs whatever the earlier one's outcome. If the earlier
+    one failed, this task fails as well (chained to that error), so the caller
+    that replaced it in the ownership map still reports it.
+    """
+
+    earlier: BaseException | None = None
+    try:
+        await asyncio.shield(previous)
+    except asyncio.CancelledError:
+        if not previous.cancelled():
+            raise  # This chained release itself was cancelled.
+        earlier = RuntimeError("An earlier idle-resource release was cancelled.")
+    except Exception as error:
+        earlier = error
+    await release()
+    if earlier is not None:
+        raise RuntimeError(
+            "An earlier idle-resource release failed before this one ran."
+        ) from earlier
+
+
+def _retrieve_idle_release_outcome(task: asyncio.Task[None]) -> None:
+    # A release that settles after its caller stopped waiting must not be
+    # logged as an unretrieved task exception; the next drain or close reports it.
+    if not task.cancelled():
+        task.exception()
+
+
 class CayuApp:
     """Application runtime for registered agents, providers, and session state."""
 
@@ -1465,6 +1498,8 @@ class CayuApp:
         self._knowledge_publication_scope = KnowledgePublicationScope()
         self._providers: dict[str, runtime_records.RegisteredProvider] = {}
         self._environments: dict[str, runtime_records.RegisteredEnvironment] = {}
+        # Idle-resource releases still running after a drain or close deadline.
+        self._idle_resource_releases: dict[str, tuple[bool, asyncio.Task[None]]] = {}
         self._artifact_store_registrations_by_id: dict[str, _ArtifactStoreRegistration] = {}
         self._default_provider_name: str | None = None
         self._default_environment_name: str | None = None
@@ -5399,6 +5434,12 @@ class CayuApp:
             ),
             (
                 ShutdownStepSpec(
+                    "idle_environment_resources",
+                    lambda budget: self.close_idle_environment_resources(timeout_s=budget),
+                ),
+            ),
+            (
+                ShutdownStepSpec(
                     "knowledge_publications",
                     lambda budget: self.drain_knowledge_publications(timeout_s=budget),
                     seal=self.seal_knowledge_publications,
@@ -5610,7 +5651,10 @@ class CayuApp:
             retained_drained = await self._environment_lifecycle.drain_retained_cleanups(
                 timeout_s=remaining,
             )
-            return retained_drained and parked_drained
+            idle_released = await self._release_idle_environment_resources(
+                close=False, deadline=deadline
+            )
+            return retained_drained and parked_drained and idle_released
 
         # A hung projection must not skip environment cleanup; it only has to
         # settle before owned resources close, which this result also gates.
@@ -5631,6 +5675,80 @@ class CayuApp:
             # The projection waiter only observes; stopping it cancels no work.
             projections.cancel()
         return combine_drain_results((cleanup, projections.result()))
+
+    async def _release_idle_environment_resources(self, *, close: bool, deadline: float) -> bool:
+        """Trim (or close) factories' idle resources, such as warm spares, by ``deadline``.
+
+        Each factory's release runs as an owned task that is never cancelled:
+        one still running at the deadline stays owned (the result is False),
+        and a later call waits for that same task instead of starting another.
+        A close requested while a trim is still running runs after it.
+        """
+
+        loop = asyncio.get_running_loop()
+        if deadline - loop.time() <= 0:
+            return False
+        owned: list[tuple[str, asyncio.Task[None]]] = []
+        released = True
+        for name, registration in tuple(self._environments.items()):
+            factory = registration.factory
+            if factory is None:
+                continue
+            release = factory.close_idle_resources if close else factory.release_idle_resources
+            previous = self._idle_resource_releases.pop(name, None)
+            if previous is not None and previous[1].done():
+                # Settled after an earlier caller stopped waiting: report it once.
+                if previous[1].cancelled() or previous[1].exception() is not None:
+                    released = False
+                previous = None
+            if previous is not None:
+                previous_close, previous_task = previous
+                if previous_close or not close:
+                    # The same release, or a close that already covers a trim.
+                    self._idle_resource_releases[name] = previous
+                    owned.append((name, previous_task))
+                    continue
+                task = loop.create_task(
+                    _release_after(previous_task, release),
+                    name=f"cayu-idle-environment-release:{name}",
+                )
+            else:
+                task = loop.create_task(release(), name=f"cayu-idle-environment-release:{name}")
+            task.add_done_callback(_retrieve_idle_release_outcome)
+            self._idle_resource_releases[name] = (close, task)
+            owned.append((name, task))
+        if not owned:
+            return released
+        remaining = deadline - loop.time()
+        if remaining > 0:
+            await asyncio.wait([task for _, task in owned], timeout=remaining)
+        for name, task in owned:
+            if not task.done():
+                released = False  # Still owned; a later drain observes its settlement.
+                continue
+            current = self._idle_resource_releases.get(name)
+            if current is not None and current[1] is task:
+                del self._idle_resource_releases[name]
+            if task.cancelled() or task.exception() is not None:
+                released = False
+        return released
+
+    async def close_idle_environment_resources(self, *, timeout_s: float = 10.0) -> bool:
+        """Close factory-held idle resources, such as warm spares, at shutdown.
+
+        ``drain_environment_cleanups`` only trims them, so an application may
+        drain while idle and keep using its factories. Call this once the
+        application stops serving; afterwards factories create no new idle
+        resources and sessions that still run start cold. Application shutdown
+        calls it after its environment drain. Returns whether every factory
+        released cleanly within ``timeout_s``; a release still running then is
+        not cancelled, and a later call waits for it.
+        """
+
+        if type(timeout_s) not in {int, float} or not isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("timeout_s must be a finite positive number.")
+        deadline = asyncio.get_running_loop().time() + float(timeout_s)
+        return await self._release_idle_environment_resources(close=True, deadline=deadline)
 
     def seal_knowledge_publications(self) -> None:
         """Refuse this application's new knowledge publications before shutdown drains.

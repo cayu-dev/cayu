@@ -210,6 +210,10 @@ class EventType(StrEnum):
     ENVIRONMENT_FACTORY_FAILED = "environment.factory.failed"
     ENVIRONMENT_LIFECYCLE_PROGRESS = "environment.lifecycle.progress"
     ENVIRONMENT_LIFECYCLE_TRANSITION = "environment.lifecycle.transition"
+    ENVIRONMENT_DEFERRED = "environment.deferred"
+    ENVIRONMENT_MATERIALIZATION_STARTED = "environment.materialization.started"
+    ENVIRONMENT_MATERIALIZATION_COMPLETED = "environment.materialization.completed"
+    ENVIRONMENT_MATERIALIZATION_FAILED = "environment.materialization.failed"
 
     WORKSPACE_REVISION_OBSERVED = "workspace.revision.observed"
     WORKSPACE_MUTATION_RECORDED = "workspace.mutation.recorded"

@@ -18236,6 +18236,25 @@ class RecoveryCoordinator:
                     provider_disposition_task_handoff_id=(provider_disposition_task_handoff_id),
                     interrupt_for_manual_tool_recovery=(interrupt_for_manual_tool_recovery),
                 )
+                if (
+                    registered_environment is not None
+                    and not pending_allocations
+                    and await self._environment_lifecycle.release_deferred_materialization(
+                        session=claim.session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                    )
+                ):
+                    # A deferred container left by a crash holds nothing the
+                    # runtime must publish; the session materializes anew.
+                    recovered = recovered.model_copy(
+                        update={
+                            "actions": (
+                                IncompleteSessionRecoveryAction.REAPED_ALLOCATION,
+                                *recovered.actions,
+                            ),
+                        }
+                    )
                 if pending_allocations:
                     recovered = recovered.model_copy(
                         update={

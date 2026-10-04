@@ -1137,6 +1137,12 @@ from cayu.environments.bindings import WorkspaceBinding as WorkspaceBinding
 from cayu.environments.bindings import WorkspaceSnapshot as WorkspaceSnapshot
 from cayu.environments.bindings import copy_bound_workspace as copy_bound_workspace
 from cayu.environments.bindings import copy_workspace_snapshot as copy_workspace_snapshot
+from cayu.environments.deferred import DeferredMaterialization as DeferredMaterialization
+from cayu.environments.deferred import DeferredRunner as DeferredRunner
+from cayu.environments.deferred import DeferredWorkspaceBinding as DeferredWorkspaceBinding
+from cayu.environments.deferred import (
+    EnvironmentMaterializationError as EnvironmentMaterializationError,
+)
 from cayu.environments.docker_coding import (
     DOCKER_CODING_PROTECTED_DIRECTORY_NAMES as DOCKER_CODING_PROTECTED_DIRECTORY_NAMES,
 )
@@ -1262,6 +1268,11 @@ from cayu.environments.lifecycle import (
 )
 from cayu.environments.lifecycle import (
     environment_lifecycle_transition_from_event as environment_lifecycle_transition_from_event,
+)
+from cayu.environments.warm_spares import WarmSpareBackend as WarmSpareBackend
+from cayu.environments.warm_spares import WarmSparePool as WarmSparePool
+from cayu.environments.warm_spares import (
+    WarmSpareRequirementsUnsatisfied as WarmSpareRequirementsUnsatisfied,
 )
 from cayu.evals.assertions import ArtifactCreated as ArtifactCreated
 from cayu.evals.assertions import ChildSessionCompleted as ChildSessionCompleted
@@ -6461,6 +6472,9 @@ __all__ = [
     "CriterionOutcomeStatus",
     "DefaultContextPolicy",
     "DeferredInteractionInput",
+    "DeferredMaterialization",
+    "DeferredRunner",
+    "DeferredWorkspaceBinding",
     "DelegatedActionReference",
     "DeleteFileTool",
     "DenyPatternRule",
@@ -6549,6 +6563,7 @@ __all__ = [
     "EnvironmentLifecycleTransition",
     "EnvironmentLifecycleTransitionOutcome",
     "EnvironmentLifecycleTransitionPhase",
+    "EnvironmentMaterializationError",
     "EnvironmentScopedToolPolicy",
     "EnvironmentSpec",
     "EvalAssertion",
@@ -8373,6 +8388,9 @@ __all__ = [
     "WaitRecovery",
     "WaitRegistration",
     "WaitSnapshot",
+    "WarmSpareBackend",
+    "WarmSparePool",
+    "WarmSpareRequirementsUnsatisfied",
     "WebAccessCircuitPolicy",
     "WebAccessEvidence",
     "WebAccessEvidenceSource",

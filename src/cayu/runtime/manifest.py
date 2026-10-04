@@ -369,6 +369,8 @@ class EnvironmentManifest(_ManifestModel):
     lifecycle_policy: FrozenJsonObject | None
     registration_provenance: RegistrationProvenance
     implementation_provenance: RegistrationProvenance
+    deferred: bool = False
+    """Whether the factory creates the runner on first use instead of at session start."""
 
 
 class StoreManifest(_ManifestModel):
@@ -765,6 +767,16 @@ def _describe_tool(
     )
 
 
+def _factory_defers_materialization(factory: object | None) -> bool:
+    if factory is None:
+        return False
+    try:
+        declared = factory.deferred_materialization  # type: ignore[attr-defined]
+    except Exception:
+        return False
+    return declared is True
+
+
 def _describe_environment(
     app: CayuApp,
     *,
@@ -781,6 +793,7 @@ def _describe_environment(
         name=name,
         is_default=name == app._default_environment_name,
         factory_backed=registration.factory is not None,
+        deferred=_factory_defers_materialization(registration.factory),
         workspace=_optional_type_name(environment.workspace),
         workspace_branch_capabilities=_workspace_branch_capabilities(app, environment.workspace),
         workspace_branch_lifecycle=_workspace_branch_lifecycle(environment.workspace),

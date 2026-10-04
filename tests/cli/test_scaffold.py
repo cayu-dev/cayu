@@ -1046,6 +1046,8 @@ def test_pinned_sandbox_registers_the_docker_factory_without_git(
 
     assert isinstance(factory, DockerCodingEnvironmentFactory)
     assert factory.git_baseline is False
+    assert factory.deferred_materialization is True
+    assert factory.warm_spares == 1
     assert "git" not in factory.required_executables
     assert factory.toolchain_profile.platform_architecture == "arm64"
     assert app.describe().environments[0].factory_backed

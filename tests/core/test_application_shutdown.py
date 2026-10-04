@@ -81,6 +81,7 @@ SHUTDOWN_PARTS = frozenset(
     {
         "aclose",
         "close_runtime_timing",
+        "close_idle_environment_resources",
         "drain_background_interruptions",
         "drain_collaboration_requests",
         "drain_environment_cleanups",
@@ -179,6 +180,7 @@ def test_idle_app_settles_and_the_context_manager_is_aclose() -> None:
             "recovery_cleanups",
             "provider_operation_cancellations",
             "environment_cleanups",
+            "idle_environment_resources",
             "knowledge_publications",
             "collaboration_requests",
             "session_exports",

@@ -9755,6 +9755,11 @@
             ],
             "title": "Credential Proxy"
           },
+          "deferred": {
+            "default": false,
+            "title": "Deferred",
+            "type": "boolean"
+          },
           "factory_backed": {
             "title": "Factory Backed",
             "type": "boolean"
@@ -18244,6 +18249,10 @@
           "environment.factory.failed",
           "environment.lifecycle.progress",
           "environment.lifecycle.transition",
+          "environment.deferred",
+          "environment.materialization.started",
+          "environment.materialization.completed",
+          "environment.materialization.failed",
           "workspace.revision.observed",
           "workspace.mutation.recorded",
           "workspace.observation.finalized",

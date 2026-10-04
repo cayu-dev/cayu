@@ -964,6 +964,7 @@ _SHUTDOWN_STEP_LOG_SUBJECTS = {
     "recovery_cleanups": "Supervised recovery cleanups",
     "provider_operation_cancellations": "Provider-operation cancellations",
     "environment_cleanups": "Retained environment cleanups",
+    "idle_environment_resources": "Idle environment resources",
     "knowledge_publications": "Retained knowledge publications",
     "collaboration_requests": "Collaboration requests",
     "session_exports": "Session exports",

@@ -90,6 +90,7 @@ from cayu.context.structured_output import (
 )
 from cayu.context.thinking import ThinkingConfig
 from cayu.environments.bindings import BoundWorkspace, _runtime_owned_workspace_observer_name
+from cayu.environments.deferred import materialization_trigger
 from cayu.events import (
     Event,
     EventType,
@@ -4963,20 +4964,27 @@ class ToolRoundExecutor:
                 await require_live_environment_exposure()
                 await require_dispatch()
 
-            execution_outcome = await tool_execution.run_tool(
-                tool=registered_tool.tool,
-                effect=registered_tool.effect,
-                ctx=tool_context,
-                arguments=effective_tool_call.arguments,
-                redactor=lambda: invocation_secret_scope.redactor,
-                registered_schema=registered_tool.schema,
-                registered_execution_contract=registered_tool.execution_contract,
-                finalize_publication=invocation_secret_scope.seal_for_publication,
-                timeout_seconds=self._tool_timeout_seconds,
-                before_dispatch=require_resource_dispatch,
-                reconcile_result=reconcile_child_result,
-                inference_scope=inference_scope,
-            )
+            # A deferred environment attributes its materialization to this call.
+            with materialization_trigger(
+                tool_call_id=effective_tool_call.id,
+                tool_name=effective_tool_call.name,
+                # Yielded with the call's runner evidence before its terminal.
+                event_sink=runner_events.append,
+            ):
+                execution_outcome = await tool_execution.run_tool(
+                    tool=registered_tool.tool,
+                    effect=registered_tool.effect,
+                    ctx=tool_context,
+                    arguments=effective_tool_call.arguments,
+                    redactor=lambda: invocation_secret_scope.redactor,
+                    registered_schema=registered_tool.schema,
+                    registered_execution_contract=registered_tool.execution_contract,
+                    finalize_publication=invocation_secret_scope.seal_for_publication,
+                    timeout_seconds=self._tool_timeout_seconds,
+                    before_dispatch=require_resource_dispatch,
+                    reconcile_result=reconcile_child_result,
+                    inference_scope=inference_scope,
+                )
             for auxiliary_event in auxiliary_events:
                 yield auxiliary_event, None
         except tool_execution.ToolDispatchAdmissionRefusal as refused:

@@ -833,6 +833,54 @@ class EnvironmentFactory(ABC):
         del request
         return False
 
+    @property
+    def deferred_materialization(self) -> bool:
+        """Whether results defer runner creation to first use.
+
+        A deferred factory returns an environment built from a
+        ``cayu.environments.deferred.DeferredMaterialization``: session start
+        binds nothing, and the first runner use creates and binds the runner.
+        Manifests and ``cayu inspect`` report this declaration.
+        """
+
+        return False
+
+    async def release_deferred_materialization(self, request: EnvironmentFactoryRequest) -> bool:
+        """Remove a resource a crashed run materialized for this exact allocation.
+
+        Called by ``recover_incomplete_session`` with RECONNECT authority for a
+        recovered session that has no pending completion finalization, so the
+        resource holds no output the runtime still has to publish. The session
+        keeps its allocation and materializes again on its next use. Return
+        whether a resource was removed. Absence is not an error. The default
+        manages nothing.
+        """
+
+        del request
+        return False
+
+    async def release_idle_resources(self) -> None:
+        """Trim factory-held idle resources, such as warm spares.
+
+        Called by ``CayuApp.drain_environment_cleanups``, which applications may
+        also call while idle. A later session may create such resources again.
+        It must never touch a resource a session owns. The default holds nothing.
+        """
+
+        return None
+
+    async def close_idle_resources(self) -> None:
+        """Release factory-held idle resources for good, at application shutdown.
+
+        Called by ``CayuApp.close_idle_environment_resources`` (the server calls it
+        after its shutdown drain). Afterwards the factory creates no new idle
+        resources, and sessions that still materialize must work without them
+        (for example by starting cold). The default trims like
+        ``release_idle_resources``.
+        """
+
+        await self.release_idle_resources()
+
     @abstractmethod
     async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
         """Return a concrete environment for the requested session."""

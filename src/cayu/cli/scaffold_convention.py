@@ -998,6 +998,8 @@ def build_sandbox_factory(
         knowledge_access_scope=knowledge_scope,
         docker_path=shutil.which("docker"),
         git_baseline=False,
+        deferred=True,
+        warm_spares=1,
     )
 
 
@@ -1997,6 +1999,11 @@ The sandbox is Cayu's `DockerCodingEnvironmentFactory` with `git_baseline=False`
 so crash recovery is Cayu's: a resumed session reconnects to its own container, a
 failed copy-back keeps the container so recovery can retry it, and
 `recover_incomplete_session` removes containers a crashed process left behind.
+The container starts on a session's first sandboxed tool call (`deferred=True`), so
+runs that never use the sandbox pay nothing. One pre-started spare
+(`warm_spares=1`) makes that first call fast; each idle spare holds its memory
+reservation (512 MiB by default) and a container slot until used or until the app
+drains. Set `warm_spares=0` to disable it.
 To use another image, workspace folder or limits, change `build_sandbox_factory`.
 Use the coding preset only for agents that edit and test a code repository.
 """

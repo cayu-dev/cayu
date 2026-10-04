@@ -4030,6 +4030,19 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         EventType.ENVIRONMENT_FACTORY_FAILED,
     ):
         policies[event_type] = factory_policy
+    materialization_policy = _observed_policy(
+        "binding_generation_id elapsed_ms environment_name execution_profile_fingerprint mode "
+        "reason trigger_tool_call_id trigger_tool_name",
+        authority_keys={"binding_generation_id", "execution_profile_fingerprint"},
+        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+    )
+    for event_type in (
+        EventType.ENVIRONMENT_DEFERRED,
+        EventType.ENVIRONMENT_MATERIALIZATION_STARTED,
+        EventType.ENVIRONMENT_MATERIALIZATION_COMPLETED,
+        EventType.ENVIRONMENT_MATERIALIZATION_FAILED,
+    ):
+        policies[event_type] = materialization_policy
     policies[EventType.ENVIRONMENT_LIFECYCLE_TRANSITION] = _observed_policy(
         "binding_generation_id candidate evidence_schema evidence_states evidence_valid_until "
         "executable_evidence_states execution_profile_fingerprint outcome ownership phase "

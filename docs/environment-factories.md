@@ -276,6 +276,187 @@ Docker remains available because its allocation is process-local. See
 [Runtime contracts](runtime-contracts.md) for the complete state and atomic
 publication contract.
 
+## Deferred materialization
+
+A factory can defer creating its runner until a session first uses it. Session
+start then binds nothing, and a run whose tools never touch the runner never
+creates it. Build the result from one `DeferredMaterialization`:
+
+```python
+from cayu import DeferredMaterialization, Environment, EnvironmentFactoryResult
+
+
+async def create(self, request):
+    async def materialize(mode):  # "use" creates fresh; "recover" must adopt
+        runner = await self._create_runner(request)
+        return runner, self._binding_for(runner)
+
+    materialization = DeferredMaterialization(
+        materialize,
+        default_cwd="/workspace",
+        configured_candidate=self._configured_candidate,  # admission without a runner
+        environment_authority=self.execution_environment_authority(),
+        dispose_unmaterialized=self._remove_leftover,  # crash leftovers
+    )
+    return EnvironmentFactoryResult(
+        environment=Environment(
+            spec,
+            workspace=self.source,
+            runner=materialization.runner,
+            binding=materialization.binding,
+        ),
+        reconnect_metadata=self._reserved_identity(request),
+    )
+```
+
+Declare `deferred_materialization = True` on the factory. Manifests, `cayu
+inspect` and crash-leftover release read that declaration, because they run
+without a factory result to inspect, so the runtime rejects a deferred
+environment from a factory that does not declare it.
+
+The contract:
+
+- **Fresh resources only.** A clean run end, completed or paused, finalizes the
+  binding, which disposes the resource. So `materialize("use")` must never adopt
+  a resource it finds under the session's reserved identity: that is a crash
+  leftover (or a failed disposal) whose temporary files and processes would
+  carry over. Remove it and create a fresh one. Only `materialize("recover")`
+  adopts.
+- **First use materializes once.** The first command or workspace operation on
+  `materialization.runner` calls `materialize("use")` under a single-flight
+  lock. Parallel tool calls share one materialization. The runtime admits the new
+  runner, the real binding then runs against it (copy-in), and only then does
+  the original call proceed. A live admission check only creates the runner:
+  it is bound on the first use after that admission passed, never before. Use the factory's ordinary creation path, so admission
+  and isolation evidence match an eager start.
+- **Admission timing.** Session start keeps the side-effect-free checks: the
+  factory's pre-create candidate and the deferred runner's `configured_candidate`.
+  Requirements that need live evidence, such as declared executables, materialize
+  at session start exactly like an eager environment: `pre_exposure` admission
+  requires `live_verified` executable evidence, which configuration cannot
+  provide. Built-in tools such as `git_changes`, search, named checks, structured
+  commands and the browser declare executables, so exposing them gives up the
+  deferral (a warm spare still shortens that start). In that case the runner is created at
+  session start only to collect live evidence; the session-start admission check
+  evaluates it once, and nothing is copied in until the first use after that
+  admission passed. A refused runner is removed without ever receiving the
+  workspace. When a runner materializes,
+  the runtime runs its bind-time live admission against it before copy-in and
+  before the triggering call: final evidence collection, the environment authority
+  check and `pre_exposure` evaluation, recorded as `environment.lifecycle.transition`
+  `final_evidence` and `admission` events. A refusal, like any creation failure,
+  raises `EnvironmentMaterializationError` (a `RunnerUnavailableError`, reason
+  `admission_refused`). That fails the triggering tool call; the session stays
+  usable, and a later use retries.
+- **Finalization.** Finalize, abandonment and completion recovery delegate to the
+  real binding once materialized. Without materialization, finalization only calls
+  `dispose_unmaterialized` so a resource created by a crashed process cannot leak.
+- **Recovery.** `_recover_completion_finalization` calls `materialize("recover")`,
+  which must reach the exact resource holding unpublished output and fail closed
+  if it is gone. Give that resource a name derived from the allocation identity
+  your factory records at session start (for example the allocation ID); then
+  recovery reaches the container a crashed process left, the next use removes it,
+  and `is_allocation_disposed` can prove absence by that name.
+- **Crash leftovers.** `recover_incomplete_session` calls
+  `EnvironmentFactory.release_deferred_materialization(request)` with the
+  session's allocation reconnect metadata, unless completion finalization is
+  pending (that resource still holds output to publish). The factory removes a
+  resource a crashed run created for that allocation, and the recovery result
+  reports `reaped_allocation`. The session keeps its allocation and materializes a
+  fresh resource on its next use. Validate only the metadata's shape and the
+  reserved name here, not the current configuration, so an image re-pin since the
+  crash cannot strand the leftover. The cleanup is best effort: if it raises (for
+  example while the container daemon is down), recovery logs it and completes.
+  The leftover is still never adopted: the next `materialize("use")` removes it
+  before creating a fresh resource, and finalization of a run that never
+  materializes removes it through `dispose_unmaterialized`.
+- **Events.** The runtime records `environment.deferred` after binding, and
+  `environment.materialization.started` / `.completed` / `.failed` with the
+  triggering `trigger_tool_call_id` and `trigger_tool_name`. They are persisted
+  and yielded in the live run stream before the triggering tool call's terminal
+  event. Each runner has exactly one `started` followed by one `completed` or
+  `failed`. When live evidence creates the runner at session start, `started`
+  is recorded then, and the same record completes when the first use after
+  admission binds it; if it is never bound (for example admission refused it),
+  finalization records `failed` with reason `not_bound` and removes the runner.
+- **Binding events.** A deferred environment records no
+  `environment.binding.started` / `.completed` at session start, because nothing
+  binds then. When the runner materializes, the runtime records the same pair an
+  eager bind records, with the same binding generation and the real bound
+  workspace (path, workspace ID, metadata), between
+  `environment.materialization.started` and `.completed`. A run that never uses
+  the runner still records the binding finalization events at teardown; they
+  report that nothing was published.
+
+`DockerCodingEnvironmentFactory(deferred=True)` implements this contract: the
+session's allocation reserves the container name `cayu-coding-<allocation id>`
+(derived from the `ealloc_` allocation ID, not the session; without an
+allocation ID the name derives from the session, environment and configuration
+fingerprint), and the container is created on first use. Every path that acts
+on that name (reconnect, use, disposal, discard and crash release) requires
+exactly the reserved name. `warm_spares=N` (requires
+`deferred=True`, at most 8) keeps N containers pre-started through the exact
+cold-start path. Each idle spare holds its memory reservation (512 MiB by
+default) and a container slot. `deferred=True` cannot be combined with
+`immutable_inputs` yet, and the factory rejects that at construction: immutable
+inputs are attached and mounted when an allocation is created, before a deferred
+container exists.
+
+### Warm spare pools
+
+`warm_spares=N` composes a `cayu.environments.WarmSparePool` with a Docker
+backend; `factory.warm_spare_pool` returns it. The pool is usable on its own: give
+it any `WarmSpareBackend` (create a spare through your cold-start path, check that
+an idle spare is alive, claim one for a consumer, discard one, and list or remove
+spares by name) and call `take(name, requirements)` from your `materialize`
+callable, falling back to your cold start when it returns `None`.
+
+- A spare is claimed by exactly one consumer and never returned. Handout re-checks
+  liveness. The Docker backend creates spares with the factory's own executable
+  requirements. When a session's tools need more (for example `git` or a search
+  executable with a probe), the claim verifies them live on that exact container
+  through the strict reconnect completion recovery uses, instead of skipping the
+  spare. If that verification fails, the pool removes that one spare and sends
+  the session to a cold start. When the check found an executable unavailable
+  (the image cannot serve those requirements), later sessions with the same
+  requirements go straight to a cold start for the pool's reap interval
+  (`reap_interval_s`) instead of spending more spares; a transient Docker error
+  is not remembered.
+  A spare whose liveness check raises is kept for later; one that is no longer
+  running is removed and the next spare is tried. `take` returns `None` instead
+  of raising for any backend failure, so the caller cold-starts. A cancelled
+  `take` returns an unchecked spare to the pool (or removes it if the pool was
+  closed, trimmed or refilled meanwhile) and removes one it was claiming. The
+  cancellation propagates at once while that removal continues detached; if
+  teardown cancels the removal too, stale-spare reaping or the session's
+  reserved-name cleanup removes the container later.
+- Refill runs in the background, is single-flight, and backs off on backend
+  errors.
+- Spare names are `<prefix><pid>-<nonce>-<id>`, with a host-specific prefix.
+  Refill re-scans once per reap interval (`reap_interval_s`, five minutes by
+  default) and removes spares of dead processes or
+  closed pools on the same host. A reused PID makes a dead owner look alive until
+  that PID exits, so such spares are removed later, never handed out.
+- `release_idle()` removes idle spares and lets the next `take` refill.
+  `close()` removes them and creates no more. `CayuApp.drain_environment_cleanups`,
+  which an idle application may call at any time, calls
+  `EnvironmentFactory.release_idle_resources()`, which trims the Docker factory's
+  pool. `CayuApp.close_idle_environment_resources()` calls
+  `EnvironmentFactory.close_idle_resources()`, which closes it. Application
+  shutdown, including server shutdown, calls it after the environment drain
+  within the same deadline. Sessions that materialize after that start cold.
+- An SDK application that never drains or closes still loses no containers on a
+  normal interpreter exit: the pool registers an exit hook that removes its idle
+  spares synchronously when the backend provides `remove_spares_at_exit(spares)`
+  (the Docker backend runs one bounded `docker rm -f`). A forked child drops the
+  spares it inherited and never hands out or removes them; its exit hook only
+  acts on spares the child created itself. A process that is killed
+  or crashes leaves its idle spares running until another pool on the same host
+  reaps them, which happens on that pool's next refill.
+- A backend's `claim_spare` raises `WarmSpareRequirementsUnsatisfied` (exported
+  from `cayu` and `cayu.environments`) when a spare cannot serve the consumer's
+  requirements at all, as opposed to a transient failure.
+
 ## Execution admission for custom integrations
 
 Applications attach provider-neutral workload requirements to the agent, not

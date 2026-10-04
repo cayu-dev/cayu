@@ -110,7 +110,13 @@ def _run_inspect(args: argparse.Namespace) -> int:
 def _render_human(manifest: AppManifest) -> str:
     agents = ", ".join(item.name for item in manifest.agents) or "none"
     providers = ", ".join(item.name for item in manifest.providers) or "none"
-    environments = ", ".join(item.name for item in manifest.environments) or "none"
+    environments = (
+        ", ".join(
+            f"{item.name} (deferred)" if item.deferred else item.name
+            for item in manifest.environments
+        )
+        or "none"
+    )
     return "\n".join(
         (
             f"Cayu application {manifest.fingerprint[:12]}",
