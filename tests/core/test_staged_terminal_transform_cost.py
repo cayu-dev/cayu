@@ -7,6 +7,7 @@ import pytest
 from tests.core.test_tool_round_publication import _lifecycle_events, _pending_round
 
 import cayu.runtime._tool_round_recovery as recovery
+from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions._assistant_tool_round_publication import StagedToolCallTerminal
 
 
@@ -20,7 +21,7 @@ def state():
             "pending_tool_round": pending.model_dump(mode="json"),
         },
         event,
-        recovery.pending_tool_round_identity(pending),
+        pending_rounds.pending_tool_round_identity(pending),
     )
 
 
@@ -103,7 +104,7 @@ def test_owned_json_parse_skips_second_stage_validation_but_never_caches(monkeyp
     assert checkpoint["pending_tool_round"]["tool_calls"][0]["arguments"]["query"] == "new query"
     # Public construction with pre-existing model instances still detaches and
     # revalidates those instances; it cannot claim the private JSON boundary.
-    recovery.PendingToolRound.model_validate(
+    pending_rounds.PendingToolRound.model_validate(
         {**checkpoint["pending_tool_round"], "staged_terminals": first.staged_terminals}
     )
     assert copies
@@ -114,7 +115,7 @@ def test_public_model_constructed_stage_is_not_trusted():
     invalid = StagedToolCallTerminal.model_construct(tool_call_id="other", event=event)
     checkpoint["pending_tool_round"]["staged_terminals"] = [invalid]
     with pytest.raises(ValueError):
-        recovery.PendingToolRound.model_validate(checkpoint["pending_tool_round"])
+        pending_rounds.PendingToolRound.model_validate(checkpoint["pending_tool_round"])
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])

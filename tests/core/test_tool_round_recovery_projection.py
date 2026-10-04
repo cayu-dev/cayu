@@ -6,6 +6,7 @@ from cayu import Event, EventType
 from cayu.approvals.tools import PendingToolCallApproval
 from cayu.runtime import _tool_round_recovery as recovery
 from cayu.runtime.execution_units import new_model_step_identity
+from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions._assistant_tool_round_publication import StagedToolCallTerminal
 from cayu.tools.base import ToolResult
 
@@ -40,7 +41,7 @@ def test_quarantine_preserves_nonexecution_evidence(projection, event_type):
     original = event.model_dump(mode="json")
     projected = event
     if projection != "hook":
-        pending = recovery.PendingToolRound(
+        pending = pending_rounds.PendingToolRound(
             **identity.payload(),
             agent_name="assistant",
             tool_calls=[

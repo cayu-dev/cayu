@@ -262,6 +262,7 @@ from cayu.runtime.execution_profiles import (
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
 from cayu.runtime.retry_policy import RetryPolicy
+from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions._invocation_terminal_decision import (
     settled_invocation_terminal_decision_from_checkpoint,
 )
@@ -37732,7 +37733,7 @@ def test_stale_tool_approval_resolver_cannot_claim_repaused_session():
             reason="replacement approval",
             metadata={"scope": "replacement"},
         )
-        round_b = tool_round_recovery.PendingToolRound(
+        round_b = pending_rounds.PendingToolRound(
             **{
                 **round_a.model_dump(mode="json"),
                 **replacement_identity.payload(),

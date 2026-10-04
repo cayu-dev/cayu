@@ -1,4 +1,6 @@
 {
+    "tests/core/test_pending_tool_round_contracts.py::test_pending_round_contract_and_runtime_parser_share_one_identity": 0.5617623340003775,
+    "tests/core/test_pending_tool_round_contracts.py::test_pending_round_contract_composes_without_execution_or_store_owners": 0.3261744999981602,
     "tests/core/test_queued_dispatch_coordinator.py::test_queued_dispatch_reconciliation_composes_without_controllers": 2.963,
     "tests/core/test_queued_dispatch_coordinator.py::test_queued_dispatch_stream_preserves_caller_signal_during_cleanup[False-cancellation]": 0.754,
     "tests/core/test_queued_dispatch_coordinator.py::test_queued_dispatch_stream_preserves_caller_signal_during_cleanup[False-error]": 0.757,

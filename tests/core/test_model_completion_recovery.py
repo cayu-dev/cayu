@@ -57,6 +57,7 @@ from cayu.runtime.execution_profiles import ExecutionProfileIdentity, ExecutionP
 from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions import _model_completion_publication as model_completion_publication
+from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions.base import (
     EventQuery,
     IncompleteSessionRecoveryAction,
@@ -1153,9 +1154,8 @@ def test_reconstruct_reconciled_model_result(
             )
             assert result.completion.end_turn is end_turn
             if with_tool_call:
-                assert (
-                    result.tool_round_identity
-                    == tool_round_recovery.pending_tool_round_identity(boundary.pending_tool_round)
+                assert result.tool_round_identity == pending_rounds.pending_tool_round_identity(
+                    boundary.pending_tool_round
                 )
                 assert result.tool_calls == tool_round_recovery.pending_round_tool_calls(
                     boundary.pending_tool_round
@@ -3248,7 +3248,7 @@ def test_model_boundary_accepts_exact_published_tool_round() -> None:
         pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
         assert pending_round is not None
         pending_call = pending_round.tool_calls[0]
-        identity = tool_round_recovery.pending_tool_round_identity(pending_round).payload()
+        identity = pending_rounds.pending_tool_round_identity(pending_round).payload()
         idempotency_key = tool_execution.tool_idempotency_key(
             session_id=staged.session.id,
             tool_round_id=pending_round.tool_round_id,

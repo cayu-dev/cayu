@@ -25,6 +25,7 @@ from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import ExecutionProfileIdentity
 from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
 from cayu.sessions import _model_completion_publication as model_completion_publication
+from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions.base import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
@@ -131,7 +132,7 @@ class _PublishedStructuredStep:
     session: Session
     user_message: Message
     assistant_message: Message
-    pending_round: tool_round_recovery.PendingToolRound
+    pending_round: pending_rounds.PendingToolRound
     completion_event: Event
     model_intent: dict
     model_receipt: RuntimePublicationReceipt
@@ -545,9 +546,7 @@ def test_incomplete_recovery_accepts_partial_unavailable_terminal_evidence() -> 
             session=staged.session,
             registered_agent=app._agents["assistant"],
             environment_name=None,
-            tool_round_identity=tool_round_recovery.pending_tool_round_identity(
-                staged.pending_round
-            ),
+            tool_round_identity=pending_rounds.pending_tool_round_identity(staged.pending_round),
             outcome=outcome,
         )
         terminal_event = event_with_execution_profile_authority(

@@ -48,6 +48,7 @@ from cayu.runners.base import (
 from cayu.runners.local import LocalRunner
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
+from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions.base import (
     ForkSessionRequest,
     InMemorySessionStore,
@@ -4776,8 +4777,7 @@ def test_pending_tool_round_rejects_secret_authority_on_write_and_legacy_load() 
             redactor=SecretRedactor(secret),
         )
     assert (
-        legacy_checkpoint[tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY]["agent_name"]
-        == secret
+        legacy_checkpoint[pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY]["agent_name"] == secret
     )
     _assert_cayu_traceback_does_not_retain_text(exc_info.value, secret)
 
@@ -5361,7 +5361,7 @@ def test_malformed_legacy_pending_checkpoint_is_rejected_without_traceback_secre
         load = pending_user_input_from_checkpoint
     else:
         checkpoint = {
-            tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY: {
+            pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY: {
                 "agent_name": {secret: "safe"},
             }
         }

@@ -220,6 +220,7 @@ from cayu.runtime.mcp_manifest_policy import (
 )
 from cayu.runtime.public_authority import parse_public_authority_alias
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
+from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions._browser_control_checkpoint import (
     browser_control_checkpoint_mutation_scope,
     browser_control_checkpoint_read_scope,
@@ -635,11 +636,11 @@ def _restore_targeted_tool_invocation_event_authority(
 
 def _require_matching_policy_round(
     *,
-    pending_round: tool_round_recovery.PendingToolRound,
+    pending_round: pending_rounds.PendingToolRound,
     tool_round_identity: ToolRoundIdentity,
     tool_calls: list[runtime_records.ToolCallRequest],
 ) -> None:
-    if tool_round_recovery.pending_tool_round_identity(pending_round) != tool_round_identity:
+    if pending_rounds.pending_tool_round_identity(pending_round) != tool_round_identity:
         raise RuntimeError("Pending tool round identity changed before policy publication.")
     expected_calls = [runtime_records.copy_tool_call_request(call) for call in tool_calls]
     pending_calls = tool_round_recovery.pending_round_tool_calls(pending_round)
@@ -649,13 +650,13 @@ def _require_matching_policy_round(
 
 def _planned_pending_tool_round(
     *,
-    pending_round: tool_round_recovery.PendingToolRound,
+    pending_round: pending_rounds.PendingToolRound,
     tool_calls: list[runtime_records.ToolCallRequest],
     policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] | None,
     active_taint_by_id: Mapping[str, frozenset[str]],
     redactor: SecretRedactor,
     deferred_messages: list[Message] | None = None,
-) -> tool_round_recovery.PendingToolRound:
+) -> pending_rounds.PendingToolRound:
     payload = pending_round.model_dump(mode="json")
     # Checkpoints written before policy-context versioning are valid while the
     # originating run is still evaluating their policy plan. Publishing a
@@ -678,7 +679,7 @@ def _planned_pending_tool_round(
         payload["deferred_messages"] = [
             message.model_dump(mode="json") for message in deferred_messages
         ]
-    return tool_round_recovery.PendingToolRound.model_validate(payload)
+    return pending_rounds.PendingToolRound.model_validate(payload)
 
 
 class ToolApprovalRequired(Exception):
@@ -883,10 +884,10 @@ class ToolRoundExecutor:
         session: Session,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
-        pending_round: tool_round_recovery.PendingToolRound,
+        pending_round: pending_rounds.PendingToolRound,
         invocation_context: InvocationContext | None = None,
     ) -> tuple[
-        tool_round_recovery.PendingToolRound,
+        pending_rounds.PendingToolRound,
         list[runtime_records.ToolCallRequest],
         tuple[Event, ...],
     ]:
@@ -933,7 +934,7 @@ class ToolRoundExecutor:
             raise RuntimeError("Targeted grant state contains duplicate identities.")
         resolved_calls: list[runtime_records.ToolCallRequest] = []
         resolution_events: list[Event] = []
-        identity = tool_round_recovery.pending_tool_round_identity(pending_round)
+        identity = pending_rounds.pending_tool_round_identity(pending_round)
         observed_at = self._clock()
         capability_ceiling = tool_capability_ceiling_from_session_metadata(session.metadata)
         ceiling_names = frozenset(capability_ceiling.tool_names)
@@ -1518,13 +1519,13 @@ class ToolRoundExecutor:
                 redactor=redactor,
             )
         ]
-        resolved_round = tool_round_recovery.PendingToolRound.model_validate(payload)
+        resolved_round = pending_rounds.PendingToolRound.model_validate(payload)
         source_payload = pending_round.model_dump(mode="json")
         resolved_payload = _require_secret_free_durable_object(
             resolved_round.model_dump(mode="json"),
             redactor=redactor,
             field_name="pending_tool_round",
-            schema_root=tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY,
+            schema_root=pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY,
         )
 
         def publish_resolution(
@@ -1538,9 +1539,9 @@ class ToolRoundExecutor:
                 if current_checkpoint is None
                 else copy_durable_json_object(current_checkpoint, "checkpoint")
             )
-            if current.get(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY) != source_payload:
+            if current.get(pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY) != source_payload:
                 raise RuntimeError("Pending tool round changed before targeted-tool resolution.")
-            current[tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = resolved_payload
+            current[pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = resolved_payload
             return copy_durable_json_object(current, "checkpoint")
 
         await self._session_store.transform_checkpoint(session.id, publish_resolution)
@@ -2147,14 +2148,14 @@ class ToolRoundExecutor:
             planned_round.model_dump(mode="json"),
             redactor=redactor,
             field_name="pending_tool_round",
-            schema_root=tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY,
+            schema_root=pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY,
         )
         # Retain the exact serialized source for the compare-and-swap. Parsing
         # an older checkpoint fills model defaults (including policy version
         # fields), which is useful for behavior but must not change the value
         # we require the atomic publication to replace.
         source_round_payload = copy_json_value(
-            checkpoint[tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY],
+            checkpoint[pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY],
             "pending_tool_round",
         )
         # Recovery can own a fenced session in a non-running status (for
@@ -2178,7 +2179,7 @@ class ToolRoundExecutor:
                 else copy_durable_record(current_checkpoint, "checkpoint")
             )
             if (
-                current.get(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
+                current.get(pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
                 != source_round_payload
             ):
                 raise RuntimeError("Pending tool round changed before approval publication.")
@@ -2186,7 +2187,7 @@ class ToolRoundExecutor:
                 raise RuntimeError("Session already has a pending tool approval.")
             if approval_support.APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY in current:
                 raise RuntimeError("Session has an orphaned approval resolution intent.")
-            current[tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = planned_round_payload
+            current[pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = planned_round_payload
             current[approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY] = approval_payload
             if recovered and _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY in current:
                 interrupt_payload = current[_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY]
@@ -2319,7 +2320,7 @@ class ToolRoundExecutor:
         active_taint_by_id: Mapping[str, frozenset[str]],
         tool_round_identity: ToolRoundIdentity,
         recovered: bool = False,
-    ) -> tool_round_recovery.PendingToolRound:
+    ) -> pending_rounds.PendingToolRound:
         """Atomically replace an unplanned round with its durable policy plan."""
 
         tool_round_identity = copy_tool_round_identity(tool_round_identity)
@@ -2363,7 +2364,7 @@ class ToolRoundExecutor:
         # model defaults, including assistant publication evidence introduced
         # after an older v2 stage was written, must not fabricate a mismatch.
         source_round_payload = copy_json_value(
-            checkpoint[tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY],
+            checkpoint[pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY],
             "pending_tool_round",
         )
         eligible_statuses = {session.status} if recovered else {SessionStatus.RUNNING}
@@ -2371,7 +2372,7 @@ class ToolRoundExecutor:
             planned_round.model_dump(mode="json"),
             redactor=redactor,
             field_name="pending_tool_round",
-            schema_root=tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY,
+            schema_root=pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY,
         )
 
         def publish_policy_plan(
@@ -2389,7 +2390,7 @@ class ToolRoundExecutor:
                 else copy_durable_record(current_checkpoint, "checkpoint")
             )
             if (
-                current.get(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
+                current.get(pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
                 != source_round_payload
             ):
                 raise RuntimeError("Pending tool round changed before policy publication.")
@@ -2397,7 +2398,7 @@ class ToolRoundExecutor:
                 raise RuntimeError("Session already has a pending tool approval.")
             if approval_support.APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY in current:
                 raise RuntimeError("Session has an orphaned approval resolution intent.")
-            current[tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = planned_round_payload
+            current[pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = planned_round_payload
             return copy_durable_json_object(current, "checkpoint")
 
         await self._session_store.transform_checkpoint(session.id, publish_policy_plan)
@@ -2528,11 +2529,11 @@ class ToolRoundExecutor:
             runtime_session=session,
         )
         source_round_payload = copy_json_value(
-            checkpoint[tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY],
+            checkpoint[pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY],
             "pending_tool_round",
         )
         target_checkpoint = copy_durable_record(checkpoint, "checkpoint")
-        target_checkpoint.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
+        target_checkpoint.pop(pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
         target_checkpoint[PENDING_USER_INPUT_CHECKPOINT_KEY] = pending_payload
         target_checkpoint = _require_secret_free_durable_object(
             target_checkpoint,
@@ -2644,7 +2645,7 @@ class ToolRoundExecutor:
         task_id: str | None,
         structured_output: StructuredOutputSpec | None,
         tool_round_identity: ToolRoundIdentity,
-    ) -> tuple[dict[str, Any], tool_round_recovery.PendingToolRound]:
+    ) -> tuple[dict[str, Any], pending_rounds.PendingToolRound]:
         checkpoint = await self._session_store.load_checkpoint(session.id)
         redactor = _redactor_for_tool_calls(
             self._secret_redactor,
@@ -7406,7 +7407,7 @@ class ToolRoundRun:
                     yield event
             raise
 
-        planned_round: tool_round_recovery.PendingToolRound | None = None
+        planned_round: pending_rounds.PendingToolRound | None = None
         if policy_plan.pending_approval is None:
             try:
                 try:

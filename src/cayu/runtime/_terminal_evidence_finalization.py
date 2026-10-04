@@ -64,6 +64,7 @@ from cayu.runtime._terminal_finalization_lifetime import (
     InterruptionFinalization,
 )
 from cayu.runtime._tool_completion import recorded_terminal_tool_completion_payload
+from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions._terminal_evidence import (
     TERMINAL_EVIDENCE_EVENT_TYPES,
     TERMINAL_EVIDENCE_QUERY_LIMIT,
@@ -996,7 +997,7 @@ class TerminalEvidenceFinalization:
             }
         elif pending_tool_round is not None and session.status == SessionStatus.INTERRUPTED:
             pending_action_interrupt_payload = {
-                **tool_round_recovery.pending_tool_round_identity(pending_tool_round).payload(),
+                **pending_rounds.pending_tool_round_identity(pending_tool_round).payload(),
                 "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
                 "reason": "terminal_event_evidence_repaired",
                 "recovered": True,

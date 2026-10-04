@@ -13,6 +13,7 @@ from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime.execution_units import ToolRoundIdentity
+from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.tools.base import ToolResult
 
 
@@ -84,7 +85,7 @@ def _conflicting_parent_identity() -> ToolRoundIdentity:
     return identity.model_copy(update={"model_step_id": f"mstep_{'9' * 32}"})
 
 
-def _pending_round() -> tool_round_recovery.PendingToolRound:
+def _pending_round() -> pending_rounds.PendingToolRound:
     identity = _identity()
     _, pending_round = tool_round_recovery.checkpoint_with_pending_tool_round(
         None,

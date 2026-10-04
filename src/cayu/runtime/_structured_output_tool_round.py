@@ -30,13 +30,13 @@ from cayu.events import (
 )
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_execution as tool_execution
-from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     ToolRoundIdentity,
     copy_model_attempt_identity,
     copy_tool_round_identity,
 )
+from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions.base import RuntimePublicationRequest, Session
 from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools.base import ToolResult
@@ -54,7 +54,7 @@ class _StructuredOutputToolRoundPublicationExtension:
         self,
         *,
         ordinary_request: RuntimePublicationRequest,
-        pending_round: tool_round_recovery.PendingToolRound,
+        pending_round: pending_rounds.PendingToolRound,
     ) -> RuntimePublicationRequest:
         if not any(
             call.tool_name == STRUCTURED_OUTPUT_TOOL_NAME for call in pending_round.tool_calls

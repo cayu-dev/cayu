@@ -94,7 +94,7 @@ def test_large_round_publishes_all_results_and_exactly_replays(tmp_path, backend
     from cayu.messages import ToolResultPart
     from cayu.runtime._tool_execution import tool_idempotency_key
     from cayu.runtime._tool_round_publication import build_tool_round_publication_request
-    from cayu.runtime._tool_round_recovery import PendingToolRound
+    from cayu.sessions._pending_tool_round import PendingToolRound
     from cayu.sessions.base import SessionStatus
     from cayu.tools.base import ToolResult
 

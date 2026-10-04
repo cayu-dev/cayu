@@ -36,7 +36,6 @@ from cayu.events import (
 from cayu.messages import Message, ProviderStatePart, TextPart
 from cayu.observability.hooks import RuntimeHook, RuntimeHookContext
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
 from cayu.runtime._durable_worker_loop import DurableWorkerMetrics
 from cayu.runtime._recovery_coordinator import ModelCompletionBoundaryReconciliation
@@ -64,6 +63,7 @@ from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     PublicAuthorityAliasKeyring,
 )
+from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions.base import (
     EventQuery,
     ForkSessionRequest,
@@ -2097,7 +2097,7 @@ def test_sqlite_target_adoption_redelivery_accepts_governed_profile(tmp_path) ->
             envelope = _QueuedDispatchEnvelope.model_validate(queued_task.input["dispatch"])
             assert envelope.source_profile != envelope.required_profile
 
-            pending_round = tool_round_recovery.PendingToolRound(
+            pending_round = pending_rounds.PendingToolRound(
                 model_step_id=f"mstep_{'1' * 32}",
                 model_attempt_id=f"matt_{'2' * 32}",
                 tool_round_id=f"tround_{'3' * 32}",
@@ -2148,7 +2148,7 @@ def test_sqlite_target_adoption_redelivery_accepts_governed_profile(tmp_path) ->
             def stage_pending_recovery(_session, current):
                 updated = dict(current or {})
                 updated.pop("last_model_step_publication", None)
-                updated[tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = (
+                updated[pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = (
                     pending_round.model_dump(mode="json")
                 )
                 return updated
@@ -3517,7 +3517,7 @@ def test_queue_preparation_preserves_released_profile_for_pending_tool_recovery(
         direct_tools=(),
         tool_catalogue_revision=f"sha256:{'c' * 64}",
     )
-    pending_round = tool_round_recovery.PendingToolRound(
+    pending_round = pending_rounds.PendingToolRound(
         model_step_id=f"mstep_{'1' * 32}",
         model_attempt_id=f"matt_{'2' * 32}",
         tool_round_id=f"tround_{'3' * 32}",
@@ -3550,8 +3550,8 @@ def test_queue_preparation_preserves_released_profile_for_pending_tool_recovery(
                 profile=recovery_profile,
                 expected=active_profile,
             )
-            updated[tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = (
-                pending_round.model_dump(mode="json")
+            updated[pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = pending_round.model_dump(
+                mode="json"
             )
             return updated
 
@@ -3568,7 +3568,7 @@ def test_queue_preparation_preserves_released_profile_for_pending_tool_recovery(
         def finish_recovery(_session, current):
             assert current is not None
             updated = dict(current)
-            updated.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
+            updated.pop(pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
             return updated
 
         await h.store.transform_checkpoint(session_id, finish_recovery)

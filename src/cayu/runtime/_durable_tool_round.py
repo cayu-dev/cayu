@@ -63,6 +63,7 @@ from cayu.runtime._tool_round_staging import (
 )
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.runtime.stop_policy import StopDecision
+from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions.base import Session, SessionStatus, SessionStore
 from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools._redaction import InvocationRedactorSnapshot
@@ -113,7 +114,7 @@ class InterruptedToolRoundRequest:
 @dataclass(frozen=True)
 class InterruptedToolRoundSnapshot:
     checkpoint: dict[str, Any] | None
-    pending_round: tool_round_recovery.PendingToolRound
+    pending_round: pending_rounds.PendingToolRound
     tool_calls: list[runtime_records.ToolCallRequest]
     expected_transcript_cursor: int
 
@@ -441,17 +442,14 @@ class DurableToolRound:
 
     async def _load_pending_round(
         self, failure: str
-    ) -> tuple[dict[str, Any] | None, tool_round_recovery.PendingToolRound]:
+    ) -> tuple[dict[str, Any] | None, pending_rounds.PendingToolRound]:
         """Read one fresh snapshot; publication uses that same validated input."""
 
         checkpoint, pending = await tool_round_recovery.load_pending_tool_round(
             self._session_store,
             self._session.id,
         )
-        if (
-            pending is None
-            or tool_round_recovery.pending_tool_round_identity(pending) != self._identity
-        ):
+        if pending is None or pending_rounds.pending_tool_round_identity(pending) != self._identity:
             raise RuntimeError(failure)
         builder = current_builder()
         if builder is not None:
@@ -484,7 +482,7 @@ class DurableToolRound:
     async def _commit_snapshot(
         self,
         source_checkpoint: dict[str, Any] | None,
-        pending_round: tool_round_recovery.PendingToolRound,
+        pending_round: pending_rounds.PendingToolRound,
         durable_events: list[Event],
         *,
         expected_statuses: set[SessionStatus] | None = None,
@@ -527,7 +525,7 @@ class DurableToolRound:
         environment_name: str | None,
         messages: list[Message],
         tool_calls: list[runtime_records.ToolCallRequest],
-        pending_round: tool_round_recovery.PendingToolRound,
+        pending_round: pending_rounds.PendingToolRound,
         spec: StructuredOutputSpec,
         step: int,
         attempt: int,
@@ -610,9 +608,7 @@ class DurableToolRound:
         lifecycle_events = await self._session_store.load_tool_round_lifecycle_events_for_round(
             session.id,
             [call.tool_call_id for call in durable_pending_round.tool_calls],
-            tool_round_identity=tool_round_recovery.pending_tool_round_identity(
-                durable_pending_round
-            ),
+            tool_round_identity=pending_rounds.pending_tool_round_identity(durable_pending_round),
         )
         prepared, cancellation = await self._commit_snapshot(
             source_checkpoint, durable_pending_round, lifecycle_events, extension=extension
@@ -628,7 +624,7 @@ class DurableToolRound:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         messages: list[Message],
-        pending_round: tool_round_recovery.PendingToolRound,
+        pending_round: pending_rounds.PendingToolRound,
         retry_allowed: bool,
         expected_transcript_cursor: int,
         execution_profile: ExecutionProfileIdentity | None,
@@ -682,7 +678,7 @@ class DurableToolRound:
             expected_outcomes,
             redactor,
         )
-        tool_round_identity = tool_round_recovery.pending_tool_round_identity(pending_round)
+        tool_round_identity = pending_rounds.pending_tool_round_identity(pending_round)
         structured_round_redactor = _redactor_for_tool_calls(
             tool_redactor,
             registered_agent=registered_agent,
@@ -729,9 +725,7 @@ class DurableToolRound:
                     session=session,
                     registered_agent=registered_agent,
                     environment_name=environment_name,
-                    tool_round_identity=tool_round_recovery.pending_tool_round_identity(
-                        pending_round
-                    ),
+                    tool_round_identity=pending_rounds.pending_tool_round_identity(pending_round),
                     outcome=expected_outcome,
                 ),
                 execution_profile,
@@ -1012,7 +1006,7 @@ class DurableToolRound:
         lifecycle_events = await self._session_store.load_tool_round_lifecycle_events_for_round(
             session.id,
             [call.tool_call_id for call in pending_round.tool_calls],
-            tool_round_identity=tool_round_recovery.pending_tool_round_identity(pending_round),
+            tool_round_identity=pending_rounds.pending_tool_round_identity(pending_round),
         )
         _, cancellation = await self._commit_snapshot(
             source_checkpoint, pending_round, lifecycle_events
@@ -1077,16 +1071,16 @@ class DurableToolRound:
         *,
         registered_agent: runtime_records.RegisteredAgentState,
         redactor: SecretRedactor,
-        pending_round: tool_round_recovery.PendingToolRound,
+        pending_round: pending_rounds.PendingToolRound,
         execution_scope_unknown_ids: set[str] | frozenset[str] = frozenset(),
-    ) -> tuple[dict[str, Any], tool_round_recovery.PendingToolRound]:
+    ) -> tuple[dict[str, Any], pending_rounds.PendingToolRound]:
         """Finalize calls after every returned secret was durably projected."""
 
         session_id = self._session.id
         if pending_round.assistant_message_state == "published":
             checkpoint = await self._session_store.load_checkpoint(session_id)
             return checkpoint or {}, pending_round
-        identity = tool_round_recovery.pending_tool_round_identity(pending_round)
+        identity = pending_rounds.pending_tool_round_identity(pending_round)
         tool_calls = tool_round_recovery.pending_round_tool_calls(pending_round)
         base_redactor = _redactor_for_tool_calls(
             redactor,
@@ -1129,7 +1123,7 @@ class DurableToolRound:
         self,
         *,
         registered_agent: runtime_records.RegisteredAgentState,
-        pending_round: tool_round_recovery.PendingToolRound,
+        pending_round: pending_rounds.PendingToolRound,
         recorded_outcomes: Mapping[str, runtime_records.ToolCallOutcome],
         effective_started_ids: set[str],
         reconcile_call: ToolCallRecoveryResolver,
@@ -1141,7 +1135,7 @@ class DurableToolRound:
         native operation, external-effect and child-session evidence; it must
         raise when a call cannot safely receive an unknown-outcome terminal.
         """
-        if tool_round_recovery.pending_tool_round_identity(pending_round) != self._identity:
+        if pending_rounds.pending_tool_round_identity(pending_round) != self._identity:
             raise RuntimeError("Recovered outcomes belong to a different tool round.")
         synthesized_outcomes: list[runtime_records.ToolCallOutcome] = []
         confirmed_native_effect_records: dict[str, ToolEffectRecord] = {}
@@ -1213,7 +1207,7 @@ class DurableToolRound:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         messages: list[Message],
-        pending_round: tool_round_recovery.PendingToolRound,
+        pending_round: pending_rounds.PendingToolRound,
         lifecycle_events: list[Event],
         synthesized_outcomes: list[runtime_records.ToolCallOutcome],
         effective_started_ids: set[str],
@@ -1268,7 +1262,7 @@ class DurableToolRound:
                 await self._session_store.transform_checkpoint(
                     session.id,
                     tool_round_recovery.completed_staged_terminal_transform(
-                        tool_round_identity=tool_round_recovery.pending_tool_round_identity(
+                        tool_round_identity=pending_rounds.pending_tool_round_identity(
                             pending_round
                         ),
                         event=quarantined_event,
@@ -1333,7 +1327,7 @@ class DurableToolRound:
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
                         tool_call_outcome=outcome,
-                        tool_round_identity=tool_round_recovery.pending_tool_round_identity(
+                        tool_round_identity=pending_rounds.pending_tool_round_identity(
                             pending_round
                         ),
                     )
@@ -1366,7 +1360,7 @@ class DurableToolRound:
                     environment_name=environment_name,
                     tool_name=outcome.call.name,
                     payload={
-                        **tool_round_recovery.pending_tool_round_identity(pending_round).payload(),
+                        **pending_rounds.pending_tool_round_identity(pending_round).payload(),
                         "tool_call_id": outcome.call.id,
                         "idempotency_key": tool_execution.tool_idempotency_key(
                             session_id=session.id,
@@ -1402,7 +1396,7 @@ class DurableToolRound:
         )
 
         emitted_events: list[Event] = []
-        tool_round_identity = tool_round_recovery.pending_tool_round_identity(pending_round)
+        tool_round_identity = pending_rounds.pending_tool_round_identity(pending_round)
         recovery_publication_coordinator = _ToolRoundPublicationCoordinator(
             session_id=session.id,
             session_instance_id=session.instance_id,

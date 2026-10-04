@@ -19,6 +19,7 @@ from cayu.runtime import _tool_execution as execution
 from cayu.runtime import _tool_round_recovery as recovery
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_units import new_model_step_identity
+from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions.base import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
@@ -128,7 +129,7 @@ async def seed_round(store, app, provider, tools, *, started):
     events = []
     for call in calls:
         payload = {
-            **recovery.pending_tool_round_identity(pending).payload(),
+            **pending_rounds.pending_tool_round_identity(pending).payload(),
             "tool_call_id": call.id,
             "idempotency_key": execution.tool_idempotency_key(
                 session_id=session_id, tool_round_id=pending.tool_round_id, tool_call_id=call.id

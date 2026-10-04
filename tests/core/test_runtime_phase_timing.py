@@ -41,6 +41,7 @@ from cayu.runtime._phase_timing import (
     current_builder,
     current_store_counters,
 )
+from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions.base import IncompleteSessionRecoveryRequest
 from cayu.storage import _sqlite_support
 from cayu.storage.migrations import SchemaMode
@@ -925,9 +926,7 @@ def test_interrupted_structured_output_close_is_not_recorded_as_recovered():
                     messages=await store.load_transcript(session.id),
                     tool_calls=tool_round_recovery.pending_round_tool_calls(pending_round),
                     tool_outcomes=[],
-                    tool_round_identity=tool_round_recovery.pending_tool_round_identity(
-                        pending_round
-                    ),
+                    tool_round_identity=pending_rounds.pending_tool_round_identity(pending_round),
                     cancellation_artifacts=None,
                     cancellation_artifacts_by_id=None,
                 )

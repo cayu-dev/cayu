@@ -438,7 +438,7 @@ def test_visual_effect_is_not_repeated_after_real_durable_fault(case_id: str) ->
     from cayu.evals.browser_acceptance_fixture import BrowserAcceptanceFixtureV1
     from cayu.evals.browser_acceptance_manifests import _case
     from cayu.evals.internal.browser_acceptance import _recover_scenario, build
-    from cayu.runtime._tool_round_recovery import PENDING_TOOL_ROUND_CHECKPOINT_KEY
+    from cayu.sessions._pending_tool_round import PENDING_TOOL_ROUND_CHECKPOINT_KEY
 
     attempt_number = secrets.randbelow(1_000_000) + 1
     session_id = f"browser-acceptance-{case_id}-1-{attempt_number}"

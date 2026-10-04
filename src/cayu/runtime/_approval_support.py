@@ -37,6 +37,7 @@ from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
+from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions.base import (
     Session,
     SessionStore,
@@ -452,11 +453,11 @@ def bounded_pending_approval_event_payload(
 
 
 def tool_round_secret_resolution_scope(
-    pending_round: tool_round_recovery.PendingToolRound,
+    pending_round: pending_rounds.PendingToolRound,
 ) -> Literal["static", "dynamic", "unknown"]:
     """Return positive durable secret-scope evidence for one tool round."""
 
-    if type(pending_round) is not tool_round_recovery.PendingToolRound:
+    if type(pending_round) is not pending_rounds.PendingToolRound:
         raise TypeError("pending_round must be a PendingToolRound.")
     publication = pending_round.assistant_publication
     return "unknown" if publication is None else publication.secret_resolution_scope
@@ -464,7 +465,7 @@ def tool_round_secret_resolution_scope(
 
 def pending_approval_scope_matches_round(
     approval: PendingToolApproval,
-    pending_round: tool_round_recovery.PendingToolRound,
+    pending_round: pending_rounds.PendingToolRound,
 ) -> bool:
     """Accept legacy unknown scope, otherwise require paired positive evidence."""
 
@@ -527,7 +528,7 @@ def public_policy_denial_result(
 
 def planned_tool_round_from_pending_approval(
     approval: PendingToolApproval,
-) -> tool_round_recovery.PendingToolRound:
+) -> pending_rounds.PendingToolRound:
     """Project the complete planned round carried by an approval checkpoint.
 
     Releases before the paired-checkpoint contract stored the approval as the
@@ -538,7 +539,7 @@ def planned_tool_round_from_pending_approval(
 
     if type(approval) is not PendingToolApproval:
         raise TypeError("Pending approval must be a PendingToolApproval.")
-    return tool_round_recovery.PendingToolRound(
+    return pending_rounds.PendingToolRound(
         tool_round_id=approval.tool_round_id,
         model_step_id=approval.model_step_id,
         model_attempt_id=approval.model_attempt_id,
@@ -640,7 +641,7 @@ def checkpoint_without_exact_pending_approval_round(
     )
     copied.pop(PENDING_TOOL_APPROVAL_CHECKPOINT_KEY)
     copied.pop(APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY, None)
-    copied.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
+    copied.pop(pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
     return copied
 
 
@@ -1446,7 +1447,7 @@ def _pending_approval_and_round_for_atomic_claim(
     recovery_tool_call_id: str | None = None,
     redactor: SecretRedactor,
     runtime_session: Session | None = None,
-) -> tuple[PendingToolApproval, tool_round_recovery.PendingToolRound]:
+) -> tuple[PendingToolApproval, pending_rounds.PendingToolRound]:
     if (gating_tool_call_id is None) == (recovery_tool_call_id is None):
         raise TypeError("Exactly one approval gating or recovery tool-call identity is required.")
     approval = pending_approval_from_checkpoint(

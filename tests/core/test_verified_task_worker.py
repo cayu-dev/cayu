@@ -72,6 +72,7 @@ from cayu.runtime.verified_task_worker import (
     VerifiedTaskWorker,
     VerifiedTaskWorkerDraining,
 )
+from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions.base import EventQuery, InMemorySessionStore, RunRequest, SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.admission import (
@@ -1190,7 +1191,7 @@ def test_worker_recovers_tool_publication_after_process_exit(
                 lifecycle = await sessions.load_tool_round_lifecycle_events_for_round(
                     admission.session_id,
                     sorted(call_ids),
-                    tool_round_identity=tool_round_recovery.pending_tool_round_identity(pending),
+                    tool_round_identity=pending_rounds.pending_tool_round_identity(pending),
                 )
                 outcomes, _ = tool_round_recovery.recorded_tool_outcomes(
                     events=lifecycle, pending_round=pending
@@ -2725,7 +2726,7 @@ def test_worker_keeps_unknown_model_dispatch_fenced_after_process_exit(
                 lifecycle = await sessions.load_tool_round_lifecycle_events_for_round(
                     admission.session_id,
                     sorted(call_ids),
-                    tool_round_identity=tool_round_recovery.pending_tool_round_identity(pending),
+                    tool_round_identity=pending_rounds.pending_tool_round_identity(pending),
                 )
                 outcomes, started_ids = tool_round_recovery.recorded_tool_outcomes(
                     events=lifecycle, pending_round=pending

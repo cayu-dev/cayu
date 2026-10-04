@@ -400,6 +400,13 @@ owners or session stores. `runtime/_run_limit_accounting.py` captures and restor
 the live monotonic clock origin; `runtime/stop_policy.py` retains stop decisions
 and auxiliary admission checks. Public stop-policy imports retain their identity.
 
+`sessions/_pending_tool_round.py` owns the saved pending-round record, checkpoint
+key, identity helper and shared owned-JSON validation marker. Its validators work
+without runtime execution or session stores. Runtime parsing uses the same marker
+after taking ownership of a complete durable JSON snapshot, retaining detached
+results without a second nested copy. Secret-aware readers, checkpoint publication
+and recovery behavior remain in `runtime/_tool_round_recovery.py`.
+
 `sessions/checkpoints.py` owns root checkpoint decoding and schema migrations.
 The adjacent private modules `_model_completion_publication`, `_terminal_evidence`,
 `_invocation_terminal_decision`, and `_provider_operation_cancellation_claim` own

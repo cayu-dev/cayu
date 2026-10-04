@@ -76,6 +76,7 @@ from cayu.providers import (
 )
 from cayu.providers.base import _preflight_provider_portable_messages
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions.base import SessionStore
 
 
@@ -256,7 +257,7 @@ class _PendingRoundRaceStore(InMemorySessionStore):
     ):
         if self.inject_pending_round and model_transition is not None:
             self.inject_pending_round = False
-            pending_round = tool_round_recovery.PendingToolRound(
+            pending_round = pending_rounds.PendingToolRound(
                 tool_round_id="tround_00000000000000000000000000000001",
                 model_step_id="mstep_00000000000000000000000000000001",
                 model_attempt_id="matt_00000000000000000000000000000001",
@@ -271,7 +272,7 @@ class _PendingRoundRaceStore(InMemorySessionStore):
             )
             checkpoint = await self.load_checkpoint(session_id)
             raced_checkpoint = dict(checkpoint or {})
-            raced_checkpoint[tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = (
+            raced_checkpoint[pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = (
                 pending_round.model_dump(mode="json")
             )
             await self.checkpoint(session_id, raced_checkpoint)

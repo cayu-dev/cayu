@@ -42,12 +42,12 @@ from cayu.runtime._foreground_subagent_recovery import (
     project_authenticated_child_result,
 )
 from cayu.runtime._tool_effect_state import ToolEffectIntent, ToolEffectRecord, ToolEffectStateOwner
-from cayu.runtime._tool_round_recovery import PENDING_TOOL_ROUND_CHECKPOINT_KEY, PendingToolRound
 from cayu.runtime.tool_effects import _bounded_text
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_is_released,
 )
+from cayu.sessions._pending_tool_round import PENDING_TOOL_ROUND_CHECKPOINT_KEY, PendingToolRound
 from cayu.sessions.base import (
     MAX_SESSION_ID_BYTES,
     EventOrder,

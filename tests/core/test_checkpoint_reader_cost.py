@@ -14,7 +14,8 @@ from cayu.approvals.user_input import (
     user_input_resolution_intent_from_checkpoint,
 )
 from cayu.runtime._approval_support import pending_approval_from_checkpoint
-from cayu.runtime._tool_round_recovery import PendingToolRound, pending_tool_round_from_checkpoint
+from cayu.runtime._tool_round_recovery import pending_tool_round_from_checkpoint
+from cayu.sessions._pending_tool_round import PendingToolRound
 from cayu.sessions.pending_actions import (
     _pending_action_checkpoint_index_state,
     pending_action_evidence_round_from_checkpoint,

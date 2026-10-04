@@ -224,6 +224,7 @@ from cayu.runtime.provider_operations import (
 )
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.runtime.session_message_lifecycle import SessionMessageQueueStatus
+from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalOutcome,
     build_invocation_terminal_decision,
@@ -715,7 +716,7 @@ def _approval_checkpoint(label: str) -> tuple[dict[str, Any], PendingToolApprova
         reason="human review required",
         metadata={"policy": "test"},
     )
-    pending_round = tool_round_recovery.PendingToolRound(
+    pending_round = pending_rounds.PendingToolRound(
         **identity,
         agent_name="assistant",
         tool_calls=[pending_call],
@@ -736,7 +737,7 @@ def _approval_checkpoint(label: str) -> tuple[dict[str, Any], PendingToolApprova
     )
     return (
         {
-            tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY: (
+            pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY: (
                 pending_round.model_dump(mode="json")
             ),
             approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY: (
@@ -6736,7 +6737,7 @@ def test_session_store_conformance_approval_publication_is_atomic_across_restart
                 identity=_identity(),
             )
             paired_checkpoint, approval = _approval_checkpoint("published")
-            raw_round = tool_round_recovery.PendingToolRound(
+            raw_round = pending_rounds.PendingToolRound(
                 tool_round_id=approval.tool_round_id,
                 model_step_id=approval.model_step_id,
                 model_attempt_id=approval.model_attempt_id,
@@ -6751,7 +6752,7 @@ def test_session_store_conformance_approval_publication_is_atomic_across_restart
                 policy_context_version=1,
             )
             raw_checkpoint = {
-                tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY: (
+                pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY: (
                     raw_round.model_dump(mode="json")
                 )
             }
@@ -11873,7 +11874,7 @@ def test_session_store_conformance_ambiguous_policy_recovery_remains_gated(
             approval = PendingToolApproval.model_validate(
                 recovered_checkpoint["pending_tool_approval"]
             )
-            planned_round = tool_round_recovery.PendingToolRound.model_validate(
+            planned_round = pending_rounds.PendingToolRound.model_validate(
                 recovered_checkpoint["pending_tool_round"]
             )
             assert planned_round.policy_state == "planned"

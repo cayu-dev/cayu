@@ -37,6 +37,7 @@ from cayu.runtime._work_attempt_invocation import (
     _WorkAttemptRecoveryAlreadyActive,
     _WorkAttemptRuntimeAuthority,
 )
+from cayu.sessions import _pending_tool_round as pending_rounds
 
 if TYPE_CHECKING:
     from cayu.runtime._producer_completion_replay import _ProducerCompletionReplay
@@ -25944,7 +25945,7 @@ class SessionEngine:
                             "Model completion with tool calls lost its durable pending marker."
                         )
                     if (
-                        tool_round_recovery.pending_tool_round_identity(pending_tool_round)
+                        pending_rounds.pending_tool_round_identity(pending_tool_round)
                         != tool_round_identity
                     ):
                         raise RuntimeError(
@@ -30236,7 +30237,7 @@ class SessionEngine:
     async def _clear_pending_tool_round_if_matches(
         self,
         session_id: str,
-        pending_round: tool_round_recovery.PendingToolRound,
+        pending_round: pending_rounds.PendingToolRound,
     ) -> None:
         checkpoint = await self.session_store.load_checkpoint(session_id)
         if checkpoint is None:
@@ -30249,7 +30250,7 @@ class SessionEngine:
         )
         if current is None or current.tool_round_id != pending_round.tool_round_id:
             return
-        copied_checkpoint.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY, None)
+        copied_checkpoint.pop(pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY, None)
         await self.session_store.transform_checkpoint(
             session_id,
             _replace_checkpoint_preserving_runtime_state(copied_checkpoint),
@@ -31504,7 +31505,7 @@ class SessionEngine:
             messages=messages,
             tool_calls=tool_round_recovery.pending_round_tool_calls(pending_round),
             tool_outcomes=[],
-            tool_round_identity=tool_round_recovery.pending_tool_round_identity(pending_round),
+            tool_round_identity=pending_rounds.pending_tool_round_identity(pending_round),
             cancellation_artifacts=None,
             cancellation_artifacts_by_id=None,
             execution_profile=execution_profile,

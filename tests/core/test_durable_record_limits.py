@@ -199,7 +199,7 @@ def test_metadata_node_and_depth_limits_are_independent_of_bytes() -> None:
 @pytest.mark.parametrize("kind", ["model_completion", "tool_round"])
 def test_reconstructed_request_metadata_obeys_shared_byte_limit(kind) -> None:
     from cayu.runtime._model_step_executor import ModelCompletionRecoveryContext
-    from cayu.runtime._tool_round_recovery import PendingToolRound
+    from cayu.sessions._pending_tool_round import PendingToolRound
 
     model = ModelCompletionRecoveryContext if kind == "model_completion" else PendingToolRound
     fields = (

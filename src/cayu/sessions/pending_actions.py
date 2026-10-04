@@ -31,6 +31,7 @@ from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._event_projection import private_event_linkage_value
 from cayu.runtime.execution_units import ToolRoundIdentity
+from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _tool_call_evidence as tool_call_evidence
 from cayu.sessions.base import (
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
@@ -138,7 +139,7 @@ def pending_action_event_retains_history(event_type: str) -> bool:
 
 def pending_action_evidence_round_from_checkpoint(
     checkpoint: dict[str, Any] | None,
-) -> tool_round_recovery.PendingToolRound | None:
+) -> pending_rounds.PendingToolRound | None:
     """Return the one tool round represented by any pending control checkpoint."""
 
     if checkpoint is None:
@@ -157,8 +158,8 @@ def pending_action_evidence_round_from_checkpoint(
 def _pending_action_evidence_round(
     approval: PendingToolApproval | None,
     pending_input: PendingUserInput | None,
-    pending_round: tool_round_recovery.PendingToolRound | None,
-) -> tool_round_recovery.PendingToolRound | None:
+    pending_round: pending_rounds.PendingToolRound | None,
+) -> pending_rounds.PendingToolRound | None:
     """Resolve already parsed candidates without changing conflict semantics."""
     if approval is not None and pending_round is not None:
         if (
@@ -184,13 +185,13 @@ def _pending_action_evidence_round(
     if not candidates:
         return None
     candidate = candidates[0]
-    if type(candidate) is tool_round_recovery.PendingToolRound:
+    if type(candidate) is pending_rounds.PendingToolRound:
         return candidate
     if type(candidate) is PendingToolApproval:
         return approval_support.planned_tool_round_from_pending_approval(candidate)
     if type(candidate) is not PendingUserInput:
         raise AssertionError("Pending-action candidate has an unsupported type.")
-    return tool_round_recovery.PendingToolRound(
+    return pending_rounds.PendingToolRound(
         tool_round_id=candidate.tool_round_id,
         model_step_id=candidate.model_step_id,
         model_attempt_id=candidate.model_attempt_id,
@@ -213,7 +214,7 @@ def _pending_action_evidence_round(
 
 def pending_action_event_matches_tool_round(
     event: Event,
-    pending_round: tool_round_recovery.PendingToolRound,
+    pending_round: pending_rounds.PendingToolRound,
 ) -> bool:
     return event.payload.get("tool_round_id") == pending_round.tool_round_id or (
         event.payload.get("model_step_id") == pending_round.model_step_id
@@ -223,7 +224,7 @@ def pending_action_event_matches_tool_round(
 
 def pending_action_event_is_from_different_tool_round(
     event: Event,
-    pending_round: tool_round_recovery.PendingToolRound,
+    pending_round: pending_rounds.PendingToolRound,
 ) -> bool:
     """Whether complete valid evidence belongs to a genuinely different round.
 
@@ -254,7 +255,7 @@ def pending_action_event_is_from_different_tool_round(
 
 def pending_action_event_has_unknown_round_call(
     event: Event,
-    pending_round: tool_round_recovery.PendingToolRound,
+    pending_round: pending_rounds.PendingToolRound,
 ) -> bool:
     """Whether current-round ledger evidence names no known checkpoint call."""
 
@@ -377,7 +378,7 @@ def pending_action_checkpoint_lookup_ids(
 
 def _pending_action_checkpoint_index_state(
     checkpoint: dict[str, Any] | None,
-) -> tuple[frozenset[str], tool_round_recovery.PendingToolRound | None]:
+) -> tuple[frozenset[str], pending_rounds.PendingToolRound | None]:
     """Read lookup IDs and evidence once for one checkpoint indexing operation.
 
     Invalid individual candidates still permit independent lookup IDs, but
@@ -980,9 +981,9 @@ def _pending_tool_round_checkpoint_call(
 
 def _pending_tool_round_evidence(
     records_desc: list[EventRecord],
-    pending_round: tool_round_recovery.PendingToolRound,
+    pending_round: pending_rounds.PendingToolRound,
 ) -> tool_call_evidence.ToolCallEvidenceLedger:
-    identity = tool_round_recovery.pending_tool_round_identity(pending_round)
+    identity = pending_rounds.pending_tool_round_identity(pending_round)
     return tool_call_evidence.scan_projected_tool_call_evidence(
         events=(record.event for record in reversed(records_desc)),
         pending_calls=pending_round.tool_calls,
@@ -1007,7 +1008,7 @@ def _tool_round_manual_recovery_action(
     if pending_round is None:
         return None
 
-    identity = tool_round_recovery.pending_tool_round_identity(pending_round)
+    identity = pending_rounds.pending_tool_round_identity(pending_round)
     evidence = _pending_tool_round_evidence(records_desc, pending_round)
     if evidence.scope_conflicting:
         return None

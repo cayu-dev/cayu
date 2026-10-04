@@ -464,6 +464,7 @@ from cayu.runtime.retry_policy import (
     retry_event_payload,
 )
 from cayu.sessions import _model_completion_publication as model_completion_publication
+from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions._model_failover import (
     MODEL_FAILOVER_CHECKPOINT_KEY,
     ModelFailoverProgress,
@@ -9431,7 +9432,7 @@ def reconstruct_assistant_step_result(
     *,
     stage: ModelCompletionStage,
     pointer: model_completion_publication.ModelStepPublicationCheckpoint,
-    pending_round: tool_round_recovery.PendingToolRound | None,
+    pending_round: pending_rounds.PendingToolRound | None,
     session_id: str,
     interaction_id: str,
     source_run_epoch: int,
@@ -9506,9 +9507,9 @@ def reconstruct_assistant_step_result(
     tool_calls: list[runtime_records.ToolCallRequest] = []
     tool_identity = None
     if pointer.tool_round_id is not None:
-        if type(pending_round) is not tool_round_recovery.PendingToolRound:
+        if type(pending_round) is not pending_rounds.PendingToolRound:
             raise ValueError("Recovered model tool calls require their original pending round.")
-        tool_identity = tool_round_recovery.pending_tool_round_identity(pending_round)
+        tool_identity = pending_rounds.pending_tool_round_identity(pending_round)
         if (
             tool_identity.model_step_id != identity.model_step_id
             or tool_identity.model_attempt_id != identity.model_attempt_id
