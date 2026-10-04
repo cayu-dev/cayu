@@ -38,6 +38,7 @@ from cayu.runtime._work_attempt_invocation import (
     _WorkAttemptRuntimeAuthority,
 )
 from cayu.sessions import _pending_tool_round as pending_rounds
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 
 if TYPE_CHECKING:
     from cayu.runtime._producer_completion_replay import _ProducerCompletionReplay
@@ -1029,7 +1030,7 @@ def _validate_fork_source_checkpoint_state(
             "resolve_tool_approval(...) first."
         )
     if (
-        tool_round_recovery.pending_tool_round_from_checkpoint(
+        pending_round_reader.pending_tool_round_from_checkpoint(
             source_checkpoint,
             redactor=redactor,
             consume_on_rejection=True,
@@ -2835,7 +2836,7 @@ def _reject_unresumable_session_checkpoint(
     if pending_user_input is not None:
         raise RuntimeError("Session is awaiting user input.")
     if not allow_pending_tool_round and (
-        tool_round_recovery.pending_tool_round_from_checkpoint(
+        pending_round_reader.pending_tool_round_from_checkpoint(
             checkpoint,
             redactor=redactor,
             consume_on_rejection=True,
@@ -4086,7 +4087,7 @@ def _checkpoint_with_pending_session_interrupt(
             if redactor is None:
                 raise TypeError("Approval stop requires its runtime redactor.")
             current_approval = approval_support.pending_approval_from_checkpoint(copied_checkpoint)
-            approval_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+            approval_round = pending_round_reader.pending_tool_round_from_checkpoint(
                 copied_checkpoint
             )
             if (
@@ -4845,7 +4846,7 @@ def _pending_interaction_action_kind(
         is not None
     ):
         return "user_input"
-    if tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint) is not None:
+    if pending_round_reader.pending_tool_round_from_checkpoint(checkpoint) is not None:
         return "tool_recovery"
     from cayu.sessions._session_continuation_store import has_unparked_external_interaction
 
@@ -11650,7 +11651,7 @@ class SessionEngine:
         ):
             return False
         if pointer.tool_round_id is not None:
-            pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+            pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
                 published_checkpoint
             )
             if pending_round is not None:
@@ -14618,7 +14619,7 @@ class SessionEngine:
                 parent, attached
             )
             return
-        checkpoint, pending = await tool_round_recovery.load_pending_tool_round(
+        checkpoint, pending = await pending_round_reader.load_pending_tool_round(
             self.session_store,
             wait.parent_effect.session_id,
         )
@@ -19466,7 +19467,7 @@ class SessionEngine:
                 decision_wait is None
                 and interrupted_pending_approval is None
                 and interrupted_pending_user_input is None
-                and tool_round_recovery.pending_tool_round_from_checkpoint(interrupt_checkpoint)
+                and pending_round_reader.pending_tool_round_from_checkpoint(interrupt_checkpoint)
                 is not None
                 and invocation_terminal_decision_from_checkpoint(interrupt_checkpoint) is None
             ):
@@ -20669,7 +20670,7 @@ class SessionEngine:
         ) -> dict[str, Any] | None:
             if (
                 request.failover is not None
-                and tool_round_recovery.pending_tool_round_from_checkpoint(
+                and pending_round_reader.pending_tool_round_from_checkpoint(
                     current_checkpoint,
                     redactor=self._secret_redactor,
                     runtime_session=current_session,
@@ -20744,7 +20745,7 @@ class SessionEngine:
                     "resolve_user_input(...) before resuming with new messages."
                 )
             if target_changed or current_session.status == SessionStatus.COMPLETED:
-                checkpoint_pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+                checkpoint_pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
                     updated_checkpoint,
                     redactor=self._secret_redactor,
                     consume_on_rejection=True,
@@ -20808,7 +20809,7 @@ class SessionEngine:
             )
             if (
                 recovery_stage is not None
-                or tool_round_recovery.pending_tool_round_from_checkpoint(
+                or pending_round_reader.pending_tool_round_from_checkpoint(
                     recovery_checkpoint,
                     redactor=self._secret_redactor,
                     runtime_session=loaded_session,
@@ -20928,7 +20929,7 @@ class SessionEngine:
         validate_resumable_checkpoint(loaded_session, checkpoint)
 
         require_foreground_checkpoint(loaded_session, checkpoint)
-        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
         continuing_recovery_boundary = (
             pending_round is not None
             or pending_model_completion
@@ -21940,7 +21941,7 @@ class SessionEngine:
                             (
                                 _failure_checkpoint,
                                 pending_failure_round,
-                            ) = await tool_round_recovery.load_pending_tool_round(
+                            ) = await pending_round_reader.load_pending_tool_round(
                                 self.session_store,
                                 session.id,
                                 redactor=self._secret_redactor,
@@ -24456,7 +24457,7 @@ class SessionEngine:
                 return
             checkpoint = await self.session_store.load_checkpoint(session.id)
             if (
-                tool_round_recovery.pending_tool_round_from_checkpoint(
+                pending_round_reader.pending_tool_round_from_checkpoint(
                     checkpoint,
                     redactor=self._secret_redactor,
                     consume_on_rejection=True,
@@ -25380,7 +25381,7 @@ class SessionEngine:
                 (
                     _checkpoint,
                     entrance_pending_round,
-                ) = await tool_round_recovery.load_pending_tool_round(
+                ) = await pending_round_reader.load_pending_tool_round(
                     self.session_store,
                     session.id,
                 )
@@ -26149,7 +26150,7 @@ class SessionEngine:
                     (
                         _checkpoint,
                         pending_tool_round,
-                    ) = await tool_round_recovery.load_pending_tool_round(
+                    ) = await pending_round_reader.load_pending_tool_round(
                         self.session_store,
                         session.id,
                     )
@@ -30312,7 +30313,7 @@ class SessionEngine:
             )
             for outcome in skipped_outcomes
         ]
-        source_checkpoint, pending_round = await tool_round_recovery.load_pending_tool_round(
+        source_checkpoint, pending_round = await pending_round_reader.load_pending_tool_round(
             self.session_store,
             session.id,
             redactor=self._secret_redactor,
@@ -30420,7 +30421,7 @@ class SessionEngine:
         if checkpoint is None:
             return
         copied_checkpoint = copy_durable_record(checkpoint, "checkpoint")
-        current = tool_round_recovery.pending_tool_round_from_checkpoint(
+        current = pending_round_reader.pending_tool_round_from_checkpoint(
             copied_checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
@@ -31668,7 +31669,7 @@ class SessionEngine:
         invocation_context: InvocationContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Close a round when interruption precedes creation of its live runner."""
-        _checkpoint, pending_round = await tool_round_recovery.load_pending_tool_round(
+        _checkpoint, pending_round = await pending_round_reader.load_pending_tool_round(
             self.session_store,
             session.id,
         )

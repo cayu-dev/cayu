@@ -135,12 +135,10 @@ from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _runtime_records as runtime_records
-from cayu.runtime import _shared_artifact_results as shared_artifact_results
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
-from cayu.runtime import _web_access_results as web_access_results
 from cayu.runtime._auxiliary_inference import AuxiliaryInferenceOwner
 from cayu.runtime._auxiliary_invocation import AuxiliaryInvocationPolicy
 from cayu.runtime._browser_control_bootstrap import BrowserGuestBootstrap
@@ -150,9 +148,6 @@ from cayu.runtime._browser_control_model import (
     validate_browser_model_publication,
 )
 from cayu.runtime._browser_control_service import BrowserControlService
-from cayu.runtime._checkpoint_redaction import (
-    require_secret_free_durable_object as _require_secret_free_durable_object,
-)
 from cayu.runtime._durable_tool_round import DurableToolRound
 from cayu.runtime._durable_tool_round import (
     InterruptedToolRoundRequest as InterruptedToolRoundRequest,
@@ -222,9 +217,13 @@ from cayu.runtime.mcp_manifest_policy import (
 from cayu.runtime.public_authority import parse_public_authority_alias
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.sessions import _pending_tool_round as pending_rounds
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._browser_control_checkpoint import (
     browser_control_checkpoint_mutation_scope,
     browser_control_checkpoint_read_scope,
+)
+from cayu.sessions._checkpoint_secret_validation import (
+    require_secret_free_durable_object as _require_secret_free_durable_object,
 )
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
@@ -249,6 +248,8 @@ from cayu.sessions.base import (
     runtime_publication_checkpoint_value_digest,
 )
 from cayu.tools import _argument_publication as tool_argument_publication
+from cayu.tools import _shared_artifact_results as shared_artifact_results
+from cayu.tools import _web_access_results as web_access_results
 from cayu.tools._operation_boundary import (
     BoundedInvocationOperationRegistry,
     await_invocation_operation,
@@ -2056,7 +2057,7 @@ class ToolRoundExecutor:
         )
         checkpoint = await self._session_store.load_checkpoint(session.id)
         checkpoint = {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
-        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
@@ -2335,7 +2336,7 @@ class ToolRoundExecutor:
         )
         checkpoint = await self._session_store.load_checkpoint(session.id)
         checkpoint = {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
-        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
@@ -2438,7 +2439,7 @@ class ToolRoundExecutor:
         )
         checkpoint = await self._session_store.load_checkpoint(session.id)
         checkpoint = {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
-        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
@@ -7373,7 +7374,7 @@ class ToolRoundRun:
         (
             _source_checkpoint,
             source_pending_round,
-        ) = await tool_round_recovery.load_pending_tool_round(
+        ) = await pending_round_reader.load_pending_tool_round(
             executor._session_store,
             session.id,
             redactor=executor._secret_redactor,

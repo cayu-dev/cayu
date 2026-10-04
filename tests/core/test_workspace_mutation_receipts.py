@@ -73,6 +73,7 @@ from cayu.runtime._model_errors import (
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import (
     EventQuery,
     IncompleteSessionRecoveryAction,
@@ -1201,7 +1202,7 @@ class _WorkspaceObservationProcessLossStore(InMemorySessionStore):
         result = await super().transform_checkpoint(session_id, transform)
         if self.fail_after_recovery_projection and not self.recovery_projection_failed:
             checkpoint = await super().load_checkpoint(session_id)
-            pending_round = tool_round_recovery_module.pending_tool_round_from_checkpoint(
+            pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
                 checkpoint,
                 redactor=SecretRedactor(),
             )
@@ -6129,7 +6130,7 @@ def test_interrupted_tool_preserves_artifact_store_supervisory_exit(
             await consumer
         checkpoint = await store.load_checkpoint(session_id)
         assert checkpoint is not None and checkpoint.get("workspace_observations")
-        pending = tool_round_recovery_module.pending_tool_round_from_checkpoint(checkpoint)
+        pending = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
         assert pending is not None
         assert [stage.tool_call_id for stage in pending.staged_terminals] == (
             ["call-completed"] if prior_completed_call else []
@@ -6286,7 +6287,7 @@ def test_grouped_interruption_does_not_transfer_cancellation_to_stream_closer(
         closer_cancellation_requests = await closer
         checkpoint = await store.load_checkpoint(session_id)
         assert checkpoint is not None and checkpoint.get("workspace_observations")
-        pending = tool_round_recovery_module.pending_tool_round_from_checkpoint(checkpoint)
+        pending = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
         assert pending is not None
         assert pending.staged_terminals == []
         durable = await store.query_events(EventQuery(session_id=session_id))
@@ -8649,7 +8650,7 @@ def test_workspace_observation_recovery_authenticates_raw_stage_before_safe_proj
         lifecycle = WorkspaceObservationLifecycle.model_validate(
             next(iter(checkpoint["workspace_observations"].values()))
         )
-        pending_round = tool_round_recovery_module.pending_tool_round_from_checkpoint(
+        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
             checkpoint,
             redactor=SecretRedactor(),
         )
@@ -8710,7 +8711,7 @@ def test_workspace_observation_recovery_authenticates_raw_stage_before_safe_proj
         projected_lifecycle = next(
             iter(workspace_observations_from_checkpoint(projected_checkpoint).values())
         )
-        projected_round = tool_round_recovery_module.pending_tool_round_from_checkpoint(
+        projected_round = pending_round_reader.pending_tool_round_from_checkpoint(
             projected_checkpoint,
             redactor=SecretRedactor(),
         )

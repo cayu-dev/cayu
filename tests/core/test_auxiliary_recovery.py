@@ -243,10 +243,10 @@ def test_public_recovery_settles_auxiliary_after_actual_process_loss(
             assert reservation is not None and reservation.status == "active"
             assert reservation.dispatch_id == before.stage.intent["model_attempt_id"]
             checkpoint = await store.load_checkpoint(SESSION_ID)
-            from cayu.runtime._tool_round_recovery import pending_tool_round_from_checkpoint
             from cayu.runtime.execution_profiles import (
                 active_invocation_execution_profile_from_checkpoint,
             )
+            from cayu.sessions._pending_tool_round_reader import pending_tool_round_from_checkpoint
 
             profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
             pending = pending_tool_round_from_checkpoint(checkpoint)

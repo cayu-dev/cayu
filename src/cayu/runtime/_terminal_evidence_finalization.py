@@ -48,7 +48,6 @@ from cayu.execution_profiles import (
 )
 from cayu.providers._credential_boundary import copy_provider_cancellation_failures
 from cayu.runtime import _approval_support as approval_support
-from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._approval_support import _pending_approval_and_round_for_atomic_claim
 from cayu.runtime._event_writer import RuntimeEventWriter, _reconcile_exact_persisted_event
 from cayu.runtime._interruption_coordinator import _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY
@@ -65,6 +64,7 @@ from cayu.runtime._terminal_finalization_lifetime import (
 )
 from cayu.runtime._tool_completion import recorded_terminal_tool_completion_payload
 from cayu.sessions import _pending_tool_round as pending_rounds
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._terminal_evidence import (
     TERMINAL_EVIDENCE_EVENT_TYPES,
     TERMINAL_EVIDENCE_QUERY_LIMIT,
@@ -931,7 +931,7 @@ class TerminalEvidenceFinalization:
             current_run_epoch=session.run_epoch,
             runtime_session=session,
         )
-        pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+        pending_tool_round = pending_round_reader.pending_tool_round_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,

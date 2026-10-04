@@ -75,8 +75,8 @@ from cayu.providers import (
     VertexProvider,
 )
 from cayu.providers.base import _preflight_provider_portable_messages
-from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.sessions import _pending_tool_round as pending_rounds
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import SessionStore
 
 
@@ -1597,7 +1597,7 @@ def test_model_switch_atomically_rejects_a_concurrent_pending_tool_round() -> No
         assert session_after.metadata == session_before.metadata
         assert await store.load_transcript("switch-pending-round-race") == transcript_before
         checkpoint = await store.load_checkpoint("switch-pending-round-race")
-        assert tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint) is not None
+        assert pending_round_reader.pending_tool_round_from_checkpoint(checkpoint) is not None
         switch_events = await store.query_events(
             EventQuery(
                 session_id="switch-pending-round-race",

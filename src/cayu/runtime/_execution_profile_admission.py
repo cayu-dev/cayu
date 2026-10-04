@@ -35,7 +35,6 @@ from cayu.providers.deadlines import _provider_deadline_material
 from cayu.providers.operations import ProviderOperationMode
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
-from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._runtime_replay_profile import runtime_replay_profile_source
 from cayu.runtime.build_provenance import RuntimeBuildProvenance
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
@@ -45,6 +44,7 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.tool_completion import ToolCompletionPolicy, copy_tool_completion_policy
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
     active_invocation_execution_profile_from_checkpoint,
@@ -815,7 +815,7 @@ def prepare_execution_profile_continuation(
     pending_profile_fingerprints = {
         pending.execution_profile_fingerprint
         for pending in (
-            tool_round_recovery.pending_tool_round_from_checkpoint(
+            pending_round_reader.pending_tool_round_from_checkpoint(
                 checkpoint,
                 redactor=redactor,
                 consume_on_rejection=True,

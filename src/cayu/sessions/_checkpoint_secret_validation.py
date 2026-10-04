@@ -8,8 +8,6 @@ from cayu.context.structured_output import json_schema_contains_secret
 from cayu.execution_profiles import (
     ExecutionProfileIdentity,
 )
-from cayu.runtime._shared_artifact_results import persisted_shared_artifact_control_paths
-from cayu.runtime._web_access_results import persisted_web_access_control_paths
 from cayu.sessions._execution_profile_checkpoint import (
     EXECUTION_PROFILE_METADATA_KEY,
     execution_profile_from_session_metadata,
@@ -29,6 +27,8 @@ from cayu.sessions.checkpoints import (
     INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )
+from cayu.tools._shared_artifact_results import persisted_shared_artifact_control_paths
+from cayu.tools._web_access_results import persisted_web_access_control_paths
 from cayu.tools.catalogue import CALL_TOOL_NAME
 from cayu.tools.exposure import (
     TOOL_CAPABILITY_CEILING_METADATA_KEY,

@@ -412,10 +412,15 @@ and auxiliary admission checks. Public stop-policy imports retain their identity
 
 `sessions/_pending_tool_round.py` owns the saved pending-round record, checkpoint
 key, identity helper and shared owned-JSON validation marker. Its validators work
-without runtime execution or session stores. Runtime parsing uses the same marker
-after taking ownership of a complete durable JSON snapshot, retaining detached
-results without a second nested copy. Secret-aware readers, checkpoint publication
-and recovery behavior remain in `runtime/_tool_round_recovery.py`.
+without runtime execution or session stores. `sessions/_pending_tool_round_reader.py`
+owns checkpoint loading and parsing, using the same marker after taking ownership
+of a complete durable JSON snapshot. It returns fresh checkpoints and detached
+rounds without a second nested copy. Checkpoint secret validation lives in
+`sessions/_checkpoint_secret_validation.py`; web-access and shared-artifact result
+controls live in `tools/_web_access_results.py` and `tools/_shared_artifact_results.py`.
+Their exact attestation and persisted-control checks are shared by checkpoint
+validation and runtime result handling. Checkpoint publication, secret resolution
+and recovery execution retain their runtime owners.
 
 `sessions/checkpoints.py` owns root checkpoint decoding and schema migrations.
 The adjacent private modules `_model_completion_publication`, `_terminal_evidence`,

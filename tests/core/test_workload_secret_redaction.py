@@ -49,6 +49,7 @@ from cayu.runners.local import LocalRunner
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.sessions import _pending_tool_round as pending_rounds
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import (
     ForkSessionRequest,
     InMemorySessionStore,
@@ -4772,7 +4773,7 @@ def test_pending_tool_round_rejects_secret_authority_on_write_and_legacy_load() 
         tool_round_identity=tool_round_identity(),
     )
     with pytest.raises(ValueError, match="cannot be executed") as exc_info:
-        tool_round_recovery.pending_tool_round_from_checkpoint(
+        pending_round_reader.pending_tool_round_from_checkpoint(
             legacy_checkpoint,
             redactor=SecretRedactor(secret),
         )
@@ -5050,7 +5051,7 @@ def test_explicit_compaction_public_flow_rejects_legacy_secret_without_traceback
 
 
 def test_checkpoint_schema_keys_remain_valid_inside_typed_collections() -> None:
-    from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
+    from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
     from cayu.vaults.redaction import SecretRedactor
 
     assert not durable_value_contains_secret(
@@ -5277,7 +5278,7 @@ def test_checkpoint_schema_keys_remain_valid_inside_typed_collections() -> None:
 
 
 def test_active_invocation_profile_unknown_extension_remains_secret_scanned() -> None:
-    from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
+    from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
     from cayu.vaults.redaction import SecretRedactor
 
     secret = "active-profile-extension-secret"
@@ -5298,7 +5299,7 @@ def test_active_invocation_profile_unknown_extension_remains_secret_scanned() ->
 def test_approval_resolution_digest_is_typed_private_checkpoint_state() -> None:
     from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
     from cayu.runtime import _approval_support as approval_support
-    from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
+    from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
     from cayu.vaults.redaction import SecretRedactor
 
     request = ToolApprovalRequest(
@@ -5342,7 +5343,6 @@ def test_malformed_legacy_pending_checkpoint_is_rejected_without_traceback_secre
         pending_user_input_from_checkpoint,
     )
     from cayu.runtime import _approval_support as approval_support
-    from cayu.runtime import _tool_round_recovery as tool_round_recovery
 
     secret = "model"
     if checkpoint_kind == "approval":
@@ -5365,7 +5365,7 @@ def test_malformed_legacy_pending_checkpoint_is_rejected_without_traceback_secre
                 "agent_name": {secret: "safe"},
             }
         }
-        load = tool_round_recovery.pending_tool_round_from_checkpoint
+        load = pending_round_reader.pending_tool_round_from_checkpoint
 
     original_checkpoint = copy.deepcopy(checkpoint)
     with pytest.raises(ValueError, match="invalid and cannot be executed") as exc_info:
@@ -5475,7 +5475,7 @@ def test_json_schema_keyword_overlap_allows_pending_round_checkpoint_and_reload(
         redactor=redactor,
     )
 
-    restored = tool_round_recovery.pending_tool_round_from_checkpoint(
+    restored = pending_round_reader.pending_tool_round_from_checkpoint(
         checkpoint,
         redactor=redactor,
     )

@@ -64,6 +64,7 @@ from cayu.runtime._tool_round_staging import (
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.runtime.stop_policy import StopDecision
 from cayu.sessions import _pending_tool_round as pending_rounds
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import Session, SessionStatus, SessionStore
 from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools._redaction import InvocationRedactorSnapshot
@@ -445,7 +446,7 @@ class DurableToolRound:
     ) -> tuple[dict[str, Any] | None, pending_rounds.PendingToolRound]:
         """Read one fresh snapshot; publication uses that same validated input."""
 
-        checkpoint, pending = await tool_round_recovery.load_pending_tool_round(
+        checkpoint, pending = await pending_round_reader.load_pending_tool_round(
             self._session_store,
             self._session.id,
         )

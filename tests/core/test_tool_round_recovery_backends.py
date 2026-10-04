@@ -20,6 +20,7 @@ from cayu.runtime import _tool_round_recovery as recovery
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_units import new_model_step_identity
 from cayu.sessions import _pending_tool_round as pending_rounds
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
@@ -219,7 +220,9 @@ def test_public_recovery_retains_native_evidence_and_recorded_siblings(
                 is not None
             )
             assert (
-                recovery.pending_tool_round_from_checkpoint(await store.load_checkpoint(session_id))
+                pending_round_reader.pending_tool_round_from_checkpoint(
+                    await store.load_checkpoint(session_id)
+                )
                 is None
             )
             await app.recover_incomplete_session(
@@ -252,7 +255,7 @@ def test_public_recovery_keeps_external_call_without_journal_pending(store_facto
             assert [tool.calls for tool in tools] == [0, 0, 0]
             assert native.reconciliations == []
             assert provider.requests == []
-            retained = recovery.pending_tool_round_from_checkpoint(
+            retained = pending_round_reader.pending_tool_round_from_checkpoint(
                 await store.load_checkpoint(session_id)
             )
             assert retained is not None

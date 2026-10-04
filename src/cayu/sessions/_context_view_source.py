@@ -80,7 +80,7 @@ def completed_boundary(
     if pointer.transcript_end_cursor - pointer.source_transcript_cursor > CONTEXT_VIEW_MAX_MESSAGES:
         raise ValueError("The completed-turn transcript boundary exceeds its limit.")
     if pointer.tool_round_id is not None:
-        from cayu.runtime._tool_round_recovery import pending_tool_round_from_checkpoint
+        from cayu.sessions._pending_tool_round_reader import pending_tool_round_from_checkpoint
 
         if pending_tool_round_from_checkpoint(checkpoint) is not None:
             raise ValueError("A partial tool round cannot be published as a context view.")

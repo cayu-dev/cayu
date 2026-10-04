@@ -27,7 +27,6 @@ from cayu.events import (
 from cayu.messages import Message
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import _invocation_lifecycle as invocation_lifecycle_module
-from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
 from cayu.runtime._checkpoint_store import (
     load_runtime_session_checkpoint_snapshot,
     runtime_checkpoint_session_store,
@@ -74,6 +73,7 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.sessions import _invocation_lifecycle as invocation_contracts_module
+from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
 from cayu.sessions.base import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
     IncompleteSessionRecoveryRequest,

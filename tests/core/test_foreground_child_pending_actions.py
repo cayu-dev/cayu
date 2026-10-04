@@ -130,7 +130,9 @@ def _check_delegated_discovery(
             child = children.sessions[0]
             if redacted_child_id and action_kind == "user_input":
                 from cayu.approvals.user_input import pending_user_input_from_checkpoint
-                from cayu.runtime._checkpoint_redaction import require_secret_free_durable_object
+                from cayu.sessions._checkpoint_secret_validation import (
+                    require_secret_free_durable_object,
+                )
 
                 private_checkpoint = await store.load_checkpoint(child.id)
                 assert private_checkpoint is not None

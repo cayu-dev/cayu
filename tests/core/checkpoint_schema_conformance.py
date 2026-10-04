@@ -19,6 +19,7 @@ from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
 )
 from cayu.runtime.execution_units import new_model_step_identity
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
@@ -315,7 +316,7 @@ async def assert_assistant_publication_checkpoint_conformance(
     )
 
     restarted_store = runtime_checkpoint_session_store(store)
-    recovered = tool_round_recovery.pending_tool_round_from_checkpoint(
+    recovered = pending_round_reader.pending_tool_round_from_checkpoint(
         await restarted_store.load_checkpoint(session_id)
     )
     assert recovered is not None

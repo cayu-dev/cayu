@@ -18,6 +18,7 @@ from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._tool_effect_state import ToolEffectReconciliationRequired
 from cayu.runtime.execution_units import ToolRoundIdentity
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity, SessionStore
 from cayu.tools.base import (
     DurableToolRecoveryAuthority,
@@ -898,7 +899,7 @@ def test_pending_round_recovery_fences_apply_patch_without_effect_identity() -> 
             )
 
         assert await store.load_events(session_id) == events_before
-        retained = tool_round_recovery.pending_tool_round_from_checkpoint(
+        retained = pending_round_reader.pending_tool_round_from_checkpoint(
             await store.load_checkpoint(session_id)
         )
         assert retained is not None

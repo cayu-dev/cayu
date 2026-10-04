@@ -31,7 +31,6 @@ from cayu.observability.hooks import AfterToolCallDecision, RuntimeHook, ToolCal
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runners.base import RunnerExecutionError, attach_cancellation_artifacts
 from cayu.runtime import _runtime_records as runtime_records
-from cayu.runtime import _web_access_results as web_access_results
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
 from cayu.runtime._run_limits import RunLimitGate
@@ -58,6 +57,7 @@ from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions.base import InMemorySessionStore, RunRequest, Session, SessionStatus
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
+from cayu.tools import _web_access_results as web_access_results
 from cayu.tools._runner import sanitize_runner_failure_group
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.exposure import (

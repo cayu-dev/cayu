@@ -66,7 +66,6 @@ from cayu.providers.operations import (
 )
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _transcript as transcript_helpers
-from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
 from cayu.runtime._diagnostics import exception_diagnostic
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._invocation_lifecycle import InvocationContext
@@ -140,6 +139,7 @@ from cayu.runtime.provider_operations import (
     provider_operation_started_event_id,
     provider_operation_unavailable_reason,
 )
+from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
 from cayu.sessions._provider_operation_cancellation_claim import (
     ProviderOperationCancellationClaim,
     provider_operation_cancellation_claim_from_checkpoint,

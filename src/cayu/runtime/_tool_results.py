@@ -18,14 +18,14 @@ from cayu._validation import (
 )
 from cayu.events import Event, EventType, event_payload_authority_is_runtime_generated
 from cayu.failure_evidence import FailureEvidence
-from cayu.runtime import _shared_artifact_results as shared_artifact_results
-from cayu.runtime import _web_access_results as web_access_results
 from cayu.runtime._diagnostics import (
     TOOL_FAILURE_DIAGNOSTIC_UTF8_BYTES,
     ExceptionDiagnostic,
     bound_diagnostic_text,
     exception_diagnostic,
 )
+from cayu.tools import _shared_artifact_results as shared_artifact_results
+from cayu.tools import _web_access_results as web_access_results
 from cayu.tools.base import ToolEffect, ToolResult
 from cayu.tools.result_projection import (
     _TOOL_RESULT_PROJECTION_AUTHORITY_FIELD,

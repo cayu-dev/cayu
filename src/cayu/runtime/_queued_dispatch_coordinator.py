@@ -15,11 +15,11 @@ from cayu.execution_profiles import (
     unavailable_execution_profile_components,
 )
 from cayu.runtime import _runtime_records as runtime_records
-from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._checkpoint_store import load_runtime_session_checkpoint_snapshot
 from cayu.runtime._delegated_event_stream import _close_delegated_event_stream
 from cayu.runtime._durable_subagents import durable_subagent_worker_incompatible
 from cayu.runtime._task_store_operation_boundary import raise_task_store_operation_failure
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_is_released,
@@ -236,7 +236,7 @@ class QueuedDispatchCoordinator:
             ) from None
         session, checkpoint = await self._load_session_snapshot(private_session_id)
         active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
-        pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+        pending_tool_round = pending_round_reader.pending_tool_round_from_checkpoint(
             checkpoint,
             redactor=self._redactor,
             consume_on_rejection=True,

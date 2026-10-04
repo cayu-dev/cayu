@@ -18,8 +18,8 @@ from cayu.events import Event, EventType
 from cayu.messages import Message, ToolResultPart
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import _run_limits as run_limits
-from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
@@ -305,7 +305,7 @@ async def _assert_published_round(
     assert [
         part.tool_call_id for part in tool_messages[0].content if isinstance(part, ToolResultPart)
     ] == ["call-side-effect-a", "call-side-effect-b"]
-    assert tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint) is None
+    assert pending_round_reader.pending_tool_round_from_checkpoint(checkpoint) is None
     assert receipt is not None
     assert len({event.id for event in events}) == len(events)
 
@@ -393,7 +393,7 @@ async def _create_process_loss_round(
     assert len(tool.calls) == 2
     assert len(provider.requests) == 1
     checkpoint = await store.load_checkpoint(session_id)
-    assert tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint) is not None
+    assert pending_round_reader.pending_tool_round_from_checkpoint(checkpoint) is not None
     assert not [
         message
         for message in await store.load_transcript(session_id)
@@ -615,7 +615,7 @@ async def _assert_limited_round(store, app, tool, *, completed_first, session_id
     receipt = await store.load_runtime_publication_receipt(session_id, f"tool-round:{round_id}")
     assert receipt is not None
     assert (
-        tool_round_recovery.pending_tool_round_from_checkpoint(
+        pending_round_reader.pending_tool_round_from_checkpoint(
             await store.load_checkpoint(session_id)
         )
         is None
@@ -785,7 +785,7 @@ async def _assert_interrupted_round(store, app, tool, *, completed_first, sessio
     round_id = terminals[0].payload["tool_round_id"]
     assert await store.load_runtime_publication_receipt(session_id, f"tool-round:{round_id}")
     assert (
-        tool_round_recovery.pending_tool_round_from_checkpoint(
+        pending_round_reader.pending_tool_round_from_checkpoint(
             await store.load_checkpoint(session_id)
         )
         is None
@@ -918,7 +918,7 @@ def test_interrupted_external_effect_keeps_round_pending_without_publication(sto
             assert tool.calls == ["first", "second"]
             assert len(provider.requests) == 1
             assert store.publication_requests == []
-            pending = tool_round_recovery.pending_tool_round_from_checkpoint(
+            pending = pending_round_reader.pending_tool_round_from_checkpoint(
                 await store.load_checkpoint(session_id)
             )
             assert pending is not None

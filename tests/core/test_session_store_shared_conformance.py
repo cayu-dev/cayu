@@ -170,7 +170,6 @@ from cayu.providers.bedrock import bedrock_billing_identity, completed_bedrock_b
 from cayu.providers.operations import ProviderOperationState, ProviderOperationStatus
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _tool_execution as tool_execution
-from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._child_session_notifications import (
     CHILD_SESSION_NOTIFICATION_INTENT_KEY,
     ChildSessionLifecycleQuery,
@@ -225,6 +224,7 @@ from cayu.runtime.provider_operations import (
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.runtime.session_message_lifecycle import SessionMessageQueueStatus
 from cayu.sessions import _pending_tool_round as pending_rounds
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalOutcome,
     build_invocation_terminal_decision,
@@ -6890,7 +6890,7 @@ def test_session_store_conformance_legacy_approval_round_migrates_in_atomic_clai
             store = await _reopen_store(session_store_case, store)
             migrated = await store.load_checkpoint(session.id)
             assert approval_support.pending_approval_from_checkpoint(migrated) == approval
-            migrated_round = tool_round_recovery.pending_tool_round_from_checkpoint(migrated)
+            migrated_round = pending_round_reader.pending_tool_round_from_checkpoint(migrated)
             assert migrated_round is not None
             assert migrated_round.policy_state == "planned"
             assert migrated_round.policy_context_version == 1

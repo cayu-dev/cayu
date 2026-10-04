@@ -1089,7 +1089,7 @@ def _validate_selected_terminal(
     events: tuple[Event, ...],
 ) -> None:
     from cayu.approvals.user_input import pending_user_input_from_checkpoint
-    from cayu.runtime._tool_round_recovery import pending_tool_round_from_checkpoint
+    from cayu.sessions._pending_tool_round_reader import pending_tool_round_from_checkpoint
 
     terminal = record.terminal
     assert terminal is not None

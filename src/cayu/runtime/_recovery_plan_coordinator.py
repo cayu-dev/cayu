@@ -23,7 +23,6 @@ from cayu.events import (
     event_with_runtime_generated_id,
 )
 from cayu.runtime import _runtime_records as runtime_records
-from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._environment_allocation import (
     ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY,
     EnvironmentAllocationRecord,
@@ -48,6 +47,7 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileMismatchError,
 )
 from cayu.runtime.provider_operations import RecoverableProviderOperation
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._durable_operation_ownership import (
     DurableOperationOwnership,
     DurableOperationOwnershipAction,
@@ -866,7 +866,7 @@ class RecoveryPlanCoordinator:
         # Inspect the retained round as well; incomplete recovery cannot own
         # the explicit continuation required by either selected outcome.
         try:
-            pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+            pending_round = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
         except (TypeError, ValueError):
             pending_round = None
             blockers.append(RecoveryPlanBlocker(code=RecoveryBlockerCode.INVALID_DURABLE_STATE))

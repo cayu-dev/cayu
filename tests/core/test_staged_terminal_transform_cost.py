@@ -8,6 +8,7 @@ from tests.core.test_tool_round_publication import _lifecycle_events, _pending_r
 
 import cayu.runtime._tool_round_recovery as recovery
 from cayu.sessions import _pending_tool_round as pending_rounds
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._assistant_tool_round_publication import StagedToolCallTerminal
 
 
@@ -30,13 +31,13 @@ def test_terminal_transition_parses_owner_once_and_detaches(monkeypatch, kind):
     checkpoint, event, identity = state()
     before = deepcopy(checkpoint)
     seen = []
-    parse = recovery._pending_tool_round_from_owned_checkpoint
+    parse = pending_round_reader._pending_tool_round_from_owned_checkpoint
 
     def count(*args, **kwargs):
         seen.append(1)
         return parse(*args, **kwargs)
 
-    monkeypatch.setattr(recovery, "_pending_tool_round_from_owned_checkpoint", count)
+    monkeypatch.setattr(pending_round_reader, "_pending_tool_round_from_owned_checkpoint", count)
     if kind == "timing":
         now = datetime.now(UTC)
         transform = recovery.started_staged_terminal_publication_transform(
@@ -93,11 +94,11 @@ def test_owned_json_parse_skips_second_stage_validation_but_never_caches(monkeyp
         return original(*args, **kwargs)
 
     monkeypatch.setattr(StagedToolCallTerminal, "model_validate", count)
-    first = recovery.pending_tool_round_from_checkpoint(checkpoint)
+    first = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
     assert first is not None
     assert copies == []
     checkpoint["pending_tool_round"]["tool_calls"][0]["arguments"]["query"] = "new query"
-    second = recovery.pending_tool_round_from_checkpoint(checkpoint)
+    second = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
     assert second.tool_calls[0].arguments["query"] == "new query"
     assert first.tool_calls[0].arguments["query"] == "alpha"
     second.tool_calls[0].arguments["query"] = "result mutation"
@@ -141,14 +142,14 @@ def test_native_round_delivers_all_results_with_bounded_parse_work(
     from cayu.storage.sqlite import SQLiteSessionStore
 
     parses = 0
-    original = recovery._pending_tool_round_from_owned_checkpoint
+    original = pending_round_reader._pending_tool_round_from_owned_checkpoint
 
     def observed(*args, **kwargs):
         nonlocal parses
         parses += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(recovery, "_pending_tool_round_from_owned_checkpoint", observed)
+    monkeypatch.setattr(pending_round_reader, "_pending_tool_round_from_owned_checkpoint", observed)
 
     async def scenario():
         store = (

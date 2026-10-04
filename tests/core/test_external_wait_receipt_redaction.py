@@ -12,10 +12,10 @@ from tests.external_wait_support import CONTEXT, Policy, registration, reservati
 
 from cayu import AgentSpec, CayuApp, Message, ModelStreamEvent, RunRequest, ScriptedModelProvider
 from cayu.external_waits import ExternalEventWaits
-from cayu.runtime._checkpoint_redaction import require_secret_free_durable_object
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.session_external_waits import SessionExternalWaitAdapter
+from cayu.sessions._checkpoint_secret_validation import require_secret_free_durable_object
 from cayu.sessions._invocation_lifecycle import _invocation_lifecycle_receipt_ledger_from_checkpoint
 from cayu.sessions.external_waits import ExternalEventDelivery
 from cayu.vaults.redaction import SecretRedactor

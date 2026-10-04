@@ -1183,7 +1183,7 @@ def checkpoint_with_durable_subagent_submission_seed(
     redactor: SecretRedactor,
 ) -> dict[str, Any]:
     from cayu._validation import copy_durable_json_object
-    from cayu.runtime._checkpoint_redaction import require_secret_free_durable_object
+    from cayu.sessions._checkpoint_secret_validation import require_secret_free_durable_object
 
     seed = copy_durable_subagent_submission_seed(seed)
     if not isinstance(redactor, SecretRedactor):

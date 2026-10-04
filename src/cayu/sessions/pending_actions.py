@@ -28,10 +28,10 @@ from cayu.approvals.user_input import (
 )
 from cayu.events import Event, EventType
 from cayu.runtime import _approval_support as approval_support
-from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._event_projection import private_event_linkage_value
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.sessions import _pending_tool_round as pending_rounds
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions import _tool_call_evidence as tool_call_evidence
 from cayu.sessions.base import (
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
@@ -151,7 +151,9 @@ def pending_action_evidence_round_from_checkpoint(
     owned = copy_durable_json_object(checkpoint, "checkpoint")
     approval = approval_support._pending_approval_from_owned_checkpoint(checkpoint, owned)
     pending_input, _ = _user_input_lifecycle_authority_from_owned_checkpoint(checkpoint, owned)
-    pending_round = tool_round_recovery._pending_tool_round_from_owned_checkpoint(checkpoint, owned)
+    pending_round = pending_round_reader._pending_tool_round_from_owned_checkpoint(
+        checkpoint, owned
+    )
     return _pending_action_evidence_round(approval, pending_input, pending_round)
 
 
@@ -404,7 +406,7 @@ def _pending_action_checkpoint_index_state(
         pending_input = None
         invalid = True
     try:
-        pending_round = tool_round_recovery._pending_tool_round_from_owned_checkpoint(
+        pending_round = pending_round_reader._pending_tool_round_from_owned_checkpoint(
             checkpoint, owned
         )
     except (TypeError, ValueError):
@@ -956,7 +958,7 @@ def _pending_tool_round_checkpoint_call(
     identity_payload: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     try:
-        pending = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        pending = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
     except (TypeError, ValueError, ValidationError):
         return None
     if pending is None or pending.tool_round_id != round_id:
@@ -1002,7 +1004,7 @@ def _tool_round_manual_recovery_action(
     checkpoint: dict[str, Any] | None,
 ) -> PendingActionRecord | None:
     try:
-        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
     except (TypeError, ValueError, ValidationError):
         return None
     if pending_round is None:
@@ -1384,7 +1386,7 @@ def pending_action_source_is_invalid(
     try:
         pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
         pending_input, _ = user_input_lifecycle_authority_from_checkpoint(checkpoint)
-        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
         evidence_round = pending_action_evidence_round_from_checkpoint(checkpoint)
     except (TypeError, ValueError, ValidationError):
         return True

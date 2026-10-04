@@ -43,10 +43,8 @@ from cayu.mcp.tools import McpToolAdapter
 from cayu.observability.hooks import RuntimeHookPhase, _runtime_hook_supports_phase
 from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _runtime_records as runtime_records
-from cayu.runtime import _shared_artifact_results as shared_artifact_results
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
-from cayu.runtime import _web_access_results as web_access_results
 from cayu.runtime._event_writer import prepare_runtime_event
 from cayu.runtime._invocation_lifecycle import InvocationContext
 from cayu.runtime._phase_timing import current_builder, timed_phase
@@ -60,6 +58,8 @@ from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_iden
 from cayu.sessions._assistant_tool_round_publication import validate_tool_exposure_terminal_event
 from cayu.sessions.base import Session, SessionStore, runtime_publication_checkpoint_mutation
 from cayu.tools import _argument_publication as tool_argument_publication
+from cayu.tools import _shared_artifact_results as shared_artifact_results
+from cayu.tools import _web_access_results as web_access_results
 from cayu.tools.base import ToolResult, _bound_policy_denial_result, _bound_policy_denial_text
 from cayu.tools.catalogue import ToolExecutionContract
 from cayu.tools.exposure import ResolvedToolExposureAuthority, copy_resolved_tool_exposure_authority

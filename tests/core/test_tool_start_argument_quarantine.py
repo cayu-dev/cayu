@@ -46,7 +46,6 @@ from cayu.providers.chat_completions import build_chat_completions_payload
 from cayu.providers.openai import build_openai_payload
 from cayu.proxies.passthrough import PassthroughProxy
 from cayu.runners.local import LocalRunner
-from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_support
 from cayu.runtime._runtime_records import ToolCallOutcome, ToolCallRequest
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
@@ -54,6 +53,7 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileComponentClass,
     ExecutionProfileMismatchError,
 )
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import (
     EventQuery,
     IncompleteSessionRecoveryRequest,
@@ -273,7 +273,7 @@ class _FailFirstBlockedAssistantProjectionStore(InMemorySessionStore):
     async def transform_checkpoint(self, session_id, checkpoint_transform):
         def fail_before_commit(session, checkpoint):
             transformed = checkpoint_transform(session, checkpoint)
-            pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(transformed)
+            pending_round = pending_round_reader.pending_tool_round_from_checkpoint(transformed)
             publication = None if pending_round is None else pending_round.assistant_publication
             if (
                 not self.failed_projection
@@ -297,7 +297,7 @@ class _RejectBlockedAssistantProjectionSQLiteStore(SQLiteSessionStore):
     async def transform_checkpoint(self, session_id, checkpoint_transform):
         def fail_before_commit(session, checkpoint):
             transformed = checkpoint_transform(session, checkpoint)
-            pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(transformed)
+            pending_round = pending_round_reader.pending_tool_round_from_checkpoint(transformed)
             publication = None if pending_round is None else pending_round.assistant_publication
             if publication is not None and publication.state == "blocked":
                 self.failed_projections += 1
@@ -3285,7 +3285,7 @@ def test_restart_fails_closed_for_a_partial_staged_multi_call_round() -> None:
         assert first_events[-1].type is EventType.SESSION_FAILED
         assert first_tool.calls == ["echo"]
         checkpoint = await store.load_checkpoint(session_id)
-        pending = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        pending = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
         assert pending is not None
         assert [item.tool_call_id for item in pending.staged_terminals] == [
             "call_echo_before_crash"
@@ -3959,7 +3959,7 @@ def test_mid_round_limit_publishes_completed_stage_before_interrupting(monkeypat
         ]
         assert len(completed) == 1
         checkpoint = await store.load_checkpoint("stage-before-limit")
-        assert tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint) is None
+        assert pending_round_reader.pending_tool_round_from_checkpoint(checkpoint) is None
         transcript = await store.load_transcript("stage-before-limit")
         assert any(part.type == "tool_result" for message in transcript for part in message.content)
 

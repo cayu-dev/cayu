@@ -19,7 +19,6 @@ from cayu.budgets._run_limit_accounting import (
 from cayu.budgets.base import BudgetLimit, copy_request_budget_limits
 from cayu.budgets.run_limits import RunLimits, copy_run_limits
 from cayu.context.structured_output import (
-    STRUCTURED_OUTPUT_TOOL_NAME,
     StructuredOutputSpec,
     StructuredOutputValidation,
     copy_structured_output_spec,
@@ -29,34 +28,34 @@ from cayu.events import Event, EventType, copy_event
 from cayu.messages import Message, detach_message
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
-from cayu.runtime import _shared_artifact_results as shared_artifact_results
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _transcript as transcript_support
-from cayu.runtime import _web_access_results as web_access_results
 from cayu.runtime._argument_continuity import capture_arguments, redact_continuity
-from cayu.runtime._checkpoint_redaction import (
-    durable_value_contains_secret,
-    require_secret_free_durable_object,
-)
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.sessions import _pending_tool_round as pending_rounds
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._assistant_tool_round_publication import (
     AssistantToolRoundPublication,
     StagedToolCallTerminal,
     validate_staged_tool_exposure_terminal,
+)
+from cayu.sessions._checkpoint_secret_validation import (
+    require_secret_free_durable_object,
 )
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
 from cayu.sessions.base import Session, SessionStatus, SessionStore
 from cayu.sessions.checkpoints import WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY
+from cayu.tools import _shared_artifact_results as shared_artifact_results
+from cayu.tools import _web_access_results as web_access_results
 from cayu.tools.base import ToolEffect, ToolResult
 from cayu.tools.exposure import (
     ResolvedToolExposureAuthority,
 )
 from cayu.tools.policy import ToolPolicyResult
-from cayu.vaults.redaction import SecretRedactor, contains_redacted_secret
+from cayu.vaults.redaction import SecretRedactor
 
 if TYPE_CHECKING:
     from cayu.approvals.user_input import PendingUserInput
@@ -111,7 +110,9 @@ def checkpoint_with_assistant_publication_snapshot(
         {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
     )
     tool_call_id = require_clean_nonblank(tool_call_id, "tool_call_id")
-    pending_round = _pending_tool_round_from_owned_checkpoint(checkpoint, copied_checkpoint)
+    pending_round = pending_round_reader._pending_tool_round_from_owned_checkpoint(
+        checkpoint, copied_checkpoint
+    )
     if pending_round is not None:
         if pending_rounds.pending_tool_round_identity(pending_round) != copy_tool_round_identity(
             tool_round_identity
@@ -196,7 +197,9 @@ def checkpoint_with_assistant_publication_redactor(
         {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
     )
     tool_call_id = require_clean_nonblank(tool_call_id, "tool_call_id")
-    pending_round = _pending_tool_round_from_owned_checkpoint(checkpoint, copied_checkpoint)
+    pending_round = pending_round_reader._pending_tool_round_from_owned_checkpoint(
+        checkpoint, copied_checkpoint
+    )
     if pending_round is not None:
         if pending_rounds.pending_tool_round_identity(pending_round) != copy_tool_round_identity(
             tool_round_identity
@@ -406,118 +409,6 @@ def _publication_with_legacy_projection(
     return AssistantToolRoundPublication(state="pending", message=projected)
 
 
-async def load_pending_tool_round(
-    session_store: SessionStore,
-    session_id: str,
-    *,
-    redactor: SecretRedactor | None = None,
-    consume_on_rejection: bool = False,
-    runtime_session: Session | None = None,
-) -> tuple[dict[str, Any] | None, pending_rounds.PendingToolRound | None]:
-    """Read a fresh round and retain its exact source snapshot for publication.
-
-    Each call loads and validates once with the caller's current context. The
-    round is detached from the returned checkpoint; neither is cached. Callers
-    already inside a checkpoint transform use the synchronous parser instead.
-    """
-
-    checkpoint = await session_store.load_checkpoint(session_id)
-    try:
-        return checkpoint, pending_tool_round_from_checkpoint(
-            checkpoint,
-            redactor=redactor,
-            consume_on_rejection=consume_on_rejection,
-            runtime_session=runtime_session,
-        )
-    finally:
-        # The parser clears rejected private data. Its loader must not retain
-        # the original snapshot in an exception traceback either.
-        checkpoint = None
-
-
-def pending_tool_round_from_checkpoint(
-    checkpoint: dict[str, Any] | None,
-    *,
-    redactor: SecretRedactor | None = None,
-    consume_on_rejection: bool = False,
-    runtime_session: Session | None = None,
-) -> pending_rounds.PendingToolRound | None:
-    if type(consume_on_rejection) is not bool:
-        raise TypeError("consume_on_rejection must be a bool.")
-    if checkpoint is None:
-        return None
-    copied_checkpoint = copy_durable_json_value(checkpoint, "checkpoint")
-    try:
-        return _pending_tool_round_from_owned_checkpoint(
-            checkpoint,
-            copied_checkpoint,
-            redactor=redactor,
-            consume_on_rejection=consume_on_rejection,
-            runtime_session=runtime_session,
-        )
-    finally:
-        # The inner parser clears rejected private data. Do not retain the
-        # caller-owned source in this wrapper's exception traceback.
-        checkpoint = None
-        copied_checkpoint = None
-
-
-def _pending_tool_round_from_owned_checkpoint(
-    checkpoint: dict[str, Any] | None,
-    copied_checkpoint: dict[str, Any],
-    *,
-    redactor: SecretRedactor | None = None,
-    consume_on_rejection: bool = False,
-    runtime_session: Session | None = None,
-) -> pending_rounds.PendingToolRound | None:
-    """Parse an immediately owned, validated snapshot; never retain or cache it."""
-    value = copied_checkpoint.get(pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
-    if value is None:
-        return None
-    if redactor is not None and durable_value_contains_secret(
-        value,
-        redactor=redactor,
-        path=(pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY,),
-        runtime_session=runtime_session,
-    ):
-        # Public callers retain their input by default. Runtime callers opt in
-        # to consuming their private checkpoint copy so no outer traceback
-        # frame keeps executable secret-bearing state.
-        if type(value) is dict:
-            value.clear()
-        value = None
-        copied_checkpoint.clear()
-        if consume_on_rejection and checkpoint is not None:
-            checkpoint.clear()
-        checkpoint = None
-        raise ValueError(
-            "Pending tool-round checkpoint contains a workload secret and cannot be executed."
-        ) from None
-    if type(value) is not dict:
-        raise ValueError("Pending tool round checkpoint must be an object.")
-    validation_rejected = False
-    try:
-        pending_round = pending_rounds.PendingToolRound.model_validate(
-            value, context=pending_rounds._OWNED_ROUND_JSON_CONTEXT
-        )
-    except Exception:
-        if redactor is None:
-            raise
-        validation_rejected = True
-    if validation_rejected:
-        value.clear()
-        value = None
-        copied_checkpoint.clear()
-        if consume_on_rejection and checkpoint is not None:
-            checkpoint.clear()
-        checkpoint = None
-        raise ValueError(
-            "Pending tool-round checkpoint is invalid and cannot be executed."
-        ) from None
-    _require_executable_pending_tool_round(pending_round)
-    return pending_round
-
-
 def checkpoint_with_pending_tool_round(
     checkpoint: dict[str, Any] | None,
     *,
@@ -560,7 +451,7 @@ def checkpoint_with_pending_tool_round(
     )
     resolved_redactor = redactor or SecretRedactor()
     if (
-        pending_tool_round_from_checkpoint(
+        pending_round_reader.pending_tool_round_from_checkpoint(
             copied_checkpoint,
             redactor=resolved_redactor,
             consume_on_rejection=True,
@@ -654,7 +545,7 @@ def checkpoint_with_pending_tool_round(
         structured_output_retries=structured_output_retries,
         structured_output_validation=structured_output_validation,
     )
-    _require_executable_pending_tool_round(pending_round)
+    pending_round_reader._require_executable_pending_tool_round(pending_round)
     pending_payload = pending_round.model_dump(mode="json")
     serialized_calls = pending_payload.get("tool_calls")
     if not isinstance(serialized_calls, list):
@@ -685,22 +576,6 @@ def checkpoint_with_pending_tool_round(
     return copied_checkpoint, pending_round
 
 
-def _require_executable_pending_tool_round(
-    pending_round: pending_rounds.PendingToolRound,
-) -> None:
-    has_redacted_arguments = any(
-        call.targeted_tool_rejection is None and contains_redacted_secret(call.arguments)
-        for call in pending_round.tool_calls
-    )
-    is_internal_structured_output_round = pending_round.structured_output is not None and any(
-        call.tool_name == STRUCTURED_OUTPUT_TOOL_NAME for call in pending_round.tool_calls
-    )
-    if has_redacted_arguments and not is_internal_structured_output_round:
-        raise ValueError(
-            "Pending tool-round arguments contain a redaction marker and cannot be executed."
-        )
-
-
 def checkpoint_without_pending_tool_round(
     checkpoint: dict[str, Any] | None,
 ) -> dict[str, Any]:
@@ -719,7 +594,7 @@ def checkpoint_without_pending_tool_round(
 
     wait, selected = foreground_child_state_from_checkpoint(copied_checkpoint)
     if wait is not None:
-        pending = pending_tool_round_from_checkpoint(copied_checkpoint)
+        pending = pending_round_reader.pending_tool_round_from_checkpoint(copied_checkpoint)
         if pending is None or pending.tool_round_id != wait.parent_effect.tool_round_id:
             raise RuntimeError("Cannot retire a foreground wait belonging to another round.")
         copied_checkpoint.pop(FOREGROUND_CHILD_WAIT_KEY)
@@ -937,7 +812,7 @@ def _staged_terminal_owner_from_owned_checkpoint(
 ) -> tuple[str, pending_rounds.PendingToolRound | PendingUserInput]:
     """Use only an immediately validated, detached document; never cache it."""
     identity = copy_tool_round_identity(tool_round_identity)
-    pending_round = _pending_tool_round_from_owned_checkpoint(copied, copied)
+    pending_round = pending_round_reader._pending_tool_round_from_owned_checkpoint(copied, copied)
     from cayu.approvals.user_input import (
         PENDING_USER_INPUT_CHECKPOINT_KEY,
         _user_input_lifecycle_authority_from_owned_checkpoint,

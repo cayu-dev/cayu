@@ -26,6 +26,7 @@ from cayu.runtime.execution_profiles import ExecutionProfileIdentity
 from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
 from cayu.sessions import _model_completion_publication as model_completion_publication
 from cayu.sessions import _pending_tool_round as pending_rounds
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
@@ -470,7 +471,7 @@ def test_incomplete_recovery_atomically_finalizes_valid_structured_output_round(
         assert result_part.content == "Structured output accepted."
         assert result_part.structured == {"output": {"answer": "recovered"}}
         assert result_part.is_error is False
-        assert tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint) is None
+        assert pending_round_reader.pending_tool_round_from_checkpoint(checkpoint) is None
 
         round_events = _round_events(events, staged.pending_round.tool_round_id)
         assert [event.type for event in round_events] == [
@@ -782,7 +783,7 @@ def test_resume_recovers_invalid_round_then_continues_once_at_next_attempt() -> 
         ]
         assert session is not None
         assert session.status == SessionStatus.COMPLETED
-        assert tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint) is None
+        assert pending_round_reader.pending_tool_round_from_checkpoint(checkpoint) is None
         assert sum(event.type == EventType.MODEL_COMPLETED for event in durable_events) == 2
         _assert_unique_event_ids(durable_events)
 
@@ -830,7 +831,7 @@ def test_incomplete_recovery_fails_mixed_round_without_retry_or_side_effects() -
         assert provider.requests == []
         assert side_effect.calls == []
         assert IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND in recovery.actions
-        assert tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint) is None
+        assert pending_round_reader.pending_tool_round_from_checkpoint(checkpoint) is None
         round_events = _round_events(events, staged.pending_round.tool_round_id)
         assert [event.type for event in round_events] == [
             EventType.TOOL_CALL_FAILED,
@@ -904,7 +905,7 @@ def test_recovery_replays_lost_structured_publication_acknowledgement_exactly() 
             "assistant",
             "tool",
         ]
-        assert tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint) is None
+        assert pending_round_reader.pending_tool_round_from_checkpoint(checkpoint) is None
         round_events = _round_events(events, staged.pending_round.tool_round_id)
         assert [event.type for event in round_events] == [
             EventType.TOOL_CALL_COMPLETED,
@@ -966,7 +967,7 @@ def test_live_structured_round_replays_lost_publication_acknowledgement() -> Non
             "assistant",
             "tool",
         ]
-        assert tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint) is None
+        assert pending_round_reader.pending_tool_round_from_checkpoint(checkpoint) is None
         assert [event.type for event in stored_events].count(
             EventType.STRUCTURED_OUTPUT_VALIDATED
         ) == 1
@@ -1282,7 +1283,7 @@ def test_live_ordinary_round_replays_lost_publication_acknowledgement(
             "call-side-effect-live-ack-loss-a",
             "call-side-effect-live-ack-loss-b",
         ]
-        assert tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint) is None
+        assert pending_round_reader.pending_tool_round_from_checkpoint(checkpoint) is None
         assert receipt is not None
         expected_references: list[str] = []
         for tool_call_id in (

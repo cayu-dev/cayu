@@ -58,6 +58,7 @@ from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions import _model_completion_publication as model_completion_publication
 from cayu.sessions import _pending_tool_round as pending_rounds
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import (
     EventQuery,
     IncompleteSessionRecoveryAction,
@@ -1779,7 +1780,7 @@ def test_resume_promotes_tool_completion_and_recovers_round_before_next_provider
         assert provider.requests == []
         assert tool.calls == 0
         pending = await _private_pending_approval(store, staged.session.id)
-        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
             await store.load_checkpoint(staged.session.id)
         )
         assert pending_round is not None
@@ -1849,7 +1850,7 @@ def test_resume_promotes_tool_completion_and_recovers_round_before_next_provider
     # publishing an ordinary tool-round receipt.
     assert tool_receipt is None
     assert (
-        tool_round_recovery.pending_tool_round_from_checkpoint(
+        pending_round_reader.pending_tool_round_from_checkpoint(
             asyncio.run(store.load_checkpoint(session_id))
         )
         is None
@@ -1900,7 +1901,7 @@ def test_resume_setup_failure_keeps_input_private_while_tool_round_is_pending() 
 
     store, provider, tool, staged, promoted, deferred_message, events = asyncio.run(run())
     checkpoint = asyncio.run(store.load_checkpoint(staged.session.id))
-    pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+    pending_round = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
     deferred = asyncio.run(store.load_deferred_interaction_input(staged.session.id))
     session = asyncio.run(store.load(staged.session.id))
     transcript = asyncio.run(store.load_transcript(staged.session.id))
@@ -2309,7 +2310,7 @@ def test_terminal_restart_materializes_tail_after_tool_publication_commit() -> N
 
     assert resume_events[-1].type is EventType.SESSION_INTERRUPTED
     assert receipt_after_commit is not None
-    assert tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint_after_commit) is None
+    assert pending_round_reader.pending_tool_round_from_checkpoint(checkpoint_after_commit) is None
     assert transcript_after_commit[-1].role.value == "tool"
     assert deferred_after_commit is not None
     assert deferred_after_commit.source_messages == [deferred_message]
@@ -3247,7 +3248,7 @@ def test_model_boundary_accepts_exact_published_tool_round() -> None:
             expected_run_epoch=staged.session.run_epoch,
         )
         checkpoint = await store.load_checkpoint(staged.session.id)
-        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
         assert pending_round is not None
         pending_call = pending_round.tool_calls[0]
         identity = pending_rounds.pending_tool_round_identity(pending_round).payload()

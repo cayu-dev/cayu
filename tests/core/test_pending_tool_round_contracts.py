@@ -69,6 +69,7 @@ assert not any(name in sys.modules for name in blocked)
 
 def test_pending_round_contract_and_runtime_parser_share_one_identity():
     from cayu.runtime import _tool_round_recovery as recovery
+    from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 
     assert recovery.pending_rounds is pending_rounds
     for name in (
@@ -82,13 +83,13 @@ def test_pending_round_contract_and_runtime_parser_share_one_identity():
         assert value.__module__ == pending_rounds.__name__
         get_type_hints(value)
     assert pending_rounds.PendingToolRound in get_args(
-        get_type_hints(recovery.pending_tool_round_from_checkpoint)["return"]
+        get_type_hints(pending_round_reader.pending_tool_round_from_checkpoint)["return"]
     )
     record = _record()
     restored = pickle.loads(pickle.dumps(record))
     assert type(restored) is pending_rounds.PendingToolRound
     assert restored == record
-    parsed = recovery.pending_tool_round_from_checkpoint(
+    parsed = pending_round_reader.pending_tool_round_from_checkpoint(
         {pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY: record.model_dump(mode="json")}
     )
     assert type(parsed) is pending_rounds.PendingToolRound

@@ -32,8 +32,8 @@ from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME, Structur
 from cayu.events import EventType
 from cayu.messages import Message, ToolResultPart
 from cayu.providers import ModelStreamEvent
-from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.access import SessionAccessDenied, SessionAccessScope
 from cayu.sessions.base import IncompleteSessionRecoveryRequest, RunRequest, SessionStatus
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
@@ -92,7 +92,7 @@ async def _leave_pending_round(app, store, request):
     with pytest.raises(_SimulatedProcessLoss):
         await _run(app, request)
     assert store.tool_publication_attempted.is_set()
-    assert tool_round_recovery.pending_tool_round_from_checkpoint(
+    assert pending_round_reader.pending_tool_round_from_checkpoint(
         await store.load_checkpoint(request.session_id)
     )
     store.fail_before_tool_publication = False
@@ -148,7 +148,7 @@ async def _assert_round(store, session_id, *, valid):
     assert result.tool_call_id == "final-call"
     assert result.is_error is (not valid)
     assert (
-        tool_round_recovery.pending_tool_round_from_checkpoint(
+        pending_round_reader.pending_tool_round_from_checkpoint(
             await store.load_checkpoint(session_id)
         )
         is None
@@ -314,7 +314,7 @@ def test_closed_structured_stream_recovers_partial_terminal_evidence(
             assert [
                 message.role.value for message in await store.load_transcript(request.session_id)
             ] == ["user"]
-            pending = tool_round_recovery.pending_tool_round_from_checkpoint(
+            pending = pending_round_reader.pending_tool_round_from_checkpoint(
                 await store.load_checkpoint(request.session_id)
             )
             assert pending is not None
@@ -351,7 +351,7 @@ def test_closed_structured_stream_recovers_partial_terminal_evidence(
             assert receipt.intent["auxiliary"]["retry_scheduled"] is False
             assert len({event.id for event in events}) == len(events)
             assert (
-                tool_round_recovery.pending_tool_round_from_checkpoint(
+                pending_round_reader.pending_tool_round_from_checkpoint(
                     await store.load_checkpoint(request.session_id)
                 )
                 is None

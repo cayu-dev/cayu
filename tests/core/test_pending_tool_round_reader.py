@@ -12,8 +12,8 @@ from tests.core.test_tool_round_publication import (
 )
 
 import cayu._validation as validation
-from cayu.runtime._tool_round_recovery import load_pending_tool_round
 from cayu.sessions._assistant_tool_round_publication import StagedToolCallTerminal
+from cayu.sessions._pending_tool_round_reader import load_pending_tool_round
 from cayu.sessions.base import InMemorySessionStore
 from cayu.vaults.redaction import SecretRedactor
 

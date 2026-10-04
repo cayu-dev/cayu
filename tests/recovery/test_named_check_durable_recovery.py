@@ -361,7 +361,7 @@ while True:
                     ]
                     if mixed_round:
                         assert not prior_terminals
-                        from cayu.runtime._tool_round_recovery import (
+                        from cayu.sessions._pending_tool_round_reader import (
                             pending_tool_round_from_checkpoint,
                         )
 

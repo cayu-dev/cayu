@@ -24,7 +24,7 @@ from cayu.runtime._tool_effect_state import (
     ToolEffectRecord,
     ToolEffectStateOwner,
 )
-from cayu.runtime._tool_round_recovery import pending_tool_round_from_checkpoint
+from cayu.sessions._pending_tool_round_reader import pending_tool_round_from_checkpoint
 from cayu.sessions.base import (
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,

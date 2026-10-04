@@ -65,7 +65,6 @@ def select_continuation(snapshot: CompletedTurnSnapshot) -> RecipientContinuatio
     from cayu.runtime._invocation_lifecycle import (
         invocation_checkpoint_state_sha256,
     )
-    from cayu.runtime._tool_round_recovery import pending_tool_round_from_checkpoint
     from cayu.sessions._execution_profile_checkpoint import (
         active_invocation_execution_profile_from_checkpoint,
         execution_profile_from_session_metadata,
@@ -73,6 +72,7 @@ def select_continuation(snapshot: CompletedTurnSnapshot) -> RecipientContinuatio
     from cayu.sessions._invocation_lifecycle import (
         _require_released_invocation_command_receipt,
     )
+    from cayu.sessions._pending_tool_round_reader import pending_tool_round_from_checkpoint
     from cayu.sessions._session_continuation_store import (
         require_continuation_selection_quiescence,
     )

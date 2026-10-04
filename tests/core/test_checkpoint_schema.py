@@ -32,17 +32,17 @@ from cayu.approvals.user_input import (
 from cayu.context.base import _compaction_checkpoint
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _session_engine as session_engine
-from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
 from cayu.runtime._invocation_lifecycle import (
     invocation_lifecycle_receipt_history_present,
 )
-from cayu.runtime._tool_round_recovery import pending_tool_round_from_checkpoint
 from cayu.sessions import _model_completion_publication as model_completion_publication
+from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalOutcome,
     build_invocation_terminal_decision,
     invocation_terminal_event_id,
 )
+from cayu.sessions._pending_tool_round_reader import pending_tool_round_from_checkpoint
 from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,

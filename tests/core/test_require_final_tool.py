@@ -230,8 +230,8 @@ def test_exhausted_reminders_can_fail_instead() -> None:
 
 
 def test_reminder_provenance_preserves_protocol_keys_under_secret_redaction() -> None:
-    from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
     from cayu.runtime._loop_policy_continuations import BEFORE_STOP_CONTINUATIONS_CHECKPOINT_KEY
+    from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
     from cayu.vaults.redaction import SecretRedactor
 
     async def scenario():

@@ -29,6 +29,7 @@ from cayu.messages import Message
 from cayu.providers import ModelStreamEvent
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionStatus
 from cayu.sessions.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -57,7 +58,7 @@ def test_pending_tool_round_recovery_rejects_redaction_marker_arguments() -> Non
     checkpoint["pending_tool_round"]["tool_calls"][0]["arguments"]["value"] = REDACTED_SECRET
 
     with pytest.raises(ValueError, match="redaction marker"):
-        tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
 
 
 def test_pending_structured_output_round_retains_redacted_result_arguments() -> None:
@@ -88,7 +89,7 @@ def test_pending_structured_output_round_retains_redacted_result_arguments() -> 
     )
 
     assert pending.tool_calls[0].arguments == {"output": {"answer": REDACTED_SECRET}}
-    assert tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint) == pending
+    assert pending_round_reader.pending_tool_round_from_checkpoint(checkpoint) == pending
 
 
 def test_cayu_app_never_executes_new_tool_call_with_redaction_marker() -> None:

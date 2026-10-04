@@ -40,7 +40,6 @@ from cayu.events import (
     event_with_runtime_payload_authority,
 )
 from cayu.messages import Message, detach_message
-from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
@@ -50,6 +49,7 @@ from cayu.sessions._assistant_tool_round_publication import (
     copy_assistant_tool_round_publication,
     validate_staged_tool_exposure_terminal,
 )
+from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
 from cayu.sessions.checkpoints import AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY
 from cayu.tools._policy_evidence import ToolPolicyEvidence
 from cayu.tools.catalogue import CALL_TOOL_NAME

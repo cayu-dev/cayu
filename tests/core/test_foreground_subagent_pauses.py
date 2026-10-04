@@ -195,7 +195,7 @@ def test_foreground_child_action_suspends_and_automatically_continues_parent(
                         and session_id == child.id
                         and not checked_staged_identity
                     ):
-                        from cayu.runtime._tool_round_recovery import (
+                        from cayu.sessions._pending_tool_round_reader import (
                             pending_tool_round_from_checkpoint,
                         )
 

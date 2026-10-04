@@ -50,6 +50,7 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentityStrength,
     execution_profile_from_session_metadata,
 )
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import EventQuery
 from cayu.tools import WebFetchAdapterRequest
 from cayu.tools.base import (
@@ -1217,10 +1218,9 @@ def test_restart_recovery_restores_exact_staged_web_access_authority(
         unattested_checkpoint["pending_tool_round"]["staged_terminals"][0]["event"]["payload"].pop(
             "web_access_result_authority"
         )
-        from cayu.runtime import _tool_round_recovery as tool_round_recovery
 
         with pytest.raises(ValueError, match="workload secret"):
-            tool_round_recovery.pending_tool_round_from_checkpoint(
+            pending_round_reader.pending_tool_round_from_checkpoint(
                 unattested_checkpoint,
                 redactor=SecretRedactor("fallback_succeeded"),
             )
@@ -1229,7 +1229,7 @@ def test_restart_recovery_restores_exact_staged_web_access_authority(
             "result"
         ]["structured"]["webbridge_route"]["selected_route"]["route_id"] = "checkpoint-route-secret"
         with pytest.raises(ValueError, match="workload secret"):
-            tool_round_recovery.pending_tool_round_from_checkpoint(
+            pending_round_reader.pending_tool_round_from_checkpoint(
                 malformed_checkpoint,
                 redactor=SecretRedactor("checkpoint-route-secret"),
             )

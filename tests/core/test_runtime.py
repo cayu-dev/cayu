@@ -263,6 +263,7 @@ from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions import _pending_tool_round as pending_rounds
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._invocation_terminal_decision import (
     settled_invocation_terminal_decision_from_checkpoint,
 )
@@ -29366,13 +29367,12 @@ def test_resume_reports_exact_nonterminal_foreground_child(child_status):
         for event in events
     )
     checkpoint = asyncio.run(store.load_checkpoint("parent"))
-    from cayu.runtime._tool_round_recovery import pending_tool_round_from_checkpoint
+    from cayu.sessions._pending_tool_round_reader import pending_tool_round_from_checkpoint
 
     assert pending_tool_round_from_checkpoint(checkpoint) is not None
 
 
 def _assert_recovered_parent_effect_unknown(store, result):
-    from cayu.runtime import _tool_round_recovery as tool_round_recovery
     from cayu.runtime._tool_effect_state import ToolEffectStateOwner
 
     async def verify():
@@ -29387,7 +29387,7 @@ def _assert_recovered_parent_effect_unknown(store, result):
         assert record.state == "outcome_unknown"
         assert record.terminal is None
         checkpoint = await store.load_checkpoint("parent")
-        assert tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint) is not None
+        assert pending_round_reader.pending_tool_round_from_checkpoint(checkpoint) is not None
         transcript = await store.load_transcript("parent")
         assert not any(message.role == "tool" for message in transcript)
         events = await store.load_events("parent")
@@ -37678,7 +37678,6 @@ def test_cayu_app_resolves_approved_tool_call_and_continues_session():
 
 def test_stale_tool_approval_resolver_cannot_claim_repaused_session():
     from cayu.approvals.tools import PendingToolCallApproval
-    from cayu.runtime import _tool_round_recovery as tool_round_recovery
     from cayu.runtime.execution_units import new_model_step_identity
 
     class BlockingApprovalClaimStore(InMemorySessionStore):
@@ -37720,7 +37719,7 @@ def test_stale_tool_approval_resolver_cannot_claim_repaused_session():
         approval_a = await _pending_tool_approval_from_public_event(store, approval_event)
         checkpoint_a = await store.load_checkpoint(session_id)
         assert checkpoint_a is not None
-        round_a = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint_a)
+        round_a = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint_a)
         assert round_a is not None
 
         replacement_identity = new_model_step_identity().new_attempt().new_tool_round()
@@ -61771,14 +61770,13 @@ def test_interrupt_session_stops_in_flight_tool_call():
 
 
 async def _assert_proxy_tool_effect_remains_unknown(store, session_id: str) -> None:
-    from cayu.runtime import _tool_round_recovery as tool_round_recovery
     from cayu.runtime._tool_effect_state import ToolEffectStateOwner
 
     session = await store.load(session_id)
     assert session is not None
     assert session.status is SessionStatus.INTERRUPTED
     checkpoint = await store.load_checkpoint(session_id)
-    pending = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+    pending = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
     assert pending is not None
     assert len(pending.tool_calls) == 1
     record = await ToolEffectStateOwner(store).resolve_call(

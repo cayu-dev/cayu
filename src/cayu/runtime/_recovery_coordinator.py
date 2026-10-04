@@ -36,6 +36,7 @@ from cayu.runtime._durable_tool_round import (
     _interrupted_tool_round_results as _interrupted_tool_round_results,
 )
 from cayu.sessions import _pending_tool_round as pending_rounds
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 
 if TYPE_CHECKING:
     from cayu.runtime._external_execution_to_wait import _ExternalExecutionToWait
@@ -817,7 +818,7 @@ def _checkpoint_with_legacy_approval_round(
 ) -> dict[str, Any] | None:
     """Atomically upgrade an approval-only checkpoint at its exact claim."""
 
-    pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+    pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
         checkpoint,
         redactor=redactor,
         runtime_session=runtime_session,
@@ -3156,7 +3157,7 @@ class RecoveryCoordinator:
         checkpoint = await self._session_store.load_checkpoint(session.id)
         pointer = model_completion_publication.model_step_publication_from_checkpoint(checkpoint)
         tool_receipt: RuntimePublicationReceipt | None = None
-        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
         pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
         pending_user_input, _resolution_intent = user_input_lifecycle_authority_from_checkpoint(
             checkpoint,
@@ -3512,7 +3513,7 @@ class RecoveryCoordinator:
         publication = completed_stage.publication
         if publication is None:
             return False
-        source_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+        source_round = pending_round_reader.pending_tool_round_from_checkpoint(
             {
                 operation.key: operation.value
                 for operation in publication.mutation.operations
@@ -3613,7 +3614,7 @@ class RecoveryCoordinator:
             return ()
         if stage.publication is None:
             raise RuntimeError("Closed structured output lost its source publication.")
-        pending = tool_round_recovery.pending_tool_round_from_checkpoint(
+        pending = pending_round_reader.pending_tool_round_from_checkpoint(
             {
                 operation.key: operation.value
                 for operation in stage.publication.mutation.operations
@@ -8281,7 +8282,7 @@ class RecoveryCoordinator:
             request_loop_policies = request.loop_policies
         else:
             raise TypeError("Tool-round recovery requires an exact recovery action.")
-        checkpoint, pending_round = await tool_round_recovery.load_pending_tool_round(
+        checkpoint, pending_round = await pending_round_reader.load_pending_tool_round(
             self._session_store,
             loaded_session.id,
             redactor=self._secret_redactor,
@@ -8389,7 +8390,7 @@ class RecoveryCoordinator:
                 session=loaded_session,
                 checkpoint=checkpoint,
             )
-            pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+            pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
                 checkpoint,
                 redactor=self._secret_redactor,
                 consume_on_rejection=True,
@@ -10029,7 +10030,7 @@ class RecoveryCoordinator:
             (
                 current_checkpoint,
                 publication_round,
-            ) = await tool_round_recovery.load_pending_tool_round(
+            ) = await pending_round_reader.load_pending_tool_round(
                 self._session_store,
                 session.id,
                 redactor=self._secret_redactor,
@@ -10763,7 +10764,7 @@ class RecoveryCoordinator:
                         if outcome is not None:
                             tool_outcomes.append(outcome)
 
-            source_checkpoint, durable_round = await tool_round_recovery.load_pending_tool_round(
+            source_checkpoint, durable_round = await pending_round_reader.load_pending_tool_round(
                 self._session_store,
                 session.id,
                 redactor=self._secret_redactor,
@@ -12626,7 +12627,7 @@ class RecoveryCoordinator:
 
         def require_matching_pending_call(checkpoint: dict[str, Any] | None) -> None:
             self._reject_approval_owned_tool_round_recovery(checkpoint)
-            current_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+            current_round = pending_round_reader.pending_tool_round_from_checkpoint(
                 checkpoint,
                 redactor=self._secret_redactor,
                 consume_on_rejection=True,
@@ -14663,7 +14664,7 @@ class RecoveryCoordinator:
 
     async def deliver_pending_tool_effect_uncertainty(self, session: Session) -> list[Event]:
         """Deliver already-committed uncertainty through the existing event writer."""
-        _checkpoint, pending = await tool_round_recovery.load_pending_tool_round(
+        _checkpoint, pending = await pending_round_reader.load_pending_tool_round(
             self._session_store,
             session.id,
         )
@@ -14876,7 +14877,7 @@ class RecoveryCoordinator:
     ) -> bool:
         """Advisory, read-only readiness; actual recovery repeats all checks under its fence."""
         checkpoint = await self._session_store.load_checkpoint(session.id)
-        pending = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        pending = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
         if (
             pending is None
             or pending.tool_round_id != tool_round_id
@@ -15482,7 +15483,7 @@ class RecoveryCoordinator:
             invocation_context=invocation_context,
             staged_only=staged_only,
         )
-        checkpoint, recovered_pending = await tool_round_recovery.load_pending_tool_round(
+        checkpoint, recovered_pending = await pending_round_reader.load_pending_tool_round(
             self._session_store,
             session.id,
             redactor=self._secret_redactor,
@@ -15541,7 +15542,7 @@ class RecoveryCoordinator:
                     "Pending tool-round recovery substituted its validated execution profile."
                 )
             execution_profile = invocation_context.profile
-        checkpoint, pending_round = await tool_round_recovery.load_pending_tool_round(
+        checkpoint, pending_round = await pending_round_reader.load_pending_tool_round(
             self._session_store,
             session.id,
             redactor=self._secret_redactor,
@@ -17538,7 +17539,7 @@ class RecoveryCoordinator:
             current_run_epoch=session.run_epoch,
             runtime_session=session,
         )
-        pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+        pending_tool_round = pending_round_reader.pending_tool_round_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
@@ -17649,7 +17650,7 @@ class RecoveryCoordinator:
             # Its exact marker is checked inside the admitted epoch claim below;
             # recovery planning must remain entirely read-only.
             post_action_transfer = claim_post_action
-            post_action_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+            post_action_round = pending_round_reader.pending_tool_round_from_checkpoint(
                 {pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY: restored},
                 redactor=self._secret_redactor,
                 consume_on_rejection=True,
@@ -18232,7 +18233,7 @@ class RecoveryCoordinator:
                 # round owner's exact recorded/staged evidence before inspecting
                 # missing command results. Completed sibling tools need not
                 # implement command recovery; unknown effects remain fenced.
-                pending = tool_round_recovery.pending_tool_round_from_checkpoint(
+                pending = pending_round_reader.pending_tool_round_from_checkpoint(
                     await self._session_store.load_checkpoint(claim.session.id)
                 )
                 settled_call_ids: set[str] = set()
@@ -19719,7 +19720,7 @@ class RecoveryCoordinator:
             operation="Workspace observation recovery checkpoint read",
         )
         observations = workspace_observations_from_checkpoint(checkpoint)
-        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
@@ -20169,7 +20170,7 @@ class RecoveryCoordinator:
             or lifecycle.tool_outcome_event_id is not None
         ):
             return None
-        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             runtime_session=session,
@@ -20235,7 +20236,7 @@ class RecoveryCoordinator:
             lambda: self._session_store.load_checkpoint(session.id),
             operation="Workspace observation terminal-stage checkpoint read",
         )
-        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             runtime_session=session,
@@ -20468,7 +20469,7 @@ class RecoveryCoordinator:
             session=session, lifecycle=lifecycle
         ):
             return True
-        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             runtime_session=session,
@@ -21369,7 +21370,7 @@ class RecoveryCoordinator:
             current_run_epoch=session.run_epoch,
             runtime_session=session,
         )
-        pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+        pending_tool_round = pending_round_reader.pending_tool_round_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
@@ -21915,7 +21916,7 @@ class RecoveryCoordinator:
             current_run_epoch=session.run_epoch,
             runtime_session=session,
         )
-        pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        pending_tool_round = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
         if pending_user_input is not None:
             pause_state = await self._classify_user_input_pause(
                 session=session,
@@ -22035,7 +22036,7 @@ class RecoveryCoordinator:
                 expected_transcript_cursor=snapshot.cursor,
             ):
                 events.append(event)
-            checkpoint, pending_tool_round = await tool_round_recovery.load_pending_tool_round(
+            checkpoint, pending_tool_round = await pending_round_reader.load_pending_tool_round(
                 self._session_store,
                 session.id,
             )
@@ -22241,7 +22242,7 @@ class RecoveryCoordinator:
                 redactor=self._secret_redactor,
                 consume_on_rejection=True,
             )
-            pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+            pending_tool_round = pending_round_reader.pending_tool_round_from_checkpoint(
                 checkpoint,
                 redactor=self._secret_redactor,
                 consume_on_rejection=True,
@@ -22261,7 +22262,7 @@ class RecoveryCoordinator:
                 lambda: self._session_store.load_checkpoint(session.id),
                 operation="Post-recovery workspace observation checkpoint read",
             )
-            pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+            pending_tool_round = pending_round_reader.pending_tool_round_from_checkpoint(
                 checkpoint,
                 redactor=self._secret_redactor,
                 consume_on_rejection=True,
@@ -22623,7 +22624,7 @@ class RecoveryCoordinator:
                 raise RuntimeError(
                     "Session changed before its unreplayable tool round was abandoned."
                 )
-            current = tool_round_recovery.pending_tool_round_from_checkpoint(
+            current = pending_round_reader.pending_tool_round_from_checkpoint(
                 checkpoint,
                 redactor=self._secret_redactor,
                 consume_on_rejection=True,

@@ -1,4 +1,6 @@
 {
+    "tests/core/test_pending_round_reader_boundary.py::test_pending_round_reader_and_runtime_share_canonical_validation": 0.2666972490042099,
+    "tests/core/test_pending_round_reader_boundary.py::test_pending_round_reader_composes_without_runtime_execution": 1.5886204169946723,
     "tests/core/test_application_provider_registry.py::test_application_provider_registration_keeps_public_provenance": 0.37,
     "tests/core/test_application_provider_registry.py::test_provider_registration_snapshots_declarations_and_keeps_live_provider": 0.001,
     "tests/core/test_application_provider_registry.py::test_provider_registry_composes_without_application_controllers": 1.072,

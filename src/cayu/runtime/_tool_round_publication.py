@@ -42,7 +42,6 @@ from cayu.runtime._durable_subagents import (
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._tool_round_recovery import (
     checkpoint_without_pending_tool_round,
-    pending_tool_round_from_checkpoint,
     ready_assistant_publication_message,
 )
 from cayu.sessions._pending_tool_round import (
@@ -50,6 +49,7 @@ from cayu.sessions._pending_tool_round import (
     PendingToolRound,
     pending_tool_round_identity,
 )
+from cayu.sessions._pending_tool_round_reader import pending_tool_round_from_checkpoint
 from cayu.sessions.base import (
     RuntimePublicationRequest,
     RuntimePublicationResult,

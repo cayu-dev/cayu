@@ -35,9 +35,10 @@ from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
-from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.sessions import _pending_tool_round as pending_rounds
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
+from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
 from cayu.sessions.base import (
     Session,
     SessionStore,
@@ -583,7 +584,7 @@ def _checkpoint_with_exact_pending_approval_round(
     current_approval = pending_approval_from_checkpoint(copied, redactor=redactor)
     if current_approval != approval:
         raise RuntimeError("Pending tool approval changed before exact checkpoint clearing.")
-    current_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+    current_round = pending_round_reader.pending_tool_round_from_checkpoint(
         copied,
         redactor=redactor,
         runtime_session=runtime_session,
@@ -1458,7 +1459,7 @@ def _pending_approval_and_round_for_atomic_claim(
         raise RuntimeError("Session has no pending tool approval.")
     if approval.approval_id != approval_id or approval.tool_round_id != tool_round_id:
         raise ValueError("Tool approval identity does not match the current pending approval.")
-    pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+    pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
         checkpoint,
         redactor=redactor,
         runtime_session=runtime_session,

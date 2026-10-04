@@ -29,7 +29,6 @@ from cayu.events import Event, EventType, event_payload_authority_is_runtime_gen
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runners.local import LocalRunner
-from cayu.runtime import _shared_artifact_results as shared_artifact_results
 from cayu.runtime._tool_round_staging import _project_staged_terminal_event
 from cayu.sessions.base import (
     InMemorySessionStore,
@@ -42,6 +41,7 @@ from cayu.sessions.base import (
 )
 from cayu.sessions.invocation import SessionExecutionSource
 from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools import _shared_artifact_results as shared_artifact_results
 from cayu.tools import shared_artifacts as shared_artifact_tools
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools.base import (

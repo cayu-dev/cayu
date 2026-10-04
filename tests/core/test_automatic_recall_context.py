@@ -106,7 +106,6 @@ from cayu.providers.operations import (
     ProviderOperationState,
     ProviderOperationStatus,
 )
-from cayu.runtime._checkpoint_redaction import require_secret_free_durable_object
 from cayu.runtime._memory_evidence import (
     MemoryEvidenceItemReference,
     MemoryEvidenceKey,
@@ -120,6 +119,7 @@ from cayu.runtime._memory_evidence import (
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
 from cayu.runtime.retry_policy import RetryPolicy
+from cayu.sessions._checkpoint_secret_validation import require_secret_free_durable_object
 from cayu.sessions.base import (
     ForkSessionRequest,
     IncompleteSessionRecoveryRequest,

@@ -20,7 +20,7 @@ from tests.core.test_session_store_shared_conformance import (
 from cayu.events import EventType
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
-from cayu.runtime._tool_round_recovery import pending_tool_round_from_checkpoint
+from cayu.sessions._pending_tool_round_reader import pending_tool_round_from_checkpoint
 from cayu.sessions.base import SessionStatus
 from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore

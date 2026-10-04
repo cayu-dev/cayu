@@ -14,7 +14,6 @@ from cayu._task_wait import (
 )
 from cayu._validation import copy_durable_record
 from cayu.messages import Message, detach_message
-from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
 from cayu.runtime._diagnostics import (
     credential_safe_runtime_exception,
     credential_safe_runtime_exception_group,
@@ -27,6 +26,7 @@ from cayu.runtime._task_store_operation_boundary import (
     capture_task_store_operation,
     raise_task_store_operation_failure,
 )
+from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
 from cayu.sessions.base import (
     DeferredInteractionInput,
     EventRecord,

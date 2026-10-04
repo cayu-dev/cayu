@@ -55,7 +55,7 @@ from cayu.providers.operations import (
     ProviderOperationState,
     ProviderOperationStatus,
 )
-from cayu.runtime import _approval_support, _tool_round_recovery
+from cayu.runtime import _approval_support
 from cayu.runtime._invocation_lifecycle import (
     AdmitInvocationCommand,
     InvocationContext,
@@ -91,6 +91,7 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
 from cayu.runtime.retry_policy import RetryPolicy
+from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import (
     EventQuery,
     ForkExecutionProfileSelection,
@@ -2706,7 +2707,7 @@ def test_approval_continuation_rejects_changed_invocation_profile_before_work() 
         assert isinstance(pending, dict)
         checkpoint = await store.load_checkpoint(session_id)
         active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
-        pending_round = _tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
         pending_approval = _approval_support.pending_approval_from_checkpoint(checkpoint)
         assert active_profile is not None
         assert pending_round is not None
@@ -5053,7 +5054,7 @@ async def _assert_snapshot_only_restart_profile_boundary(
     assert crashed.status is SessionStatus.RUNNING
     assert await store.load_active_model_completion_stage(session_id) is None
     assert (
-        _tool_round_recovery.pending_tool_round_from_checkpoint(
+        pending_round_reader.pending_tool_round_from_checkpoint(
             await store.load_checkpoint(session_id)
         )
         is None

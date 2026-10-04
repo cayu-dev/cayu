@@ -87,7 +87,6 @@ from cayu.providers.base import (
     copy_model_completion,
     copy_usage_dialect,
 )
-from cayu.runtime._checkpoint_redaction import require_secret_free_durable_object
 from cayu.runtime._completion_projection import portable_model_completion_projection
 from cayu.runtime._model_errors import (
     ProviderExceptionControl,
@@ -114,6 +113,7 @@ from cayu.runtime.retry_policy import (
     retry_decision,
     retry_diagnostic_payload,
 )
+from cayu.sessions._checkpoint_secret_validation import require_secret_free_durable_object
 from cayu.sessions.base import COMPACTION_INSTRUCTIONS_MAX_CHARS, Session, copy_session
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
