@@ -1245,6 +1245,31 @@ class ModelStepExecutor:
 
         return await wait_until_idle(self._running_detached_writes, timeout_s=timeout_s)
 
+    @property
+    def provider_cancellation_claims_pending(self) -> bool:
+        """Whether a cancellation claim heartbeat or renewal write still runs."""
+
+        return self._provider_operation_cancellation.pending
+
+    async def wait_for_provider_cancellation_renewals(self, *, timeout_s: float) -> bool:
+        """Wait up to ``timeout_s`` for claim renewal writes, without cancelling them."""
+
+        return await wait_until_idle(
+            self._provider_operation_cancellation.detached_renewals, timeout_s=timeout_s
+        )
+
+    async def stop_and_wait_for_provider_cancellation_claims(self, *, timeout_s: float) -> bool:
+        """Stop orphaned claim heartbeats, then wait for them and their renewals.
+
+        Only for shutdown once no operation is in flight: no live cancellation
+        then needs a claim, and each stopped claim's lease expires.
+        """
+
+        self._provider_operation_cancellation.stop_all_heartbeats()
+        return await wait_until_idle(
+            self._provider_operation_cancellation.running, timeout_s=timeout_s
+        )
+
     async def wait_for_provider_reconciliations(self, *, timeout_s: float) -> bool:
         """Wait up to ``timeout_s`` for provider-operation reconciliations to settle."""
 

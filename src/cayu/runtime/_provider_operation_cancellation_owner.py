@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, ParamSpec, Protocol, TypeVar
 
 from cayu._exception_groups import add_exception_note_safely, exception_cause, set_exception_cause
 from cayu._task_wait import (
@@ -68,6 +69,9 @@ from cayu.sessions._provider_operation_cancellation_claim import (
 from cayu.sessions.base import ModelCompletionStage, Session, SessionRunFenced, SessionStore
 
 _PROVIDER_OPERATION_START_CLEANUP_TIMEOUT_SECONDS = 5.0
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 _PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE = timedelta(seconds=30)
 
@@ -223,6 +227,33 @@ class _ProviderOperationCancellationHeartbeat:
     release_intended: asyncio.Event
     claim_deadline_monotonic: float
     task: asyncio.Task[None] | None = None
+    owner_task: asyncio.Task[Any] | None = None
+
+
+def _stops_owned_heartbeats_on_failure(
+    operation: Callable[_P, Awaitable[_R]],
+) -> Callable[_P, Awaitable[_R]]:
+    """Stop heartbeats this task started when the cancellation fails.
+
+    Otherwise a heartbeat keeps renewing its claim until its owner task ends,
+    which never happens when that task goes on to shut the application down.
+    An expired lease is the safe outcome of a failed cancellation.
+    """
+
+    @functools.wraps(operation)
+    async def guarded(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        owner_task = asyncio.current_task()
+        try:
+            return await operation(*args, **kwargs)
+        except GeneratorExit:
+            raise
+        except BaseException:
+            owner = args[0]
+            assert isinstance(owner, ProviderOperationCancellationOwner)
+            owner._stop_heartbeats_owned_by(owner_task)
+            raise
+
+    return guarded
 
 
 def _provider_operation_target_model(session: Session, stage: ModelCompletionStage) -> str:
@@ -257,6 +288,51 @@ class ProviderOperationCancellationOwner:
         self._provider_operation_cancellation_heartbeats: dict[
             str, _ProviderOperationCancellationHeartbeat
         ] = {}
+        # Claim renewal writes that outlived their lease: waited for at
+        # shutdown, never cancelled, so stores stay open under them.
+        self._detached_renewals: set[asyncio.Task[Any]] = set()
+
+    def _retain_detached_renewal(self, task: asyncio.Task[Any]) -> None:
+        self._detached_renewals.add(task)
+
+        def settled(completed: asyncio.Task[Any]) -> None:
+            self._detached_renewals.discard(completed)
+            _consume_detached_task_outcome(completed)
+
+        task.add_done_callback(settled)
+
+    def _stop_heartbeats_owned_by(self, owner_task: asyncio.Task[Any] | None) -> None:
+        for control in self._provider_operation_cancellation_heartbeats.values():
+            if control.owner_task is owner_task:
+                control.stop.set()
+
+    def detached_renewals(self) -> set[asyncio.Future[Any]]:
+        """Claim renewal writes that outlived their lease and still run."""
+
+        return set(self._detached_renewals)
+
+    def running(self) -> set[asyncio.Future[Any]]:
+        """Claim heartbeats and renewal writes still running."""
+
+        heartbeats = {
+            control.task
+            for control in self._provider_operation_cancellation_heartbeats.values()
+            if control.task is not None
+        }
+        return {*heartbeats, *self._detached_renewals}
+
+    def stop_all_heartbeats(self) -> None:
+        """Stop every claim heartbeat; each claim's lease then expires.
+
+        Only safe once no operation that may still hold a claim is running.
+        """
+
+        for control in self._provider_operation_cancellation_heartbeats.values():
+            control.stop.set()
+
+    @property
+    def pending(self) -> bool:
+        return any(not task.done() for task in self.running())
 
     def _start_provider_operation_cancellation_heartbeat(
         self,
@@ -283,6 +359,7 @@ class ProviderOperationCancellationOwner:
             )
         )
         control.task = task
+        control.owner_task = asyncio.current_task()
         self._provider_operation_cancellation_heartbeats[claim.claim_id] = control
 
         def settled(completed: asyncio.Task[None]) -> None:
@@ -536,14 +613,31 @@ class ProviderOperationCancellationOwner:
                 raise RuntimeError("Provider-operation cancellation claim expired before release.")
 
         self._mark_provider_operation_cancellation_claim_release(claim)
-        await self._session_store.publish_checkpoint_and_events_with_store_time(
-            session.id,
-            idempotency_key=f"provider-operation-cancellation-lease:{claim.claim_id}",
-            checkpoint_transform=release_claim,
-            commit_time_guard=commit_time_guard,
-            events=[],
-            expected_run_epoch=session.run_epoch,
-        )
+        try:
+            await self._session_store.publish_checkpoint_and_events_with_store_time(
+                session.id,
+                idempotency_key=f"provider-operation-cancellation-lease:{claim.claim_id}",
+                checkpoint_transform=release_claim,
+                commit_time_guard=commit_time_guard,
+                events=[],
+                expected_run_epoch=session.run_epoch,
+            )
+        except BaseException as release_error:
+            # A failed release still ends renewal and its lease then expires;
+            # the release error stays the one reported.
+            control = self._provider_operation_cancellation_heartbeats.get(claim.claim_id)
+            heartbeat = None if control is None else control.task
+            if control is not None and heartbeat is not None:
+                control.stop.set()
+                # Wait without cancelling: a renewal in flight finishes and stays owned.
+                await asyncio.wait((heartbeat,))
+                if not heartbeat.cancelled() and isinstance(heartbeat.exception(), Exception):
+                    add_exception_note_safely(
+                        release_error,
+                        "Provider-operation cancellation claim renewal also failed: "
+                        f"{type(heartbeat.exception()).__name__}.",
+                    )
+            raise
         await self._stop_provider_operation_cancellation_heartbeat(claim)
 
     async def _heartbeat_provider_operation_cancellation_claim(
@@ -559,12 +653,17 @@ class ProviderOperationCancellationOwner:
     ) -> None:
         """Renew one cancellation lease until its owner releases or loses it."""
 
+        def lose_ownership(reason: str) -> None:
+            ownership_lost.set()
+            # An owner that already stopped this heartbeat gave the claim up;
+            # cancelling it would replace the outcome it is reporting.
+            if not stop.is_set() and owner_task is not None and not owner_task.done():
+                owner_task.cancel(reason)
+
         while not stop.is_set():
             remaining = control.claim_deadline_monotonic - time.monotonic()
             if remaining <= 0:
-                ownership_lost.set()
-                if owner_task is not None and not owner_task.done():
-                    owner_task.cancel("Provider-operation cancellation ownership lease expired.")
+                lose_ownership("Provider-operation cancellation ownership lease expired.")
                 return
             try:
                 wait_seconds = (
@@ -652,18 +751,16 @@ class ProviderOperationCancellationOwner:
             except _ProviderOperationCancellationClaimReleaseObserved:
                 return
             except asyncio.CancelledError:
-                renewal_task.add_done_callback(_consume_detached_task_outcome)
+                self._retain_detached_renewal(renewal_task)
                 raise
             if outcome.cancellation is not None:
-                renewal_task.add_done_callback(_consume_detached_task_outcome)
+                self._retain_detached_renewal(renewal_task)
                 raise outcome.cancellation
             if outcome.timed_out:
-                renewal_task.add_done_callback(_consume_detached_task_outcome)
-                ownership_lost.set()
-                if owner_task is not None and not owner_task.done():
-                    owner_task.cancel(
-                        "Provider-operation cancellation ownership renewal was not acknowledged."
-                    )
+                self._retain_detached_renewal(renewal_task)
+                lose_ownership(
+                    "Provider-operation cancellation ownership renewal was not acknowledged."
+                )
                 return
             if outcome.error is not None:
                 if isinstance(
@@ -671,22 +768,17 @@ class ProviderOperationCancellationOwner:
                     _ProviderOperationCancellationClaimReleaseObserved,
                 ):
                     return
-                ownership_lost.set()
-                if owner_task is not None and not owner_task.done():
-                    owner_task.cancel("Provider-operation cancellation ownership heartbeat failed.")
+                lose_ownership("Provider-operation cancellation ownership heartbeat failed.")
                 raise outcome.error
             control.claim_deadline_monotonic = (
                 renewal_started_monotonic
                 + _PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE.total_seconds()
             )
             if time.monotonic() >= control.claim_deadline_monotonic:
-                ownership_lost.set()
-                if owner_task is not None and not owner_task.done():
-                    owner_task.cancel(
-                        "Provider-operation cancellation ownership acknowledgement expired."
-                    )
+                lose_ownership("Provider-operation cancellation ownership acknowledgement expired.")
                 return
 
+    @_stops_owned_heartbeats_on_failure
     async def cancel_started_operation(
         self,
         *,

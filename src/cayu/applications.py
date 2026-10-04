@@ -57,7 +57,7 @@ from cayu._application_registration import (
     _validate_registered_tool as _validate_registered_tool,
 )
 from cayu._application_registration import _validate_runtime_hooks as _validate_runtime_hooks
-from cayu._task_wait import collect_failures, combine_drain_results
+from cayu._task_wait import collect_failures, combine_drain_results, wait_until_idle
 from cayu._validation import (
     canonical_bounded_durable_json_bytes,
     canonical_durable_json_bytes,
@@ -5291,7 +5291,20 @@ class CayuApp:
         async def provider_operation_cancellations(budget: float) -> bool:
             # The drain seals, and only after interruptions settled: an
             # interrupted provider operation still needs a cancellation owner.
-            return await self.drain_provider_operation_cancellations(timeout_s=budget)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + budget
+            drained = await self.drain_provider_operation_cancellations(timeout_s=budget)
+            if self._admission.in_flight:
+                # A running operation may still hold a claim its heartbeat renews.
+                return False
+            # With nothing in flight, a surviving heartbeat is orphaned: stop it
+            # and wait for it and its renewal writes before stores close.
+            claims_settled = (
+                await self._model_step_executor.stop_and_wait_for_provider_cancellation_claims(
+                    timeout_s=max(0.0, deadline - loop.time())
+                )
+            )
+            return drained and claims_settled
 
         async def collaboration_requests(budget: float) -> bool:
             try:
@@ -5426,6 +5439,9 @@ class CayuApp:
         if (
             self.recovery_cleanup_status().active_tasks
             or self._session_control.execution_presence.releasing
+            or any(
+                not task.done() for task in self._recovery_coordinator.detached_recovery_writes()
+            )
         ):
             late["recovery_cleanups"] = "late_work"
         if self._knowledge_publication_scope.pending:
@@ -5447,6 +5463,10 @@ class CayuApp:
             or self._model_step_executor.detached_writes_pending
         ):
             late["session_operations"] = "late_work"
+        if self._model_step_executor.provider_cancellation_claims_pending:
+            late["provider_operation_cancellations"] = "late_work"
+        if any(not task.done() for task in self._tool_round_executor.detached_projections()):
+            late["environment_cleanups"] = "late_work"
         provider = self.provider_operation_cancellation_status()
         # A rejection after sealing is a provider operation left without a
         # cancellation owner; report each one in the attempt that saw it.
@@ -5490,9 +5510,22 @@ class CayuApp:
         *,
         timeout_s: float = 10.0,
     ) -> bool:
-        """Seal and boundedly drain every Runtime-owned provider cancellation."""
+        """Seal and boundedly drain every Runtime-owned provider cancellation.
 
-        return await self._provider_operation_cancellation_lifecycle.drain(timeout_s=timeout_s)
+        Also waits, without cancelling, for claim renewal writes that outlived
+        their lease. It does not stop or wait for claim heartbeats, which an
+        operation may still need; ``aclose()`` stops those once nothing runs.
+        """
+
+        if type(timeout_s) not in {int, float} or not isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("timeout_s must be a finite positive number.")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        drained = await self._provider_operation_cancellation_lifecycle.drain(timeout_s=timeout_s)
+        claims_settled = await self._model_step_executor.wait_for_provider_cancellation_renewals(
+            timeout_s=max(0.0, deadline - loop.time())
+        )
+        return drained and claims_settled
 
     def recovery_cleanup_status(self) -> RecoveryCleanupSupervisorSnapshot:
         """Return content-free process-local cleanup supervision state."""
@@ -5528,7 +5561,8 @@ class CayuApp:
         return self._tool_round_executor.terminal_publication_metrics()
 
     async def drain_recovery_cleanups(self, *, timeout_s: float = 10.0) -> bool:
-        """Wait boundedly for recovery cleanup and stopped execution-presence writes."""
+        """Wait boundedly for recovery cleanup, stopped execution-presence writes and
+        recovery claim renewals that outlived their heartbeat."""
 
         if type(timeout_s) not in {int, float} or not isfinite(timeout_s) or timeout_s <= 0:
             raise ValueError("timeout_s must be a finite positive number.")
@@ -5540,10 +5574,17 @@ class CayuApp:
         presence_released = await self._session_control.execution_presence.drain(
             timeout_s=remaining,
         )
-        return recovered and presence_released
+        writes_settled = await wait_until_idle(
+            self._recovery_coordinator.detached_recovery_writes,
+            timeout_s=max(0.0, deadline - asyncio.get_running_loop().time()),
+        )
+        return recovered and presence_released and writes_settled
 
     async def drain_environment_cleanups(self, *, timeout_s: float = 10.0) -> bool:
         """Settle this process's retained cleanup without cancelling live mutations.
+
+        Also waits for tool-result projections that outlived their timeout, which
+        may still write into an environment's artifact store.
 
         This is not a durable allocation census. After restart, use
         ``recover_incomplete_session`` (including for terminal sessions) to
@@ -5554,20 +5595,42 @@ class CayuApp:
             raise ValueError("timeout_s must be a finite positive number.")
         loop = asyncio.get_running_loop()
         deadline = loop.time() + float(timeout_s)
-        handler = self._egress_authority_adoption_handler
-        parked_drained = True
-        if handler is not None:
-            parked_drained = await _drain_parked_egress_authority_allocations(
-                handler,
-                timeout_s=float(timeout_s),
+
+        async def environment_cleanups() -> bool:
+            handler = self._egress_authority_adoption_handler
+            parked_drained = True
+            if handler is not None:
+                parked_drained = await _drain_parked_egress_authority_allocations(
+                    handler,
+                    timeout_s=float(timeout_s),
+                )
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            retained_drained = await self._environment_lifecycle.drain_retained_cleanups(
+                timeout_s=remaining,
             )
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            return False
-        retained_drained = await self._environment_lifecycle.drain_retained_cleanups(
-            timeout_s=remaining,
+            return retained_drained and parked_drained
+
+        # A hung projection must not skip environment cleanup; it only has to
+        # settle before owned resources close, which this result also gates.
+        # Cleanup runs in this task so a caller's cancellation reaches it as is.
+        projections = asyncio.create_task(
+            wait_until_idle(
+                self._tool_round_executor.detached_projections, timeout_s=float(timeout_s)
+            )
         )
-        return retained_drained and parked_drained
+        try:
+            cleanup: bool | BaseException
+            try:
+                cleanup = await environment_cleanups()
+            except Exception as error:
+                cleanup = error
+            await asyncio.wait((projections,))
+        finally:
+            # The projection waiter only observes; stopping it cancels no work.
+            projections.cancel()
+        return combine_drain_results((cleanup, projections.result()))
 
     def seal_knowledge_publications(self) -> None:
         """Refuse this application's new knowledge publications before shutdown drains.

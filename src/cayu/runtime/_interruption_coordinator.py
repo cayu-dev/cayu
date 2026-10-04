@@ -270,6 +270,9 @@ class BackgroundInterruptionCoordinator:
         )
         self._secret_redactor = secret_redactor or SecretRedactor()
         self._tasks: set[asyncio.Task[None]] = set()
+        # Store writes that outlived their claim's deadline: waited for, never
+        # cancelled, so shutdown does not release stores under them.
+        self._detached_store_tasks: set[asyncio.Task[Any]] = set()
         self._tasks_by_parent: dict[str, asyncio.Task[None]] = {}
         self._stop = asyncio.Event()
         self._deferred: dict[str, _DeferredBackgroundInterruption] = {}
@@ -319,7 +322,9 @@ class BackgroundInterruptionCoordinator:
 
         Returns ``False`` when the bounded wait expires. In-memory coordinators
         and workers are then cancelled; their durable parent markers remain for
-        the next process to recover.
+        the next process to recover. Store writes they leave behind, and
+        cancelled cascades, workers and the deferred cascade still finishing
+        store writes, stay retained for the next drain.
         """
 
         if (
@@ -356,12 +361,16 @@ class BackgroundInterruptionCoordinator:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_s
         drained = True
-        while self._tasks or self._has_drain_required_background_interruptions():
+        while (
+            self._tasks
+            or self._has_drain_required_background_interruptions()
+            or self._detached_store_tasks
+        ):
             remaining = deadline - loop.time()
             if remaining <= 0:
                 drained = False
                 break
-            tasks: tuple[asyncio.Task[None], ...] = tuple(self._tasks)
+            tasks: tuple[asyncio.Task[Any], ...] = (*self._tasks, *self._detached_store_tasks)
             deferred_task = self._deferred_task
             if deferred_task is not None and not deferred_task.done():
                 tasks = (*tasks, deferred_task)
@@ -374,7 +383,9 @@ class BackgroundInterruptionCoordinator:
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if loop.time() >= deadline and (
-                self._tasks or self._has_drain_required_background_interruptions()
+                self._tasks
+                or self._has_drain_required_background_interruptions()
+                or self._detached_store_tasks
             ):
                 drained = False
                 break
@@ -405,11 +416,16 @@ class BackgroundInterruptionCoordinator:
             self._workers.clear()
             self._workers_stopped.set()
             # Give cooperative tasks one event-loop turn to run their finally
-            # blocks. Anything that suppresses cancellation is detached below;
-            # its captured stop event remains set and its durable claim is left
-            # to expire rather than extending the configured shutdown grace.
+            # blocks. Their captured stop events remain set, so they schedule no
+            # new work.
             await asyncio.sleep(0)
         finally:
+            # A cancelled cascade or worker may still be finishing a store write:
+            # keep it retained, even if this cleanup is itself cancelled, so a
+            # later drain waits for it.
+            for task in (*pending_tasks, *workers, deferred_task):
+                if task is not None and not task.done():
+                    self._retain_detached_store_task(task)
             self._tasks.clear()
             self._tasks_by_parent.clear()
             self._workers.clear()
@@ -429,9 +445,18 @@ class BackgroundInterruptionCoordinator:
 
     @property
     def pending(self) -> bool:
-        """Whether accepted cascade work is still running or waiting to run."""
+        """Whether cascade work, or a store write it left behind, still runs."""
 
-        return bool(self._tasks) or bool(self._deferred)
+        return bool(self._tasks) or bool(self._deferred) or bool(self._detached_store_tasks)
+
+    def _retain_detached_store_task(self, task: asyncio.Task[Any]) -> None:
+        self._detached_store_tasks.add(task)
+
+        def settled(completed: asyncio.Task[Any]) -> None:
+            self._detached_store_tasks.discard(completed)
+            _consume_background_interruption_store_task(completed)
+
+        task.add_done_callback(settled)
 
     def _has_drain_required_background_interruptions(self) -> bool:
         return any(deferred.drain_required for deferred in self._deferred.values())
@@ -951,13 +976,13 @@ class BackgroundInterruptionCoordinator:
                     timeout_s=max(0.0, claim_deadline - time.monotonic()),
                 )
             except asyncio.CancelledError:
-                renewal_task.add_done_callback(_consume_background_interruption_store_task)
+                self._retain_detached_store_task(renewal_task)
                 raise
             if outcome.cancellation is not None:
-                renewal_task.add_done_callback(_consume_background_interruption_store_task)
+                self._retain_detached_store_task(renewal_task)
                 raise outcome.cancellation
             if outcome.timed_out:
-                renewal_task.add_done_callback(_consume_background_interruption_store_task)
+                self._retain_detached_store_task(renewal_task)
                 state.claim_lost.set()
                 return
             if outcome.error is not None:

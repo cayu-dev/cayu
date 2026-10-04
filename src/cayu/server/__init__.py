@@ -1007,6 +1007,8 @@ async def _shutdown_cayu_app(app: CayuApp, *, timeout_s: float) -> None:
             step.subsystem == "provider_operation_cancellations"
             and step.status == "incomplete"
             and step.reason != "unowned_cancellations"
+            # Claim heartbeats or renewal writes alone get the generic message.
+            and app.provider_operation_cancellation_status().active_owners
         ):
             logger.warning(
                 "%d provider-operation cancellation owner(s) remained unresolved after the "

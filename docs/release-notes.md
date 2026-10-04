@@ -1,5 +1,17 @@
 # Release notes
 
+## Unreleased
+
+- `CayuApp.aclose()` now waits, without cancelling them, for store writes that
+  outlived their owner's bounded wait, so they no longer land on a store that
+  shutdown already closed. These are claim renewals from interruption cascades,
+  provider-operation cancellations and incomplete-session recovery, cascades and
+  workers cancelled by an earlier drain timeout, and tool-result projections
+  that timed out while writing an artifact. A provider-operation cancellation
+  whose claim is no longer needed, because it failed or no admitted or tracked
+  operation is running at shutdown, now stops renewing and lets the claim's
+  lease expire.
+
 ## v0.8.1
 
 Improve collaboration-host fairness validation by allowing page discovery and

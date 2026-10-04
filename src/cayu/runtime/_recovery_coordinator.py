@@ -1719,6 +1719,9 @@ class RecoveryCoordinator:
             max_operations=64
         )
         self._effect_reconciliation_owner = ToolEffectReconciliationOwner()
+        # Claim renewal writes that outlived their lease: waited for at
+        # shutdown, never cancelled, so stores stay open under them.
+        self._detached_recovery_writes: set[asyncio.Task[Any]] = set()
 
     def _build_human_review(
         self,
@@ -19280,6 +19283,20 @@ class RecoveryCoordinator:
                 if selected_failure is not authoritative_failure:
                     raise selected_failure
 
+    def _retain_detached_recovery_write(self, task: asyncio.Task[Any]) -> None:
+        self._detached_recovery_writes.add(task)
+
+        def settled(completed: asyncio.Task[Any]) -> None:
+            self._detached_recovery_writes.discard(completed)
+            _consume_incomplete_recovery_store_task(completed)
+
+        task.add_done_callback(settled)
+
+    def detached_recovery_writes(self) -> set[asyncio.Future[Any]]:
+        """Recovery claim renewal writes still running after their heartbeat."""
+
+        return set(self._detached_recovery_writes)
+
     async def _heartbeat_incomplete_recovery_claim(
         self,
         *,
@@ -19325,17 +19342,17 @@ class RecoveryCoordinator:
                     ),
                 )
             except asyncio.CancelledError:
-                renewal_task.add_done_callback(_consume_incomplete_recovery_store_task)
+                self._retain_detached_recovery_write(renewal_task)
                 raise
             if outcome.cancellation is not None:
-                renewal_task.add_done_callback(_consume_incomplete_recovery_store_task)
+                self._retain_detached_recovery_write(renewal_task)
                 restore_task_cancellation_requests(
                     outcome.cancellation_requests_consumed,
                     cancellation=outcome.cancellation,
                 )
                 raise outcome.cancellation
             if outcome.timed_out:
-                renewal_task.add_done_callback(_consume_incomplete_recovery_store_task)
+                self._retain_detached_recovery_write(renewal_task)
                 raise _IncompleteRecoveryClaimLost(
                     "Incomplete-session recovery could not confirm store lease renewal "
                     f"before its local deadline for session {session_id}."

@@ -740,6 +740,9 @@ class ToolRoundExecutor:
     ) -> None:
         self._session_store = session_store
         self._event_writer = event_writer
+        # Projections that outlived their timeout may still write artifacts:
+        # waited for before environment cleanup, never cancelled again.
+        self._detached_projections: set[asyncio.Task[Any]] = set()
         self._auxiliary_inference = auxiliary_inference
         self._session_control = session_control
         self._hook_runtime = hook_runtime
@@ -6840,6 +6843,20 @@ class ToolRoundExecutor:
                 restore_cancellation_requests=projection_requests,
             )
 
+    def _retain_detached_projection(self, task: asyncio.Task[Any]) -> None:
+        self._detached_projections.add(task)
+
+        def settled(completed: asyncio.Task[Any]) -> None:
+            self._detached_projections.discard(completed)
+            _consume_projection_task_outcome(completed)
+
+        task.add_done_callback(settled)
+
+    def detached_projections(self) -> set[asyncio.Future[Any]]:
+        """Timed-out tool-result projections that are still running."""
+
+        return set(self._detached_projections)
+
     async def _project_terminal_tool_result(
         self,
         *,
@@ -6899,7 +6916,7 @@ class ToolRoundExecutor:
         if outcome.timed_out:
             settlement_observer.record_active_candidates()
             policy_task.cancel()
-            policy_task.add_done_callback(_consume_projection_task_outcome)
+            self._retain_detached_projection(policy_task)
             projection = projection_failure(
                 policy=policy,
                 request=request,
