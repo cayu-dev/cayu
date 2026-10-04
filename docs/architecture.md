@@ -566,6 +566,10 @@ access checks and atomic writes remain inside the existing store operations.
 revisions, publication boundaries and exact source evidence, and prepares the
 replacement and archived source revisions. Memory, SQLite and PostgreSQL compose
 these rules inside their existing access, lock and transaction boundaries.
+`knowledge/_relation_queries.py` owns relation and lineage projections, query
+and access-scope fingerprints, cursor encoding and validation, and bounded result
+pages. Memory, SQLite and PostgreSQL supply authorized candidates from their
+existing snapshots and retain native filtering, ordering and transaction owners.
 The existing `cayu`, `cayu.storage` and `cayu.storage.memory` imports resolve to
 the same canonical types, including persisted legacy pickle class paths.
 

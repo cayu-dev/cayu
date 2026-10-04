@@ -222,6 +222,15 @@ from cayu.knowledge._maintenance_rules import (
     _require_knowledge_maintenance_publication_boundary,
     _require_knowledge_maintenance_source_evidence,
 )
+from cayu.knowledge._relation_queries import (
+    _bounded_knowledge_lineage_result,
+    _bounded_knowledge_relation_result,
+    _decode_knowledge_lineage_cursor,
+    _decode_knowledge_relation_cursor,
+    _knowledge_lineage_link,
+    _knowledge_lineage_query_fingerprint,
+    _knowledge_relation_query_fingerprint,
+)
 from cayu.knowledge._revision_rules import (
     _copy_chunks_for_revision,
     _copy_evidence_for_revision,
@@ -880,17 +889,10 @@ from cayu.storage.knowledge_transition import require_empty_knowledge_revision_t
 from cayu.storage.memory import (
     KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY,
     _bounded_knowledge_evidence,
-    _bounded_knowledge_lineage_result,
-    _bounded_knowledge_relation_result,
     _decode_knowledge_embedding_backfill_cursor,
-    _decode_knowledge_lineage_cursor,
-    _decode_knowledge_relation_cursor,
     _encode_knowledge_embedding_backfill_cursor,
     _knowledge_change_now,
     _knowledge_embedding_backfill_fingerprint,
-    _knowledge_lineage_link,
-    _knowledge_lineage_query_fingerprint,
-    _knowledge_relation_query_fingerprint,
     _knowledge_semantic_watch_identity,
     _score_entry,
     _search_result_from_scored_embeddings,
