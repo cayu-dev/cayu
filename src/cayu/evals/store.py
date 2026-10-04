@@ -34,6 +34,7 @@ from cayu._validation import (
     json_utf8_size_within_limit,
     revalidate_model_input,
 )
+from cayu.budgets.run_limits import RunLimits, copy_run_limits
 from cayu.configuration import MAX_STEPS
 from cayu.evals.calibration import (
     EVAL_JUDGE_CALIBRATION_MAX_BYTES,
@@ -104,7 +105,6 @@ from cayu.evals.suite_authoring import (
     validate_expected_eval_suite_revision,
 )
 from cayu.evals.trial_policy import EVAL_SUITE_MAX_CONCURRENCY, EvalSuiteRunExposureV1
-from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.sessions.invocation import (
     InvocationOrigin,
     InvocationOriginTrust,

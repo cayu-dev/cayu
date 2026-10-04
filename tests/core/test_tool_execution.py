@@ -17,6 +17,7 @@ from cayu.applications import CayuApp
 from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
 from cayu.budgets.base import BudgetLimit, BudgetReservation
 from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.budgets.run_limits import RunLimits
 from cayu.configuration import CayuConfig, ToolExecutionConfig
 from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.events import Event, EventType
@@ -30,7 +31,6 @@ from cayu.observability.hooks import (
 )
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import _tool_execution as tool_execution
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import (
     InMemorySessionStore,
     InterruptSessionRequest,

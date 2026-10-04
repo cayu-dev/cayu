@@ -7,13 +7,13 @@ from collections.abc import AsyncIterator
 
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
+from cayu.budgets.run_limits import RunLimits
 from cayu.budgets.usage import session_usage_summary
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import _session_control as session_control
 from cayu.runtime._run_limits import SessionUsageTracker
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity, SessionStatus
 
 

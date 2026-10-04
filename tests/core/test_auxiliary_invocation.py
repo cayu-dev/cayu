@@ -10,8 +10,10 @@ import pytest
 
 from cayu import AgentSpec, CayuApp, Event, EventType, Message, RunRequest, ScriptedModelProvider
 from cayu._exception_groups import exception_cause, iter_exception_tree
+from cayu.budgets._run_limit_accounting import RunLimitAccountingContext
 from cayu.budgets.base import BudgetLimit, BudgetPolicy, BudgetReservation, InMemoryBudgetLedger
 from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.budgets.run_limits import RunLimits
 from cayu.budgets.usage import SessionUsageSummary, session_usage_summary
 from cayu.providers import (
     ModelProviderError,
@@ -24,7 +26,6 @@ from cayu.providers.deadlines import ProviderStreamDeadlines
 from cayu.providers.response import ModelResponse
 from cayu.runtime import _tool_execution
 from cayu.runtime._auxiliary_invocation import AuxiliaryInferenceScope, AuxiliaryInvocationPolicy
-from cayu.runtime._run_limit_accounting import RunLimitAccountingContext
 from cayu.runtime._tool_round_executor import ToolRoundExecutor
 from cayu.runtime.evidence import RuntimeEvidenceOperation, RuntimeEvidenceRequest, runtime_evidence
 from cayu.runtime.execution_profiles import (
@@ -33,7 +34,7 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.runtime.execution_units import ModelAttemptIdentity
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.stop_policy import RunLimits, auxiliary_token_admission
+from cayu.runtime.stop_policy import auxiliary_token_admission
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.inference import AuxiliaryInferencePolicy, InferenceLimits

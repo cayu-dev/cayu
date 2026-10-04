@@ -31,6 +31,7 @@ from cayu.approvals.user_input import (
 )
 from cayu.budgets.base import BudgetLimit, BudgetPolicy
 from cayu.budgets.pricing import ModelPrice, PriceBook, default_price_book
+from cayu.budgets.run_limits import RunLimits
 from cayu.context.structured_output import StructuredOutputSpec, StructuredOutputStrategy
 from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.events import Event, EventType
@@ -46,7 +47,6 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import (
     EventQuery,
     ForkSessionRequest,

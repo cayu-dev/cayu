@@ -27,11 +27,11 @@ from cayu import (
     SecretRedactor,
     default_price_book,
 )
+from cayu.budgets.run_limits import RunLimits
 from cayu.configuration import DEFAULT_MAX_STEPS, CayuConfig
 from cayu.evals.execution import evaluation_target_identity
 from cayu.evals.execution_profiles import EvalExecutionProfilePolicyV1
 from cayu.project_control_plane import ProjectEvalJudgeConfiguration
-from cayu.runtime.stop_policy import RunLimits
 from cayu.server.evals_registry import (
     DEFAULT_EVAL_PROFILE_ID,
     EvalTargetRegistry,

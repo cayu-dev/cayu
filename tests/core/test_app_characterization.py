@@ -35,6 +35,7 @@ from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
 from cayu.approvals.user_input import UserInputResponse
 from cayu.budgets.base import BudgetLimit, BudgetWindow
 from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.budgets.run_limits import RunLimits
 from cayu.context.counting import ContextCountingConfig, ContextCountingMode
 from cayu.events import Event, EventType
 from cayu.messages import Message
@@ -46,7 +47,6 @@ from cayu.providers import (
     ModelRequest,
     ModelStreamEvent,
 )
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import (
     EventQuery,
     InMemorySessionStore,

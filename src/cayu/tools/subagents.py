@@ -24,6 +24,7 @@ from cayu._validation import (
     require_unicode_scalar_text,
 )
 from cayu.budgets.base import copy_request_budget_limits
+from cayu.budgets.run_limits import RunLimits, copy_run_limits
 from cayu.configuration import DEFAULT_MAX_STEPS, MAX_STEPS
 from cayu.events import Event, EventType
 from cayu.messages import Message, MessageRole, TextPart
@@ -46,7 +47,6 @@ from cayu.runtime._durable_subagents import (
     require_durable_subagent_receipt_matches_seed,
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.sessions._execution_profile_checkpoint import (
     execution_profile_from_session_metadata,
 )

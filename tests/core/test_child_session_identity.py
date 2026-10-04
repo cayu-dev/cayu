@@ -8,12 +8,12 @@ from tests.core._workload_secret_support import FakeProvider
 
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
+from cayu.budgets.run_limits import RunLimits
 from cayu.configuration import DEFAULT_MAX_STEPS
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime._child_session_identity import ChildSessionKind, generate_child_session_id
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec

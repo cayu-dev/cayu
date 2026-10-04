@@ -12,6 +12,7 @@ from cayu._exception_groups import exception_cause, set_exception_cause
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.budgets.billing import BillingIdentity
+from cayu.budgets.run_limits import RunLimits
 from cayu.configuration import MAX_STEPS, CayuConfig, RunDefaults
 from cayu.context.base import RecentTurnsContextPolicy
 from cayu.context.thinking import ThinkingConfig
@@ -55,7 +56,6 @@ from cayu.runtime.provider_operations import (
     inspect_provider_operation,
 )
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import (
     EventQuery,
     EventRecord,

@@ -18,6 +18,7 @@ from pydantic import Field, StrictFloat, StrictInt, StrictStr, field_validator, 
 from cayu._validation import canonical_durable_json_bytes
 from cayu.artifacts import ArtifactScope, ArtifactStore
 from cayu.artifacts.local import _rename_directory_no_replace
+from cayu.budgets.run_limits import RunLimits
 from cayu.evals._admission import LaunchAdmission, admission_scope
 from cayu.evals._inspection_documents import ProcessDocuments, write_process_document
 from cayu.evals._process_progress import ProcessEvalProgress
@@ -77,7 +78,6 @@ from cayu.evals.suite_preflight import (
     allocate_authored_suite_launch_concurrency,
     compile_authored_suite_run_exposure,
 )
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import ModelTarget, copy_run_request
 from cayu.storage.evals_sqlite import SQLiteEvalStore
 

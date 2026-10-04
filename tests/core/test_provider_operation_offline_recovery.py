@@ -46,6 +46,7 @@ from cayu.budgets.base import (
 )
 from cayu.budgets.billing import BillingIdentity
 from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.budgets.run_limits import RunLimits
 from cayu.budgets.usage import SessionUsageSummary
 from cayu.context.base import MessageWindowContextPolicy, context_input_coverage
 from cayu.context.structured_output import (
@@ -111,7 +112,6 @@ from cayu.runtime.provider_operations import (
     resolve_provider_operation_stage,
 )
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions._invocation_terminal_decision import (
     settled_invocation_terminal_decision_from_checkpoint,
 )

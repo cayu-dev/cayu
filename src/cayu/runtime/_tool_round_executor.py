@@ -74,11 +74,16 @@ from cayu.artifacts.local import LocalArtifactStore
 from cayu.artifacts.settlement import (
     ArtifactWriteSettlementObserver,
 )
+from cayu.budgets._run_limit_accounting import (
+    RunLimitAccountingContext,
+    pause_run_limit_accounting_context,
+)
 from cayu.budgets.base import (
     BudgetLimit,
     _copy_budget_limit_definition,
     copy_request_budget_limits,
 )
+from cayu.budgets.run_limits import RunLimits, copy_run_limits
 from cayu.context.structured_output import (
     StructuredOutputSpec,
     copy_structured_output_spec,
@@ -169,10 +174,6 @@ from cayu.runtime._interruption_coordinator import (
 )
 from cayu.runtime._invocation_lifecycle import InvocationContext
 from cayu.runtime._phase_timing import timed_phase, timed_tool_round
-from cayu.runtime._run_limit_accounting import (
-    RunLimitAccountingContext,
-    pause_run_limit_accounting_context,
-)
 from cayu.runtime._run_limits import (
     LimitEvaluation,
     RunLimitGate,
@@ -219,7 +220,6 @@ from cayu.runtime.mcp_manifest_policy import (
 )
 from cayu.runtime.public_authority import parse_public_authority_alias
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
-from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.sessions._browser_control_checkpoint import (
     browser_control_checkpoint_mutation_scope,
     browser_control_checkpoint_read_scope,

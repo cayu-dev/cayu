@@ -48,6 +48,7 @@ from cayu import AgentSpec, CayuApp, EventType, ScriptedModelProvider, WorkflowS
 from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
 from cayu.budgets.base import BudgetLimit, BudgetWindow
 from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.budgets.run_limits import RunLimits
 from cayu.configuration import DEFAULT_MAX_STEPS
 from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.context.thinking import ThinkingConfig
@@ -60,7 +61,6 @@ from cayu.runtime._workflow_structured_output_handoff import (
     WorkflowStructuredOutputHandoff,
 )
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import (
     EventQuery,
     IncompleteSessionsRecoveryRequest,

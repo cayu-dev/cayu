@@ -18,9 +18,9 @@ from cayu.artifacts.attachments import (
     DEFAULT_MAX_FILE_ATTACHMENTS_PER_REQUEST,
     DEFAULT_MAX_TOTAL_FILE_ATTACHMENT_BYTES,
 )
+from cayu.budgets.run_limits import RunLimits
 from cayu.context.thinking import ThinkingConfig
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.cleanup import (
     RecoveryCleanupPolicy,
     copy_recovery_cleanup_policy,

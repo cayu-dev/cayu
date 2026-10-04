@@ -97,11 +97,11 @@ def test_legacy_model_contract_imports_preserve_exact_identity(
 
 
 def test_legacy_pickled_recovery_context_keeps_frozen_run_semantics() -> None:
+    from cayu.budgets.run_limits import RunLimits
     from cayu.runtime._model_completion_contracts import (
         HostedToolDiscoveryRecoveryAuthority,
         ModelCompletionRecoveryContext,
     )
-    from cayu.runtime.stop_policy import RunLimits
 
     context = ModelCompletionRecoveryContext(
         interaction_id="interaction",

@@ -90,6 +90,7 @@ from cayu.budgets.base import (
 )
 from cayu.budgets.billing import BillingIdentity
 from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.budgets.run_limits import RunLimits
 from cayu.budgets.usage import UsageMetrics
 from cayu.build_provenance import (
     RuntimeBuildArtifactKind,
@@ -223,7 +224,6 @@ from cayu.runtime.provider_operations import (
 )
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.runtime.session_message_lifecycle import SessionMessageQueueStatus
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalOutcome,
     build_invocation_terminal_decision,

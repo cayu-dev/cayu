@@ -15,12 +15,17 @@ from cayu._validation import (
     inspect_bounded_durable_json,
     require_durable_clean_nonblank,
 )
+from cayu.budgets._run_limit_accounting import (
+    RunLimitAccountingContext,
+    has_run_limit_accounting_authority,
+)
 from cayu.budgets.base import (
     BudgetLimit,
     BudgetReservationRecoveryContext,
     copy_request_budget_limits,
 )
 from cayu.budgets.billing import BillingIdentity, copy_billing_identity
+from cayu.budgets.run_limits import RunLimits
 from cayu.configuration import MAX_STEPS
 from cayu.context.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
@@ -48,15 +53,10 @@ from cayu.runtime._memory_evidence import (
     validate_context_exposure_stage_scope,
 )
 from cayu.runtime._model_execution_selection import ModelFailoverAttempt
-from cayu.runtime._run_limit_accounting import (
-    RunLimitAccountingContext,
-    has_run_limit_accounting_authority,
-)
 from cayu.runtime._run_limits import BudgetStepReservation
 from cayu.runtime.execution_units import copy_tool_round_identity
 from cayu.runtime.model_steps import AssistantStepResult
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.tool_completion import ToolCompletionPolicy
 from cayu.sessions.base import (
     MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES,

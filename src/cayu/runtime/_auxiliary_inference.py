@@ -18,6 +18,7 @@ from cayu._validation import (
     canonical_durable_json_bytes,
     require_durable_clean_nonblank,
 )
+from cayu.budgets._run_limit_accounting import has_run_limit_accounting_authority
 from cayu.budgets.base import (
     BudgetLimit,
     BudgetReservationRecoveryContext,
@@ -73,10 +74,7 @@ from cayu.runtime._provider_stream import (
     _provider_stream_self_cancellation_error,
     _ProviderStreamSelfCancellation,
 )
-from cayu.runtime._run_limit_accounting import (
-    has_run_limit_accounting_authority,
-    restore_run_limit_accounting_context,
-)
+from cayu.runtime._run_limit_accounting import restore_run_limit_accounting_context
 from cayu.runtime._run_limits import (
     _TRUSTED_BINDING_PROVENANCE,
     BudgetStepReservation,

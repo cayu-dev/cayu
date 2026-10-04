@@ -266,7 +266,7 @@ def test_usage_read_has_fixed_working_set_for_one_hundred_thousand_events(monkey
 
     from cayu.applications import CayuApp
     from cayu.budgets.base import BudgetLimit
-    from cayu.runtime.stop_policy import RunLimits
+    from cayu.budgets.run_limits import RunLimits
 
     async def run():
         store = InMemorySessionStore()
@@ -535,7 +535,7 @@ def test_run_limits_merge_inflight_usage_at_the_snapshot_boundary_without_histor
     import time
 
     from cayu.applications import CayuApp
-    from cayu.runtime.stop_policy import RunLimits
+    from cayu.budgets.run_limits import RunLimits
 
     async def run():
         store = InMemorySessionStore()

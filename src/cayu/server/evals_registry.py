@@ -15,6 +15,7 @@ from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.budgets.base import BudgetLimit, budget_pricing_preflight_error
 from cayu.budgets.pricing import PriceBook
+from cayu.budgets.run_limits import RunLimits
 from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
 from cayu.evals.capacity import EvalExecutionCapacity
 from cayu.evals.corpus import JudgePrivacyPolicyV1
@@ -35,7 +36,6 @@ from cayu.evals.execution_profiles import (
 )
 from cayu.evals.store import EvalRunInvocation, EvalStore
 from cayu.project_control_plane import ProjectEvalJudgeConfiguration
-from cayu.runtime.stop_policy import RunLimits
 from cayu.server.config import (
     DEFAULT_EVAL_LEASE_SECONDS,
     DEFAULT_EVAL_POLL_INTERVAL_SECONDS,

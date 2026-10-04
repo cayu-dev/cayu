@@ -24,6 +24,7 @@ from cayu._validation import (
     copy_json_value,
     require_clean_nonblank,
 )
+from cayu.budgets._run_limit_accounting import RunBudgetAccountingAuthority
 from cayu.budgets.base import (
     MODEL_COMPLETION_BUDGET_SETTLEMENTS_KEY,
     BudgetCheck,
@@ -85,6 +86,7 @@ from cayu.budgets.pricing import (
     estimate_session_cost,
     session_cost_totals,
 )
+from cayu.budgets.run_limits import RunLimits, has_run_limits
 from cayu.budgets.usage import (
     USAGE_BEARING_EVENT_TYPES,
     SessionUsageSummary,
@@ -107,7 +109,6 @@ from cayu.providers import ModelProviderError
 from cayu.providers._credential_boundary import provider_cancellation_failures
 from cayu.runtime._cost_accounting import CostAccountingSnapshot
 from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime._run_limit_accounting import RunBudgetAccountingAuthority
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
@@ -116,12 +117,10 @@ from cayu.runtime.execution_units import (
     copy_model_step_identity,
 )
 from cayu.runtime.stop_policy import (
-    RunLimits,
     StopDecision,
     StopLimit,
     auxiliary_token_admission,
     first_reached_limit,
-    has_run_limits,
 )
 from cayu.sessions.base import (
     EventQuery,

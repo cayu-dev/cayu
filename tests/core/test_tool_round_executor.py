@@ -19,6 +19,7 @@ from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.budgets.base import BudgetLimit
 from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.budgets.run_limits import RunLimits
 from cayu.events import (
     Event,
     EventType,
@@ -55,7 +56,6 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import InMemorySessionStore, RunRequest, Session, SessionStatus
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 from cayu.tools._runner import sanitize_runner_failure_group

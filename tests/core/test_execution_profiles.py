@@ -25,6 +25,7 @@ from cayu.applications import CayuApp
 from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
 from cayu.budgets.base import BudgetLimit, BudgetPolicy, BudgetReservation
 from cayu.budgets.pricing import ModelPrice, PriceBook, estimate_session_cost
+from cayu.budgets.run_limits import RunLimits
 from cayu.configuration import CayuConfig, RunDefaults, ToolExecutionConfig
 from cayu.context.base import (
     CheckpointCompactionContextPolicy,
@@ -141,7 +142,6 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import (
     ForkExecutionProfileSelection,
     ForkSessionRequest,

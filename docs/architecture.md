@@ -380,6 +380,15 @@ runtime staging and recovery. `tools/_policy_evidence.py` owns their tool-policy
 evidence classification. Both components work without execution or store owners;
 runtime retains publication, hook execution and secret-scope resolution.
 
+`budgets/run_limits.py` owns lightweight run-limit configuration and copy/presence
+checks. `budgets/_run_limit_accounting.py` owns durable usage/time origins,
+run-budget authority records, and the shared pause/resume/rebase validation rules.
+Checkpoint records and runtime use the same types and bounded accounting data.
+These rules work without runtime clock adapters, stop-policy evaluation, execution
+owners or session stores. `runtime/_run_limit_accounting.py` captures and restores
+the live monotonic clock origin; `runtime/stop_policy.py` retains stop decisions
+and auxiliary admission checks. Public stop-policy imports retain their identity.
+
 `sessions/checkpoints.py` owns root checkpoint decoding and schema migrations.
 The adjacent private modules `_model_completion_publication`, `_terminal_evidence`,
 `_invocation_terminal_decision`, and `_provider_operation_cancellation_claim` own

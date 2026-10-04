@@ -19,6 +19,7 @@ from cayu.applications import CayuApp
 from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
 from cayu.approvals.user_input import UserInputResponse
 from cayu.artifacts.local import LocalArtifactStore
+from cayu.budgets.run_limits import RunLimits
 from cayu.configuration import CayuConfig, ToolExecutionConfig
 from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME, StructuredOutputSpec
 from cayu.environments.base import Environment, EnvironmentSpec
@@ -53,7 +54,6 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileComponentClass,
     ExecutionProfileMismatchError,
 )
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import (
     EventQuery,
     IncompleteSessionRecoveryRequest,

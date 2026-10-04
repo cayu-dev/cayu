@@ -36,6 +36,7 @@ from cayu._validation import (
 )
 from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
 from cayu.budgets.base import BudgetLimit, copy_request_budget_limits
+from cayu.budgets.run_limits import RunLimits, copy_run_limits
 from cayu.configuration import DEFAULT_MAX_STEPS, MAX_STEPS
 from cayu.context.structured_output import (
     StructuredOutputSpec,
@@ -85,7 +86,6 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
-from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.sessions._model_failover import ModelFailoverPolicy, copy_optional_model_failover_policy
 from cayu.sessions._terminal_evidence import (
     queued_dispatch_terminal_event_id as _queued_dispatch_terminal_event_id,

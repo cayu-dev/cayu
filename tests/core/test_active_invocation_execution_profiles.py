@@ -23,6 +23,7 @@ from cayu.approvals.tools import (
 from cayu.approvals.user_input import UserInputResponse, pending_user_input_from_checkpoint
 from cayu.budgets.base import BudgetLimit, BudgetPolicy
 from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.budgets.run_limits import RunLimits
 from cayu.configuration import CayuConfig, RunDefaults
 from cayu.context.base import (
     CheckpointCompactionContextPolicy,
@@ -90,7 +91,6 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import (
     EventQuery,
     ForkExecutionProfileSelection,

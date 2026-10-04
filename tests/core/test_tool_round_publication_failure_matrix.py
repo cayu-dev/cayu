@@ -13,13 +13,13 @@ from tests.core._execution_profile_fixtures import versioned_test_provider_ident
 from cayu import CayuConfig, ToolExecutionConfig
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
+from cayu.budgets.run_limits import RunLimits
 from cayu.events import Event, EventType
 from cayu.messages import Message, ToolResultPart
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import _run_limits as run_limits
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,

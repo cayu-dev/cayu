@@ -14,12 +14,12 @@ from cayu._validation import (
     revalidate_model_input,
 )
 from cayu.budgets.base import BudgetLimit, copy_request_budget_limits
+from cayu.budgets.run_limits import RunLimits
 from cayu.configuration import MAX_STEPS
 from cayu.context.structured_output import StructuredOutputSpec
 from cayu.context.thinking import ThinkingConfig
 from cayu.deadlines import ExecutionDeadline
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.tool_completion import ToolCompletionPolicy, copy_tool_completion_policy
 from cayu.sessions._model_failover import ModelFailoverPolicy, copy_optional_model_failover_policy
 from cayu.tasks.contracts import require_bounded_work_completion_document

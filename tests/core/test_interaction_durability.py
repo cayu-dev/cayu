@@ -15,6 +15,7 @@ from cayu._exception_groups import exception_cause, iter_exception_tree
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
+from cayu.budgets.run_limits import RunLimits
 from cayu.environments import (
     EnvironmentFactory,
     EnvironmentFactoryRequest,
@@ -34,7 +35,6 @@ from cayu.observability.hooks import RuntimeHook, RuntimeHookContext
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import _session_engine as session_engine_module
 from cayu.runtime.loop_policies import LoopPolicy
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import (
     EnqueueSessionMessageRequest,
     EventQuery,

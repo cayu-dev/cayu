@@ -7,6 +7,7 @@ from typing import Literal
 import pytest
 from tests.evals.test_corpus_execution import _corpus, _provider, _target
 
+from cayu.budgets.run_limits import RunLimits
 from cayu.evals.corpus import (
     CorpusUserMessageSpec,
     EvaluationEvidencePolicySpec,
@@ -49,7 +50,6 @@ from cayu.evals.suite_preflight import (
     compile_authored_suite_run_exposure,
 )
 from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
-from cayu.runtime.stop_policy import RunLimits
 
 
 def _profile(

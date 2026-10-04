@@ -11,6 +11,7 @@ from tests.provider_cleanup_assertions import without_redacted_cleanup_context
 from cayu._exception_groups import iter_exception_tree
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
+from cayu.budgets.run_limits import RunLimits
 from cayu.context.base import context_input_coverage
 from cayu.events import Event, EventType
 from cayu.messages import Message
@@ -26,7 +27,6 @@ from cayu.runtime._model_step_executor import (
 from cayu.runtime._run_limits import RunLimitGate
 from cayu.runtime.execution_units import new_model_step_identity
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     ModelStepPublicationCheckpoint,

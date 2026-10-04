@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from tests._session_provenance import fixture_session_invocation
 
 from cayu.agents import AgentSpec
+from cayu.budgets.run_limits import RunLimits
 from cayu.context.base import CompactionRequest, ContextRequest
 from cayu.embeddings import (
     TextEmbedding,
@@ -32,7 +33,6 @@ from cayu.providers import (
 )
 from cayu.proxies import AllowlistProxy
 from cayu.runners import ExecCommand
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import ResumeRequest, RunRequest, Session
 from cayu.storage import (
     InMemoryEmbeddingKnowledgeStore,

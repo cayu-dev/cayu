@@ -55,6 +55,7 @@ from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.applications import CayuApp
 from cayu.approvals.user_input import PendingUserInput
 from cayu.artifacts.local import LocalArtifactStore
+from cayu.budgets.run_limits import RunLimits
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.providers.operations import ProviderOperationStatus
@@ -73,7 +74,6 @@ from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     PublicAuthorityAliasKeyring,
 )
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import (
     EventOrder,
     EventQuery,

@@ -1,4 +1,7 @@
 {
+    "tests/core/test_run_limit_accounting_contracts.py::test_run_accounting_composes_without_clock_execution_or_store_owners": 0.17194487401138758,
+    "tests/core/test_run_limit_accounting_contracts.py::test_run_accounting_records_and_clock_adapter_share_canonical_types": 0.002180915995268151,
+    "tests/core/test_run_limit_accounting_contracts.py::test_run_limit_public_imports_and_historical_class_pickle_keep_identity": 0.0036824169947067276,
     "tests/core/test_knowledge_relation_queries.py::test_lineage_matching_preserves_direction_symmetry_and_exact_revision[both-contradicts]": 0.0002912089985329658,
     "tests/core/test_knowledge_relation_queries.py::test_lineage_matching_preserves_direction_symmetry_and_exact_revision[both-derived_from]": 0.0002950409907498397,
     "tests/core/test_knowledge_relation_queries.py::test_lineage_matching_preserves_direction_symmetry_and_exact_revision[both-supersedes]": 0.0003040000010514632,

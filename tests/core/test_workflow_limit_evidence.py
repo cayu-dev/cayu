@@ -9,10 +9,10 @@ import pytest
 
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
+from cayu.budgets.run_limits import RunLimits
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.observability.hooks import RuntimeHook
 from cayu.providers.base import ModelStreamEvent
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import InMemorySessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolResult, ToolSpec

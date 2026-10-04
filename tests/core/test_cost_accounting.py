@@ -733,9 +733,9 @@ def test_active_cost_refresh_serializes_and_drops_removed_scopes():
     import asyncio
 
     from cayu.applications import CayuApp
+    from cayu.budgets.run_limits import RunLimits
     from cayu.messages import Message
     from cayu.runtime._run_limits import SessionUsageTracker
-    from cayu.runtime.stop_policy import RunLimits
     from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
 
     async def run():

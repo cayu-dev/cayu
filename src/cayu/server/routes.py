@@ -90,6 +90,7 @@ from cayu.budgets.pricing import (
     PriceBook,
     SessionCostSummary,
 )
+from cayu.budgets.run_limits import RunLimits
 from cayu.budgets.usage import (
     CausalBudgetUsageSummary,
     SessionUsageSummary,
@@ -167,7 +168,6 @@ from cayu.runtime.session_message_lifecycle import (
     SessionMessageQuery,
     SessionMessageSource,
 )
-from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.tool_completion import ToolCompletionPolicy
 from cayu.server._browser_client import (
     BROWSER_CLIENT_MODULE,

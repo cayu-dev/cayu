@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
+from cayu.budgets.run_limits import RunLimits
 from cayu.configuration import (
     DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS,
     DEFAULT_MAX_PARALLEL_TOOL_CALLS,
@@ -24,7 +25,6 @@ from cayu.evals.testing import ScriptedModelProvider
 from cayu.messages import Message
 from cayu.runtime.config_inspection import EffectiveRunConfiguration
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import RunRequest, copy_run_request
 
 

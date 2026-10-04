@@ -36,6 +36,7 @@ from cayu.browser_profiles import (
 )
 from cayu.budgets.base import BudgetLimit, BudgetReservation
 from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.budgets.run_limits import RunLimits
 from cayu.egress.adapter import EgressBinding, RunnerFinalizationResult, SandboxEgressAdapter
 from cayu.egress.authority import EgressAuthorityCutoverStrategy
 from cayu.egress.broker import HttpxUpstream
@@ -82,7 +83,6 @@ from cayu.providers.base import ModelRequest, ModelStreamEvent
 from cayu.runners.base import ExecCommand, ExecResult, Runner, RunnerWorkloadAuthority
 from cayu.runners.workloads import PINNED_BROWSER_SESSION_WORKLOAD
 from cayu.runtime._event_projection import public_event_id, public_event_sequence
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import RunRequest
 from cayu.tools.base import (
     Tool,

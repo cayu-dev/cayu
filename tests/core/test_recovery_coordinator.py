@@ -17,6 +17,7 @@ from cayu.applications import CayuApp
 from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
 from cayu.budgets.base import BudgetLimit
 from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.budgets.run_limits import RunLimits
 from cayu.context.thinking import ThinkingConfig
 from cayu.events import Event, EventType
 from cayu.messages import Message
@@ -42,7 +43,6 @@ from cayu.runtime.build_provenance import (
 )
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import (
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     CheckpointTransform,

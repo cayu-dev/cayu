@@ -27,6 +27,7 @@ from cayu.artifacts.attachments import FileAttachmentKind, file_attachment
 from cayu.budgets.base import BudgetLimit, BudgetPolicy, BudgetReservation, InMemoryBudgetLedger
 from cayu.budgets.billing import BillingIdentity
 from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.budgets.run_limits import RunLimits
 from cayu.configuration import CayuConfig, ToolExecutionConfig
 from cayu.context.base import (
     CheckpointCompactionContextPolicy,
@@ -63,7 +64,6 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileMismatchError,
 )
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import (
     CompactSessionRequest,
     EventQuery,

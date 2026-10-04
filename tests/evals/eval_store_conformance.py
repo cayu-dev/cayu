@@ -10,6 +10,7 @@ from typing import Literal
 
 import pytest
 
+from cayu.budgets.run_limits import RunLimits
 from cayu.evals.calibration import EvalJudgeCalibrationReportV1
 from cayu.evals.corpus import (
     CorpusUserMessageSpec,
@@ -85,7 +86,6 @@ from cayu.evals.suite_authoring import (
     compile_eval_suite_draft,
 )
 from cayu.runtime.manifest import AppManifest, ToolManifest, _app_manifest_fingerprint
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.invocation import (
     InvocationOrigin,
     InvocationOriginTrust,

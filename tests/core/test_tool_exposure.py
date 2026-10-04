@@ -11,10 +11,10 @@ import cayu
 import cayu.tools.exposure as exposure_contracts
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
+from cayu.budgets.run_limits import RunLimits
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.stop_policy import RunLimits
 from cayu.tools.base import ToolEffect
 from cayu.tools.exposure import (
     ALL_REGISTERED_TOOLS_PROFILE_ID,

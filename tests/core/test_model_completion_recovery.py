@@ -31,6 +31,7 @@ from cayu.budgets.base import (
     budget_settlement_id,
 )
 from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.budgets.run_limits import RunLimits
 from cayu.configuration import DEFAULT_MAX_STEPS
 from cayu.events import Event, EventType
 from cayu.messages import Message, ToolCallPart, ToolResultPart
@@ -55,7 +56,6 @@ from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import ExecutionProfileIdentity, ExecutionProfileMismatchError
 from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions import _model_completion_publication as model_completion_publication
 from cayu.sessions.base import (
     EventQuery,

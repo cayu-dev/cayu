@@ -5,8 +5,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 
+from cayu.budgets.run_limits import RunLimits
 from cayu.configuration import MAX_STEPS
-from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.work_attempt_semantics import (
     WORK_ATTEMPT_RUN_SEMANTICS_MAX_BYTES,
     WorkAttemptRunSemantics,

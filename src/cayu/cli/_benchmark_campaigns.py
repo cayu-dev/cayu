@@ -9,6 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
+from cayu.budgets.run_limits import RunLimits
 from cayu.cli.project import project_context, resolve_eval_project
 from cayu.evals.benchmark_campaign import (
     BenchmarkCampaignSettingsV1,
@@ -22,7 +23,6 @@ from cayu.evals.benchmark_inspection import (
 )
 from cayu.evals.benchmark_package import benchmark_suite_selection, load_benchmark_package
 from cayu.evals.store import EvalRunCostBudget, EvalRunRecoveryPolicyV1
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import ModelTarget
 from cayu.storage.evals_sqlite import SQLiteEvalStore
 

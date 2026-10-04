@@ -30,6 +30,7 @@ from cayu.budgets.pricing import (
     TieredPricing,
     default_price_book,
 )
+from cayu.budgets.run_limits import RunLimits
 from cayu.evals.corpus import (
     MemoryAttributionAssertionSpec,
     PrivateJudgeReferenceV1,
@@ -106,7 +107,6 @@ from cayu.memory.execution import (
 from cayu.memory.interventions import MemoryInterventionTrialBinding
 from cayu.messages import Message
 from cayu.providers import ModelRequest, ModelStreamEvent
-from cayu.runtime.stop_policy import RunLimits
 from cayu.snapshots.base import (
     AgentSnapshotCoordinator,
     AgentSnapshotResultBinding,

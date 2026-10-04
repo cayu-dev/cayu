@@ -34,6 +34,7 @@ import cayu.server.routes as routes_module
 import cayu.storage.evals_sqlite as evals_sqlite_module
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
+from cayu.budgets.run_limits import RunLimits
 from cayu.evals.capacity import EvalExecutionCapacity
 from cayu.evals.corpus import (
     CorpusUserMessageSpec,
@@ -68,7 +69,6 @@ from cayu.project_control_plane import (
     _create_project_control_plane_context,
 )
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime.stop_policy import RunLimits
 from cayu.server import (
     AuthContext,
     AuthenticatedAccess,

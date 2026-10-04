@@ -114,6 +114,7 @@ from cayu.budgets.pricing import (
     Provenance,
     TieredPricing,
 )
+from cayu.budgets.run_limits import RunLimits
 from cayu.configuration import CayuConfig, OperationsConfig, RunDefaults, ToolExecutionConfig
 from cayu.context.base import (
     CheckpointCompactionContextPolicy,
@@ -261,7 +262,6 @@ from cayu.runtime.execution_profiles import (
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions._invocation_terminal_decision import (
     settled_invocation_terminal_decision_from_checkpoint,
 )

@@ -16,6 +16,7 @@ from cayu._validation import (
     require_clean_nonblank,
     require_unicode_scalar_text,
 )
+from cayu.budgets.run_limits import RunLimits
 from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
 from cayu.evals.corpus import EvalCorpusDocument, eval_suite_trial_policy
 from cayu.evals.execution import CompiledCorpusSuite, CorpusTarget, compile_corpus_suite
@@ -29,7 +30,6 @@ from cayu.evals.store import (
     EvalStorePublicationRejected,
 )
 from cayu.evals.trial_policy import EvalSuiteRunExposureV1
-from cayu.runtime.stop_policy import RunLimits
 from cayu.server.auth import AuthContext
 from cayu.server.evals_registry import target_for_eval_invocation
 from cayu.sessions.invocation import InvocationOrigin, InvocationOriginTrust, SessionExecutionSource

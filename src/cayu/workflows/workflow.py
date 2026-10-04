@@ -34,6 +34,7 @@ from cayu._validation import (
 )
 from cayu.applications import CayuApp
 from cayu.budgets.base import BudgetLimit, copy_request_budget_limits
+from cayu.budgets.run_limits import RunLimits, copy_run_limits
 from cayu.configuration import DEFAULT_MAX_STEPS, MAX_STEPS
 from cayu.context.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
@@ -71,7 +72,6 @@ from cayu.runtime._child_session_identity import (
 )
 from cayu.runtime._session_request_boundary import prepare_run_request
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
-from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.sessions._model_failover import ModelFailoverPolicy, copy_optional_model_failover_policy
 from cayu.sessions.base import (
     IncompleteSessionRecoveryRequest,

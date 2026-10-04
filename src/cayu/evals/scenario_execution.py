@@ -22,6 +22,7 @@ from cayu.artifacts.attachments import (
     FileAttachment,
     FileAttachmentKind,
 )
+from cayu.budgets.run_limits import RunLimits
 from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
 from cayu.evals._trial_publication import save_trial_checkpoint_with_retry
 from cayu.evals.capacity import EvalExecutionCapacity
@@ -100,7 +101,6 @@ from cayu.messages import FilePart, Message, MessageRole, TextPart
 from cayu.runtime.execution_profiles import (
     ExecutionProfileMismatchError,
 )
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import (
     EnqueueSessionMessageRequest,
     PendingActionKind,

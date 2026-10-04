@@ -213,6 +213,7 @@ from cayu.budgets.base import (
 )
 from cayu.budgets.pricing import PriceBook
 from cayu.budgets.reported import ReportedCostCollector
+from cayu.budgets.run_limits import RunLimits, copy_run_limits
 from cayu.budgets.usage import UsageMetrics
 from cayu.configuration import DEFAULT_MAX_STEPS, MAX_STEPS
 from cayu.context.structured_output import (
@@ -342,7 +343,6 @@ from cayu.runtime.session_message_lifecycle import (
     session_message_checkpoint_sha256,
     session_message_rejection,
 )
-from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.tool_completion import ToolCompletionPolicy, copy_tool_completion_policy
 from cayu.sessions._browser_control_checkpoint import (
     browser_control_checkpoint_visible,

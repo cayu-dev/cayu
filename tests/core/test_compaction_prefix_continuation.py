@@ -12,6 +12,7 @@ from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.budgets.base import BudgetLimit
 from cayu.budgets.pricing import ModelPrice, PriceBook
+from cayu.budgets.run_limits import RunLimits
 from cayu.context.base import (
     CheckpointCompactionContextPolicy,
     CompactionResult,
@@ -25,7 +26,6 @@ from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelProvider, ModelStreamEvent
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest, SessionIdentity
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.vaults.redaction import SecretRedactor

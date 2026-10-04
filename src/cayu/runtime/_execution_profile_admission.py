@@ -16,6 +16,7 @@ from cayu._validation import canonical_durable_json_bytes, revalidate_model_inpu
 from cayu.approvals.user_input import user_input_lifecycle_authority_from_checkpoint
 from cayu.artifacts._store_identity import local_artifact_store_identity
 from cayu.artifacts.local import LocalArtifactStore
+from cayu.budgets.run_limits import RunLimits
 from cayu.egress.authority import EgressAuthorityIdentity, _copy_egress_authority_identity
 from cayu.execution_profiles import (
     ExecutionProfileComponentClass,
@@ -43,7 +44,6 @@ from cayu.runtime.execution_profiles import (
     execution_profile_provider_adapter_component,
 )
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.tool_completion import ToolCompletionPolicy, copy_tool_completion_policy
 from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,

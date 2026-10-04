@@ -22,6 +22,7 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_unicode_scalar_text,
 )
+from cayu.budgets.run_limits import RunLimits, copy_run_limits
 from cayu.configuration import MAX_STEPS
 from cayu.evals.capacity import EVAL_MAX_CONCURRENCY
 from cayu.evals.corpus import (
@@ -40,7 +41,6 @@ from cayu.evals.execution import (
 from cayu.execution_profiles import (
     ExecutionProfileIdentity,
 )
-from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.sessions.base import copy_run_request
 
 EVAL_EXECUTION_PROFILE_MAX_TEXT_CHARS = 256

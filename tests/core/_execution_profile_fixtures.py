@@ -10,6 +10,7 @@ from uuid import uuid4
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.budgets.base import BudgetLimit, request_budget_limits_for_session
+from cayu.budgets.run_limits import RunLimits, copy_run_limits
 from cayu.configuration import DEFAULT_MAX_STEPS
 from cayu.context.structured_output import StructuredOutputSpec
 from cayu.context.thinking import ThinkingConfig, thinking_config_payload
@@ -50,7 +51,6 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
-from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.sessions.base import (
     RunRequest,
     Session,

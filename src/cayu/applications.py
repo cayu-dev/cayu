@@ -118,6 +118,7 @@ from cayu.budgets.pricing import (
     SessionCostSummary,
     SessionCostTotals,
 )
+from cayu.budgets.run_limits import RunLimits
 from cayu.budgets.usage import (
     CausalBudgetUsageSummary,
     SessionUsageSummary,
@@ -592,10 +593,7 @@ from cayu.runtime.session_steering import (
     SessionSteeringReceipt,
     StopAfterCurrentToolRoundRequest,
 )
-from cayu.runtime.stop_policy import (
-    RunLimits,
-    StopDecision,
-)
+from cayu.runtime.stop_policy import StopDecision
 from cayu.runtime.tool_effects import (
     ToolEffectConflict,
     ToolEffectReceipt,

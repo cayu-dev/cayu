@@ -11,6 +11,7 @@ from tests.core._execution_profile_fixtures import create_admitted_session
 from cayu import CayuConfig, ToolExecutionConfig
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
+from cayu.budgets.run_limits import RunLimits
 from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME, StructuredOutputSpec
 from cayu.events import Event, EventType
 from cayu.messages import Message, ToolCallPart, ToolResultPart
@@ -23,7 +24,6 @@ from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import ExecutionProfileIdentity
 from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions import _model_completion_publication as model_completion_publication
 from cayu.sessions.base import (
     IncompleteSessionRecoveryAction,

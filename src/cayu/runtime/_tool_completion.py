@@ -5,6 +5,7 @@ from __future__ import annotations
 from enum import Enum, auto
 from typing import Any
 
+from cayu.budgets.run_limits import RunLimits
 from cayu.events import EventType
 from cayu.execution_profiles import (
     ExecutionProfileComponentClass,
@@ -25,7 +26,6 @@ from cayu.runtime._tool_round_recovery import (
     pending_tool_round_identity,
 )
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.tool_completion import ToolCompletionPolicy, ToolCompletionResult
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,

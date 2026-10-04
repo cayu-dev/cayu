@@ -28,6 +28,7 @@ from cayu.artifacts import (
     copy_artifact_read_result,
 )
 from cayu.budgets.base import budget_pricing_preflight_error
+from cayu.budgets.run_limits import RunLimits, copy_run_limits
 from cayu.configuration import MAX_STEPS
 from cayu.evals.capacity import EVAL_MAX_CONCURRENCY
 from cayu.evals.corpus import (
@@ -53,7 +54,6 @@ from cayu.evals.scenario import (
 )
 from cayu.evals.scenario_authoring import replace_eval_scenario_artifact_requirement
 from cayu.evals.store import EvalRunCostBudget
-from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.vaults import Vault, VaultError, copy_secret_ref
 
 SCENARIO_PREFLIGHT_MAX_DIAGNOSTICS = 1_024

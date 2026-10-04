@@ -40,6 +40,7 @@ from cayu.browser_profiles import (
     BrowserProfileScope,
     InMemoryBrowserProfileStore,
 )
+from cayu.budgets.run_limits import RunLimits
 from cayu.egress.broker import HttpxUpstream
 from cayu.egress.destinations import ApprovedEgressDestination
 from cayu.egress.docker_adapter import DockerEgressAdapter
@@ -86,7 +87,6 @@ from cayu.runtime._event_projection import public_event_sequence
 from cayu.runtime._tool_round_recovery import PENDING_TOOL_ROUND_CHECKPOINT_KEY, PendingToolRound
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.runtime.stop_policy import RunLimits
 from cayu.sessions._execution_profile_checkpoint import (
     execution_profile_from_session_metadata,
 )

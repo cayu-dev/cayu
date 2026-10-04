@@ -44,6 +44,7 @@ from cayu.budgets.pricing import (
     SessionCostSummary,
 )
 from cayu.budgets.reported import ReportedCostPage
+from cayu.budgets.run_limits import RunLimits
 from cayu.budgets.usage import (
     AggregateUsageMetrics,
     CausalBudgetUsageSummary,
@@ -110,7 +111,6 @@ from cayu.evals.trial_policy import EvalSuiteRunExposureV1
 from cayu.events import EVENT_ID_MAX_CHARS
 from cayu.knowledge.records import MAX_KNOWLEDGE_REVISION
 from cayu.runtime.build_provenance import RuntimeBuildProvenance
-from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.system_diagnostics import (
     MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS as MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS,
 )
