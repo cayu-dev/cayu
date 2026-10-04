@@ -9803,3 +9803,17 @@ def test_same_public_web_profile_resumes_without_adoption() -> None:
         )
 
     asyncio.run(exercise())
+
+
+def test_tool_implementation_mismatch_points_to_the_tool_identity_fix() -> None:
+    error = ExecutionProfileMismatchError(
+        session_id="paused",
+        expected_profile_fingerprint="a" * 64,
+        candidate_profile_fingerprint="b" * 64,
+        changed_component_classes=(ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,),
+    )
+
+    message = str(error)
+    assert "execution profile changed in: tool_implementations" in message
+    assert "execution_profile_identity=ExecutionProfileBehaviorIdentity(" in message
+    assert "cayu generate tool" in message

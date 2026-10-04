@@ -409,6 +409,9 @@ def test_cli_reports_live_capability_drift(tmp_path, capsys, monkeypatch, comman
     project = tmp_path / "profile"
     tools = project / "tools/registration.py"
     source = tools.read_text()
+    if add:
+        # Disabled capabilities generate no imports, so wiring one adds its own.
+        source = source.replace('"""\n\n', '"""\n\nfrom cayu import UserInputTool\n', 1)
     tools.write_text(
         source.replace(
             "    return tuple(tools)",
@@ -438,8 +441,8 @@ def test_cli_reports_live_task_store_drift(tmp_path, capsys, monkeypatch, comman
     project = tmp_path / "profile"
     storage = project / "configuration/storage.py"
     source = storage.read_text()
-    old = f"build_tasks = {not add} and task_store is None"
-    new = f"build_tasks = {add} and task_store is None"
+    enabled, disabled = "build_tasks = task_store is None\n", "build_tasks = False\n"
+    old, new = (disabled, enabled) if add else (enabled, disabled)
     assert old in source
     storage.write_text(source.replace(old, new))
     monkeypatch.chdir(project)

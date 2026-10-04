@@ -25,6 +25,7 @@ from cayu.cli._bounded_command import (
     BoundedCommandTimeoutError,
     run_bounded_command,
 )
+from cayu.cli._constant_branches import ConstantBranchError, simplify_constant_branches
 from cayu.cli._guarded_tree_publication import (
     DestinationPolicy,
     GuardedTreePublicationError,
@@ -198,19 +199,72 @@ def _require_safe_scaffold_parent(parent: Path) -> None:
         raise _ScaffoldCommandError("scaffold parent is unavailable") from None
     if not stat.S_ISDIR(parent_stat.st_mode):
         raise _ScaffoldCommandError("scaffold parent is not a directory")
-    if _unsafe_shared_scaffold_parent_mode(parent_stat.st_mode, platform=os.name):
+    mode = parent_stat.st_mode
+    # Reading the user database is only worth it when group write alone decides.
+    group_write_decides = (
+        os.name != "nt" and bool(mode & stat.S_IWGRP) and not mode & (stat.S_ISVTX | stat.S_IWOTH)
+    )
+    if _unsafe_shared_scaffold_parent_mode(
+        mode,
+        platform=os.name,
+        group_is_private=group_write_decides and _owned_private_group(parent_stat),
+    ):
         raise _ScaffoldCommandError(
-            "scaffold parent must not be group/world-writable unless it is sticky"
+            "scaffold parent must not be group/world-writable unless it is sticky "
+            "or group-writable only by your own private group"
         )
 
 
-def _unsafe_shared_scaffold_parent_mode(mode: int, *, platform: str) -> bool:
-    """Interpret shared-write and sticky bits only where POSIX modes are authoritative."""
+def _unsafe_shared_scaffold_parent_mode(
+    mode: int,
+    *,
+    platform: str,
+    group_is_private: bool = False,
+) -> bool:
+    """Interpret shared-write and sticky bits only where POSIX modes are authoritative.
 
-    if platform == "nt":
+    Group write is safe when the group is the owner's private group (the default
+    under umask 002 on Ubuntu and Fedora): no other user is in it.
+    """
+
+    if platform == "nt" or mode & stat.S_ISVTX:
         return False
-    shared_write = mode & (stat.S_IWGRP | stat.S_IWOTH)
-    return bool(shared_write and not mode & stat.S_ISVTX)
+    if mode & stat.S_IWOTH:
+        return True
+    return bool(mode & stat.S_IWGRP) and not group_is_private
+
+
+def _owned_private_group(parent_stat: os.stat_result) -> bool:
+    """Whether the current user owns the directory and its group is theirs alone.
+
+    Membership comes from the local user and group databases: no supplementary
+    member other than the user, and no other account with it as its primary
+    group (``gr_mem`` lists supplementary members only). Directory services that
+    do not enumerate their users cannot prove the second part, so a group they
+    share may still look private here.
+    """
+
+    if os.name == "nt":
+        return False
+    import grp
+    import pwd
+
+    uid = os.geteuid()
+    try:
+        user = pwd.getpwuid(uid)
+        group = grp.getgrgid(parent_stat.st_gid)
+    except KeyError:
+        return False
+    if not (
+        parent_stat.st_uid == uid
+        and parent_stat.st_gid == user.pw_gid
+        and group.gr_name == user.pw_name
+        and set(group.gr_mem) <= {user.pw_name}
+    ):
+        return False
+    return not any(
+        entry.pw_gid == parent_stat.st_gid and entry.pw_uid != uid for entry in pwd.getpwall()
+    )
 
 
 def _run_scaffold_git_command(
@@ -943,9 +997,16 @@ Use public `cayu` imports and public CLI JSON only. Do not depend on Cayu source
 private symbols, or import-time application construction.
 
 If the job truly needs a tool, read `cayu guide tool-effects`; every tool must
-declare `ToolEffect`, and effect metadata does not authorize execution. A
+declare `ToolEffect`, and effect metadata does not authorize execution. Every
+custom tool, including read-only ones, also needs
+`execution_profile_identity=ExecutionProfileBehaviorIdentity(name=..., behavior_version="1", implementation_version="1")`
+in its class-level `ToolSpec`: without it, paused or resumed sessions fail with
+`ExecutionProfileMismatchError ... tool_implementations` as soon as the tool set
+changes. Bump `behavior_version` when a tool's behavior changes. A
 `ScriptedModelProvider` proves handling of predetermined calls, not prompt
-comprehension or live model behavior.
+comprehension or live model behavior. A custom tool's result reaches the model
+only through its `content`, never its `structured` data: assert on
+`model_facing_text(provider.requests[i])` to check what the real model would read.
 
 For the starter's first real tool, run
 `uv run --no-sync cayu generate tool TOOL_NAME --agent __AGENT_NAME__ --effect EFFECT`.
@@ -2601,6 +2662,45 @@ def _uses_cayu_source_checkout(plan: ApplicationPlan) -> bool:
 
 
 def project_files(
+    name: str,
+    *,
+    agent_name: str | None = None,
+    provider: str | None = None,
+    coding_toolchain: str | None = None,
+    coding_command_authority: str | None = None,
+    preset: str | None = None,
+    execution: str | None = None,
+    with_capabilities: tuple[str, ...] = (),
+    without_capabilities: tuple[str, ...] = (),
+    application_plan: ApplicationPlan | None = None,
+) -> dict[str, str]:
+    """Render every project file, keeping only the selected capability branches."""
+
+    files = _rendered_project_files(
+        name,
+        agent_name=agent_name,
+        provider=provider,
+        coding_toolchain=coding_toolchain,
+        coding_command_authority=coding_command_authority,
+        preset=preset,
+        execution=execution,
+        with_capabilities=with_capabilities,
+        without_capabilities=without_capabilities,
+        application_plan=application_plan,
+    )
+    simplified: dict[str, str] = {}
+    for relative, content in files.items():
+        if not relative.endswith(".py"):
+            simplified[relative] = content
+            continue
+        try:
+            simplified[relative] = simplify_constant_branches(content)
+        except ConstantBranchError as exc:
+            raise ConstantBranchError(f"{relative}: {exc}") from exc
+    return simplified
+
+
+def _rendered_project_files(
     name: str,
     *,
     agent_name: str | None = None,

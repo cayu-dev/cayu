@@ -19,8 +19,12 @@ from cayu.cli.project_control_plane import (
     close_project_control_plane_context,
 )
 from cayu.cli.scaffold_check import (
+    application_load_failed_diagnostic,
+    application_not_imported_diagnostic,
     check_declared_scaffold,
     check_declared_scaffold_source,
+    filter_findings,
+    import_blocking_findings,
 )
 from cayu.runtime.checks import (
     AVAILABLE_CHECK_TAGS,
@@ -86,21 +90,42 @@ def _run_check(args: argparse.Namespace) -> int:
         message = f"Unknown check tags: {', '.join(sorted(unknown))}."
         _render_invocation_error(message, as_json=args.output_format == "json")
         return 2
+    source_errors = False
     try:
         project = resolve_project(args.target, command="cayu check")
-        source_diagnostics = check_declared_scaffold_source(
-            project.root,
+        all_source_diagnostics = check_declared_scaffold_source(project.root)
+        source_diagnostics = filter_findings(
+            all_source_diagnostics,
             tags=requested_tags,
             deploy_only=args.deploy,
         )
-        blocking_source_diagnostics = tuple(
-            item for item in source_diagnostics if item.severity is DiagnosticSeverity.ERROR
-        )
+        # Never import code that failed the import-safety check, whatever the
+        # requested tags. Blocking findings are always reported, even outside the
+        # requested tags: they stopped every other check, so a tagged run must
+        # not pass having checked nothing. Other source errors still let the
+        # app load and be checked.
+        blocking_source_diagnostics = import_blocking_findings(all_source_diagnostics)
         if blocking_source_diagnostics:
+            outside_selection = tuple(
+                item for item in blocking_source_diagnostics if item not in source_diagnostics
+            )
             return _render_report(
                 args,
-                _source_only_report(blocking_source_diagnostics),
+                _source_only_report(
+                    (
+                        *source_diagnostics,
+                        *outside_selection,
+                        application_not_imported_diagnostic(
+                            len(blocking_source_diagnostics),
+                            outside_selection=len(outside_selection),
+                        ),
+                    )
+                ),
             )
+        # Only reported errors may stand in for a factory failure below.
+        source_errors = any(
+            item.severity is DiagnosticSeverity.ERROR for item in source_diagnostics
+        )
         control_plane_context = build_project_control_plane_context(
             project.root,
             mode="production",
@@ -147,6 +172,12 @@ def _run_check(args: argparse.Namespace) -> int:
         finally:
             close_project_control_plane_context(control_plane_context)
     except Exception as exc:
+        if source_errors and not isinstance(exc, ProjectError):
+            # Source drift often explains a factory failure; keep it visible.
+            return _render_report(
+                args,
+                _source_only_report((*source_diagnostics, application_load_failed_diagnostic(exc))),
+            )
         message = (
             str(exc)
             if isinstance(exc, ProjectError)
@@ -203,7 +234,9 @@ def _source_only_report(
 
     return ProjectCheckReport(
         manifest_fingerprint="unavailable",
-        diagnostics=tuple(sorted(diagnostics, key=lambda item: (item.code, item.path))),
+        diagnostics=tuple(
+            sorted(diagnostics, key=lambda item: (item.severity.value, item.code, item.path))
+        ),
         service_evidence=ServiceCheckEvidence(
             control_plane_access="not_evaluated",
             service_contract="not_declared",

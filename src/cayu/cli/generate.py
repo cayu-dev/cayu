@@ -1818,7 +1818,14 @@ from tools.{tool_name} import {tool_name_constant}
     authoring_state=AgentAuthoringState.UNFINISHED_GENERATED_TRACER_BULLET,
 )
 '''
-    tool = f'''from cayu import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+    tool = f'''from cayu import (
+    ExecutionProfileBehaviorIdentity,
+    Tool,
+    ToolContext,
+    ToolEffect,
+    ToolResult,
+    ToolSpec,
+)
 
 
 {tool_name_constant} = "{tool_name}"
@@ -1835,6 +1842,13 @@ class {tool_class}(Tool):
             "required": ["input"],
             "additionalProperties": False,
         }},
+        # Every custom tool declares its behavior so paused sessions can resume.
+        # Bump behavior_version whenever this tool's behavior changes.
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="{name}.{tool_name}",
+            behavior_version="1",
+            implementation_version="1",
+        ),
     )
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
@@ -1995,7 +2009,14 @@ def _first_tool_files(*, agent_name: str, tool_name: str, effect: str) -> dict[s
             }
         )
     )
-    tool = f'''from cayu import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+    tool = f'''from cayu import (
+    ExecutionProfileBehaviorIdentity,
+    Tool,
+    ToolContext,
+    ToolEffect,
+    ToolResult,
+    ToolSpec,
+)
 
 
 {tool_name_constant} = "{tool_name}"
@@ -2012,6 +2033,13 @@ class {tool_class}(Tool):
             "required": ["input"],
             "additionalProperties": False,
         }},
+        # Every custom tool declares its behavior so paused sessions can resume.
+        # Bump behavior_version whenever this tool's behavior changes.
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="{agent_name}.{tool_name}",
+            behavior_version="1",
+            implementation_version="1",
+        ),
     )
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:

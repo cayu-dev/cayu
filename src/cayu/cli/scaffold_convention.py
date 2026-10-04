@@ -578,7 +578,7 @@ def build_agent_tools() -> tuple[Tool, ...]:
                 RememberKnowledgeTool(
                     spec=RememberKnowledgeTool.spec.model_copy(
                         update={
-                            "execution_profile_identity": _REMEMBER_KNOWLEDGE_IDENTITY
+                            "execution_profile_identity": _REMEMBER_KNOWLEDGE_IDENTITY,
                         },
                         deep=True,
                     ),
@@ -866,7 +866,7 @@ def build_local_environment(
     selected_artifacts = artifact_store
     if not __KNOWLEDGE_ENABLED__ and (knowledge_store is not None or knowledge_scope is not None):
         raise ValueError("knowledge collaborators require the knowledge capability")
-    if selected_artifacts is None and __ARTIFACTS_ENABLED__:
+    if __ARTIFACTS_ENABLED__ and selected_artifacts is None:
         selected_artifacts = LocalArtifactStore(
             _PROJECT_ROOT / "data" / "artifacts",
             store_id="standard-local-artifacts",

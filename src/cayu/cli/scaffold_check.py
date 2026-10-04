@@ -121,6 +121,99 @@ def check_declared_scaffold_source(
     return _filter(diagnostics, tags=tags, deploy_only=deploy_only)
 
 
+def filter_findings(
+    diagnostics: tuple[ProjectDiagnostic, ...],
+    *,
+    tags: frozenset[str] = frozenset(),
+    deploy_only: bool = False,
+) -> tuple[ProjectDiagnostic, ...]:
+    """Select the findings a ``--tag``/``--deploy`` report shows."""
+
+    return _filter(diagnostics, tags=tags, deploy_only=deploy_only)
+
+
+# Findings that mean importing the application could run unproven code: an
+# import-safety failure, or a contract so invalid that the import-safety proof
+# never ran. Every other source finding still lets `cayu check` load the app.
+IMPORT_BLOCKING_CODES = frozenset(
+    {
+        "SCAFFOLD_CONTRACT_INVALID",
+        "SCAFFOLD_CONVENTION_UNSUPPORTED",
+        "SCAFFOLD_IMPORT_SIDE_EFFECT",
+        "SCAFFOLD_MODULE_SOURCE_INVALID",
+    }
+)
+
+
+def import_blocking_findings(
+    diagnostics: tuple[ProjectDiagnostic, ...],
+) -> tuple[ProjectDiagnostic, ...]:
+    """Return error findings that make importing the application unsafe."""
+
+    return tuple(
+        item
+        for item in diagnostics
+        if item.code in IMPORT_BLOCKING_CODES and item.severity is DiagnosticSeverity.ERROR
+    )
+
+
+def application_not_imported_diagnostic(
+    blocking: int, *, outside_selection: int = 0
+) -> ProjectDiagnostic:
+    """Explain which checks did not run because the app was not imported.
+
+    *outside_selection* counts blocking findings outside the requested tags or
+    ``--deploy``; the report lists them anyway, because they stopped the check.
+    """
+
+    listed = (
+        "every source finding is listed."
+        if not outside_selection
+        else (
+            f"{outside_selection} of the blocking findings "
+            f"{'is' if outside_selection == 1 else 'are'} outside the requested tags and "
+            f"{'is' if outside_selection == 1 else 'are'} listed anyway, because "
+            f"{'it' if outside_selection == 1 else 'they'} stopped the check."
+        )
+    )
+    return _diagnostic(
+        code="SCAFFOLD_APPLICATION_NOT_IMPORTED",
+        path="app.py",
+        message=(
+            f"Cayu did not import the application because {blocking} "
+            f"{'finding leaves' if blocking == 1 else 'findings leave'} importing it "
+            "unproven safe. "
+            "Checks that need the loaded application (agents, tools, policies, "
+            f"providers, capabilities) did not run; {listed}"
+        ),
+        hint=(
+            "Fix the import-safety or scaffold-contract findings, then rerun "
+            "`cayu check` to run the remaining checks."
+        ),
+        parameters={
+            "blocking_findings": blocking,
+            "blocking_findings_outside_selection": outside_selection,
+        },
+        severity=DiagnosticSeverity.INFO,
+    )
+
+
+def application_load_failed_diagnostic(error: BaseException) -> ProjectDiagnostic:
+    """Report an application that failed to load next to the source findings."""
+
+    return _diagnostic(
+        code="SCAFFOLD_APPLICATION_LOAD_FAILED",
+        path="app.py",
+        message=(
+            f"The application factory failed ({type(error).__name__}), so checks that "
+            "need the loaded application did not run."
+        ),
+        hint="Fix the source findings listed with this one; they often cause the failure.",
+        parameters={"error_type": type(error).__name__},
+        severity=DiagnosticSeverity.ERROR,
+    )
+
+
 def check_declared_scaffold(
     root: Path,
     manifest: AppManifest,
@@ -784,7 +877,7 @@ def _check_import_inertness(root: Path) -> tuple[ProjectDiagnostic, ...]:
             continue
         import_bindings = _import_bindings(tree)
         rebound_names = _module_rebound_names(tree)
-        declarative_identities = _declarative_identity_names(
+        identity_lines = _declarative_identity_lines(
             tree,
             import_bindings=import_bindings,
             rebound_names=rebound_names,
@@ -810,7 +903,7 @@ def _check_import_inertness(root: Path) -> tuple[ProjectDiagnostic, ...]:
                     node,
                     import_bindings=import_bindings,
                     rebound_names=rebound_names,
-                    declarative_identities=declarative_identities,
+                    declarative_identities=_identities_before(identity_lines, node),
                     declarative_subscriptions=declarative_subscriptions,
                     project_root=root,
                     declarative_bases=declarative_bases,
@@ -822,7 +915,7 @@ def _check_import_inertness(root: Path) -> tuple[ProjectDiagnostic, ...]:
                     node,
                     import_bindings=import_bindings,
                     rebound_names=rebound_names,
-                    declarative_identities=declarative_identities,
+                    declarative_identities=_identities_before(identity_lines, node),
                     declarative_subscriptions=declarative_subscriptions,
                     project_root=root,
                     declarative_bases=declaration_proofs.structural.get(path, {}),
@@ -853,7 +946,7 @@ def _check_import_inertness(root: Path) -> tuple[ProjectDiagnostic, ...]:
     for path, failures in sorted(declaration_proofs.failures.items()):
         relative = path.relative_to(root).as_posix()
         for unsafe_node in failures:
-            location = f"{relative}:{unsafe_node.lineno}"
+            location = f"{relative}:{_narrowed_unsafe_node(unsafe_node).lineno}"
             if location not in reported:
                 diagnostics.append(_import_side_effect_diagnostic(relative, unsafe_node))
                 reported.add(location)
@@ -874,6 +967,159 @@ def _check_import_inertness(root: Path) -> tuple[ProjectDiagnostic, ...]:
     return tuple(diagnostics)
 
 
+_EFFECT_MODULES = frozenset(
+    {
+        "asyncio",
+        "ftplib",
+        "http",
+        "httpx",
+        "multiprocessing",
+        "requests",
+        "shutil",
+        "smtplib",
+        "socket",
+        "subprocess",
+        "threading",
+        "urllib",
+        "webbrowser",
+    }
+)
+_EFFECT_OS_FUNCTIONS = frozenset(
+    {
+        "chdir",
+        "kill",
+        "makedirs",
+        "mkdir",
+        "popen",
+        "remove",
+        "rename",
+        "replace",
+        "rmdir",
+        "startfile",
+        "system",
+        "unlink",
+    }
+)
+_EFFECT_METHODS = frozenset(
+    {
+        "mkdir",
+        "open",
+        "read_bytes",
+        "read_text",
+        "rename",
+        "replace",
+        "rmdir",
+        "start",
+        "touch",
+        "unlink",
+        "write",
+        "write_bytes",
+        "write_text",
+    }
+)
+_EFFECT_BUILTINS = frozenset({"eval", "exec", "input", "open"})
+_MAX_CONSTRUCT_CHARS = 80
+
+
+def _construct_name(node: ast.expr | ast.stmt) -> str:
+    """Name the construct without echoing its arguments or literal values."""
+
+    def name(expression: ast.expr) -> str:
+        if isinstance(expression, ast.Name):
+            return expression.id
+        if isinstance(expression, ast.Attribute):
+            return f"{name(expression.value)}.{expression.attr}"
+        if isinstance(expression, ast.Call):
+            return f"{name(expression.func)}(...)"
+        if isinstance(expression, ast.Subscript):
+            return f"{name(expression.value)}[...]"
+        return type(expression).__name__
+
+    if isinstance(node, ast.Call):
+        rendered = f"{name(node.func)}(...)"
+    elif isinstance(node, ast.expr):
+        rendered = name(node)
+    else:
+        rendered = type(node).__name__
+    if len(rendered) > _MAX_CONSTRUCT_CHARS:
+        return rendered[: _MAX_CONSTRUCT_CHARS - 3] + "..."
+    return rendered
+
+
+def _is_environment_read(node: ast.expr | ast.stmt) -> bool:
+    """``os.environ[...]``, ``os.environ.get(...)`` or ``os.getenv(...)``."""
+
+    def is_environ(expression: ast.expr) -> bool:
+        return (
+            isinstance(expression, ast.Attribute)
+            and expression.attr == "environ"
+            and isinstance(expression.value, ast.Name)
+            and expression.value.id == "os"
+        ) or (isinstance(expression, ast.Name) and expression.id == "environ")
+
+    if isinstance(node, ast.Subscript):
+        return is_environ(node.value)
+    if not isinstance(node, ast.Call) or not isinstance(node.func, (ast.Attribute, ast.Name)):
+        return False
+    function = node.func
+    if isinstance(function, ast.Name):
+        return function.id == "getenv"
+    return (function.attr == "get" and is_environ(function.value)) or (
+        function.attr == "getenv"
+        and isinstance(function.value, ast.Name)
+        and function.value.id == "os"
+    )
+
+
+def _demonstrated_effect(node: ast.expr | ast.stmt) -> bool:
+    """Recognize calls that clearly perform I/O, network, process or file work."""
+
+    if not isinstance(node, ast.Call):
+        return False
+    function = node.func
+    parts: list[str] = []
+    while isinstance(function, (ast.Attribute, ast.Call)):
+        if isinstance(function, ast.Call):
+            function = function.func
+            continue
+        parts.append(function.attr)
+        function = function.value
+    if isinstance(function, ast.Name):
+        parts.append(function.id)
+    parts.reverse()
+    if not parts:
+        return False
+    if parts[0] in _EFFECT_BUILTINS:
+        return True
+    if parts[0] in _EFFECT_MODULES:
+        return True
+    if parts[0] == "os" and parts[-1] in _EFFECT_OS_FUNCTIONS:
+        return True
+    return parts[-1] in _EFFECT_METHODS
+
+
+_DECLARATION_CONSTRUCTORS = frozenset({"ExecutionProfileBehaviorIdentity", "ToolSpec"})
+
+
+def _narrowed_unsafe_node(node: ast.expr | ast.stmt) -> ast.expr | ast.stmt:
+    """Point at the argument that made a reviewed declaration unprovable."""
+
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in _DECLARATION_CONSTRUCTORS
+    ):
+        return node
+    for value in (*node.args, *(keyword.value for keyword in node.keywords)):
+        for child in ast.walk(value):
+            if isinstance(child, ast.Call) and not (
+                isinstance(child.func, ast.Name)
+                and child.func.id in {*_DECLARATION_CONSTRUCTORS, "list"}
+            ):
+                return child
+    return node
+
+
 def _import_side_effect_diagnostic(
     relative: str,
     unsafe_node: ast.expr | ast.stmt,
@@ -881,25 +1127,59 @@ def _import_side_effect_diagnostic(
     unproven_base: bool = False,
     blocking_modules: tuple[str, ...] = (),
 ) -> ProjectDiagnostic:
+    if not unproven_base:
+        unsafe_node = _narrowed_unsafe_node(unsafe_node)
+    construct = _construct_name(unsafe_node)
+    effect = not unproven_base and _demonstrated_effect(unsafe_node)
+    if unproven_base:
+        reason = "unproven_class_base"
+        message = (
+            f"Class inheritance from `{construct}` cannot be proven declarative; the "
+            "base or its import dependency closure is unproven."
+        )
+        hint = (
+            "Inspect unsupported_expression findings in the base's defining "
+            "module and dependencies before changing the dependent class."
+        )
+    elif _is_environment_read(unsafe_node):
+        reason = "import_time_configuration"
+        message = (
+            f"`{construct}` reads configuration when the module is imported, so tests "
+            "and deployments cannot change it afterwards."
+        )
+        hint = (
+            "Read the setting at call time in a configuration/settings.py function "
+            "(the generated configured_* helpers show the pattern)."
+        )
+    elif effect:
+        reason = "import_time_effect"
+        message = (
+            f"`{construct}` performs I/O, network, process or file work when the module "
+            "is imported."
+        )
+        hint = (
+            "Move it into a function that a builder, lifecycle hook or tool `run` "
+            "calls, so importing the application stays side-effect free."
+        )
+    else:
+        reason = "unsupported_expression"
+        message = (
+            f"`{construct}` runs when the module is imported and is not a reviewed "
+            "declarative form, so it cannot be proven side-effect free."
+        )
+        hint = (
+            "Use literal data or a reviewed declaration (see `cayu guide applications` "
+            "for the accepted forms), or move the call into a builder or lifecycle "
+            "entry point."
+        )
     return _diagnostic(
         code="SCAFFOLD_IMPORT_SIDE_EFFECT",
         path=f"{relative}:{unsafe_node.lineno}",
-        message=(
-            "Class inheritance cannot be proven declarative; the base or its "
-            "import dependency closure is unproven."
-            if unproven_base
-            else "Import-time execution in a declared application module "
-            "cannot be proven declarative."
-        ),
-        hint=(
-            "Inspect unsupported_expression findings in the base's defining "
-            "module and dependencies before changing the dependent class."
-            if unproven_base
-            else "Move external or lifecycle work behind an explicit builder or "
-            "lifecycle entry point."
-        ),
+        message=message,
+        hint=hint,
         parameters={
-            "reason": ("unproven_class_base" if unproven_base else "unsupported_expression"),
+            "reason": reason,
+            "construct": construct,
             "symbol": (
                 _expression_root_name(
                     unsafe_node.func if isinstance(unsafe_node, ast.Call) else unsafe_node
@@ -1661,6 +1941,16 @@ def _unsafe_import_time_expression(
                     rebound_names | class_bindings,
                     project_root,
                     class_proofs,
+                    declarative_identities - class_bindings,
+                )
+                # dataclasses.Field.__set_name__ only forwards to a literal default.
+                or (
+                    isinstance(statement.value, ast.Call)
+                    and _dataclass_field_is_declarative(
+                        statement.value,
+                        import_bindings=import_bindings,
+                        rebound_names=rebound_names | class_bindings,
+                    )
                 )
             )
         }
@@ -1706,6 +1996,12 @@ def _unsafe_import_time_expression(
         for subscript in _evaluated_subscripts(expression):
             if _trusted_symbol(
                 subscript.value, import_bindings, expression_rebound_names, project_root
+            ) == ("os", "environ"):
+                # Settings are read at call time so tests and deployments can
+                # change them; see the import_time_configuration diagnostic.
+                return subscript
+            if _trusted_symbol(
+                subscript.value, import_bindings, expression_rebound_names, project_root
             ) in {
                 ("contextvars", "ContextVar"),
                 ("asyncio", "Future"),
@@ -1734,7 +2030,12 @@ def _unsafe_import_time_expression(
                 call.func, import_bindings, expression_rebound_names, project_root
             ) == ("cayu", "ToolSpec"):
                 if not _runtime_namespace_value_is_inert(
-                    call, import_bindings, expression_rebound_names, project_root, expression_proofs
+                    call,
+                    import_bindings,
+                    expression_rebound_names,
+                    project_root,
+                    expression_proofs,
+                    declarative_identities - class_rebound_names,
                 ):
                     return call
                 continue
@@ -1916,6 +2217,17 @@ def _bare_decorator_is_declarative(
     import_bindings: Mapping[str, tuple[str, str | None]],
     rebound_names: frozenset[str],
 ) -> bool:
+    if (
+        isinstance(decorator, ast.Attribute)
+        and isinstance(decorator.value, ast.Name)
+        and decorator.value.id == "functools"
+        and decorator.attr in {"cache", "cached_property", "lru_cache"}
+    ):
+        # Memoizing wrappers only wrap the function; nothing runs at import.
+        return (
+            import_bindings.get("functools") == ("functools", None)
+            and "functools" not in rebound_names
+        )
     if not isinstance(decorator, ast.Name) or decorator.id in rebound_names:
         return False
     name = decorator.id
@@ -1923,7 +2235,9 @@ def _bare_decorator_is_declarative(
         return name not in import_bindings
     expected_imports = {
         "abstractmethod": ("abc", "abstractmethod"),
+        "cache": ("functools", "cache"),
         "cached_property": ("functools", "cached_property"),
+        "lru_cache": ("functools", "lru_cache"),
         "dataclass": ("dataclasses", "dataclass"),
         "final": ("typing", "final"),
         "overload": ("typing", "overload"),
@@ -2019,21 +2333,48 @@ def _metadata_shape(
     return None
 
 
+def _identity_call_is_inert(
+    value: ast.expr,
+    imports: Mapping[str, tuple[str, str | None]],
+    rebound: frozenset[str],
+    root: Path,
+) -> bool:
+    """A Runtime behavior identity built only from literal data."""
+
+    return (
+        isinstance(value, ast.Call)
+        and _trusted_symbol(value.func, imports, rebound, root)
+        == ("cayu", "ExecutionProfileBehaviorIdentity")
+        and all(_literal_collection_is_data_only(arg) for arg in value.args)
+        and all(
+            keyword.arg is not None and _literal_collection_is_data_only(keyword.value)
+            for keyword in value.keywords
+        )
+    )
+
+
 def _toolspec_metadata_is_inert(
     value: ast.expr,
     imports: Mapping[str, tuple[str, str | None]],
     rebound: frozenset[str],
     root: Path,
     proofs: Mapping[str, _DeclarativeBinding],
+    identities: frozenset[str] = frozenset(),
 ) -> bool:
-    """Prove metadata without evaluating application objects or their hooks."""
+    """Prove metadata without evaluating application objects or their hooks.
+
+    A nested literal ``ExecutionProfileBehaviorIdentity(...)``, or a module-level
+    constant holding one, is the documented way to version a tool's behavior.
+    """
 
     def safe(item: ast.expr) -> bool:
-        return _toolspec_metadata_is_inert(item, imports, rebound, root, proofs)
+        return _toolspec_metadata_is_inert(item, imports, rebound, root, proofs, identities)
 
     if isinstance(value, ast.Constant):
         return True
     if isinstance(value, ast.Name):
+        if value.id in identities:
+            return True
         proof = proofs.get(value.id)
         return proof is not None and proof.kind == "literal" and proof.line < value.lineno
     if isinstance(value, ast.Attribute):
@@ -2056,6 +2397,8 @@ def _toolspec_metadata_is_inert(
             key is not None and safe(key) and safe(item)
             for key, item in zip(value.keys, value.values, strict=True)
         )
+    if _identity_call_is_inert(value, imports, rebound, root):
+        return True
     if isinstance(value, ast.Call):
         return (
             isinstance(value.func, ast.Name)
@@ -2076,6 +2419,7 @@ def _runtime_namespace_value_is_inert(
     rebound: frozenset[str],
     root: Path,
     proofs: Mapping[str, _DeclarativeBinding],
+    identities: frozenset[str] = frozenset(),
 ) -> bool:
     """Reviewed immutable Runtime metadata cannot supply descriptor hooks."""
     if isinstance(value, ast.Attribute):
@@ -2088,22 +2432,16 @@ def _runtime_namespace_value_is_inert(
         "ToolSpec",
     ):
         return all(
-            _toolspec_metadata_is_inert(arg, imports, rebound, root, proofs) for arg in value.args
+            _toolspec_metadata_is_inert(arg, imports, rebound, root, proofs, identities)
+            for arg in value.args
         ) and all(
             keyword.arg is not None
-            and _toolspec_metadata_is_inert(keyword.value, imports, rebound, root, proofs)
+            and _toolspec_metadata_is_inert(
+                keyword.value, imports, rebound, root, proofs, identities
+            )
             for keyword in value.keywords
         )
-    return (
-        isinstance(value, ast.Call)
-        and _trusted_symbol(value.func, imports, rebound, root)
-        == ("cayu", "ExecutionProfileBehaviorIdentity")
-        and all(_literal_collection_is_data_only(arg) for arg in value.args)
-        and all(
-            keyword.arg is not None and _literal_collection_is_data_only(keyword.value)
-            for keyword in value.keywords
-        )
-    )
+    return _identity_call_is_inert(value, imports, rebound, root)
 
 
 def _unsafe_class_namespace(
@@ -2433,7 +2771,9 @@ def _module_declaration_failures(
 ) -> tuple[ast.expr | ast.stmt, ...]:
     bindings = _import_bindings(tree)
     rebound = _module_rebound_names(tree)
-    identities = _declarative_identity_names(tree, import_bindings=bindings, rebound_names=rebound)
+    identity_lines = _declarative_identity_lines(
+        tree, import_bindings=bindings, rebound_names=rebound
+    )
     subscriptions = _declarative_subscription_names(root, tree)
     failures: list[ast.expr | ast.stmt] = []
     for statement in tree.body:
@@ -2455,7 +2795,7 @@ def _module_declaration_failures(
                 statement,
                 import_bindings=bindings,
                 rebound_names=rebound,
-                declarative_identities=identities,
+                declarative_identities=_identities_before(identity_lines, statement),
                 declarative_subscriptions=subscriptions,
                 project_root=root,
                 declarative_bases=bases,
@@ -2484,6 +2824,11 @@ def _imported_class_base_is_declarative(
         ("enum", "StrEnum"),
         ("typing", "Protocol"),
         ("typing_extensions", "Protocol"),
+        # Typed record declarations: annotations and literal defaults only.
+        ("typing", "NamedTuple"),
+        ("typing", "TypedDict"),
+        ("typing_extensions", "NamedTuple"),
+        ("typing_extensions", "TypedDict"),
     }
 
 
@@ -3002,19 +3347,35 @@ def _scope_rebound_names(
     return frozenset(names)
 
 
-def _declarative_identity_names(
+def _declarative_identity_lines(
     tree: ast.Module,
     *,
     import_bindings: Mapping[str, tuple[str, str | None]],
     rebound_names: frozenset[str],
-) -> frozenset[str]:
+) -> dict[str, int]:
+    """Map module constants that hold a literal identity to their assignment line.
+
+    A name qualifies only when that assignment is its sole module-level binding,
+    so no import, definition or later assignment can replace what it holds.
+    Callers admit a use only after this line: earlier, the name is unbound or
+    still holds something else.
+    """
+
     if (
         import_bindings.get("ExecutionProfileBehaviorIdentity")
         != ("cayu", "ExecutionProfileBehaviorIdentity")
         or "ExecutionProfileBehaviorIdentity" in rebound_names
     ):
-        return frozenset()
-    names: set[str] = set()
+        return {}
+    binding_counts: dict[str, int] = {}
+    for node in tree.body:
+        if isinstance(node, ast.AnnAssign) and node.value is None:
+            continue  # A bare annotation declares a type; it binds nothing.
+        for name in _scope_rebound_names([node], include_imports=True) | _nested_import_names(
+            [node]
+        ):
+            binding_counts[name] = binding_counts.get(name, 0) + 1
+    lines: dict[str, int] = {}
     for node in tree.body:
         targets: tuple[ast.expr, ...] = ()
         value: ast.expr | None = None
@@ -3030,8 +3391,14 @@ def _declarative_identity_names(
             and value.func.id == "ExecutionProfileBehaviorIdentity"
         ):
             continue
-        names.update(target.id for target in targets if isinstance(target, ast.Name))
-    return frozenset(names)
+        for target in targets:
+            if isinstance(target, ast.Name) and binding_counts.get(target.id) == 1:
+                lines[target.id] = node.lineno
+    return lines
+
+
+def _identities_before(identity_lines: Mapping[str, int], statement: ast.stmt) -> frozenset[str]:
+    return frozenset(name for name, line in identity_lines.items() if line < statement.lineno)
 
 
 def _import_time_expression_uses(
@@ -3256,6 +3623,81 @@ def _private_collection_update_is_inert(
     return isinstance(call.args[0], (ast.Constant, ast.Name))
 
 
+_DATACLASS_FIELD_FLAGS = frozenset({"compare", "hash", "init", "kw_only", "repr"})
+_BUILTIN_COLLECTION_FACTORIES = frozenset({"dict", "frozenset", "list", "set", "tuple"})
+
+
+def _dataclass_field_is_declarative(
+    call: ast.Call,
+    *,
+    import_bindings: Mapping[str, tuple[str, str | None]],
+    rebound_names: frozenset[str],
+) -> bool:
+    """``field(default=...)`` with literals or a builtin empty-collection factory."""
+
+    function = call.func
+    is_field = (
+        isinstance(function, ast.Name)
+        and function.id not in rebound_names
+        and import_bindings.get(function.id) == ("dataclasses", "field")
+    ) or (
+        isinstance(function, ast.Attribute)
+        and function.attr == "field"
+        and isinstance(function.value, ast.Name)
+        and function.value.id not in rebound_names
+        and import_bindings.get(function.value.id) == ("dataclasses", None)
+    )
+    if not is_field or call.args:
+        return False
+    for keyword in call.keywords:
+        if keyword.arg == "default_factory":
+            factory = keyword.value
+            if not (
+                isinstance(factory, ast.Name)
+                and factory.id in _BUILTIN_COLLECTION_FACTORIES
+                and factory.id not in import_bindings
+                and factory.id not in rebound_names
+            ):
+                return False
+        elif keyword.arg in _DATACLASS_FIELD_FLAGS | {"default"}:
+            if not _literal_collection_is_data_only(keyword.value):
+                return False
+        else:
+            return False
+    return True
+
+
+def _memoizing_decorator_call_is_declarative(
+    call: ast.Call,
+    *,
+    import_bindings: Mapping[str, tuple[str, str | None]],
+    rebound_names: frozenset[str],
+) -> bool:
+    """``lru_cache(maxsize=..., typed=...)`` with literal options."""
+
+    function = call.func
+    is_lru_cache = (
+        isinstance(function, ast.Name)
+        and function.id not in rebound_names
+        and import_bindings.get(function.id) == ("functools", "lru_cache")
+    ) or (
+        isinstance(function, ast.Attribute)
+        and function.attr == "lru_cache"
+        and isinstance(function.value, ast.Name)
+        and function.value.id not in rebound_names
+        and import_bindings.get(function.value.id) == ("functools", None)
+    )
+    return (
+        is_lru_cache
+        and len(call.args) <= 1
+        and all(_literal_collection_is_data_only(argument) for argument in call.args)
+        and all(
+            keyword.arg in {"maxsize", "typed"} and _literal_collection_is_data_only(keyword.value)
+            for keyword in call.keywords
+        )
+    )
+
+
 def _import_call_is_declarative(
     call: ast.Call,
     *,
@@ -3263,6 +3705,15 @@ def _import_call_is_declarative(
     rebound_names: frozenset[str],
     declarative_identities: frozenset[str],
 ) -> bool:
+    benign_forms = (
+        _dataclass_field_is_declarative,
+        _memoizing_decorator_call_is_declarative,
+    )
+    if any(
+        form(call, import_bindings=import_bindings, rebound_names=rebound_names)
+        for form in benign_forms
+    ):
+        return True
     if isinstance(call.func, ast.Name):
         name = call.func.id
         if name in rebound_names:

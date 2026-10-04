@@ -279,6 +279,24 @@ async def main():
     assert result.status == "passed"
 ```
 
+### What the model actually sees
+
+A scripted test inspects `ModelRequest` objects that still carry each tool
+result's `structured` data, but bundled providers send only its `content` (plus
+file attachments). `model_facing_text(request)` renders a request as the model
+can read it, one line per text part, tool call and tool result `content`;
+`model_facing_tool_result(result)` returns just the readable text of one
+result. Assert on these so a tool that hides its findings in `structured`
+fails the test instead of the live model:
+
+```python
+from cayu import model_facing_text
+
+seen = model_facing_text(provider.requests[1])
+assert "tool audit_csv: 3 blank rows in data.csv" in seen
+assert "blank_rows" not in seen  # a custom tool's structured data never reaches the model
+```
+
 ## CLI
 
 `cayu eval run [module:attribute]` loads a Python target. The target should

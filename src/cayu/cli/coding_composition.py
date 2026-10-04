@@ -397,6 +397,14 @@ def _subagent_tool_identity(
     )
 
 
+def _subagent_result_tool_identity(
+    *, generated_session_store: bool
+) -> ExecutionProfileBehaviorIdentity | None:
+    """Recovery identity for subagent results; needs the generated session store."""
+
+    return _SUBAGENT_RESULT_TOOL_IDENTITY if generated_session_store else None
+
+
 def _command_environment() -> dict[str, str]:
     return configured_coding_command_environment()
 
@@ -1255,7 +1263,6 @@ def build_coding_app(
         task_store=task_store,
         knowledge_store=knowledge_store,
     )
-    generated_session_store = stores.generated_session_store
     selected_session_store = stores.session_store
     selected_task_store = stores.task_store
     selected_knowledge_store = stores.knowledge_store
@@ -1269,15 +1276,11 @@ def build_coding_app(
         selected_scope = _require_coding_knowledge_scope(
             scope if bound_scope is None else bound_scope
         )
-    selected_artifact_store = (
-        artifact_store
-        if artifact_store is not None
-        else (
-            LocalArtifactStore(_STATE_ROOT / "artifacts", store_id="coding-artifacts")
-            if __CODING_ARTIFACTS_ENABLED__
-            else None
+    selected_artifact_store = artifact_store
+    if __CODING_ARTIFACTS_ENABLED__ and selected_artifact_store is None:
+        selected_artifact_store = LocalArtifactStore(
+            _STATE_ROOT / "artifacts", store_id="coding-artifacts"
         )
-    )
     environment_identity = _coding_environment_identity(
         root=root,
         artifact_store=selected_artifact_store,
@@ -1369,17 +1372,15 @@ def build_coding_app(
                     execution_profile_identity=_subagent_tool_identity(
                         reviewer_agent,
                         reviewer_execution_profile_identity,
-                        generated_session_store=generated_session_store,
+                        generated_session_store=stores.generated_session_store,
                     ),
                 ),
                 SubagentResultTool(
                     app.session_store,
                     background_registry=background_registry,
                     default_timeout_s=30,
-                    execution_profile_identity=(
-                        _SUBAGENT_RESULT_TOOL_IDENTITY
-                        if generated_session_store
-                        else None
+                    execution_profile_identity=_subagent_result_tool_identity(
+                        generated_session_store=stores.generated_session_store,
                     ),
                 ),
             )
@@ -3623,7 +3624,6 @@ def build_coding_composition(
         task_store=task_store,
         knowledge_store=knowledge_store,
     )
-    generated_session_store = stores.generated_session_store
     selected_session_store = stores.session_store
     selected_task_store = stores.task_store
     selected_knowledge_store = stores.knowledge_store
@@ -3637,15 +3637,11 @@ def build_coding_composition(
         selected_scope = _require_coding_knowledge_scope(
             scope if bound_scope is None else bound_scope
         )
-    selected_artifact_store = (
-        artifact_store
-        if artifact_store is not None
-        else (
-            LocalArtifactStore(_STATE_ROOT / "artifacts", store_id="coding-artifacts")
-            if __CODING_ARTIFACTS_ENABLED__
-            else None
+    selected_artifact_store = artifact_store
+    if __CODING_ARTIFACTS_ENABLED__ and selected_artifact_store is None:
+        selected_artifact_store = LocalArtifactStore(
+            _STATE_ROOT / "artifacts", store_id="coding-artifacts"
         )
-    )
     store_identity = _coding_environment_identity(
         root=root,
         artifact_store=selected_artifact_store,
@@ -3781,17 +3777,15 @@ def build_coding_composition(
                     execution_profile_identity=_subagent_tool_identity(
                         reviewer_agent,
                         reviewer_execution_profile_identity,
-                        generated_session_store=generated_session_store,
+                        generated_session_store=stores.generated_session_store,
                     ),
                 ),
                 SubagentResultTool(
                     app.session_store,
                     background_registry=background_registry,
                     default_timeout_s=30,
-                    execution_profile_identity=(
-                        _SUBAGENT_RESULT_TOOL_IDENTITY
-                        if generated_session_store
-                        else None
+                    execution_profile_identity=_subagent_result_tool_identity(
+                        generated_session_store=stores.generated_session_store,
                     ),
                 ),
             )

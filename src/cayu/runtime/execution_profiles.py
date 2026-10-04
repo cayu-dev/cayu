@@ -344,6 +344,14 @@ class ExecutionProfileMismatchError(RuntimeError):
                 "identities declared from the first run. Adding a declaration does not "
                 "repair an already persisted opaque baseline."
             )
+        if ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS in changed_component_classes:
+            guidance += (
+                " If you added or edited a tool: give every custom tool "
+                "`execution_profile_identity=ExecutionProfileBehaviorIdentity(name=..., "
+                'behavior_version="1", implementation_version="1")` in its ToolSpec, as '
+                "`cayu generate tool` does, bump behavior_version when its behavior "
+                "changes, and start a new session for the changed tool set."
+            )
         super().__init__(self._message(session_id=session_id, changed=changed) + guidance)
 
     def _message(self, *, session_id: str, changed: str) -> str:

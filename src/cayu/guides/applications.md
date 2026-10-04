@@ -4,6 +4,15 @@
 Python. The generated tree is executable architecture for people and coding
 agents; it is not a runtime plugin system, service locator, or authority grant.
 
+`cayu new` refuses a parent directory that other users can write: one that is
+world-writable without the sticky bit, or group-writable by a shared group. A
+group-writable parent (the default home directory under umask 002) is accepted
+when you own it and its group is your private group: named after you, your
+primary group, with no other members and no other account using it as a
+primary group. Cayu reads this from the local user and group databases; with a
+directory service that does not enumerate its users (some LDAP or SSSD setups)
+it cannot see every account, so prefer a parent that is not group-writable there.
+
 ## Convention
 
 Normal agent, service, and coding presets share these ownership boundaries:
@@ -41,6 +50,14 @@ composition work, and agent registration that no longer originates from the
 explicit registration module. Removing the contract is an intentional custom
 layout migration, not a supported way to silence a finding.
 
+`cayu check` never imports application code that failed the import-safety check
+(or whose scaffold contract is too invalid for that check to run). It still lists
+every source finding and adds `SCAFFOLD_APPLICATION_NOT_IMPORTED` naming the
+checks that did not run. Any other source error, such as plan drift, no longer
+stops the check: the application is loaded and checked as usual, and if its
+factory fails, `SCAFFOLD_APPLICATION_LOAD_FAILED` is reported next to the source
+findings that likely caused it.
+
 The import check accepts inert application class hierarchies, including exception
 classes and subclasses of a shared `Tool` base. Define bases before their uses
 and use explicit named imports, such as `from tools.base import ProductTool`;
@@ -59,6 +76,36 @@ hierarchy must also have reviewed subclass-creation behavior: builtin exceptions
 `object`, `abc.ABC`, and Cayu's `Tool` are supported. Enum-derived application
 bases remain unproven because enum metaclasses can execute inherited member
 initializers; mixing a local base with an enum has the same restriction.
+
+Module and class bodies may also use these reviewed declarative forms, which
+the check accepts without executing them:
+
+- A class-level `spec = ToolSpec(...)` whose values are literals, `ToolEffect`
+  members, and a nested literal `ExecutionProfileBehaviorIdentity(...)` or a
+  module-level constant holding one. This is the shape `cayu generate tool`
+  emits.
+- `logging.getLogger(__name__)` or with a literal name.
+- Dataclass fields `field(default=<literal>)` or
+  `field(default_factory=list|dict|set|tuple|frozenset)` with literal flags.
+- `Enum`/`StrEnum`/`IntEnum`, `TypedDict` and `NamedTuple` declarations with
+  annotations and literal values.
+- `@functools.cache`, `@functools.lru_cache` and `@lru_cache(maxsize=...)` with
+  literal options.
+
+Environment reads at import (`os.environ[...]`, `os.environ.get(...)`,
+`os.getenv(...)`) are deliberately unsupported, with `reason:
+import_time_configuration`: read settings at call time in a
+`configuration/settings.py` function, as the generated `configured_*` helpers
+do, so tests and deployments can change them.
+
+Anything else that runs at import is reported as `SCAFFOLD_IMPORT_SIDE_EFFECT`.
+The finding names the construct and says why: `reason: import_time_effect` for a
+call that clearly performs I/O, network, process or file work (for example
+`subprocess.run(...)` or `Path(...).write_text(...)`), and
+`reason: unsupported_expression` for a shape the check cannot prove inert (for
+example an application function call such as `load(...)`, including one nested
+inside a `ToolSpec`). Move either kind into a builder, lifecycle hook or tool
+`run`.
 
 Pydantic `BaseModel` declarations (including named import aliases) may register `@field_validator` and
 `@model_validator` methods. Import these helpers explicitly from `pydantic`
@@ -228,8 +275,11 @@ Implement and review the public constructors in their canonical homes:
   through `agents/registration.py`, and keep lifecycle work in `operations/`.
   Declare child targets, limits, result access, exposure, and effect policy explicitly.
 
-Generated disabled-concern guards are ordinary source: update the relevant owning
-builders with their collaborators and identities. Do not read scaffold metadata
+Generated code contains only the capabilities that were selected; a disabled
+concern leaves no guard or placeholder to flip. Add its wiring to the relevant
+owning builders with their collaborators and identities, using the public
+constructors above, or compare with a disposable `cayu new --with <capability>`
+reference. Do not read scaffold metadata
 at runtime to enable tools or stores. Retain import safety and composition-only
 `app.py`; keep service routes, product authentication, tenant lookup, and operator
 policy intact. Artifact visibility, knowledge namespaces, and child-result access

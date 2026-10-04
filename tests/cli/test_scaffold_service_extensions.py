@@ -11,6 +11,8 @@ from pathlib import Path
 import pytest
 
 from cayu.cli import main
+from cayu.cli._constant_branches import simplify_constant_branches
+from cayu.cli.scaffold import _rendered_project_files
 
 
 def _edit(project, relative, old, new):
@@ -20,56 +22,67 @@ def _edit(project, relative, old, new):
     path.write_text(source.replace(old, new))
 
 
+def _enable_generated_branches(project, edits):
+    """Wire an extension the way its disabled template branches would.
+
+    Generated files keep only selected capability branches, so render the
+    service templates before that pass, flip the reviewed branches, and write
+    the simplified result: the same code a developer adds by hand.
+    """
+
+    raw = _rendered_project_files("profile", preset="service")
+    for relative, replacements in edits.items():
+        source = raw[relative]
+        for old, new in replacements:
+            assert old in source
+            source = source.replace(old, new)
+        (project / relative).write_text(simplify_constant_branches(source))
+
+
 def _wire_extension(project, capability):
     if capability == "artifacts":
+        _enable_generated_branches(
+            project,
+            {
+                "environments/local.py": (
+                    ("False and selected_artifacts is None", "True and selected_artifacts is None"),
+                    ("if not False and artifact_store", "if not True and artifact_store"),
+                    ("    if False\n", "    if True\n"),
+                ),
+            },
+        )
+        _edit(
+            project,
+            "tools/registration.py",
+            "from cayu import Tool\n",
+            "from cayu import ListArtifactsTool, Tool\n",
+        )
         _edit(
             project,
             "tools/registration.py",
             "    return tuple(tools)",
             "    tools.append(ListArtifactsTool())\n    return tuple(tools)",
         )
-        _edit(
-            project,
-            "environments/local.py",
-            "selected_artifacts is None and False",
-            "selected_artifacts is None and True",
-        )
-        _edit(
-            project,
-            "environments/local.py",
-            "if not False and artifact_store",
-            "if not True and artifact_store",
-        )
-        _edit(project, "environments/local.py", "    if False\n", "    if True\n")
     elif capability == "knowledge":
-        _edit(project, "policies/tools.py", "    if False\n", "    if True\n")
-        _edit(
+        _enable_generated_branches(
             project,
-            "tools/registration.py",
-            "    if False:\n        tools.extend(",
-            "    if True:\n        tools.extend(",
+            {
+                "policies/tools.py": (("    if False\n", "    if True\n"),),
+                "tools/registration.py": (
+                    ("    if False:\n        tools.extend(", "    if True:\n        tools.extend("),
+                    ('("remember_knowledge",) if False', '("remember_knowledge",) if True'),
+                    ("    if False\n", "    if True\n"),
+                ),
+                "configuration/storage.py": (
+                    ("if not False and knowledge_scope", "if not True and knowledge_scope"),
+                ),
+                "knowledge/retrieval.py": (("if not False:", "if not True:"),),
+                "environments/local.py": (
+                    ("if not False and (knowledge_store", "if not True and (knowledge_store"),
+                    ("    if False\n", "    if True\n"),
+                ),
+            },
         )
-        _edit(
-            project,
-            "tools/registration.py",
-            '("remember_knowledge",) if False',
-            '("remember_knowledge",) if True',
-        )
-        _edit(project, "tools/registration.py", "    if False\n", "    if True\n")
-        _edit(
-            project,
-            "configuration/storage.py",
-            "if not False and knowledge_scope",
-            "if not True and knowledge_scope",
-        )
-        _edit(project, "knowledge/retrieval.py", "if not False:", "if not True:")
-        _edit(
-            project,
-            "environments/local.py",
-            "if not False and (knowledge_store",
-            "if not True and (knowledge_store",
-        )
-        _edit(project, "environments/local.py", "    if False\n", "    if True\n")
         _edit(
             project,
             "configuration/runtime.py",

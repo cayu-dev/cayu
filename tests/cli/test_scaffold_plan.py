@@ -14,6 +14,7 @@ import pytest
 
 from cayu import CayuApp
 from cayu.cli import main
+from cayu.cli._constant_branches import has_constant_branches
 from cayu.cli.project import project_context
 from cayu.cli.scaffold import project_files
 from cayu.cli.scaffold_plan import normalize_application_plan
@@ -136,7 +137,9 @@ def test_without_memory_disables_recall_but_retains_its_truthful_home() -> None:
 
     assert "memory" not in plan.capabilities
     assert "memory/context.py" in files
-    assert "if not False:" in files["memory/context.py"]
+    # Disabled recall renders as a plain `return None`, not a literal branch.
+    assert "    return None\n" in files["memory/context.py"]
+    assert "AutomaticRecallContextPolicy(" not in files["memory/context.py"]
     assert "tests/test_memory.py" not in files
     assert "available but not configured" in files["memory/CAPABILITY.md"]
 
@@ -188,8 +191,8 @@ def test_recovery_opt_out_changes_the_generated_runtime_profile() -> None:
         "policies/tools.py",
         "tools/registration.py",
     ):
-        assert "if True" in selected[path]
-        assert "if False" in excluded[path]
+        assert not has_constant_branches(selected[path])
+        assert not has_constant_branches(excluded[path])
 
 
 def test_user_names_cannot_collide_with_internal_capability_tokens() -> None:
@@ -246,10 +249,12 @@ def test_without_flags_disable_each_safe_default_deterministically(
     assert "enable_logging=False" in (project / "configuration" / "runtime.py").read_text(
         encoding="utf-8"
     )
-    assert "build_tasks = False and task_store is None" in (
-        project / "configuration" / "storage.py"
-    ).read_text(encoding="utf-8")
-    assert "if not False:" in (project / "memory" / "context.py").read_text(encoding="utf-8")
+    assert "build_tasks = False\n" in (project / "configuration" / "storage.py").read_text(
+        encoding="utf-8"
+    )
+    assert "AutomaticRecallContextPolicy(" not in (project / "memory" / "context.py").read_text(
+        encoding="utf-8"
+    )
     for capability in excluded:
         card_path = {
             "approvals": "operations/APPROVALS.md",

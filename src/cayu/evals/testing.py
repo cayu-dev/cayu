@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -9,7 +10,14 @@ from typing import Any
 from cayu._validation import copy_json_value
 from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.context.thinking import ThinkingConfig
-from cayu.messages import Message
+from cayu.messages import (
+    FilePart,
+    Message,
+    PeerContentPart,
+    TextPart,
+    ToolCallPart,
+    ToolResultPart,
+)
 from cayu.providers._thinking import copy_preflight_thinking
 from cayu.providers.base import (
     ModelProvider,
@@ -30,6 +38,62 @@ from cayu.providers.operations import (
     ProviderOperationState,
     ProviderOperationStatus,
 )
+from cayu.tools.base import ToolResult
+
+
+def model_facing_tool_result(result: ToolResult | ToolResultPart) -> str:
+    """Return the text a model receives for one tool result.
+
+    Custom tool results reach the model only through ``content`` (plus any
+    file attachments); their ``structured`` data is for dashboards, workflows
+    and downstream tools. A tool that puts its findings only in ``structured``
+    leaves the model with nothing to read. Assert on this in scripted-provider
+    tests instead of inspecting ``structured``.
+    """
+
+    if not isinstance(result, (ToolResult, ToolResultPart)):
+        raise TypeError("model_facing_tool_result expects a ToolResult or ToolResultPart.")
+    return result.content
+
+
+def model_facing_text(request: ModelRequest) -> str:
+    """Render a model request as the text its model can read, one line per part.
+
+    Text, peer content (with the attribution header bundled providers add),
+    tool calls (name and arguments) and tool results (``content`` only) are
+    shown; ``structured`` tool data, provider state and reasoning are not,
+    because custom tool results reach the model only through ``content``.
+    Attachments appear as ``[attachment]``. Use it with
+    ``ScriptedModelProvider.requests`` to check what a real model would have
+    seen at each step.
+    """
+
+    if not isinstance(request, ModelRequest):
+        raise TypeError("model_facing_text expects a ModelRequest.")
+    lines: list[str] = []
+    for message in request.messages:
+        role = message.role.value
+        for part in message.content:
+            if isinstance(part, TextPart):
+                lines.append(f"{role}: {part.text}")
+            elif isinstance(part, PeerContentPart):
+                # The attribution header every bundled provider adapter sends.
+                lines.append(
+                    f"{role}: [Peer content from {part.sender_participant_id}; "
+                    f"occurrence {part.occurrence_id}]\n{part.text}"
+                )
+            elif isinstance(part, ToolCallPart):
+                arguments = json.dumps(part.continuation_arguments(), sort_keys=True)
+                lines.append(f"{role}: call {part.tool_name} {arguments}")
+            elif isinstance(part, ToolResultPart):
+                marker = " (error)" if part.is_error else ""
+                attachments = " [attachment]" * len(part.artifacts)
+                lines.append(
+                    f"tool {part.tool_name}{marker}: {model_facing_tool_result(part)}{attachments}"
+                )
+            elif isinstance(part, FilePart):
+                lines.append(f"{role}: [attachment]")
+    return "\n".join(lines)
 
 
 @dataclass

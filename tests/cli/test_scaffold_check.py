@@ -9,7 +9,11 @@ import pytest
 
 from cayu.cli import main
 from cayu.cli.project import project_context
-from cayu.cli.scaffold_check import check_declared_scaffold, check_declared_scaffold_source
+from cayu.cli.scaffold_check import (
+    application_not_imported_diagnostic,
+    check_declared_scaffold,
+    check_declared_scaffold_source,
+)
 from cayu.runtime.manifest import RegistrationProvenance
 
 
@@ -178,6 +182,81 @@ def test_cli_check_applies_tag_selection_before_source_only_gating(
     assert all(item["code"] != "SCAFFOLD_LAYOUT_PATH_MISSING" for item in report["diagnostics"])
 
 
+@pytest.mark.parametrize(("blocking", "phrase"), [(1, "1 finding leaves"), (2, "2 findings leave")])
+def test_not_imported_diagnostic_counts_its_blocking_findings(blocking: int, phrase: str) -> None:
+    assert phrase in application_not_imported_diagnostic(blocking).message
+
+
+def test_cli_check_tag_selection_never_imports_an_unproven_application(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    pyproject = project / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8").replace("convention = 1", "convention = 2"),
+        encoding="utf-8",
+    )
+    marker = tmp_path / "imported"
+    tools_init = project / "tools/__init__.py"
+    tools_init.write_text(
+        tools_init.read_text(encoding="utf-8")
+        + f"\nfrom pathlib import Path\nPath({str(marker)!r}).write_text('ran')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project)
+
+    # A tagged CI gate must not pass having checked nothing.
+    assert main(["check", "--tag", "providers", "--json"]) == 1
+    report = json.loads(capsys.readouterr().out)
+
+    assert not marker.exists()
+    assert report["manifest_fingerprint"] == "unavailable"
+    codes = [item["code"] for item in report["diagnostics"]]
+    assert "SCAFFOLD_CONVENTION_UNSUPPORTED" in codes
+    (not_imported,) = (
+        item
+        for item in report["diagnostics"]
+        if item["code"] == "SCAFFOLD_APPLICATION_NOT_IMPORTED"
+    )
+    assert not_imported["parameters"]["blocking_findings_outside_selection"] >= 1
+    assert "listed anyway" in not_imported["message"]
+
+
+def test_cli_check_reports_a_factory_failure_with_only_the_selected_source_errors(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    (project / "operations/watchers.py").unlink()
+    app_module = project / "app.py"
+    app_module.write_text(
+        app_module.read_text(encoding="utf-8").replace(
+            "def build_app(\n",
+            "def build_app(*_args, **_kwargs):\n    raise RuntimeError('boom')\n\n\ndef _unused(\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project)
+
+    # Unfiltered: the source error explains the factory failure next to it.
+    assert main(["check", "--json"]) == 1
+    codes = {item["code"] for item in json.loads(capsys.readouterr().out)["diagnostics"]}
+    assert {"SCAFFOLD_LAYOUT_PATH_MISSING", "SCAFFOLD_APPLICATION_LOAD_FAILED"} <= codes
+
+    # The source error is outside the tag, so the factory failure is reported
+    # as such instead of a report whose findings would not explain it.
+    assert main(["check", "--tag", "security", "--json"]) == 2
+    assert "Application factory failed (RuntimeError)" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("replacement", ("missing", "directory"))
 def test_cli_check_reports_an_invalid_registration_seam_before_import(
     tmp_path: Path,
@@ -205,6 +284,8 @@ def test_cli_check_reports_an_invalid_registration_seam_before_import(
     assert [(item["code"], item["path"]) for item in report["diagnostics"]] == [
         ("SCAFFOLD_IMPORT_SIDE_EFFECT", f"app.py:{registration_import.lineno}"),
         ("SCAFFOLD_LAYOUT_PATH_MISSING", "agents/registration.py"),
+        # The report says which checks did not run instead of stopping silently.
+        ("SCAFFOLD_APPLICATION_NOT_IMPORTED", "app.py"),
     ]
     assert report["diagnostics"][0]["parameters"]["expression_kind"] == "ImportFrom"
 
@@ -823,7 +904,10 @@ def test_cli_check_rejects_metadata_only_preset_and_database_changes_before_impo
     report = json.loads(capsys.readouterr().out)
 
     assert report["manifest_fingerprint"] == "unavailable"
-    assert {item["code"] for item in report["diagnostics"]} == {"SCAFFOLD_CONTRACT_INVALID"}
+    assert {item["code"] for item in report["diagnostics"]} == {
+        "SCAFFOLD_CONTRACT_INVALID",
+        "SCAFFOLD_APPLICATION_NOT_IMPORTED",
+    }
 
 
 @pytest.mark.parametrize(
@@ -1039,3 +1123,80 @@ def test_import_checker_still_rejects_real_import_time_work(
 
     findings = _import_side_effects(tmp_path / "project", _IMPORT_TIME_MODULES[case])
     assert [finding["path"].split(":")[0] for finding in findings] == ["domain/probe.py"]
+
+
+def test_cli_check_reports_every_source_finding_when_import_is_unsafe(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    (project / "tools" / "probe.py").write_text(
+        "import subprocess\n\nsubprocess.run(['true'])\n", encoding="utf-8"
+    )
+    with (project / "app.py").open("a", encoding="utf-8") as app_source:
+        app_source.write("\n\ndef helper() -> int:\n    return 1\n")
+    monkeypatch.chdir(project)
+
+    assert main(["check", "--json"]) == 1
+    report = json.loads(capsys.readouterr().out)
+
+    # The unsafe module is never imported, but lower-severity source findings
+    # are no longer hidden behind it, and the report says what did not run.
+    assert report["manifest_fingerprint"] == "unavailable"
+    codes = [item["code"] for item in report["diagnostics"]]
+    assert codes == [
+        "SCAFFOLD_IMPORT_SIDE_EFFECT",
+        "SCAFFOLD_APPLICATION_NOT_IMPORTED",
+        "SCAFFOLD_APP_COMPOSITION_DRIFT",
+    ]
+    assert report["diagnostics"][0]["parameters"]["reason"] == "import_time_effect"
+
+
+def test_cli_check_still_loads_the_app_after_a_non_import_source_error(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    # An agent project with a Docker sandbox config is plan drift, not unsafe source.
+    (project / "docker-sandbox.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.chdir(project)
+
+    assert main(["check", "--json"]) == 1
+    report = json.loads(capsys.readouterr().out)
+
+    assert report["manifest_fingerprint"] != "unavailable"
+    assert [item["code"] for item in report["diagnostics"]] == ["SCAFFOLD_PLAN_DRIFT"]
+
+
+def test_cli_check_folds_an_application_load_failure_into_the_source_report(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    (project / "docker-sandbox.json").write_text("{}\n", encoding="utf-8")
+    runtime = project / "configuration" / "runtime.py"
+    source = runtime.read_text(encoding="utf-8")
+    marker = "def build_runtime_options() -> RuntimeOptions:\n"
+    assert marker in source
+    runtime.write_text(
+        source.replace(marker, marker + '    raise RuntimeError("factory failed")\n'),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project)
+
+    assert main(["check", "--json"]) == 1
+    report = json.loads(capsys.readouterr().out)
+
+    assert [item["code"] for item in report["diagnostics"]] == [
+        "SCAFFOLD_APPLICATION_LOAD_FAILED",
+        "SCAFFOLD_PLAN_DRIFT",
+    ]

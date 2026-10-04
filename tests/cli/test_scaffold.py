@@ -259,7 +259,7 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert "os.environ" not in provider_source
     assert "os.environ" not in storage_source
     assert "config=runtime.config" in app_source
-    assert "build_tasks = True and task_store is None" in storage_source
+    assert "build_tasks = task_store is None" in storage_source
     assert "sessions.sqlite" not in storage_source
     assert "def build_app(" in app_source
     assert "class " not in app_source
@@ -1407,6 +1407,125 @@ def test_scaffold_parent_mode_does_not_apply_posix_bits_on_windows() -> None:
     assert scaffold._unsafe_shared_scaffold_parent_mode(0o777, platform="posix") is True
     assert scaffold._unsafe_shared_scaffold_parent_mode(0o1777, platform="posix") is False
     assert scaffold._unsafe_shared_scaffold_parent_mode(0o777, platform="nt") is False
+
+
+def test_scaffold_parent_allows_group_write_only_for_a_private_group() -> None:
+    from cayu.cli import scaffold
+
+    unsafe = scaffold._unsafe_shared_scaffold_parent_mode
+    # umask 002 home directories: group-writable, group is the user's own.
+    assert unsafe(0o775, platform="posix", group_is_private=True) is False
+    assert unsafe(0o775, platform="posix", group_is_private=False) is True
+    # World-writable is never made safe by the group.
+    assert unsafe(0o777, platform="posix", group_is_private=True) is True
+    assert unsafe(0o755, platform="posix", group_is_private=False) is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX users and groups")
+@pytest.mark.parametrize(
+    ("owner", "gid", "group_name", "members", "primary_users", "private"),
+    [
+        ("self", 4242, "alice", [], [], True),
+        ("self", 4242, "alice", ["alice"], [], True),
+        ("self", 4242, "alice", ["bob"], [], False),
+        # gr_mem lists supplementary members only; a primary-group user shares it too.
+        ("self", 4242, "alice", [], ["bob"], False),
+        ("self", 4242, "developers", [], [], False),
+        ("self", 5000, "alice", [], [], False),
+        ("other", 4242, "alice", [], [], False),
+        # macOS: the primary group is the shared `staff`, never a private group.
+        ("self", 20, "staff", [], ["carol"], False),
+    ],
+)
+def test_owned_private_group_requires_owner_primary_and_no_other_members(
+    monkeypatch: pytest.MonkeyPatch,
+    owner: str,
+    gid: int,
+    group_name: str,
+    members: list[str],
+    primary_users: list[str],
+    private: bool,
+) -> None:
+    import grp
+    import pwd
+    import types
+
+    from cayu.cli import scaffold
+
+    uid = os.geteuid()
+    user_gid = 20 if group_name == "staff" else 4242
+    monkeypatch.setattr(
+        pwd, "getpwuid", lambda _uid: types.SimpleNamespace(pw_name="alice", pw_gid=user_gid)
+    )
+    monkeypatch.setattr(
+        pwd,
+        "getpwall",
+        lambda: [
+            types.SimpleNamespace(pw_name="alice", pw_uid=uid, pw_gid=user_gid),
+            *(
+                types.SimpleNamespace(pw_name=name, pw_uid=uid + 1 + index, pw_gid=gid)
+                for index, name in enumerate(primary_users)
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        grp,
+        "getgrgid",
+        lambda _gid: types.SimpleNamespace(gr_name=group_name, gr_mem=members),
+    )
+    parent_stat = types.SimpleNamespace(st_uid=uid if owner == "self" else uid + 1, st_gid=gid)
+
+    assert scaffold._owned_private_group(parent_stat) is private
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX group-write modes")
+def test_cayu_new_accepts_a_private_group_writable_parent(
+    tmp_path: Path,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cayu.cli import scaffold
+
+    parent = tmp_path / "home"
+    parent.mkdir()
+    parent.chmod(0o775)
+    monkeypatch.setattr(scaffold, "_owned_private_group", lambda _stat: True)
+
+    assert main(["new", "umask-project", "--dir", str(parent)]) == 0
+    assert (parent / "umask-project" / "app.py").is_file()
+    capsys.readouterr()
+
+    monkeypatch.setattr(scaffold, "_owned_private_group", lambda _stat: False)
+    assert main(["new", "shared-project", "--dir", str(parent)]) == 1
+    assert not (parent / "shared-project").exists()
+    assert "private group" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX group-write modes")
+@pytest.mark.parametrize(("mode", "consulted"), [(0o755, False), (0o1775, False), (0o775, True)])
+def test_cayu_new_reads_the_user_database_only_when_group_write_decides(
+    tmp_path: Path,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: int,
+    consulted: bool,
+) -> None:
+    from cayu.cli import scaffold
+
+    parent = tmp_path / "home"
+    parent.mkdir()
+    parent.chmod(mode)
+    calls: list[object] = []
+
+    def owned_private_group(parent_stat: object) -> bool:
+        calls.append(parent_stat)
+        return True
+
+    monkeypatch.setattr(scaffold, "_owned_private_group", owned_private_group)
+
+    assert main(["new", "probe", "--dir", str(parent)]) == 0
+    capsys.readouterr()
+    assert bool(calls) is consulted
 
 
 def test_cayu_new_coding_removes_generated_files_after_git_failure(

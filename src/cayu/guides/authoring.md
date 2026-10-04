@@ -488,6 +488,15 @@ changes only the delimited machine-owned import/registration regions in
 `app.py`. Missing anchors, conflicting files, or different user content fail
 without partial writes. Repeating a successful invocation is a no-op.
 
+Generated tools declare `execution_profile_identity=ExecutionProfileBehaviorIdentity(...)`
+in their class-level `ToolSpec`. Keep that declaration on every custom tool you
+write, including read-only ones: sessions record the tool set's identities, so a
+tool without one makes a paused or resumed session fail with
+`ExecutionProfileMismatchError` (changed in `tool_implementations`) as soon as
+tools change. Bump `behavior_version` when a tool's behavior changes. Cayu does
+not invent a default identity, because a guessed identity would let changed
+behavior resume a session recorded with the old one.
+
 Generated code is a tracer bullet, not finished domain behavior. A generated
 slice carries an explicit `AgentAuthoringState.UNFINISHED_GENERATED_TRACER_BULLET`
 marker, while the scaffold's first-tool flow sets `_AUTHORING_STATE` to
@@ -716,7 +725,21 @@ guess tool references from arbitrary natural-language prompt text.
 
 `ScriptedModelProvider` can prove runtime handling of predetermined calls, but
 it cannot prove prompt comprehension, model tool choice, or live-provider
-behavior. Keep manifest-backed prompt/tool alignment evidence separate from a
+behavior. A scripted test can also pass while the real model sees nothing
+useful: a custom tool's result reaches the model only through its `content`,
+never its `structured` data. Assert on what the model reads with
+`model_facing_text(provider.requests[i])` (one line per text part, peer
+content, tool call and tool result `content`) or
+`model_facing_tool_result(result)`:
+
+```python
+from cayu import model_facing_text
+
+seen = model_facing_text(provider.requests[1])
+assert "tool audit_csv: 3 blank rows in data.csv" in seen
+```
+
+Keep manifest-backed prompt/tool alignment evidence separate from a
 scripted trajectory. Optional live-provider evidence may exercise comprehension
 and tool choice, but remains credential-gated and is not required for hermetic
 CI.

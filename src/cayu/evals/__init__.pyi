@@ -1393,6 +1393,8 @@ from cayu.evals.suite_preflight import (
     compile_authored_suite_run_exposure as compile_authored_suite_run_exposure,
 )
 from cayu.evals.testing import ScriptedModelProvider as ScriptedModelProvider
+from cayu.evals.testing import model_facing_text as model_facing_text
+from cayu.evals.testing import model_facing_tool_result as model_facing_tool_result
 from cayu.evals.testing import scripted_structured_output as scripted_structured_output
 from cayu.evals.trajectory import SessionTrajectoryError as SessionTrajectoryError
 from cayu.evals.trajectory import final_output_text as final_output_text
