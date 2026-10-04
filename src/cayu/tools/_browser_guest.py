@@ -8,6 +8,7 @@ Cayu host process.
 
 from __future__ import annotations
 
+import array
 import asyncio
 import base64
 import binascii
@@ -167,15 +168,18 @@ _INTERACTIVE_STARTUP_SECONDS = 20.0
 _INTERACTIVE_STARTUP_SETTLEMENT_SECONDS = 5.0
 _INTERACTIVE_IDLE_POLL_SECONDS = 0.25
 _INTERACTIVE_RESPONSE_DRAIN_SECONDS = 5.0
-_INTERACTIVE_MAX_PROFILE_PLAINTEXT_BYTES = 1024 * 1024
-_INTERACTIVE_MAX_PROFILE_ORIGINS = 32
-_INTERACTIVE_MAX_PROFILE_COOKIES = 256
-_INTERACTIVE_MAX_PROFILE_STORAGE_ENTRIES = 512
+# This file runs inside the browser image and cannot import cayu, so these
+# mirror the host's BROWSER_PROFILE_MAX_* ceilings; a test keeps them equal.
+# A guest that accepted less than the host would refuse valid profiles.
+_INTERACTIVE_MAX_PROFILE_PLAINTEXT_BYTES = 8 * 1024 * 1024
+_INTERACTIVE_MAX_PROFILE_ORIGINS = 256
+_INTERACTIVE_MAX_PROFILE_COOKIES = 4_096
+_INTERACTIVE_MAX_PROFILE_STORAGE_ENTRIES = 8_192
 _INTERACTIVE_MAX_PROFILE_PRIVATE_VALUES = 2 * (
     _INTERACTIVE_MAX_PROFILE_COOKIES + _INTERACTIVE_MAX_PROFILE_STORAGE_ENTRIES
 )
-_INTERACTIVE_MAX_PROFILE_NAME_BYTES = 1024
-_INTERACTIVE_MAX_PROFILE_VALUE_BYTES = 64 * 1024
+_INTERACTIVE_MAX_PROFILE_NAME_BYTES = 4_096
+_INTERACTIVE_MAX_PROFILE_VALUE_BYTES = 1024 * 1024
 _INTERACTIVE_MAX_REQUEST_BYTES = 7 * _INTERACTIVE_MAX_PROFILE_PLAINTEXT_BYTES
 _INTERACTIVE_MAX_SNAPSHOT_BYTES = 256 * 1024
 _INTERACTIVE_MAX_DOM_NODES = 100_000
@@ -1922,6 +1926,167 @@ def _interactive_profile_private_values(state: dict[str, Any]) -> tuple[str, ...
                 raise _GuestFailure("incompatible_browser")
             values.update(item for item in (entry["name"], entry["value"]) if item)
     return tuple(sorted(values, key=lambda item: (-len(item), item)))
+
+
+# Anti-reflection checks every protected profile value against every observed
+# text. A plain ``value in text`` loop costs values x text length, which at the
+# profile ceilings (24k values, 256 KiB snapshots) takes seconds per
+# observation. The matcher below gives the same answer with an index:
+_ANCHOR_CHARS = 8
+_ANCHOR_BUCKET_BITS = 20
+# Up to this many values x text characters the plain scan is used. Measured on
+# a 276K-character observation (256 KiB snapshot plus 1,024 refs): the index
+# costs about 50 ms whatever the profile size; the plain scan costs about
+# 0.05 ns per character pair on typical text (24 ms at this budget) but up to
+# about 1 ns on an all-'a' page against values like 'aaaaaaaabaaaaaaaa'
+# (about 120 ms at this budget, 0.2-0.3 s at twice it).
+_PLAIN_SCAN_BUDGET = 1 << 27
+# A short-value length group up to this size is scanned directly.
+_SHORT_GROUP_SCAN_LIMIT = 16
+_TEXT_SEPARATOR = "\x00"
+# One verified anchor occurrence costs about this many scanned characters.
+_OCCURRENCE_COST = 1_000
+
+
+class _ProtectedValueMatcher:
+    """Report whether any protected value occurs in a text, like ``value in text``.
+
+    - Values shorter than ``_ANCHOR_CHARS`` are grouped by length and compared
+      with the set of the text's substrings of that length.
+    - Longer values are indexed by anchor windows (``_ANCHOR_CHARS`` characters,
+      non-overlapping, covering the whole value). Bucket counts of every
+      window-length substring of the text skip a value with any window that
+      never occurs, and otherwise pick its rarest window. Each occurrence of
+      that window is verified exactly, sharing the search across values with
+      the same window and offset, or the values are scanned directly when that
+      is cheaper.
+    Every candidate is confirmed by exact comparison, so hash collisions only
+    cost time, never correctness. Memory is a fixed 4 MiB bucket table plus four
+    bytes per eight protected characters.
+    """
+
+    def __init__(self, values: tuple[str, ...]) -> None:
+        self.values = values
+        self.matches_everything = "" in values
+        # A value containing the separator could match across joined texts, so
+        # those (never produced by validated profile state) are scanned plainly.
+        self.separator_values = tuple(value for value in values if _TEXT_SEPARATOR in value)
+        self.indexed = tuple(value for value in values if value and _TEXT_SEPARATOR not in value)
+        self.indexed_count = len(self.indexed)
+        self.short_by_length: dict[int, set[str]] = {}
+        # (bucket of every anchor window, value); windows sit at _anchor_offsets.
+        self.long_values: list[tuple[array.array, str]] = []
+        self._index_built = False
+
+    def _build_index(self) -> None:
+        # Built on first use: small profiles only ever take the plain scan.
+        if self._index_built:
+            return
+        self._index_built = True
+        mask = (1 << _ANCHOR_BUCKET_BITS) - 1
+        for value in self.indexed:
+            length = len(value)
+            if length < _ANCHOR_CHARS:
+                self.short_by_length.setdefault(length, set()).add(value)
+                continue
+            buckets = array.array(
+                "I",
+                (
+                    hash(value[offset : offset + _ANCHOR_CHARS]) & mask
+                    for offset in _anchor_offsets(length)
+                ),
+            )
+            self.long_values.append((buckets, value))
+
+    def found_in(self, texts: tuple[str, ...]) -> bool:
+        if not texts:
+            return False
+        if self.matches_everything:
+            return True
+        if any(value in text for value in self.separator_values for text in texts):
+            return True
+        if not self.indexed_count:
+            return False
+        joined = _TEXT_SEPARATOR.join(texts)
+        size = len(joined)
+        if self.indexed_count * size <= _PLAIN_SCAN_BUDGET:
+            return any(value in joined for value in self.indexed)
+        self._build_index()
+        return self._short_found(joined, size) or self._long_found(joined, size)
+
+    def _short_found(self, text: str, size: int) -> bool:
+        for length, group in self.short_by_length.items():
+            if length > size:
+                continue
+            if len(group) <= _SHORT_GROUP_SCAN_LIMIT:
+                if any(value in text for value in group):
+                    return True
+            elif not group.isdisjoint(
+                {text[index : index + length] for index in range(size - length + 1)}
+            ):
+                return True
+        return False
+
+    def _long_found(self, text: str, size: int) -> bool:
+        if not self.long_values or size < _ANCHOR_CHARS:
+            return False
+        mask = (1 << _ANCHOR_BUCKET_BITS) - 1
+        counts = array.array("I", bytes(4 << _ANCHOR_BUCKET_BITS))
+        for index in range(size - _ANCHOR_CHARS + 1):
+            counts[hash(text[index : index + _ANCHOR_CHARS]) & mask] += 1
+        groups: dict[tuple[int, str, int], dict[int, set[str]]] = {}
+        for buckets, value in self.long_values:
+            length = len(value)
+            if length > size:
+                continue
+            # The windows cover the whole value, so a value with any window
+            # that never occurs in the text is skipped without a search.
+            window_counts = [counts[bucket] for bucket in buckets]
+            best_count = min(window_counts)
+            if best_count == 0:
+                continue
+            index = window_counts.index(best_count)
+            offset = _anchor_offsets(length)[index]
+            best = (offset, value[offset : offset + _ANCHOR_CHARS], buckets[index])
+            groups.setdefault(best, {}).setdefault(length, set()).add(value)
+        for (offset, anchor, bucket), by_length in groups.items():
+            # Verify at each anchor occurrence, or scan for each value directly
+            # when the anchor is so common that the scan is cheaper.
+            occurrences = counts[bucket] * len(by_length)
+            if occurrences * _OCCURRENCE_COST > size * sum(map(len, by_length.values())):
+                if any(value in text for group in by_length.values() for value in group):
+                    return True
+                continue
+            position = text.find(anchor)
+            while position != -1:
+                start = position - offset
+                if start >= 0:
+                    for length, group in by_length.items():
+                        if text[start : start + length] in group:
+                            return True
+                position = text.find(anchor, position + 1)
+        return False
+
+
+def _anchor_offsets(length: int) -> tuple[int, ...]:
+    """Non-overlapping anchor windows covering every character of a long value."""
+
+    last = length - _ANCHOR_CHARS
+    return (*range(0, last, _ANCHOR_CHARS), last)
+
+
+_PROTECTED_VALUE_MATCHER: _ProtectedValueMatcher | None = None
+
+
+def _protected_value_matcher(values: tuple[str, ...]) -> _ProtectedValueMatcher:
+    """Reuse the index while the protected values stay the same."""
+
+    global _PROTECTED_VALUE_MATCHER
+    matcher = _PROTECTED_VALUE_MATCHER
+    if matcher is None or (matcher.values is not values and matcher.values != values):
+        matcher = _ProtectedValueMatcher(values)
+        _PROTECTED_VALUE_MATCHER = matcher
+    return matcher
 
 
 def _bounded_interactive_profile_private_values(
@@ -5391,7 +5556,7 @@ class _InteractiveDaemon:
         if origin is None:
             return None
         origin = origin.removesuffix("/")
-        if len(origin) > 2048 or any(value in origin for value in private_values):
+        if len(origin) > 2048 or _protected_value_matcher(private_values).found_in((origin,)):
             return None
         return origin
 
@@ -7869,7 +8034,8 @@ class _InteractiveDaemon:
         url = protected.get("url")
         if type(url) is not str:
             raise _GuestFailure("policy_denied")
-        if any(secret in url for secret in protected_values):
+        matcher = _protected_value_matcher(protected_values)
+        if matcher.found_in((url,)):
             raise _GuestFailure("policy_denied")
         visible_values = [protected.get("title"), protected.get("snapshot")]
         refs = protected.get("refs")
@@ -7881,11 +8047,7 @@ class _InteractiveDaemon:
             if type(item) is dict
             for value in (item.get("role"), item.get("name"))
         )
-        if any(
-            type(value) is str and secret in value
-            for secret in protected_values
-            for value in visible_values
-        ):
+        if matcher.found_in(tuple(value for value in visible_values if type(value) is str)):
             protected["title"] = None
             protected["snapshot"] = _INTERACTIVE_PROFILE_OUTPUT_OMITTED
             protected["refs"] = []

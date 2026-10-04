@@ -14452,3 +14452,23 @@ def test_server_recover_tool_round_route_is_registered() -> None:
         },
     )
     assert response.status_code == 404
+
+
+def test_oversized_prompt_reports_the_size_limit() -> None:
+    from cayu.server.contracts import MAX_CONTROL_PLANE_PROMPT_BYTES
+
+    app = CayuApp()
+    app.register_provider(UsageProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    response = client.post("/api/run", json={"prompt": "x" * (MAX_CONTROL_PLANE_PROMPT_BYTES + 1)})
+
+    assert MAX_CONTROL_PLANE_PROMPT_BYTES > 64 * 1024
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": (
+            f"prompt exceeds the maximum encoded size of {MAX_CONTROL_PLANE_PROMPT_BYTES} bytes."
+        )
+    }
+    assert "xxxx" not in response.text

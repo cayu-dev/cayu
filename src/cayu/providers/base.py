@@ -107,7 +107,9 @@ _DEFAULT_FINGERPRINT_RUNTIME_OPTION_KEYS = frozenset(
 OPENAI_ADDITIONAL_TOOLS_PROTOCOL = "openai.additional_tools.v1"
 OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL = "openai.tool_search.client.v1"
 OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL = "openai.tool_search.hosted.v1"
-TOOL_DISCOVERY_PROJECTION_MAX_TOOLS = 256
+# Matches TOOL_CATALOGUE_MAX_TOOLS: every catalogue entry can be projected. The
+# per-schema and total byte bounds below are what limit a request's size.
+TOOL_DISCOVERY_PROJECTION_MAX_TOOLS = 10_000
 TOOL_DISCOVERY_PROJECTION_MAX_SCHEMA_BYTES = 64 * 1024
 TOOL_DISCOVERY_PROJECTION_MAX_TOTAL_BYTES = 1024 * 1024
 TARGETED_TOOL_PROJECTION_MARKER_TYPE = "cayu.targeted-tool-projection-marker"

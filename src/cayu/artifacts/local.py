@@ -53,6 +53,7 @@ from cayu.artifacts._settlement import (
 )
 from cayu.artifacts.access import runtime_artifact_operation
 from cayu.artifacts.base import (
+    ArtifactIdentityConflictError,
     ArtifactListResult,
     ArtifactMetadata,
     ArtifactReadResult,
@@ -1078,7 +1079,9 @@ def _remove_matching_incomplete_artifact(
                     os.listdir(directory_fd) if directory_fd is not None else os.listdir(target)
                 )
                 if not names <= {_CONTENT_FILE, _METADATA_FILE}:
-                    raise ValueError("Incomplete artifact directory contains unexpected entries.")
+                    raise ArtifactIdentityConflictError(
+                        "Incomplete artifact directory contains unexpected entries."
+                    )
                 if _CONTENT_FILE in names:
                     content_fd = _open_artifact_file(
                         directory_fd,
@@ -1090,7 +1093,7 @@ def _remove_matching_incomplete_artifact(
                     with os.fdopen(content_fd, "rb") as file:
                         existing_content = file.read()
                     if existing_content != content:
-                        raise ValueError(
+                        raise ArtifactIdentityConflictError(
                             "Incomplete artifact content conflicts with deterministic retry."
                         )
                 if _METADATA_FILE in names:
@@ -1102,6 +1105,12 @@ def _remove_matching_incomplete_artifact(
                         )
                     except FileNotFoundError:
                         pass
+                    except ValueError as exc:
+                        # Unreadable metadata (invalid JSON, schema or id) cannot be
+                        # proven to belong to this deterministic write.
+                        raise ArtifactIdentityConflictError(
+                            "Incomplete artifact metadata conflicts with deterministic retry."
+                        ) from exc
                     else:
                         comparable_existing = existing_metadata.model_dump(
                             mode="json",
@@ -1112,7 +1121,7 @@ def _remove_matching_incomplete_artifact(
                             exclude={"created_at"},
                         )
                         if comparable_existing != comparable_expected:
-                            raise ValueError(
+                            raise ArtifactIdentityConflictError(
                                 "Incomplete artifact metadata conflicts with deterministic retry."
                             )
                         if _CONTENT_FILE in names:
@@ -1120,6 +1129,16 @@ def _remove_matching_incomplete_artifact(
                 incomplete_identity = directory_identity
         except FileNotFoundError:
             return True
+        except ArtifactIdentityConflictError:
+            raise
+        except ValueError as exc:
+            # A safety check refused what sits at the id (a non-directory path,
+            # a symlinked or non-regular file, or one that changed while being
+            # opened). It cannot be proven to belong to this write. Real OS
+            # failures stay ArtifactStoreUnavailableError.
+            raise ArtifactIdentityConflictError(
+                "Artifact at the deterministic id failed a safety check."
+            ) from exc
         quarantine_name = f"{artifact.id}.partial-{uuid4().hex}"
         quarantine = root / quarantine_name
         try:

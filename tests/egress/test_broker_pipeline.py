@@ -127,6 +127,7 @@ def _build(
     clock: _Clock | None = None,
     policies: Mapping[str, EgressPolicy] | None = None,
     max_active_upstream_operations: int = 16,
+    upstream_max_response_bytes: int | None = None,
 ) -> tuple[
     TransparentEgressBroker, VirtualCredentialRegistry, _RecordingResolver, list[EgressDecision]
 ]:
@@ -149,6 +150,11 @@ def _build(
         upstream=upstream,
         audit=decisions.append,
         max_active_upstream_operations=max_active_upstream_operations,
+        **(
+            {}
+            if upstream_max_response_bytes is None
+            else {"upstream_max_response_bytes": upstream_max_response_bytes}
+        ),
     )
     return broker, registry, resolver, decisions
 
@@ -267,18 +273,13 @@ def test_connect_admission_audits_denial_before_http_authority_exists() -> None:
     ]
 
 
-def test_broker_revalidates_global_response_limit_for_custom_upstream(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_broker_revalidates_global_response_limit_for_custom_upstream() -> None:
     body = b"bounded-upstream-response"
     upstream = _FakeUpstream(CapturedResponse(status_code=200, body=body))
-    broker, registry, _resolver, decisions = _build(upstream=upstream)
-    grant = _mint(registry)
-    monkeypatch.setattr(
-        broker_module,
-        "MAX_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES",
-        len(body) - 1,
+    broker, registry, _resolver, decisions = _build(
+        upstream=upstream, upstream_max_response_bytes=len(body) - 1
     )
+    grant = _mint(registry)
 
     response = asyncio.run(broker.handle_request(_request(grant.presented_value, "/v1/customers")))
 
@@ -926,16 +927,9 @@ def test_allowed_response_redacts_echoed_real_secret() -> None:
     _no_real_secret(decisions)
 
 
-def test_response_redaction_cannot_expand_body_beyond_hard_limit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_response_redaction_cannot_expand_body_beyond_hard_limit() -> None:
     short_secret = "sk_test_x"
     body = short_secret.encode() * 4
-    monkeypatch.setattr(
-        broker_module,
-        "MAX_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES",
-        len(body),
-    )
     registry = VirtualCredentialRegistry()
     decisions: list[EgressDecision] = []
     broker = TransparentEgressBroker(
@@ -945,6 +939,7 @@ def test_response_redaction_cannot_expand_body_beyond_hard_limit(
         upstream=_FakeUpstream(CapturedResponse(status_code=200, body=body)),
         audit=decisions.append,
         browser_max_response_bytes=len(body),
+        upstream_max_response_bytes=len(body),
     )
     grant = _mint(registry)
 
@@ -1522,7 +1517,7 @@ def test_httpx_upstream_accepts_response_at_exact_decoded_byte_limit() -> None:
     [
         ({"max_response_bytes": True}, TypeError),
         ({"max_response_bytes": 0}, ValueError),
-        ({"max_response_bytes": 64 * 1024 * 1024 + 1}, ValueError),
+        ({"max_response_bytes": 2 * 1024 * 1024 * 1024 + 1}, ValueError),
         ({"timeout_s": True}, TypeError),
         ({"timeout_s": 0}, ValueError),
         ({"timeout_s": float("nan")}, ValueError),
@@ -1711,7 +1706,7 @@ def test_browser_policy_revalidates_custom_upstream_response_contract(
     expected_error: str,
 ) -> None:
     monkeypatch.setattr(
-        "cayu.egress.broker.DEFAULT_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES",
+        "cayu.egress.broker.DEFAULT_EGRESS_BROWSER_MAX_RESPONSE_BYTES",
         4,
     )
     broker = TransparentEgressBroker(

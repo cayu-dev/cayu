@@ -329,15 +329,33 @@ def test_isolated_tool_rejects_nonportable_or_interpreter_affecting_configuratio
             limits=ProcessIsolatedToolLimits(deadline_seconds=1),
             factory_config=MappingInput(),
         )
-    interpreter_secret = "PYTHON_SECRET_CANARY"
-    with pytest.raises(ValueError, match="child interpreter") as environment_error:
-        ProcessIsolatedTool(
-            ToolSpec(name="invalid", input_schema={"type": "object"}),
-            factory=_factory_ref(),
-            limits=ProcessIsolatedToolLimits(deadline_seconds=1),
-            environment={interpreter_secret: "/caller/path"},
-        )
-    assert interpreter_secret not in str(environment_error.value)
+    for interpreter_name in (
+        "PYTHONPATH",
+        "PYTHONWARNINGS",
+        "PYTHONUTF8",
+        "PYTHON_PRESITE",
+        "LD_PRELOAD",
+    ):
+        with pytest.raises(ValueError, match="child interpreter") as environment_error:
+            ProcessIsolatedTool(
+                ToolSpec(name="invalid", input_schema={"type": "object"}),
+                factory=_factory_ref(),
+                limits=ProcessIsolatedToolLimits(deadline_seconds=1),
+                environment={interpreter_name: "/caller/path-canary"},
+            )
+        assert "/caller/path-canary" not in str(environment_error.value)
+    # Benign interpreter tuning reaches processes the tool starts.
+    tuned = ProcessIsolatedTool(
+        ToolSpec(name="tuned", input_schema={"type": "object"}),
+        factory=_factory_ref(),
+        limits=ProcessIsolatedToolLimits(deadline_seconds=1),
+        environment={
+            "PYTHONUNBUFFERED": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONHASHSEED": "0",
+        },
+    )
+    assert tuned.environment_copy()["PYTHONUNBUFFERED"] == "1"
     with pytest.raises(DurableValueError, match="JSON-compatible"):
         ProcessIsolatedTool(
             ToolSpec(name="invalid", input_schema={"type": "object"}),

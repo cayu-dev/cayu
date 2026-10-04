@@ -383,6 +383,8 @@ def test_broker_call_failures_emit_secret_free_transport_events(monkeypatch, fai
         monkeypatch.setattr(broker, "handle_request", fail)
         if failure == "proxy_timeout":
             monkeypatch.setattr(proxy_server_module, "_BROKER_TIMEOUT_S", 0.1)
+            monkeypatch.setattr(proxy_server_module, "_BROKER_RESPONSE_MARGIN_S", 0.1)
+            monkeypatch.setattr(broker, "_upstream_total_timeout_s", 0.0)
         server = TransparentEgressProxyServer(broker, loop=asyncio.get_running_loop())
         port = await server.start()
         try:

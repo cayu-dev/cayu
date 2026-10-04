@@ -300,6 +300,7 @@ from cayu.server.sse import (
     sse_message_data_bytes,
 )
 from cayu.sessions.base import (
+    COMPACTION_INSTRUCTIONS_MAX_CHARS,
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     SESSION_MESSAGE_CONTENT_MAX_BYTES,
     CompactSessionRequest,
@@ -583,7 +584,10 @@ class _BoundedPrivateJsonBodyRoute(APIRoute):
                 bounded_request = Request(request.scope, receive=bounded_receive)
             try:
                 response = await route_handler(bounded_request)
-            except RequestValidationError:
+            except RequestValidationError as exc:
+                size_detail = _authored_size_error(exc)
+                if size_detail is not None:
+                    return _private_no_store_error_response(422, size_detail)
                 return invalid_request_response()
             except HTTPException as exc:
                 headers = dict(exc.headers or {})
@@ -729,6 +733,25 @@ def _private_tool_discovery_view_route_class(cayu_app: Any) -> type[APIRoute]:
             return private_route_handler
 
     return _PrivateToolDiscoveryViewRoute
+
+
+_AUTHORED_SIZE_ERROR_PREFIXES = (
+    "prompt exceeds the maximum encoded size of ",
+    "content exceeds the maximum encoded size of ",
+)
+
+
+def _authored_size_error(error: RequestValidationError) -> str | None:
+    """Return a server-authored size message; never echoes the rejected value."""
+
+    for item in error.errors():
+        message = item.get("msg")
+        if type(message) is not str:
+            continue
+        message = message.removeprefix("Value error, ")
+        if message.startswith(_AUTHORED_SIZE_ERROR_PREFIXES) and message.endswith(" bytes."):
+            return message
+    return None
 
 
 class _BoundedControlPlaneRequestRoute(_BoundedPrivateJsonBodyRoute):
@@ -982,7 +1005,9 @@ _EVENT_PAGE_LIMIT_MAX = 1000
 _TRANSCRIPT_PAGE_LIMIT_MAX = 1000
 _ARTIFACT_PAGE_LIMIT_MAX = 500
 _ARTIFACT_PAGE_OFFSET_MAX = 10_000
-_ARTIFACT_CONTENT_BYTES_MAX = 64 * 1024 * 1024
+# Direct content responses are buffered; sized for typical generated files
+# (reports, archives, media). Larger artifacts use store-native range reads.
+_ARTIFACT_CONTENT_BYTES_MAX = 256 * 1024 * 1024
 _ARTIFACT_FILENAME_HEADER_UTF8_MAX_BYTES = 512
 _ARTIFACT_FILENAME_HEADER_ASCII_MAX_CHARS = 255
 _ARTIFACT_ID_HEADER_MAX_CHARS = 512
@@ -1793,7 +1818,9 @@ class CompactSessionBody(BaseModel):
     idempotency_key: PersistableNonBlankString = Field(max_length=256)
     expected_run_epoch: StrictInt = Field(ge=0)
     expected_transcript_cursor: StrictInt = Field(ge=0)
-    instructions: NonBlankString | None = Field(default=None, max_length=4096)
+    instructions: NonBlankString | None = Field(
+        default=None, max_length=COMPACTION_INSTRUCTIONS_MAX_CHARS
+    )
     limits: RunLimits = Field(default_factory=RunLimits)
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     requested_by: ResolutionActor | None = None

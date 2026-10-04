@@ -2387,6 +2387,29 @@ def test_read_file_returns_not_found_error_when_workspace_attachment_disappears(
     assert result.is_error is True
 
 
+def test_read_file_workspace_snapshot_replay_returns_the_same_artifact(tmp_path):
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    workspace = LocalWorkspace(workspace_root, workspace_id="local")
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    ctx = ToolContext(
+        session_id="sess_1",
+        agent_name="assistant",
+        environment_name="local-dev",
+        workspace=workspace,
+        artifact_store=artifact_store,
+    )
+    asyncio.run(workspace.write_bytes("docs/invoice.pdf", _tiny_pdf_bytes()))
+
+    first = asyncio.run(ReadFileTool().run(ctx, {"path": "docs/invoice.pdf"}))
+    second = asyncio.run(ReadFileTool().run(ctx, {"path": "docs/invoice.pdf"}))
+    listing = asyncio.run(artifact_store.list(session_id="sess_1"))
+
+    assert ReadFileTool().spec.effect is ToolEffect.IDEMPOTENT
+    assert first.structured["snapshot_artifact_id"] == second.structured["snapshot_artifact_id"]
+    assert len(listing.artifacts) == 1
+
+
 def test_read_file_does_not_misclassify_missing_published_workspace_snapshot(tmp_path):
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
@@ -2727,7 +2750,9 @@ def _multi_page_pdf_bytes(page_count: int) -> bytes:
     return buffer.getvalue()
 
 
-def test_read_file_caps_pages_for_small_many_page_pdf(tmp_path):
+def test_read_file_caps_pages_for_small_many_page_pdf(tmp_path, monkeypatch):
+    # Exercise the page cap with small fixtures; the production cap is 100.
+    monkeypatch.setattr(files_module, "MAX_PDF_PAGES_PER_READ", 10)
     artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
     pdf = asyncio.run(
         artifact_store.put_bytes(
@@ -2762,7 +2787,9 @@ def test_read_file_caps_pages_for_small_many_page_pdf(tmp_path):
         ("13", "starts after the end of the PDF"),
     ],
 )
-def test_read_file_reports_invalid_pdf_page_ranges(tmp_path, pages, message):
+def test_read_file_reports_invalid_pdf_page_ranges(tmp_path, pages, message, monkeypatch):
+    # Exercise the page cap with small fixtures; the production cap is 100.
+    monkeypatch.setattr(files_module, "MAX_PDF_PAGES_PER_READ", 10)
     artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
     pdf = asyncio.run(
         artifact_store.put_bytes(
@@ -2781,7 +2808,9 @@ def test_read_file_reports_invalid_pdf_page_ranges(tmp_path, pages, message):
     assert message in result.content
 
 
-def test_read_file_dedupes_repeated_pdf_page_extraction(tmp_path):
+def test_read_file_dedupes_repeated_pdf_page_extraction(tmp_path, monkeypatch):
+    # Exercise the page cap with small fixtures; the production cap is 100.
+    monkeypatch.setattr(files_module, "MAX_PDF_PAGES_PER_READ", 10)
     artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
     pdf = asyncio.run(
         artifact_store.put_bytes(
@@ -2976,7 +3005,8 @@ def test_read_file_rebuilds_missing_and_corrupt_pdf_derivations(
     rebuilt_corrupt = asyncio.run(ReadFileTool().run(ctx, args))
 
     assert rebuilt_missing.is_error is False
-    assert missing_id != first_id
+    # Derived attachments are content-addressed, so a rebuild reuses the id.
+    assert missing_id == first_id
     assert rejected_corrupt.is_error is True
     assert rejected_corrupt.artifacts == ()
     assert extraction_count_after_strict_rebuild == 3

@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
+import pytest
 
 from cayu import SQLiteSessionStore
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
@@ -3152,3 +3153,36 @@ def test_session_cli_rejects_interaction_completion_before_start(
     error = json.loads(capsys.readouterr().out)["error"]
     assert error["code"] == "SESSION_INSPECTION_FAILED"
     assert "completed_at must not precede started_at" in error["message"]
+
+
+def test_server_error_detail_is_bounded_not_discarded() -> None:
+    import httpx
+
+    from cayu.cli.session import _safe_server_error_detail
+
+    long_detail = "Line one of the reason.\nLine two \x1b[31mred\x1b[0m " + "x" * 20_000
+    response = httpx.Response(409, json={"detail": long_detail})
+
+    detail = _safe_server_error_detail(response, authorization=None)
+
+    assert detail is not None
+    assert detail.startswith("Line one of the reason.\nLine two  [31mred")
+    assert "\x1b" not in detail
+    assert detail.endswith("...[truncated]")
+    assert len(detail.encode("utf-8")) <= 8 * 1024
+
+
+@pytest.mark.parametrize(
+    "character",
+    ["\x9b", "\x7f", "\u202e", "\u2066", "\u200f", "\x85"],
+)
+def test_server_error_detail_neutralizes_c1_del_and_bidi_controls(character: str) -> None:
+    import httpx
+
+    from cayu.cli.session import _safe_server_error_detail
+
+    response = httpx.Response(409, json={"detail": f"before{character}31mafter\tcolumn\nnext line"})
+
+    detail = _safe_server_error_detail(response, authorization=None)
+
+    assert detail == "before 31mafter\tcolumn\nnext line"

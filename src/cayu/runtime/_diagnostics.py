@@ -19,6 +19,9 @@ from cayu._validation import (
 from cayu.vaults import SecretRedactor
 
 MAX_DIAGNOSTIC_UTF8_BYTES = 4 * 1024
+# Tool failures are read by the model to recover, so they keep full validation
+# output and tracebacks. Redaction still runs on the complete text first.
+TOOL_FAILURE_DIAGNOSTIC_UTF8_BYTES = 32 * 1024
 MAX_DIAGNOSTIC_TYPE_UTF8_BYTES = 128
 MAX_DIAGNOSTIC_EXCEPTION_GROUP_NODES = 16
 _TRUNCATION_MARKER = "\u2026[truncated]"
@@ -333,6 +336,7 @@ def exception_diagnostic(
     nonportable_message: str = "Operation failed with a non-portable diagnostic.",
     preserve_empty_message: bool = False,
     redactor: SecretRedactor | None = None,
+    max_message_bytes: int = MAX_DIAGNOSTIC_UTF8_BYTES,
 ) -> ExceptionDiagnostic:
     """Snapshot an exception without carrying rejected text into durability.
 
@@ -353,7 +357,7 @@ def exception_diagnostic(
         return ExceptionDiagnostic(
             message=resolved_redactor.redact_text_bounded(
                 nonportable_message,
-                max_bytes=MAX_DIAGNOSTIC_UTF8_BYTES,
+                max_bytes=max_message_bytes,
             ),
             error_type=error_type,
             durable_value_error_code=code,
@@ -380,7 +384,7 @@ def exception_diagnostic(
             return ExceptionDiagnostic(
                 message=resolved_redactor.redact_text_bounded(
                     nonportable_message,
-                    max_bytes=MAX_DIAGNOSTIC_UTF8_BYTES,
+                    max_bytes=max_message_bytes,
                 ),
                 error_type=error_type,
                 durable_value_error_code=code,
@@ -396,7 +400,7 @@ def exception_diagnostic(
     return ExceptionDiagnostic(
         message=resolved_redactor.redact_text_bounded(
             message,
-            max_bytes=MAX_DIAGNOSTIC_UTF8_BYTES,
+            max_bytes=max_message_bytes,
         ),
         error_type=error_type,
     )
@@ -443,16 +447,16 @@ def task_update_error_payload(
     )
 
 
-def bound_diagnostic_text(value: str) -> str:
+def bound_diagnostic_text(value: str, *, max_bytes: int = MAX_DIAGNOSTIC_UTF8_BYTES) -> str:
     """Bound already-portable diagnostic text without splitting UTF-8."""
 
     used_bytes = 0
     characters: list[str] = []
     for character in value:
         character_bytes = len(character.encode("utf-8"))
-        if used_bytes + character_bytes > MAX_DIAGNOSTIC_UTF8_BYTES:
+        if used_bytes + character_bytes > max_bytes:
             marker_bytes = len(_TRUNCATION_MARKER.encode("utf-8"))
-            while characters and used_bytes + marker_bytes > MAX_DIAGNOSTIC_UTF8_BYTES:
+            while characters and used_bytes + marker_bytes > max_bytes:
                 removed = characters.pop()
                 used_bytes -= len(removed.encode("utf-8"))
             return "".join(characters) + _TRUNCATION_MARKER

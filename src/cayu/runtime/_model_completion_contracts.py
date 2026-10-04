@@ -20,6 +20,7 @@ from cayu.budgets._run_limit_accounting import (
     has_run_limit_accounting_authority,
 )
 from cayu.budgets.base import (
+    MAX_REQUEST_BUDGET_LIMITS,
     BudgetLimit,
     BudgetReservationRecoveryContext,
     copy_request_budget_limits,
@@ -68,8 +69,10 @@ from cayu.sessions.base import (
 from cayu.tools.exposure import ResolvedToolExposureAuthority, copy_resolved_tool_exposure_authority
 
 MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES = MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES
-MAX_MODEL_COMPLETION_RECOVERY_METADATA_ENTRIES = 256
-MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS = 32
+# RunRequest metadata is bounded only by DURABLE_METADATA_LIMITS and its budget
+# limits by MAX_REQUEST_BUDGET_LIMITS; recovery copies both the same way, so an
+# admitted run cannot fail at its first model step.
+MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS = MAX_REQUEST_BUDGET_LIMITS
 _MAX_MODEL_COMPLETION_RECOVERY_PRICE_ENTRIES = 512
 _MAX_MODEL_COMPLETION_RECOVERY_PRICING_CONTEXTS = 128
 _MAX_MODEL_COMPLETION_RECOVERY_EVIDENCE_ENTRIES = 256
@@ -168,13 +171,7 @@ class ModelCompletionRecoveryContext(BaseModel):
     @field_validator("request_metadata", mode="before")
     @classmethod
     def copy_request_metadata(cls, value: object) -> dict[str, Any]:
-        copied = copy_durable_metadata(value, "request_metadata")
-        if len(copied) > MAX_MODEL_COMPLETION_RECOVERY_METADATA_ENTRIES:
-            raise ValueError(
-                "request_metadata cannot contain more than "
-                f"{MAX_MODEL_COMPLETION_RECOVERY_METADATA_ENTRIES} entries."
-            )
-        return copied
+        return copy_durable_metadata(value, "request_metadata")
 
     @field_validator("budget_limits", mode="before")
     @classmethod

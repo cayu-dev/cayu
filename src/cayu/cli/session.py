@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any, cast
@@ -60,8 +61,9 @@ CLI_SCHEMA_VERSION = "8"
 _MAX_COLLECTED_EVENT_BYTES = 64 * 1024 * 1024
 _MAX_COLLECTED_EVENT_RECORDS = 100_000
 _MAX_TRANSCRIPT_CONTENT_BYTES = 1_048_576
-_MAX_SERVER_ERROR_BODY_BYTES = 8 * 1024
-_MAX_SERVER_ERROR_DETAIL_BYTES = 1024
+_MAX_SERVER_ERROR_BODY_BYTES = 128 * 1024
+_MAX_SERVER_ERROR_DETAIL_BYTES = 8 * 1024
+_MAX_SERVER_ERROR_DETAIL_SOURCE_BYTES = 64 * 1024
 _MAX_TRANSCRIPT_SUMMARY_PARTS = 100
 _EVENT_QUERY_PAGE_SIZE = 200
 _USAGE_INSPECTION_PRICING_STATE_KEY = "_cayu_pricing_state"
@@ -415,14 +417,29 @@ def _safe_server_error_detail(
         detail_size = len(detail.encode("utf-8"))
     except UnicodeEncodeError:
         return None
-    if detail_size > _MAX_SERVER_ERROR_DETAIL_BYTES:
+    if detail_size > _MAX_SERVER_ERROR_DETAIL_SOURCE_BYTES:
         return None
-    if any(ord(character) < 32 and character not in "\t" for character in detail):
-        return None
+    # Keep tabs and line breaks; neutralize every other control or format
+    # character: C0/C1 controls (including the 8-bit CSI U+009B), DEL, and bidi
+    # overrides that could make the shown text differ from what was sent.
+    detail = "".join(
+        " "
+        if character not in "\t\n" and unicodedata.category(character) in {"Cc", "Cf"}
+        else character
+        for character in detail
+    )
     if authorization is not None:
         detail = detail.replace(authorization, "[REDACTED]")
     redacted = _redact_sensitive(detail)
-    return redacted if type(redacted) is str else None
+    if type(redacted) is not str:
+        return None
+    # Redact the complete text first, then bound it.
+    encoded = redacted.encode("utf-8")
+    if len(encoded) <= _MAX_SERVER_ERROR_DETAIL_BYTES:
+        return redacted
+    marker = "...[truncated]"
+    head = encoded[: _MAX_SERVER_ERROR_DETAIL_BYTES - len(marker)].decode("utf-8", "ignore")
+    return head + marker
 
 
 def _render_session_error(message: str, output_format: str) -> None:

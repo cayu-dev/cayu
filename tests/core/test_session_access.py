@@ -451,3 +451,20 @@ def test_sqlite_relabel_race_checks_inside_write_transaction(tmp_path, operation
         assert not thread.is_alive() and not failures
 
     asyncio.run(run())
+
+
+def test_access_scope_bounds_fit_organization_sized_policies() -> None:
+    from cayu.sessions.access import SessionAccessRule, SessionAccessScope, SessionAccessSelector
+
+    many_values = SessionAccessSelector(key="team", values=tuple(f"t{i}" for i in range(500)))
+    with pytest.raises(ValueError, match="at most 500 values"):
+        SessionAccessSelector(key="team", values=tuple(f"t{i}" for i in range(501)))
+    rules = tuple(
+        SessionAccessRule(selectors=(SessionAccessSelector(key="tenant", values=(f"x{i}",)),))
+        for i in range(64)
+    )
+    scope = SessionAccessScope(read=rules, protected_label_keys=tuple(f"k{i}" for i in range(200)))
+    assert len(scope.read) == 64
+    assert SessionAccessRule(selectors=(many_values,)).matches({"team": "t499"})
+    with pytest.raises(ValueError, match="at most 64 SessionAccessRule"):
+        SessionAccessScope(read=(*rules, rules[0]))

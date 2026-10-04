@@ -94,12 +94,15 @@ class RetryPolicy(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    max_attempts: StrictInt = Field(default=5, ge=1, le=10)
-    max_unknown_attempts: StrictInt = Field(default=2, ge=1, le=10)
-    initial_delay_s: StrictFloat = Field(default=0.5, ge=0.0, le=60.0)
-    max_delay_s: StrictFloat = Field(default=30.0, ge=0.0, le=300.0)
+    # Ceilings fit provider rate-limit windows: a 429 may ask for several
+    # minutes, and background work can afford many attempts. Raise max_delay_s
+    # to honor a long Retry-After; defaults stay short for interactive runs.
+    max_attempts: StrictInt = Field(default=5, ge=1, le=50)
+    max_unknown_attempts: StrictInt = Field(default=2, ge=1, le=50)
+    initial_delay_s: StrictFloat = Field(default=0.5, ge=0.0, le=600.0)
+    max_delay_s: StrictFloat = Field(default=30.0, ge=0.0, le=3600.0)
     backoff_multiplier: StrictFloat = Field(default=2.0, ge=1.0, le=10.0)
-    jitter_s: StrictFloat = Field(default=0.5, ge=0.0, le=60.0)
+    jitter_s: StrictFloat = Field(default=0.5, ge=0.0, le=600.0)
     retry_on_status_codes: tuple[StrictInt, ...] = Field(
         default=DEFAULT_RETRYABLE_STATUS_CODES,
         min_length=0,

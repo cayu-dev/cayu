@@ -16,7 +16,12 @@ from cayu.evals.corpus import (
     _content_revision,
 )
 from cayu.evals.evidence import AssertionEvidenceView, project_assertion_evidence_view
-from cayu.evals.json_subset import JsonSubsetOutcome, compare_json_subset, equal_json_values
+from cayu.evals.json_subset import (
+    EVAL_TOOL_JSON_MAX_BYTES,
+    JsonSubsetOutcome,
+    compare_json_subset,
+    equal_json_values,
+)
 from cayu.evals.models import EvalOutcome, Trajectory
 from cayu.evals.portable_assertions import compile_assertion_spec
 from cayu.evals.portable_evaluation import evaluate_assertion_spec
@@ -181,7 +186,7 @@ def test_tool_json_specs_enforce_bounded_objects_and_public_result_roots():
         ToolArgumentsContainAssertionSpec(
             id="arguments",
             tool_name="search",
-            expected_subset={"query": "x" * 4096},
+            expected_subset={"query": "x" * EVAL_TOOL_JSON_MAX_BYTES},
         )
     with pytest.raises(ValidationError, match="support only"):
         ToolResultContainsAssertionSpec(
@@ -309,7 +314,7 @@ def test_tool_json_assertions_distinguish_mismatch_absence_redaction_and_truncat
                 ),
                 (
                     "oversized",
-                    {"value": "x" * 5000},
+                    {"value": "x" * (EVAL_TOOL_JSON_MAX_BYTES + 1000)},
                     ToolResult(content="ok"),
                 ),
             )

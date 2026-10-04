@@ -5379,6 +5379,64 @@ def test_interactive_guest_omits_new_profile_values_before_response_publication(
     asyncio.run(scenario())
 
 
+def test_interactive_guest_profile_ceilings_match_the_host_ceilings() -> None:
+    import cayu.browser_profiles as profiles
+
+    assert (
+        _browser_guest._INTERACTIVE_MAX_PROFILE_ORIGINS,
+        _browser_guest._INTERACTIVE_MAX_PROFILE_COOKIES,
+        _browser_guest._INTERACTIVE_MAX_PROFILE_STORAGE_ENTRIES,
+        _browser_guest._INTERACTIVE_MAX_PROFILE_NAME_BYTES,
+        _browser_guest._INTERACTIVE_MAX_PROFILE_VALUE_BYTES,
+        _browser_guest._INTERACTIVE_MAX_PROFILE_PLAINTEXT_BYTES,
+    ) == (
+        profiles.BROWSER_PROFILE_MAX_ORIGINS,
+        profiles.BROWSER_PROFILE_MAX_COOKIES,
+        profiles.BROWSER_PROFILE_MAX_STORAGE_ENTRIES,
+        profiles.BROWSER_PROFILE_MAX_NAME_BYTES,
+        profiles.BROWSER_PROFILE_MAX_VALUE_BYTES,
+        profiles.BROWSER_PROFILE_MAX_PLAINTEXT_BYTES,
+    )
+
+
+def test_interactive_guest_restores_a_profile_with_many_cookies() -> None:
+    # 300 cookies fit the default profile limits (1,024) but not the old guest cap (256).
+    cookies = [
+        {
+            "name": f"c{index:04d}",
+            "value": "v" * 40,
+            "domain": "app.example.test",
+            "path": "/",
+            "expires": -1.0,
+            "httpOnly": True,
+            "secure": True,
+            "sameSite": "Lax",
+        }
+        for index in range(300)
+    ]
+    state = {
+        "cookies": cookies,
+        "origins": [
+            {
+                "origin": "https://app.example.test",
+                "localStorage": [{"name": f"k{index:04d}", "value": "x"} for index in range(600)],
+            }
+        ],
+    }
+
+    restored = _browser_guest._validate_interactive_profile_state(
+        state,
+        maximum_bytes=_browser_guest._INTERACTIVE_MAX_PROFILE_PLAINTEXT_BYTES,
+        allowed_origins=("https://app.example.test",),
+        require_canonical_order=True,
+    )
+    assert len(restored["cookies"]) == 300
+    live_values = _browser_guest._bounded_live_browser_private_values(
+        state, maximum_bytes=_browser_guest._INTERACTIVE_MAX_PROFILE_PLAINTEXT_BYTES
+    )
+    assert "c0299" in live_values
+
+
 def test_interactive_guest_bounds_cumulative_profile_anti_reflection_state() -> None:
     class _ProfileContext:
         async def storage_state(self, *, indexed_db: bool) -> dict[str, Any]:

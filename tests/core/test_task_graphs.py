@@ -362,22 +362,36 @@ async def test_maximum_graph_transitive_skip_is_bounded(store: TaskStore) -> Non
 
 
 async def test_graph_aggregate_bounds_do_not_accept_individually_valid_members() -> None:
+    from cayu.tasks._graph_identity import (
+        TASK_GRAPH_MAX_BYTES,
+        TASK_GRAPH_MAX_EDGES,
+        TASK_GRAPH_MAX_NODES,
+    )
+
+    blob = 32768
     nodes = tuple(
         TaskGraphNode(
-            task=TaskCreate(task_id=f"large-{i}", type="test", input={"blob": "x" * 32768})
+            task=TaskCreate(task_id=f"large-{i}", type="test", input={"blob": "x" * blob})
         )
-        for i in range(32)
+        for i in range(TASK_GRAPH_MAX_BYTES // blob + 1)
     )
     with pytest.raises(ValueError, match="canonical byte limit"):
         TaskGraphCreate(graph_id="oversized", nodes=nodes)
+    small = tuple(
+        TaskGraphNode(task=TaskCreate(task_id=f"many-{i}", type="test"))
+        for i in range(TASK_GRAPH_MAX_NODES + 1)
+    )
     with pytest.raises(ValueError, match="node count"):
-        TaskGraphCreate(graph_id="many", nodes=nodes * 5)
+        TaskGraphCreate(graph_id="many", nodes=small)
+    width = 2
+    while width * (width - 1) // 2 <= TASK_GRAPH_MAX_EDGES:
+        width += 1
     dense = tuple(
         TaskGraphNode(
             task=TaskCreate(task_id=f"dense-{i}", type="test"),
             prerequisite_task_ids=tuple(f"dense-{j}" for j in range(i)),
         )
-        for i in range(46)
+        for i in range(width)
     )
     with pytest.raises(ValueError, match="edge count"):
         TaskGraphCreate(graph_id="dense", nodes=dense)

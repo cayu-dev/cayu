@@ -65,8 +65,10 @@ work. At most 16 client connections are dispatched by default (the internal
 hard ceiling is 64); excess connections receive a fixed `503` response and are
 never queued in the worker executor. Each request head is limited to 64 KiB,
 with 8 KiB request/header lines, at most 100 headers, and a ten-second absolute
-head deadline. Request bodies remain limited to 8 MiB and a 30-second absolute
-read window. The same stop-aware polling bounds transport authentication, TLS
+head deadline. Request bodies are buffered for credential substitution and
+limited to 128 MiB with a 300-second absolute read window, which fits package
+uploads and git pushes. A forwarded request waits for the broker's upstream
+deadline plus 30 seconds. The same stop-aware polling bounds transport authentication, TLS
 handshake, chunk framing, response writes, and proxy shutdown.
 
 CONNECT is admitted in two stages. The normalized HTTPS destination must first
@@ -101,8 +103,38 @@ response byte limit (see below). Its default DNS
 lookup runs in an owned helper process, so expiry terminates and reaps the
 resolver before returning the timeout. Application-injected HTTPX transports
 or destination resolvers carry no inferred cancellation authority and remain
-capacity-counted until natural completion. The broker also rejects any returned
-response above the 64 MiB hard ceiling. Response scrubbing projects each body
+capacity-counted until natural completion. Responses are buffered so the broker
+can scrub credentials before the guest sees them. The broker rejects any
+returned response above its configured limit:
+`TransparentEgressBroker(upstream_max_response_bytes=...)` defaults to 256 MiB
+and accepts up to the 2 GiB hard ceiling, and
+`upstream_total_timeout_s` (default 600 seconds, at most one hour) bounds each
+upstream request including its body. The default HTTPX upstream takes both
+values from the broker; a supplied `HttpxUpstream` keeps its own ceilings, and
+the smaller limit applies.
+
+Buffered responses also draw on an `EgressResponseBufferBudget` (default 1 GiB,
+at most 64 GiB), which bounds the bytes held at once. A broker built directly
+gets its own budget (`response_buffer_budget_bytes=`) or shares one passed as
+`response_buffer_budget=`. `VirtualEgressEnvironmentFactory` creates one budget
+and shares it across every session broker it creates; pass the same
+`response_buffer_budget=` to several factories to bound them together. A budget
+must hold at least one largest response, so it cannot be smaller than the
+upstream or browser response limit. A reservation covers the decoded body, any
+retained encoded input, and the next bounded decode step (at most 1 MiB ahead),
+and is taken before that memory is allocated. Secret scrubbing reserves any
+growth of the body before building the expanded copy (the brief overlap of the
+two copies is not counted), and the reservation then settles to the body
+actually handed on. Through the proxy server it lasts
+until the body has been written to the guest or dropped; through
+`handle_request` it ends when that call returns. A request that would exceed the
+budget is refused with 503 `upstream_capacity_exhausted` instead of growing host
+memory. Custom upstreams receive the reservation as
+`EgressUpstreamLimits.response_buffer` and call `reserve_to(total_bytes)` before
+holding more (it is thread-safe); the broker also reserves whatever body a
+custom upstream returns.
+
+Response scrubbing projects each body
 replacement before allocating it and rejects redaction that would expand the
 body beyond the same ceiling. Proxy
 diagnostics use fixed codes and never reflect request targets, headers, or
@@ -380,10 +412,12 @@ the connection target and prevents DNS rebinding to private networks or cloud
 metadata. Application-owned `HttpxUpstream(routes=...)` mappings are an explicit
 trusted-control-plane override for private service origins; they still reject
 loopback, link-local/metadata, multicast, reserved, and unspecified addresses.
-The default upstream requests identity content encoding, retains at most 8 MiB
-of response data, and rejects larger responses. Applications that construct
-`HttpxUpstream` explicitly can select a lower limit or raise it as far as the
-hard 64 MiB ceiling. Some origins, such as the Internet Archive, return a
+The default upstream requests identity content encoding, retains at most 256 MiB
+of response data within a 600-second total deadline, and rejects larger
+responses. Applications that construct `HttpxUpstream` explicitly can select a
+lower limit or raise it as far as the hard 2 GiB ceiling; the broker applies the
+smaller of its own and the upstream's limits. Browser traffic keeps a separate
+64 MiB default (`browser_max_response_bytes`). Some origins, such as the Internet Archive, return a
 stored coding regardless of that request. When the response carries exactly
 one `Content-Encoding` of `gzip` (or `x-gzip`), `deflate`, `br`, or `zstd`,
 the upstream reads the raw body and decodes it while streaming. Both the bytes

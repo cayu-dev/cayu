@@ -11,9 +11,12 @@ from cayu._validation import (
 )
 from cayu.vaults import REDACTED_SECRET
 
-EVAL_TOOL_JSON_MAX_BYTES = 4 * 1024
-EVAL_TOOL_JSON_MAX_DEPTH = 12
-EVAL_TOOL_JSON_MAX_NODES = 128
+# Real tool arguments and results (file contents, API payloads) routinely exceed
+# a few KiB. 256 retained calls x 16 KiB stays inside the 10 MiB per-trial
+# assertion evidence ceiling; larger values keep the explicit "truncated" state.
+EVAL_TOOL_JSON_MAX_BYTES = 16 * 1024
+EVAL_TOOL_JSON_MAX_DEPTH = 24
+EVAL_TOOL_JSON_MAX_NODES = 1024
 
 
 class JsonSubsetOutcome(StrEnum):

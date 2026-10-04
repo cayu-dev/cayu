@@ -114,7 +114,7 @@ from cayu.runtime.retry_policy import (
     retry_decision,
     retry_diagnostic_payload,
 )
-from cayu.sessions.base import Session, copy_session
+from cayu.sessions.base import COMPACTION_INSTRUCTIONS_MAX_CHARS, Session, copy_session
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -784,7 +784,9 @@ class ContextRequest(BaseModel):
     )
     force_compaction: StrictBool = False
     force_bounded_compaction: StrictBool = False
-    compaction_instructions: str | None = Field(default=None, max_length=4096)
+    compaction_instructions: str | None = Field(
+        default=None, max_length=COMPACTION_INSTRUCTIONS_MAX_CHARS
+    )
 
     @field_validator("messages")
     @classmethod
@@ -2374,7 +2376,7 @@ class CompactionRequest(BaseModel):
     context_messages: list[Message] = Field(default_factory=list)
     cache_prefix_request: ModelRequest | None = None
     force_bounded_compaction: StrictBool = False
-    instructions: str | None = Field(default=None, max_length=4096)
+    instructions: str | None = Field(default=None, max_length=COMPACTION_INSTRUCTIONS_MAX_CHARS)
 
     @field_validator("messages")
     @classmethod

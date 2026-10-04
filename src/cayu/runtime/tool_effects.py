@@ -35,6 +35,7 @@ from cayu.runtime.execution_identity import (
 
 TOOL_EFFECT_RECEIPT_MAX_BYTES = 96 * 1024
 TOOL_EFFECT_RESULT_MAX_BYTES = 64 * 1024
+_RECEIPT_MESSAGE_MAX_BYTES = 4096
 _RECEIPT_MAX_NODES = 8192
 
 
@@ -118,7 +119,10 @@ class ToolEffectReceipt(BaseModel):
     @field_validator("message")
     @classmethod
     def validate_message(cls, value: str) -> str:
-        return _bounded_text(value, "message", maximum=4096)
+        # Receipts are validated before workload redaction runs, so shortening
+        # here could cut a registered secret and leave a prefix that redaction
+        # no longer recognizes. An oversized message is rejected instead.
+        return _bounded_text(value, "message", maximum=_RECEIPT_MESSAGE_MAX_BYTES)
 
     @field_validator("structured", mode="before")
     @classmethod

@@ -3110,6 +3110,12 @@ def copy_budget_limits(
     return tuple(_coerce_budget_limit(limit) for limit in limits)
 
 
+# Request-scoped budget limits one request may carry. Model completion recovery
+# stores a run's limits with the same bound, so an admitted run cannot fail at
+# its first model step.
+MAX_REQUEST_BUDGET_LIMITS = 1024
+
+
 def copy_request_budget_limits(
     limits: Iterable[BudgetLimit | Mapping[str, Any]] | None,
 ) -> tuple[BudgetLimit, ...]:
@@ -3127,7 +3133,15 @@ def copy_request_budget_limits(
     usage of the one model step that is in flight when the read-then-act
     check passes.
     """
+    if type(limits) in (list, tuple) and len(limits) > MAX_REQUEST_BUDGET_LIMITS:
+        raise ValueError(
+            f"budget_limits cannot contain more than {MAX_REQUEST_BUDGET_LIMITS} limits."
+        )
     copied = copy_budget_limits(limits, field_name="budget_limits")
+    if len(copied) > MAX_REQUEST_BUDGET_LIMITS:
+        raise ValueError(
+            f"budget_limits cannot contain more than {MAX_REQUEST_BUDGET_LIMITS} limits."
+        )
     for limit in copied:
         if limit.reservation is not None and limit.scope in ("session", "run"):
             raise ValueError(

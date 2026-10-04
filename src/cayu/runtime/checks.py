@@ -56,6 +56,7 @@ _WORKSPACE_TOOL_NAMES = frozenset(
     }
 )
 _RUNNER_TOOL_NAMES = frozenset({"exec_command", "git_changes", "run_check"})
+_ASK_USER_SYMBOL = "cayu.tools.user_input:UserInputTool"
 
 
 class DiagnosticSeverity(StrEnum):
@@ -415,11 +416,23 @@ def check_manifest(
                         ),
                     )
                 )
-            if tool.effect != "external" or tool.policy_coverage in {
-                "conditional",
-                "denied",
-                "approval_required",
-            }:
+            if (
+                tool.effect != "external"
+                or tool.policy_coverage
+                in {
+                    "conditional",
+                    "denied",
+                    "approval_required",
+                }
+                # Naming the tool in an allowlist is a deliberate authorization.
+                or (tool.policy_coverage == "allowed" and tool._policy_allows_explicitly)
+                # The built-in ask_user always pauses for the user before
+                # anything happens; the person answering is the guard.
+                or (
+                    tool.implementation_provenance.kind == "built_in"
+                    and tool.implementation_provenance.symbol == _ASK_USER_SYMBOL
+                )
+            ):
                 continue
             coverage_unknown = tool.policy_coverage == "unknown"
             diagnostics.append(

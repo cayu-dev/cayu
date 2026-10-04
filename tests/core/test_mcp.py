@@ -3130,12 +3130,16 @@ def test_mcp_tool_adapter_preserves_text_framing_for_short_schema_secret(
     [-128, -8, 64],
     ids=["before-boundary", "crosses-boundary", "after-boundary"],
 )
+@pytest.mark.parametrize("registered_by", ["mcp_server", "workload"])
 def test_mcp_tool_adapter_redacts_structured_secret_before_byte_truncation(
     secret_offset_from_boundary: int,
+    registered_by: str,
 ) -> None:
+    from cayu.mcp.tools import _MAX_STRUCTURED_CONTENT_TEXT_BYTES
+
     secret = "密钥🔐boundary-canary"
     rendered_prefix = 'Structured MCP content:\n{\n  "token": "'
-    secret_start = 20_000 + secret_offset_from_boundary
+    secret_start = _MAX_STRUCTURED_CONTENT_TEXT_BYTES + secret_offset_from_boundary
     padding = "a" * (secret_start - len(rendered_prefix.encode("utf-8")))
 
     class RedactingSession(FakeMcpSession):
@@ -3143,7 +3147,8 @@ def test_mcp_tool_adapter_redacts_structured_secret_before_byte_truncation(
             super().__init__(
                 definitions=(McpToolDefinition(name="echo", input_schema={"type": "object"}),)
             )
-            self._secret_redactor = SecretRedactor(secret)
+            if registered_by == "mcp_server":
+                self._secret_redactor = SecretRedactor(secret)
 
         async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpToolResult:
             del name, arguments
@@ -3158,9 +3163,13 @@ def test_mcp_tool_adapter_redacts_structured_secret_before_byte_truncation(
         session=session,
         definitions=session.definitions,
     )
-    result = asyncio.run(
-        toolset.tools[0].run(ToolContext(session_id="sess_1", agent_name="assistant"), {})
+    workload = SecretRedactor(secret if registered_by == "workload" else ())
+    ctx = ToolContext(
+        session_id="sess_1",
+        agent_name="assistant",
+        invocation_secret_redactor=lambda: workload,
     )
+    result = asyncio.run(toolset.tools[0].run(ctx, {}))
 
     assert secret not in result.content
     assert secret not in json.dumps(
@@ -3171,6 +3180,7 @@ def test_mcp_tool_adapter_redacts_structured_secret_before_byte_truncation(
         f"{REDACTED_SECRET}-suffix"
     )
     if secret_offset_from_boundary == -8:
+        # No prefix of a secret cut at the boundary survives.
         assert "密钥" not in result.content
 
 

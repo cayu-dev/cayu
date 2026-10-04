@@ -43,18 +43,37 @@ MAX_ISOLATED_TOOL_ENVIRONMENT_ITEMS: Final = 128
 
 _IMPORT_SEGMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z", flags=re.ASCII)
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z", flags=re.ASCII)
+# The worker interpreter runs with ``-I`` and ignores PYTHON* variables; these
+# names are denied because processes the tool starts would honor them to load
+# code from elsewhere, or because Cayu fixes them for the worker protocol.
+# Benign tuning variables (PYTHONUNBUFFERED, PYTHONDONTWRITEBYTECODE,
+# PYTHONHASHSEED, PYTHONFAULTHANDLER, ...) are allowed.
 _FORBIDDEN_ENVIRONMENT_NAMES = frozenset(
     {
+        # Fixed by Cayu for the worker protocol.
         "LC_ALL",
+        "PYTHONIOENCODING",
+        "PYTHONUTF8",
+        # Redirect imports, startup code or interpreter location.
+        "PYTHONBREAKPOINT",
+        "PYTHONCASEOK",
+        "PYTHONEXECUTABLE",
         "PYTHONHOME",
         "PYTHONINSPECT",
+        "PYTHONLEGACYWINDOWSDLLLOADING",
         "PYTHONPATH",
+        "PYTHONPLATLIBDIR",
+        # Imports a module before site on debug builds (3.13+).
+        "PYTHON_PRESITE",
+        "PYTHONPYCACHEPREFIX",
         "PYTHONSTARTUP",
+        "PYTHONUSERBASE",
+        # Warning filters can import arbitrary modules by category name.
         "PYTHONWARNINGS",
         "__CF_USER_TEXT_ENCODING",
     }
 )
-_FORBIDDEN_ENVIRONMENT_PREFIXES = ("DYLD_", "LD_", "PYTHON")
+_FORBIDDEN_ENVIRONMENT_PREFIXES = ("DYLD_", "LD_")
 
 
 class ToolTimeoutStrength(StrEnum):

@@ -130,8 +130,20 @@ async def read_image_region(request, policy):
             "scale",
         )
     }
-    artifact = await request.artifact_store.put_bytes(
+    from cayu.tools.files import _content_addressed_artifact_id, _put_content_addressed_artifact
+
+    # Same id for a replayed or repeated region read, so read_file stays idempotent.
+    artifact = await _put_content_addressed_artifact(
+        request.artifact_store,
         content,
+        artifact_id=_content_addressed_artifact_id(
+            request.ctx,
+            "image_region",
+            request.artifact.id,
+            structured["source_sha256"],
+            ",".join(str(edge) for edge in box),
+            digest,
+        ),
         filename="image-region.png",
         content_type="image/png",
         scope=ArtifactScope.SESSION,

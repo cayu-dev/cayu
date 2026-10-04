@@ -41,6 +41,7 @@ from cayu.artifacts.attachments import (
     validate_file_attachment_content_type as validate_file_attachment_content_type,
 )
 from cayu.artifacts.aws_s3 import S3ArtifactStore as S3ArtifactStore
+from cayu.artifacts.base import ArtifactIdentityConflictError as ArtifactIdentityConflictError
 from cayu.artifacts.base import ArtifactListResult as ArtifactListResult
 from cayu.artifacts.base import ArtifactMetadata as ArtifactMetadata
 from cayu.artifacts.base import ArtifactReadResult as ArtifactReadResult

@@ -31,6 +31,7 @@ from cayu.egress.broker import (
     CAYU_EGRESS_ERROR_HEADER,
     CapturedRequest,
     CapturedResponse,
+    EgressResponseBuffer,
     TransparentEgressBroker,
     _ConnectDestinationAdmission,
 )
@@ -39,13 +40,15 @@ from cayu.egress.destinations import normalize_egress_hostname
 _ONE_DAY = _dt.timedelta(days=1)
 _CA_VALIDITY = _dt.timedelta(days=825)
 _LEAF_VALIDITY = _dt.timedelta(days=365)
-_MAX_REQUEST_BYTES = 8 * 1024 * 1024
+# Request bodies are buffered for credential substitution; sized for package
+# uploads and git pushes.
+_MAX_REQUEST_BYTES = 128 * 1024 * 1024
 _MAX_REQUEST_HEAD_BYTES = 64 * 1024
 _MAX_REQUEST_LINE_BYTES = 8 * 1024
 _MAX_HEADER_LINE_BYTES = 8 * 1024
 _MAX_HEADER_COUNT = 100
 _REQUEST_HEAD_TIMEOUT_S = 10.0
-_REQUEST_BODY_TIMEOUT_S = 30.0
+_REQUEST_BODY_TIMEOUT_S = 300.0
 _TLS_HANDSHAKE_TIMEOUT_S = 10.0
 _SOCKET_POLL_INTERVAL_S = 0.1
 _MAX_PROXY_WORKERS = 64
@@ -53,6 +56,8 @@ _MAX_CERTIFICATE_CACHE_ENTRIES = 128
 _CERTIFICATE_CACHE_TTL_S = 15 * 60.0
 _CERTIFICATE_GENERATION_WAIT_S = 5.0
 _BROKER_TIMEOUT_S = 60.0
+# Forwarded requests wait for the broker's own upstream deadline plus this margin.
+_BROKER_RESPONSE_MARGIN_S = 30.0
 _TRANSPORT_TUNNEL_TARGET = "cayu-transport.invalid:443"
 _PLAIN_HTTP_DENIAL_RESPONSE = (
     "HTTP/1.1 403 Forbidden\r\n"
@@ -647,10 +652,16 @@ class TransparentEgressProxyServer:
                 headers=headers,
                 body=body,
             )
-            response = self._call_broker(captured, client=tls)
-            response_head = _serialize_response_head(response)
-            _send_all(tls, response_head, stop=self._stop)
-            _send_all(tls, response.body, stop=self._stop)
+            response, response_buffers = self._call_broker(captured, client=tls)
+            try:
+                response_head = _serialize_response_head(response)
+                _send_all(tls, response_head, stop=self._stop)
+                _send_all(tls, response.body, stop=self._stop)
+            finally:
+                # The buffered body counted against the egress budget until here,
+                # including when the write fails or times out.
+                del response
+                _release_response_buffers(response_buffers)
         except _ProxyProtocolError as exc:
             _send_protocol_rejection(tls, exc, stop=self._stop)
         finally:
@@ -766,17 +777,21 @@ class TransparentEgressProxyServer:
         request: CapturedRequest,
         *,
         client: ssl.SSLSocket,
-    ) -> CapturedResponse:
-        future = asyncio.run_coroutine_threadsafe(self._broker.handle_request(request), self._loop)
+    ) -> tuple[CapturedResponse, tuple[EgressResponseBuffer, ...]]:
+        future, claim = _submit_broker_request(self._broker, request, self._loop)
         # Poll so a concurrent close() (which sets _stop) aborts the wait quickly
-        # instead of blocking the whole shutdown for up to _BROKER_TIMEOUT_S.
+        # instead of blocking the whole shutdown until the response deadline.
+        response_timeout_s = max(
+            _BROKER_TIMEOUT_S,
+            getattr(self._broker, "upstream_total_timeout_s", 0.0) + _BROKER_RESPONSE_MARGIN_S,
+        )
         waited = 0.0
-        while waited < _BROKER_TIMEOUT_S:
+        while waited < response_timeout_s:
             if self._stop.is_set():
-                future.cancel()
+                _abandon_broker_request(future, claim)
                 raise RuntimeError("Egress proxy is shutting down.")
             if _client_disconnected(client):
-                future.cancel()
+                _abandon_broker_request(future, claim)
                 raise _ProxyProtocolError(
                     "client_disconnected",
                     "Client disconnected before the broker response was available.",
@@ -789,15 +804,80 @@ class TransparentEgressProxyServer:
                 except TimeoutError:
                     waited += 0.25
                     continue
-                return future.result()
+                response = future.result()
+                return response, claim.take()
             except Exception:
                 self._loop.call_soon_threadsafe(
                     self._broker._record_proxy_failure, "proxy_broker_failed"
                 )
                 raise
-        future.cancel()
+        _abandon_broker_request(future, claim)
         self._loop.call_soon_threadsafe(self._broker._record_proxy_failure, "proxy_broker_timeout")
         raise TimeoutError("Broker did not respond within the timeout.")
+
+
+def _release_response_buffers(response_buffers: tuple[EgressResponseBuffer, ...]) -> None:
+    for response_buffer in response_buffers:
+        response_buffer.release()
+
+
+class _BrokerResponseClaim:
+    """Hand a response's buffer reservations to the worker, or release them.
+
+    A ``run_coroutine_threadsafe`` future stays pending until the loop copies the
+    task's result, so a worker can cancel it after the broker finished and the
+    result is then dropped. The reservations therefore travel through this
+    claim instead: the loop offers them before the coroutine returns, and
+    whichever of offer and abandon comes second releases them.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._abandoned = False
+        self._taken = False
+        self._buffers: tuple[EgressResponseBuffer, ...] = ()
+
+    def offer(self, buffers: tuple[EgressResponseBuffer, ...]) -> None:
+        with self._lock:
+            if not self._abandoned:
+                self._buffers = buffers
+                return
+        _release_response_buffers(buffers)
+
+    def take(self) -> tuple[EgressResponseBuffer, ...]:
+        with self._lock:
+            self._taken = True
+            buffers, self._buffers = self._buffers, ()
+            return buffers
+
+    def abandon(self) -> None:
+        with self._lock:
+            self._abandoned = True
+            buffers, self._buffers = ((), ()) if self._taken else (self._buffers, ())
+        _release_response_buffers(buffers)
+
+
+def _submit_broker_request(
+    broker: TransparentEgressBroker,
+    request: CapturedRequest,
+    loop: asyncio.AbstractEventLoop,
+) -> tuple[Future[CapturedResponse], _BrokerResponseClaim]:
+    claim = _BrokerResponseClaim()
+
+    async def handle() -> CapturedResponse:
+        response, buffers = await broker._handle_request_holding_buffer(request)
+        # No await follows, so cancellation cannot separate the offer from the result.
+        claim.offer(buffers)
+        return response
+
+    return asyncio.run_coroutine_threadsafe(handle(), loop), claim
+
+
+def _abandon_broker_request(future: Future[CapturedResponse], claim: _BrokerResponseClaim) -> None:
+    """Cancel a broker call; reservations of a result that exists are released."""
+
+    claim.abandon()
+    future.cancel()
 
 
 class DualStackLoopbackEgressProxyServer(TransparentEgressProxyServer):

@@ -21,7 +21,7 @@ from cayu.failure_evidence import FailureEvidence
 from cayu.runtime import _shared_artifact_results as shared_artifact_results
 from cayu.runtime import _web_access_results as web_access_results
 from cayu.runtime._diagnostics import (
-    MAX_DIAGNOSTIC_UTF8_BYTES,
+    TOOL_FAILURE_DIAGNOSTIC_UTF8_BYTES,
     ExceptionDiagnostic,
     bound_diagnostic_text,
     exception_diagnostic,
@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.tools.result_projection import ToolResultProjection
 
-_MAX_DIAGNOSTIC_UTF8_BYTES = MAX_DIAGNOSTIC_UTF8_BYTES
+_MAX_DIAGNOSTIC_UTF8_BYTES = TOOL_FAILURE_DIAGNOSTIC_UTF8_BYTES
 _MAX_PORTABLE_EVIDENCE_UTF8_BYTES = 12 * 1024
 _MAX_PORTABLE_EVIDENCE_DEPTH = 16
 _MAX_PORTABLE_EVIDENCE_NODES = 256
@@ -759,7 +759,11 @@ def tool_result_from_payload(payload: dict[str, Any]) -> ToolResult:
 def exception_message(exc: Exception) -> str:
     """Backward-compatible safe message used by ordinary tool failures."""
 
-    return exception_diagnostic(exc, empty_message="tool execution failed").message
+    return exception_diagnostic(
+        exc,
+        empty_message="tool execution failed",
+        max_message_bytes=TOOL_FAILURE_DIAGNOSTIC_UTF8_BYTES,
+    ).message
 
 
 def terminal_failure_result(
@@ -1120,4 +1124,4 @@ def _redact_terminal_result(result: ToolResult, redactor: SecretRedactor) -> Too
 
 
 def _bound_diagnostic_text(value: str) -> str:
-    return bound_diagnostic_text(value)
+    return bound_diagnostic_text(value, max_bytes=TOOL_FAILURE_DIAGNOSTIC_UTF8_BYTES)

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from cayu._validation import require_durable_clean_nonblank
 
-TASK_GRAPH_MAX_NODES = 128
-TASK_GRAPH_MAX_EDGES = 1024
-TASK_GRAPH_MAX_BYTES = 1024 * 1024
+# The byte bound is what keeps a graph document small; node and edge counts are
+# sized so a fan-out over a realistic batch (one task per file or record) fits.
+TASK_GRAPH_MAX_NODES = 1024
+TASK_GRAPH_MAX_EDGES = 4096
+TASK_GRAPH_MAX_BYTES = 4 * 1024 * 1024
 TASK_GRAPH_ID_MAX_BYTES = 256
 
 

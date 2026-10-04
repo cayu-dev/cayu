@@ -349,3 +349,146 @@ def test_cmyk_jpeg_region_preserves_pixels_and_source_identity(tmp_path):
         assert (await store.read_bytes(source.id)).content == content
 
     asyncio.run(run())
+
+
+def test_repeated_region_read_returns_the_same_artifact(tmp_path):
+    async def run():
+        store = LocalArtifactStore(tmp_path / "artifacts")
+        source = await store.put_bytes(
+            image_bytes((40, 40)), filename="small.png", content_type="image/png", session_id="s"
+        )
+        ctx = ToolContext(session_id="s", artifact_store=store)
+        arguments = {"artifact_id": source.id, "image_region": [0, 0, 20, 20]}
+        first = await ReadFileTool().run(ctx, arguments)
+        replay = await ReadFileTool().run(ctx, arguments)
+        other = await ReadFileTool().run(
+            ctx, {"artifact_id": source.id, "image_region": [20, 20, 40, 40]}
+        )
+        assert not first.is_error and not replay.is_error and not other.is_error
+        first_id = first.structured["attachment_artifact_id"]
+        assert replay.structured["attachment_artifact_id"] == first_id
+        assert other.structured["attachment_artifact_id"] != first_id
+        listed = await store.list(session_id="s")
+        assert len(listed.artifacts) == 3
+
+    asyncio.run(run())
+
+
+def test_region_write_failure_is_not_retried_at_a_fresh_id(tmp_path):
+    class _FlakyStore(LocalArtifactStore):
+        def __init__(self, root):
+            super().__init__(root)
+            self.fresh_writes = 0
+
+        async def put_bytes(self, content, **kwargs):
+            if kwargs.get("artifact_id") is not None:
+                raise OSError("transient store failure")
+            if kwargs.get("filename") == "image-region.png":
+                self.fresh_writes += 1
+            return await super().put_bytes(content, **kwargs)
+
+    async def run():
+        store = _FlakyStore(tmp_path / "artifacts")
+        source = await store.put_bytes(
+            image_bytes((20, 20)), filename="small.png", content_type="image/png", session_id="s"
+        )
+        ctx = ToolContext(session_id="s", artifact_store=store)
+        with pytest.raises(OSError, match="transient"):
+            await ReadFileTool().run(
+                ctx, {"artifact_id": source.id, "image_region": [0, 0, 10, 10]}
+            )
+        assert store.fresh_writes == 0
+
+    asyncio.run(run())
+
+
+def test_region_read_falls_back_when_the_stored_region_is_corrupt(tmp_path):
+    async def run():
+        root = tmp_path / "artifacts"
+        store = LocalArtifactStore(root)
+        source = await store.put_bytes(
+            image_bytes((20, 20)), filename="small.png", content_type="image/png", session_id="s"
+        )
+        ctx = ToolContext(session_id="s", artifact_store=store)
+        arguments = {"artifact_id": source.id, "image_region": [0, 0, 10, 10]}
+        first = await ReadFileTool().run(ctx, arguments)
+        first_id = first.structured["attachment_artifact_id"]
+        (root / first_id / "content").write_bytes(b"corrupted out of band")
+
+        replay = await ReadFileTool().run(ctx, arguments)
+
+        assert not replay.is_error, replay.content
+        replay_id = replay.structured["attachment_artifact_id"]
+        assert replay_id != first_id
+        derived = await store.read_bytes(replay_id)
+        assert sha256(derived.content).hexdigest() == replay.structured["attachment_sha256"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("metadata", [b"{not json", b'{"id": "other"}', b"\xff\xfe"])
+def test_region_read_falls_back_when_the_stored_metadata_is_corrupt(tmp_path, metadata):
+    async def run():
+        root = tmp_path / "artifacts"
+        store = LocalArtifactStore(root)
+        source = await store.put_bytes(
+            image_bytes((20, 20)), filename="small.png", content_type="image/png", session_id="s"
+        )
+        ctx = ToolContext(session_id="s", artifact_store=store)
+        arguments = {"artifact_id": source.id, "image_region": [0, 0, 10, 10]}
+        first = await ReadFileTool().run(ctx, arguments)
+        first_id = first.structured["attachment_artifact_id"]
+        (root / first_id / "metadata.json").write_bytes(metadata)
+
+        replay = await ReadFileTool().run(ctx, arguments)
+
+        assert not replay.is_error, replay.content
+        assert replay.structured["attachment_artifact_id"] != first_id
+
+    asyncio.run(run())
+
+
+def _replace_with_symlink(path):
+    # Outside the artifact directory, so the directory holds no unexpected entry.
+    target = path.parent.parent.parent / f"elsewhere-{path.parent.name}"
+    target.write_bytes(path.read_bytes())
+    path.unlink()
+    path.symlink_to(target)
+
+
+def _replace_with_directory(path):
+    path.unlink()
+    path.mkdir()
+
+
+def _replace_artifact_directory_with_file(path):
+    import shutil
+
+    directory = path.parent
+    shutil.rmtree(directory)
+    directory.write_bytes(b"not a directory")
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [_replace_with_symlink, _replace_with_directory, _replace_artifact_directory_with_file],
+)
+def test_region_read_falls_back_when_the_stored_region_fails_a_safety_check(tmp_path, damage):
+    async def run():
+        root = tmp_path / "artifacts"
+        store = LocalArtifactStore(root)
+        source = await store.put_bytes(
+            image_bytes((20, 20)), filename="small.png", content_type="image/png", session_id="s"
+        )
+        ctx = ToolContext(session_id="s", artifact_store=store)
+        arguments = {"artifact_id": source.id, "image_region": [0, 0, 10, 10]}
+        first = await ReadFileTool().run(ctx, arguments)
+        first_id = first.structured["attachment_artifact_id"]
+        damage(root / first_id / "content")
+
+        replay = await ReadFileTool().run(ctx, arguments)
+
+        assert not replay.is_error, replay.content
+        assert replay.structured["attachment_artifact_id"] != first_id
+
+    asyncio.run(run())

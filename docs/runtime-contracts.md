@@ -5341,9 +5341,12 @@ prior terminal event is durable and no newer operation started before the
 telemetry marker. Arbitrary custom-event payloads cannot claim terminal lineage.
 
 Control-plane mutation admission is bounded before route execution. `/run` and
-`/resume` prompts accept at most 65,536 UTF-8 bytes and reject NUL characters or
-lone Unicode surrogates before constructing runtime messages or calling a
-provider. Run, resume, interrupt, approval, tool-round recovery, and user-input
+`/resume` prompts, like steering messages, accept at most 983,040 UTF-8 bytes
+(960 KiB: the 1 MiB request cap minus a JSON envelope) and reject NUL characters
+or lone Unicode surrogates before constructing runtime messages or calling a
+provider. That size assumes mostly-ASCII JSON: a prompt whose request encoding
+escapes many characters (`\uXXXX` escapes, or a client serializing with
+`ensure_ascii`) can reach the 1 MiB request cap first and is refused with `413`. Run, resume, interrupt, approval, tool-round recovery, and user-input
 resolution/recovery requests accept at most 1 MiB of HTTP body bytes, including
 when the body arrives without `Content-Length`; an oversized stream is stopped
 without retaining the complete body. Interrupt and resolution/recovery
@@ -7659,7 +7662,7 @@ Turns messages into event streams using:
 
 The initial `CayuApp` runtime registers agent specs, model providers, and tools, then emits and persists events for one session run. A run may make multiple model requests: model output can request tools, the runtime executes those tools, appends assistant `tool_call` messages and matching `tool_result` messages, and calls the model again until the model completes without tool calls or consumes `RunRequest.max_steps`. If the model still requests continuation after that final allowed step, Cayu treats the configured boundary as a controlled pause: it emits `session.limit_reached` with `limit="model_steps"`, `maximum` equal to the configured allowance, and `actual` equal to the consumed steps; records the turn as interrupted; and emits `session.interrupted` with `interruption_type="limit_reached"` after transitioning the durable session to the resumable `interrupted` state. A later `resume(...)` invocation supplies a fresh `max_steps` allowance and continues from the durable transcript. Multiple tool calls from one model step are grouped into one assistant message and one tool-result message in Cayu's internal transcript. Provider adapters must emit a `completed` stream event for each model step; a stream that ends silently is treated as a failed runtime contract.
 
-The tool calls in one model step run concurrently by default, bounded by a semaphore of size `CayuConfig(tool_execution=ToolExecutionConfig(max_parallel_tool_calls=…))` (default 4); set it to `1` to force fully sequential execution. Concurrency cuts wall-clock time when a step emits several independent, I/O-bound calls. A tool whose `ToolSpec.parallel_safe` is `False` (the default is `True`) is an ordering **barrier** — it runs alone in its model-order position, after everything before it and before everything after it — the opt-out for tools with side effects or single-threaded backends. `parallel_safe` controls ordering only; it is intentionally separate from `ToolSpec.effect`, which describes retry/idempotency semantics. Execution preserves the model's tool-call order: a round is split into ordered segments where each contiguous run of `parallel_safe` calls executes concurrently and each `parallel_safe=False` call runs by itself, so `[safe A, safe B, unsafe C, safe D]` runs as concurrent `A/B`, then `C`, then `D` (never `A/B/D` before `C`, which would read-after-write). The built-in mutating tools (`exec_command`, `write_file`, `remember_knowledge`, and the spawning subagent tool) ship with `parallel_safe=False`; pure readers keep the default ordering. `read_file` is effect-conservative even though it is read-oriented, because workspace image/PDF reads can create artifact snapshots. Approval and `ask_user` are unaffected: policy is evaluated before execution and a round that requires approval or asks the user pauses before any tool runs, so a concurrent segment only ever contains already-authorized calls. The persisted `tool_result` message keeps the model's tool-call order regardless of completion order. A round is projected against `max_tool_calls`, token, and cost limits once before execution begins; because a concurrent batch cannot be stopped part-way, a batch of cost-incurring tools can overshoot a token/cost budget that a cap of `1` would have caught between calls. If a session is interrupted mid-batch, calls that already finished are recorded as completed (not re-run on resume); only unfinished calls are marked interrupted.
+The tool calls in one model step run concurrently by default, bounded by a semaphore of size `CayuConfig(tool_execution=ToolExecutionConfig(max_parallel_tool_calls=…))` (default 4); set it to `1` to force fully sequential execution. Concurrency cuts wall-clock time when a step emits several independent, I/O-bound calls. A tool whose `ToolSpec.parallel_safe` is `False` (the default is `True`) is an ordering **barrier** — it runs alone in its model-order position, after everything before it and before everything after it — the opt-out for tools with side effects or single-threaded backends. `parallel_safe` controls ordering only; it is intentionally separate from `ToolSpec.effect`, which describes retry/idempotency semantics. Execution preserves the model's tool-call order: a round is split into ordered segments where each contiguous run of `parallel_safe` calls executes concurrently and each `parallel_safe=False` call runs by itself, so `[safe A, safe B, unsafe C, safe D]` runs as concurrent `A/B`, then `C`, then `D` (never `A/B/D` before `C`, which would read-after-write). The built-in mutating tools (`exec_command`, `write_file`, `remember_knowledge`, and the spawning subagent tool) ship with `parallel_safe=False`; pure readers keep the default ordering. `read_file` is `idempotent`: workspace image/PDF snapshots, derived attachments and `image_region` crops use content-addressed artifact ids, so replaying a read returns the same artifacts. Approval and `ask_user` are unaffected: policy is evaluated before execution and a round that requires approval or asks the user pauses before any tool runs, so a concurrent segment only ever contains already-authorized calls. The persisted `tool_result` message keeps the model's tool-call order regardless of completion order. A round is projected against `max_tool_calls`, token, and cost limits once before execution begins; because a concurrent batch cannot be stopped part-way, a batch of cost-incurring tools can overshoot a token/cost budget that a cap of `1` would have caught between calls. If a session is interrupted mid-batch, calls that already finished are recorded as completed (not re-run on resume); only unfinished calls are marked interrupted.
 
 Registered tools declare their provider-facing JSON Schema through
 `ToolSpec.input_schema`; the default `Tool.schema` property exposes that value,
@@ -9081,7 +9084,7 @@ deployment.
 `PriceBook`. Pass `default_price_book()` for Cayu's reviewed default rates. Request-scoped
 `BudgetLimit` entries can be attached through
 `budget_limits` on `RunRequest`, `ResumeRequest`, `DispatchRequest`,
-`ToolApprovalRequest`, and `ToolApprovalRecoveryRequest`. `BudgetLimit` defaults to `scope="session"`; `RunLimits` defaults to `scope="run"`.
+`ToolApprovalRequest`, and `ToolApprovalRecoveryRequest`, at most 1,024 per request (`MAX_REQUEST_BUDGET_LIMITS`, the same bound model completion recovery stores). `BudgetLimit` defaults to `scope="session"`; `RunLimits` defaults to `scope="run"`.
 Session-scoped token, tool-call, and cost limits are cumulative because they are
 evaluated from durable `model.completed` and `tool.call.started` events.
 Run-scoped limits retain their original aggregate baseline across approval and
@@ -9565,7 +9568,9 @@ OpenAI, Chat Completions, Vertex, and Anthropic HTTP errors also preserve valid
 `Retry-After` delta-seconds and HTTP-date headers as `retry_after_s`, including
 an in-band error carried by a successful HTTP stream. This delay comes only
 from the trusted response header, never an event JSON field; the runtime uses
-it in preference to exponential backoff, capped by `RetryPolicy.max_delay_s`.
+it in preference to exponential backoff, capped by `RetryPolicy.max_delay_s`
+(30 seconds by default; set it up to 3,600 seconds to honor a long rate-limit
+window). `max_attempts` and `max_unknown_attempts` accept up to 50.
 Structured in-band stream errors use the same retry contract and retain an
 explicit valid `status_code` when the event supplies one:
 Anthropic-shaped overload/rate-limit/API/timeout identities map to

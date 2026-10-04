@@ -6,13 +6,22 @@ These decoders cap returned output relative to the response byte limit, so a
 decompression bomb is detected before its expansion is materialized. Zstandard
 also caps its history window relative to that limit. Deflate may retain bounded
 encoded input to retry a raw stream whose prefix resembles a zlib header.
+
+Each codec call produces at most one output step. A caller that accounts memory
+passes ``reserve``: the decoder calls it with the total bytes it will hold (the
+decoded sink, retained encoded input, and the next step's output) before that
+memory is allocated, so a small compressed chunk never inflates past the
+reservation.
 """
 
 from __future__ import annotations
 
 import importlib
 import zlib
+from collections.abc import Callable
 from typing import Any, Protocol
+
+Reserve = Callable[[int], None]
 
 
 class UnsupportedContentEncodingError(ValueError):
@@ -28,9 +37,11 @@ class DecodedContentTooLargeError(ValueError):
 
 
 class BoundedContentDecoder(Protocol):
-    def feed(self, data: bytes, sink: bytearray, limit: int) -> None: ...
+    def feed(
+        self, data: bytes, sink: bytearray, limit: int, reserve: Reserve | None = None
+    ) -> None: ...
 
-    def finish(self, sink: bytearray, limit: int) -> None: ...
+    def finish(self, sink: bytearray, limit: int, reserve: Reserve | None = None) -> None: ...
 
 
 def _optional_module(name: str) -> Any | None:
@@ -89,10 +100,19 @@ def _append(sink: bytearray, output: bytes, limit: int) -> None:
     sink.extend(output)
 
 
+# Output produced by one codec call; also the most a reservation runs ahead.
+_DECODE_OUTPUT_STEP = 1024 * 1024
+
+
 def _next_output_bound(sink: bytearray, limit: int) -> int:
     # One byte past the remaining allowance proves overflow without allocating
     # more than the limit permits.
-    return limit - len(sink) + 1
+    return min(limit - len(sink) + 1, _DECODE_OUTPUT_STEP)
+
+
+def _reserve(reserve: Reserve | None, total: int) -> None:
+    if reserve is not None:
+        reserve(total)
 
 
 class _ZlibDecoder:
@@ -102,32 +122,45 @@ class _ZlibDecoder:
         self._decompressor = zlib.decompressobj(wbits)
         self._started = False
 
-    def feed(self, data: bytes | bytearray, sink: bytearray, limit: int) -> None:
+    def feed(
+        self,
+        data: bytes | bytearray,
+        sink: bytearray,
+        limit: int,
+        reserve: Reserve | None = None,
+        *,
+        held: int = 0,
+    ) -> None:
         pending = data
-        while pending:
+        draining = False
+        while pending or draining:
             if self._decompressor.eof:
                 if not self._multi_member:
                     raise ContentDecodingError("Encoded response has trailing data.")
                 self._decompressor = zlib.decompressobj(self._wbits)
             self._started = True
+            bound = _next_output_bound(sink, limit)
+            _reserve(reserve, len(sink) + held + bound)
             try:
-                output = self._decompressor.decompress(pending, _next_output_bound(sink, limit))
+                output = self._decompressor.decompress(pending, bound)
             except zlib.error as exc:
                 raise ContentDecodingError("Encoded response is malformed.") from exc
             _append(sink, output, limit)
-            # Output below the bound means inflate stopped only for lack of
-            # input, so no decoded bytes remain buffered inside zlib.
-            pending = (
-                self._decompressor.unused_data
-                if self._decompressor.eof
-                else self._decompressor.unconsumed_tail
-            )
+            if self._decompressor.eof:
+                pending = self._decompressor.unused_data
+                draining = False
+            else:
+                # A full step may leave decoded bytes inside zlib even with no
+                # input left; output below the bound means it stopped only for
+                # lack of input.
+                pending = self._decompressor.unconsumed_tail
+                draining = len(output) == bound
 
     @property
     def complete(self) -> bool:
         return self._decompressor.eof
 
-    def finish(self, sink: bytearray, limit: int) -> None:
+    def finish(self, sink: bytearray, limit: int, reserve: Reserve | None = None) -> None:
         if not self._started or not self._decompressor.eof:
             raise ContentDecodingError("Encoded response is truncated.")
 
@@ -140,12 +173,19 @@ class _DeflateDecoder:
         self._decoder: _ZlibDecoder | None = None
         self._sink_start: int | None = None
 
-    def feed(self, data: bytes, sink: bytearray, limit: int) -> None:
+    def _held(self) -> int:
+        return 0 if self._replay is None else len(self._replay)
+
+    def feed(
+        self, data: bytes, sink: bytearray, limit: int, reserve: Reserve | None = None
+    ) -> None:
         if self._sink_start is None:
             self._sink_start = len(sink)
         if self._replay is not None:
             if len(self._replay) + len(data) > limit:
                 raise DecodedContentTooLargeError("Encoded response exceeded the byte limit.")
+            # Retained encoded input is held memory too.
+            _reserve(reserve, len(sink) + len(self._replay) + len(data))
             self._replay.extend(data)
         pending: bytes | bytearray = data
         if self._decoder is None:
@@ -162,24 +202,24 @@ class _DeflateDecoder:
             if not zlib_wrapped:
                 self._replay = None
         try:
-            self._decoder.feed(pending, sink, limit)
+            self._decoder.feed(pending, sink, limit, reserve, held=self._held())
         except ContentDecodingError:
             if self._replay is None:
                 raise
-            self._fallback_to_raw(sink, limit)
+            self._fallback_to_raw(sink, limit, reserve)
         if self._decoder.complete:
             # A complete wrapped stream passed its checksum. It must not be
             # reinterpreted as raw if a later chunk contains trailing garbage.
             self._replay = None
 
-    def _fallback_to_raw(self, sink: bytearray, limit: int) -> None:
+    def _fallback_to_raw(self, sink: bytearray, limit: int, reserve: Reserve | None) -> None:
         assert self._replay is not None and self._sink_start is not None
         replay, self._replay = self._replay, None
         del sink[self._sink_start :]
         self._decoder = _ZlibDecoder(wbits=-zlib.MAX_WBITS, multi_member=False)
-        self._decoder.feed(replay, sink, limit)
+        self._decoder.feed(replay, sink, limit, reserve, held=len(replay))
 
-    def finish(self, sink: bytearray, limit: int) -> None:
+    def finish(self, sink: bytearray, limit: int, reserve: Reserve | None = None) -> None:
         if self._decoder is None:
             raise ContentDecodingError("Encoded response is truncated.")
         try:
@@ -187,7 +227,7 @@ class _DeflateDecoder:
         except ContentDecodingError:
             if self._replay is None:
                 raise
-            self._fallback_to_raw(sink, limit)
+            self._fallback_to_raw(sink, limit, reserve)
             self._decoder.finish(sink, limit)
 
 
@@ -196,6 +236,8 @@ class _DeflateDecoder:
 # first block (just under 32 KiB), which bounds the transient overshoot that is
 # produced and discarded before the limit error.
 _BROTLI_OUTPUT_REQUEST = 16 * 1024
+# Reserved ahead of each Brotli call: its first output block stays below this.
+_BROTLI_CALL_OUTPUT_BOUND = 32 * 1024
 
 
 class _BrotliDecoder:
@@ -204,11 +246,14 @@ class _BrotliDecoder:
         self._decompressor = module.Decompressor()
         self._started = False
 
-    def feed(self, data: bytes, sink: bytearray, limit: int) -> None:
+    def feed(
+        self, data: bytes, sink: bytearray, limit: int, reserve: Reserve | None = None
+    ) -> None:
         if not data:
             return
         self._started = True
         try:
+            _reserve(reserve, len(sink) + _BROTLI_CALL_OUTPUT_BOUND)
             output = self._decompressor.process(
                 data, output_buffer_limit=self._request(sink, limit)
             )
@@ -218,6 +263,7 @@ class _BrotliDecoder:
             while not self._decompressor.is_finished() and (
                 output or not self._decompressor.can_accept_more_data()
             ):
+                _reserve(reserve, len(sink) + _BROTLI_CALL_OUTPUT_BOUND)
                 output = self._decompressor.process(
                     b"", output_buffer_limit=self._request(sink, limit)
                 )
@@ -229,7 +275,7 @@ class _BrotliDecoder:
     def _request(sink: bytearray, limit: int) -> int:
         return min(_next_output_bound(sink, limit), _BROTLI_OUTPUT_REQUEST)
 
-    def finish(self, sink: bytearray, limit: int) -> None:
+    def finish(self, sink: bytearray, limit: int, reserve: Reserve | None = None) -> None:
         if not self._started or not self._decompressor.is_finished():
             raise ContentDecodingError("Encoded response is truncated.")
 
@@ -284,7 +330,9 @@ class _ZstdDecoder:
         self._window_checked = True
         self._frame_header.clear()
 
-    def feed(self, data: bytes, sink: bytearray, limit: int) -> None:
+    def feed(
+        self, data: bytes, sink: bytearray, limit: int, reserve: Reserve | None = None
+    ) -> None:
         pending = data
         while pending or not self._decompressor.needs_input:
             if self._decompressor.eof:
@@ -294,8 +342,10 @@ class _ZstdDecoder:
                 self._window_checked = False
             self._started = True
             self._check_window(pending)
+            bound = _next_output_bound(sink, limit)
+            _reserve(reserve, len(sink) + bound)
             try:
-                output = self._decompressor.decompress(pending, _next_output_bound(sink, limit))
+                output = self._decompressor.decompress(pending, bound)
             except (self._module.ZstdError, EOFError) as exc:
                 raise ContentDecodingError("Encoded response is malformed.") from exc
             _append(sink, output, limit)
@@ -303,6 +353,6 @@ class _ZstdDecoder:
             if self._decompressor.eof and not pending:
                 return
 
-    def finish(self, sink: bytearray, limit: int) -> None:
+    def finish(self, sink: bytearray, limit: int, reserve: Reserve | None = None) -> None:
         if not self._started or not self._decompressor.eof:
             raise ContentDecodingError("Encoded response is truncated.")

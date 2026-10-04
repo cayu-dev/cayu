@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from cayu._exception_groups import exception_cause, set_exception_cause
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
+from cayu.budgets.base import MAX_REQUEST_BUDGET_LIMITS
 from cayu.budgets.billing import BillingIdentity
 from cayu.budgets.run_limits import RunLimits
 from cayu.configuration import MAX_STEPS, CayuConfig, RunDefaults
@@ -41,7 +42,6 @@ from cayu.runtime._model_step_executor import (
     _MODEL_COMPLETION_RECOVERY_V1_DEFAULT_MAX_STEPS,
     MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS,
     MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES,
-    MAX_MODEL_COMPLETION_RECOVERY_METADATA_ENTRIES,
     ModelAttemptFailed,
     ModelCompletionRecoveryContext,
     _raise_terminal_model_attempt_failure,
@@ -65,6 +65,7 @@ from cayu.sessions.base import (
     ModelCompletionStageRequest,
     ModelCompletionStageResult,
     PersistedEventSideEffectClaim,
+    ResumeRequest,
     RunRequest,
     SessionIdentity,
     SessionRunFenced,
@@ -1273,17 +1274,29 @@ def test_offline_recovery_context_is_bounded_before_stage_storage() -> None:
         ModelCompletionRecoveryContext(interaction_id=" ")
     with pytest.raises(ValidationError, match=f"less than or equal to {MAX_STEPS}"):
         ModelCompletionRecoveryContext(max_steps=MAX_STEPS + 1)
-    with pytest.raises(ValidationError, match="request_metadata cannot contain more than"):
-        ModelCompletionRecoveryContext(
-            request_metadata={
-                f"key-{index}": index
-                for index in range(MAX_MODEL_COMPLETION_RECOVERY_METADATA_ENTRIES + 1)
-            }
+    # Recovery accepts whatever RunRequest metadata accepts (no extra entry cap).
+    assert (
+        len(
+            ModelCompletionRecoveryContext(
+                request_metadata={f"key-{index}": index for index in range(1_000)}
+            ).request_metadata
         )
+        == 1_000
+    )
     with pytest.raises(ValidationError, match="budget_limits cannot contain more than"):
         ModelCompletionRecoveryContext.model_validate(
             {"budget_limits": [None] * (MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS + 1)}
         )
+    # Requests admit no more budget limits than recovery can hold.
+    assert MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS == MAX_REQUEST_BUDGET_LIMITS
+    for request_type, required in (
+        (RunRequest, {"agent_name": "assistant", "messages": []}),
+        (ResumeRequest, {"session_id": "s"}),
+    ):
+        with pytest.raises(ValidationError, match="budget_limits cannot contain more than"):
+            request_type.model_validate(
+                {**required, "budget_limits": [None] * (MAX_REQUEST_BUDGET_LIMITS + 1)}
+            )
     with pytest.raises(ValidationError, match="configured encoded JSON byte limit"):
         ModelCompletionRecoveryContext(
             request_metadata={"payload": "x" * MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES}

@@ -637,3 +637,49 @@ def test_diagnostic_parameters_are_copied_read_only_json() -> None:
             parameters={"bad": object()},
             verification_command="cayu check --json",
         )
+
+
+def test_default_policy_accepts_read_file_and_ask_user_but_not_implicit_writes() -> None:
+    from cayu import AgentSpec, CayuApp, ScriptedModelProvider, StaticToolPolicy
+    from cayu.runtime.checks import check_manifest
+    from cayu.tools.files import ReadFileTool, WriteFileTool
+    from cayu.tools.user_input import UserInputTool
+
+    def unguarded(policy: StaticToolPolicy | None) -> set[str]:
+        app = CayuApp(enable_logging=False)
+        app.register_provider(ScriptedModelProvider([]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake"),
+            tools=[UserInputTool(), ReadFileTool(), WriteFileTool()],
+            **({} if policy is None else {"tool_policy": policy}),
+        )
+        manifest = app.describe()
+        return {
+            diagnostic.subject
+            for diagnostic in check_manifest(manifest).diagnostics
+            if diagnostic.code == "EXTERNAL_TOOL_UNGUARDED"
+        }
+
+    assert unguarded(None) == {"tool:assistant/write_file"}
+    assert unguarded(StaticToolPolicy()) == {"tool:assistant/write_file"}
+    assert unguarded(StaticToolPolicy(allow=["ask_user", "read_file", "write_file"])) == set()
+
+
+def test_explicit_allow_is_not_published_in_the_manifest() -> None:
+    from cayu import AgentSpec, CayuApp, ScriptedModelProvider, StaticToolPolicy
+    from cayu.runtime.manifest import AppManifest
+    from cayu.tools.files import WriteFileTool
+
+    app = CayuApp(enable_logging=False)
+    app.register_provider(ScriptedModelProvider([]), default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake"),
+        tools=[WriteFileTool()],
+        tool_policy=StaticToolPolicy(allow=["write_file"]),
+    )
+    manifest = app.describe()
+    serialized = manifest.model_dump_json()
+    assert "allows_explicitly" not in serialized
+    # A manifest loaded from JSON keeps the conservative default.
+    reloaded = AppManifest.model_validate_json(serialized)
+    assert reloaded.agents[0].tools[0]._policy_allows_explicitly is False

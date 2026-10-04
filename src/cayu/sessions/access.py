@@ -41,6 +41,17 @@ _ACTIONS = (
 )
 
 
+# Access predicates compile into store queries; the parameter bound keeps one
+# action well inside SQLite's (32,766) and PostgreSQL's (65,535) limits while
+# fitting tenant, team and project selectors for real organizations.
+_MAX_SELECTOR_VALUES = 500
+_MAX_RULE_SELECTORS = 64
+_MAX_ACTION_RULES = 64
+_MAX_ACTION_PARAMETERS = 2_048
+# Matches the session label map ceiling: every label key can be protected.
+_MAX_PROTECTED_LABEL_KEYS = 200
+
+
 @dataclass(frozen=True, slots=True)
 class SessionAccessSelector:
     """Immutable label requirement using the existing session-query semantics."""
@@ -53,8 +64,8 @@ class SessionAccessSelector:
         validated = LabelSelectorRequirement(
             key=self.key, operator=self.operator, values=self.values
         )
-        if len(validated.values) > 50:
-            raise ValueError("Access selectors accept at most 50 values.")
+        if len(validated.values) > _MAX_SELECTOR_VALUES:
+            raise ValueError(f"Access selectors accept at most {_MAX_SELECTOR_VALUES} values.")
         object.__setattr__(self, "key", validated.key)
         object.__setattr__(self, "operator", validated.operator)
         object.__setattr__(self, "values", validated.values)
@@ -79,7 +90,7 @@ class SessionAccessRule:
 
     def __post_init__(self) -> None:
         selectors = tuple(self.selectors)
-        if type(self.allow_all) is not bool or len(selectors) > 25:
+        if type(self.allow_all) is not bool or len(selectors) > _MAX_RULE_SELECTORS:
             raise ValueError("Invalid access rule bounds.")
         if any(type(item) is not SessionAccessSelector for item in selectors):
             raise TypeError("Access rules require SessionAccessSelector values.")
@@ -112,16 +123,27 @@ class SessionAccessScope:
     def __post_init__(self) -> None:
         for name in _ACTIONS:
             rules = tuple(getattr(self, name))
-            if len(rules) > 16 or any(type(rule) is not SessionAccessRule for rule in rules):
-                raise ValueError("Each action accepts at most 16 SessionAccessRule alternatives.")
-            if sum(1 + len(selector.values) for rule in rules for selector in rule.selectors) > 256:
-                raise ValueError("Action predicates exceed the 256-parameter bound.")
+            if len(rules) > _MAX_ACTION_RULES or any(
+                type(rule) is not SessionAccessRule for rule in rules
+            ):
+                raise ValueError(
+                    f"Each action accepts at most {_MAX_ACTION_RULES} SessionAccessRule alternatives."
+                )
+            if (
+                sum(1 + len(selector.values) for rule in rules for selector in rule.selectors)
+                > _MAX_ACTION_PARAMETERS
+            ):
+                raise ValueError(
+                    f"Action predicates exceed the {_MAX_ACTION_PARAMETERS}-parameter bound."
+                )
             object.__setattr__(self, name, rules)
         if isinstance(self.protected_label_keys, str | bytes):
             raise TypeError("Protected label keys must be a sequence of keys.")
         keys = tuple(self.protected_label_keys)
-        if len(keys) > 50:
-            raise ValueError("At most 50 protected label keys are supported.")
+        if len(keys) > _MAX_PROTECTED_LABEL_KEYS:
+            raise ValueError(
+                f"At most {_MAX_PROTECTED_LABEL_KEYS} protected label keys are supported."
+            )
         validated = copy_label_map(dict.fromkeys(keys, "_"), "protected_label_keys")
         object.__setattr__(self, "protected_label_keys", tuple(sorted(validated)))
 

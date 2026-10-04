@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import json
 import math
 import ssl
@@ -64,12 +65,21 @@ from cayu.vaults import (
 )
 
 CAYU_EGRESS_ERROR_HEADER = "X-Cayu-Egress-Error"
-DEFAULT_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
-MAX_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+# Responses are buffered so the broker can scrub credentials before the guest
+# sees them. Defaults fit package and repository traffic (pip wheels, git
+# packs); the ceiling bounds per-operation memory and is configurable below it.
+DEFAULT_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES = 256 * 1024 * 1024
+DEFAULT_EGRESS_BROWSER_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+MAX_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_EGRESS_MAX_ACTIVE_UPSTREAM_OPERATIONS = 16
 MAX_EGRESS_MAX_ACTIVE_UPSTREAM_OPERATIONS = 64
 _MAX_ACTIVE_CREDENTIAL_RESOLUTIONS = 16
-DEFAULT_EGRESS_UPSTREAM_TOTAL_TIMEOUT_S = 60.0
+DEFAULT_EGRESS_UPSTREAM_TOTAL_TIMEOUT_S = 600.0
+MAX_EGRESS_UPSTREAM_TOTAL_TIMEOUT_S = 3600.0
+# Every in-flight buffered response draws on one broker-wide budget, so many
+# concurrent large downloads fail clearly instead of exhausting host memory.
+DEFAULT_EGRESS_RESPONSE_BUFFER_BUDGET_BYTES = 1024 * 1024 * 1024
+MAX_EGRESS_RESPONSE_BUFFER_BUDGET_BYTES = 64 * 1024 * 1024 * 1024
 
 # Headers that must not be forwarded verbatim between hops.
 _HOP_BY_HOP = frozenset(
@@ -236,12 +246,22 @@ class EgressDecision:
 
 @dataclass(frozen=True)
 class EgressUpstreamLimits:
-    """Cayu-owned limits that an upstream must enforce while reading."""
+    """Cayu-owned limits that an upstream must enforce while reading.
+
+    ``response_buffer``, when present, is this operation's share of the
+    broker-wide buffer budget: an upstream calls ``reserve_to`` with the bytes
+    it holds for the response so far, and stops reading if that raises.
+    """
 
     max_response_bytes: int
     total_timeout_s: float
+    response_buffer: EgressResponseBuffer | None = None
 
     def __post_init__(self) -> None:
+        if self.response_buffer is not None and not isinstance(
+            self.response_buffer, EgressResponseBuffer
+        ):
+            raise TypeError("response_buffer must be an EgressResponseBuffer.")
         object.__setattr__(
             self,
             "max_response_bytes",
@@ -447,6 +467,108 @@ class _UpstreamCapacityError(RuntimeError):
     pass
 
 
+class _UpstreamBufferBudgetError(RuntimeError):
+    pass
+
+
+class EgressResponseBufferBudget:
+    """Bytes of buffered upstream responses held at once, shared by brokers.
+
+    One budget may back many brokers (``VirtualEgressEnvironmentFactory`` shares
+    one across every session it creates), so its accounting is thread-safe.
+    """
+
+    def __init__(self, limit_bytes: int = DEFAULT_EGRESS_RESPONSE_BUFFER_BUDGET_BYTES) -> None:
+        self._limit_bytes = _bounded_buffer_budget(limit_bytes)
+        self._used_bytes = 0
+        self._lock = threading.Lock()
+
+    @property
+    def limit_bytes(self) -> int:
+        return self._limit_bytes
+
+    @property
+    def used_bytes(self) -> int:
+        return self._used_bytes
+
+    def _take(self, size: int) -> None:
+        with self._lock:
+            if self._used_bytes + size > self._limit_bytes:
+                raise _UpstreamBufferBudgetError("Egress response buffer budget is exhausted.")
+            self._used_bytes += size
+
+    def _give(self, size: int) -> None:
+        with self._lock:
+            self._used_bytes = max(0, self._used_bytes - size)
+
+
+class EgressResponseBuffer:
+    """One forwarded request's reservation against an egress buffer budget.
+
+    The broker creates one per forwarded request. It holds the reservation until
+    the response body has been handed on: ``handle_request`` releases it when it
+    returns, and the proxy server releases it only after it has written or
+    dropped the body. ``reserve_to`` only grows the reservation; it raises when
+    the shared budget cannot hold the new total, or after release. Both are
+    thread-safe, so a custom upstream may reserve from another thread.
+    """
+
+    __slots__ = ("_budget", "_lock", "_released", "_reserved_bytes")
+
+    def __init__(self, budget: EgressResponseBufferBudget) -> None:
+        if not isinstance(budget, EgressResponseBufferBudget):
+            raise TypeError("budget must be an EgressResponseBufferBudget.")
+        self._budget = budget
+        self._lock = threading.Lock()
+        self._reserved_bytes = 0
+        self._released = False
+
+    @property
+    def reserved_bytes(self) -> int:
+        return self._reserved_bytes
+
+    @property
+    def released(self) -> bool:
+        return self._released
+
+    def reserve_to(self, total_bytes: int) -> None:
+        if type(total_bytes) is not int or total_bytes < 0:
+            raise ValueError("total_bytes must be a non-negative integer.")
+        with self._lock:
+            if self._released:
+                raise _UpstreamBufferBudgetError("Egress response buffer was already released.")
+            if total_bytes <= self._reserved_bytes:
+                return
+            self._budget._take(total_bytes - self._reserved_bytes)
+            self._reserved_bytes = total_bytes
+
+    def _shrink_to(self, total_bytes: int) -> None:
+        # Broker-internal: once the final body is known, hold only its size.
+        with self._lock:
+            if self._released or total_bytes >= self._reserved_bytes:
+                return
+            surplus = self._reserved_bytes - total_bytes
+            self._reserved_bytes = total_bytes
+            self._budget._give(surplus)
+
+    def release(self) -> None:
+        """Return the reservation to the budget; later calls do nothing."""
+
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+            reserved, self._reserved_bytes = self._reserved_bytes, 0
+            self._budget._give(reserved)
+
+
+# The proxy server's request: keep the reservation past ``handle_request`` so it
+# covers the body until the worker has written it.
+_RESPONSE_BUFFER_HANDOFF: contextvars.ContextVar[list[EgressResponseBuffer] | None] = (
+    contextvars.ContextVar("cayu_egress_response_buffer_handoff", default=None)
+)
+
+
 _UpstreamFailureCode = Literal[
     "upstream_connect_failed",
     "upstream_connection_reset",
@@ -553,7 +675,7 @@ class HttpxUpstream:
     def __init__(
         self,
         *,
-        timeout_s: float = 30.0,
+        timeout_s: float = DEFAULT_EGRESS_UPSTREAM_TOTAL_TIMEOUT_S,
         max_response_bytes: int = DEFAULT_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES,
         transport: httpx.AsyncBaseTransport | None = None,
         routes: Mapping[str, str] | None = None,
@@ -577,6 +699,7 @@ class HttpxUpstream:
         effective_limits = EgressUpstreamLimits(
             max_response_bytes=min(self._max_response_bytes, limits.max_response_bytes),
             total_timeout_s=min(self._timeout_s, limits.total_timeout_s),
+            response_buffer=limits.response_buffer,
         )
         return EgressUpstreamOperation(
             lambda: self._send(request, limits=effective_limits),
@@ -762,11 +885,14 @@ class HttpxUpstream:
                             "Upstream response exceeded the configured byte limit."
                         )
             body = bytearray()
+            reserve = None if limits.response_buffer is None else limits.response_buffer.reserve_to
             try:
                 if decoder is None:
                     async for chunk in response.aiter_bytes():
                         if len(body) + len(chunk) > limits.max_response_bytes:
                             raise DecodedContentTooLargeError
+                        if reserve is not None:
+                            reserve(len(body) + len(chunk))
                         body.extend(chunk)
                 else:
                     # Read raw bytes so httpx's unbounded decoders never run.
@@ -776,11 +902,12 @@ class HttpxUpstream:
                         received += len(chunk)
                         if received > limits.max_response_bytes:
                             raise DecodedContentTooLargeError
-                        decoder.feed(chunk, body, limits.max_response_bytes)
+                        # The decoder reserves before each bounded output step.
+                        decoder.feed(chunk, body, limits.max_response_bytes, reserve)
                     # HEAD, 204, and 304 responses may announce a coding with
                     # no body; only a started encoded body must be complete.
                     if received:
-                        decoder.finish(body, limits.max_response_bytes)
+                        decoder.finish(body, limits.max_response_bytes, reserve)
             except DecodedContentTooLargeError as exc:
                 raise _UpstreamResponseTooLargeError(
                     "Upstream response exceeded the configured byte limit."
@@ -862,7 +989,22 @@ def _bounded_timeout(value: float) -> float:
     normalized = float(value)
     if not math.isfinite(normalized) or normalized <= 0:
         raise ValueError("timeout_s must be a finite positive number.")
+    if normalized > MAX_EGRESS_UPSTREAM_TOTAL_TIMEOUT_S:
+        raise ValueError(
+            f"timeout_s must be at most {MAX_EGRESS_UPSTREAM_TOTAL_TIMEOUT_S:g} seconds."
+        )
     return normalized
+
+
+def _bounded_buffer_budget(value: int) -> int:
+    if type(value) is not int:
+        raise TypeError("response_buffer_budget_bytes must be an integer.")
+    if value <= 0 or value > MAX_EGRESS_RESPONSE_BUFFER_BUDGET_BYTES:
+        raise ValueError(
+            "response_buffer_budget_bytes must be between 1 and "
+            f"{MAX_EGRESS_RESPONSE_BUFFER_BUDGET_BYTES}."
+        )
+    return value
 
 
 def _bounded_response_bytes(value: int) -> int:
@@ -935,6 +1077,10 @@ class TransparentEgressBroker:
         require_test_mode_credentials: bool = True,
         browser_max_response_bytes: int | None = None,
         max_active_upstream_operations: int = DEFAULT_EGRESS_MAX_ACTIVE_UPSTREAM_OPERATIONS,
+        upstream_max_response_bytes: int = DEFAULT_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES,
+        upstream_total_timeout_s: float = DEFAULT_EGRESS_UPSTREAM_TOTAL_TIMEOUT_S,
+        response_buffer_budget_bytes: int | None = None,
+        response_buffer_budget: EgressResponseBufferBudget | None = None,
     ) -> None:
         if resolver is not None:
             validate_secret_resolver(resolver, "resolver")
@@ -975,7 +1121,6 @@ class TransparentEgressBroker:
         self._connect_admissions_idle = asyncio.Event()
         self._connect_admissions_idle.set()
         self._revoking_grant_ids: set[str] = set()
-        self._upstream = upstream or HttpxUpstream()
         self._audit = audit
         self._require_test_mode = require_test_mode_credentials
         self._max_active_upstream_operations = max_active_upstream_operations
@@ -989,10 +1134,46 @@ class TransparentEgressBroker:
         self._credential_resolutions_idle = asyncio.Event()
         self._credential_resolutions_idle.set()
         self._browser_max_response_bytes = _bounded_response_bytes(
-            DEFAULT_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES
+            DEFAULT_EGRESS_BROWSER_MAX_RESPONSE_BYTES
             if browser_max_response_bytes is None
             else browser_max_response_bytes
         )
+        self._upstream_max_response_bytes = _bounded_response_bytes(upstream_max_response_bytes)
+        self._upstream_total_timeout_s = _bounded_timeout(upstream_total_timeout_s)
+        if response_buffer_budget is not None:
+            if response_buffer_budget_bytes is not None:
+                raise ValueError(
+                    "Pass either response_buffer_budget or response_buffer_budget_bytes, not both."
+                )
+            if not isinstance(response_buffer_budget, EgressResponseBufferBudget):
+                raise TypeError("response_buffer_budget must be an EgressResponseBufferBudget.")
+            self._response_buffer_budget = response_buffer_budget
+        else:
+            self._response_buffer_budget = EgressResponseBufferBudget(
+                DEFAULT_EGRESS_RESPONSE_BUFFER_BUDGET_BYTES
+                if response_buffer_budget_bytes is None
+                else response_buffer_budget_bytes
+            )
+        largest_response = max(self._upstream_max_response_bytes, self._browser_max_response_bytes)
+        if self._response_buffer_budget.limit_bytes < largest_response:
+            raise ValueError(
+                "The response buffer budget must hold at least one largest response "
+                f"({largest_response} bytes)."
+            )
+        # The default upstream takes the broker's limits as its own ceilings, so
+        # raising a broker limit is enough; a supplied upstream keeps its own.
+        self._upstream = upstream or HttpxUpstream(
+            timeout_s=self._upstream_total_timeout_s,
+            max_response_bytes=max(
+                self._upstream_max_response_bytes, self._browser_max_response_bytes
+            ),
+        )
+
+    @property
+    def upstream_total_timeout_s(self) -> float:
+        """Total time one upstream request may take, including the response body."""
+
+        return self._upstream_total_timeout_s
 
     @property
     def registry(self) -> VirtualCredentialRegistry:
@@ -1098,6 +1279,28 @@ class TransparentEgressBroker:
         ):
             return normalized_host
         return None
+
+    async def _handle_request_holding_buffer(
+        self,
+        request: CapturedRequest,
+    ) -> tuple[CapturedResponse, tuple[EgressResponseBuffer, ...]]:
+        """Handle one request, returning its buffer reservations to the caller.
+
+        The caller must release every returned reservation once it has written or
+        dropped the response body. Any failure or cancellation here releases them.
+        """
+
+        handoff: list[EgressResponseBuffer] = []
+        token = _RESPONSE_BUFFER_HANDOFF.set(handoff)
+        try:
+            response = await self.handle_request(request)
+        except BaseException:
+            for response_buffer in handoff:
+                response_buffer.release()
+            raise
+        finally:
+            _RESPONSE_BUFFER_HANDOFF.reset(token)
+        return response, tuple(handoff)
 
     async def handle_request(self, request: CapturedRequest) -> CapturedResponse:
         if type(request) is not CapturedRequest:
@@ -1516,6 +1719,40 @@ class TransparentEgressBroker:
         authorization: _ForwardingAuthorization,
         ensure_authority: Callable[[], None] | None = None,
     ) -> CapturedResponse:
+        # The reservation covers the buffered body until the scrubbed response is
+        # handed on; cancellation and every denial release it here.
+        response_buffer = EgressResponseBuffer(self._response_buffer_budget)
+        handoff = _RESPONSE_BUFFER_HANDOFF.get()
+        try:
+            response = await self._forward_authorized_buffered(
+                request=request,
+                upstream_request=upstream_request,
+                authorization=authorization,
+                ensure_authority=ensure_authority,
+                response_buffer=response_buffer,
+            )
+        except BaseException:
+            response_buffer.release()
+            raise
+        if handoff is None:
+            response_buffer.release()
+        else:
+            # The proxy server keeps the reservation until it has written the
+            # body; it now covers exactly the body handed on (scrubbed, or a
+            # small denial), not the transient copies made on the way.
+            response_buffer._shrink_to(len(response.body))
+            handoff.append(response_buffer)
+        return response
+
+    async def _forward_authorized_buffered(
+        self,
+        *,
+        request: CapturedRequest,
+        upstream_request: CapturedRequest,
+        authorization: _ForwardingAuthorization,
+        ensure_authority: Callable[[], None] | None,
+        response_buffer: EgressResponseBuffer,
+    ) -> CapturedResponse:
         if ensure_authority is not None:
             try:
                 ensure_authority()
@@ -1536,16 +1773,29 @@ class TransparentEgressBroker:
             )
         effective_response_limit = (
             min(
-                MAX_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES,
+                self._upstream_max_response_bytes,
                 self._browser_max_response_bytes,
             )
             if authorization.require_identity_encoding
-            else MAX_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES
+            else self._upstream_max_response_bytes
         )
         try:
             response = await self._run_upstream_operation(
                 upstream_request,
                 max_response_bytes=effective_response_limit,
+                response_buffer=response_buffer,
+            )
+            # A custom upstream may not reserve while reading; hold what it returned.
+            response_buffer.reserve_to(len(response.body))
+        except _UpstreamBufferBudgetError:
+            return self._deny(
+                request,
+                authorization.grant_id,
+                authorization.policy_name,
+                503,
+                "Egress response buffer budget is exhausted; retry when other downloads finish.",
+                authorization_kind=authorization.authorization_kind,
+                error_code="upstream_capacity_exhausted",
             )
         except _UpstreamCapacityError:
             return self._deny(
@@ -1687,6 +1937,17 @@ class TransparentEgressBroker:
                 response,
                 secrets=authorization.secrets,
                 max_body_bytes=response_limit,
+                response_buffer=response_buffer,
+            )
+        except _UpstreamBufferBudgetError:
+            return self._deny(
+                request,
+                authorization.grant_id,
+                authorization.policy_name,
+                503,
+                "Egress response buffer budget is exhausted; retry when other downloads finish.",
+                authorization_kind=authorization.authorization_kind,
+                error_code="upstream_capacity_exhausted",
             )
         except _UpstreamCookieHeadersError:
             return self._deny(
@@ -1728,6 +1989,7 @@ class TransparentEgressBroker:
         request: CapturedRequest,
         *,
         max_response_bytes: int,
+        response_buffer: EgressResponseBuffer | None = None,
     ) -> CapturedResponse:
         token = self._reserve_upstream_operation()
         if token is None:
@@ -1742,7 +2004,8 @@ class TransparentEgressBroker:
                 request,
                 limits=EgressUpstreamLimits(
                     max_response_bytes=max_response_bytes,
-                    total_timeout_s=DEFAULT_EGRESS_UPSTREAM_TOTAL_TIMEOUT_S,
+                    total_timeout_s=self._upstream_total_timeout_s,
+                    response_buffer=response_buffer,
                 ),
             )
             if not isinstance(operation, EgressUpstreamOperation):
@@ -2039,6 +2302,7 @@ def _scrub_response(
     *,
     secrets: tuple[str, ...] = (),
     max_body_bytes: int,
+    response_buffer: EgressResponseBuffer | None = None,
 ) -> CapturedResponse:
     headers = _forwardable_headers(response.headers)
     cookies = _validated_set_cookie_headers(response.set_cookie_headers)
@@ -2054,14 +2318,19 @@ def _scrub_response(
     replacement = REDACTED_SECRET.encode()
     for secret in secrets:
         encoded_secret = secret.encode()
-        if len(replacement) > len(encoded_secret):
-            projected_size = len(redacted_body) + redacted_body.count(encoded_secret) * (
-                len(replacement) - len(encoded_secret)
+        occurrences = redacted_body.count(encoded_secret)
+        if not occurrences:
+            continue
+        projected_size = len(redacted_body) + occurrences * (len(replacement) - len(encoded_secret))
+        if projected_size > max_body_bytes:
+            raise _UpstreamResponseTooLargeError(
+                "Redaction would expand the response beyond its byte limit."
             )
-            if projected_size > max_body_bytes:
-                raise _UpstreamResponseTooLargeError(
-                    "Redaction would expand the response beyond its byte limit."
-                )
+        if response_buffer is not None:
+            # Hold whichever is larger, the received body or its expanded copy.
+            # The brief overlap while replace() builds the copy is transient and,
+            # like other transient copies, not counted.
+            response_buffer.reserve_to(max(len(response.body), projected_size))
         redacted_body = redacted_body.replace(encoded_secret, replacement)
     return response.model_copy(
         update={

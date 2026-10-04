@@ -31,6 +31,7 @@ from cayu.egress.adapter import (
 )
 from cayu.egress.authority import EgressAuthorityCutoverStrategy
 from cayu.egress.broker import (
+    MAX_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES,
     CapturedRequest,
     CapturedResponse,
     EgressUpstreamLimits,
@@ -1570,7 +1571,7 @@ def test_factory_accepts_a_configured_browser_response_limit() -> None:
     [
         (True, TypeError),
         (0, ValueError),
-        (64 * 1024 * 1024 + 1, ValueError),
+        (MAX_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES + 1, ValueError),
     ],
 )
 def test_factory_rejects_invalid_browser_response_limits(
@@ -9300,3 +9301,34 @@ def test_factory_drains_request_audit_before_revoked_events() -> None:
     assert types.index(EventType.EGRESS_REQUEST_AUTHORIZED) < types.index(
         EventType.EGRESS_GRANT_REVOKED
     )
+
+
+def test_factory_shares_one_response_buffer_budget_across_sessions() -> None:
+    from cayu.egress import EgressResponseBufferBudget
+
+    async def broker_for(factory: VirtualEgressEnvironmentFactory, session_id: str):  # type: ignore[no-untyped-def]
+        adapter = factory._adapter
+        await factory.create(
+            EnvironmentFactoryRequest(
+                session_id=session_id,
+                agent_name="assistant",
+                environment_name="egress-env",
+            )
+        )
+        return adapter.captured["broker"]
+
+    factory = _virtual_factory(adapter=_RecordingAdapter())
+    first = asyncio.run(broker_for(factory, "sess_budget_one"))
+    second = asyncio.run(broker_for(factory, "sess_budget_two"))
+    assert first is not second
+    assert first._response_buffer_budget is second._response_buffer_budget
+
+    shared = EgressResponseBufferBudget(512 * 1024 * 1024)
+    other_factory = _virtual_factory(adapter=_RecordingAdapter(), response_buffer_budget=shared)
+    assert asyncio.run(broker_for(other_factory, "sess_budget_three"))._response_buffer_budget is (
+        shared
+    )
+    with pytest.raises(ValueError, match="largest response"):
+        _virtual_factory(
+            adapter=_RecordingAdapter(), response_buffer_budget=EgressResponseBufferBudget(1024)
+        )

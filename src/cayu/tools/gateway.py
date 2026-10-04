@@ -38,7 +38,9 @@ from cayu.tools.grants import (
 from cayu.vaults import SecretRedactor
 
 CALL_TOOL_SCHEMA_VERSION = 1
-CALL_TOOL_MAX_ARGUMENT_BYTES = 256 * 1024
+# Match the direct built-in tools (write_file accepts up to 4 MiB); durable
+# event limits still bound what a model call can carry.
+CALL_TOOL_MAX_ARGUMENT_BYTES = 4 * 1024 * 1024
 CALL_TOOL_MAX_CONTEXT_BYTES = 512 * 1024
 _LOCAL_JSON_SCHEMA_REGISTRY: Registry[Any] = Registry()
 CALL_TOOL_REJECTION_CONTENT = {

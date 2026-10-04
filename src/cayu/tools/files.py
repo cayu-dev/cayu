@@ -30,6 +30,7 @@ from cayu.artifacts.attachments import (
     file_attachment_from_payload,
 )
 from cayu.artifacts.base import (
+    ArtifactIdentityConflictError,
     ArtifactMetadata,
     ArtifactReadResult,
     ArtifactScope,
@@ -65,7 +66,9 @@ DEFAULT_ATTACHMENT_LIMIT_BYTES = DEFAULT_MAX_FILE_ATTACHMENT_BYTES
 DEFAULT_MAX_ATTACHMENT_LIMIT_BYTES = DEFAULT_MAX_FILE_ATTACHMENT_BYTES
 MAX_IMAGE_SOURCE_BYTES = 20 * 1024 * 1024
 MAX_PDF_SOURCE_BYTES = 32 * 1024 * 1024
-MAX_PDF_PAGES_PER_READ = 10
+# Providers accept PDFs of up to 100 pages natively; attachment byte limits
+# still apply to the extracted pages.
+MAX_PDF_PAGES_PER_READ = 100
 DEFAULT_WRITE_LIMIT_BYTES = 256 * 1024
 MAX_WRITE_LIMIT_BYTES = 4 * 1024 * 1024
 DEFAULT_EDIT_DIFF_LIMIT_BYTES = 32 * 1024
@@ -189,9 +192,9 @@ def _read_file_tool_spec(
         max_terminal_payload_bytes=(
             max(MAX_READ_LIMIT_BYTES, max_attachment_limit_bytes) + 1024 * 1024
         ),
-        # Workspace image/PDF reads can create artifact snapshots; keep this conservative until
-        # snapshot writes are idempotent/content-addressed.
-        effect=ToolEffect.EXTERNAL,
+        # Workspace image/PDF snapshots and derived attachments use content-addressed
+        # artifact ids, so replaying a read returns the same artifacts.
+        effect=ToolEffect.IDEMPOTENT,
         description=(
             "Read a file from the active workspace or read an artifact by id. "
             "Use `path` for workspace files and `artifact_id` for uploaded/generated artifacts. "
@@ -874,8 +877,17 @@ async def _read_workspace_file_attachment(
             effective_read_limit_bytes=effective_source_limit,
         )
 
-    snapshot = await artifact_store.put_bytes(
+    snapshot = await _put_content_addressed_artifact(
+        artifact_store,
         result.content,
+        artifact_id=_content_addressed_artifact_id(
+            ctx,
+            "read_file_workspace_snapshot",
+            ctx.workspace_id,
+            path,
+            content_type,
+            _content_hash(result.content),
+        ),
         filename=_workspace_snapshot_filename(path),
         content_type=content_type,
         scope=ArtifactScope.SESSION,
@@ -1510,8 +1522,17 @@ class ImageArtifactReader:
                         is_error=True,
                     )
                 image_bytes, content_type = resized
-                attachment_artifact = await artifact_store.put_bytes(
+                attachment_artifact = await _put_content_addressed_artifact(
+                    artifact_store,
                     image_bytes,
+                    artifact_id=_content_addressed_artifact_id(
+                        request.ctx,
+                        "derived_attachment",
+                        type(self).__name__,
+                        artifact.id,
+                        derivation_key,
+                        _content_hash(image_bytes),
+                    ),
                     filename=artifact.filename,
                     content_type=content_type,
                     scope=ArtifactScope.SESSION,
@@ -1715,8 +1736,17 @@ class PdfArtifactReader:
                         structured=request.structured,
                         is_error=True,
                     )
-                attachment_artifact = await artifact_store.put_bytes(
+                attachment_artifact = await _put_content_addressed_artifact(
+                    artifact_store,
                     pdf_bytes,
+                    artifact_id=_content_addressed_artifact_id(
+                        request.ctx,
+                        "derived_attachment",
+                        type(self).__name__,
+                        artifact.id,
+                        derivation_key,
+                        _content_hash(pdf_bytes),
+                    ),
                     filename=artifact.filename,
                     content_type=PDF_CONTENT_TYPE,
                     scope=ArtifactScope.SESSION,
@@ -3115,6 +3145,48 @@ def _utf8_text_size(value: str) -> int:
             1 if codepoint < 0x80 else 2 if codepoint < 0x800 else 3 if codepoint < 0x10000 else 4
         )
     return size
+
+
+def _content_addressed_artifact_id(ctx: ToolContext, *parts: str | None) -> str:
+    """Return a stable artifact id for one deterministic tool-produced artifact.
+
+    The id covers the session, agent and environment the artifact is stored
+    under plus every input that determines its bytes and immutable metadata, so
+    a replayed or repeated call returns the existing artifact instead of a copy.
+    """
+
+    material = json.dumps(
+        [
+            "cayu.read_file.artifact.v1",
+            ctx.session_id,
+            ctx.agent_name,
+            ctx.environment_name,
+            *parts,
+        ],
+        separators=(",", ":"),
+    )
+    return "art_" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+async def _put_content_addressed_artifact(
+    artifact_store: ArtifactStore,
+    content: bytes,
+    *,
+    artifact_id: str,
+    **kwargs: object,
+) -> ArtifactMetadata:
+    """Store at the content-addressed id, or at a fresh id if that id holds other bytes.
+
+    An artifact already at the id with other bytes (corrupted or replaced out of
+    band) makes the idempotent write conflict; a fresh copy keeps the read
+    working, as before content addressing. Any other store failure propagates,
+    so a transient error never writes a second copy.
+    """
+
+    try:
+        return await artifact_store.put_bytes(content, artifact_id=artifact_id, **kwargs)
+    except ArtifactIdentityConflictError:
+        return await artifact_store.put_bytes(content, **kwargs)
 
 
 def _derivation_key(*, source_hash: str, operation: str, params: str) -> str:

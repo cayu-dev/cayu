@@ -80,7 +80,10 @@ a policy that can allow that specific tool without an enforcing boundary. The
 diagnostic reports the effective per-tool coverage rather than trusting the
 policy class name. Register an enforcing policy. Use
 `AlwaysRequireApprovalToolPolicy(tools=[...])` when a human must authorize
-execution, and include the external tool's actual name in its scope.
+execution, and include the external tool's actual name in its scope. Naming the
+tool in an explicit allowlist (`StaticToolPolicy(allow=[...])`) is a deliberate
+authorization and satisfies this check. The built-in `ask_user` tool always
+pauses for the user before anything happens, so it is never reported.
 
 ## external-tool-coverage-unknown
 

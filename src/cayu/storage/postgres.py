@@ -61,6 +61,7 @@ from cayu.sessions.access import (
     runtime_session_query,
 )
 from cayu.sessions.base import (
+    SESSION_MESSAGE_QUEUE_STORAGE_VALUE_MAX_BYTES,
     SessionMessageActionResult,
     SessionMessageDeliveryMode,
     SessionMessageInspection,
@@ -34093,11 +34094,12 @@ class PostgresSessionStore(
     ) -> dict[str, Any]:
         columns = _SESSION_MESSAGE_QUEUE_COLUMNS.split(", ")
         projection = ", ".join(
-            f"CASE WHEN octet_length({name}::text) <= 131072 THEN {name} END AS {name}"
+            f"CASE WHEN octet_length({name}::text) <= {SESSION_MESSAGE_QUEUE_STORAGE_VALUE_MAX_BYTES} "
+            f"THEN {name} END AS {name}"
             for name in columns
         )
         hashes = ", ".join(
-            f"CASE WHEN octet_length({name}::text) > 131072 "
+            f"CASE WHEN octet_length({name}::text) > {SESSION_MESSAGE_QUEUE_STORAGE_VALUE_MAX_BYTES} "
             f"THEN encode(sha256(convert_to({name}::text, 'UTF8')), 'hex') END"
             for name in columns
         )

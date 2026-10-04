@@ -35,7 +35,9 @@ from cayu.sessions.base import TerminalSessionEvidenceErrorCode
 from cayu.workflows.base import WorkflowSpec, copy_workflow_spec
 from cayu.workflows.workflow import WorkflowBase
 
-WORKFLOW_EVAL_MAX_FINAL_OUTPUT_CHARS = 65_536
+# A workflow may produce a long report. Evidence still retains a bounded prefix
+# (EVIDENCE_MAX_FINAL_OUTPUT_CHARS) marked "limit_exceeded" beyond that.
+WORKFLOW_EVAL_MAX_FINAL_OUTPUT_CHARS = 1_048_576
 WORKFLOW_EVAL_MAX_STRUCTURED_OUTPUT_BYTES = 256 << 10
 WORKFLOW_EVAL_MAX_APPLICATION_CONTEXT_BYTES = 64 << 10
 WORKFLOW_EVAL_MAX_INPUT_MESSAGES = 32

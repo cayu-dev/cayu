@@ -1394,21 +1394,25 @@ class _BoundedProductResultCapture:
             self._prefix_finalized = True
 
 
+_PUBLIC_RESULT_TRUNCATION_MARKER = (
+    f"\n\n[result truncated at {MAX_PUBLIC_RESULT_CHARS:,} characters]"
+)
+
+
 def _bounded_public_result_text(value: str) -> str:
-    """Apply the character limit without publishing a partial redaction marker."""
+    """Apply the character limit visibly, without a partial redaction marker."""
 
     if len(value) <= MAX_PUBLIC_RESULT_CHARS:
         return value
+    limit = MAX_PUBLIC_RESULT_CHARS - len(_PUBLIC_RESULT_TRUNCATION_MARKER)
     marker_start = value.rfind(
         REDACTED_SECRET,
         0,
-        MAX_PUBLIC_RESULT_CHARS + len(REDACTED_SECRET),
+        limit + len(REDACTED_SECRET),
     )
-    if marker_start >= 0 and marker_start < MAX_PUBLIC_RESULT_CHARS < marker_start + len(
-        REDACTED_SECRET
-    ):
-        return value[:marker_start]
-    return value[:MAX_PUBLIC_RESULT_CHARS]
+    if marker_start >= 0 and marker_start < limit < marker_start + len(REDACTED_SECRET):
+        return value[:marker_start] + _PUBLIC_RESULT_TRUNCATION_MARKER
+    return value[:limit] + _PUBLIC_RESULT_TRUNCATION_MARKER
 
 
 def _product_operation_authority_fields(operation: ProductOperation) -> dict[str, object]:

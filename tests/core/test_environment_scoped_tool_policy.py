@@ -85,8 +85,13 @@ def test_checker_recognizes_only_maintained_scope_for_real_external_tools(kind):
     if kind == "scoped":
         assert not diagnostics
         assert all(t.policy_environment_names == ("research",) for t in manifest.agents[0].tools)
+    elif kind == "static":
+        # Naming each tool in an allowlist is a deliberate authorization.
+        assert not diagnostics
+        assert all(t.policy_environment_names is None for t in manifest.agents[0].tools)
     else:
-        assert len(diagnostics) == 4
+        # read_file is idempotent (content-addressed snapshots), so three remain.
+        assert len(diagnostics) == 3
         assert {d.code for d in diagnostics} == {
             "EXTERNAL_TOOL_COVERAGE_UNKNOWN" if kind == "custom" else "EXTERNAL_TOOL_UNGUARDED"
         }

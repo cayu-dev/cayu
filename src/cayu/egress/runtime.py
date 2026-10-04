@@ -82,7 +82,12 @@ from cayu.egress.adapter import (
     _await_bounded_cleanup_task,
 )
 from cayu.egress.authority import _copy_egress_authority_identity
-from cayu.egress.broker import _bounded_response_bytes
+from cayu.egress.broker import (
+    DEFAULT_EGRESS_BROWSER_MAX_RESPONSE_BYTES,
+    DEFAULT_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES,
+    EgressResponseBufferBudget,
+    _bounded_response_bytes,
+)
 from cayu.egress.credential_kinds import validate_credential_kind
 from cayu.egress.destinations import normalize_egress_hostname, validate_approved_destinations
 from cayu.egress.transitions import (
@@ -553,6 +558,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         upstream: EgressUpstream | None = None,
         require_test_mode_credentials: bool = True,
         browser_max_response_bytes: int | None = None,
+        response_buffer_budget: EgressResponseBufferBudget | None = None,
         execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
         egress_authority_generation: int = 1,
         egress_authority_source: str | None = None,
@@ -695,6 +701,24 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             if browser_max_response_bytes is None
             else _bounded_response_bytes(browser_max_response_bytes)
         )
+        # Every broker this factory creates (one per session authority) draws on
+        # one budget, so concurrent sandboxes share a single memory bound.
+        if response_buffer_budget is None:
+            response_buffer_budget = EgressResponseBufferBudget()
+        elif not isinstance(response_buffer_budget, EgressResponseBufferBudget):
+            raise TypeError("response_buffer_budget must be an EgressResponseBufferBudget.")
+        largest_response = max(
+            DEFAULT_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES,
+            DEFAULT_EGRESS_BROWSER_MAX_RESPONSE_BYTES
+            if self._browser_max_response_bytes is None
+            else self._browser_max_response_bytes,
+        )
+        if response_buffer_budget.limit_bytes < largest_response:
+            raise ValueError(
+                "response_buffer_budget must hold at least one largest response "
+                f"({largest_response} bytes)."
+            )
+        self._response_buffer_budget = response_buffer_budget
         self._execution_profile_identity = copy_execution_profile_behavior_identity(
             execution_profile_identity
         )
@@ -865,6 +889,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             audit=audit,
             require_test_mode_credentials=self._require_test_mode,
             browser_max_response_bytes=self._browser_max_response_bytes,
+            response_buffer_budget=self._response_buffer_budget,
         )
         revoker = _EgressAuthorityRevoker(grants=grants, broker=broker)
         target_credential_env = {grant.env_name: grant.presented_value for grant in grants}
@@ -1283,6 +1308,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             audit=audit,
             require_test_mode_credentials=self._require_test_mode,
             browser_max_response_bytes=self._browser_max_response_bytes,
+            response_buffer_budget=self._response_buffer_budget,
         )
         authority_revoker = _EgressAuthorityRevoker(
             grants=grants,

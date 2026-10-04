@@ -336,3 +336,54 @@ def test_precancelled_owner_never_enters_callback():
         assert await owner.aclose()
 
     asyncio.run(scenario())
+
+
+def test_receipt_message_across_the_limit_never_leaks_a_secret_prefix():
+    # A message cut before redaction would keep a prefix of a registered secret
+    # that redaction can no longer recognize. Oversized messages are rejected;
+    # at the limit the whole secret is still present and redacted.
+    secret = "credential-CANARY-0123456789abcdef"
+    oversized = "x" * 4060 + secret + " trailing detail"
+    with pytest.raises(ValueError, match="message"):
+        _receipt_with_message(oversized)
+
+    async def scenario():
+        callback = _Echo()
+        registered, record, request, _ = await _setup(callback)
+        at_limit = "x" * (4096 - len(secret)) + secret
+        request = request.model_copy(
+            update={"receipt": request.receipt.model_copy(update={"message": at_limit})}
+        )
+        request = ToolEffectReconciliationRequest.model_validate(request.model_dump())
+        owner = ToolEffectReconciliationOwner()
+        accepted = await owner.reconcile(
+            request=request, record=record, run_epoch=0, registered=registered
+        )
+        projected = project_accepted_reconciliation(
+            accepted, registered=registered, redactor=SecretRedactor([secret])
+        )
+        published = projected.model_dump_json()
+        assert "credential-CANARY" not in published
+        assert projected.receipt.message.endswith("[REDACTED_SECRET]")
+        assert await owner.aclose()
+
+    asyncio.run(scenario())
+
+
+def _receipt_with_message(message):
+    from datetime import UTC, datetime
+
+    from cayu.runtime.tool_effects import ToolEffectReceipt
+
+    return ToolEffectReceipt(
+        receipt_id="receipt",
+        receipt_schema="deployment",
+        receipt_schema_version=1,
+        tool_call_id="call",
+        tool_name="deploy",
+        idempotency_key="key",
+        outcome="completed",
+        message=message,
+        source="reconciler",
+        observed_at=datetime(2026, 9, 8, tzinfo=UTC),
+    )

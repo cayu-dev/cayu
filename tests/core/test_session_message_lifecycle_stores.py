@@ -29,6 +29,8 @@ from cayu.runtime.session_message_lifecycle import (
     SessionMessageTarget,
 )
 from cayu.sessions.base import (
+    SESSION_MESSAGE_CONTENT_MAX_BYTES,
+    SESSION_MESSAGE_QUEUE_STORAGE_VALUE_MAX_BYTES,
     EnqueueSessionMessageRequest,
     RunRequest,
     SessionMessageDeliveryMode,
@@ -429,6 +431,31 @@ def test_ordered_inspection_withdrawal_exact_replay_and_restart(lifecycle_case):
             batch = await store.deliver_queued_session_messages(session.id, include_on_idle=False)
             assert action.queue_id not in {message.queue_id for message in batch.messages}
             assert len(await store.load_transcript(session.id)) == 2
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_message_at_the_content_limit_inspects_and_withdraws(lifecycle_case):
+    async def run():
+        store = await _open_store(lifecycle_case)
+        try:
+            session = await _session(store)
+            # Non-ASCII text at the full encoded limit, with a typed message copy.
+            content = "\u00e9" * (SESSION_MESSAGE_CONTENT_MAX_BYTES // 2)
+            request = EnqueueSessionMessageRequest(
+                session_id=session.id,
+                idempotency_key="large",
+                content=content,
+                message=Message.text("user", content[: SESSION_MESSAGE_CONTENT_MAX_BYTES // 4]),
+                delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
+            )
+            await store.enqueue_session_message(request)
+            page = await store.inspect_session_messages(SessionMessageQuery(session_id=session.id))
+            assert page.records[0].validity == "valid"
+            result = await store.apply_session_message_action(_action(page, page.records[0]))
+            assert result.record.status == "withdrawn"
         finally:
             await _close_store(store)
 
@@ -1590,7 +1617,10 @@ def test_sqlite_oversized_raw_quarantine_and_post_terminal_mutation(tmp_path):
         try:
             session = await _session(store)
             await store.enqueue_session_message(_request(session.id, "large"))
-            original = "secret-canary" * 30000
+            # Larger than the inline projection bound for one queue column.
+            original = "secret-canary" * (
+                SESSION_MESSAGE_QUEUE_STORAGE_VALUE_MAX_BYTES // len("secret-canary") + 1
+            )
             store._connection.execute(
                 "UPDATE cayu_session_message_queue SET content = ?",
                 (original,),

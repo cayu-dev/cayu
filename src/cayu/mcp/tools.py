@@ -39,13 +39,17 @@ from cayu.mcp.base import (
 )
 from cayu.mcp.http import HttpMcpClient, HttpMcpSession
 from cayu.mcp.stdio import StdioMcpClient, StdioMcpSession
+from cayu.tools._redaction import active_secret_redactor
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.vaults import SecretRedactor
 
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _UNSAFE_TOOL_NAME_CHARS_RE = re.compile(r"[^A-Za-z0-9_-]+")
-_MAX_STRUCTURED_CONTENT_TEXT_BYTES = 20_000
-_MAX_SERVER_INSTRUCTIONS_DESCRIPTION_CHARS = 1_000
+# The model-facing JSON rendering of structured MCP content. The complete
+# redacted value stays in ToolResult.structured; result projection policies
+# (for example artifact externalization) handle larger outputs.
+_MAX_STRUCTURED_CONTENT_TEXT_BYTES = 128 * 1024
+_MAX_SERVER_INSTRUCTIONS_DESCRIPTION_CHARS = 4_000
 _MAX_MCP_DISCOVERY_ERROR_BYTES = 4096
 _MCP_SESSION_SOURCE_ATTRIBUTE = "_cayu_internal_mcp_tool_source_v1"
 _MCP_SESSION_SOURCE_BIND_LOCK = Lock()
@@ -857,11 +861,14 @@ class McpToolAdapter(Tool):
         redactor = self.__binding.toolset.secret_redactor
         mcp_content = result.content
         mcp_structured_content = result.structured_content
-        if redactor.has_values:
-            # Redact the complete server values before rendering can truncate a
-            # secret across the model-visible structured-content byte boundary.
-            mcp_content = _redact_mcp_content(result.content, redactor=redactor)
-            mcp_structured_content = redactor.redact_json(result.structured_content)
+        # Redact the complete values before rendering can truncate a secret across
+        # the model-visible structured-content byte boundary: the server's own
+        # injected secrets and the invocation's registered workload secrets,
+        # which the runtime otherwise redacts only after this rendering.
+        for active in (redactor, active_secret_redactor(ctx)):
+            if active.has_values:
+                mcp_content = _redact_mcp_content(mcp_content, redactor=active)
+                mcp_structured_content = active.redact_json(mcp_structured_content)
         content = _mcp_tool_result_text(
             mcp_content,
             structured_content=mcp_structured_content,
@@ -1936,8 +1943,12 @@ def _structured_content_text(structured_content: Any) -> str:
     data = encoded.encode("utf-8")
     if len(data) <= _MAX_STRUCTURED_CONTENT_TEXT_BYTES:
         return f"Structured MCP content:\n{encoded}"
-    truncated = data[:_MAX_STRUCTURED_CONTENT_TEXT_BYTES].decode("utf-8", errors="replace")
-    return f"Structured MCP content:\n{truncated}\n\n[structured content truncated]"
+    truncated = data[:_MAX_STRUCTURED_CONTENT_TEXT_BYTES].decode("utf-8", errors="ignore")
+    return (
+        f"Structured MCP content:\n{truncated}\n\n[structured content truncated: showing "
+        f"{_MAX_STRUCTURED_CONTENT_TEXT_BYTES} of {len(data)} bytes; the complete value is in "
+        "the tool result's structured field]"
+    )
 
 
 def _validate_unique_tool_names(adapters: list[McpToolAdapter]) -> None:

@@ -1230,7 +1230,7 @@ def test_browser_profile_state_contract_is_exact_bounded_and_diagnostic_safe() -
             secure=False,
         )
     with pytest.raises(ValidationError):
-        BrowserProfileStorageEntry(name="name", value="x" * (64 * 1024 + 1))
+        BrowserProfileStorageEntry(name="name", value="x" * (1024 * 1024 + 1))
 
 
 def test_browser_profile_binding_owns_immutable_authority() -> None:

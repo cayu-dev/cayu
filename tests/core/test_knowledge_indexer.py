@@ -499,3 +499,23 @@ def test_knowledge_indexer_validates_bounds_and_store_type() -> None:
 
     with pytest.raises(TypeError, match="KnowledgeStore"):
         KnowledgeIndexer(cast("InMemoryKnowledgeStore", object()))
+
+
+def test_indexed_entry_keeps_long_documents_and_reports_truncation() -> None:
+    from cayu.storage.knowledge_indexer import (
+        DEFAULT_KNOWLEDGE_INDEX_ENTRY_TEXT_MAX_BYTES,
+        KnowledgeIndexer,
+        KnowledgeIndexRequest,
+    )
+
+    long_text = "paragraph " * 5_000  # about 50 KB, over the old 20 KB cut
+    kept = KnowledgeIndexer().build(KnowledgeIndexRequest(text=long_text))
+    assert kept.entry.text == long_text
+    assert kept.entry_text_truncated is False
+
+    cut = KnowledgeIndexer().build(
+        KnowledgeIndexRequest(text=long_text, entry_text_max_bytes=1_000)
+    )
+    assert len(cut.entry.text.encode()) <= 1_000
+    assert cut.entry_text_truncated is True
+    assert DEFAULT_KNOWLEDGE_INDEX_ENTRY_TEXT_MAX_BYTES == 1024 * 1024

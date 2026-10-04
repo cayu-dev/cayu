@@ -20,7 +20,6 @@ from cayu._validation import (
 from cayu.knowledge.base import KnowledgeStore
 from cayu.knowledge.records import (
     DEFAULT_KNOWLEDGE_KIND,
-    DEFAULT_KNOWLEDGE_MAX_BYTES,
     DEFAULT_KNOWLEDGE_NAMESPACE,
     KnowledgeActorType,
     KnowledgeChunk,
@@ -39,6 +38,10 @@ from cayu.knowledge.scopes import (
 DEFAULT_KNOWLEDGE_CHUNK_TARGET_BYTES = 4_000
 DEFAULT_KNOWLEDGE_CHUNK_OVERLAP_BYTES = 400
 DEFAULT_KNOWLEDGE_INDEX_MAX_CHUNKS = 1_000
+# The indexed entry keeps the source document; chunks carry the searchable
+# windows. This is separate from DEFAULT_KNOWLEDGE_MAX_BYTES, the search-result
+# budget, which the entry text used to reuse.
+DEFAULT_KNOWLEDGE_INDEX_ENTRY_TEXT_MAX_BYTES = 1024 * 1024
 MIN_KNOWLEDGE_TEXT_BYTES = 4
 _MARKDOWN_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 
@@ -69,7 +72,7 @@ class KnowledgeIndexRequest(BaseModel):
     title: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     chunk_metadata: dict[str, Any] = Field(default_factory=dict)
-    entry_text_max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES
+    entry_text_max_bytes: int = DEFAULT_KNOWLEDGE_INDEX_ENTRY_TEXT_MAX_BYTES
     chunk_target_bytes: int = DEFAULT_KNOWLEDGE_CHUNK_TARGET_BYTES
     chunk_overlap_bytes: int = DEFAULT_KNOWLEDGE_CHUNK_OVERLAP_BYTES
     max_chunks: int = DEFAULT_KNOWLEDGE_INDEX_MAX_CHUNKS
@@ -203,6 +206,9 @@ class KnowledgeIndexResult(BaseModel):
     text_bytes: int
     chunk_count: int
     truncated: bool = False
+    # The entry's stored text was shortened to entry_text_max_bytes; chunks
+    # still index the complete source up to max_chunks.
+    entry_text_truncated: bool = False
     written: bool = False
     unchanged: bool = False
 
@@ -318,6 +324,7 @@ class KnowledgeIndexer:
             text_bytes=len(request.text.encode("utf-8")),
             chunk_count=len(chunks),
             truncated=truncated,
+            entry_text_truncated=entry_text != request.text,
         )
 
     async def index_text(self, request: KnowledgeIndexRequest) -> KnowledgeIndexResult:
@@ -413,6 +420,7 @@ def copy_knowledge_index_result(result: KnowledgeIndexResult) -> KnowledgeIndexR
         text_bytes=result.text_bytes,
         chunk_count=result.chunk_count,
         truncated=result.truncated,
+        entry_text_truncated=result.entry_text_truncated,
         written=result.written,
         unchanged=result.unchanged,
     )

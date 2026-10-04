@@ -4950,7 +4950,7 @@
         "instructions": {
           "anyOf": [
             {
-              "maxLength": 4096,
+              "maxLength": 32768,
               "minLength": 1,
               "type": "string"
             },
@@ -5514,7 +5514,7 @@
           "$ref": "#/components/schemas/SessionMessageConditions"
         },
         "content": {
-          "maxLength": 65536,
+          "maxLength": 983040,
           "minLength": 1,
           "title": "Content",
           "type": "string"
@@ -8799,35 +8799,35 @@
         },
         "initial_delay_s": {
           "default": 0.5,
-          "maximum": 60.0,
+          "maximum": 600.0,
           "minimum": 0.0,
           "title": "Initial Delay S",
           "type": "number"
         },
         "jitter_s": {
           "default": 0.5,
-          "maximum": 60.0,
+          "maximum": 600.0,
           "minimum": 0.0,
           "title": "Jitter S",
           "type": "number"
         },
         "max_attempts": {
           "default": 5,
-          "maximum": 10.0,
+          "maximum": 50.0,
           "minimum": 1.0,
           "title": "Max Attempts",
           "type": "integer"
         },
         "max_delay_s": {
           "default": 30.0,
-          "maximum": 300.0,
+          "maximum": 3600.0,
           "minimum": 0.0,
           "title": "Max Delay S",
           "type": "number"
         },
         "max_unknown_attempts": {
           "default": 2,
-          "maximum": 10.0,
+          "maximum": 50.0,
           "minimum": 1.0,
           "title": "Max Unknown Attempts",
           "type": "integer"
@@ -10994,7 +10994,7 @@
           "$ref": "#/components/schemas/SseFrameExamples"
         },
         "max_error_text_bytes": {
-          "default": 512,
+          "default": 4096,
           "description": "Maximum UTF-8 bytes in the redacted error field.",
           "minimum": 1.0,
           "title": "Max Error Text Bytes",
@@ -14978,8 +14978,8 @@
             "name": "max_bytes",
             "required": false,
             "schema": {
-              "default": 67108864,
-              "maximum": 67108864,
+              "default": 268435456,
+              "maximum": 268435456,
               "minimum": 1,
               "title": "Max Bytes",
               "type": "integer"

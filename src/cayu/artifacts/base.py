@@ -43,6 +43,14 @@ class ArtifactStoreUnavailableError(RuntimeError):
     """An artifact store cannot currently complete an operation."""
 
 
+class ArtifactIdentityConflictError(ValueError):
+    """An idempotent write named an artifact id that holds other bytes or metadata.
+
+    Also raised when the id holds a corrupt or incomplete artifact that a
+    deterministic retry cannot prove is its own.
+    """
+
+
 class ArtifactMetadata(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
@@ -320,7 +328,9 @@ def _require_matching_artifact(
         exclude={"created_at"},
     )
     if comparable_existing != comparable_expected or existing.content != content:
-        raise ValueError("Artifact identity already exists with different content or metadata.")
+        raise ArtifactIdentityConflictError(
+            "Artifact identity already exists with different content or metadata."
+        )
 
 
 class ArtifactStore(ABC):

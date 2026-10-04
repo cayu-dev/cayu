@@ -261,9 +261,6 @@ from cayu.runtime._model_completion_contracts import (
     MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES as MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES,
 )
 from cayu.runtime._model_completion_contracts import (
-    MAX_MODEL_COMPLETION_RECOVERY_METADATA_ENTRIES as MAX_MODEL_COMPLETION_RECOVERY_METADATA_ENTRIES,
-)
-from cayu.runtime._model_completion_contracts import (
     HostedToolDiscoveryRecoveryAuthority,
     ModelCompletionDispatch,
     ModelCompletionDispatchNotAuthorized,

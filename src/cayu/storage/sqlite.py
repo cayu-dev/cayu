@@ -48,6 +48,7 @@ from cayu.sessions.access import (
     runtime_session_query,
 )
 from cayu.sessions.base import (
+    SESSION_MESSAGE_QUEUE_STORAGE_VALUE_MAX_BYTES,
     SessionMessageActionResult,
     SessionMessageDeliveryMode,
     SessionMessageInspection,
@@ -1608,7 +1609,8 @@ def _session_message_raw_bounded(
         "delivered_at",
     )
     projection = ", ".join(
-        f"CASE WHEN length(CAST({name} AS BLOB)) <= 131072 THEN {name} END AS {name}"
+        f"CASE WHEN length(CAST({name} AS BLOB)) <= {SESSION_MESSAGE_QUEUE_STORAGE_VALUE_MAX_BYTES} "
+        f"THEN {name} END AS {name}"
         for name in columns
     )
     row = connection.execute(
@@ -1625,7 +1627,7 @@ def _session_message_raw_bounded(
         (session_id, queue_id),
     ).fetchone()
     for name, size in zip(columns, sizes, strict=True):
-        if size is None or size <= 131072:
+        if size is None or size <= SESSION_MESSAGE_QUEUE_STORAGE_VALUE_MAX_BYTES:
             continue
         digest = sha256()
         for offset in range(1, size + 1, 65536):

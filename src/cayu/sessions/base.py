@@ -1323,7 +1323,14 @@ class SessionStatus(StrEnum):
     INTERRUPTED = "interrupted"
 
 
-SESSION_MESSAGE_CONTENT_MAX_BYTES = 65_536
+# Compaction guidance can carry a domain glossary or a list of facts to keep.
+COMPACTION_INSTRUCTIONS_MAX_CHARS = 32_768
+# Steering messages match server prompts: a 1 MiB request minus a JSON envelope.
+SESSION_MESSAGE_CONTENT_MAX_BYTES = 1024 * 1024 - 64 * 1024
+# Queue reads project a stored column inline only up to this size; larger
+# values are reported as an out-of-band digest (an unreadable record). Twice the
+# content limit leaves room for the typed message JSON envelope.
+SESSION_MESSAGE_QUEUE_STORAGE_VALUE_MAX_BYTES = 2 * SESSION_MESSAGE_CONTENT_MAX_BYTES
 SESSION_MESSAGE_DELIVERY_BATCH_LIMIT = 100
 MODEL_TARGET_PROJECTION_METADATA_KEY = "cayu:model_target_projection"
 MODEL_TARGET_PROJECTION_RECORD_TYPE = "cayu.model-target-projection"
@@ -2266,7 +2273,7 @@ class CompactSessionRequest(BaseModel):
     expected_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     expected_transcript_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     reason: Literal["application_requested"] = "application_requested"
-    instructions: str | None = Field(default=None, max_length=4096)
+    instructions: str | None = Field(default=None, max_length=COMPACTION_INSTRUCTIONS_MAX_CHARS)
     limits: RunLimits = Field(default_factory=RunLimits)
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     requested_by: ResolutionActor | None = None
@@ -6265,7 +6272,9 @@ MODEL_COMPLETION_STAGE_DISPATCH_OPERATION_KEY_PREFIX = (
     MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX + "dispatched:"
 )
 MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY = MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX + "active"
-MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES = 256 * 1024
+# Must hold everything an admitted RunRequest carries into recovery: up to
+# 256 KiB of request metadata plus budget limits and run settings.
+MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES = 2 * 1024 * 1024
 MODEL_COMPLETION_PROVIDER_START_INTENT_MAX_BYTES = 16 * 1024
 _NON_TURN_MODEL_COMPLETION_CLASSIFICATIONS = frozenset({"failed", "filtered", "invalid", "length"})
 _MESSAGELESS_MODEL_COMPLETION_CLASSIFICATIONS = _NON_TURN_MODEL_COMPLETION_CLASSIFICATIONS | {
@@ -9126,7 +9135,8 @@ TRANSCRIPT_SEARCH_MAX_CURSOR_BYTES = 4_096
 TRANSCRIPT_SEARCH_MIN_MAX_BYTES = 4
 _TRANSCRIPT_SEARCH_CURSOR_VERSION = 1
 _TRANSCRIPT_SEARCH_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
-_TRANSCRIPT_SEARCH_OCCURRENCE_CAP = SESSION_MESSAGE_CONTENT_MAX_BYTES
+# Scoring scale for search occurrence counts; independent of message size limits.
+_TRANSCRIPT_SEARCH_OCCURRENCE_CAP = 65_536
 _TRANSCRIPT_SEARCH_COVERAGE_SCALE = _TRANSCRIPT_SEARCH_OCCURRENCE_CAP + 1
 _TRANSCRIPT_SEARCH_PHRASE_SCALE = (
     TRANSCRIPT_SEARCH_MAX_QUERY_BYTES + 1

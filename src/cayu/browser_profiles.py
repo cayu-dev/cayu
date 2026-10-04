@@ -59,12 +59,14 @@ BROWSER_PROFILE_SCHEMA_VERSION = 1
 BROWSER_PROFILE_STATE_SCHEMA_VERSION = 1
 BROWSER_PROFILE_ENCRYPTION_ALGORITHM = "AES-256-GCM"
 BROWSER_PROFILE_NONCE_BYTES = 12
-BROWSER_PROFILE_MAX_ORIGINS = 32
-BROWSER_PROFILE_MAX_COOKIES = 256
-BROWSER_PROFILE_MAX_STORAGE_ENTRIES = 512
-BROWSER_PROFILE_MAX_NAME_BYTES = 1_024
-BROWSER_PROFILE_MAX_VALUE_BYTES = 64 * 1_024
-BROWSER_PROFILE_MAX_PLAINTEXT_BYTES = 1024 * 1_024
+# Ceilings sized for real signed-in profiles: SSO flows span many origins and a
+# single SaaS site can hold well over a hundred cookies.
+BROWSER_PROFILE_MAX_ORIGINS = 256
+BROWSER_PROFILE_MAX_COOKIES = 4_096
+BROWSER_PROFILE_MAX_STORAGE_ENTRIES = 8_192
+BROWSER_PROFILE_MAX_NAME_BYTES = 4_096
+BROWSER_PROFILE_MAX_VALUE_BYTES = 1024 * 1_024
+BROWSER_PROFILE_MAX_PLAINTEXT_BYTES = 8 * 1024 * 1_024
 BROWSER_PROFILE_MAX_CIPHERTEXT_BYTES = BROWSER_PROFILE_MAX_PLAINTEXT_BYTES + 16
 BROWSER_PROFILE_MAX_IMPORT_EXPORT_SECONDS = 30.0
 BROWSER_PROFILE_MAX_LEASE_SECONDS = 3_600
@@ -256,26 +258,26 @@ class BrowserProfileStatus(StrEnum):
 
 
 class BrowserProfileLimits(_ProfileModel):
-    max_origins: StrictInt = Field(default=8, ge=1, le=BROWSER_PROFILE_MAX_ORIGINS)
-    max_cookies: StrictInt = Field(default=128, ge=1, le=BROWSER_PROFILE_MAX_COOKIES)
+    max_origins: StrictInt = Field(default=32, ge=1, le=BROWSER_PROFILE_MAX_ORIGINS)
+    max_cookies: StrictInt = Field(default=1_024, ge=1, le=BROWSER_PROFILE_MAX_COOKIES)
     max_storage_entries: StrictInt = Field(
-        default=256,
+        default=2_048,
         ge=1,
         le=BROWSER_PROFILE_MAX_STORAGE_ENTRIES,
     )
-    max_name_bytes: StrictInt = Field(default=512, ge=1, le=BROWSER_PROFILE_MAX_NAME_BYTES)
+    max_name_bytes: StrictInt = Field(default=1_024, ge=1, le=BROWSER_PROFILE_MAX_NAME_BYTES)
     max_value_bytes: StrictInt = Field(
-        default=16 * 1_024,
+        default=64 * 1_024,
         ge=1,
         le=BROWSER_PROFILE_MAX_VALUE_BYTES,
     )
     max_plaintext_bytes: StrictInt = Field(
-        default=256 * 1_024,
+        default=2 * 1024 * 1_024,
         ge=1,
         le=BROWSER_PROFILE_MAX_PLAINTEXT_BYTES,
     )
     max_ciphertext_bytes: StrictInt = Field(
-        default=256 * 1_024 + 16,
+        default=2 * 1024 * 1_024 + 16,
         ge=17,
         le=BROWSER_PROFILE_MAX_CIPHERTEXT_BYTES,
     )

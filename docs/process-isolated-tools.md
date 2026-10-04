@@ -156,8 +156,14 @@ It does not inherit stores, runners, workspaces, event loops, provider clients,
 policy or approval objects, open parent sockets, `PATH`, `HOME`, proxy settings,
 cloud/model credentials, or any other parent environment. An application may
 explicitly declare a non-interpreter environment value when its adapter needs
-it. `PYTHON*`, dynamic-loader, and interpreter-affecting environment names are
-always rejected. The current adapter also rejects registered workload-secret
+it. Dynamic-loader names (`LD_*`, `DYLD_*`) and the `PYTHON*` names that load
+code from elsewhere (`PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP`,
+`PYTHONINSPECT`, `PYTHONWARNINGS`, `PYTHONBREAKPOINT`, `PYTHONUSERBASE` and
+similar) are always rejected, as are `LC_ALL`, `PYTHONIOENCODING` and
+`PYTHONUTF8`, which Cayu fixes for the worker. Benign tuning variables such as
+`PYTHONUNBUFFERED`, `PYTHONDONTWRITEBYTECODE` and `PYTHONHASHSEED` are allowed;
+they affect processes the tool starts, since the worker interpreter itself runs
+with `-I`. The current adapter also rejects registered workload-secret
 values in configuration, arguments, projected context, or environment. A tool
 needing credentials must use a separate application-owned broker/acquisition
 design; ambient inheritance is not a compatibility path.

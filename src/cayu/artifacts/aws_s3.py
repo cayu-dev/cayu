@@ -49,6 +49,7 @@ from cayu.artifacts._settlement import (
 )
 from cayu.artifacts.access import runtime_artifact_operation
 from cayu.artifacts.base import (
+    ArtifactIdentityConflictError,
     ArtifactListResult,
     ArtifactMetadata,
     ArtifactReadResult,
@@ -316,7 +317,7 @@ class S3ArtifactStore(ArtifactStore):
             response = client.get_object(Bucket=self.bucket, Key=key)
             observed = _response_body_bytes(response, len(encoded) + 1)
             if observed != encoded:
-                raise ValueError(
+                raise ArtifactIdentityConflictError(
                     "Artifact identity already exists with different content or metadata."
                 ) from None
 

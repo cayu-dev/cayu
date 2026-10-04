@@ -15,6 +15,7 @@ from pydantic import (
     Field,
     PlainSerializer,
     PlainValidator,
+    PrivateAttr,
     field_validator,
     model_validator,
 )
@@ -265,6 +266,10 @@ class ToolManifest(_ManifestModel):
     named_checks: tuple[NamedCheckManifest, ...] = ()
     registration_provenance: RegistrationProvenance
     implementation_provenance: RegistrationProvenance
+    # In-process fact for checks, not part of the published manifest: the
+    # registered policy names this tool in an explicit allowlist. A manifest
+    # loaded from JSON keeps the conservative default.
+    _policy_allows_explicitly: bool = PrivateAttr(default=False)
 
     @field_validator("adapter_identity", mode="before")
     @classmethod
@@ -610,12 +615,23 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
     if type(normalized_payload) is not dict:
         raise TypeError("Application manifest redaction must preserve the JSON object shape.")
     structural_payload = cast("dict[str, object]", normalized_payload)
-    return AppManifest.model_validate(
+    manifest = AppManifest.model_validate(
         {
             **normalized_payload,
             "fingerprint": _app_manifest_fingerprint(structural_payload),
         }
     )
+    # Revalidation drops in-process private facts; carry them over by identity.
+    explicit = {
+        (agent.name, tool.name)
+        for agent in agents
+        for tool in agent.tools
+        if tool._policy_allows_explicitly
+    }
+    for agent in manifest.agents:
+        for tool in agent.tools:
+            tool._policy_allows_explicitly = (agent.name, tool.name) in explicit
+    return manifest
 
 
 def _tool_result_projection_policy_manifest(
@@ -722,7 +738,7 @@ def _describe_tool(
     project_root: Path | None,
 ) -> ToolManifest:
     execution_contract = ToolExecutionContract.model_validate(tool.execution_contract)
-    return ToolManifest(
+    manifest = ToolManifest(
         name=tool_name,
         description=tool.description,
         effect=tool.effect.value,
@@ -765,6 +781,24 @@ def _describe_tool(
         registration_provenance=registration_provenance,
         implementation_provenance=_provenance(tool.tool, project_root),
     )
+    manifest._policy_allows_explicitly = _policy_allows_explicitly(tool_policy, tool_name)
+    return manifest
+
+
+def _policy_allows_explicitly(policy: ToolPolicy, tool_name: str) -> bool:
+    """Whether a maintained policy allows this tool by naming it in an allowlist."""
+
+    if type(policy) is GuardedToolPolicy:
+        return _policy_allows_explicitly(policy.then, tool_name)
+    if type(policy) is StaticToolPolicy:
+        return (
+            policy.allow is not None and tool_name in policy.allow and tool_name not in policy.deny
+        )
+    from cayu.tools.structured_commands import StructuredCommandToolPolicy
+
+    if type(policy) is StructuredCommandToolPolicy and policy._base_policy is not None:
+        return _policy_allows_explicitly(policy._base_policy, tool_name)
+    return False
 
 
 def _factory_defers_materialization(factory: object | None) -> bool:

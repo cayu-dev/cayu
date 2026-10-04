@@ -669,7 +669,8 @@ and null compare by exact JSON kind and value; finite JSON numbers compare by
 their exact decimal value, so `1` and `1.0` match but `true` and `1` do not.
 There is no regex, JSONPath, executable predicate, schema evaluator, or
 unbounded deep equality. Expected and retained values are limited independently
-to 4 KiB, 12 levels, and 128 nodes; each trial retains at most 256 ordered call
+to 16 KiB, 24 levels, and 1,024 nodes (larger values are retained with an
+explicit `truncated` state); each trial retains at most 256 ordered call
 identities. Tool-result subsets may select only `content`, `structured`, and
 `is_error` and must select at least one of them.
 

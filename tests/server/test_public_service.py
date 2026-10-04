@@ -2614,10 +2614,17 @@ def test_result_limit_does_not_publish_or_store_a_partial_secret() -> None:
         json={"request": "safe work"},
     )
 
+    from cayu.server.service import _PUBLIC_RESULT_TRUNCATION_MARKER
+
+    expected = (
+        safe_prefix[: MAX_PUBLIC_RESULT_CHARS - len(_PUBLIC_RESULT_TRUNCATION_MARKER)]
+        + _PUBLIC_RESULT_TRUNCATION_MARKER
+    )
     operation = next(iter(store.by_work_id.values()))
     assert response.status_code == 201
-    assert response.json()["result"] == safe_prefix
-    assert operation.result == safe_prefix
+    assert response.json()["result"] == expected
+    assert operation.result == expected
+    assert len(expected) == MAX_PUBLIC_RESULT_CHARS
     assert secret not in repr(operation)
 
 
@@ -2783,7 +2790,12 @@ def test_product_result_capture_is_bounded_without_losing_terminal_status() -> N
 
     assert response.status_code == 201
     assert response.json()["status"] == "completed"
-    assert response.json()["result"] == oversized_result[:MAX_PUBLIC_RESULT_CHARS]
+    from cayu.server.service import _PUBLIC_RESULT_TRUNCATION_MARKER
+
+    result = response.json()["result"]
+    # The cut is visible, not silent.
+    assert result.endswith(_PUBLIC_RESULT_TRUNCATION_MARKER)
+    assert len(result) == MAX_PUBLIC_RESULT_CHARS
     assert len(provider.requests) == 1
 
 
