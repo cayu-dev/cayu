@@ -8,12 +8,14 @@ caller is not made authoritative merely because its fields happen to match.
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, dataclass
-from typing import TYPE_CHECKING, Never, SupportsIndex
+from typing import TYPE_CHECKING, Literal, Never, SupportsIndex
 
+from cayu.runtime.work_attempt_source import WorkAttemptSourceRequest
 from cayu.tasks.admission import (
     WorkAttemptAdmission,
     WorkAttemptAdmissionState,
     WorkAttemptExecutionClaimRequest,
+    WorkAttemptExecutionRequest,
     require_work_attempt_admission_result,
 )
 
@@ -125,3 +127,18 @@ def _authenticated_work_attempt_invocation(
     admission: WorkAttemptAdmission,
 ) -> WorkAttemptInvocationAuthority:
     return WorkAttemptInvocationAuthority(admission, _token=_WORK_ATTEMPT_INVOCATION_TOKEN)
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkAttemptRuntimeAuthority:
+    """Private runtime provenance accompanying a public stable admission request."""
+
+    request: WorkAttemptExecutionRequest
+    execution_owner_id: str
+    kind: Literal["initial", "continuation"]
+    source_request_sha256: str
+    source_request: WorkAttemptSourceRequest | None
+
+
+class _WorkAttemptRecoveryAlreadyActive(RuntimeError):
+    """Internal control signal for an exact concurrently activated recovery."""

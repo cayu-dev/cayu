@@ -1117,3 +1117,11 @@ def redact_resolution_actor(
         },
         deep=True,
     )
+
+
+def _validate_run_request(request: RunRequest) -> RunRequest:
+    return copy_run_request(request)
+
+
+def _validate_resume_request(request: ResumeRequest) -> ResumeRequest:
+    return copy_resume_request(request)

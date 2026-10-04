@@ -33,6 +33,10 @@ from cayu.runtime._durable_tool_round import (
 from cayu.runtime._durable_tool_round import _limit_value_for_payload as _limit_value_for_payload
 from cayu.runtime._model_policy import PolicySelection
 from cayu.runtime._policy_wire import decode as decode_policy_evidence
+from cayu.runtime._work_attempt_invocation import (
+    _WorkAttemptRecoveryAlreadyActive,
+    _WorkAttemptRuntimeAuthority,
+)
 
 if TYPE_CHECKING:
     from cayu.runtime._producer_completion_replay import _ProducerCompletionReplay
@@ -753,7 +757,6 @@ from cayu.sessions.base import (
     copy_interaction_transition_spec,
     copy_model_completion_manual_recovery_request,
     copy_profiled_session_fork_result,
-    copy_resume_request,
     copy_run_request,
     copy_session_runtime_identity,
     execution_profile_adoption_request_fingerprint,
@@ -3273,14 +3276,6 @@ def _fail_session_operation_checkpoint(
     return fail
 
 
-def _validate_run_request(request: RunRequest) -> RunRequest:
-    return copy_run_request(request)
-
-
-def _validate_resume_request(request: ResumeRequest) -> ResumeRequest:
-    return copy_resume_request(request)
-
-
 def _require_native_structured_output_support(
     structured_output: StructuredOutputSpec | None,
     *,
@@ -3378,21 +3373,6 @@ async def _require_tool_discovery_view(
     )
     if require_empty and (state.revision != 0 or state.grants):
         raise RuntimeError("New session branch did not start with an empty discovery view.")
-
-
-@dataclass(frozen=True, slots=True)
-class _WorkAttemptRuntimeAuthority:
-    """Private runtime provenance accompanying a public stable admission request."""
-
-    request: WorkAttemptExecutionRequest
-    execution_owner_id: str
-    kind: Literal["initial", "continuation"]
-    source_request_sha256: str
-    source_request: WorkAttemptSourceRequest | None
-
-
-class _WorkAttemptRecoveryAlreadyActive(RuntimeError):
-    """Internal control signal for an exact concurrently activated recovery."""
 
 
 def _session_identity(

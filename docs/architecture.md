@@ -204,6 +204,7 @@ CayuApp
   -> DurableSubagentCoordinator
   -> RecoveryCoordinator
   -> SessionEngine
+  -> WorkAttemptCoordinator
 ```
 
 `SessionEngine` owns run, resume, fork, explicit compaction, queued-message
@@ -212,6 +213,18 @@ turn completion, and terminal hooks. `RecoveryCoordinator` owns durable paused
 continuations, manual outcome reconciliation, incomplete-session repair, and
 abandoned-run finalization. Model, tool, environment, limit, control, and event
 modules own their complete lower-level behavior slices.
+
+`WorkAttemptCoordinator` owns application work-attempt admission, execution
+claim checks and renewal, recovery, and proposal publication. It owns one
+process-local execution identity and refreshes it after a process fork. TaskStore
+retains durable claim and receipt authority; the existing engine retains session
+preparation, execution and settlement behind the coordinator's typed interface.
+`CayuApp` supplies current-store access, run defaults, public-session resolution
+and the checkpoint guard, and keeps admission/tracking and request detachment at
+its public entrances. The verified worker can still acquire an acknowledged
+recovery claim, maintain its heartbeat, and resume recovery separately. The
+coordinator can be composed without importing the application or concrete engine;
+its collaborators provide the same execution and checkpoint contracts.
 
 `ProviderOperationCancellationOwner` owns durable provider cancellation claims,
 lease renewal, cancellation evidence, accounting handoff and exact claim release.

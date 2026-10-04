@@ -17,20 +17,27 @@ from cayu.workspaces.observation_recovery import (
 
 
 class _RunFenceOwnedEventStream:
-    """Advance and close one delegated stream under its captured run fences."""
+    """Advance and close a delegated stream, optionally capturing its run fences."""
 
-    def __init__(self, stream: AsyncGenerator[Event, None]) -> None:
+    def __init__(
+        self, stream: AsyncGenerator[Event, None], *, capture_run_fences: bool = True
+    ) -> None:
         self._stream = stream
-        self._run_fences = _SessionRunFenceContext.current_or_new()
+        self._run_fences = _SessionRunFenceContext.current_or_new() if capture_run_fences else None
 
     def __aiter__(self) -> _RunFenceOwnedEventStream:
         return self
 
     async def __anext__(self) -> Event:
+        if self._run_fences is None:
+            return await anext(self._stream)
         with self._run_fences.activate():
             return await anext(self._stream)
 
     async def aclose(self) -> None:
+        if self._run_fences is None:
+            await self._stream.aclose()
+            return
         with self._run_fences.activate():
             await self._stream.aclose()
 
@@ -95,10 +102,16 @@ async def _close_owned_event_stream_resisting_cancellation(
 @asynccontextmanager
 async def _close_delegated_event_stream(
     stream: AsyncGenerator[Event, None],
+    *,
+    capture_run_fences: bool = True,
 ) -> AsyncIterator[_RunFenceOwnedEventStream]:
-    """Close a delegated stream synchronously without hiding its exit signal."""
+    """Close a delegated stream synchronously without hiding its exit signal.
 
-    owned_stream = _RunFenceOwnedEventStream(stream)
+    A stream that establishes its own fences can use ``capture_run_fences=False``
+    to advance in the caller's context. Cleanup and failure handling still apply.
+    """
+
+    owned_stream = _RunFenceOwnedEventStream(stream, capture_run_fences=capture_run_fences)
     authoritative_failure: BaseException | None = None
     try:
         yield owned_stream
