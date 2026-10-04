@@ -1385,6 +1385,67 @@ def test_browser_verifier_supplies_pricing_guidance_without_environment(monkeypa
     assert verifier._env_name == "model-verifier-docker"
 
 
+def test_verifier_prefers_official_documents_without_losing_committed_sources() -> None:
+    model = next(model for model in default_model_catalog().models if model.model == "gpt-6-luna")
+    price = next(price for price in default_price_book().prices if price.model == model.model)
+    prompt = browser_verifier_module._prompt(model, price, effective_on=date(2026, 10, 1))
+
+    assert "browser pricing source: https://developers.openai.com/api/docs/pricing.md" in prompt
+    assert (
+        "browser model source: https://developers.openai.com/api/docs/models/gpt-6-luna.md"
+        in prompt
+    )
+    assert f"committed model source: {model.provenance.url}" in prompt
+    for provider in ("openai", "anthropic"):
+        source = RECOMMENDATION_PAGES[provider]
+        recommendation = browser_verifier_module._recommendation_prompt(provider, ())
+        assert f"page: {source}.md\n" in recommendation
+        assert f"committed HTML source is {source}" in recommendation
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://developers.openai.com/api/docs/pricing.md",
+        "https://developers.openai.com/api/docs/pricing?mode=batch",
+        "https://developers.openai.com/api/docs/llms.txt",
+        "https://developers.openai.com/api/unrelated",
+        "https://developers.openai.com.example.test/api/docs/pricing",
+        "https://ai.google.dev/gemini-api/docs/pricing",
+    ],
+)
+def test_verifier_does_not_invent_document_endpoints(url) -> None:
+    assert browser_verifier_module._browser_source_url(url) == url
+
+
+def test_verifier_missing_output_reports_browser_failures_without_navigation_arguments() -> None:
+    events = [
+        Event(
+            type=EventType.TOOL_CALL_COMPLETED,
+            session_id="verification",
+            tool_name="browser_session",
+            payload={
+                "arguments": {"url": "https://example.test/private-navigation-detail"},
+                "result": {"is_error": True, "structured": {"error": error}},
+            },
+        )
+        for error in ("navigation_timeout", *("resource_exhausted",) * 5)
+    ]
+    events.append(
+        Event(
+            type=EventType.SESSION_LIMIT_REACHED,
+            session_id="verification",
+            payload={"limit": "execution_deadline"},
+        )
+    )
+    note = browser_verifier_module._missing_output_note(events)
+    assert "completed_page_reads=0" in note
+    assert "browser_session: navigation_timeout, resource_exhausted" in note
+    assert note.count("resource_exhausted") == 1
+    assert "execution_deadline" in note
+    assert "private-navigation-detail" not in note
+
+
 def test_browser_verifier_records_only_page_reading_urls() -> None:
     events = [
         Event(
@@ -2102,7 +2163,7 @@ def test_browser_verifier_subscription_mode_uses_luna_max() -> None:
     assert verifier.app.list_providers() == ("openai",)
     for agent_name in ("model-verifier", "model-verifier-recommendations"):
         spec = verifier.app.get_agent(agent_name).spec
-        assert spec.model == "gpt-5.6-luna"
+        assert spec.model == "gpt-6-luna"
         assert spec.provider_options == {"openai": {"reasoning": {"effort": "xhigh"}}}
 
 
@@ -2222,7 +2283,7 @@ def test_browser_verifier_rejects_unpriced_configured_model() -> None:
 
 def test_verifier_model_must_be_canonical_active_and_tool_capable() -> None:
     catalog = default_model_catalog()
-    luna = catalog.match(provider_name="openai", model="gpt-5.6-luna")
+    luna = catalog.match(provider_name="openai", model="gpt-6-luna")
     assert luna is not None
     without_luna = catalog.model_copy(
         update={"models": tuple(item for item in catalog.models if item != luna)}
@@ -2285,7 +2346,7 @@ def test_browser_verifier_stops_after_unknown_resolved_model() -> None:
         app = RecordingCayuApp(session_store=store)
         app.register_provider(provider, default=True)
         app.register_agent(
-            AgentSpec(name="model-verifier", model="gpt-5.6-luna"),
+            AgentSpec(name="model-verifier", model="gpt-6-luna"),
             tools=[catalog_tools.SearchWebTool()],
         )
         verifier = BrowserVerifier(as_of="2026-07-13", app=app)
@@ -2421,7 +2482,7 @@ def test_refresh_removes_newly_deprecated_models_before_policy_validation(
 
 def test_refresh_preserves_active_verifier_when_marked_deprecated(tmp_path, monkeypatch) -> None:
     original = default_model_catalog()
-    verifier_model = original.match(provider_name="openai", model="gpt-5.6-luna")
+    verifier_model = original.match(provider_name="openai", model="gpt-6-luna")
     assert verifier_model is not None
     identity = f"{verifier_model.provider_name}/{verifier_model.model}"
 
@@ -2885,6 +2946,8 @@ def test_native_browser_rejects_failed_or_blocked_observations(load, access, err
     ("requested", "destination", "state", "load", "access", "error", "accepted"),
     [
         ("fixed", "official", "finalized", "loaded", "available", False, True),
+        ("markdown", "official", "finalized", "loaded", "available", False, True),
+        ("markdown", "official", "finalized", "failed", "available", False, False),
         ("unrelated", "official", "finalized", "loaded", "available", False, False),
         ("fixed", "unofficial", "finalized", "loaded", "available", False, False),
         ("fixed", "official", "quarantined", "loaded", "available", False, False),
@@ -2916,6 +2979,8 @@ def test_recommendation_redirect_requires_successful_fixed_page_navigation(
                 "operation": "navigate",
                 "url": RECOMMENDATION_PAGES["anthropic"]
                 if requested == "fixed"
+                else RECOMMENDATION_PAGES["anthropic"] + ".md"
+                if requested == "markdown"
                 else "https://platform.claude.com/docs/en/unrelated",
             },
             "result": {

@@ -34,8 +34,10 @@ VERIFIED_SCHEMA: dict[str, Any] = {
         "context_window": {
             "type": ["integer", "null"],
             "minimum": 1,
-            "description": "Advertised max INPUT context as a single round number "
-            "(e.g. 200000, 1000000). Do NOT add max-output tokens or sum two values. "
+            "description": "The provider's explicitly advertised context window "
+            "(e.g. 200000, 1000000). If the page also lists maximum input tokens, use the "
+            "context window. Do NOT add or subtract max-output tokens or derive a window "
+            "from separate limits. "
             "Null if the page does not clearly state it.",
         },
         "input_per_million": dict(_PRICE, description="Standard input price, USD per 1M tokens."),

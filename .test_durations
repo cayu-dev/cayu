@@ -42555,5 +42555,21 @@
     "tests/core/test_background_owner_shutdown.py::test_cancelling_the_public_session_drain_keeps_a_final_accounting_failure": 0.056092250044457614,
     "tests/core/test_background_owner_shutdown.py::test_a_collected_settlement_failure_is_reported_only_if_its_caller_never_got_it[cancelled]": 0.013836959027685225,
     "tests/core/test_background_owner_shutdown.py::test_a_collected_settlement_failure_is_reported_only_if_its_caller_never_got_it[returned]": 0.010052249766886234,
-    "tests/core/test_background_owner_shutdown.py::test_a_collected_and_the_running_settlement_failure_are_each_reported_once": 0.01068316784221679
+    "tests/core/test_background_owner_shutdown.py::test_a_collected_and_the_running_settlement_failure_are_each_reported_once": 0.01068316784221679,
+    "tests/core/test_model_catalog_maintenance.py::test_automated_hosted_web_search_removal_requires_review": 0.001532749996840721,
+    "tests/core/test_model_catalog_maintenance.py::test_hosted_web_search_is_ignored_and_rejected_outside_adapter_providers": 0.0014687079965369776,
+    "tests/core/test_model_catalog_maintenance.py::test_pricing_only_verification_cannot_change_hosted_web_search": 0.0015087079991644714,
+    "tests/core/test_model_catalog_maintenance.py::test_recommendation_redirect_requires_successful_fixed_page_navigation[markdown-official-finalized-failed-available-False-False]": 0.00039649999598623253,
+    "tests/core/test_model_catalog_maintenance.py::test_recommendation_redirect_requires_successful_fixed_page_navigation[markdown-official-finalized-loaded-available-False-True]": 0.000417251001636032,
+    "tests/core/test_model_catalog_maintenance.py::test_verified_model_facts_establish_hosted_web_search": 0.002631792001920985,
+    "tests/core/test_model_catalog_maintenance.py::test_verifier_does_not_invent_document_endpoints[https://ai.google.dev/gemini-api/docs/pricing]": 0.0001510010042693466,
+    "tests/core/test_model_catalog_maintenance.py::test_verifier_does_not_invent_document_endpoints[https://developers.openai.com.example.test/api/docs/pricing]": 0.0001505010004620999,
+    "tests/core/test_model_catalog_maintenance.py::test_verifier_does_not_invent_document_endpoints[https://developers.openai.com/api/docs/llms.txt]": 0.00015333400006056763,
+    "tests/core/test_model_catalog_maintenance.py::test_verifier_does_not_invent_document_endpoints[https://developers.openai.com/api/docs/pricing.md]": 0.0001965849987755064,
+    "tests/core/test_model_catalog_maintenance.py::test_verifier_does_not_invent_document_endpoints[https://developers.openai.com/api/docs/pricing?mode=batch]": 0.00016366599811590277,
+    "tests/core/test_model_catalog_maintenance.py::test_verifier_does_not_invent_document_endpoints[https://developers.openai.com/api/unrelated]": 0.00015887600238784216,
+    "tests/core/test_model_catalog_maintenance.py::test_verifier_missing_output_reports_browser_failures_without_navigation_arguments": 0.0008155829964380246,
+    "tests/core/test_model_catalog_maintenance.py::test_verifier_prefers_official_documents_without_losing_committed_sources": 0.0013971669977763668,
+    "tests/core/test_model_catalog_maintenance.py::test_verifier_schema_reports_hosted_web_search_as_nullable_model_fact": 0.00012612500358955003,
+    "tests/core/test_session_execution_presence.py::test_cancellation_during_presence_release_remains_a_single_cancellation": 0.33517879099963466
 }

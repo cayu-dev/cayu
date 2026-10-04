@@ -570,6 +570,7 @@ def test_cayu_storage_migrate_upgrades_postgres_to_the_product_revision(
 
     async def create_revision_111() -> None:
         store = PostgresSessionStore(fresh_postgres_dsn, schema_mode=schema.SchemaMode.MIGRATE)
+        store._min_required_revision = 111
         try:
             await store.ensure_schema()
         finally:

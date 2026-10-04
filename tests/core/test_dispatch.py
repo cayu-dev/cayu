@@ -7468,6 +7468,7 @@ def test_concurrent_workers_claim_distinct_dispatch_tasks(postgres_dsn: str) -> 
     # per-process-unique task type isolates this run from any leftover rows.
     from cayu.storage.migrations import SchemaMode
     from cayu.storage.postgres import PostgresTaskStore
+    from cayu.tasks._execution_settlement import TaskExecutionSettlementPending
 
     task_type = f"cayu.dispatch.test.{os.getpid()}"
 
@@ -7492,10 +7493,21 @@ def test_concurrent_workers_claim_distinct_dispatch_tasks(postgres_dsn: str) -> 
                     pass
                 await h.app.dispatch(_dispatch_request(session_id, f"d_{session_id}"))
 
-            results = await asyncio.gather(
-                h.dispatcher.process_next(h.app, worker_id="worker_a"),
-                h.dispatcher.process_next(h.app, worker_id="worker_b"),
-            )
+            async def process(worker_id: str):
+                try:
+                    return await h.dispatcher.process_next(h.app, worker_id=worker_id)
+                except TaskExecutionSettlementPending as pending:
+                    settlement = pending.settlement
+                # Loaded PostgreSQL runners can outlast the bounded observation
+                # window. Join the exact acknowledgement without redispatching.
+                async with asyncio.timeout(20):
+                    while True:
+                        try:
+                            return await settlement.retry()
+                        except TaskExecutionSettlementPending as pending:
+                            assert pending.settlement is settlement
+
+            results = await asyncio.gather(process("worker_a"), process("worker_b"))
             claimed = [r for r in results if r is not None]
             assert len(claimed) == 2
             assert {r.session_id for r in claimed} == {"sess_pg_a", "sess_pg_b"}

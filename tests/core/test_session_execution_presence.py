@@ -799,7 +799,8 @@ def test_transient_heartbeat_failure_keeps_live_owner(
                 )
             )
             try:
-                await asyncio.wait_for(provider.entered.wait(), 5)
+                # Admission includes PostgreSQL setup before the heartbeat test starts.
+                await asyncio.wait_for(provider.entered.wait(), 20)
                 before = await store.inspect_session_execution("transient-heartbeat")
                 inject = True
                 await asyncio.wait_for(failed.wait(), 5)
@@ -1059,7 +1060,7 @@ def test_recovery_reports_live_owner_expiry_in_single_and_batch_results(
                 )
             )
             try:
-                await asyncio.wait_for(provider.entered.wait(), 5)
+                await asyncio.wait_for(provider.entered.wait(), 20)
                 observer = _app(reopen(), _BlockedProvider())
                 result = await observer.recover_incomplete_session(
                     IncompleteSessionRecoveryRequest(
@@ -1208,3 +1209,54 @@ def test_custom_events_do_not_break_execution_progress() -> None:
         assert progress["session-1"] == (1, "model_stream")
 
     copy_context().run(note_events)
+
+
+def test_cancellation_during_presence_release_remains_a_single_cancellation() -> None:
+    class HeldReleaseStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
+        def __init__(self):
+            super().__init__()
+            self.release_started = asyncio.Event()
+            self.allow_release = asyncio.Event()
+            self.release_finished = asyncio.Event()
+
+        async def _release_session_execution(self, expected):
+            self.release_started.set()
+            await self.allow_release.wait()
+            await super()._release_session_execution(expected)
+            self.release_finished.set()
+
+    async def scenario():
+        store = HeldReleaseStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(
+            VersionedFakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        async def collect():
+            return [
+                event
+                async for event in app.run(
+                    RunRequest(agent_name="assistant", messages=[Message.text("user", "run")])
+                )
+            ]
+
+        task = asyncio.create_task(collect())
+        try:
+            await asyncio.wait_for(store.release_started.wait(), timeout=5)
+            task.cancel("caller stopped")
+            store.allow_release.set()
+            with pytest.raises(asyncio.CancelledError, match="caller stopped"):
+                await asyncio.wait_for(task, timeout=5)
+            assert store.release_finished.is_set()
+            assert task.cancelled()
+        finally:
+            store.allow_release.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())

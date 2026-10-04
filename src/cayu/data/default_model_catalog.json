@@ -1,6 +1,6 @@
 {
-  "catalog_version": "2026-09-24",
-  "generated_at": "2026-09-24",
+  "catalog_version": "2026-10-01",
+  "generated_at": "2026-10-01",
   "models": [
     {
       "aliases": [],
@@ -187,9 +187,9 @@
       "model": "claude-opus-5-5",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-09-24",
+        "as_of": "2026-10-01",
         "source": "official",
-        "url": "https://platform.claude.com/docs/en/models/opus-5-5/overview.md"
+        "url": "https://platform.claude.com/docs/en/models/opus-5-5/overview"
       },
       "provider_name": "anthropic",
       "reasoning": true,
@@ -262,6 +262,37 @@
       "provider_name": "anthropic",
       "reasoning": true,
       "release_date": "2026-06-30",
+      "retirement_date": null,
+      "structured_output": true,
+      "tool_calling": true
+    },
+    {
+      "aliases": [],
+      "context_window": 1000000,
+      "deprecated": false,
+      "family": "claude-sonnet",
+      "hosted_web_search": false,
+      "knowledge_cutoff": null,
+      "match": "exact",
+      "match_prefixes": [],
+      "max_output_tokens": 128000,
+      "modalities_in": [
+        "text",
+        "image"
+      ],
+      "modalities_out": [
+        "text"
+      ],
+      "model": "claude-sonnet-5-5",
+      "prompt_caching": true,
+      "provenance": {
+        "as_of": "2026-10-01",
+        "source": "official",
+        "url": "https://platform.claude.com/docs/en/models/sonnet-5-5/overview"
+      },
+      "provider_name": "anthropic",
+      "reasoning": true,
+      "release_date": "2026-09-28",
       "retirement_date": null,
       "structured_output": true,
       "tool_calling": true
@@ -803,7 +834,7 @@
       "context_window": 1050000,
       "deprecated": false,
       "family": "gpt-6",
-      "hosted_web_search": false,
+      "hosted_web_search": true,
       "knowledge_cutoff": "2026-04-30",
       "match": "exact",
       "match_prefixes": [],
@@ -818,7 +849,7 @@
       "model": "gpt-6-astra",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-09-24",
+        "as_of": "2026-10-01",
         "source": "official",
         "url": "https://developers.openai.com/api/docs/models/gpt-6-astra"
       },
@@ -834,7 +865,7 @@
       "context_window": 1050000,
       "deprecated": false,
       "family": "gpt-6",
-      "hosted_web_search": false,
+      "hosted_web_search": true,
       "knowledge_cutoff": "2026-05-18",
       "match": "exact",
       "match_prefixes": [],
@@ -849,7 +880,7 @@
       "model": "gpt-6-luna",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-09-24",
+        "as_of": "2026-10-01",
         "source": "official",
         "url": "https://developers.openai.com/api/docs/models/gpt-6-luna"
       },
@@ -865,7 +896,7 @@
       "context_window": 1050000,
       "deprecated": false,
       "family": "gpt-6",
-      "hosted_web_search": false,
+      "hosted_web_search": true,
       "knowledge_cutoff": "2026-04-20",
       "match": "exact",
       "match_prefixes": [],
@@ -880,13 +911,44 @@
       "model": "gpt-6-sol",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-09-24",
+        "as_of": "2026-10-01",
         "source": "official",
         "url": "https://developers.openai.com/api/docs/models/gpt-6-sol"
       },
       "provider_name": "openai",
       "reasoning": true,
       "release_date": "2026-09-22",
+      "retirement_date": null,
+      "structured_output": true,
+      "tool_calling": true
+    },
+    {
+      "aliases": [],
+      "context_window": 1050000,
+      "deprecated": false,
+      "family": "gpt-6",
+      "hosted_web_search": true,
+      "knowledge_cutoff": "2026-04-30",
+      "match": "exact",
+      "match_prefixes": [],
+      "max_output_tokens": 128000,
+      "modalities_in": [
+        "text",
+        "image"
+      ],
+      "modalities_out": [
+        "text"
+      ],
+      "model": "gpt-6.1-sol",
+      "prompt_caching": true,
+      "provenance": {
+        "as_of": "2026-10-01",
+        "source": "official",
+        "url": "https://developers.openai.com/api/docs/models/gpt-6.1-sol"
+      },
+      "provider_name": "openai",
+      "reasoning": true,
+      "release_date": "2026-09-29",
       "retirement_date": null,
       "structured_output": true,
       "tool_calling": true
@@ -1059,6 +1121,38 @@
       "provider_name": "vertex",
       "reasoning": true,
       "release_date": "2026-06-30",
+      "retirement_date": null,
+      "structured_output": true,
+      "tool_calling": true
+    },
+    {
+      "aliases": [],
+      "context_window": 1000000,
+      "deprecated": false,
+      "family": "claude-sonnet",
+      "hosted_web_search": false,
+      "knowledge_cutoff": null,
+      "match": "exact",
+      "match_prefixes": [],
+      "max_output_tokens": 128000,
+      "modalities_in": [
+        "text",
+        "image",
+        "pdf"
+      ],
+      "modalities_out": [
+        "text"
+      ],
+      "model": "claude-sonnet-5-5",
+      "prompt_caching": true,
+      "provenance": {
+        "as_of": "2026-10-01",
+        "source": "official",
+        "url": "https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/sonnet-5-5"
+      },
+      "provider_name": "vertex",
+      "reasoning": true,
+      "release_date": "2026-09-28",
       "retirement_date": null,
       "structured_output": true,
       "tool_calling": true

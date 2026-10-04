@@ -726,7 +726,7 @@ def main(argv: list[str] | None = None) -> None:
         "--openai-subscription",
         action="store_true",
         help=(
-            "use the locally authenticated ChatGPT subscription with gpt-5.6-luna at "
+            "use the locally authenticated ChatGPT subscription with gpt-6-luna at "
             "maximum xhigh reasoning"
         ),
     )

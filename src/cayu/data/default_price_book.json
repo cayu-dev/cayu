@@ -1,7 +1,7 @@
 {
   "contextual_pricing_requirements": [],
-  "generated_at": "2026-09-24",
-  "price_book_version": "2026-09-24",
+  "generated_at": "2026-10-01",
+  "price_book_version": "2026-10-01",
   "prices": [
     {
       "aliases": [],
@@ -236,9 +236,9 @@
             ]
           },
           "provenance": {
-            "as_of": "2026-09-24",
+            "as_of": "2026-10-01",
             "source": "official",
-            "url": "https://platform.claude.com/docs/en/models/opus-5-5/overview.md"
+            "url": "https://platform.claude.com/docs/en/models/opus-5-5/overview"
           }
         }
       ]
@@ -321,6 +321,45 @@
             "as_of": "2026-09-24",
             "source": "official",
             "url": "https://platform.claude.com/docs/en/about-claude/pricing"
+          }
+        }
+      ]
+    },
+    {
+      "aliases": [],
+      "cache_write_ttls": [],
+      "match": "exact",
+      "match_prefixes": [],
+      "model": "claude-sonnet-5-5",
+      "pricing_context": null,
+      "provider_name": "anthropic",
+      "schedules": [
+        {
+          "effective_from": "2026-09-28",
+          "effective_through": null,
+          "pricing": {
+            "batch": {
+              "cache_read_input_per_million": null,
+              "input_per_million": "1",
+              "max_input_tokens": null,
+              "output_per_million": "5"
+            },
+            "cache_write_1h_per_million": "4",
+            "cache_write_5m_per_million": "2.5",
+            "currency": "USD",
+            "standard": [
+              {
+                "cache_read_input_per_million": "0.20",
+                "input_per_million": "2",
+                "max_input_tokens": null,
+                "output_per_million": "10"
+              }
+            ]
+          },
+          "provenance": {
+            "as_of": "2026-10-01",
+            "source": "official",
+            "url": "https://platform.claude.com/docs/en/models/sonnet-5-5/overview"
           }
         }
       ]
@@ -1374,9 +1413,9 @@
             "web_search_per_thousand": "10"
           },
           "provenance": {
-            "as_of": "2026-09-24",
+            "as_of": "2026-10-01",
             "source": "official",
-            "url": "https://developers.openai.com/api/docs/models/gpt-6-luna"
+            "url": "https://developers.openai.com/api/docs/pricing"
           }
         }
       ]
@@ -1420,6 +1459,49 @@
             "as_of": "2026-09-24",
             "source": "official",
             "url": "https://developers.openai.com/api/docs/models/gpt-6-sol"
+          }
+        }
+      ]
+    },
+    {
+      "aliases": [],
+      "cache_write_ttls": [],
+      "match": "exact",
+      "match_prefixes": [],
+      "model": "gpt-6.1-sol",
+      "pricing_context": null,
+      "provider_name": "openai",
+      "schedules": [
+        {
+          "effective_from": "2026-09-29",
+          "effective_through": null,
+          "pricing": {
+            "batch": null,
+            "cache_write_1h_per_million": null,
+            "cache_write_5m_per_million": null,
+            "currency": "USD",
+            "standard": [
+              {
+                "cache_read_input_per_million": "0.1",
+                "input_per_million": "2",
+                "max_input_tokens": 272000,
+                "output_per_million": "10",
+                "cache_write_input_per_million": "2.5"
+              },
+              {
+                "cache_read_input_per_million": "0.2",
+                "input_per_million": "4",
+                "max_input_tokens": null,
+                "output_per_million": "15",
+                "cache_write_input_per_million": "5"
+              }
+            ],
+            "web_search_per_thousand": "10"
+          },
+          "provenance": {
+            "as_of": "2026-10-01",
+            "source": "official",
+            "url": "https://developers.openai.com/api/docs/pricing"
           }
         }
       ]
@@ -1625,6 +1707,45 @@
           },
           "provenance": {
             "as_of": "2026-09-09",
+            "source": "official",
+            "url": "https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing"
+          }
+        }
+      ]
+    },
+    {
+      "aliases": [],
+      "cache_write_ttls": [],
+      "match": "exact",
+      "match_prefixes": [],
+      "model": "claude-sonnet-5-5",
+      "pricing_context": null,
+      "provider_name": "vertex",
+      "schedules": [
+        {
+          "effective_from": "2026-09-28",
+          "effective_through": null,
+          "pricing": {
+            "batch": {
+              "cache_read_input_per_million": "0.10",
+              "input_per_million": "1",
+              "max_input_tokens": 200000,
+              "output_per_million": "5"
+            },
+            "cache_write_1h_per_million": "4",
+            "cache_write_5m_per_million": "2.5",
+            "currency": "USD",
+            "standard": [
+              {
+                "cache_read_input_per_million": "0.20",
+                "input_per_million": "2",
+                "max_input_tokens": null,
+                "output_per_million": "10"
+              }
+            ]
+          },
+          "provenance": {
+            "as_of": "2026-10-01",
             "source": "official",
             "url": "https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing"
           }

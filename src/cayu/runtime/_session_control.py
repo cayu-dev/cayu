@@ -127,7 +127,7 @@ class SessionControl(Generic[UsageTrackerT]):
         )
         self._active_runs: dict[str, dict[asyncio.Task[Any], ActiveSessionRun[UsageTrackerT]]] = {}
         self._active_control_tasks: dict[str, set[asyncio.Task[Any]]] = {}
-        self._sessions_emitting_interrupted: dict[str, asyncio.Task[Any] | None] = {}
+        self._sessions_emitting_interrupted: dict[str, set[asyncio.Task[Any] | None]] = {}
         self._sessions_requesting_interruption: set[str] = set()
         self._interrupt_signals: dict[str, asyncio.Event] = {}
         self._terminal_finalization_claim_handoffs: dict[str, TerminalFinalizationClaimHandoff] = {}
@@ -477,16 +477,22 @@ class SessionControl(Generic[UsageTrackerT]):
         return signalled
 
     def begin_emitting_interrupted(self, session_id: str) -> None:
-        self._sessions_emitting_interrupted[session_id] = asyncio.current_task()
+        self._sessions_emitting_interrupted.setdefault(session_id, set()).add(
+            asyncio.current_task()
+        )
 
     def end_emitting_interrupted(self, session_id: str) -> None:
-        self._sessions_emitting_interrupted.pop(session_id, None)
+        owners = self._sessions_emitting_interrupted.get(session_id)
+        if owners is not None:
+            owners.discard(asyncio.current_task())
+            if not owners:
+                self._sessions_emitting_interrupted.pop(session_id, None)
 
     def is_emitting_interrupted(
         self, session_id: str, *, task: asyncio.Task[Any] | None = None
     ) -> bool:
         return session_id in self._sessions_emitting_interrupted and (
-            task is None or self._sessions_emitting_interrupted[session_id] is task
+            task is None or task in self._sessions_emitting_interrupted[session_id]
         )
 
     def begin_interruption_request(self, session_id: str) -> None:

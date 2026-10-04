@@ -347,8 +347,14 @@ def test_interruption_markers_keep_active_wait_alive_until_terminal_event(
                 # Another finalizer's marker must not acknowledge this task's
                 # deferred cancellation.
                 assert not control.is_emitting_interrupted("sess_wait", task=asyncio.current_task())
+                control.begin_emitting_interrupted("sess_wait")
+                try:
+                    assert control.is_emitting_interrupted("sess_wait", task=asyncio.current_task())
+                finally:
+                    control.end_emitting_interrupted("sess_wait")
 
             await asyncio.create_task(check_other_task())
+            assert control.is_emitting_interrupted("sess_wait", task=asyncio.current_task())
             assert await control.wait_for_active_interrupted_event("sess_wait") is None
             assert len(store.event_queries) == 2
         finally:

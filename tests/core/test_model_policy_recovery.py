@@ -331,7 +331,8 @@ async def test_startup_failure_then_real_cancellation_preserves_both(store_facto
         app.register_agent(AgentSpec(name=name, model="model-a"))
     task = asyncio.create_task(app.start_model_policy())
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        # PostgreSQL setup precedes the controlled cleanup/cancellation boundary.
+        await asyncio.wait_for(entered.wait(), 20)
         task.cancel()
         await asyncio.sleep(0)
         assert not task.done()

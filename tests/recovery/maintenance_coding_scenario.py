@@ -3,6 +3,8 @@
 import asyncio
 import importlib
 import importlib.util
+import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -15,7 +17,12 @@ from worker_harness import _wait_for_task_lease_expiry, _write_json_atomic
 from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
 from cayu.budgets.base import BudgetPolicy
 from cayu.cli.project import project_context
+from cayu.environments.docker_coding import (
+    DockerCodingEnvironmentFactory,
+    _docker_coding_reconnect_metadata,
+)
 from cayu.environments.docker_toolchains import DockerCodingToolchainProfile
+from cayu.environments.factory import EnvironmentFactoryOperation
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
@@ -85,6 +92,36 @@ async def run_maintenance_coding(config):
         fixture._install_fake_docker_factory(
             patch, target=Path(config["target"]), created_runners=runners
         )
+        local_create = DockerCodingEnvironmentFactory.create
+        factory_operations = []
+        local_identity_path = Path(config["target"]).parent / "local-allocation.json"
+
+        async def reconnectable_local_create(factory, request):
+            # Retain the exact local target across process loss. These native
+            # metadata fields exercise binding recovery, not live Docker proof.
+            metadata = _docker_coding_reconnect_metadata(
+                container_id="b" * 64,
+                configuration_fingerprint=factory._configuration_fingerprint,
+                image_fingerprint=factory.image_identity.fingerprint,
+                toolchain_profile_fingerprint=factory.toolchain_profile.fingerprint,
+            )
+            local_identity = {
+                "session_id": request.session_id,
+                "target": config["target"],
+                "reconnect_metadata": metadata,
+            }
+            if request.operation is EnvironmentFactoryOperation.CREATE:
+                assert config["action"] == "start" and not local_identity_path.exists()
+                _write_json_atomic(local_identity_path, local_identity)
+            else:
+                assert config["action"] == "recover"
+                assert json.loads(local_identity_path.read_text()) == local_identity
+                assert request.reconnect_metadata == metadata
+                assert Path(config["target"]).is_dir()
+            factory_operations.append(request.operation)
+            return replace(await local_create(factory, request), reconnect_metadata=metadata)
+
+        patch.setattr(DockerCodingEnvironmentFactory, "create", reconnectable_local_create)
         provider = _Provider(config)
         application = importlib.import_module("app").build_coding_product_application(
             provider=provider,
@@ -181,7 +218,7 @@ async def run_maintenance_coding(config):
                     ),
                 )
                 receipt = await application.app.execute_recovery(execution)
-                assert receipt.items[0].status is RecoveryItemExecutionStatus.EXECUTED
+                assert receipt.items[0].status is RecoveryItemExecutionStatus.EXECUTED, receipt
                 replay = await application.app.execute_recovery(execution)
                 assert replay.items[0].replayed
                 assert replay.items[0].receipt_event_id == receipt.items[0].receipt_event_id
@@ -237,7 +274,9 @@ async def run_maintenance_coding(config):
                 assert await store.load_task(held.id) == terminal
                 with pytest.raises(results.MaintenanceResultUnavailable):
                     await results.load_verified_coding_result(application, reservations, identity)
-                assert not provider.requests and not runners
+                assert not provider.requests
+                assert factory_operations == [EnvironmentFactoryOperation.RECONNECT]
+                assert len(runners) == 1 and runners[0].closed
                 return {
                     "identity": identity.model_dump(mode="json"),
                     "state": publication.candidate.state.value,

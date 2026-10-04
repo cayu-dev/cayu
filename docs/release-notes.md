@@ -1,230 +1,167 @@
 # Release notes
 
-## Unreleased
+## v0.8.0
 
-- Add `CayuApp.aclose()` and `async with CayuApp(...)`: one shutdown call that
-  refuses new runs, recoveries, and dispatches, waits for operations in flight,
-  and drains every subsystem in dependency order under one shared deadline. It
-  returns one `ApplicationShutdownOutcome` with per-step results instead of
-  raising for unfinished work, and retrying an incomplete shutdown runs a new
-  attempt. The app never closes caller-supplied stores or providers; hand them
-  over with `owned_resources=(...)` to have them closed after a settled
-  shutdown. The Cayu server, `cayu worker`, `cayu recovery`, and generated
-  `run.py` now call it, so the server's shutdown grace is one deadline (the
-  interruption and knowledge publication graces combined) and it now also
-  drains collaboration requests and session exports.
-  `drain_knowledge_publications()` no longer seals shared knowledge tools; it
-  waits for this app's publications. `drain_collaboration_requests()` no longer
-  closes the shared collaboration store; it refuses this app's new work and
-  waits for every operation pending on the store. Cancelling a
-  `drain_background_interruptions()` caller now leaves that cancellation in
-  place instead of clearing it. Cayu's task, dispatch, and verified-work workers
-  stop once their app closes; a task or dispatch claimed during shutdown goes
-  back to its queue, and work already attached to a session is recovered after
-  its lease expires instead of failing. A shut-down app can no longer start a
-  second server lifespan. `ApplicationStores.close()` retries only the stores
-  that failed to close, and concurrent callers share one close. Shutdown also
-  waits, without cancelling, for completion verification and result resolution
-  still running after their call returned (`app.drain_verified_completions()`),
-  and reports such work that then failed instead of settling.
+Cayu adds durable collaboration execution, safer session continuation, shared
+application storage, recoverable coding workflows, and unified application shutdown.
 
-- `CayuApp.aclose()` now also waits for background work that outlives the call
-  that started it: event watcher deliveries whose caller was cancelled
-  (`app.drain_event_watchers()`), session store writes and provider-operation
-  reconciliations kept past their call (`app.drain_session_operations()`), and
-  browser control (`app.drain_browser_control()`; under a Cayu server, which
-  drains it first, the step waits for that drain and reports whether it settled,
-  and a retry drains again). It also
-  releases the app's ownership of caller-supplied MCP toolsets and stops their
-  pending notification refreshes once no operation is in flight, even after the
-  deadline is used up, so a closed app no longer keeps a toolset from
-  being registered with another app, and a closing app refuses to take MCP
-  toolsets again. A toolset whose tools changed after its last refresh stays
-  stale: another app cannot register it as a refreshable toolset, and its tools
-  are not dispatched until it is refreshed. A tools-changed notification that
-  arrives while shutdown waits for a run no longer stalls the event loop, and an
-  execution-presence release still running after the recovery cleanup step now
-  leaves shutdown incomplete. Retained work whose outcome nobody else owns and
-  that then fails, such as a watcher delivery whose settlement could not be
-  published, a late provider cancellation that failed, or final session
-  accounting that failed, makes one shutdown attempt report its step as failed
-  instead of settling over it.
+- Require AnyIO **4.14.2 or later**, including upstream TLS hostname-validation
+  and process-handling fixes. Refresh application lockfiles and remove any
+  constraints that force an older AnyIO version.
+- Add `CayuApp.aclose()` and `async with CayuApp(...)` to stop admission and drain
+  owned work under one deadline, with per-step shutdown outcomes and retryable
+  incomplete cleanup. Shutdown tracks retained provider operations, session writes,
+  event watchers, browser control, verified completions, and execution-presence
+  release; it also releases application ownership of MCP toolsets. The server,
+  workers, recovery CLI, and generated `run.py` use the same lifecycle.
+- Recover Docker commands and named checks after worker loss from authenticated
+  command receipts, without redispatching proven completed work. Recover mixed
+  tool rounds from settled sibling evidence while keeping unknown effects fenced.
+  Retain workspace bindings, terminal outcomes, and cleanup ownership across
+  restart, expose exact released coding-invocation inspection, and add an executable
+  application settlement and source-release guide.
+- Retain provider rejection diagnostics during automatic compaction, publish
+  `model.error` for each failed attempt, and report `reason=provider_failed`
+  with the final provider status and retry disposition. Usage-unavailable
+  accounting records remain consistent with the failed attempt.
+- Run durable collaboration through an explicit runtime host, with recipient
+  planning and admission, authenticated peer content, bounded clarification,
+  retained producer output, and restartable final-result delivery. Common-root
+  budget admission reserves shared spend atomically before dispatch.
+- Enforce opt-in, application-owned resource access across sessions, tasks,
+  artifacts, knowledge, and durable execution. Application policy owns identity
+  and permissions; runtime preserves the admitted bounds and checks revocation.
+- Recover abandoned sessions before continuation through fenced ownership
+  takeover, while refusing live or unknown owners and preserving uncertain tool
+  outcomes. Ordinary resume inherits verified omitted loop controls, and startup
+  recovery isolates incompatible sessions instead of blocking unrelated work.
+  Wait for execution-presence release during cleanup so immediate recovery retries
+  and store shutdown observe the retired owner. Preserve policy shutdown failures
+  when the caller is cancelled. Takeover continues the conversation; it does not
+  provide general automatic replay of interrupted `NONE` or `IDEMPOTENT` tool
+  calls. Completing those operations still needs supported tool-specific recovery
+  or application reconciliation.
+- Add `RequireFinalTool` and successful application-tool completion. Validate tool
+  arguments before approval and dispatch, preserve durable tool-round recovery,
+  and exclude human approval and user-input waits from elapsed run limits.
+- Add `open_application_stores`, environment-selected PostgreSQL/SQLite storage,
+  and runtime-owned product operation stores. Storage migration commands support
+  deployment configuration, direct database connections, and managed backup receipts.
+- Add Lambda sandbox allocation recovery, credential renewal, ownership fencing,
+  browser control and recording, and coding-tool admission. Docker and Lambda
+  workspaces support branches and checkpoint restoration into replacements;
+  S3 artifact stores support durable pins. Experimental runner/egress extension
+  interfaces support externally packaged adapters.
+- Add session event streaming, event long polling, conditional state/usage reads,
+  incremental session usage, a browser client, and an application UI guide. Reduce
+  idle dashboard polling and SQLite validation/reader contention. Runtime phase
+  timing and request-cost diagnostics make execution overhead visible. Preserve
+  terminal interruption events when a detached stream stops before observation
+  begins, without redelivering an already handled cancellation during cleanup.
+- Score completed workflow output with bounded child evidence when every assertion
+  explicitly reads only final output. Retain anchored output in unscored trials,
+  preserve partial-workflow lifecycle checks, and bound post-close workspace
+  settlement and profile revalidation by the target's remaining close deadline.
+- Decode bounded `gzip`, `deflate`, `br`, and `zstd` upstream responses in virtual
+  egress; preserve readable browser pages through telemetry denials and large
+  snapshots. Improve OpenAI stream reconciliation and provider diagnostics.
+- Expand bundled model and pricing coverage, including GPT-6.1 Sol, Claude
+  Sonnet 5.5 on Anthropic and Vertex, Claude Fable 5.1, Claude Opus 5.5, and current
+  Gemini models. Native catalog verification prefers official document endpoints
+  to avoid documentation-site background requests. OpenAI hosted web-search admission
+  now uses the model catalog, including application-supplied `model_catalog=`.
+  `return_token_budget="unlimited"` accepts GPT-5 and later families.
+- Add opt-in, durable model-policy adoption for new sessions, plus Gateway
+  provider support, reported usage and costs, and optional catalog price books.
+- Support durable Docker sandboxes in generated agent applications and add a
+  verified-work reference workflow and guide.
+- Ship a restartable support-agent example with external approval receipts, and
+  repair generated project configuration, dashboard embedding, and optional-import
+  behavior.
 
-- Record provider rejections during automatic compaction as failures. Each
-  rejected compactor attempt now also publishes `model.error` with the same
-  `status_code`, `provider_error_type`, `provider_error_code`, `retryable`, and
-  retry decision fields as a failed model step; its usage-unavailable
-  `model.completed` stays as the accounting record, and budget inspection no
-  longer treats the pair as contradictory. `context.compaction.failed` and the
-  session's `compaction_failure` report `reason=provider_failed` instead of
-  `internal_failed`, `provider_dispatch_disposition=dispatched` when the
-  provider returned an HTTP status, and the final `status_code`,
-  `provider_error_type`, `provider_error_code`, `provider_retryable`, and
-  `retry_disposition`.
+### Upgrade from v0.7.0
 
-- Apply the workflow target's remaining close deadline to the first post-close
-  profile inspection as well as retries, including a workspace fence that waits
-  inside inspection. An expired budget reports quiescence failure; caller
-  cancellation and inspection-owned errors preserve their original meaning.
-- Stop turning completed workflow eval trials into errors when post-close
-  execution-profile revalidation races a workspace mutation that has not
-  settled yet. The runner now retries inspection after
-  `WorkspaceMutationSettlementError` within the remaining target close budget
-  and scores the trial once the settled profile matches exactly. If
-  settlement is still unproven at the deadline, the trial fails with
-  `workflow_quiescence_failed` instead of `workflow_target_failed`, so it is
-  distinguishable from a profile that changed. A changed profile still fails
-  as `workflow_target_failed`.
+The latest storage revision is **114** (previously **96**), with a minimum
+supported revision of **111**. Server contract is **47** (previously **46**);
+manifest/generator schema **17** is unchanged. This crosses breaking writer
+boundaries: stop old writers, retain a restorable backup, inspect the store with
+`cayu storage status`, and follow the
+[storage migration guidance](https://github.com/cayu-dev/cayu/blob/main/docs/session-store-targets.md)
+before starting upgraded writers. Do not run 0.7.0 writers against the upgraded
+database; an application-only rollback is insufficient. Refresh generated clients
+and validate the complete application before adoption. Review and supply each
+required `--acknowledge-breaking REVISION` reported by migration preflight.
 
-- Exclude human approval and user-input waits from run-scoped
-  `RunLimits.max_elapsed_seconds`. The pause records its start when it is
-  published and its end at the first resolution claim, so retries and restarts
-  exclude the same interval once; token, tool-call, and cost limits are unchanged.
-  Pauses already in flight on 0.7.0 have no recorded start and keep the old
-  accounting, including the human wait. An approval-limit skip that 0.7.0
-  recorded without a `tool.call.started` event can now be resumed through
-  `resume` instead of failing reconciliation.
-
-- OpenAI hosted web search support now comes from the model catalog instead of a
-  hardcoded model list. `ModelInfo` has a new `hosted_web_search` capability
-  (default `False`, so catalogs written without it still load and mean "not
-  established"). The bundled catalog sets it for `gpt-5.6-luna`, `gpt-5.6-sol`
-  (and its `gpt-5.6` alias), and `gpt-5.6-terra`; `chat-latest` stays admitted as
-  OpenAI's moving ChatGPT pointer unless the active catalog has a record for it.
-  `OpenAIProvider` and `OpenAISubscriptionProvider` accept `model_catalog=` to
-  replace the bundled catalog for this decision (no merge), so an application can
-  declare a newer model before a Cayu release adds it. The model-catalog
-  maintenance job now verifies the fact from each OpenAI model page's supported
-  tools, and an automated removal is held for human review.
-  `return_token_budget="unlimited"` now accepts GPT-5 and later families
-  (previously it matched only `gpt-5`).
-- Invalid arguments can no longer be approved through built-in parameter validity
-  rules. `ParameterConstrainedToolPolicy(REQUIRE_APPROVAL)` without an explicit
-  application identity changes its execution-profile fingerprint. Resolve paused
-  sessions on the prior build before upgrading, or explicitly reconcile their
-  profile; do not silently rebind them. DENY fingerprints remain stable.
-  Runtime schema checks apply to locally resolvable Draft 2020-12 schemas;
-  `cayu check` warns on unsupported schemas, whose validation stays tool-owned.
-  Built-in command and patch tools retain their structured preflight diagnostics
-  and patch-input evidence. Schema denials retain finalized, redacted arguments
-  when the tool has static secret scope and publishes arguments.
-- Keep unscored workflow eval trials internally consistent. A workflow trial that
-  produced and anchored its output but then became `error` or `unavailable`
-  (capture limits, a case timeout during capture, an evidence preparation error,
-  a target `close` failure or timeout, or a post-quiescence profile or evidence
-  revalidation failure) used to report `final_output=""` while its
-  `retained_workflow_output` and `workflow_attempt` digests described the real
-  output, so consumers that check report consistency rejected the whole report.
-  Such trials now report the anchored projection in `final_output` and
-  `structured_output`; `status`, `score=null`, the blocked assertions and the
-  diagnostic still mark them unscored, and the public output preview stays
-  unavailable. Scored trials and trials that fail before projection are
-  unchanged. Readers that treated a non-empty `final_output` as a scored answer
-  must check `status`.
-- Keep partial workflow scoring fail-closed when an omitted descendant is still
-  running or its lifecycle changes during scoring or target close. Bounded topology
-  and identity checks run independently of event-payload capture limits. A partial
-  case without assertions returns unavailable instead of aborting the suite with
-  an invalid skipped trial.
-- Score completed workflow eval trials whose child evidence exceeds capture
-  bounds instead of making them `unavailable`. When child capture fails with a
-  capture-limit rejection (for example `record_bytes_exceeded`) or
-  `origin_evidence_rejected`, the trial is scored from the workflow's projected
-  output, reports `evidence_complete=false` and unknown usage, and keeps its
-  `capture_diagnostic`. Only assertions whose new
-  `EvalAssertion.reads_final_output_only` property is `True` are evaluated: the
-  built-in final-output assertions and corpus specs, plus any application
-  assertion that overrides it. Undeclared assertions, including model judges,
-  stay unavailable, so the trial is unavailable unless every assertion is
-  output-only. Read failures,
-  closure changes, and non-terminal children still make the trial unavailable.
-  `WorkflowEvalTarget.capture_bounds` can raise the limits per target. Readers
-  that assumed every scored trial has complete evidence must accept scored
-  trials that carry a capture diagnostic.
-
-- Decode compressed upstream responses in virtual egress instead of rejecting
-  them. `HttpxUpstream` still requests identity encoding, but when an origin
-  (such as the Internet Archive) returns a single `gzip`, `deflate`, `br`, or
-  `zstd` coding anyway, it decodes the body while streaming and counts decoded
-  bytes against the same response limit, so a decompression bomb still fails as
-  an oversized response. Browser and public-web guests receive the decoded body
-  without `Content-Encoding`. `br` needs the optional `brotli>=1.2` package and
-  `zstd` needs Python 3.14; unknown or stacked codings are still rejected. The
-  deny reason for them is now "Upstream response content encoding is
-  unsupported.", and malformed encoded bodies fail with `fetch_failed`.
-  Zstandard history windows are capped relative to the response budget on
-  every frame. Raw deflate remains accepted when its prefix resembles a zlib
-  header, using a replay bounded by the received-byte limit.
-- Make `cayu storage migrate` usable as a deployment step. `status`, `migrate`,
-  and `export` resolve their target from `CAYU_DATABASE_URL`, then
-  `[tool.cayu.session_store]`, when no `--sqlite`/`--postgres` is given, and
-  `migrate`/`status` prefer `CAYU_DATABASE_DIRECT_URL` for an unpooled
-  connection. `--backup-managed rds-snapshot:<id>|rds-pitr:<UTC timestamp>`
-  records a provider-managed backup in the migration receipt, and the first
-  migration of a database with no Cayu schema needs no backup authority.
-  `cayu storage status` now reports a `migration` object and exits `0` when up
-  to date, `3` when a forward migration is available, and `4` when this build
-  cannot migrate the database; scripts that treated any successful `status` as
-  exit `0` must accept `3`.
-- Add runtime-owned `SQLiteProductOperationStore` and
-  `PostgresProductOperationStore` implementations of `ProductOperationStore`.
-  The PostgreSQL store lets more than one maintained service process share
-  product authorization, claims, receipts, and settlement. Storage revision
-  **112** adds `cayu_product_operations`; it is additive, so run
-  `cayu storage migrate` before using either store against an existing database.
-  `open_application_stores(..., product_operations=True)` builds the store in the
-  configured database, sharing the PostgreSQL pool. The `service` preset no longer
-  generates `product_store.py`; it uses the runtime store, so `CAYU_DATABASE_URL`
-  moves product records to PostgreSQL and local runs keep SQLite in
-  `data/cayu.db`. Existing service projects get a `SCAFFOLD_PLAN_DRIFT` storage
-  finding while `product_store.py` remains; copy any rows that must be kept from
-  `data/product.db` before removing it.
-- Support durable artifact pins on `S3ArtifactStore` with conditional-write state,
-  so workspace checkpoints can use S3 artifact storage.
-- Add a read-only `GET /api/sessions/{session_id}/events/stream` follow stream for
-  session events, advertised in `/api/contract` as `sse.session_follow` and
-  `capabilities.surfaces.session_follow`. It resumes with `Last-Event-ID`, filters
-  like the event list, sends comment heartbeats, ends with an `end` frame after
-  the terminal event, and is capped per caller and per session. Add `wait_seconds`
-  long polling to the event list and `ETag`/`304` revalidation to session state.
-- Accept already-searching OpenAI web-search registrations and completed replay
-  registrations. Reconcile unoccupied completion indexes by exact item identity,
-  retain terminal integrity checks, and retry function index-type collisions and
-  unregistered argument completions under the caller's transient retry budget.
-- Make whole-session usage reads incremental in the memory, SQLite, and PostgreSQL
-  stores, add `ETag`/`If-None-Match` to `GET /api/sessions/{session_id}/usage`, add
-  `include=usage` to the session list, and list the usage and cost endpoints under
-  `accounting` in `/api/contract`.
-- Add experimental `cayu.extensions.runners` and `cayu.extensions.egress` seams
-  for externally packaged adapters, including an explicit runner adapter
-  identity registry so registered adapter names and error classes survive in
-  runner diagnostics instead of becoming `"unknown"`/`"Exception"`. The
-  Microsandbox proxy exposure now lives in `cayu.egress.microsandbox_adapter`;
-  its former import path still works.
-- Add `open_application_stores` and `configured_database_url`. Every `cayu new`
-  project now selects PostgreSQL from `CAYU_DATABASE_URL` at runtime (one shared
-  pool bounded by `CAYU_DATABASE_POOL_MAX`, default 5, plus one task-admission
-  `LISTEN` connection that can use `CAYU_DATABASE_DIRECT_URL`) and local SQLite
-  otherwise, and depends on `cayu[postgres]`. `cayu new --database` is deprecated
-  and ignored; existing projects get a `SCAFFOLD_PLAN_DRIFT` storage finding until
-  their storage module uses the helper. `CAYU_REQUIRE_POSTGRES=1` now makes every
-  Cayu SQLite store refuse to open; the test suite's Postgres-tier flag is renamed
-  `CAYU_REQUIRE_POSTGRES_TESTS`.
-- Add content-free runtime phase timing for tool rounds and model-step
-  preparation. `CayuApp` keeps a bounded recent view
-  (`inspect_recent_tool_round_timing`,
-  `inspect_recent_model_step_preparation_timing`) and can export records through
-  `timing_sinks`, `EventSink.emit_timing` or `OpenTelemetryEventSink`; configure
-  or disable it with `RuntimeTimingConfig`, and call `close_runtime_timing()` at
-  shutdown if you run the application outside the Cayu server. Records add no
-  durable writes. `LoggingEventSink` logs them only with
-  `log_runtime_timing=True`. **Telemetry change:** `OpenTelemetryEventSink` now
-  ends each `execute_tool` span at the tool's attested effect-completion time
-  instead of at the terminal event, so `execute_tool` durations get shorter by
-  the terminal staging and publication time. Dashboards or alerts on that span's
-  duration should be re-baselined; the staging and publication time is in the
-  new `cayu.tool.phases` child span, and the span's terminal-staged and
-  publication-started events are stamped after its end.
+- **Application shutdown:** use `await app.aclose(timeout_s=...)` or the async
+  context manager, and inspect `ApplicationShutdownOutcome.settled` (or
+  `app.shutdown_outcome`). An incomplete outcome retains cleanup ownership;
+  keep dependencies available and retry `aclose()`. Closing refuses new runs,
+  recoveries, dispatches, and another server lifespan. Caller-supplied stores and
+  providers remain caller-owned unless passed through `owned_resources=(...)`,
+  which closes them only after work settles. Server shutdown now shares one
+  deadline across its interruption and knowledge-publication grace periods.
+  `drain_knowledge_publications()` no longer seals shared tools, and
+  `drain_collaboration_requests()` no longer closes the shared store. Prefer the
+  complete application shutdown over relying on either individual drain.
+- **Coding recovery:** command-receipt recovery applies only to admitted runner
+  configurations with retained launch authority and authenticated completion
+  evidence. Private command journals advance from schema 1 to schema 2; schema 1
+  journals are not accepted by the new recovery path. Settle in-flight structured
+  commands on the prior build before upgrading, or retain that build and its
+  admitted dependencies for explicit reconciliation. Missing, conflicting, or
+  incomplete evidence keeps the effect unresolved; do not redispatch it or treat
+  an environment reconnect as proof of
+  completion. Preserve the admitted workspace, toolchain, check, policy, and
+  execution-profile identities when reconstructing an active coding application.
+  See the [named-check recovery requirements](https://github.com/cayu-dev/cayu/blob/main/docs/named-checks.md#worker-loss-recovery).
+- **Storage deployment:** `status`, `migrate`, and `export` resolve
+  `CAYU_DATABASE_URL`, then `[tool.cayu.session_store]`, when no explicit target is
+  supplied. `status` and `migrate` prefer `CAYU_DATABASE_DIRECT_URL` for an unpooled
+  connection. `cayu storage status` exits `0` when current, `3` when forward
+  migration is available, and `4` when this build cannot migrate the store;
+  deployment scripts must handle those codes. A first migration into a database
+  without a Cayu schema needs no backup authority; existing stores retain the
+  backup requirement, including managed `rds-snapshot:`/`rds-pitr:` receipts.
+- **Generated applications:** use `open_application_stores` and depend on
+  `cayu[postgres]`; `CAYU_DATABASE_URL` selects PostgreSQL and local runs use
+  SQLite. `cayu new --database` is deprecated and ignored. Existing projects may
+  report `SCAFFOLD_PLAN_DRIFT` until their storage module adopts the helper.
+  Service projects now use runtime product stores: copy any required rows from
+  `data/product.db` before removing the old `product_store.py`.
+  `CAYU_REQUIRE_POSTGRES=1` now refuses every Cayu SQLite store; the test-tier flag
+  is `CAYU_REQUIRE_POSTGRES_TESTS`.
+- **Paused sessions and policies:**
+  `ParameterConstrainedToolPolicy(REQUIRE_APPROVAL)` without an explicit
+  application identity has a changed execution-profile fingerprint. Resolve
+  affected pauses on the prior build or explicitly reconcile their profile;
+  do not silently rebind them. DENY fingerprints remain stable. Runtime validates
+  locally resolvable Draft 2020-12 schemas; `cayu check` warns on unsupported
+  schemas, whose validation remains tool-owned.
+- **Run limits:** new approval/user-input pauses exclude human wait time from
+  `RunLimits.max_elapsed_seconds`, including after restart. Pauses already in
+  flight on 0.7.0 retain the previous accounting because they have no recorded
+  start. Token, tool-call, and cost limits are unchanged. Approval-limit skips
+  recorded without a tool-start event can now be resumed.
+- **Evaluation readers:** a non-empty `final_output` no longer implies a scored
+  trial; inspect `status` and `score`. Scored output-only trials can carry
+  `evidence_complete=false`, unknown usage, and a capture diagnostic. Custom
+  assertions must declare `reads_final_output_only=True` to run without complete
+  child evidence; undeclared assertions and model judges remain unavailable.
+  Exhausted post-close settlement budgets report `workflow_quiescence_failed`;
+  changed execution profiles report `workflow_target_failed`.
+- **Model catalogs:** the new `ModelInfo.hosted_web_search` capability defaults to
+  `False` for existing custom catalogs. Establish support explicitly when using
+  those catalogs for OpenAI hosted-search admission; an application-supplied
+  catalog replaces the bundled catalog for that decision.
+- **Telemetry:** OpenTelemetry `execute_tool` spans now end at attested effect
+  completion, so re-baseline duration dashboards and alerts. Terminal staging and
+  publication timing are available in `cayu.tool.phases`. Applications using
+  runtime timing outside the Cayu server should use `app.aclose()`, which includes
+  `close_runtime_timing()`; `LoggingEventSink` requires `log_runtime_timing=True`
+  to log timings.
+- **Egress:** Brotli decoding requires optional `brotli>=1.2`; Zstandard requires
+  Python 3.14. Unknown/stacked encodings remain rejected, malformed encoded bodies
+  report `fetch_failed`, and decoded bytes and decoder history remain bounded.
 
 ## v0.7.0
 

@@ -296,14 +296,14 @@ def test_subscription_provider_hosted_web_search_preflight_uses_model_catalog() 
     )
     with pytest.raises(HostedToolCapabilityError, match="not established for model"):
         bundled.preflight_hosted_tools(
-            model="gpt-6.1-sol", hosted_tools=(OpenAIWebSearch(),), options={}
+            model="gpt-6-app-catalog-test", hosted_tools=(OpenAIWebSearch(),), options={}
         )
 
     custom = OpenAISubscriptionProvider(
-        auth=StaticSubscriptionAuth(), model_catalog=catalog("gpt-6.1-sol")
+        auth=StaticSubscriptionAuth(), model_catalog=catalog("gpt-6-app-catalog-test")
     )
     custom.preflight_hosted_tools(
-        model="gpt-6.1-sol", hosted_tools=(OpenAIWebSearch(),), options={}
+        model="gpt-6-app-catalog-test", hosted_tools=(OpenAIWebSearch(),), options={}
     )
     with pytest.raises(HostedToolCapabilityError, match="not established for model"):
         custom.preflight_hosted_tools(

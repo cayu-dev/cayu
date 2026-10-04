@@ -26901,33 +26901,73 @@ class SessionEngine:
         except SessionInterruptedByRequest as interruption:
             from cayu.runtime._session_steering import SessionSteeringBoundaryReached
 
-            if isinstance(interruption, SessionSteeringBoundaryReached):
-                await self._promote_rejected_completion_stop(session)
-            await materialize_deferred_messages_after_failure()
-            interruption_events: list[Event] = []
-            if close_new_pending_round_on_interrupt:
-                async for event in self._close_durable_pending_tool_round_after_interrupt(
+            promote_rejected_stop = isinstance(interruption, SessionSteeringBoundaryReached)
+
+            async def prepare_requested_interruption() -> list[Event]:
+                if promote_rejected_stop:
+                    await self._promote_rejected_completion_stop(session)
+                await materialize_deferred_messages_after_failure()
+                prepared_events: list[Event] = []
+                if close_new_pending_round_on_interrupt:
+                    async for event in self._close_durable_pending_tool_round_after_interrupt(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        execution_profile=execution_profile,
+                        invocation_context=invocation_context,
+                    ):
+                        prepared_events.append(event)
+                return prepared_events
+
+            # A detached observer may redeliver its interrupt while terminal
+            # publication is awaiting storage. Finish that owned publication
+            # and retain its events before propagating concurrent cancellation.
+            # Acknowledge this task's handled request before handing settlement
+            # to a child task. A deferred observer signal belongs to the parent;
+            # the child's publication marker cannot acknowledge it on its own.
+            self._session_control.begin_emitting_interrupted(session.id)
+            try:
+                (
+                    interruption_events,
+                    propagated,
+                ) = await self._handle_session_interrupted_preserving_failure(
+                    authoritative_failure=interruption,
+                    prepare_interruption=prepare_requested_interruption,
+                    include_interrupted_session=True,
                     session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
+                    environment_name=environment_name,
                     execution_profile=execution_profile,
                     invocation_context=invocation_context,
-                ):
-                    interruption_events.append(event)
-            async for event in self._handle_session_interrupted(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                environment_name=environment_name,
-                execution_profile=execution_profile,
-                invocation_context=invocation_context,
-                run_started_at=run_started_at,
-                turn_usage_tracker=turn_usage_tracker,
-                active_run=active_run,
-            ):
-                interruption_events.append(event)
+                    run_started_at=run_started_at,
+                    turn_usage_tracker=turn_usage_tracker,
+                    active_run=active_run,
+                )
+            finally:
+                self._session_control.end_emitting_interrupted(session.id)
             for event in interruption_events:
                 yield event
+            if propagated is not interruption:
+                additional_failure = _failure_without_existing_exception_identities(
+                    propagated, {id(interruption)}
+                )
+                if additional_failure is not None:
+                    if (
+                        isinstance(additional_failure, BaseExceptionGroup)
+                        and len(additional_failure.exceptions) == 1
+                    ):
+                        # Removing the handled request leaves the original
+                        # sole failure, including process-control exceptions.
+                        additional_failure = additional_failure.exceptions[0]
+                    pending_requests = workspace_observation_pending_cancellation_requests(
+                        propagated
+                    )
+                    if pending_requests:
+                        retain_workspace_observation_pending_cancellation_requests(
+                            additional_failure, pending_requests
+                        )
+                    raise additional_failure from None
             return
         except asyncio.CancelledError as cancellation:
             provider_cancellation_diagnostics = (
@@ -30706,6 +30746,7 @@ class SessionEngine:
         execution_profile: ExecutionProfileIdentity | None = None,
         invocation_context: InvocationContext | None = None,
         prepare_interruption: Callable[[], Awaitable[Iterable[Event] | None]] | None = None,
+        include_interrupted_session: bool = False,
         run_started_at: float | None = None,
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
@@ -30734,11 +30775,10 @@ class SessionEngine:
 
         async def collect_events() -> None:
             persisted_session = await self.session_store.load(session.id)
-            if (
-                persisted_session is None
-                or persisted_session.status
-                not in _INTERRUPTIBLE_SESSION_STATUSES | {SessionStatus.INTERRUPTING}
-            ):
+            allowed_statuses = _INTERRUPTIBLE_SESSION_STATUSES | {SessionStatus.INTERRUPTING}
+            if include_interrupted_session:
+                allowed_statuses = allowed_statuses | {SessionStatus.INTERRUPTED}
+            if persisted_session is None or persisted_session.status not in allowed_statuses:
                 return
             if prepare_interruption is not None:
                 try:

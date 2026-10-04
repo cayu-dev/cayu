@@ -400,21 +400,25 @@ def test_openai_hosted_web_search_accepts_application_catalog_declaration() -> N
     from cayu.providers.hosted import HostedToolCapabilityError, OpenAIWebSearch
 
     default_provider = OpenAIProvider(api_key="test-key", transport=RecordingTransport())
-    with pytest.raises(HostedToolCapabilityError, match="not established for model 'gpt-6.1-sol'"):
+    with pytest.raises(
+        HostedToolCapabilityError, match="not established for model 'gpt-6-app-catalog-test'"
+    ):
         default_provider.preflight_hosted_tools(
-            model="gpt-6.1-sol",
+            model="gpt-6-app-catalog-test",
             hosted_tools=(OpenAIWebSearch(),),
             options={},
         )
 
-    catalog = _hosted_search_catalog(("gpt-6.1-sol", True))
+    catalog = _hosted_search_catalog(("gpt-6-app-catalog-test", True))
     provider = OpenAIProvider(
         api_key="test-key",
         transport=RecordingTransport(),
         model_catalog=catalog,
     )
     for tool in (OpenAIWebSearch(), OpenAIWebSearch(return_token_budget="unlimited")):
-        provider.preflight_hosted_tools(model="gpt-6.1-sol", hosted_tools=(tool,), options={})
+        provider.preflight_hosted_tools(
+            model="gpt-6-app-catalog-test", hosted_tools=(tool,), options={}
+        )
 
     # The provider keeps its own validated copy of the application catalog.
     assert provider.model_catalog == catalog
