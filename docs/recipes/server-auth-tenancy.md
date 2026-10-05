@@ -24,6 +24,11 @@ Unicode characters. Custom authentication dependencies upgrading from an
 earlier prerelease must map longer external identities to collision-resistant
 bounded identifiers rather than silently truncating them. `BasicAuth` applies
 the same limit to `username`, explicit `subject`, and `tenant`.
+`OidcBearerAuth(tenant_claim=...)` fills `tenant` from a verified token claim;
+the value is the same provenance-only field. For the maintained service,
+`OidcBearerAuth.product_dependency()` resolves `ProductPrincipal` from the
+verified token's tenant and subject claims and rejects a token without the
+tenant claim.
 
 The `tenant` value is useful operator provenance. Cayu stamps verified identity
 into durable evidence for approvals, interruptions, recovery, user-input

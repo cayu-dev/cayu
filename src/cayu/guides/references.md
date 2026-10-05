@@ -276,6 +276,10 @@ or forwarded-header checks for authentication. Put authentication/authorization
 at the application boundary, run schema migration explicitly, and separate API
 processes from task workers. Test the app factory and auth boundary before
 deployment.
+`OidcBearerAuth` from `cayu[oidc]` verifies JWT bearer tokens from an OpenID
+Connect provider (Cognito, Auth0, Okta, Entra ID, Google, Workday) for either
+operator access or, through `product_dependency()`, product access. It does not
+provide browser sign-in.
 
 ## advanced-runtime
 

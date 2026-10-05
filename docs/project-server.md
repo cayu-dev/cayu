@@ -109,45 +109,11 @@ instead of `os.environ`.
 
 ### Use your own authentication
 
-`[tool.cayu.serve].auth` accepts any request-to-`AuthContext` dependency, so
-operators can sign in with your organization's identity provider (OIDC/JWT from
-Cognito, Auth0, Okta, Workday, or an email and password check) instead of a
-shared Basic credential. The sketch below is illustrative: `verify_jwt` stands
-for a JWT library of your choice, and Cayu does not ship one.
-
-```python
-# operator_auth.py
-import os
-
-from fastapi import HTTPException, Request
-
-from cayu.server import AuthContext
-
-ISSUER = os.environ["OIDC_ISSUER"]  # e.g. https://example.okta.com/oauth2/default
-AUDIENCE = os.environ["OIDC_AUDIENCE"]
-JWKS_URL = f"{ISSUER}/v1/keys"  # the provider's published signing keys
-
-
-def AUTH(request: Request) -> AuthContext:
-    scheme, _, token = request.headers.get("authorization", "").partition(" ")
-    if scheme.lower() != "bearer" or not token:
-        raise HTTPException(401, "Missing bearer token.", {"WWW-Authenticate": "Bearer"})
-    try:
-        # Verify the signature against the JWKS, then the expiry, issuer, and audience.
-        claims = verify_jwt(token, jwks_url=JWKS_URL, issuer=ISSUER, audience=AUDIENCE)
-    except Exception:
-        raise HTTPException(401, "Invalid bearer token.", {"WWW-Authenticate": "Bearer"})
-    return AuthContext(
-        subject=claims["sub"],
-        tenant=claims.get("org_id"),
-        claims={"email": claims.get("email")},
-    )
-```
-
-```toml
-[tool.cayu.serve]
-auth = "operator_auth:AUTH"
-```
+`[tool.cayu.serve].auth` accepts any request-to-`AuthContext` dependency.
+For bearer tokens from your organization's identity provider, use
+[`OidcBearerAuth`](#verify-oidc-bearer-tokens). For another authentication
+system, expose a callable that verifies the request and returns `AuthContext`,
+then set `auth = "operator_auth:AUTH"` to its module and attribute.
 
 This guards operator access to the Agent's own control plane: the sessions
 API, the dashboard, and `/cayu/` on Cayu Cloud. It is not end-user product
@@ -162,6 +128,102 @@ provides are simply unused, and `cayu cloud init` leaves the target alone.
 `--auth` are mutually exclusive; explicit `--dev` selects the open local
 profile even when the project also has deployment authentication configured.
 Host and port always reach uvicorn as concrete values.
+
+### Verify OIDC bearer tokens
+
+`OidcBearerAuth` checks JWT bearer tokens issued by an OpenID Connect provider
+such as Amazon Cognito, Auth0, Okta, Microsoft Entra ID, Google, or Workday.
+Install it with `pip install "cayu[oidc]"`, which adds PyJWT to the server
+extra. Build the target from the environment:
+
+```python
+# operator_auth.py
+from cayu.server import OidcBearerAuth
+
+AUTH = OidcBearerAuth.from_environment(required_scopes=["cayu:operate"])
+```
+
+```toml
+[tool.cayu.serve]
+auth = "operator_auth:AUTH"
+```
+
+`from_environment()` reads the issuer URL from `CAYU_OIDC_ISSUER` and the
+expected audience from `CAYU_OIDC_AUDIENCE` (a comma-separated list is
+accepted) when `cayu serve` loads the target. If either is unset or empty, the
+command exits before it builds the application; it does not fall back to open
+access. Pass other variable names as the first two arguments, and any
+constructor option as a keyword argument.
+
+Each request must send `Authorization: Bearer <JWT>`. The verifier:
+
+- reads `{issuer}/.well-known/openid-configuration`, requires its `issuer` to
+  match exactly, and loads signing keys from its `jwks_uri` (pass `jwks_url=`
+  to skip discovery);
+- accepts only asymmetric signatures (`RS*`, `PS*`, `ES*`, `EdDSA`) made by the
+  JWKS key named by the token's `kid`, never `none` or `HS*`;
+- requires `iss`, `aud`, and `exp`, checks `nbf` and `iat` when present, and
+  allows 60 seconds of clock skew (`leeway_seconds=`);
+- maps `sub` (or `subject_claim=`) to `AuthContext.subject`. When
+  `tenant_claim=` is set, that claim is required and becomes
+  `AuthContext.tenant`, which is actor provenance only;
+- can require claims or exact claim values (`required_claims=`) and scopes from
+  `scope` or `scp` (`required_scopes=`; a missing scope gets 403
+  `insufficient_scope`).
+
+A claim name is used as written, so namespaced claims such as
+`"https://example.com/org_id"` or `"custom:tenant_id"` work. Pass a tuple such
+as `("org", "id")` for a nested claim.
+
+Rejected requests get 401 with `WWW-Authenticate: Bearer realm="Cayu"`, plus
+`error="invalid_token"` when a token was sent. Response bodies and logs never
+include the token. If no signing keys can be fetched, requests get 503 rather
+than 401. If the issuer answers with a key set that has no usable keys, tokens
+get 401: the issuer has withdrawn its keys, so this is not an outage.
+
+Keys are cached for the JWKS response's `Cache-Control: max-age`, kept between
+one minute and one day (10 minutes when the header is absent). A token with an
+unknown `kid` triggers at most one refetch every 30 seconds, so rotated keys are
+picked up without letting clients force a fetch per request, and concurrent
+requests share one fetch. Every JWKS document the issuer serves (HTTP 200 with
+a `keys` array) replaces the cached keys, so a key it removes, or all of them,
+stops verifying tokens at the next refresh. Only when the issuer can't be reached, or returns an error, a
+malformed document, or one over 256 KiB, do the previous keys stay in use, for
+at most an hour after they expire. Set `max_stale_seconds=` on
+`OidcSigningKeys` (0 to 24 hours) to change that: a longer window rides out
+longer issuer outages, and a shorter one limits how long keys stay trusted
+while the issuer can't be checked. Key fetches ask for an uncompressed body and
+refuse compressed responses. Issuer and JWKS URLs must use HTTPS;
+`allow_insecure_loopback=True` admits `http://` on a loopback host for local
+testing only.
+
+Typical values:
+
+| Provider | `CAYU_OIDC_ISSUER` | `CAYU_OIDC_AUDIENCE` | Notes |
+| --- | --- | --- | --- |
+| Amazon Cognito | `https://cognito-idp.<region>.amazonaws.com/<user-pool-id>` | App client ID | Access tokens have no `aud`; pass `audience_claim="client_id"` and `required_claims={"token_use": "access"}`. |
+| Auth0 | `https://<your-auth0-domain>/`, with the trailing slash | API identifier | Custom claims are namespaced; Auth0 Organizations put the organization in `org_id`. |
+| Okta | `https://<org>.okta.com/oauth2/default` or another custom authorization server | `api://default` or your API audience | Scopes arrive in `scp`. |
+| Microsoft Entra ID | `https://login.microsoftonline.com/<tenant-id>/v2.0` | The API's application (client) ID | Set the API's `requestedAccessTokenVersion` to 2 so access tokens use this issuer. Use a single-tenant issuer; `tid` holds the tenant. |
+| Google | `https://accounts.google.com` | Your OAuth client ID | Verifies Google ID tokens; Google access tokens are not JWTs. |
+| Workday or another OIDC provider | The `issuer` from its discovery document | The client ID or API audience it puts in tokens | Any provider that publishes discovery and a JWKS works. |
+
+`OidcBearerAuth` verifies tokens that clients already hold. It does not provide
+browser sign-in: there are no authorization-code redirects, callback routes,
+refresh tokens, or session cookies. For browser access, put an identity-aware
+proxy or your own login service in front of the server and have it forward the
+token as a bearer header. API clients and scripts can obtain tokens directly,
+for example with the client-credentials grant.
+
+The parts work on their own. `await auth.verify_token(token)` returns the
+verified claims or raises `OidcTokenError`, `await auth.verify_request(request)`
+does the same from a request's header, and `auth.auth_context(claims)` builds
+the `AuthContext`. `claims_mapper=` chooses what goes into
+`AuthContext.claims`; by default it keeps `iss`, `sub`, `aud`, `azp`,
+`client_id`, `scope`, `scp`, `exp`, and `iat`. `OidcSigningKeys` holds the
+discovery and key cache and can be shared by verifiers with different
+requirements. Pass `http_client=` (an `httpx.AsyncClient`) to send key fetches
+through your own proxy or transport.
 
 The command also assembles project identity, release identity, and durable
 Evals storage before it constructs the server. It reads `[project].name`,
@@ -247,6 +309,47 @@ trusted TLS-terminating ingress or reverse proxy with the backend listener
 restricted to that trusted network. Expose only HTTPS to customers and
 operators; neither bearer policy is safe over a directly exposed HTTP
 connection.
+
+### Customer and operator access with OIDC
+
+The service factory can take both policies from one OIDC provider. Share the key
+cache, take the tenant from a verified claim for customers, and require an
+operator scope for the control plane:
+
+```python
+from cayu.server import (
+    AuthenticatedAccess,
+    AuthenticatedProductAccess,
+    OidcBearerAuth,
+    OidcSigningKeys,
+)
+
+keys = OidcSigningKeys("https://example.okta.com/oauth2/default")
+customers = OidcBearerAuth(
+    issuer=keys.issuer,
+    audience="api://support-agent",
+    signing_keys=keys,
+    tenant_claim="org_id",
+)
+operators = OidcBearerAuth(
+    issuer=keys.issuer,
+    audience="api://support-agent",
+    signing_keys=keys,
+    required_scopes=["cayu:operate"],
+)
+
+product_access = AuthenticatedProductAccess(dependency=customers.product_dependency())
+operator_access = AuthenticatedAccess(dependency=operators)
+```
+
+`product_dependency()` returns a `ProductPrincipal` whose `tenant_id` and
+`subject_id` come only from the verified token. A token without a non-blank
+string tenant claim is rejected with 401; there is no default tenant. Pass
+`tenant_claim=` to `product_dependency()` to use a different claim than the
+verifier's own. `cayu check --deploy` treats this like any other
+`AuthenticatedProductAccess` and `AuthenticatedAccess`. Keep the two policies
+distinct, here with a scope; a separate audience also works. A customer token
+must not be able to reach the operator control plane.
 
 ## Migrate storage before starting a release
 

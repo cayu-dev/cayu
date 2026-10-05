@@ -138,6 +138,7 @@ _OPTIONAL_DISTRIBUTIONS = (
     "psycopg",
     "psycopg-pool",
     "pydantic-settings",
+    "pyjwt",
     "pypdf",
     "sse-starlette",
     "uvicorn",

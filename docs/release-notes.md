@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Add `OidcBearerAuth` and `OidcSigningKeys` to `cayu.server`, in the new
+  `cayu[oidc]` extra. They verify JWT bearer tokens from an OpenID Connect
+  provider (Cognito, Auth0, Okta, Entra ID, Google, Workday) against its
+  discovered JWKS, as a `[tool.cayu.serve].auth` target, an
+  `AuthenticatedAccess` dependency, or, through `product_dependency()`, an
+  `AuthenticatedProductAccess` dependency that takes the tenant from a verified
+  claim. `OidcBearerAuth.from_environment()` reads `CAYU_OIDC_ISSUER` and
+  `CAYU_OIDC_AUDIENCE`. Browser sign-in flows are not included.
 - Projects from `cayu new` can now be deployed with `cayu cloud init` and
   `cayu cloud deploy` and start. Every preset depends on `cayu[postgres,server]`,
   and the `agent` and `coding` presets set `[tool.cayu.serve].auth` to the new

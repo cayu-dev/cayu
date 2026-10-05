@@ -178,7 +178,9 @@ development or fail-closed placeholder access adapter rather than configured
 production authentication. Configure `AuthenticatedProductAccess` so its
 server-side dependency returns a trusted `ProductPrincipal`. Tenant identity
 must not come from the product request body, query, Cayu labels or metadata,
-model output, or tool input.
+model output, or tool input. For OIDC/JWT bearer tokens,
+`OidcBearerAuth(...).product_dependency(tenant_claim=...)` takes both from the
+verified token and rejects a token without the tenant claim.
 
 ## public-service-operator-access-unsafe
 

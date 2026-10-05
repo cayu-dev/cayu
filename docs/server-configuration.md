@@ -28,8 +28,28 @@ Basic-authentication realms are emitted in `WWW-Authenticate`. They must use
 visible ASCII characters; embedded quotes and backslashes are escaped as HTTP
 quoted-string content.
 
-Custom JWT, OIDC, session-cookie, or gateway authentication keeps using the
-existing callable dependency contract:
+For JWT bearer tokens from an OpenID Connect provider (Cognito, Auth0, Okta,
+Entra ID, Google, Workday, and others), use the built-in `OidcBearerAuth`
+from the `cayu[oidc]` extra. See
+[Verify OIDC bearer tokens](project-server.md#verify-oidc-bearer-tokens) for
+provider values and caching behavior:
+
+```python
+from cayu.server import OidcBearerAuth, ServerConfig
+
+auth = OidcBearerAuth(
+    issuer="https://login.microsoftonline.com/<tenant-id>/v2.0",
+    audience="<api-client-id>",
+    required_scopes=["Cayu.Operate"],
+)
+config = ServerConfig.protected(auth, deployment_name="production-eu")
+```
+
+It verifies bearer tokens that clients already hold; browser sign-in flows are
+not provided.
+
+Session-cookie, gateway, or other custom authentication keeps using the
+callable dependency contract:
 
 ```python
 from cayu.server import AuthenticatedAccess, ServerConfig

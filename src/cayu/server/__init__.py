@@ -106,6 +106,7 @@ try:
         normalize_dashboard_runtime_config,
     )
     from cayu.server.contracts import SERVER_API_PREFIX, validate_usage_rollup_price_book
+    from cayu.server.oidc import OidcBearerAuth, OidcSigningKeys, OidcTokenError
     from cayu.server.routes import create_router
     from cayu.server.service import (
         AuthenticatedProductAccess,
@@ -163,6 +164,9 @@ __all__ = [
     "DocsConfig",
     "EvalsConfig",
     "EvaluationPromotionConfig",
+    "OidcBearerAuth",
+    "OidcSigningKeys",
+    "OidcTokenError",
     "OpenAccess",
     "OperatorAccess",
     "PlaceholderOperatorAccess",
