@@ -19,6 +19,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Self, TypeVar, cast
 from uuid import uuid4
 
+from cayu import _application_context_views as context_views
 from cayu import _application_task_creation as task_creation
 from cayu._application_agent_registry import ApplicationAgentRegistry
 from cayu._application_agent_registry import (
@@ -658,8 +659,6 @@ from cayu.sessions.context_views import (
     ParticipantSessionExecutionRequest,
     RecipientSessionCreationReceipt,
     RecipientSessionCreationRequest,
-    context_view_artifact_ids,
-    context_view_attachments,
     json_commitment,
     project_context_view_extensions,
     require_independent_context_view_material,
@@ -4112,247 +4111,23 @@ class CayuApp:
     ) -> ContextViewManifest:
         """Publish an immutable view from authoritative completed-turn evidence."""
 
-        if type(request) is not ContextViewPublicationRequest:
-            raise TypeError("Context-view publication requires a typed request.")
-        from cayu.collaboration._preparation import prepare_contract
-
-        request = prepare_contract(
-            ContextViewPublicationRequest, request, redactor=self._secret_redactor
-        )
-        resource_references_json = (
-            None
-            if not request.resource_receipts
-            else canonical_bounded_durable_json_bytes(
-                [item.model_dump(mode="json") for item in request.resource_receipts],
-                "context view resources",
-                max_bytes=256 * 1024,
-                max_nodes=8192,
-                max_nesting=64,
-            ).decode()
-        )
-        if request.resource_receipts and not isinstance(resource_owner, LocalArtifactResourceOwner):
-            raise PermissionError("Context-view resources require their qualified source owner.")
-        if type(participant) is not ParticipantRef:
-            raise TypeError("Context-view publication requires a ParticipantRef.")
-        if self.session_store.context_view_version is None:
-            raise RuntimeError("The configured SessionStore does not support context views.")
-        source_session_id, _ = await self._resolve_public_session_authority(
-            request.source_session_id
-        )
-        request = request.model_copy(update={"source_session_id": source_session_id}, deep=True)
-        inspection = await self._participant_coordinator.inspect(
-            participant,
+        operation = context_views.publish_completed_context_view(
+            request,
+            participant=participant,
             context=context,
-            action="administration",
+            resource_owner=resource_owner,
+            session_store=self.session_store,
+            participants=self._participant_coordinator,
+            resolve_session=self._resolve_public_session_authority,
+            redactor=self._secret_redactor,
+            extensions=self._context_view_extensions,
+            project_extensions=self.project_context_view_extensions,
+            get_registered_environment=self._get_registered_environment_for_session,
+            get_registered_agent=self._get_registered_agent,
+            process_identity=self._execution_profile_process_identity,
         )
-        if inspection.participant.lifecycle != "active":
-            raise PermissionError("Only active participants can publish context views.")
-        lookup_publication = getattr(self.session_store, "lookup_context_view_publication", None)
-        if lookup_publication is None:
-            raise RuntimeError(
-                "The configured SessionStore cannot reconcile context-view publication."
-            )
-        existing_manifest = await lookup_publication(request.publication_key)
-        if existing_manifest is not None:
-            stored_extension_schema = tuple(
-                (extension.extension, extension.schema_version)
-                for extension in existing_manifest.extensions
-            )
-            current_extension_schema = tuple(
-                (extension.extension, extension.schema_version)
-                for extension in self._context_view_extensions
-            )
-            if (
-                existing_manifest.participant != participant
-                or existing_manifest.source_session_id != request.source_session_id
-                or existing_manifest.source_session_instance_id
-                != request.source_session_instance_id
-                or existing_manifest.view_id != request.view_id
-                or existing_manifest.interaction_id != request.interaction_id
-                or existing_manifest.boundary_id != request.boundary_id
-                or existing_manifest.projection_schema != request.projection_schema
-                or stored_extension_schema != current_extension_schema
-                or existing_manifest.resource_references_json != resource_references_json
-            ):
-                raise ValueError("Context-view publication key conflicts with its request.")
-            return existing_manifest
-        source = await self.session_store.capture_context_view_publication_source(
-            request.source_session_id
-        )
-        session = source.session
-        if session.instance_id != request.source_session_instance_id:
-            raise LookupError("The source session incarnation is unavailable.")
-        binding = source.binding
-        if binding.participant != participant:
-            raise PermissionError("The source session is not bound to this participant.")
-        for field_name in ("agent_name", "provider_name", "model", "environment_name"):
-            session_request_boundary.require_secret_free_session_authority(
-                getattr(session, field_name),
-                field_name=field_name,
-                redactor=self._secret_redactor,
-            )
-        pointer = source.pointer
-        completion_event = source.completion_event
-        assert completion_event.interaction_id is not None
-        if request.interaction_id != completion_event.interaction_id:
-            raise ValueError(
-                "The publication interaction identity conflicts with completion evidence."
-            )
-        if request.boundary_id != pointer.logical_step_id:
-            raise ValueError(
-                "The publication boundary identity conflicts with completion evidence."
-            )
-        records = source.records
-
-        required_artifacts = context_view_artifact_ids([record.message for record in records])
-        if not set(required_artifacts) <= {
-            item for receipt in request.resource_receipts for item in receipt.material_ids
-        }:
-            raise ValueError(
-                "Context-view publication requires independently qualified resource references."
-            )
-        messages_json = canonical_bounded_durable_json_bytes(
-            [record.message.model_dump(mode="json") for record in records],
-            "context view messages",
-            max_bytes=8 * 1024 * 1024,
-            max_nodes=8192,
-            max_nesting=64,
-        ).decode("utf-8")
-        # Extensions receive only the bounded historical projection source.
-        # Passing the executable Session model would expose invocation,
-        # metadata, leases, and other private authority to a producer even
-        # though none of it is eligible for a historical manifest.
-        # No application-owned executable context is published by this baseline
-        # projection.  ``null`` is explicit and committed rather than a mutable
-        # placeholder that could be mistaken for retained configuration.
-        application_context_json = None
-        historical_profile = source.execution_profile
-        historical_ancestry_json = canonical_bounded_durable_json_bytes(
-            {
-                "source_session_instance_id": session.instance_id,
-                "provider_name": session.provider_name,
-                "model": session.model,
-                "agent_name": session.agent_name,
-                "execution_profile": historical_profile.model_dump(mode="json"),
-                "runtime_build_fingerprint": session.runtime_build_fingerprint,
-                "creation_definition_json": binding.historical_definition_json,
-                "creation_definition_commitment": json_commitment(
-                    binding.historical_definition_json
-                ),
-            },
-            "historical ancestry",
-            max_bytes=256 * 1024,
-            max_nodes=8192,
-            max_nesting=64,
-        ).decode("utf-8")
-        causal_budget_ancestry_json = canonical_bounded_durable_json_bytes(
-            {"causal_budget_id": session.causal_budget_id},
-            "causal budget ancestry",
-            max_bytes=256 * 1024,
-            max_nodes=8192,
-            max_nesting=64,
-        ).decode("utf-8")
-        compaction_json = canonical_bounded_durable_json_bytes(
-            {
-                "state": "uncompacted",
-                "input_frontier": pointer.source_transcript_cursor,
-                "retained_output_frontier": source.transcript_end_cursor,
-                "retained_suffix_frontier": source.transcript_end_cursor,
-            },
-            "context view compaction relationship",
-            max_bytes=256 * 1024,
-            max_nodes=8192,
-            max_nesting=64,
-        ).decode("utf-8")
-        extension_source = ContextViewProjectionSource(
-            source_session_id=session.id,
-            source_session_instance_id=session.instance_id,
-            participant_json=canonical_bounded_durable_json_bytes(
-                participant.model_dump(mode="json"), "participant", max_bytes=8192, max_nodes=64
-            ).decode("utf-8"),
-            interaction_id=completion_event.interaction_id,
-            boundary_id=pointer.logical_step_id,
-            completion_event_id=pointer.completion_event_id,
-            source_transcript_cursor=pointer.source_transcript_cursor,
-            transcript_cursor=source.transcript_end_cursor,
-            messages_json=messages_json,
-            compaction_json=compaction_json,
-            historical_ancestry_json=historical_ancestry_json,
-        )
-        extension_records, extension_set_commitment = self.project_context_view_extensions(
-            extension_source
-        )
-        material = {
-            "schema_version": 1,
-            "source_owner": participant.owner.model_dump(mode="json"),
-            "participant": participant.model_dump(mode="json"),
-            "source_session_id": session.id,
-            "source_session_instance_id": session.instance_id,
-            "view_id": request.view_id,
-            "interaction_id": request.interaction_id,
-            "boundary_id": request.boundary_id,
-            "completion_event_id": pointer.completion_event_id,
-            "transcript_cursor": source.transcript_end_cursor,
-            "projection_schema": request.projection_schema,
-            "extension_set_commitment": extension_set_commitment,
-            "messages_json": messages_json,
-            "application_context_json": application_context_json,
-            "extensions": [record.model_dump(mode="json") for record in extension_records],
-            "historical_ancestry_json": historical_ancestry_json,
-            "causal_budget_ancestry_json": causal_budget_ancestry_json,
-            "resource_references_json": resource_references_json,
-            "compaction_json": compaction_json,
-            "messages_commitment": json_commitment(messages_json, "messages"),
-            "application_context_commitment": json_commitment(
-                application_context_json or "null", "application context"
-            ),
-        }
-        material["manifest_commitment"] = (
-            "sha256:"
-            + sha256(
-                canonical_bounded_durable_json_bytes(
-                    material,
-                    "context view manifest",
-                    max_bytes=8 * 1024 * 1024,
-                    max_nodes=8192,
-                    max_nesting=64,
-                )
-            ).hexdigest()
-        )
-        manifest = ContextViewManifest.model_validate(material)
-
-        async def publish():
-            return await self.session_store.publish_context_view(
-                manifest,
-                publication_key=request.publication_key,
-            )
-
-        if request.resource_receipts:
-            assert resource_owner is not None
-            from cayu.runtime._execution_profile_admission import (
-                require_historical_artifact_environment,
-            )
-
-            environment = self._get_registered_environment_for_session(session.environment_name)
-            require_historical_artifact_environment(
-                profile=source.execution_profile,
-                registered_environment=environment,
-                registered_agent=self._get_registered_agent(session.agent_name),
-                runtime_version=session.runtime_version,
-                process_identity=self._execution_profile_process_identity,
-                redactor=self._secret_redactor,
-            )
-            assert environment is not None
-            return await resource_owner._run_context_view_commit(
-                request.resource_receipts,
-                participant=participant,
-                attachments=context_view_attachments([record.message for record in records]),
-                artifact_store=environment.environment.artifact_store,
-                environment_name=environment.spec.name,
-                session_id=session.id,
-                operation=publish,
-            )
-        return await publish()
+        del request, participant, context, resource_owner
+        return await operation
 
     @_tracked_entrance
     async def transition_context_view_ownership(
@@ -4365,41 +4140,16 @@ class CayuApp:
     ):
         """Apply one authenticated, replay-safe context-view ownership transition."""
 
-        if type(request) is not ContextViewOwnershipRequest:
-            raise TypeError("Context-view ownership requires a typed request.")
-        if type(participant) is not ParticipantRef:
-            raise TypeError("Context-view ownership requires a ParticipantRef.")
-        if self.session_store.context_view_version is None:
-            raise RuntimeError("The configured SessionStore does not support context views.")
-        inspection = await self._participant_coordinator.inspect(
-            participant,
+        operation = context_views.transition_context_view_ownership(
+            request,
+            participant=participant,
+            destination_participant=destination_participant,
             context=context,
-            action="administration",
+            session_store=self.session_store,
+            participants=self._participant_coordinator,
         )
-        if inspection.participant.lifecycle != "active" and request.operation != "release":
-            raise PermissionError("Only active participants can change context-view ownership.")
-        if request.current_owner != participant.owner:
-            raise PermissionError("The authenticated participant is not the current owner.")
-        request = request.model_copy(update={"current_participant": participant}, deep=True)
-        if request.destination_owner is not None:
-            if (
-                destination_participant is None
-                or destination_participant.owner != request.destination_owner
-            ):
-                raise PermissionError(
-                    "The destination participant does not match the transfer owner."
-                )
-            destination_inspection = await self._participant_coordinator.inspect(
-                destination_participant,
-                context=context,
-                action="administration",
-            )
-            if destination_inspection.participant.lifecycle != "active":
-                raise PermissionError("Ownership cannot be transferred to an inactive participant.")
-            request = request.model_copy(
-                update={"destination_participant": destination_participant}, deep=True
-            )
-        return await self.session_store.transition_context_view_ownership(request)
+        del request, participant, destination_participant, context
+        return await operation
 
     @_tracked_entrance
     async def select_context_view(
@@ -4409,38 +4159,16 @@ class CayuApp:
         participant: ParticipantRef,
         context: CollaborationAccessContext,
     ):
-        if type(request) is not ContextViewSelectionRequest:
-            raise TypeError("Context-view selection requires a typed request.")
-        if type(participant) is not ParticipantRef:
-            raise TypeError("Context-view selection requires a ParticipantRef.")
-        if self.session_store.context_view_version is None:
-            raise RuntimeError("The configured SessionStore does not support context views.")
-        source_session_id, _ = await self._resolve_public_session_authority(
-            request.source_session_id
-        )
-        request = request.model_copy(update={"source_session_id": source_session_id}, deep=True)
-        inspection = await self._participant_coordinator.inspect(
-            participant,
+        operation = context_views.select_context_view(
+            request,
+            participant=participant,
             context=context,
-            action="administration",
+            session_store=self.session_store,
+            participants=self._participant_coordinator,
+            resolve_session=self._resolve_public_session_authority,
         )
-        if inspection.participant.lifecycle != "active":
-            raise PermissionError("Only active participants can select context views.")
-        if request.source_owner != participant.owner:
-            raise PermissionError("The authenticated participant does not own the source view.")
-        binding = await self.session_store.load_participant_session_binding(
-            request.source_session_id
-        )
-        if (
-            binding is None
-            or binding.participant != participant
-            or binding.session_id != request.source_session_id
-            or binding.session_instance_id != request.source_session_instance_id
-        ):
-            raise PermissionError(
-                "The source session is not bound to this participant incarnation."
-            )
-        return await self.session_store.select_context_view(request)
+        del request, participant, context
+        return await operation
 
     @_tracked_entrance
     async def read_context_view(
@@ -4451,34 +4179,17 @@ class CayuApp:
         participant: ParticipantRef,
         context: CollaborationAccessContext,
     ) -> ContextViewReadback:
-        if type(view_id) is not str or type(source_session_id) is not str:
-            raise TypeError("Context-view readback requires string identifiers.")
-        if type(participant) is not ParticipantRef:
-            raise TypeError("Context-view readback requires a ParticipantRef.")
-        if self.session_store.context_view_version is None:
-            raise RuntimeError("The configured SessionStore does not support context views.")
-        source_session_id, _ = await self._resolve_public_session_authority(source_session_id)
-        await self._participant_coordinator.inspect(
-            participant,
-            context=context,
-            action="readback",
-        )
-        readback = await self.session_store.read_context_view(
+        operation = context_views.read_context_view(
             view_id,
             source_session_id=source_session_id,
+            participant=participant,
+            context=context,
+            session_store=self.session_store,
+            participants=self._participant_coordinator,
+            resolve_session=self._resolve_public_session_authority,
         )
-        # A collaboration OwnerRef is shared by many participants. Historical
-        # owner events cannot authenticate a different participant incarnation.
-        events = await self.session_store.read_context_view_lifecycle_events(
-            view_id, limit=1, owner_participant=participant
-        )
-        authorized_participants = {
-            readback.view.participant,
-            *(event.owner_participant for event in events if event.owner_participant is not None),
-        }
-        if participant not in authorized_participants:
-            raise PermissionError("The authenticated participant does not own the source view.")
-        return readback
+        del view_id, source_session_id, participant, context
+        return await operation
 
     @_tracked_entrance
     async def read_context_view_lifecycle_events(
@@ -4490,41 +4201,18 @@ class CayuApp:
         context: CollaborationAccessContext,
         limit: int = 256,
     ):
-        if type(limit) is not int or not 1 <= limit <= 256:
-            raise ValueError("Context-view public event limits must be between 1 and 256.")
-        if type(view_id) is not str or type(source_session_id) is not str:
-            raise TypeError("Context-view event readback requires string identifiers.")
-        if type(participant) is not ParticipantRef:
-            raise TypeError("Context-view event readback requires a ParticipantRef.")
-        if self.session_store.context_view_version is None:
-            raise RuntimeError("The configured SessionStore does not support context views.")
-        source_session_id, _ = await self._resolve_public_session_authority(source_session_id)
-        await self._participant_coordinator.inspect(
-            participant,
-            context=context,
-            action="readback",
-        )
-        readback = await self.session_store.read_context_view(
+        operation = context_views.read_context_view_lifecycle_events(
             view_id,
             source_session_id=source_session_id,
+            participant=participant,
+            context=context,
+            limit=limit,
+            session_store=self.session_store,
+            participants=self._participant_coordinator,
+            resolve_session=self._resolve_public_session_authority,
         )
-        authority_events = await self.session_store.read_context_view_lifecycle_events(
-            view_id, limit=1, owner_participant=participant
-        )
-        authorized_participants = {
-            readback.view.participant,
-            *(
-                event.owner_participant
-                for event in authority_events
-                if event.owner_participant is not None
-            ),
-        }
-        if participant not in authorized_participants:
-            raise PermissionError("The authenticated participant does not own the view events.")
-        events = await self.session_store.read_context_view_lifecycle_events(view_id, limit=limit)
-        if not events:
-            raise LookupError("Context-view lifecycle evidence is unavailable.")
-        return events
+        del view_id, source_session_id, participant, context, limit
+        return await operation
 
     @property
     def budget_policy(self) -> BudgetPolicy | None:

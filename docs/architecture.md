@@ -225,6 +225,16 @@ their existing owners. `CayuApp` retains the public signatures and lifecycle
 tracking and releases request references before awaiting the operation so
 rejected sensitive input is not retained in its traceback.
 
+`_application_context_views.py` owns completed-view publication, ownership
+transitions, selection and authenticated readback. Its functions receive the
+session store, participant coordinator and session-identity resolver explicitly.
+Publication composes the existing historical projection and resource owners;
+views without resources need no environment or agent resolvers. Native stores
+retain snapshot capture, exact replay and transaction checks. `CayuApp` supplies
+registrations and projection hooks and keeps lifecycle tracking around each
+complete operation. The component can be used without constructing an application
+or loading execution controllers.
+
 ```text
 CayuApp
   -> RuntimeEventWriter
