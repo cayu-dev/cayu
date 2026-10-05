@@ -411,7 +411,9 @@ def test_openai_hosted_web_search_accepts_application_catalog_declaration() -> N
         transport=RecordingTransport(),
         model_catalog=_hosted_search_catalog(("gpt-6-app-catalog-test", False)),
     )
-    with pytest.raises(HostedToolCapabilityError, match="not established for model 'gpt-6-app-catalog-test'"):
+    with pytest.raises(
+        HostedToolCapabilityError, match="not established for model 'gpt-6-app-catalog-test'"
+    ):
         declared_false.preflight_hosted_tools(
             model="gpt-6-app-catalog-test",
             hosted_tools=(OpenAIWebSearch(),),
