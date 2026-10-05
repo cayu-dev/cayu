@@ -280,6 +280,7 @@ from cayu.knowledge.changes import (
     _knowledge_change_claim_sha256,
     _knowledge_change_identity,
     _knowledge_change_lease_seconds,
+    _knowledge_change_now,
     _validate_knowledge_change_limit,
     _validate_knowledge_change_sequence,
     copy_knowledge_change_claim,
@@ -319,6 +320,7 @@ from cayu.knowledge.indexing import (
     knowledge_chunk_embedding_identity,
 )
 from cayu.knowledge.maintenance_contracts import (
+    KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY,
     KnowledgeMaintenanceConflict,
     KnowledgeMaintenanceDecision,
     KnowledgeMaintenanceDecisionKind,
@@ -364,6 +366,7 @@ from cayu.knowledge.records import (
     _copy_entry_evidence,
     _knowledge_entry_id,
     _knowledge_publication_operation_id,
+    _knowledge_semantic_watch_identity,
     _next_knowledge_revision,
     _validate_knowledge_revision,
     _validate_positive_int,
@@ -903,11 +906,6 @@ from cayu.storage._task_group_schema import (
 )
 from cayu.storage._task_scheduling_schema import POSTGRES_SCHEDULING_DDL
 from cayu.storage.knowledge_transition import require_empty_knowledge_revision_transition
-from cayu.storage.memory import (
-    KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY,
-    _knowledge_change_now,
-    _knowledge_semantic_watch_identity,
-)
 from cayu.tasks import _verified_work_policy as verified_work_support
 from cayu.tasks._scheduling import (
     admitted_schedule,

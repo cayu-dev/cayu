@@ -305,7 +305,13 @@ assert not {"cayu.storage.memory", "cayu.storage.knowledge_sqlite", "cayu.storag
 
 
 def test_query_rules_have_one_owner_and_resolvable_annotations():
-    from cayu.storage import knowledge_sqlite, memory, postgres
+    from cayu.storage import (
+        knowledge_embedding_memory,
+        knowledge_memory,
+        knowledge_sqlite,
+        memory,
+        postgres,
+    )
 
     for name in (
         "_entry_matches_query",
@@ -319,7 +325,8 @@ def test_query_rules_have_one_owner_and_resolvable_annotations():
         assert canonical.__module__ == rules.__name__
         assert not hasattr(memory, name)
         get_type_hints(canonical)
-    assert memory._query_rules is rules
+    assert knowledge_memory._query_rules is rules
+    assert knowledge_embedding_memory._query_rules is rules
     assert (
         knowledge_sqlite._validate_knowledge_search_frontier
         is rules._validate_knowledge_search_frontier

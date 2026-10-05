@@ -112,6 +112,7 @@ from cayu.knowledge.changes import (
     _knowledge_change_claim_sha256,
     _knowledge_change_identity,
     _knowledge_change_lease_seconds,
+    _knowledge_change_now,
     _validate_knowledge_change_limit,
     _validate_knowledge_change_sequence,
     copy_knowledge_change_claim,
@@ -136,6 +137,7 @@ from cayu.knowledge.indexing import (
     copy_knowledge_index_readiness_update,
 )
 from cayu.knowledge.maintenance_contracts import (
+    KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY,
     KnowledgeMaintenanceConflict,
     KnowledgeMaintenanceDecision,
     KnowledgeMaintenanceDecisionKind,
@@ -179,6 +181,7 @@ from cayu.knowledge.records import (
     _copy_entry_evidence,
     _knowledge_entry_id,
     _knowledge_publication_operation_id,
+    _knowledge_semantic_watch_identity,
     _next_knowledge_revision,
     _validate_knowledge_revision,
     copy_knowledge_chunk,
@@ -234,11 +237,6 @@ from cayu.storage._knowledge_closure import (
     copy_knowledge_closure_query,
 )
 from cayu.storage._phase_timing import TimedStoreLock
-from cayu.storage.memory import (
-    KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY,
-    _knowledge_change_now,
-    _knowledge_semantic_watch_identity,
-)
 from cayu.storage.targets import require_sqlite_store_allowed
 
 _SEARCH_TOKEN_RE = re.compile(r"\w+")

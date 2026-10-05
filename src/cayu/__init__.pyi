@@ -2641,6 +2641,9 @@ from cayu.knowledge.maintenance import (
     KnowledgeMaintenanceSignalKind as KnowledgeMaintenanceSignalKind,
 )
 from cayu.knowledge.maintenance_contracts import (
+    KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY as KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY,
+)
+from cayu.knowledge.maintenance_contracts import (
     MAX_KNOWLEDGE_MAINTENANCE_BYTES as MAX_KNOWLEDGE_MAINTENANCE_BYTES,
 )
 from cayu.knowledge.maintenance_contracts import (
@@ -4448,6 +4451,9 @@ from cayu.storage.collaboration_postgres import (
 from cayu.storage.collaboration_sqlite import SQLiteCollaborationStore as SQLiteCollaborationStore
 from cayu.storage.evals_postgres import PostgresEvalStore as PostgresEvalStore
 from cayu.storage.event_watchers import SQLiteEventWatcherStore as SQLiteEventWatcherStore
+from cayu.storage.knowledge_embedding_memory import (
+    InMemoryEmbeddingKnowledgeStore as InMemoryEmbeddingKnowledgeStore,
+)
 from cayu.storage.knowledge_indexer import (
     DEFAULT_KNOWLEDGE_CHUNK_OVERLAP_BYTES as DEFAULT_KNOWLEDGE_CHUNK_OVERLAP_BYTES,
 )
@@ -4460,13 +4466,9 @@ from cayu.storage.knowledge_indexer import (
 from cayu.storage.knowledge_indexer import KnowledgeIndexer as KnowledgeIndexer
 from cayu.storage.knowledge_indexer import KnowledgeIndexRequest as KnowledgeIndexRequest
 from cayu.storage.knowledge_indexer import KnowledgeIndexResult as KnowledgeIndexResult
+from cayu.storage.knowledge_memory import InMemoryKnowledgeStore as InMemoryKnowledgeStore
 from cayu.storage.knowledge_review import KnowledgeReviewWorkflow as KnowledgeReviewWorkflow
 from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore as SQLiteKnowledgeStore
-from cayu.storage.memory import (
-    KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY as KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY,
-)
-from cayu.storage.memory import InMemoryEmbeddingKnowledgeStore as InMemoryEmbeddingKnowledgeStore
-from cayu.storage.memory import InMemoryKnowledgeStore as InMemoryKnowledgeStore
 from cayu.storage.postgres import PostgresAgentWorkContextStore as PostgresAgentWorkContextStore
 from cayu.storage.postgres import PostgresBudgetLedger as PostgresBudgetLedger
 from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore as PostgresEmbeddingKnowledgeStore

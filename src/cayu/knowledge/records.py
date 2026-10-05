@@ -751,3 +751,7 @@ def _copy_entry_evidence(
             raise ValueError("Knowledge evidence ids must be unique within a revision.")
         seen_ids.add(item.id)
     return sorted(copied, key=lambda item: item.id)
+
+
+def _knowledge_semantic_watch_identity(value: str, field_name: str) -> str:
+    return _bounded_knowledge_identity(value, field_name, max_bytes=256)

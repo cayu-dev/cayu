@@ -2741,10 +2741,13 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "InMemoryBrowserProfileStore": ("cayu.browser_profiles", "InMemoryBrowserProfileStore"),
     "InMemoryBudgetLedger": ("cayu.budgets.base", "InMemoryBudgetLedger"),
     "InMemoryBudgetStore": ("cayu.budgets.base", "InMemoryBudgetStore"),
-    "InMemoryEmbeddingKnowledgeStore": ("cayu.storage.memory", "InMemoryEmbeddingKnowledgeStore"),
+    "InMemoryEmbeddingKnowledgeStore": (
+        "cayu.storage.knowledge_embedding_memory",
+        "InMemoryEmbeddingKnowledgeStore",
+    ),
     "InMemoryEvalStore": ("cayu.evals.store", "InMemoryEvalStore"),
     "InMemoryEventWatcherStore": ("cayu.observability.watchers", "InMemoryEventWatcherStore"),
-    "InMemoryKnowledgeStore": ("cayu.storage.memory", "InMemoryKnowledgeStore"),
+    "InMemoryKnowledgeStore": ("cayu.storage.knowledge_memory", "InMemoryKnowledgeStore"),
     "InMemoryMemoryInterventionExecutionStore": (
         "cayu.memory.execution",
         "InMemoryMemoryInterventionExecutionStore",
@@ -2819,7 +2822,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "KNOWLEDGE_MAINTENANCE_DETERMINISTIC_EVALUATOR_VERSION",
     ),
     "KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY": (
-        "cayu.storage.memory",
+        "cayu.knowledge.maintenance_contracts",
         "KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY",
     ),
     "KNOWLEDGE_MAINTENANCE_PLANNING_SCHEMA_VERSION": (

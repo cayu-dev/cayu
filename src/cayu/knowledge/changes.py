@@ -418,3 +418,10 @@ def _initialize_knowledge_change_consumer_state(
             "updated_at": now,
         }
     )
+
+
+def _knowledge_change_now(value: datetime | None) -> datetime:
+    result = datetime.now(UTC) if value is None else value
+    if result.tzinfo is None or result.utcoffset() is None:
+        raise ValueError("`now` must be timezone-aware.")
+    return result.astimezone(UTC)

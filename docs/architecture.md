@@ -628,6 +628,15 @@ router/planner can be used without loading a storage implementation.
 and optional-operation refusals. Custom stores can implement it without loading
 a built-in backend. Resource constraints still intersect through `knowledge/access.py`;
 backend access checks and atomic persistence operations remain with each store.
+`storage/knowledge_memory.py` owns the ordinary in-memory knowledge backend,
+including its list facets and update timestamps. The optional embedding subclass,
+stored vectors and similarity helpers live in `storage/knowledge_embedding_memory.py`.
+It inherits the ordinary backend and composes the same knowledge contracts and rules.
+`storage/memory.py` retains the existing import surface. Shared change-time and
+operation-identity validation live in `knowledge/changes.py` and `knowledge/records.py`;
+the governance metadata key belongs to `knowledge/maintenance_contracts.py`.
+SQL backends and knowledge services import those owners directly. The ordinary
+store retains synchronous preparation and mutation without added awaits or locks.
 `knowledge/_access_rules.py` owns shared authorization snapshots, change audiences
 and access decisions for entries, relations, maintenance and activation history.
 Memory, SQLite and PostgreSQL call these rules inside their existing storage

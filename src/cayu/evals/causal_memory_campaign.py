@@ -165,7 +165,7 @@ from cayu.snapshots.base import (
     execution_profile_snapshot_ref,
 )
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
-from cayu.storage.memory import InMemoryKnowledgeStore
+from cayu.storage.knowledge_memory import InMemoryKnowledgeStore
 from cayu.storage.sqlite import SQLiteSessionStore
 
 CAUSAL_MEMORY_CAMPAIGN_TARGET_KEY = "causal-memory-reference"

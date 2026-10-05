@@ -173,8 +173,8 @@ _SCHEMALESS_STORE_IDENTITIES = frozenset(
         ("cayu.observability.watchers", "InMemoryEventWatcherStore"),
         ("cayu.sessions.base", "InMemorySessionStore"),
         ("cayu.tasks.base", "InMemoryTaskStore"),
-        ("cayu.storage.memory", "InMemoryEmbeddingKnowledgeStore"),
-        ("cayu.storage.memory", "InMemoryKnowledgeStore"),
+        ("cayu.storage.knowledge_embedding_memory", "InMemoryEmbeddingKnowledgeStore"),
+        ("cayu.storage.knowledge_memory", "InMemoryKnowledgeStore"),
     }
 )
 

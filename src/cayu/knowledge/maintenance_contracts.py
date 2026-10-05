@@ -29,6 +29,8 @@ from cayu.knowledge.relations import (
 )
 from cayu.knowledge.scopes import KnowledgeAccessScope, copy_knowledge_access_scope
 
+KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY = "cayu_knowledge_maintenance_governance"
+
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 MAX_KNOWLEDGE_MAINTENANCE_SOURCES = 50

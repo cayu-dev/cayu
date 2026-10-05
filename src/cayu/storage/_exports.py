@@ -22,8 +22,11 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "DEFAULT_KNOWLEDGE_LIMIT": ("cayu.knowledge.records", "DEFAULT_KNOWLEDGE_LIMIT"),
     "DEFAULT_KNOWLEDGE_MAX_BYTES": ("cayu.knowledge.records", "DEFAULT_KNOWLEDGE_MAX_BYTES"),
     "DEFAULT_KNOWLEDGE_NAMESPACE": ("cayu.knowledge.records", "DEFAULT_KNOWLEDGE_NAMESPACE"),
-    "InMemoryEmbeddingKnowledgeStore": ("cayu.storage.memory", "InMemoryEmbeddingKnowledgeStore"),
-    "InMemoryKnowledgeStore": ("cayu.storage.memory", "InMemoryKnowledgeStore"),
+    "InMemoryEmbeddingKnowledgeStore": (
+        "cayu.storage.knowledge_embedding_memory",
+        "InMemoryEmbeddingKnowledgeStore",
+    ),
+    "InMemoryKnowledgeStore": ("cayu.storage.knowledge_memory", "InMemoryKnowledgeStore"),
     "KNOWLEDGE_CHUNK_TEXT_GENERATOR": ("cayu.knowledge.indexing", "KNOWLEDGE_CHUNK_TEXT_GENERATOR"),
     "KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION": (
         "cayu.knowledge.indexing",
