@@ -203,7 +203,7 @@ coding) calls `open_application_stores(configured_database_url(), sqlite_path=..
 at an absolute path under the project (`data/cayu.db`, or `.cayu/runtime/cayu.db`
 for coding). `[tool.cayu.session_store]` names that same local file for Cayu CLI
 tooling, and `CAYU_DATABASE_URL` overrides it for the app and the CLI alike. Every
-generated project depends on `cayu[postgres]`. `cayu new --database` is deprecated
+generated project depends on `cayu[postgres,server]`. `cayu new --database` is deprecated
 and ignored. The service preset keeps its product operation records (tenant
 authorization, claims, and settlement) in the same database with
 `product_operations=True`, so several service processes can share PostgreSQL.

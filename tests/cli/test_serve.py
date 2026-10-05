@@ -527,3 +527,95 @@ def test_dev_host_check_accepts_loopback_names(host: str) -> None:
 def test_dev_host_check_refuses_non_loopback_hosts(host: str) -> None:
     with pytest.raises(serve_cli.ServeError, match="non-loopback host"):
         serve_cli._require_loopback_dev_host(host)
+
+
+def _write_scaffold(root: Path, name: str, *, preset: str = "agent") -> None:
+    for relative, content in project_files(name, preset=preset).items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+
+@pytest.fixture
+def _memory_evidence_key(monkeypatch) -> None:
+    # `cayu new` writes this private key file; project_files() does not.
+    monkeypatch.setenv("CAYU_MEMORY_EVIDENCE_KEY", "k" * 64)
+
+
+@pytest.mark.usefixtures("_memory_evidence_key")
+def test_scaffolded_agent_serves_publicly_with_environment_operator_credentials(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _write_scaffold(tmp_path, "smoke-agent")
+    monkeypatch.setenv("CAYU_OPERATOR_USERNAME", "operator")
+    monkeypatch.setenv("CAYU_OPERATOR_PASSWORD", "secret-password")
+    monkeypatch.delitem(sys.modules, "cayu.server.environment_auth", raising=False)
+    launched: dict[str, Any] = {}
+    uvicorn = ModuleType("uvicorn")
+    uvicorn.run = lambda server, *, host, port: launched.update(  # type: ignore[attr-defined]
+        server=server,
+        host=host,
+        port=port,
+    )
+    monkeypatch.setitem(sys.modules, "uvicorn", uvicorn)
+    monkeypatch.chdir(tmp_path)
+
+    try:
+        assert main(["serve", "--host", "0.0.0.0", "--port", "8000"]) == 0
+    finally:
+        sys.modules.pop("cayu.server.environment_auth", None)
+
+    server = launched["server"]
+    assert server.state.cayu_server_config.access.kind == "authenticated"
+    with TestClient(server) as client:
+        assert client.get("/api/sessions").status_code == 401
+        assert client.get("/api/sessions", auth=("operator", "wrong")).status_code == 401
+        assert client.get("/api/sessions", auth=("operator", "secret-password")).status_code == 200
+
+
+@pytest.mark.usefixtures("_memory_evidence_key")
+def test_scaffolded_agent_refuses_to_serve_without_operator_credentials(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    _write_scaffold(tmp_path, "smoke-agent")
+    monkeypatch.delenv("CAYU_OPERATOR_USERNAME", raising=False)
+    monkeypatch.setenv("CAYU_OPERATOR_PASSWORD", "")
+    monkeypatch.delitem(sys.modules, "cayu.server.environment_auth", raising=False)
+    launched: list[Any] = []
+    uvicorn = ModuleType("uvicorn")
+    uvicorn.run = lambda server, *, host, port: launched.append(server)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "uvicorn", uvicorn)
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["serve", "--host", "0.0.0.0"]) == 1
+
+    error = capsys.readouterr().err
+    assert launched == []
+    assert "CAYU_OPERATOR_USERNAME and CAYU_OPERATOR_PASSWORD are unset or empty" in error
+    assert "`cayu serve --dev`" in error
+    assert "`cayu cloud service credentials --application APP`" in error
+
+    # Trusted local development still needs no credentials.
+    assert main(["serve", "--dev"]) == 0
+    assert len(launched) == 1
+
+
+def test_serve_refusal_names_the_ready_made_environment_auth_target(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.cayu]\nfactory = "unused:build_app"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["serve"]) == 1
+
+    error = capsys.readouterr().err
+    assert 'auth = "cayu.server.environment_auth:OPERATOR_BASIC_AUTH"' in error
+    assert "CAYU_OPERATOR_USERNAME and CAYU_OPERATOR_PASSWORD" in error

@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, cast
 
+from cayu._operator_credentials import OPERATOR_PASSWORD_VARIABLE, OPERATOR_USERNAME_VARIABLE
+
 SCAFFOLD_CONVENTION_VERSION = 1
 
 PresetName = Literal["agent", "service", "coding"]
@@ -130,6 +132,7 @@ PRESETS: tuple[PresetSpec, ...] = (
             "tasks",
         ),
         supported_executions=("none", "docker"),
+        environment=(OPERATOR_PASSWORD_VARIABLE, OPERATOR_USERNAME_VARIABLE),
     ),
     PresetSpec(
         name="service",
@@ -149,6 +152,7 @@ PRESETS: tuple[PresetSpec, ...] = (
             "evals",
         ),
         supported_executions=("none", "docker"),
+        environment=(OPERATOR_PASSWORD_VARIABLE, OPERATOR_USERNAME_VARIABLE),
     ),
 )
 
@@ -635,7 +639,8 @@ def _plan_environment(plan: ApplicationPlan) -> tuple[str, ...]:
 
 def _plan_dependencies(plan: ApplicationPlan) -> tuple[str, ...]:
     # Every project can switch to PostgreSQL through CAYU_DATABASE_URL.
-    dependencies = {"cayu[postgres]"}
+    # Every preset is served with `cayu serve`, which needs the server extra.
+    dependencies = {"cayu[postgres,server]"}
     for kind, name in (
         ("provider", plan.provider),
         ("execution", plan.execution),

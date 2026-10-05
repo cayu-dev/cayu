@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import base64
 import inspect
+import os
 import secrets
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from ipaddress import ip_address
-from typing import Any, cast
+from typing import Any, Self, cast
 
 from fastapi import Request  # noqa: TC002 - FastAPI inspects this annotation at runtime.
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from cayu._operator_credentials import (
+    OPERATOR_PASSWORD_VARIABLE,
+    OPERATOR_USERNAME_VARIABLE,
+)
 from cayu._validation import (
     copy_json_value,
     require_clean_nonblank,
@@ -120,12 +125,79 @@ def copy_auth_context(value: AuthContext | Mapping[str, Any]) -> AuthContext:
     raise TypeError("Server auth dependencies must return AuthContext or a compatible mapping.")
 
 
+class AuthConfigurationError(ValueError):
+    """Server authentication cannot be assembled from its configured inputs.
+
+    The message names the inputs to fix and never includes their values.
+    """
+
+
 class BasicAuth:
     """HTTP Basic authentication dependency for small self-hosted deployments.
 
     ``tenant``, when configured, is copied into ``AuthContext`` as authenticated
     actor provenance only. It does not scope or authorize access to Cayu data.
     """
+
+    @classmethod
+    def from_environment(
+        cls,
+        username_variable: str = OPERATOR_USERNAME_VARIABLE,
+        password_variable: str = OPERATOR_PASSWORD_VARIABLE,
+        *,
+        environ: Mapping[str, str] | None = None,
+        realm: str = "Cayu",
+        subject: str | None = None,
+        tenant: str | None = None,
+        claims: dict[str, Any] | None = None,
+    ) -> Self:
+        """Build Basic authentication from two environment variables.
+
+        The variables are read once, when this method is called. A variable that
+        is unset, empty, or whitespace-only raises ``AuthConfigurationError``;
+        there is no fallback to open access. Requests are checked exactly as by
+        the ``BasicAuth`` constructor, including constant-time comparison.
+
+        ``environ`` replaces ``os.environ`` as the source, for tests and for
+        callers that resolve secrets into a mapping first.
+        """
+
+        names = (
+            _require_variable_name(username_variable, "username_variable"),
+            _require_variable_name(password_variable, "password_variable"),
+        )
+        if names[0] == names[1]:
+            raise ValueError("username_variable and password_variable must differ.")
+        source: Mapping[str, str] = os.environ if environ is None else environ
+        values = tuple(source.get(name) for name in names)
+        missing = [
+            name
+            for name, value in zip(names, values, strict=True)
+            if not isinstance(value, str) or not value.strip()
+        ]
+        if missing:
+            raise AuthConfigurationError(_missing_credentials_message(names, missing))
+        username, password = cast("tuple[str, str]", values)
+        try:
+            _require_basic_auth_username(username)
+        except ValueError as exc:
+            raise AuthConfigurationError(
+                f"{names[0]} cannot be used as a Basic auth username: {exc}"
+            ) from None
+        try:
+            _require_basic_auth_text(password, "password")
+        except ValueError as exc:
+            raise AuthConfigurationError(
+                f"{names[1]} cannot be used as a Basic auth password: {exc}"
+            ) from None
+        return cls(
+            username=username,
+            password=password,
+            realm=realm,
+            subject=subject,
+            tenant=tenant,
+            claims=claims,
+        )
 
     def __init__(
         self,
@@ -221,6 +293,30 @@ def _is_loopback_host(host: str | None) -> bool:
         return ip_address(host.strip("[]")).is_loopback
     except ValueError:
         return False
+
+
+def _require_variable_name(value: str, field_name: str) -> str:
+    if type(value) is not str or not value or value != value.strip() or "=" in value:
+        raise ValueError(f"{field_name} must be a non-empty environment variable name.")
+    return value
+
+
+def _missing_credentials_message(names: tuple[str, str], missing: list[str]) -> str:
+    unset = " and ".join(missing)
+    verb = "is" if len(missing) == 1 else "are"
+    message = (
+        f"Basic authentication is not configured: {unset} {verb} unset or empty. "
+        f"Set both {names[0]} and {names[1]} before starting the server; it does not "
+        "fall back to open access. For trusted local development, run "
+        "`cayu serve --dev` instead."
+    )
+    if names == (OPERATOR_USERNAME_VARIABLE, OPERATOR_PASSWORD_VARIABLE):
+        message += (
+            " On Cayu Cloud these are provided to each Agent as secrets; read them with "
+            "`cayu cloud service credentials --application APP`, and make sure no "
+            "Agent environment variable overrides them with an empty value."
+        )
+    return message
 
 
 def _require_basic_auth_text(value: str, field_name: str) -> str:

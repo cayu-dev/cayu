@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Projects from `cayu new` can now be deployed with `cayu cloud init` and
+  `cayu cloud deploy` and start. Every preset depends on `cayu[postgres,server]`,
+  and the `agent` and `coding` presets set `[tool.cayu.serve].auth` to the new
+  ready-made target `cayu.server.environment_auth:OPERATOR_BASIC_AUTH`. It reads
+  HTTP Basic credentials from `CAYU_OPERATOR_USERNAME` and `CAYU_OPERATOR_PASSWORD`
+  when `cayu serve` starts and refuses to start if either is unset or empty;
+  `cayu serve --dev` is unchanged. `BasicAuth.from_environment(...)` builds the
+  same dependency from any two variables, and `AuthConfigurationError` reports
+  missing or invalid ones. `cayu cloud init` adds the `server` extra and an auth
+  target to an existing project that lacks them, never replaces a configured
+  auth target, and refuses with the exact edit when it cannot edit
+  `pyproject.toml` safely. It names the ready-made target only when the `cayu`
+  requirement excludes 0.8.1 and older, which lack it; otherwise it creates a
+  `server_auth.py` that builds `BasicAuth` from the same variables and works on
+  every release, and never overwrites an existing one. Existing projects keep
+  working; run `cayu cloud init` or add the two settings by hand before deploying.
 - `CayuApp.aclose()` now waits, without cancelling them, for store writes that
   outlived their owner's bounded wait, so they no longer land on a store that
   shutdown already closed. These are claim renewals from interruption cascades,

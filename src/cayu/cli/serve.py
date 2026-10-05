@@ -10,6 +10,11 @@ from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, cast
 
+from cayu._operator_credentials import (
+    ENVIRONMENT_OPERATOR_AUTH_TARGET,
+    OPERATOR_PASSWORD_VARIABLE,
+    OPERATOR_USERNAME_VARIABLE,
+)
 from cayu.cli._targets import TargetResolutionError, load_target
 from cayu.cli.project import (
     build_project_app,
@@ -86,7 +91,10 @@ def run_serve(args: argparse.Namespace) -> int:
         if project.service_target is None and not args.dev and auth_target is None:
             raise ServeError(
                 "Refusing to start an unauthenticated server. Pass --dev only for "
-                "trusted local development or configure an authentication target."
+                "trusted local development or configure an authentication target, "
+                "for example [tool.cayu.serve] auth = "
+                f'"{ENVIRONMENT_OPERATOR_AUTH_TARGET}", which reads '
+                f"{OPERATOR_USERNAME_VARIABLE} and {OPERATOR_PASSWORD_VARIABLE}."
             )
         with project_context(project.root):
             try:

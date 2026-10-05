@@ -241,9 +241,12 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert "_SCAFFOLDED_PROVIDER = None" in configuration_source
     assert 'os.environ.get("CAYU_PROVIDER", _SCAFFOLDED_PROVIDER)' in configuration_source
     pyproject = (proj / "pyproject.toml").read_text(encoding="utf-8")
-    assert f'dependencies = ["cayu[postgres]=={cayu_version}"]' in pyproject
+    assert f'dependencies = ["cayu[postgres,server]=={cayu_version}"]' in pyproject
     assert 'console = ["cayu[console]"]' not in pyproject
-    assert f'dev = ["cayu[postgres,server]=={cayu_version}", "pytest"]' in pyproject
+    assert 'dev = ["pytest"]' in pyproject
+    assert (
+        '[tool.cayu.serve]\nauth = "cayu.server.environment_auth:OPERATOR_BASIC_AUTH"' in pyproject
+    )
     assert '[tool.uv]\ncache-dir = ".cayu/uv-cache"' in pyproject
     assert (proj / ".gitignore").read_text(encoding="utf-8").startswith(".cayu/\n")
     assert '[tool.cayu]\nfactory = "app:build_app"' in pyproject
@@ -1830,6 +1833,7 @@ def test_cayu_new_service_emits_the_supported_secure_product_shell(
     assert 'dev = ["pytest", "ruff>=0.15.15,<0.16"]' in pyproject
     assert 'service_factory = "service:build_service"' in pyproject
     assert 'factory = "app:build_app"' in pyproject
+    assert "[tool.cayu.serve]" not in pyproject
 
     service_source = (project / "service.py").read_text(encoding="utf-8")
     settings_source = (project / "configuration/settings.py").read_text(encoding="utf-8")
@@ -2931,7 +2935,7 @@ def test_scaffold_from_a_source_checkout_points_the_project_at_it(
     receipt = capsys.readouterr().out
 
     document = tomllib.loads((tmp_path / "fromsource" / "pyproject.toml").read_text())
-    assert document["project"]["dependencies"] == ["cayu[postgres]==9.9.0"]
+    assert document["project"]["dependencies"] == ["cayu[postgres,server]==9.9.0"]
     assert document["tool"]["uv"]["sources"] == {
         "cayu": {"path": str(checkout_root), "editable": True}
     }
@@ -2946,7 +2950,7 @@ def test_scaffold_from_a_source_checkout_points_the_project_at_it(
     )
     coding_document = tomllib.loads(coding["pyproject.toml"])
     assert "sources" not in coding_document["tool"]["uv"]
-    assert coding_document["project"]["dependencies"][0] == "cayu[postgres]==9.9.0"
+    assert coding_document["project"]["dependencies"][0] == "cayu[postgres,server]==9.9.0"
 
 
 def test_scaffold_from_a_release_install_keeps_the_pypi_pin(
@@ -2963,10 +2967,7 @@ def test_scaffold_from_a_release_install_keeps_the_pypi_pin(
     receipt = capsys.readouterr().out
 
     document = tomllib.loads((tmp_path / "fromrelease" / "pyproject.toml").read_text())
-    assert document["project"]["dependencies"] == ["cayu[postgres]==1.2.3"]
-    assert document["project"]["optional-dependencies"]["dev"] == [
-        "cayu[postgres,server]==1.2.3",
-        "pytest",
-    ]
+    assert document["project"]["dependencies"] == ["cayu[postgres,server]==1.2.3"]
+    assert document["project"]["optional-dependencies"]["dev"] == ["pytest"]
     assert document["tool"]["uv"] == {"cache-dir": ".cayu/uv-cache"}
     assert "Cayu source:" not in receipt

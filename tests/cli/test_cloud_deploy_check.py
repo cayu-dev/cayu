@@ -109,6 +109,7 @@ def _service_project(root: Path, *, module: str = _SERVICE_MODULE) -> Path:
         """[project]
 name = "check-service"
 version = "0.1.0"
+dependencies = ["cayu[server]"]
 
 [tool.cayu]
 factory = "cloud_check_service:build_app"

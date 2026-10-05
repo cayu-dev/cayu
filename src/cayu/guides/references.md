@@ -260,7 +260,16 @@ deployment verification.
 The server extra provides an HTTP control plane over the same application and
 durable stores. A generated project's `dev` extra installs it; for trusted local
 inspection run `uv run cayu serve --dev` and open
-`http://127.0.0.1:8000/cayu/`. Use `mount_cayu(..., path="/cayu")` when an
+`http://127.0.0.1:8000/cayu/`. Without `--dev`, `cayu serve` requires the
+`[tool.cayu.serve].auth` target; generated agent and coding projects set it to
+`cayu.server.environment_auth:OPERATOR_BASIC_AUTH`, which reads
+`CAYU_OPERATOR_USERNAME` and `CAYU_OPERATOR_PASSWORD` at startup and refuses to
+start without them (on Cayu Cloud, `cayu cloud service credentials --application
+APP` shows them). The target may be any request-to-`AuthContext` dependency, such
+as `BasicAuth.from_environment(...)` with other variables or an OIDC/JWT check
+against your identity provider; it guards operator access to the control plane,
+not end-user product login, which belongs in the service preset's
+`AuthenticatedProductAccess`. Use `mount_cayu(..., path="/cayu")` when an
 existing FastAPI product owns the host server; that mount requires
 `AuthenticatedAccess(...)` on any public listener. Do not substitute client-IP
 or forwarded-header checks for authentication. Put authentication/authorization

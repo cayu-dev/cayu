@@ -11,6 +11,7 @@ import stat
 import subprocess
 import tarfile
 import threading
+import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -424,12 +425,14 @@ def test_cloud_init_generates_web_manifest_from_cayu_project(
 [project]
 name = "research-agent"
 version = "1.2.3"
+dependencies = ["cayu[postgres]==0.8.2"]
 
 [tool.cayu]
 factory = "research_agent:build_app"
 
 [tool.cayu.serve]
-access = "authenticated"
+startup_recovery_statuses = ["pending"]
+recovery_inactive_after_seconds = 900
 """.strip()
         + "\n"
     )
@@ -440,11 +443,29 @@ access = "authenticated"
     manifest_path = tmp_path / "cayu-cloud.toml"
     manifest = cloud_project.CloudProjectManifest.load(manifest_path)
     assert output["operation"] == "init"
+    serve = output["result"].pop("serve")
     assert output["result"] == {
         "application": "research-agent",
         "manifest": str(manifest_path),
         "name": "Research Agent",
         "runtime": "web",
+    }
+    assert serve["server_extra"] == {
+        "status": "added",
+        "requirement": "cayu[postgres,server]==0.8.2",
+    }
+    assert serve["auth"] == {
+        "status": "added",
+        "target": "cayu.server.environment_auth:OPERATOR_BASIC_AUTH",
+    }
+    assert serve["next_steps"] == ["uv lock"]
+    assert any("cayu cloud service credentials" in note for note in serve["notes"])
+    document = tomllib.loads((tmp_path / "pyproject.toml").read_text())
+    assert document["project"]["dependencies"] == ["cayu[postgres,server]==0.8.2"]
+    assert document["tool"]["cayu"]["serve"] == {
+        "auth": "cayu.server.environment_auth:OPERATOR_BASIC_AUTH",
+        "startup_recovery_statuses": ["pending"],
+        "recovery_inactive_after_seconds": 900,
     }
     assert manifest.entrypoint == "cayu serve --host 0.0.0.0 --port 8000"
     assert manifest.web == cloud_project.CloudWebProcess(

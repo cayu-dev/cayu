@@ -120,11 +120,8 @@ def maintenance_project_files(*, database: str = "postgres") -> dict[str, str]:
         .read_text()
         .replace("  # ty: ignore[unresolved-import]", "")
     )
-    # The application-owned API/operator host is deployed without dev groups.
-    # Keep the coding preset; this does not adopt the service execution owner.
-    files["pyproject.toml"] = _replace_once(
-        files["pyproject.toml"], '"cayu[postgres]==', '"cayu[postgres,server]=='
-    )
+    # The coding preset already ships the server extra for its deployed
+    # API/operator host; this does not adopt the service execution owner.
     files["pyproject.toml"] = _replace_once(
         files["pyproject.toml"],
         'factory = "app:build_app"',

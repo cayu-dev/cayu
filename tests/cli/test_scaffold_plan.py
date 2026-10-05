@@ -352,9 +352,7 @@ def test_every_plan_selects_its_database_at_runtime(preset: str) -> None:
     ]
     local_database = ".cayu/runtime/cayu.db" if preset == "coding" else "data/cayu.db"
 
-    assert pyproject["project"]["dependencies"][0].startswith(
-        "cayu[postgres,server]==" if preset == "service" else "cayu[postgres]=="
-    )
+    assert pyproject["project"]["dependencies"][0].startswith("cayu[postgres,server]==")
     assert "database" not in pyproject["tool"]["cayu"]["scaffold"]
     assert pyproject["tool"]["cayu"]["session_store"] == {
         "backend": "sqlite",
@@ -365,7 +363,7 @@ def test_every_plan_selects_its_database_at_runtime(preset: str) -> None:
     for fixed in ("SQLiteSessionStore", "PostgresSessionStore", "cayu-unconfigured"):
         assert fixed not in storage
     assert "SCAFFOLDED_DATABASE" not in files["configuration/settings.py"]
-    assert "cayu[postgres]" in plan.as_dict()["dependencies"][0]
+    assert "cayu[postgres,server]" in plan.as_dict()["dependencies"][0]
     assert "CAYU_DATABASE_URL" in plan.as_dict()["environment"]
     assert "database" not in plan.as_dict()["adapters"]
     for guidance in (files["README.md"], files["AGENTS.md"]):
@@ -419,6 +417,28 @@ def test_service_plan_declares_and_supplies_non_secret_auth_proof_environment() 
     )
     assert check.startswith("PRODUCT_AUTH_TOKENS_JSON=")
     assert "CAYU_OPERATOR_BEARER_TOKEN=local-operator-token" in check
+
+
+@pytest.mark.parametrize("preset", ("agent", "coding"))
+def test_served_plans_protect_cayu_serve_with_environment_operator_auth(preset: str) -> None:
+    plan = normalize_application_plan(name="app", agent_name="app", preset=preset)
+    pyproject = tomllib.loads(project_files("app", application_plan=plan)["pyproject.toml"])
+
+    assert pyproject["tool"]["cayu"]["serve"] == {
+        "auth": "cayu.server.environment_auth:OPERATOR_BASIC_AUTH"
+    }
+    assert pyproject["project"]["optional-dependencies"]["dev"][0] == "pytest"
+    payload = plan.as_dict()
+    assert {"CAYU_OPERATOR_USERNAME", "CAYU_OPERATOR_PASSWORD"} <= set(payload["environment"])
+    assert payload["dependencies"][0] == "cayu[postgres,server]"
+
+
+def test_service_plan_keeps_its_own_access_policies_instead_of_serve_auth() -> None:
+    plan = normalize_application_plan(name="service", agent_name="service", preset="service")
+    pyproject = tomllib.loads(project_files("service", application_plan=plan)["pyproject.toml"])
+
+    assert "serve" not in pyproject["tool"]["cayu"]
+    assert pyproject["tool"]["cayu"]["service_factory"] == "service:build_service"
 
 
 def test_docker_plan_puts_image_construction_before_runtime_verification() -> None:

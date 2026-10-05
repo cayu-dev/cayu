@@ -27,24 +27,12 @@ def main() -> int:
         if scaffold.returncode != 0:
             raise RuntimeError(scaffold.stdout + scaffold.stderr)
         project = root / "proof"
-        with (project / "pyproject.toml").open("a", encoding="utf-8") as config:
-            config.write('\n[tool.cayu.serve]\nauth = "server_auth:AUTH"\n')
-        (project / "server_auth.py").write_text(
-            """import os
-
-from cayu.server import BasicAuth
-
-AUTH = BasicAuth(
-    username="wheel-operator",
-    password=os.environ["CAYU_WHEEL_SMOKE_PASSWORD"],
-)
-""",
-            encoding="utf-8",
-        )
         nested = project / "nested" / "directory"
         nested.mkdir(parents=True)
         environment = os.environ.copy()
-        environment["CAYU_WHEEL_SMOKE_PASSWORD"] = "wheel-secret-password"
+        # Exercise the scaffold's own auth target with its deployment credentials.
+        environment["CAYU_OPERATOR_USERNAME"] = "wheel-operator"
+        environment["CAYU_OPERATOR_PASSWORD"] = "wheel-secret-password"
         process, port = _start_server(nested, environment)
         try:
             _require_status(f"http://127.0.0.1:{port}/api/sessions", expected=401)

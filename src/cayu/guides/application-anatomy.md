@@ -248,8 +248,12 @@ PostgreSQL when multiple active processes need sustained write concurrency.
 
 ## Dependency boundary
 
-Generated production dependencies use `cayu[postgres]`, so any project can switch
-to PostgreSQL through `CAYU_DATABASE_URL`. Interactive console support
+Generated production dependencies use `cayu[postgres,server]`, so any project can
+switch to PostgreSQL through `CAYU_DATABASE_URL` and run `cayu serve` in its
+deployment. Non-service presets also set `[tool.cayu.serve].auth` to
+`cayu.server.environment_auth:OPERATOR_BASIC_AUTH`, so a deployed `cayu serve`
+authenticates operators with `CAYU_OPERATOR_USERNAME` and `CAYU_OPERATOR_PASSWORD`
+and refuses to start without them. Interactive console support
 is an explicit development extra such as `cayu[console]`; a production process
 does not need to install REPL tooling merely because the project declares a
 factory.

@@ -17,6 +17,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from cayu._operator_credentials import (
+    ENVIRONMENT_OPERATOR_AUTH_TARGET,
+    OPERATOR_PASSWORD_VARIABLE,
+    OPERATOR_USERNAME_VARIABLE,
+)
 from cayu._version import package_version
 from cayu.cli._bounded_command import (
     BoundedCommandOutputOverflowError,
@@ -765,7 +770,7 @@ dev = __DEV_DEPENDENCIES__
 [tool.cayu]
 factory = "app:build_app"
 __SERVICE_FACTORY____EVAL_TARGET__
-[tool.cayu.session_store]
+__SERVE_AUTH__[tool.cayu.session_store]
 __SESSION_STORE__
 
 [tool.pytest.ini_options]
@@ -774,6 +779,43 @@ pythonpath = ["."]
 [tool.uv]
 cache-dir = ".cayu/uv-cache"
 __UV_SOURCES__"""
+
+_SERVE_AUTH = f"""# `cayu serve` requires {OPERATOR_USERNAME_VARIABLE} and {OPERATOR_PASSWORD_VARIABLE}
+# (HTTP Basic auth) and refuses to start without them. `cayu serve --dev` stays
+# open for trusted local development on a loopback host.
+[tool.cayu.serve]
+auth = "{ENVIRONMENT_OPERATOR_AUTH_TARGET}"
+
+"""
+
+_SERVE_DEPLOYMENT_README = f"""
+## Serve a deployment
+
+Without `--dev`, `cayu serve` requires operator credentials.
+`[tool.cayu.serve].auth` in `pyproject.toml` names
+`{ENVIRONMENT_OPERATOR_AUTH_TARGET}`, which reads HTTP Basic
+credentials from `{OPERATOR_USERNAME_VARIABLE}` and `{OPERATOR_PASSWORD_VARIABLE}` when the
+server starts. If either is unset or empty, the server refuses to start:
+
+```bash
+export {OPERATOR_USERNAME_VARIABLE}=operator
+export {OPERATOR_PASSWORD_VARIABLE}='replace-with-a-long-random-password'
+uv run --no-sync cayu serve --host 0.0.0.0
+```
+
+The listener uses plain HTTP; expose it only through a trusted TLS-terminating
+proxy. On Cayu Cloud, `cayu cloud init` writes this same `cayu serve` command,
+Cloud provides both variables to each Agent, and
+`cayu cloud service credentials --application APP` shows them. To use another
+identity source, point `auth` at your own auth dependency, for example one built
+with `BasicAuth.from_environment(...)` (`uv run --no-sync cayu guide references#server`).
+"""
+
+_SERVE_DEPLOYMENT_AGENTS = f"""- Deployed control plane: `cayu serve` without `--dev` authenticates operators with
+  `{OPERATOR_USERNAME_VARIABLE}` and `{OPERATOR_PASSWORD_VARIABLE}` through
+  `[tool.cayu.serve].auth` and refuses to start without them. Keep that setting
+  unless you replace it with another authentication dependency; never remove it.
+"""
 
 _PROVIDER_GUIDE_POINTER = """OpenRouter is a first-class scaffold choice. Fireworks, Baseten, OpenCode Go,
 and other compatible endpoints work through Cayu's generic adapter. Run
@@ -837,7 +879,7 @@ choosing judge provider, model, privacy, and same-model policy.
 Never mount it with unauthenticated open access on a public listener;
 client-IP checks are not authentication. Public or deployed control-plane
 access requires an authenticated access policy.
-
+__SERVE_DEPLOYMENT_README__
 ## Run with a live provider
 
 Provider intent is explicit. This scaffold defaults to `__PROVIDER_DISPLAY__`;
@@ -986,7 +1028,7 @@ __DATABASE_AGENTS_PROOF_GUIDANCE__
 - Local developer/operator control plane: run `uv run --no-sync cayu serve --dev` in a separate
   terminal and open `http://127.0.0.1:8000/cayu/`. This is not the application's
   end-user UI or a production server configuration.
-- First Control Plane evaluation: `uv run --no-sync cayu guide evals-first`.
+__SERVE_DEPLOYMENT_AGENTS__- First Control Plane evaluation: `uv run --no-sync cayu guide evals-first`.
 - Never mount it with `OpenAccess()` on a public listener.
 - Client-IP and forwarded-header checks are not authentication. Use
   `AuthenticatedAccess(...)` for any public or deployed control-plane surface.
@@ -2751,10 +2793,9 @@ def _rendered_project_files(
         else ""
     )
     # Every project can switch to PostgreSQL through CAYU_DATABASE_URL.
-    runtime_extra = "[postgres,server]" if plan.preset == "service" else "[postgres]"
+    # Every preset is served with `cayu serve`, which needs the server extra at runtime.
+    runtime_extra = "[postgres,server]"
     dev_dependencies = ["pytest"]
-    if plan.preset != "service":
-        dev_dependencies.insert(0, f"cayu[postgres,server]=={version}")
     if plan.preset == "service" or (plan.preset == "coding" and plan.execution == "docker"):
         dev_dependencies.append("ruff>=0.15.15,<0.16")
 
@@ -2839,6 +2880,15 @@ def _rendered_project_files(
             "__UV_SOURCES__": uv_sources,
             "__SERVICE_FACTORY__": (
                 'service_factory = "service:build_service"\n' if plan.preset == "service" else ""
+            ),
+            # A public service owns its product and operator access policies; every
+            # other preset protects `cayu serve` with environment operator credentials.
+            "__SERVE_AUTH__": "" if plan.preset == "service" else _SERVE_AUTH,
+            "__SERVE_DEPLOYMENT_README__": (
+                "" if plan.preset == "service" else _SERVE_DEPLOYMENT_README
+            ),
+            "__SERVE_DEPLOYMENT_AGENTS__": (
+                "" if plan.preset == "service" else _SERVE_DEPLOYMENT_AGENTS
             ),
             "__EVAL_TARGET__": (
                 'eval_target = "evals.agent:build_eval"\n' if "evals" in plan.capabilities else ""

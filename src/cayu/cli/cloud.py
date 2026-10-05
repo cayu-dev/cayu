@@ -524,7 +524,12 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     initialize = commands.add_parser(
         "init",
         help="Generate cayu-cloud.toml.",
-        description="Generate cayu-cloud.toml from a Python Agent project.",
+        description=(
+            "Generate cayu-cloud.toml from a Python Agent project. For a `cayu serve` web "
+            "process, also add the cayu server extra and the environment operator auth "
+            "target to pyproject.toml when they are missing; an existing auth target is "
+            "never replaced."
+        ),
     )
     initialize.add_argument("path", nargs="?", default=Path("."), type=Path)
     initialize.add_argument(
@@ -714,6 +719,8 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
             "name": initialized.name,
             "runtime": initialized.runtime,
         }
+        if initialized.serve is not None:
+            result["serve"] = initialized.serve
         from cayu.cli._cloud_deploy_check import init_deploy_check_notice, run_cloud_deploy_check
 
         check = run_cloud_deploy_check(

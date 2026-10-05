@@ -77,7 +77,7 @@ try:
     from cayu.server._browser_client import browser_client_base_path, browser_client_router
     from cayu.server._diagnostics import SystemDiagnosticsSnapshot, dashboard_pricing_metadata
     from cayu.server._request_timing import RequestTimingMiddleware, RequestTimingRecorder
-    from cayu.server.auth import AuthContext, AuthDependency, BasicAuth
+    from cayu.server.auth import AuthConfigurationError, AuthContext, AuthDependency, BasicAuth
     from cayu.server.config import (
         DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS,
         DEFAULT_INTERRUPTION_SHUTDOWN_GRACE_SECONDS,
@@ -148,6 +148,7 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 __all__ = [
+    "AuthConfigurationError",
     "AuthContext",
     "AuthDependency",
     "AuthenticatedAccess",

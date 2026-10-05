@@ -19,7 +19,14 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
+from cayu._operator_credentials import (
+    ENVIRONMENT_OPERATOR_AUTH_TARGET,
+    LAST_RELEASE_WITHOUT_ENVIRONMENT_AUTH,
+    OPERATOR_PASSWORD_VARIABLE,
+    OPERATOR_USERNAME_VARIABLE,
+)
 from cayu.cli._cloud_api import CloudApiError
+from cayu.cli._serve_readiness import ServeSetupPlan, plan_serve_setup
 
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 _APPLICATION = re.compile(r"[a-z0-9][a-z0-9-]{6,61}[a-z0-9]\Z")
@@ -481,6 +488,7 @@ class InitializedCloudProject:
     manifest_path: Path
     name: str
     runtime: str
+    serve: dict[str, object] | None = None
 
 
 def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudProject:
@@ -522,9 +530,13 @@ def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudPr
     cayu = cayu if isinstance(cayu, dict) else {}
     workers = cayu.get("workers", {})
     scripts = project.get("scripts", {})
+    serve_setup: ServeSetupPlan | None = None
+    writes_auth_module = False
     if "serve" in cayu or isinstance(cayu.get("factory"), str):
         runtime = "web"
         command = "cayu serve --host 0.0.0.0 --port 8000"
+        serve_setup = _plan_init_serve_setup(pyproject_path)
+        writes_auth_module = _auth_module_needs_writing(root, serve_setup)
     elif isinstance(workers, dict) and len(workers) == 1:
         runtime = "worker"
         command = f"cayu worker {next(iter(workers))}"
@@ -542,6 +554,26 @@ def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudPr
         runtime=runtime,
     )
     CloudProjectManifest.loads(content)
+    if writes_auth_module:
+        assert serve_setup is not None and serve_setup.auth_module is not None
+        module_path = root / serve_setup.auth_module.path
+        try:
+            # Exclusive creation: never replace a file that appeared since planning.
+            with module_path.open("x", encoding="utf-8") as module_file:
+                module_file.write(serve_setup.auth_module.content)
+        except OSError as exc:
+            raise CloudApiError(
+                "project_unavailable",
+                f"Could not create {module_path} for `cayu serve`.",
+            ) from exc
+    if serve_setup is not None and serve_setup.updated_text is not None:
+        try:
+            pyproject_path.write_text(serve_setup.updated_text)
+        except OSError as exc:
+            raise CloudApiError(
+                "project_unavailable",
+                f"Could not update {pyproject_path} for `cayu serve`.",
+            ) from exc
     try:
         manifest_path.write_text(content)
     except OSError as exc:
@@ -554,7 +586,143 @@ def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudPr
         manifest_path=manifest_path,
         name=name or application,
         runtime=runtime,
+        serve=None
+        if serve_setup is None
+        else _serve_setup_report(serve_setup, created_auth_module=writes_auth_module),
     )
+
+
+def _plan_init_serve_setup(pyproject_path: Path) -> ServeSetupPlan:
+    """Make sure the `cayu serve` web process init writes can start on Cloud."""
+
+    setup = plan_serve_setup(pyproject_path.read_text(), root=pyproject_path.parent)
+    if setup.manual_edits:
+        edits = "\n".join(f"- {edit}" for edit in setup.manual_edits)
+        raise CloudApiError(
+            "serve_setup_required",
+            "cayu cloud init writes a `cayu serve` web process, which needs the "
+            "`server` extra of cayu and an authentication target to start outside "
+            f"--dev. It could not safely edit {pyproject_path}; make these edits, "
+            f"run `uv lock`, and rerun `cayu cloud init`:\n{edits}",
+        )
+    return setup
+
+
+def _auth_module_needs_writing(root: Path, setup: ServeSetupPlan) -> bool:
+    """Whether init must create the auth module; refuse if another file holds its name."""
+
+    module = setup.auth_module
+    if module is None:
+        return False
+    path = root / module.path
+    package = root / module.path.removesuffix(".py")
+    if not path.exists() and not path.is_symlink() and not package.exists():
+        return True
+    try:
+        identical = (
+            not path.is_symlink()
+            and path.is_file()
+            and not package.exists()
+            and path.read_text(encoding="utf-8") == module.content
+        )
+    except (OSError, UnicodeError):
+        identical = False
+    if identical:
+        return False
+    raise CloudApiError(
+        "serve_setup_required",
+        "cayu cloud init writes a `cayu serve` web process, which needs an "
+        "authentication target to start outside --dev. The declared cayu requirement "
+        f"allows cayu {LAST_RELEASE_WITHOUT_ENVIRONMENT_AUTH} or older, which lack "
+        f"{ENVIRONMENT_OPERATOR_AUTH_TARGET}, so init would create {module.path} for "
+        f"auth = {json.dumps(module.target)}, but {path if path.exists() else package} "
+        "already exists and init never replaces it. Either set [tool.cayu.serve].auth "
+        "to your own auth dependency, or make these edits, run `uv lock`, and set auth = "
+        f"{json.dumps(ENVIRONMENT_OPERATOR_AUTH_TARGET)}:\n"
+        + "\n".join(f"- {edit}" for edit in setup.environment_auth_upgrade),
+    )
+
+
+def _serve_setup_report(setup: ServeSetupPlan, *, created_auth_module: bool) -> dict[str, object]:
+    extra_added = setup.server_extra.status == "missing_extra"
+    auth_added = setup.auth.status == "missing"
+    module = setup.auth_module
+    report: dict[str, object] = {
+        "server_extra": {
+            "status": "added" if extra_added else "present",
+            "requirement": setup.server_extra.replacement
+            if extra_added
+            else setup.server_extra.requirement,
+        },
+        "auth": {
+            "status": "added"
+            if auth_added
+            else "service_factory"
+            if setup.auth.status == "service_factory"
+            else "kept",
+            "target": setup.auth_target if auth_added else setup.auth.target,
+        },
+        "pyproject_changes": list(setup.changes),
+        "next_steps": ["uv lock"] if extra_added else [],
+    }
+    if module is not None:
+        report["auth_module"] = {
+            "path": module.path,
+            "status": "created" if created_auth_module else "present",
+        }
+    notes: list[str] = []
+    if extra_added:
+        notes.append(
+            "Added the server extra to the cayu dependency. Run `uv lock` and commit "
+            "pyproject.toml and uv.lock; Cayu Cloud installs from uv.lock."
+        )
+    if auth_added and module is not None:
+        notes.append(
+            f"Set [tool.cayu.serve].auth to {module.target}, defined in {module.path}, "
+            "which builds BasicAuth from "
+            f"{OPERATOR_USERNAME_VARIABLE} and {OPERATOR_PASSWORD_VARIABLE}. The declared "
+            f"cayu requirement allows cayu {LAST_RELEASE_WITHOUT_ENVIRONMENT_AUTH} or "
+            f"older, which lack {ENVIRONMENT_OPERATOR_AUTH_TARGET}; this module works on "
+            f"every release. Commit {module.path}. Cayu Cloud provides both variables to "
+            "each Agent; read them with `cayu cloud service credentials --application APP`. "
+            "Run `cayu serve --dev` locally without them."
+        )
+    elif auth_added:
+        notes.append(
+            f"Set [tool.cayu.serve].auth to {ENVIRONMENT_OPERATOR_AUTH_TARGET}. Cayu "
+            f"Cloud provides {OPERATOR_USERNAME_VARIABLE} and {OPERATOR_PASSWORD_VARIABLE} "
+            "to each Agent; read them with `cayu cloud service credentials "
+            "--application APP`. Run `cayu serve --dev` locally without them."
+        )
+    elif setup.auth.target == ENVIRONMENT_OPERATOR_AUTH_TARGET and not (
+        setup.ships_environment_auth
+    ):
+        notes.append(
+            f"[tool.cayu.serve].auth names {ENVIRONMENT_OPERATOR_AUTH_TARGET}, but the "
+            f"declared cayu requirement allows cayu {LAST_RELEASE_WITHOUT_ENVIRONMENT_AUTH} "
+            "or older, which lack it, so `cayu serve` would not start. "
+            + " ".join(setup.environment_auth_upgrade)
+            + " Then run `uv lock`."
+        )
+    elif setup.auth.target == ENVIRONMENT_OPERATOR_AUTH_TARGET:
+        notes.append(
+            f"[tool.cayu.serve].auth already reads {OPERATOR_USERNAME_VARIABLE} and "
+            f"{OPERATOR_PASSWORD_VARIABLE}, which Cayu Cloud provides to each Agent; read "
+            "them with `cayu cloud service credentials --application APP`."
+        )
+    elif setup.auth.status == "configured":
+        notes.append(
+            f"Left the existing [tool.cayu.serve].auth target {setup.auth.target} "
+            f"unchanged. Cayu Cloud's {OPERATOR_USERNAME_VARIABLE} and "
+            f"{OPERATOR_PASSWORD_VARIABLE} are unused unless that target reads them."
+        )
+    else:
+        notes.append(
+            "The project's service_factory owns product and operator access; "
+            "[tool.cayu.serve].auth does not apply."
+        )
+    report["notes"] = notes
+    return report
 
 
 def _application_slug(value: str) -> str:
