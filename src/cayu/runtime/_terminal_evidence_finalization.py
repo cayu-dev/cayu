@@ -63,6 +63,7 @@ from cayu.runtime._terminal_finalization_lifetime import (
     InterruptionFinalization,
 )
 from cayu.runtime._tool_completion import recorded_terminal_tool_completion_payload
+from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._terminal_evidence import (
@@ -919,7 +920,7 @@ class TerminalEvidenceFinalization:
                 pending_interrupt_payload=pending_interrupt_payload,
             )
 
-        pending_approval = approval_support.pending_approval_from_checkpoint(
+        pending_approval = pending_approval_reader.pending_approval_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,

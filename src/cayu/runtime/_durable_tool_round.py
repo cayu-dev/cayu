@@ -63,6 +63,7 @@ from cayu.runtime._tool_round_staging import (
 )
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.runtime.stop_policy import StopDecision
+from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import Session, SessionStatus, SessionStore
@@ -1152,7 +1153,7 @@ class DurableToolRound:
                 continue
             tool_call = approval_support.tool_call_request_from_pending(pending_tool_call)
             if (
-                approval_support.effective_tool_policy_evidence(pending_tool_call)
+                pending_approval_reader.effective_tool_policy_evidence(pending_tool_call)
                 is ToolPolicyEvidence.UNEXPOSED
             ):
                 exposure = pending_round.tool_exposure
@@ -1336,7 +1337,7 @@ class DurableToolRound:
                 planned_outcomes.append(outcome)
                 planned_hook_states.append("finalized")
                 continue
-            policy_evidence = approval_support.effective_tool_policy_evidence(pending_call)
+            policy_evidence = pending_approval_reader.effective_tool_policy_evidence(pending_call)
             is_unexposed = policy_evidence is ToolPolicyEvidence.UNEXPOSED
             event_type = (
                 EventType.TOOL_CALL_BLOCKED

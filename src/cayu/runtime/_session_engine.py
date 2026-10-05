@@ -37,6 +37,7 @@ from cayu.runtime._work_attempt_invocation import (
     _WorkAttemptRecoveryAlreadyActive,
     _WorkAttemptRuntimeAuthority,
 )
+from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 
@@ -1018,7 +1019,7 @@ def _validate_fork_source_checkpoint_state(
             "resolve_user_input(...) first."
         )
     if (
-        approval_support.pending_approval_from_checkpoint(
+        pending_approval_reader.pending_approval_from_checkpoint(
             source_checkpoint,
             redactor=redactor,
             consume_on_rejection=True,
@@ -2818,7 +2819,7 @@ def _reject_unresumable_session_checkpoint(
             "resume, fork, and compaction fail closed. Start a new session."
         )
     if (
-        approval_support.pending_approval_from_checkpoint(
+        pending_approval_reader.pending_approval_from_checkpoint(
             checkpoint,
             redactor=redactor,
             consume_on_rejection=True,
@@ -4086,7 +4087,9 @@ def _checkpoint_with_pending_session_interrupt(
         if expected_interrupted_approval is not None:
             if redactor is None:
                 raise TypeError("Approval stop requires its runtime redactor.")
-            current_approval = approval_support.pending_approval_from_checkpoint(copied_checkpoint)
+            current_approval = pending_approval_reader.pending_approval_from_checkpoint(
+                copied_checkpoint
+            )
             approval_round = pending_round_reader.pending_tool_round_from_checkpoint(
                 copied_checkpoint
             )
@@ -4839,7 +4842,7 @@ def _pending_interaction_action_kind(
     if foreground_child_state_from_checkpoint(checkpoint)[0] is not None:
         return "waiting_on_child_action"
 
-    if approval_support.pending_approval_from_checkpoint(checkpoint) is not None:
+    if pending_approval_reader.pending_approval_from_checkpoint(checkpoint) is not None:
         return "tool_approval"
     if (
         user_input_lifecycle_authority_from_checkpoint(checkpoint, current_run_epoch=run_epoch)[0]
@@ -19155,7 +19158,7 @@ class SessionEngine:
         accepted_delegated_gate_kind: str | None = None
         if loaded_session.status == SessionStatus.INTERRUPTED:
             interrupted_checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
-            interrupted_pending_approval = approval_support.pending_approval_from_checkpoint(
+            interrupted_pending_approval = pending_approval_reader.pending_approval_from_checkpoint(
                 interrupted_checkpoint
             )
             interrupted_foreground_wait, _ = foreground_child_state_from_checkpoint(
@@ -19438,7 +19441,7 @@ class SessionEngine:
                     return None, None
             if interrupted_pending_approval is not None:
                 if (
-                    approval_support.pending_approval_from_checkpoint(interrupt_checkpoint)
+                    pending_approval_reader.pending_approval_from_checkpoint(interrupt_checkpoint)
                     != interrupted_pending_approval
                     or approval_support.approval_resolution_intent_from_checkpoint(
                         interrupt_checkpoint
@@ -20721,7 +20724,7 @@ class SessionEngine:
                 )
             _reject_prepared_prompt_transition_intent(updated_checkpoint)
             if (
-                approval_support.pending_approval_from_checkpoint(
+                pending_approval_reader.pending_approval_from_checkpoint(
                     updated_checkpoint,
                     redactor=self._secret_redactor,
                     consume_on_rejection=True,

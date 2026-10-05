@@ -216,6 +216,7 @@ from cayu.runtime.mcp_manifest_policy import (
 )
 from cayu.runtime.public_authority import parse_public_authority_alias
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
+from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._browser_control_checkpoint import (
@@ -2071,7 +2072,7 @@ class ToolRoundExecutor:
             tool_calls=tool_calls,
         )
         if (
-            approval_support.pending_approval_from_checkpoint(
+            pending_approval_reader.pending_approval_from_checkpoint(
                 checkpoint,
                 redactor=self._secret_redactor,
                 consume_on_rejection=True,
@@ -2108,7 +2109,7 @@ class ToolRoundExecutor:
                 tool_calls,
             ),
             secret_resolution_scope=(
-                approval_support.tool_round_secret_resolution_scope(pending_round)
+                pending_approval_reader.tool_round_secret_resolution_scope(pending_round)
             ),
             reason=(
                 None if policy_result.reason is None else redactor.redact_text(policy_result.reason)
@@ -2139,7 +2140,7 @@ class ToolRoundExecutor:
             approval.model_dump(mode="json"),
             redactor=redactor,
             field_name="pending_tool_approval",
-            schema_root=approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
+            schema_root=pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
         )
         planned_round = _planned_pending_tool_round(
             pending_round=pending_round,
@@ -2188,12 +2189,12 @@ class ToolRoundExecutor:
                 != source_round_payload
             ):
                 raise RuntimeError("Pending tool round changed before approval publication.")
-            if approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY in current:
+            if pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY in current:
                 raise RuntimeError("Session already has a pending tool approval.")
             if approval_support.APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY in current:
                 raise RuntimeError("Session has an orphaned approval resolution intent.")
             current[pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = planned_round_payload
-            current[approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY] = approval_payload
+            current[pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY] = approval_payload
             if recovered and _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY in current:
                 interrupt_payload = current[_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY]
                 if type(interrupt_payload) is not dict:
@@ -2232,7 +2233,7 @@ class ToolRoundExecutor:
                     agent_name=registered_agent.spec.name,
                     environment_name=_environment_name(registered_environment),
                     payload={
-                        "checkpoint": approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
+                        "checkpoint": pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
                         "approval_id": approval.approval_id,
                         "tool_call_id": approval.tool_call_id,
                         **tool_round_identity.payload(),
@@ -2350,7 +2351,7 @@ class ToolRoundExecutor:
             tool_calls=tool_calls,
         )
         if (
-            approval_support.pending_approval_from_checkpoint(
+            pending_approval_reader.pending_approval_from_checkpoint(
                 checkpoint,
                 redactor=self._secret_redactor,
                 consume_on_rejection=True,
@@ -2399,7 +2400,7 @@ class ToolRoundExecutor:
                 != source_round_payload
             ):
                 raise RuntimeError("Pending tool round changed before policy publication.")
-            if approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY in current:
+            if pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY in current:
                 raise RuntimeError("Session already has a pending tool approval.")
             if approval_support.APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY in current:
                 raise RuntimeError("Session has an orphaned approval resolution intent.")
@@ -2453,7 +2454,7 @@ class ToolRoundExecutor:
             tool_calls=tool_calls,
         )
         if (
-            approval_support.pending_approval_from_checkpoint(
+            pending_approval_reader.pending_approval_from_checkpoint(
                 checkpoint,
                 redactor=self._secret_redactor,
                 consume_on_rejection=True,
@@ -2704,7 +2705,7 @@ class ToolRoundExecutor:
         if checkpoint is None:
             return
         copied_checkpoint = copy_durable_record(checkpoint, "checkpoint")
-        pending_approval = approval_support.pending_approval_from_checkpoint(
+        pending_approval = pending_approval_reader.pending_approval_from_checkpoint(
             copied_checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
@@ -7577,8 +7578,8 @@ class ToolRoundRun:
 
         if planned_round is None:
             raise RuntimeError("Executable tool round has no durable policy plan.")
-        policy_output_secret_resolution_scope = approval_support.tool_round_secret_resolution_scope(
-            planned_round
+        policy_output_secret_resolution_scope = (
+            pending_approval_reader.tool_round_secret_resolution_scope(planned_round)
         )
         defer_round_terminals = (
             len(tool_calls) > 1 and policy_output_secret_resolution_scope != "static"

@@ -35,6 +35,7 @@ from cayu.runtime._durable_tool_round import (
 from cayu.runtime._durable_tool_round import (
     _interrupted_tool_round_results as _interrupted_tool_round_results,
 )
+from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 
@@ -825,7 +826,7 @@ def _checkpoint_with_legacy_approval_round(
     )
     if pending_round is not None:
         return checkpoint
-    current_approval = approval_support.pending_approval_from_checkpoint(
+    current_approval = pending_approval_reader.pending_approval_from_checkpoint(
         checkpoint,
         redactor=redactor,
     )
@@ -833,7 +834,9 @@ def _checkpoint_with_legacy_approval_round(
         raise RuntimeError("Pending tool approval changed before legacy round migration.")
     copied = {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
     copied[pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = (
-        approval_support.planned_tool_round_from_pending_approval(approval).model_dump(mode="json")
+        pending_approval_reader.planned_tool_round_from_pending_approval(approval).model_dump(
+            mode="json"
+        )
     )
     return copied
 
@@ -878,13 +881,16 @@ def _pending_round_policy_gate_call_id(
 
     for call in pending_round.tool_calls:
         if (
-            approval_support.effective_tool_policy_evidence(call)
+            pending_approval_reader.effective_tool_policy_evidence(call)
             is ToolPolicyEvidence.AUTHORITATIVE
             and call.policy_decision == ToolPolicyDecision.REQUIRE_APPROVAL.value
         ):
             return call.tool_call_id
     for call in pending_round.tool_calls:
-        if approval_support.effective_tool_policy_evidence(call) is ToolPolicyEvidence.AMBIGUOUS:
+        if (
+            pending_approval_reader.effective_tool_policy_evidence(call)
+            is ToolPolicyEvidence.AMBIGUOUS
+        ):
             return call.tool_call_id
     return None
 
@@ -1736,7 +1742,7 @@ class RecoveryCoordinator:
         policy = self._human_review_policy
         if policy is None:
             raise HumanReviewDenied()
-        approval = approval_support.pending_approval_from_checkpoint(
+        approval = pending_approval_reader.pending_approval_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
         )
@@ -1795,7 +1801,7 @@ class RecoveryCoordinator:
                 tool_name=call.tool_name,
                 on_grant=(
                     "withheld"
-                    if approval_support.effective_tool_policy_evidence(call)
+                    if pending_approval_reader.effective_tool_policy_evidence(call)
                     is not ToolPolicyEvidence.AUTHORITATIVE
                     else "denied"
                     if call.policy_decision == ToolPolicyDecision.DENY.value
@@ -1808,7 +1814,7 @@ class RecoveryCoordinator:
             for call in pending.tool_calls
         )
         executable = resolution_intent is None and all(
-            approval_support.effective_tool_policy_evidence(call)
+            pending_approval_reader.effective_tool_policy_evidence(call)
             is not ToolPolicyEvidence.AMBIGUOUS
             for call in pending.tool_calls
         )
@@ -3158,7 +3164,7 @@ class RecoveryCoordinator:
         pointer = model_completion_publication.model_step_publication_from_checkpoint(checkpoint)
         tool_receipt: RuntimePublicationReceipt | None = None
         pending_round = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
-        pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+        pending_approval = pending_approval_reader.pending_approval_from_checkpoint(checkpoint)
         pending_user_input, _resolution_intent = user_input_lifecycle_authority_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
@@ -5502,7 +5508,7 @@ class RecoveryCoordinator:
                 update={"loop_policies": policies}
             )
             checkpoint = await self._session_store.load_checkpoint(parent.id)
-            approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+            approval = pending_approval_reader.pending_approval_from_checkpoint(checkpoint)
             if approval is None:
                 raise SessionRunFenced("Foreground approval disappeared before continuation.")
             stream = self._resolve_tool_approval_owned(
@@ -7993,7 +7999,7 @@ class RecoveryCoordinator:
         self,
         checkpoint: dict[str, Any] | None,
     ) -> None:
-        pending_approval = approval_support.pending_approval_from_checkpoint(
+        pending_approval = pending_approval_reader.pending_approval_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
         )
@@ -8343,7 +8349,7 @@ class RecoveryCoordinator:
             loaded_session.environment_name
         )
         invocation_secrets.require_continuation_secret_resolution_compatibility(
-            approval_support.tool_round_secret_resolution_scope(pending_round),
+            pending_approval_reader.tool_round_secret_resolution_scope(pending_round),
             registered_environment,
         )
         pending_operator_interruption = (
@@ -9076,7 +9082,9 @@ class RecoveryCoordinator:
 
                 pending_call = pending_by_id[tool_call.id]
                 registered_tool = registered_agent.executable_tool(tool_call.name)
-                policy_evidence = approval_support.effective_tool_policy_evidence(pending_call)
+                policy_evidence = pending_approval_reader.effective_tool_policy_evidence(
+                    pending_call
+                )
                 policy_result = approval_support.policy_result_from_pending_tool_call(pending_call)
                 if tool_call.id == pending.tool_call_id:
                     if policy_evidence is not ToolPolicyEvidence.AUTHORITATIVE:
@@ -10299,7 +10307,7 @@ class RecoveryCoordinator:
                         continue
                     tool_call = approval_support.tool_call_request_from_pending(pending_tool_call)
                     pending_tool_calls.append(tool_call)
-                    policy_evidence = approval_support.effective_tool_policy_evidence(
+                    policy_evidence = pending_approval_reader.effective_tool_policy_evidence(
                         pending_tool_call
                     )
                     policy_result = approval_support.policy_result_from_pending_tool_call(
@@ -10442,7 +10450,9 @@ class RecoveryCoordinator:
                 policy_result = approval_support.policy_result_from_pending_tool_call(
                     pending_tool_call
                 )
-                policy_evidence = approval_support.effective_tool_policy_evidence(pending_tool_call)
+                policy_evidence = pending_approval_reader.effective_tool_policy_evidence(
+                    pending_tool_call
+                )
                 call_taint_labels = approval_support.taint_labels_from_pending_tool_call(
                     pending_tool_call
                 )
@@ -11173,7 +11183,7 @@ class RecoveryCoordinator:
             "model_step_id": approval.model_step_id,
             "model_attempt_id": approval.model_attempt_id,
             "tool_round_id": approval.tool_round_id,
-            "checkpoint": approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
+            "checkpoint": pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
             "approval_id": approval.approval_id,
             "tool_call_id": approval.tool_call_id,
             "cleared": True,
@@ -13687,8 +13697,8 @@ class RecoveryCoordinator:
             artifacts=request.artifacts,
             is_error=request.outcome == ToolApprovalRecoveryOutcome.FAILED,
         )
-        recovery_secret_resolution_scope = approval_support.tool_round_secret_resolution_scope(
-            pending_round
+        recovery_secret_resolution_scope = (
+            pending_approval_reader.tool_round_secret_resolution_scope(pending_round)
         )
         public_recovered_result = _public_manual_recovery_result(
             recovered_result,
@@ -14891,7 +14901,7 @@ class RecoveryCoordinator:
         if (
             call is None
             or call.policy_decision != ToolPolicyDecision.ALLOW.value
-            or approval_support.effective_tool_policy_evidence(call)
+            or pending_approval_reader.effective_tool_policy_evidence(call)
             is not ToolPolicyEvidence.AUTHORITATIVE
         ):
             return False
@@ -15709,7 +15719,7 @@ class RecoveryCoordinator:
                 and call.policy_decision == ToolPolicyDecision.REQUIRE_APPROVAL.value
                 for call in pending_round.tool_calls
             )
-            and approval_support.pending_approval_from_checkpoint(
+            and pending_approval_reader.pending_approval_from_checkpoint(
                 checkpoint,
                 redactor=self._secret_redactor,
             )
@@ -15799,13 +15809,13 @@ class RecoveryCoordinator:
         approval_required_calls = [
             call
             for call in pending_round.tool_calls
-            if approval_support.effective_tool_policy_evidence(call)
+            if pending_approval_reader.effective_tool_policy_evidence(call)
             is ToolPolicyEvidence.AUTHORITATIVE
             and call.policy_decision == ToolPolicyDecision.REQUIRE_APPROVAL.value
         ]
         if approval_required_calls:
             current_checkpoint = await self._session_store.load_checkpoint(session.id)
-            paired_approval = approval_support.pending_approval_from_checkpoint(
+            paired_approval = pending_approval_reader.pending_approval_from_checkpoint(
                 current_checkpoint,
                 redactor=self._secret_redactor,
             )
@@ -17527,7 +17537,7 @@ class RecoveryCoordinator:
         )
         if durable_child_guard is not None:
             return durable_child_guard
-        pending_approval = approval_support.pending_approval_from_checkpoint(
+        pending_approval = pending_approval_reader.pending_approval_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
@@ -21358,7 +21368,7 @@ class RecoveryCoordinator:
             checkpoint
         )
         provider_interrupt_payload = _provider_cancellation_interrupt_payload(checkpoint)
-        pending_approval = approval_support.pending_approval_from_checkpoint(
+        pending_approval = pending_approval_reader.pending_approval_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
@@ -21908,7 +21918,7 @@ class RecoveryCoordinator:
         ):
             events.append(copy_event(model_boundary.completion_event))
         checkpoint = await self._session_store.load_checkpoint(session.id)
-        pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+        pending_approval = pending_approval_reader.pending_approval_from_checkpoint(checkpoint)
         pending_user_input, _resolution_intent = user_input_lifecycle_authority_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
@@ -22237,7 +22247,7 @@ class RecoveryCoordinator:
                 raise
             session = await self._require_session(session.id)
             checkpoint = await self._session_store.load_checkpoint(session.id)
-            pending_approval = approval_support.pending_approval_from_checkpoint(
+            pending_approval = pending_approval_reader.pending_approval_from_checkpoint(
                 checkpoint,
                 redactor=self._secret_redactor,
                 consume_on_rejection=True,
@@ -22383,7 +22393,7 @@ class RecoveryCoordinator:
             session = await self._require_session(session.id)
             checkpoint = await self._session_store.load_checkpoint(session.id)
 
-        pending_approval = approval_support.pending_approval_from_checkpoint(
+        pending_approval = pending_approval_reader.pending_approval_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
@@ -23139,7 +23149,8 @@ class RecoveryCoordinator:
             pending_action_evidence_round_from_checkpoint(child_checkpoint)
             child_action_pending = (
                 child_action_pending
-                or approval_support.pending_approval_from_checkpoint(child_checkpoint) is not None
+                or pending_approval_reader.pending_approval_from_checkpoint(child_checkpoint)
+                is not None
                 or user_input_lifecycle_authority_from_checkpoint(
                     child_checkpoint, current_run_epoch=child.run_epoch
                 )[0]

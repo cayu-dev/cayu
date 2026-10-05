@@ -13,7 +13,7 @@ from cayu.approvals.user_input import (
     user_input_lifecycle_authority_from_checkpoint,
     user_input_resolution_intent_from_checkpoint,
 )
-from cayu.runtime._approval_support import pending_approval_from_checkpoint
+from cayu.sessions._pending_approval_reader import pending_approval_from_checkpoint
 from cayu.sessions._pending_tool_round import PendingToolRound
 from cayu.sessions._pending_tool_round_reader import pending_tool_round_from_checkpoint
 from cayu.sessions.pending_actions import (

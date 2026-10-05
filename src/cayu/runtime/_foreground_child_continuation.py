@@ -6,7 +6,6 @@ from hashlib import sha256
 from cayu._validation import canonical_durable_json_bytes
 from cayu.approvals.user_input import user_input_lifecycle_authority_from_checkpoint
 from cayu.events import Event, EventType
-from cayu.runtime import _approval_support as approval_support
 from cayu.runtime._child_session_identity import ChildSessionKind, generate_child_session_id
 from cayu.runtime._foreground_child_wait import (
     FOREGROUND_CHILD_WAIT_KEY,
@@ -18,6 +17,7 @@ from cayu.runtime._foreground_child_wait import (
     owned_delegated_wait,
 )
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
+from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_is_released,
@@ -203,7 +203,7 @@ async def deliver_foreground_child_terminal(
     # resumable human action. In particular, stopping an input pause can leave
     # such a round while closing the child interaction.
     pending_action_evidence_round_from_checkpoint(child_checkpoint)
-    approval = approval_support.pending_approval_from_checkpoint(child_checkpoint)
+    approval = pending_approval_reader.pending_approval_from_checkpoint(child_checkpoint)
     pending_input, _ = user_input_lifecycle_authority_from_checkpoint(
         child_checkpoint, current_run_epoch=child.run_epoch
     )

@@ -28,7 +28,7 @@ _RECOVERY: ContextVar[tuple[ContinuationTicket, InvocationContext] | None] = Con
 def require_resolved_native_pause(checkpoint) -> None:
     """A retained pause belongs to its native resolver, not whole-turn replay."""
     from cayu.approvals.user_input import PENDING_USER_INPUT_CHECKPOINT_KEY
-    from cayu.runtime._approval_support import PENDING_TOOL_APPROVAL_CHECKPOINT_KEY
+    from cayu.sessions._pending_approval_reader import PENDING_TOOL_APPROVAL_CHECKPOINT_KEY
     from cayu.sessions.external_waits import ExternalWaitUnavailable
 
     # Presence only refuses recovery; it grants no authority to interpret or

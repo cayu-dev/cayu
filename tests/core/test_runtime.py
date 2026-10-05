@@ -262,6 +262,7 @@ from cayu.runtime.execution_profiles import (
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
 from cayu.runtime.retry_policy import RetryPolicy
+from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._invocation_terminal_decision import (
@@ -1696,7 +1697,7 @@ async def _pending_tool_approval_from_public_event(
         )
     )[0]
     projected_approval = PendingToolApprovalEventView.from_event(private_event)
-    checkpoint_approval = approval_support_module.pending_approval_from_checkpoint(
+    checkpoint_approval = pending_approval_reader.pending_approval_from_checkpoint(
         await store.load_checkpoint(event.session_id)
     )
     assert checkpoint_approval is not None
@@ -65265,7 +65266,7 @@ def test_pending_tool_approval_rejects_checkpoint_without_explicit_publication_a
         ValueError,
         match="Pending tool approval checkpoint is invalid and cannot be executed",
     ):
-        approval_support_module.pending_approval_from_checkpoint(
+        pending_approval_reader.pending_approval_from_checkpoint(
             {"pending_tool_approval": payload},
             redactor=SecretRedactor(),
         )

@@ -7,6 +7,7 @@ from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval, T
 from cayu.approvals.user_input import PendingUserInput
 from cayu.events import Event, EventType
 from cayu.runtime import _approval_support as approval_support
+from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions._assistant_tool_round_publication import StagedToolCallTerminal
 from cayu.sessions._pending_tool_round import PendingToolRound
 from cayu.tools.base import ToolResult
@@ -439,11 +440,11 @@ def test_pending_approval_scope_requires_matching_paired_round_evidence() -> Non
         tool_calls=[_call()],
     )
 
-    assert not approval_support.pending_approval_scope_matches_round(
+    assert not pending_approval_reader.pending_approval_scope_matches_round(
         approval,
         pending_round,
     )
-    assert approval_support.pending_approval_scope_matches_round(
+    assert pending_approval_reader.pending_approval_scope_matches_round(
         approval.model_copy(update={"secret_resolution_scope": "unknown"}),
         pending_round,
     )

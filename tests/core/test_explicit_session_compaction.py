@@ -64,6 +64,7 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileMismatchError,
 )
 from cayu.runtime.retry_policy import RetryPolicy
+from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions.base import (
     CompactSessionRequest,
     EventQuery,
@@ -3959,7 +3960,6 @@ def test_compact_session_replays_original_outcome_after_session_advances() -> No
 
 def test_compact_session_replays_legacy_terminal_record_before_later_pending_state() -> None:
     from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
-    from cayu.runtime import _approval_support as approval_support
 
     async def run() -> None:
         store = InMemorySessionStore()
@@ -4027,7 +4027,7 @@ def test_compact_session_replays_legacy_terminal_record_before_later_pending_sta
                         }
                     },
                 },
-                approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY: pending.model_dump(
+                pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY: pending.model_dump(
                     mode="json"
                 ),
             },

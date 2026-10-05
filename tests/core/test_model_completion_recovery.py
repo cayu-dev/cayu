@@ -36,7 +36,6 @@ from cayu.configuration import DEFAULT_MAX_STEPS
 from cayu.events import Event, EventType
 from cayu.messages import Message, ToolCallPart, ToolResultPart
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_engine as session_engine
@@ -57,6 +56,7 @@ from cayu.runtime.execution_profiles import ExecutionProfileIdentity, ExecutionP
 from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions import _model_completion_publication as model_completion_publication
+from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import (
@@ -426,7 +426,7 @@ async def _private_pending_approval(
     store: InMemorySessionStore,
     session_id: str,
 ) -> PendingToolApproval:
-    pending = approval_support.pending_approval_from_checkpoint(
+    pending = pending_approval_reader.pending_approval_from_checkpoint(
         await store.load_checkpoint(session_id)
     )
     assert pending is not None
@@ -1960,7 +1960,7 @@ def test_resume_promotion_failure_keeps_input_private_until_restart_recovery() -
             IncompleteSessionRecoveryRequest(session_id=staged.session.id)
         )
         checkpoint_after_recovery = await store.load_checkpoint(staged.session.id)
-        pending_approval = approval_support.pending_approval_from_checkpoint(
+        pending_approval = pending_approval_reader.pending_approval_from_checkpoint(
             checkpoint_after_recovery
         )
         assert pending_approval is not None
@@ -2029,7 +2029,7 @@ def test_resume_promotion_failure_keeps_input_private_until_restart_recovery() -
     assert deferred_after_recovery.source_messages == [deferred_message]
     assert active_after_recovery is None
     checkpoint = asyncio.run(store.load_checkpoint(staged.session.id))
-    assert approval_support.pending_approval_from_checkpoint(checkpoint) is None
+    assert pending_approval_reader.pending_approval_from_checkpoint(checkpoint) is None
     assert pending_approval.tool_round_id == staged.pointer.tool_round_id
     assert resolution_events[-1].type is EventType.SESSION_COMPLETED
     assert len(provider.requests) == 1
@@ -2534,7 +2534,10 @@ def test_limit_approval_close_precommit_failure_reuses_bound_terminal_evidence()
 
     assert first[-1].type is EventType.SESSION_INTERRUPTED
     assert receipt_after_failure is None
-    assert approval_support.pending_approval_from_checkpoint(checkpoint_after_failure) is not None
+    assert (
+        pending_approval_reader.pending_approval_from_checkpoint(checkpoint_after_failure)
+        is not None
+    )
     assert EventType.SESSION_LIMIT_REACHED in [event.type for event in second]
     assert second[-1].type is EventType.SESSION_INTERRUPTED
     assert receipt is not None
@@ -2555,7 +2558,7 @@ def test_limit_approval_close_precommit_failure_reuses_bound_terminal_evidence()
         )
     )
     checkpoint = asyncio.run(store.load_checkpoint(staged.session.id))
-    assert approval_support.pending_approval_from_checkpoint(checkpoint) is None
+    assert pending_approval_reader.pending_approval_from_checkpoint(checkpoint) is None
     transcript = asyncio.run(store.load_transcript(staged.session.id))
     assert transcript[-1] == deferred_message
     assert transcript.count(deferred_message) == 1
@@ -2637,7 +2640,7 @@ def test_approval_close_cancellation_materializes_deferred_input_before_propagat
     transcript = asyncio.run(store.load_transcript(staged.session.id))
     session = asyncio.run(store.load(staged.session.id))
     assert receipt is not None
-    assert approval_support.pending_approval_from_checkpoint(checkpoint) is None
+    assert pending_approval_reader.pending_approval_from_checkpoint(checkpoint) is None
     assert session is not None and session.status is SessionStatus.INTERRUPTED
     assert [message.role.value for message in transcript] == [
         "user",

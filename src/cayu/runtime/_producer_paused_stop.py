@@ -1,10 +1,10 @@
 """Exact human-pause closure, serialized against native continuation."""
 
 from cayu.approvals.user_input import user_input_lifecycle_authority_from_checkpoint
-from cayu.runtime._approval_support import pending_approval_from_checkpoint
 from cayu.runtime._producer_release import release_from_snapshot
 from cayu.runtime._session_steering import require_steering_receipt, steering_operation_key
 from cayu.runtime.session_steering import SessionSteeringConflict, SessionSteeringReceipt
+from cayu.sessions._pending_approval_reader import pending_approval_from_checkpoint
 from cayu.sessions._producer_checkpoint import (
     ROOT_KEY,
     NativeProducerIndex,

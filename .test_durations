@@ -1,4 +1,6 @@
 {
+    "tests/core/test_pending_approval_reader_boundary.py::test_pending_approval_reader_composes_without_runtime_execution": 2.02,
+    "tests/core/test_pending_approval_reader_boundary.py::test_pending_approval_reader_has_one_owner_and_resolvable_annotations": 0.004,
     "tests/cli/test_coding_policy_coverage.py::test_maintained_wrapper_preserves_exact_base_coverage[guarded-cycle]": 0.007725292001850903,
     "tests/cli/test_coding_policy_coverage.py::test_maintained_wrapper_preserves_exact_base_coverage[mixed-cycle]": 0.009649001018260606,
     "tests/cli/test_coding_policy_coverage.py::test_maintained_wrapper_preserves_exact_base_coverage[nested-cycle]": 0.008287873992230743,

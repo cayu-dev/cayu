@@ -36,6 +36,7 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
+from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
@@ -47,9 +48,8 @@ from cayu.sessions.base import (
 from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools.base import ToolResult
 from cayu.tools.policy import ToolPolicyDecision, ToolPolicyResult
-from cayu.vaults.redaction import SecretRedactor, contains_redacted_secret
+from cayu.vaults.redaction import SecretRedactor
 
-PENDING_TOOL_APPROVAL_CHECKPOINT_KEY = "pending_tool_approval"
 APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY = "approval_resolution_intent"
 APPROVAL_INTERRUPT_CLOSE_INTENT_KEY = "approval_close_intent"
 
@@ -453,51 +453,6 @@ def bounded_pending_approval_event_payload(
     return result
 
 
-def tool_round_secret_resolution_scope(
-    pending_round: pending_rounds.PendingToolRound,
-) -> Literal["static", "dynamic", "unknown"]:
-    """Return positive durable secret-scope evidence for one tool round."""
-
-    if type(pending_round) is not pending_rounds.PendingToolRound:
-        raise TypeError("pending_round must be a PendingToolRound.")
-    publication = pending_round.assistant_publication
-    return "unknown" if publication is None else publication.secret_resolution_scope
-
-
-def pending_approval_scope_matches_round(
-    approval: PendingToolApproval,
-    pending_round: pending_rounds.PendingToolRound,
-) -> bool:
-    """Accept legacy unknown scope, otherwise require paired positive evidence."""
-
-    if type(approval) is not PendingToolApproval:
-        raise TypeError("approval must be a PendingToolApproval.")
-    round_scope = tool_round_secret_resolution_scope(pending_round)
-    return (
-        approval.secret_resolution_scope == "unknown"
-        or approval.secret_resolution_scope == round_scope
-    )
-
-
-def public_pending_approval_reason(
-    approval: PendingToolApproval,
-    *,
-    tool_call_id: str | None = None,
-) -> str | None:
-    """Return policy reason only with positive static-scope evidence."""
-
-    if type(approval) is not PendingToolApproval:
-        raise TypeError("approval must be a PendingToolApproval.")
-    if approval.publish_arguments is not True or approval.secret_resolution_scope != "static":
-        return None
-    if tool_call_id is None or tool_call_id == approval.tool_call_id:
-        return approval.reason
-    for call in approval.tool_calls:
-        if call.tool_call_id == tool_call_id:
-            return call.reason
-    return None
-
-
 def public_policy_denial_result(
     *,
     secret_resolution_scope: Literal["static", "dynamic", "unknown"],
@@ -527,40 +482,6 @@ def public_policy_denial_result(
     return ToolPolicyResult(decision=ToolPolicyDecision.DENY)
 
 
-def planned_tool_round_from_pending_approval(
-    approval: PendingToolApproval,
-) -> pending_rounds.PendingToolRound:
-    """Project the complete planned round carried by an approval checkpoint.
-
-    Releases before the paired-checkpoint contract stored the approval as the
-    only round authority. The approval already contains every call and its
-    policy decision, so it is sufficient positive evidence to reconstruct the
-    missing round during an atomic claim without re-running policy.
-    """
-
-    if type(approval) is not PendingToolApproval:
-        raise TypeError("Pending approval must be a PendingToolApproval.")
-    return pending_rounds.PendingToolRound(
-        tool_round_id=approval.tool_round_id,
-        model_step_id=approval.model_step_id,
-        model_attempt_id=approval.model_attempt_id,
-        agent_name=approval.agent_name,
-        environment_name=approval.environment_name,
-        task_id=approval.task_id,
-        execution_profile_fingerprint=approval.execution_profile_fingerprint,
-        tool_calls=approval.tool_calls,
-        policy_state="planned",
-        policy_context_version=1,
-        structured_output=approval.structured_output,
-        thinking=approval.thinking,
-        max_steps=approval.max_steps,
-        limits=approval.limits,
-        run_limit_accounting=approval.run_limit_accounting,
-        budget_limits=approval.budget_limits,
-        retry_policy=approval.retry_policy,
-    )
-
-
 async def checkpoint_without_pending_approval(
     session_store: SessionStore,
     session_id: str,
@@ -568,7 +489,7 @@ async def checkpoint_without_pending_approval(
     """Copy a session checkpoint without its pending approval marker."""
     checkpoint = await session_store.load_checkpoint(session_id)
     copied = {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
-    copied.pop(PENDING_TOOL_APPROVAL_CHECKPOINT_KEY, None)
+    copied.pop(pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY, None)
     copied.pop(APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY, None)
     return copied
 
@@ -581,7 +502,9 @@ def _checkpoint_with_exact_pending_approval_round(
     runtime_session: Session | None = None,
 ) -> dict[str, Any]:
     copied = {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
-    current_approval = pending_approval_from_checkpoint(copied, redactor=redactor)
+    current_approval = pending_approval_reader.pending_approval_from_checkpoint(
+        copied, redactor=redactor
+    )
     if current_approval != approval:
         raise RuntimeError("Pending tool approval changed before exact checkpoint clearing.")
     current_round = pending_round_reader.pending_tool_round_from_checkpoint(
@@ -620,7 +543,7 @@ def checkpoint_without_exact_pending_approval(
         redactor=redactor,
         runtime_session=runtime_session,
     )
-    copied.pop(PENDING_TOOL_APPROVAL_CHECKPOINT_KEY)
+    copied.pop(pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY)
     copied.pop(APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY, None)
     return copied
 
@@ -640,7 +563,7 @@ def checkpoint_without_exact_pending_approval_round(
         redactor=redactor,
         runtime_session=runtime_session,
     )
-    copied.pop(PENDING_TOOL_APPROVAL_CHECKPOINT_KEY)
+    copied.pop(pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY)
     copied.pop(APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY, None)
     copied.pop(pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
     return copied
@@ -767,7 +690,7 @@ def cleared_event(
             "model_step_id": approval.model_step_id,
             "model_attempt_id": approval.model_attempt_id,
             "tool_round_id": approval.tool_round_id,
-            "checkpoint": PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
+            "checkpoint": pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
             "approval_id": approval.approval_id,
             "tool_call_id": approval.tool_call_id,
             "cleared": True,
@@ -789,7 +712,7 @@ def checkpoint_for_fork(
     if checkpoint is None:
         return None
     copied_checkpoint = copy_durable_json_value(checkpoint, "checkpoint")
-    pending_approval = pending_approval_from_checkpoint(copied_checkpoint)
+    pending_approval = pending_approval_reader.pending_approval_from_checkpoint(copied_checkpoint)
     if pending_approval is not None:
         raise RuntimeError(
             "Session awaiting tool approval cannot be forked; resolve it with "
@@ -1237,88 +1160,6 @@ def recovered_tool_result(
     )
 
 
-def pending_approval_from_checkpoint(
-    checkpoint: dict[str, Any] | None,
-    *,
-    redactor: SecretRedactor | None = None,
-    consume_on_rejection: bool = False,
-) -> PendingToolApproval | None:
-    if type(consume_on_rejection) is not bool:
-        raise TypeError("consume_on_rejection must be a bool.")
-    if checkpoint is None:
-        return None
-    copied_checkpoint = copy_durable_json_value(checkpoint, "checkpoint")
-    try:
-        return _pending_approval_from_owned_checkpoint(
-            checkpoint,
-            copied_checkpoint,
-            redactor=redactor,
-            consume_on_rejection=consume_on_rejection,
-        )
-    finally:
-        # The inner parser clears rejected private data. Do not retain the
-        # caller-owned source in this wrapper's exception traceback.
-        checkpoint = None
-        copied_checkpoint = None
-
-
-def _pending_approval_from_owned_checkpoint(
-    checkpoint: dict[str, Any] | None,
-    copied_checkpoint: dict[str, Any],
-    *,
-    redactor: SecretRedactor | None = None,
-    consume_on_rejection: bool = False,
-) -> PendingToolApproval | None:
-    """Parse an immediately owned, validated snapshot; never retain or cache it."""
-    value = copied_checkpoint.get(PENDING_TOOL_APPROVAL_CHECKPOINT_KEY)
-    if value is None:
-        return None
-    if redactor is not None and durable_value_contains_secret(
-        value,
-        redactor=redactor,
-        path=(PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,),
-    ):
-        # Public callers retain their input by default. Runtime callers opt in
-        # to consuming their private checkpoint copy so no outer traceback
-        # frame keeps executable secret-bearing state.
-        if type(value) is dict:
-            value.clear()
-        value = None
-        copied_checkpoint.clear()
-        if consume_on_rejection and checkpoint is not None:
-            checkpoint.clear()
-        checkpoint = None
-        raise ValueError(
-            "Pending tool approval checkpoint contains a workload secret and cannot be executed."
-        ) from None
-    if type(value) is not dict:
-        raise ValueError("Pending tool approval checkpoint must be an object.")
-    validation_rejected = False
-    try:
-        approval = PendingToolApproval(**value)
-    except Exception:
-        if redactor is None:
-            raise
-        validation_rejected = True
-    if validation_rejected:
-        value.clear()
-        value = None
-        copied_checkpoint.clear()
-        if consume_on_rejection and checkpoint is not None:
-            checkpoint.clear()
-        checkpoint = None
-        raise ValueError(
-            "Pending tool approval checkpoint is invalid and cannot be executed."
-        ) from None
-    if contains_redacted_secret(approval.arguments) or any(
-        contains_redacted_secret(call.arguments) for call in approval.tool_calls
-    ):
-        raise ValueError(
-            "Pending approval arguments contain a redaction marker and cannot be executed."
-        )
-    return approval
-
-
 def pending_tool_call_approvals(
     *,
     tool_calls: list[runtime_records.ToolCallRequest],
@@ -1409,28 +1250,6 @@ def policy_result_from_pending_tool_call(
     return resume_ledger.policy_result_from_pending_tool_call(pending_tool_call)
 
 
-def effective_tool_policy_evidence(
-    pending_tool_call: PendingToolCallApproval,
-) -> ToolPolicyEvidence:
-    """Return explicit evidence, conservatively classifying legacy records.
-
-    A legacy recognized decision is authoritative because it is durable.
-    Absence of a decision in an old paused checkpoint is never positive
-    authorization; it represents a call that was unregistered when planned.
-    Raw legacy rounds are separately promoted to ``AMBIGUOUS`` by recovery.
-    """
-
-    if pending_tool_call.policy_evidence is not None:
-        return pending_tool_call.policy_evidence
-    if pending_tool_call.policy_decision in {
-        ToolPolicyDecision.ALLOW.value,
-        ToolPolicyDecision.DENY.value,
-        ToolPolicyDecision.REQUIRE_APPROVAL.value,
-    }:
-        return ToolPolicyEvidence.AUTHORITATIVE
-    return ToolPolicyEvidence.UNREGISTERED
-
-
 def taint_labels_from_pending_tool_call(
     pending_tool_call: PendingToolCallApproval,
 ) -> frozenset[str]:
@@ -1451,7 +1270,7 @@ def _pending_approval_and_round_for_atomic_claim(
 ) -> tuple[PendingToolApproval, pending_rounds.PendingToolRound]:
     if (gating_tool_call_id is None) == (recovery_tool_call_id is None):
         raise TypeError("Exactly one approval gating or recovery tool-call identity is required.")
-    approval = pending_approval_from_checkpoint(
+    approval = pending_approval_reader.pending_approval_from_checkpoint(
         checkpoint,
         redactor=redactor,
     )
@@ -1470,7 +1289,7 @@ def _pending_approval_and_round_for_atomic_claim(
         # approval/round contract. PendingToolApproval is itself validated and
         # carries the complete policy-planned call list; the atomic claim below
         # persists this projection before any resolution work can begin.
-        pending_round = planned_tool_round_from_pending_approval(approval)
+        pending_round = pending_approval_reader.planned_tool_round_from_pending_approval(approval)
     if pending_round.policy_state != "planned":
         raise RuntimeError("Pending tool approval has no durable policy plan.")
     if (
@@ -1479,7 +1298,7 @@ def _pending_approval_and_round_for_atomic_claim(
         or pending_round.model_attempt_id != approval.model_attempt_id
         or (
             not reconstructed_approval_only_round
-            and not pending_approval_scope_matches_round(
+            and not pending_approval_reader.pending_approval_scope_matches_round(
                 approval,
                 pending_round,
             )
@@ -1492,7 +1311,9 @@ def _pending_approval_and_round_for_atomic_claim(
         call for call in pending_round.tool_calls if call.tool_call_id == approval.tool_call_id
     ]
     gating_evidence = (
-        None if len(gating_calls) != 1 else effective_tool_policy_evidence(gating_calls[0])
+        None
+        if len(gating_calls) != 1
+        else pending_approval_reader.effective_tool_policy_evidence(gating_calls[0])
     )
     if len(gating_calls) != 1 or not (
         (

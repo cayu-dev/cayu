@@ -27,10 +27,10 @@ from cayu.approvals.user_input import (
     user_input_lifecycle_authority_from_checkpoint,
 )
 from cayu.events import Event, EventType
-from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._event_projection import private_event_linkage_value
 from cayu.runtime.execution_units import ToolRoundIdentity
+from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions import _tool_call_evidence as tool_call_evidence
@@ -150,7 +150,7 @@ def pending_action_evidence_round_from_checkpoint(
     from cayu.approvals.user_input import _user_input_lifecycle_authority_from_owned_checkpoint
 
     owned = copy_durable_json_object(checkpoint, "checkpoint")
-    approval = approval_support._pending_approval_from_owned_checkpoint(checkpoint, owned)
+    approval = pending_approval_reader._pending_approval_from_owned_checkpoint(checkpoint, owned)
     pending_input, _ = _user_input_lifecycle_authority_from_owned_checkpoint(checkpoint, owned)
     pending_round = pending_round_reader._pending_tool_round_from_owned_checkpoint(
         checkpoint, owned
@@ -171,7 +171,7 @@ def _pending_action_evidence_round(
             or pending_round.tool_round_id != approval.tool_round_id
             or pending_round.model_step_id != approval.model_step_id
             or pending_round.model_attempt_id != approval.model_attempt_id
-            or not approval_support.pending_approval_scope_matches_round(
+            or not pending_approval_reader.pending_approval_scope_matches_round(
                 approval,
                 pending_round,
             )
@@ -191,7 +191,7 @@ def _pending_action_evidence_round(
     if type(candidate) is pending_rounds.PendingToolRound:
         return candidate
     if type(candidate) is PendingToolApproval:
-        return approval_support.planned_tool_round_from_pending_approval(candidate)
+        return pending_approval_reader.planned_tool_round_from_pending_approval(candidate)
     if type(candidate) is not PendingUserInput:
         raise AssertionError("Pending-action candidate has an unsupported type.")
     return pending_rounds.PendingToolRound(
@@ -397,7 +397,9 @@ def _pending_action_checkpoint_index_state(
         return frozenset(), None
     invalid = False
     try:
-        approval = approval_support._pending_approval_from_owned_checkpoint(checkpoint, owned)
+        approval = pending_approval_reader._pending_approval_from_owned_checkpoint(
+            checkpoint, owned
+        )
     except (TypeError, ValueError):
         approval = None
         invalid = True
@@ -856,7 +858,7 @@ def _pending_approval_checkpoint_call(
     gating_only: bool = False,
 ) -> dict[str, Any] | None:
     try:
-        pending = approval_support.pending_approval_from_checkpoint(checkpoint)
+        pending = pending_approval_reader.pending_approval_from_checkpoint(checkpoint)
     except (TypeError, ValueError, ValidationError):
         return None
     if pending is None or pending.approval_id != approval_id:
@@ -876,8 +878,8 @@ def _pending_approval_checkpoint_call(
             "arguments": pending.arguments if pending.publish_arguments else {},
             "tool_call_id": pending.tool_call_id,
             "tool_round_id": pending.tool_round_id,
-            "reason": approval_support.public_pending_approval_reason(pending),
-            "policy_evidence": approval_support.effective_tool_policy_evidence(
+            "reason": pending_approval_reader.public_pending_approval_reason(pending),
+            "policy_evidence": pending_approval_reader.effective_tool_policy_evidence(
                 next(
                     call for call in pending.tool_calls if call.tool_call_id == pending.tool_call_id
                 )
@@ -892,11 +894,11 @@ def _pending_approval_checkpoint_call(
                 "arguments": call.arguments if pending.publish_arguments else {},
                 "tool_call_id": call.tool_call_id,
                 "tool_round_id": pending.tool_round_id,
-                "reason": approval_support.public_pending_approval_reason(
+                "reason": pending_approval_reader.public_pending_approval_reason(
                     pending,
                     tool_call_id=call.tool_call_id,
                 ),
-                "policy_evidence": approval_support.effective_tool_policy_evidence(call),
+                "policy_evidence": pending_approval_reader.effective_tool_policy_evidence(call),
             }
     return None
 
@@ -1115,7 +1117,7 @@ def pending_action_from_records(
                 try:
                     event_pending = PendingToolApprovalEventView.from_event(event)
                     arguments_quarantined = event_pending.arguments_state == "quarantined"
-                    checkpoint_pending = approval_support.pending_approval_from_checkpoint(
+                    checkpoint_pending = pending_approval_reader.pending_approval_from_checkpoint(
                         checkpoint
                     )
                 except (TypeError, ValueError, ValidationError):
@@ -1402,7 +1404,7 @@ def pending_action_source_is_invalid(
         # manual tool replay is appropriate. Keep it diagnostically fail-closed.
         return True
     try:
-        pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+        pending_approval = pending_approval_reader.pending_approval_from_checkpoint(checkpoint)
         pending_input, _ = user_input_lifecycle_authority_from_checkpoint(checkpoint)
         pending_round = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
         evidence_round = pending_action_evidence_round_from_checkpoint(checkpoint)

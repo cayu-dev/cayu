@@ -43,6 +43,7 @@ from cayu.runtime._foreground_subagent_recovery import (
 )
 from cayu.runtime._tool_effect_state import ToolEffectIntent, ToolEffectRecord, ToolEffectStateOwner
 from cayu.runtime.tool_effects import _bounded_text
+from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_is_released,
@@ -259,7 +260,7 @@ def post_action_continuation_round_from_checkpoint(
             },
             deep=True,
         )
-    approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+    approval = pending_approval_reader.pending_approval_from_checkpoint(checkpoint)
     if approval is not None:
         context = approval.run_limit_accounting
         intent = approval_support.approval_resolution_intent_from_checkpoint(checkpoint)
@@ -317,7 +318,7 @@ def post_action_continuation_for_close(
         or profile.run_epoch != session.run_epoch
     ):
         raise RuntimeError("Action-close continuation conflicts with its child invocation.")
-    approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+    approval = pending_approval_reader.pending_approval_from_checkpoint(checkpoint)
     pending_input, _ = user_input_lifecycle_authority_from_checkpoint(
         checkpoint, current_run_epoch=session.run_epoch
     )
@@ -611,7 +612,7 @@ async def project_current_foreground_child_result(
             tool_call_id=intent.tool_call_id,
         )
     pending_action_evidence_round_from_checkpoint(checkpoint)
-    if approval_support.pending_approval_from_checkpoint(checkpoint) is not None or (
+    if pending_approval_reader.pending_approval_from_checkpoint(checkpoint) is not None or (
         user_input_lifecycle_authority_from_checkpoint(
             checkpoint, current_run_epoch=child.run_epoch
         )[0]
@@ -672,7 +673,7 @@ async def observe_foreground_child_wait(
     assert type(subagent) is dict
     checkpoint = await store.load_checkpoint(child.id)
     delegated = await owned_delegated_wait(store, child=child, checkpoint=checkpoint)
-    approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+    approval = pending_approval_reader.pending_approval_from_checkpoint(checkpoint)
     pending_input, _ = user_input_lifecycle_authority_from_checkpoint(
         checkpoint, current_run_epoch=child.run_epoch
     )
@@ -754,7 +755,7 @@ async def owned_delegated_wait(
     profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
     pending = pending_action_evidence_round_from_checkpoint(checkpoint)
     if (
-        approval_support.pending_approval_from_checkpoint(checkpoint) is not None
+        pending_approval_reader.pending_approval_from_checkpoint(checkpoint) is not None
         or user_input_lifecycle_authority_from_checkpoint(checkpoint)[0] is not None
     ):
         from cayu.runtime._foreground_gate_continuation import load_gate_request

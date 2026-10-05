@@ -48,6 +48,7 @@ from cayu.runners.base import (
 from cayu.runners.local import LocalRunner
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
+from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import (
@@ -4785,7 +4786,6 @@ def test_pending_tool_round_rejects_secret_authority_on_write_and_legacy_load() 
 
 def test_legacy_pending_approval_rejects_secret_authority_before_recovery() -> None:
     from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
-    from cayu.runtime import _approval_support as approval_support
     from cayu.vaults.redaction import SecretRedactor
 
     secret = "legacy-approval-authority-secret-canary"
@@ -4804,11 +4804,13 @@ def test_legacy_pending_approval_rejects_secret_authority_before_recovery() -> N
         ],
     )
     checkpoint = {
-        approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY: pending.model_dump(mode="json")
+        pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY: pending.model_dump(
+            mode="json"
+        )
     }
 
     with pytest.raises(ValueError, match="workload secret") as exc_info:
-        approval_support.pending_approval_from_checkpoint(
+        pending_approval_reader.pending_approval_from_checkpoint(
             checkpoint,
             redactor=SecretRedactor(secret),
         )
@@ -4817,7 +4819,6 @@ def test_legacy_pending_approval_rejects_secret_authority_before_recovery() -> N
 
 def test_legacy_pending_approval_rejects_secret_argument_key_without_mutating_input() -> None:
     from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
-    from cayu.runtime import _approval_support as approval_support
     from cayu.vaults.redaction import SecretRedactor
 
     secret = "legacy-approval-key-secret-canary"
@@ -4839,18 +4840,20 @@ def test_legacy_pending_approval_rejects_secret_argument_key_without_mutating_in
         ],
     )
     checkpoint = {
-        approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY: pending.model_dump(mode="json")
+        pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY: pending.model_dump(
+            mode="json"
+        )
     }
 
     with pytest.raises(ValueError, match="workload secret") as exc_info:
-        approval_support.pending_approval_from_checkpoint(
+        pending_approval_reader.pending_approval_from_checkpoint(
             checkpoint,
             redactor=SecretRedactor(secret),
         )
 
-    assert checkpoint[approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY]["arguments"] == {
-        secret_key: "top-level"
-    }
+    assert checkpoint[pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY][
+        "arguments"
+    ] == {secret_key: "top-level"}
     _assert_cayu_traceback_does_not_retain_text(exc_info.value, secret)
 
 
@@ -4943,7 +4946,6 @@ def test_legacy_pending_user_input_rejects_secret_argument_key_without_mutating_
 
 def test_explicit_compaction_rejects_secret_bearing_legacy_pending_checkpoint() -> None:
     from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
-    from cayu.runtime import _approval_support as approval_support
     from cayu.runtime import _session_engine as session_engine
     from cayu.vaults.redaction import SecretRedactor
 
@@ -4963,7 +4965,9 @@ def test_explicit_compaction_rejects_secret_bearing_legacy_pending_checkpoint() 
         ],
     )
     checkpoint = {
-        approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY: pending.model_dump(mode="json")
+        pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY: pending.model_dump(
+            mode="json"
+        )
     }
 
     with pytest.raises(ValueError, match="workload secret") as exc_info:
@@ -4982,7 +4986,6 @@ def test_explicit_compaction_public_flow_rejects_legacy_secret_without_traceback
     None
 ):
     from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
-    from cayu.runtime import _approval_support as approval_support
     from cayu.sessions.base import CompactSessionRequest
     from cayu.vaults.redaction import SecretRedactor
 
@@ -5015,7 +5018,7 @@ def test_explicit_compaction_public_flow_rejects_legacy_secret_without_traceback
         await store.transform_checkpoint(
             session_id,
             lambda _session, _checkpoint: {
-                approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY: pending.model_dump(
+                pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY: pending.model_dump(
                     mode="json"
                 )
             },
@@ -5043,7 +5046,9 @@ def test_explicit_compaction_public_flow_rejects_legacy_secret_without_traceback
         durable_checkpoint = await store.load_checkpoint(session_id)
         assert durable_checkpoint is not None
         assert (
-            durable_checkpoint[approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY]["approval_id"]
+            durable_checkpoint[pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY][
+                "approval_id"
+            ]
             == secret
         )
 
@@ -5342,16 +5347,15 @@ def test_malformed_legacy_pending_checkpoint_is_rejected_without_traceback_secre
         PENDING_USER_INPUT_CHECKPOINT_KEY,
         pending_user_input_from_checkpoint,
     )
-    from cayu.runtime import _approval_support as approval_support
 
     secret = "model"
     if checkpoint_kind == "approval":
         checkpoint = {
-            approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY: {
+            pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY: {
                 "approval_id": {secret: "safe"},
             }
         }
-        load = approval_support.pending_approval_from_checkpoint
+        load = pending_approval_reader.pending_approval_from_checkpoint
     elif checkpoint_kind == "user_input":
         checkpoint = {
             PENDING_USER_INPUT_CHECKPOINT_KEY: {
@@ -5553,7 +5557,6 @@ def test_business_approval_rejects_legacy_secret_before_routing_or_traceback_exp
         resolve_business_approval,
     )
     from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
-    from cayu.runtime import _approval_support as approval_support
     from cayu.vaults.redaction import SecretRedactor
 
     async def run() -> None:
@@ -5590,7 +5593,7 @@ def test_business_approval_rejects_legacy_secret_before_routing_or_traceback_exp
         await store.transform_checkpoint(
             session_id,
             lambda _session, _checkpoint: {
-                approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY: pending.model_dump(
+                pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY: pending.model_dump(
                     mode="json"
                 )
             },

@@ -33,7 +33,6 @@ from cayu.execution_profiles import (
 )
 from cayu.providers.deadlines import _provider_deadline_material
 from cayu.providers.operations import ProviderOperationMode
-from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._runtime_replay_profile import runtime_replay_profile_source
 from cayu.runtime.build_provenance import RuntimeBuildProvenance
@@ -44,6 +43,7 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.tool_completion import ToolCompletionPolicy, copy_tool_completion_policy
+from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
@@ -821,7 +821,7 @@ def prepare_execution_profile_continuation(
                 consume_on_rejection=True,
                 runtime_session=session,
             ),
-            approval_support.pending_approval_from_checkpoint(
+            pending_approval_reader.pending_approval_from_checkpoint(
                 checkpoint,
                 redactor=redactor,
                 consume_on_rejection=True,

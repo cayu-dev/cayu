@@ -55,7 +55,6 @@ from cayu.providers.operations import (
     ProviderOperationState,
     ProviderOperationStatus,
 )
-from cayu.runtime import _approval_support
 from cayu.runtime._invocation_lifecycle import (
     AdmitInvocationCommand,
     InvocationContext,
@@ -91,6 +90,7 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
 from cayu.runtime.retry_policy import RetryPolicy
+from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import (
     EventQuery,
@@ -2590,7 +2590,7 @@ def test_profiled_fork_resume_freezes_profile_through_approval_continuation(
         assert isinstance(pending, dict)
         checkpoint = await store.load_checkpoint(child_id)
         active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
-        pending_approval = _approval_support.pending_approval_from_checkpoint(checkpoint)
+        pending_approval = pending_approval_reader.pending_approval_from_checkpoint(checkpoint)
         assert active_profile is not None
         assert pending_approval is not None
         assert pending_approval.execution_profile_fingerprint == active_profile.profile.fingerprint
@@ -2708,7 +2708,7 @@ def test_approval_continuation_rejects_changed_invocation_profile_before_work() 
         checkpoint = await store.load_checkpoint(session_id)
         active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
         pending_round = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
-        pending_approval = _approval_support.pending_approval_from_checkpoint(checkpoint)
+        pending_approval = pending_approval_reader.pending_approval_from_checkpoint(checkpoint)
         assert active_profile is not None
         assert pending_round is not None
         assert pending_approval is not None

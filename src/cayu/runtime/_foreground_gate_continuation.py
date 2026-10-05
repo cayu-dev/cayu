@@ -26,6 +26,7 @@ from cayu.runtime._foreground_child_wait import (
     post_action_continuation_round_from_checkpoint,
 )
 from cayu.runtime.loop_policies import LoopPolicy
+from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
@@ -357,7 +358,7 @@ async def load_gate_request(
     store: SessionStore, *, parent: Session, wait: ForegroundChildWait
 ) -> dict[str, Any] | None:
     checkpoint = await store.load_checkpoint(parent.id)
-    approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+    approval = pending_approval_reader.pending_approval_from_checkpoint(checkpoint)
     pending_input, _ = user_input_lifecycle_authority_from_checkpoint(checkpoint)
     if approval is None and pending_input is None:
         return None

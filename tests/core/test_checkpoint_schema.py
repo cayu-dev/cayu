@@ -30,12 +30,12 @@ from cayu.approvals.user_input import (
     pending_user_input_from_checkpoint,
 )
 from cayu.context.base import _compaction_checkpoint
-from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _session_engine as session_engine
 from cayu.runtime._invocation_lifecycle import (
     invocation_lifecycle_receipt_history_present,
 )
 from cayu.sessions import _model_completion_publication as model_completion_publication
+from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalOutcome,
@@ -195,7 +195,7 @@ def test_frozen_versionless_root_payloads_decode_and_supported_shapes_remain_con
             }
     assert without_version == expected
     if fixture_name == "approval":
-        assert approval_support.pending_approval_from_checkpoint(decoded) is not None
+        assert pending_approval_reader.pending_approval_from_checkpoint(decoded) is not None
     elif fixture_name == "user-input":
         ambiguous = ambiguous_pending_user_input_from_checkpoint(decoded)
         assert ambiguous is not None

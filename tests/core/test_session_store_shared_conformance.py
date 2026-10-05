@@ -223,6 +223,7 @@ from cayu.runtime.provider_operations import (
 )
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.runtime.session_message_lifecycle import SessionMessageQueueStatus
+from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._invocation_terminal_decision import (
@@ -740,7 +741,7 @@ def _approval_checkpoint(label: str) -> tuple[dict[str, Any], PendingToolApprova
             pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY: (
                 pending_round.model_dump(mode="json")
             ),
-            approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY: (
+            pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY: (
                 approval.model_dump(mode="json")
             ),
         },
@@ -848,7 +849,7 @@ async def _pending_approval_for_public_event(
     event_approval = PendingToolApprovalEventView.from_event(
         await _private_event_for_public_event(store, event)
     )
-    checkpoint_approval = approval_support.pending_approval_from_checkpoint(
+    checkpoint_approval = pending_approval_reader.pending_approval_from_checkpoint(
         await store.load_checkpoint(event.session_id)
     )
     assert checkpoint_approval is not None
@@ -6762,7 +6763,7 @@ def test_session_store_conformance_approval_publication_is_atomic_across_restart
                 type=EventType.SESSION_CHECKPOINTED,
                 session_id=session.id,
                 payload={
-                    "checkpoint": approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
+                    "checkpoint": pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
                     "approval_id": approval.approval_id,
                     "tool_call_id": approval.tool_call_id,
                     "tool_round_id": approval.tool_round_id,
@@ -6853,8 +6854,8 @@ def test_session_store_conformance_legacy_approval_round_migrates_in_atomic_clai
             await store.update_status(session.id, SessionStatus.INTERRUPTED)
             paired_checkpoint, approval = _approval_checkpoint("legacy")
             legacy_checkpoint = {
-                approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY: (
-                    paired_checkpoint[approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY]
+                pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY: (
+                    paired_checkpoint[pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY]
                 )
             }
             await store.checkpoint(session.id, legacy_checkpoint)
@@ -6889,7 +6890,7 @@ def test_session_store_conformance_legacy_approval_round_migrates_in_atomic_clai
 
             store = await _reopen_store(session_store_case, store)
             migrated = await store.load_checkpoint(session.id)
-            assert approval_support.pending_approval_from_checkpoint(migrated) == approval
+            assert pending_approval_reader.pending_approval_from_checkpoint(migrated) == approval
             migrated_round = pending_round_reader.pending_tool_round_from_checkpoint(migrated)
             assert migrated_round is not None
             assert migrated_round.policy_state == "planned"
@@ -7068,7 +7069,10 @@ def test_session_store_conformance_pre_digest_approval_claim_fails_closed(
                 resolution_request_digest=None,
                 pause_resolved_at=intent.pause_resolved_at,
             )
-            assert approval_support.pending_approval_from_checkpoint(final_checkpoint) == approval
+            assert (
+                pending_approval_reader.pending_approval_from_checkpoint(final_checkpoint)
+                == approval
+            )
         finally:
             await _close_store(store)
 
@@ -11587,7 +11591,10 @@ def test_session_store_conformance_legacy_history_cannot_be_poisoned_by_retry(
                 )
                 is None
             )
-            assert approval_support.pending_approval_from_checkpoint(final_checkpoint) == approval
+            assert (
+                pending_approval_reader.pending_approval_from_checkpoint(final_checkpoint)
+                == approval
+            )
         finally:
             await _close_store(store)
 
@@ -11751,7 +11758,7 @@ def test_session_store_conformance_lossy_legacy_grant_cannot_authorize_pending_s
             assert calls == []
             checkpoint = await store.load_checkpoint(session_id)
             assert (
-                approval_support.pending_approval_from_checkpoint(
+                pending_approval_reader.pending_approval_from_checkpoint(
                     checkpoint,
                     redactor=redactor,
                 )

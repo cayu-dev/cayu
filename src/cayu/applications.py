@@ -585,6 +585,7 @@ from cayu.runtime.tool_effects import (
     ToolEffectReconciliationRequest,
     ToolEffectReconciliationTarget,
 )
+from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
     execution_profile_from_session_metadata,
@@ -5189,7 +5190,7 @@ class CayuApp:
     ) -> PendingToolApproval | None:
         """Parse trusted approval state through this app's secret boundary."""
 
-        return approval_support.pending_approval_from_checkpoint(
+        return pending_approval_reader.pending_approval_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=consume_on_rejection,

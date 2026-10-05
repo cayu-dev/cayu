@@ -61,7 +61,6 @@ def select_continuation(snapshot: CompletedTurnSnapshot) -> RecipientContinuatio
     """Qualify one coherent native snapshot with existing lifecycle validators."""
     from cayu.approvals.user_input import user_input_lifecycle_authority_from_checkpoint
     from cayu.collaboration.prepared_admission import MAX_PREPARED_PROFILE_BYTES
-    from cayu.runtime._approval_support import pending_approval_from_checkpoint
     from cayu.runtime._invocation_lifecycle import (
         invocation_checkpoint_state_sha256,
     )
@@ -72,6 +71,7 @@ def select_continuation(snapshot: CompletedTurnSnapshot) -> RecipientContinuatio
     from cayu.sessions._invocation_lifecycle import (
         _require_released_invocation_command_receipt,
     )
+    from cayu.sessions._pending_approval_reader import pending_approval_from_checkpoint
     from cayu.sessions._pending_tool_round_reader import pending_tool_round_from_checkpoint
     from cayu.sessions._session_continuation_store import (
         require_continuation_selection_quiescence,

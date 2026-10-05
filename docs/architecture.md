@@ -433,6 +433,12 @@ Their exact attestation and persisted-control checks are shared by checkpoint
 validation and runtime result handling. Checkpoint publication, secret resolution
 and recovery execution retain their runtime owners.
 
+`sessions/_pending_approval_reader.py` owns saved approval parsing, paired-round
+scope checks and the pure projection/evidence helpers used by pending actions.
+Session inspection and runtime recovery use the same reader and canonical approval
+models. Approval resolution, checkpoint writes, live policy evaluation and event
+publication remain with their existing owners.
+
 `sessions/checkpoints.py` owns root checkpoint decoding and schema migrations.
 The adjacent private modules `_model_completion_publication`, `_terminal_evidence`,
 `_invocation_terminal_decision`, and `_provider_operation_cancellation_claim` own
