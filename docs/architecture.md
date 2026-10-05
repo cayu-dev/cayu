@@ -633,6 +633,12 @@ existing snapshots and retain native filtering, ordering and transaction owners.
 cursor encoding and validation, and the memory page-ordering key. Memory and
 PostgreSQL share the cursor rules while retaining candidate selection, native
 ordering, embedding-provider calls and transaction ownership.
+`knowledge/_query_rules.py` owns shared entry filters and expiry checks,
+semantic-query text preparation and paired knowledge/index frontier validation.
+Memory composes these rules for search, listing and backfill; SQLite and PostgreSQL
+share frontier validation, and PostgreSQL also shares semantic-query text.
+Native filtering, access checks, per-entry clock behavior and transactions retain
+their existing boundaries.
 `knowledge/_search_scoring.py` owns shared keyword matching and entry/title/chunk
 scoring, including phrase field boundaries, exclusions and best-match selection.
 Memory and PostgreSQL compose these rules with the existing query tokenization;

@@ -659,8 +659,8 @@ class KnowledgeStore(ABC):
     ) -> int:
         """Hard-delete entries whose ``expires_at`` is at or before ``now`` (default: current UTC).
 
-        Returns the count removed. The read-time filter (:func:`_entry_is_expired`) only *hides*
-        expired entries; this reclaims their storage. Hosts call it on a schedule or opportunistically.
+        Returns the count removed. Read-time expiry filtering only *hides* expired entries;
+        this reclaims their storage. Hosts call it on a schedule or opportunistically.
         ``now`` is injectable for deterministic tests.
 
         Default raises ``NotImplementedError`` so out-of-tree stores keep working.

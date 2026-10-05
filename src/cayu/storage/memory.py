@@ -17,9 +17,6 @@ from cayu._validation import (
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
-from cayu._validation import (
-    require_durable_nonblank as require_nonblank,
-)
 from cayu.embeddings import (
     TextEmbeddingProvider,
     TextEmbeddingRequest,
@@ -29,6 +26,7 @@ from cayu.knowledge import (
     _activation_rules,
     _embedding_backfill,
     _maintenance_rules,
+    _query_rules,
     _relation_queries,
     _retrieval_results,
     _revision_rules,
@@ -3666,7 +3664,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         knowledge_query = copy_knowledge_query(query)
         references = copy_knowledge_revision_refs(revision_refs)
-        _validate_knowledge_search_frontier(
+        _query_rules._validate_knowledge_search_frontier(
             knowledge_sequence,
             index_readiness_sequence,
         )
@@ -3708,7 +3706,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 continue
             if not _knowledge_scope_allows_entry(scope, entry):
                 continue
-            if not _entry_matches_query(entry, knowledge_query):
+            if not _query_rules._entry_matches_query(entry, knowledge_query):
                 continue
             chunks = self._chunks.get((entry.id, entry.revision), [])
             if _search_scoring._entry_matches_none_terms(entry, chunks, terms):
@@ -3754,7 +3752,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             for entry_id in self._entries
             if (entry := self._current_entry(entry_id)) is not None
             if _knowledge_scope_allows_entry(scope, entry)
-            if _entry_matches_list_query(entry, knowledge_query)
+            if _query_rules._entry_matches_list_query(entry, knowledge_query)
         ]
         entries.sort(
             key=lambda entry: (
@@ -4052,7 +4050,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             for entry_id in self._entries
             if (entry := self._current_entry(entry_id)) is not None
             if _knowledge_scope_allows_entry(scope, entry)
-            if _entry_matches_list_query(entry, knowledge_query)
+            if _query_rules._entry_matches_list_query(entry, knowledge_query)
         ]
         entries.sort(
             key=lambda entry: _embedding_backfill._knowledge_embedding_backfill_sort_key(
@@ -4240,7 +4238,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         knowledge_query = copy_knowledge_query(query)
         references = copy_knowledge_revision_refs(revision_refs)
-        _validate_knowledge_search_frontier(
+        _query_rules._validate_knowledge_search_frontier(
             knowledge_sequence,
             index_readiness_sequence,
         )
@@ -4302,7 +4300,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             chunks = self._chunks.get((entry.id, entry.revision), [])
             if not _knowledge_scope_allows_entry(scope, entry):
                 continue
-            if not _entry_matches_query(entry, knowledge_query):
+            if not _query_rules._entry_matches_query(entry, knowledge_query):
                 continue
             if _search_scoring._entry_matches_none_terms(entry, chunks, terms):
                 continue
@@ -4328,7 +4326,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
                 total_hits_known=0,
                 index_coverage=[coverage],
             )
-        semantic_query_text = _semantic_query_text(knowledge_query)
+        semantic_query_text = _query_rules._semantic_query_text(knowledge_query)
         query_vector = (
             await self._embed_query(knowledge_query, semantic_query_text)
             if candidate_embeddings
@@ -4803,98 +4801,6 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         )
 
 
-def _entry_matches_query(entry: KnowledgeEntry, query: KnowledgeQuery) -> bool:
-    return _entry_matches_metadata(
-        entry,
-        namespace=query.namespace,
-        labels=query.labels,
-        kinds=query.kinds,
-        statuses=query.statuses,
-        visibilities=query.visibilities,
-        aspects=query.aspects,
-        aspect_groups=query.aspect_groups,
-        impact_targets=query.impact_targets,
-        source_type=query.source_type,
-        source_id=query.source_id,
-        include_expired=query.include_expired,
-    )
-
-
-def _entry_matches_list_query(entry: KnowledgeEntry, query: KnowledgeListQuery) -> bool:
-    return _entry_matches_metadata(
-        entry,
-        namespace=query.namespace,
-        labels=query.labels,
-        kinds=query.kinds,
-        statuses=query.statuses,
-        visibilities=query.visibilities,
-        aspects=query.aspects,
-        aspect_groups=[],
-        impact_targets=query.impact_targets,
-        source_type=query.source_type,
-        source_id=query.source_id,
-        include_expired=query.include_expired,
-    )
-
-
-def _entry_matches_metadata(
-    entry: KnowledgeEntry,
-    *,
-    namespace: str | None,
-    labels: dict[str, str],
-    kinds: list[str] | None,
-    statuses: list[KnowledgeStatus],
-    visibilities: list[KnowledgeVisibility] | None,
-    aspects: list[str],
-    aspect_groups: list[list[str]],
-    impact_targets: list[str],
-    source_type: str | None,
-    source_id: str | None,
-    include_expired: bool,
-) -> bool:
-    if namespace is not None and entry.namespace != namespace:
-        return False
-    for key, value in labels.items():
-        if entry.labels.get(key) != value:
-            return False
-    if kinds is not None and entry.kind not in set(kinds):
-        return False
-    if entry.status not in set(statuses):
-        return False
-    if visibilities is not None and entry.visibility not in set(visibilities):
-        return False
-    if source_type is not None and entry.source_type != source_type:
-        return False
-    if source_id is not None and entry.source_id != source_id:
-        return False
-    if aspects and not set(aspects).intersection(entry.aspects):
-        return False
-    entry_aspects = set(entry.aspects)
-    if any(not entry_aspects.intersection(group) for group in aspect_groups):
-        return False
-    if impact_targets and not set(impact_targets).intersection(entry.impact_targets):
-        return False
-    return not _entry_is_expired(entry, include_expired=include_expired)
-
-
-def _entry_is_expired(entry: KnowledgeEntry, *, include_expired: bool) -> bool:
-    return (
-        not include_expired
-        and entry.expires_at is not None
-        and entry.expires_at <= datetime.now(UTC)
-    )
-
-
-def _semantic_query_text(query: KnowledgeQuery) -> str:
-    parts: list[str] = []
-    if query.text is not None:
-        parts.append(query.text)
-    parts.extend(query.any_terms)
-    parts.extend(query.all_terms)
-    parts.extend(query.phrases)
-    return require_nonblank(" ".join(parts), "semantic query text")
-
-
 def _cosine_similarity(left: list[float], right: list[float]) -> float:
     if len(left) != len(right):
         raise ValueError("Embedding vectors must have the same dimension.")
@@ -4952,24 +4858,6 @@ def _next_updated_at(entry: KnowledgeEntry) -> datetime:
 
 def _knowledge_semantic_watch_identity(value: str, field_name: str) -> str:
     return _bounded_knowledge_identity(value, field_name, max_bytes=256)
-
-
-def _validate_knowledge_search_frontier(
-    knowledge_sequence: int | None,
-    index_readiness_sequence: int | None,
-) -> None:
-    if (knowledge_sequence is None) != (index_readiness_sequence is None):
-        raise ValueError(
-            "`knowledge_sequence` and `index_readiness_sequence` must be supplied together."
-        )
-    if knowledge_sequence is None:
-        return
-    assert index_readiness_sequence is not None
-    _validate_knowledge_change_sequence(knowledge_sequence, "knowledge_sequence")
-    _validate_knowledge_index_sequence(
-        index_readiness_sequence,
-        "index_readiness_sequence",
-    )
 
 
 def _knowledge_change_now(value: datetime | None) -> datetime:

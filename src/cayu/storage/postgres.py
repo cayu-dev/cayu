@@ -230,6 +230,10 @@ from cayu.knowledge._maintenance_rules import (
     _require_knowledge_maintenance_publication_boundary,
     _require_knowledge_maintenance_source_evidence,
 )
+from cayu.knowledge._query_rules import (
+    _semantic_query_text,
+    _validate_knowledge_search_frontier,
+)
 from cayu.knowledge._relation_queries import (
     _bounded_knowledge_lineage_result,
     _bounded_knowledge_relation_result,
@@ -903,8 +907,6 @@ from cayu.storage.memory import (
     KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY,
     _knowledge_change_now,
     _knowledge_semantic_watch_identity,
-    _semantic_query_text,
-    _validate_knowledge_search_frontier,
 )
 from cayu.tasks import _verified_work_policy as verified_work_support
 from cayu.tasks._scheduling import (
