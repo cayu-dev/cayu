@@ -17767,6 +17767,20 @@ returns `ExactMatch`, `ExactNotFound`, `ExactConflict`, or `ExactUnavailable`;
 ordinary dependency-read failure is not interpreted as absence. Permission
 denial and caller cancellation remain separate from those lookup outcomes.
 
+A native continuation ticket may carry `deadline=None` for an event-only wait;
+this is an explicit absence of a timer, not a fabricated far-future deadline.
+Collaboration waits continue to require their own finite deadline. A temporary
+service remains bounded by its question deadline and service timeout even when
+the underlying native ticket has no deadline.
+
+Source receivers that participate in retained latch recovery explicitly implement
+`RetainedContinuationLatchReceiver`. Its owned authentication entrance must keep
+dispatched source work owned through settlement and validate the complete latch
+against source evidence. Ordinary receivers remain usable for public latch
+observation, but are not implicitly qualified for retained recovery. Neither
+receiver registration nor an identical caller-shaped latch grants direct native
+publication authority.
+
 Participant-root execution-to-wait additionally binds paired commitments for the
 complete execution admission and unbound collaboration wait into the native
 intent/ticket. The root execution owner compares the admission commitment before

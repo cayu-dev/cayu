@@ -1392,3 +1392,39 @@ async def test_provider_conformance_cache_observation_matches_capability_claim(
     assert usage is not None
     assert usage.cache.read_tokens == 3
     assert usage.cache.cached_input_tokens == 3
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "registration",
+    [registrations_module.CHAT_COMPLETIONS, registrations_module.GATEWAY],
+    ids=lambda item: item.name,
+)
+async def test_cache_conformance_allows_scheduling_delay(registration, monkeypatch):
+    original = registrations_module._ChatCompletionsTransport.stream_chat_completions
+
+    async def delayed(self, **kwargs):
+        # This checks cache evidence, not one-second response latency. Exercise
+        # the real provider deadline guard beyond the former harness deadline.
+        await asyncio.sleep(1.1)
+        async for event in original(self, **kwargs):
+            yield event
+
+    monkeypatch.setattr(
+        registrations_module._ChatCompletionsTransport, "stream_chat_completions", delayed
+    )
+    harness = await registration.factory("provider_cache_observation")
+    try:
+        events = await harness.collect()
+    finally:
+        await harness.aclose()
+    assert events[-1].type is ModelStreamEventType.COMPLETED
+    usage = normalize_usage_metrics(
+        provider_name=registration.name,
+        model=harness.model,
+        requested_model=harness.model,
+        raw_usage=events[-1].payload.get("usage"),
+        usage_dialect=harness.provider.usage_dialect,
+    )
+    assert usage is not None
+    assert usage.cache.read_tokens == usage.cache.cached_input_tokens == 3

@@ -15,17 +15,17 @@ from cayu.collaboration._clarification_state import clarification_commitment
 from cayu.collaboration._contracts import CollaborationConflict, ObjectRef
 from cayu.collaboration._permits import PermitCommand, PermitIntent, PermitRegistration
 from cayu.collaboration.waits import request_object_ref
-from cayu.runtime._session_continuation import (
+from cayu.runtime._temporary_continuation_permits import TemporaryServicePermitAuthority
+from cayu.sessions._session_continuation import (
     ContinuationNamespace,
     continuation_digest,
     continuation_namespace_id,
 )
-from cayu.runtime._temporary_continuation import (
+from cayu.sessions._temporary_continuation import (
     TemporaryServiceAdmission,
     TemporaryServiceDispatch,
     temporary_service_invocation_id,
 )
-from cayu.runtime._temporary_continuation_permits import TemporaryServicePermitAuthority
 from cayu.vaults.redaction import SecretRedactor
 
 pytestmark = pytest.mark.anyio
@@ -33,8 +33,9 @@ REDACTOR = SecretRedactor()
 
 
 @pytest.mark.parametrize("worker_offset", (-3600, 3600))
+@pytest.mark.parametrize("event_only", [False, True])
 async def test_owner_deadline_ignores_worker_clock_and_bounds_active_stream(
-    stores, monkeypatch, worker_offset
+    stores, monkeypatch, worker_offset, event_only
 ):
     from datetime import UTC, datetime, timedelta
 
@@ -50,6 +51,9 @@ async def test_owner_deadline_ignores_worker_clock_and_bounds_active_stream(
     candidate = candidate.model_copy(
         update={
             "question": candidate.question.model_copy(update={"deadline_at_ms": now + 1000}),
+            "ticket": candidate.ticket.model_copy(update={"deadline": None})
+            if event_only
+            else candidate.ticket,
         }
     )
 

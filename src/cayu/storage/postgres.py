@@ -73,6 +73,8 @@ from cayu.sessions.base import (
 from cayu.storage import _creation_fence
 from cayu.storage._context_selection_fence import PostgresContextSelectionFenceMixin
 from cayu.storage._creation_fence import PostgresCreationFenceMixin
+from cayu.storage._external_wait_postgres import PostgresExternalWaitMixin
+from cayu.storage._external_wait_schema import POSTGRES_EXTERNAL_WAIT_DDL
 from cayu.storage._model_policy_schema import POSTGRES_MODEL_POLICY_DDL
 from cayu.storage._phase_timing import PostgresTimingScope, timed_postgres_connection
 from cayu.storage._session_execution import POSTGRES_EXECUTION_DDL, PostgresSessionExecutionMixin
@@ -1573,6 +1575,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     112: POSTGRES_PRODUCT_OPERATION_DDL,
     113: POSTGRES_EXECUTION_DDL,
     114: POSTGRES_MODEL_POLICY_DDL,
+    115: POSTGRES_EXTERNAL_WAIT_DDL,
     106: (),  # Contract-only writer fence; existing typed request records own storage.
     105: POSTGRES_COLLABORATION_CLARIFICATION_DDL,
     104: (
@@ -7412,6 +7415,12 @@ class _PostgresStoreBase:
     ) -> None:
         """Validate non-index objects before recording their owning revision."""
 
+        if revision.revision == 115:
+            from cayu.storage._continuation_index_migration import (
+                migrate_postgres_continuation_indexes,
+            )
+
+            await migrate_postgres_continuation_indexes(cur)
         if revision.revision == 108:
             await validate_postgres_context_selection_schema(cur)
         if revision.revision == 110:
@@ -25759,6 +25768,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
 
 @model_store_surface("sessions")
 class PostgresSessionStore(
+    PostgresExternalWaitMixin,
     PostgresSessionExecutionMixin,
     PostgresContextSelectionFenceMixin,
     PostgresCreationFenceMixin,
@@ -25846,6 +25856,7 @@ class PostgresSessionStore(
     session_steering_version: ClassVar[int | None] = 1
     session_export_version: ClassVar[int] = 1
     session_continuation_version: ClassVar[int] = 1
+    external_wait_version: ClassVar[int] = 1
     _producer_attachment_version: ClassVar[int] = 1
     supports_completion_result_event_publication_reservations: ClassVar[bool] = True
     supports_transcript_search: ClassVar[bool] = True
@@ -27556,6 +27567,7 @@ class PostgresSessionStore(
                 async with conn.cursor() as cur:
                     await self._lock_closure_lineage(cur)
                     await self._require_available_closure_identity(cur, session_id)
+                    await self._require_external_creation(conn, request)
                     from cayu.sessions.base import _RECIPIENT_PROVENANCE_CAPABILITY
 
                     if (
@@ -30427,6 +30439,13 @@ class PostgresSessionStore(
 
     async def _require_session_erasure_quiescence(self, cur, session: Session) -> None:
         """Shared admission for closure and final deletion; no mutations."""
+        await cur.execute(
+            "SELECT 1 FROM cayu_external_waits WHERE session_id=%s "
+            "AND session_instance_id=%s AND pending_handoff=1 LIMIT 1",
+            (session.id, session.instance_id),
+        )
+        if await cur.fetchone() is not None:
+            raise ValueError("Session has a pending external-wait handoff.")
         from cayu._validation import DURABLE_DOCUMENT_LIMITS
         from cayu.collaboration import _session_export_store as session_exports
         from cayu.runtime._session_closure_records import require_terminal_protected_effect
@@ -30841,7 +30860,8 @@ class PostgresSessionStore(
         expected_run_epoch = _current_session_run_epoch(session_id)
         async with self._connection() as conn:
             async with conn.cursor() as cur:
-                if await self._load_for_update(cur, session_id) is None:
+                admission_source = await self._load_for_update(cur, session_id)
+                if admission_source is None:
                     raise KeyError(f"Session not found: {session_id}")
                 for owner in await self._closure_lineage_owners(cur, (session_id,)):
                     _check_closure_lineage_owner(owner, (session_id,))
@@ -30880,6 +30900,7 @@ class PostgresSessionStore(
                         f"Session status transition not allowed: {loaded.status} -> {to_status}"
                     )
                 if to_status is SessionStatus.RUNNING:
+                    await self._require_external_wait_admission(cur, admission_source)
                     _require_live_incomplete_recovery_claim_for_run_epoch_transfer(
                         await self._load_checkpoint(cur, session_id),
                         now=updated_at,
@@ -30977,6 +30998,8 @@ class PostgresSessionStore(
                         raise SessionStatusConflict(
                             f"Session status transition not allowed: {loaded.status} -> {to_status}"
                         )
+                    if to_status is SessionStatus.RUNNING:
+                        await self._require_external_wait_admission(cur, loaded)
                     if expected_latest_interaction_event_id is not None:
                         await cur.execute(
                             "SELECT retained.event_id "

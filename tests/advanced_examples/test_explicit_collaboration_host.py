@@ -590,6 +590,58 @@ async def test_example_keeps_servicing_during_business_readback(monkeypatch, own
 
 
 @pytest.mark.anyio
+async def test_example_planning_read_outlives_client_observation(monkeypatch):
+    from tests.core.test_request_planning_public import scenario
+
+    from cayu.collaboration import _planning_coordinator
+    from cayu.collaboration._contracts import ExactMatch
+    from cayu.collaboration.memory import InMemoryCollaborationStore
+
+    app, resolver, command, _, provider = await scenario(InMemoryCollaborationStore(), "decline")
+    context = resolver.recipient.context
+    expected = await app.plan_collaboration_request(command, context=context)
+    monkeypatch.setattr(app._request_coordinator._owners, "observation_timeout", 0.02)
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = _planning_coordinator._held
+    reads = []
+
+    async def held(*args, **kwargs):
+        if kwargs.get("read_only"):
+            reads.append(True)
+            entered.set()
+            await release.wait()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(_planning_coordinator, "_held", held)
+    observation = explicit_host._ExampleObservation(
+        lambda: explicit_host.lookup_host_plan(app, command, context=context)
+    )
+    observation.start()
+    running = observation.task
+    try:
+        async with asyncio.timeout(10):
+            while not entered.is_set():
+                if running.done():
+                    await running
+                await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        assert not running.done()
+        assert reads == [True]
+        release.set()
+        found, error = await asyncio.wait_for(running, 10)
+        assert error is None
+        assert isinstance(found, ExactMatch) and found.receipt == expected
+        assert reads == [True]
+        assert not provider.requests
+    finally:
+        release.set()
+        if not running.done():
+            running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
+        await app.aclose()
+
+
+@pytest.mark.anyio
 async def test_example_cancelled_readback_remains_owned_and_observable(monkeypatch):
     entered = asyncio.Event()
     release = asyncio.Event()

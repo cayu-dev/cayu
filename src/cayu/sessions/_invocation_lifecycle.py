@@ -839,6 +839,18 @@ class _ReleaseInvocationAuthority:
     command_sha256: str
 
 
+class _ExternalExecutionOrigin(BaseModel):
+    """Constant-size native cleanup provenance, never an execution permit."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    registration_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    execution_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    admission_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    admission_kind: Literal["create", "admit"]
+    admission_epoch: StrictInt = Field(ge=1)
+
+
 class _InvocationLifecycleCommandReceipt(BaseModel):
     """Durable evidence and original result for one atomic lifecycle mutation."""
 
@@ -859,6 +871,10 @@ class _InvocationLifecycleCommandReceipt(BaseModel):
     participant_permit_commitment: str | None = None
     temporary_service_operation_key: str | None = Field(
         default=None, pattern=r"^session-continuation:service:[0-9a-f]{64}$"
+    )
+    # Existing receipts must retain their original content commitment on upgrade.
+    external_execution_origin: _ExternalExecutionOrigin | None = Field(
+        default=None, exclude_if=lambda value: value is None
     )
     record_sha256: str = ""
 
@@ -893,6 +909,22 @@ class _InvocationLifecycleCommandReceipt(BaseModel):
 
     @model_validator(mode="after")
     def validate_record(self) -> _InvocationLifecycleCommandReceipt:
+        origin = self.external_execution_origin
+        if origin is not None and (
+            origin.admission_epoch > self.active_profile.run_epoch
+            or self.participant_permit_operation is not None
+            or self.participant_permit_commitment is not None
+            or (
+                self.kind
+                in {InvocationLifecycleCommandKind.CREATE, InvocationLifecycleCommandKind.ADMIT}
+                and (
+                    origin.admission_kind != self.kind.value
+                    or origin.admission_epoch != self.active_profile.run_epoch
+                    or origin.admission_sha256 != self.command_sha256
+                )
+            )
+        ):
+            raise ValueError("External execution origin conflicts with lifecycle authority.")
         if self.temporary_service_operation_key is not None and (
             self.kind is not InvocationLifecycleCommandKind.ADMIT
             or self.participant_permit_operation is None
@@ -997,6 +1029,7 @@ def _projected_invocation_release_receipt(
             }
         ),
         active_profile=reserved_receipt.active_profile,
+        external_execution_origin=reserved_receipt.external_execution_origin,
     )
 
 
@@ -1348,6 +1381,7 @@ def _invocation_lifecycle_command_receipt(
     *,
     active_profile: ActiveInvocationExecutionProfile,
     result_session: Session,
+    external_execution_origin: _ExternalExecutionOrigin | None = None,
 ) -> _InvocationLifecycleCommandReceipt:
     return _InvocationLifecycleCommandReceipt(
         kind=command.kind,
@@ -1360,6 +1394,7 @@ def _invocation_lifecycle_command_receipt(
         participant_permit_operation=getattr(command, "participant_permit_operation", None),
         participant_permit_commitment=getattr(command, "participant_permit_commitment", None),
         temporary_service_operation_key=getattr(command, "temporary_service_operation_key", None),
+        external_execution_origin=external_execution_origin,
     )
 
 

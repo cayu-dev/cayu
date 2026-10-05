@@ -124,6 +124,7 @@ async def discover_session_continuations(app, session, *, context, after=None, l
         if (
             record.namespace != root.namespace
             or continuation_operation_key(record.ticket) != entry.ticket_key
+            or entry.purpose != record.ticket.purpose
             or digest(record.model_dump(mode="json")) != entry.record_sha256
         ):
             # A concurrent native transition is a retryable observation conflict,

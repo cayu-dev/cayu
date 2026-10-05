@@ -517,7 +517,20 @@ def test_sqlite_store_requires_migration_from_revision_111(tmp_path, monkeypatch
 
     with pytest.raises(schema.SchemaTooOld):
         SQLiteProductOperationStore(path)
-    assert main(["storage", "migrate", "--sqlite", str(path), "--waive-backup"]) == 0
+    assert (
+        main(
+            [
+                "storage",
+                "migrate",
+                "--sqlite",
+                str(path),
+                "--waive-backup",
+                "--acknowledge-breaking",
+                "115",
+            ]
+        )
+        == 0
+    )
 
     async def use_migrated_store() -> bool:
         store = SQLiteProductOperationStore(path, schema_mode=schema.SchemaMode.VALIDATE)
@@ -592,7 +605,20 @@ def test_cayu_storage_migrate_upgrades_postgres_to_the_product_revision(
 
     with pytest.raises(schema.SchemaTooOld):
         asyncio.run(open_product_store())
-    assert main(["storage", "migrate", "--postgres", fresh_postgres_dsn, "--waive-backup"]) == 0
+    assert (
+        main(
+            [
+                "storage",
+                "migrate",
+                "--postgres",
+                fresh_postgres_dsn,
+                "--waive-backup",
+                "--acknowledge-breaking",
+                "115",
+            ]
+        )
+        == 0
+    )
     assert asyncio.run(open_product_store())
 
 

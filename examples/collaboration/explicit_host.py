@@ -78,6 +78,7 @@ from cayu import (
 from cayu.budgets.base import BudgetLedger, InMemoryBudgetLedger
 from cayu.budgets.pricing import ModelPrice, PriceBook
 from cayu.collaboration._contracts import ExactMatch, InitiatorBinding, ObjectRef, OwnerRef
+from cayu.collaboration._host_planning import lookup_host_plan
 from cayu.collaboration.base import CollaborationStore
 from cayu.collaboration.exports import ExportLimits
 from cayu.collaboration.mandates import ResourceSelector
@@ -609,7 +610,10 @@ async def run_question(
     await service_until(
         app,
         host_registration(planning_rules=(HostPlanningRule(planning, context),)),
-        lambda: app.lookup_collaboration_plan(planning, context=context),
+        # This example retains the observation under its journey deadline. Use
+        # the host's existing read owner so a slow exact read is not discarded
+        # by the shorter public-client acknowledgement timeout.
+        lambda: lookup_host_plan(app, planning, context=context),
         lambda found: (
             isinstance(found, ExactMatch)
             and found.receipt.state == "admitted"

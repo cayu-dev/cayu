@@ -1201,6 +1201,17 @@ def _is_active_invocation_build_provenance_structural_key(
 
 
 def _is_invocation_lifecycle_receipt_identity_path(path: tuple[str, ...]) -> bool:
+    if len(path) == 4 and path[:3] == (
+        INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+        "receipts",
+        "external_execution_origin",
+    ):
+        return path[3] in {
+            "registration_sha256",
+            "execution_sha256",
+            "admission_sha256",
+            "admission_kind",
+        }
     if len(path) == 2 and path[0] == INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY:
         return path[1] in {
             "record_type",
@@ -1278,6 +1289,18 @@ def _is_invocation_lifecycle_receipt_structural_key(
     path: tuple[str, ...],
     key: str,
 ) -> bool:
+    if path == (
+        INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+        "receipts",
+        "external_execution_origin",
+    ):
+        return key in {
+            "registration_sha256",
+            "execution_sha256",
+            "admission_sha256",
+            "admission_kind",
+            "admission_epoch",
+        }
     if path == (INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,):
         return key in {
             "record_type",
@@ -1299,6 +1322,7 @@ def _is_invocation_lifecycle_receipt_structural_key(
         "session_instance_id",
         "result_session",
         "active_profile",
+        "external_execution_origin",
         "record_sha256",
     }
 

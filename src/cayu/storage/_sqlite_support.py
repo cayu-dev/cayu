@@ -66,6 +66,7 @@ from cayu.storage._diagnostic_inspection import (
     DiagnosticStoreInspectionChanged,
     current_diagnostic_store_inspection,
 )
+from cayu.storage._external_wait_schema import SQLITE_EXTERNAL_WAIT_DDL
 from cayu.storage._model_policy_schema import SQLITE_MODEL_POLICY_DDL
 from cayu.storage._participant_bindings_schema import (
     SQLITE_PARTICIPANT_BINDINGS_DDL,
@@ -1046,6 +1047,7 @@ _MIGRATION_STEPS: dict[int, str] = {
     112: SQLITE_PRODUCT_OPERATION_DDL,
     113: SQLITE_EXECUTION_DDL,
     114: SQLITE_MODEL_POLICY_DDL,
+    115: SQLITE_EXTERNAL_WAIT_DDL,
     110: """
         CREATE TABLE IF NOT EXISTS cayu_producer_cleanup_receipts (
             operation_key TEXT PRIMARY KEY NOT NULL,
@@ -5952,6 +5954,12 @@ def _backfill_interrupted_handoff_generations(connection: sqlite3.Connection) ->
     finalize_active_task()
 
 
+def _upgrade_continuation_indexes(connection: sqlite3.Connection) -> None:
+    from cayu.storage._continuation_index_migration import migrate_sqlite_continuation_indexes
+
+    migrate_sqlite_continuation_indexes(connection)
+
+
 # Per-revision Python follow-ups that cannot be expressed as unconditional DDL
 # (e.g. conditionally carrying data out of a legacy ad-hoc table). Each hook runs
 # after its revision's DDL and before the revision is recorded.
@@ -5965,6 +5973,7 @@ _MIGRATION_HOOKS: dict[int, Callable[[sqlite3.Connection], None]] = {
     59: _backfill_session_instance_ids,
     62: _migrate_revision_sixty_two_payloads,
     76: _backfill_interrupted_handoff_generations,
+    115: _upgrade_continuation_indexes,
 }
 
 _REVISION_17_INDEX_NAMES = frozenset(

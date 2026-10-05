@@ -482,13 +482,17 @@ def test_expired_owner_cannot_renew_or_block_existing_fenced_recovery(
 
 
 def test_server_startup_retries_sessions_skipped_for_live_lease_after_expiry(monkeypatch):
+    from datetime import UTC, datetime, timedelta
+
     from fastapi.testclient import TestClient
 
     import cayu.server as server_module
     from cayu.server import ServerConfig, ServerLifecycleConfig, create_server
 
+    clock = [datetime.now(UTC)]
+
     async def prepare():
-        store = InMemorySessionStore()
+        store = InMemorySessionStore(ownership_clock=lambda: clock[0])
         session = await store.create(
             RunRequest(agent_name="assistant", session_id="startup-live-lease", messages=[]),
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
@@ -508,6 +512,16 @@ def test_server_startup_retries_sessions_skipped_for_live_lease_after_expiry(mon
 
     store, owner = asyncio.run(prepare())
     monkeypatch.setattr(server_module, "_STARTUP_EXECUTION_OWNER_RETRY_MARGIN_SECONDS", 0.05)
+    retry_delay = server_module._startup_execution_owner_retry_delay
+
+    async def expire_before_retry(app, session_ids, statuses):
+        # Keep the lease live through first planning even on a loaded runner.
+        # Expire it at the native clock before the real retry loop inspects it.
+        assert session_ids == ["startup-live-lease"]
+        clock[0] = owner.lease_expires_at + timedelta(milliseconds=1)
+        return await retry_delay(app, session_ids, statuses)
+
+    monkeypatch.setattr(server_module, "_startup_execution_owner_retry_delay", expire_before_retry)
     app = _app(store, _BlockedProvider())
     plans = []
     plan_recovery, execute_recovery = app.plan_recovery, app.execute_recovery
@@ -515,7 +529,7 @@ def test_server_startup_retries_sessions_skipped_for_live_lease_after_expiry(mon
 
     async def recording_plan(request):
         plan = await plan_recovery(request)
-        plans.append((time.time(), plan))
+        plans.append((clock[0].timestamp(), plan))
         return plan
 
     async def recording_execute(request):

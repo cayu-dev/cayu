@@ -60,6 +60,7 @@ from cayu.sessions.base import (
 from cayu.storage import _creation_fence
 from cayu.storage._context_selection_fence import SQLiteContextSelectionFenceMixin
 from cayu.storage._creation_fence import SQLiteCreationFenceMixin
+from cayu.storage._external_wait_sqlite import SQLiteExternalWaitMixin
 from cayu.storage._phase_timing import TimedStoreLock, TimedStoreReadQueue
 from cayu.storage._session_execution import SQLiteSessionExecutionMixin
 from cayu.storage.targets import require_sqlite_store_allowed
@@ -1686,6 +1687,7 @@ def _queued_session_message_from_row(row: sqlite3.Row | dict[str, Any]) -> Sessi
 
 @model_store_surface("sessions")
 class SQLiteSessionStore(
+    SQLiteExternalWaitMixin,
     SQLiteSessionExecutionMixin,
     SQLiteContextSelectionFenceMixin,
     SQLiteCreationFenceMixin,
@@ -1781,6 +1783,7 @@ class SQLiteSessionStore(
     session_steering_version: ClassVar[int | None] = 1
     session_export_version: ClassVar[int] = 1
     session_continuation_version: ClassVar[int] = 1
+    external_wait_version: ClassVar[int] = 1
     _producer_attachment_version: ClassVar[int] = 1
     supports_completion_result_event_publication_reservations: ClassVar[bool] = True
     supports_transcript_search: ClassVar[bool] = True
@@ -3510,6 +3513,7 @@ class SQLiteSessionStore(
                         created_at=created_at,
                     )
                     self._require_available_closure_identity_unlocked(session.id)
+                    self._require_external_creation_unlocked(request)
                     admission = _copy_optional_interaction_admission(
                         session.id,
                         interaction_started_event,
@@ -6206,6 +6210,15 @@ class SQLiteSessionStore(
 
     def _require_session_erasure_quiescence_unlocked(self, session: Session) -> None:
         """Shared admission for closure and final deletion; no mutations."""
+        if (
+            self._connection.execute(
+                "SELECT 1 FROM cayu_external_waits WHERE session_id=? "
+                "AND session_instance_id=? AND pending_handoff=1 LIMIT 1",
+                (session.id, session.instance_id),
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("Session has a pending external-wait handoff.")
         from cayu._validation import DURABLE_DOCUMENT_LIMITS
         from cayu.collaboration import _session_export_store as session_exports
         from cayu.runtime._session_closure_records import require_terminal_protected_effect
@@ -6653,6 +6666,9 @@ class SQLiteSessionStore(
                     _check_closure_lineage_owner(owner, (session_id,))
                 updated_at = self._ownership_clock()
                 expected_run_epoch = _current_session_run_epoch(session_id)
+                admission_source = (
+                    self._load_unlocked(session_id) if to_status is SessionStatus.RUNNING else None
+                )
                 placeholders = ", ".join("?" for _ in allowed_statuses)
                 params: list[object] = [
                     str(to_status),
@@ -6688,6 +6704,9 @@ class SQLiteSessionStore(
                         f"Session status transition not allowed: {loaded.status} -> {to_status}"
                     )
                 if to_status is SessionStatus.RUNNING:
+                    if admission_source is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    self._require_external_wait_admission_unlocked(admission_source)
                     _require_live_incomplete_recovery_claim_for_run_epoch_transfer(
                         self._load_checkpoint_unlocked(session_id),
                         now=updated_at,
@@ -6789,6 +6808,8 @@ class SQLiteSessionStore(
                     raise SessionStatusConflict(
                         f"Session status transition not allowed: {loaded.status} -> {to_status}"
                     )
+                if to_status is SessionStatus.RUNNING:
+                    self._require_external_wait_admission_unlocked(loaded)
                 if expected_latest_interaction_event_id is not None:
                     latest_interaction_row = self._connection.execute(
                         "SELECT event.latest_event_sequence, retained.event_id "

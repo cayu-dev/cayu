@@ -109,7 +109,11 @@ async def exclude_released_execution_wait(
             permit_commitment=admission.participant_permit_commitment,
         )
     identity = handoff.execution_identity
-    if identity is None or proof.permit_operation != identity.operation_key:
+    if (
+        identity is None
+        or proof.permit_operation != identity.operation_key
+        or proof.permit_commitment is None
+    ):
         raise ContinuationConflict("Wait release belongs to another execution operation.")
     permit = await source._lookup_registered_permit(
         initialized, initialized.operation(identity.operation_key), redactor=app._secret_redactor

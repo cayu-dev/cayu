@@ -44,6 +44,18 @@ from tests.providers.conformance import (
 from tests.providers.lifecycle_cases import lifecycle_events
 
 
+def _conformance_deadlines(scenario: ProviderScenario) -> ProviderStreamDeadlines:
+    # Ordinary capability assertions are not latency benchmarks. Keep finite
+    # scheduling headroom on loaded workers, and retain the deliberate idle
+    # timeout independently so its classification is still exercised.
+    return ProviderStreamDeadlines(
+        transport_idle_timeout_s=0.02 if scenario == "idle_timeout" else 10.0,
+        semantic_progress_timeout_s=10.0,
+        protocol_idle_timeout_s=10.0,
+        absolute_stream_timeout_s=10.0,
+    )
+
+
 class _AsyncTransport:
     def __init__(self) -> None:
         self.closed = False
@@ -580,12 +592,7 @@ async def _openai_factory(scenario: ProviderScenario) -> ProviderHarness:
     provider = OpenAIProvider(
         api_key="conformance-key",
         transport=transport,
-        stream_deadlines=ProviderStreamDeadlines(
-            transport_idle_timeout_s=0.02 if scenario == "idle_timeout" else 1.0,
-            semantic_progress_timeout_s=1.0,
-            protocol_idle_timeout_s=1.0,
-            absolute_stream_timeout_s=1.0,
-        ),
+        stream_deadlines=_conformance_deadlines(scenario),
     )
     return _async_transport_harness(provider, "gpt-conformance", transport)
 
@@ -605,12 +612,7 @@ async def _openai_subscription_factory(scenario: ProviderScenario) -> ProviderHa
     provider = OpenAISubscriptionProvider(
         auth=_OpenAISubscriptionAuth(),
         transport=transport,
-        stream_deadlines=ProviderStreamDeadlines(
-            transport_idle_timeout_s=0.02 if scenario == "idle_timeout" else 1.0,
-            semantic_progress_timeout_s=1.0,
-            protocol_idle_timeout_s=1.0,
-            absolute_stream_timeout_s=1.0,
-        ),
+        stream_deadlines=_conformance_deadlines(scenario),
     )
     return _async_transport_harness(provider, "gpt-conformance", transport)
 
@@ -620,12 +622,7 @@ async def _anthropic_factory(scenario: ProviderScenario) -> ProviderHarness:
     provider = AnthropicProvider(
         api_key="conformance-key",
         transport=transport,
-        stream_deadlines=ProviderStreamDeadlines(
-            transport_idle_timeout_s=0.02 if scenario == "idle_timeout" else 1.0,
-            semantic_progress_timeout_s=1.0,
-            protocol_idle_timeout_s=1.0,
-            absolute_stream_timeout_s=1.0,
-        ),
+        stream_deadlines=_conformance_deadlines(scenario),
     )
     return _async_transport_harness(provider, "claude-conformance", transport)
 
@@ -636,12 +633,7 @@ async def _chat_completions_factory(scenario: ProviderScenario) -> ProviderHarne
         api_key="conformance-key",
         name="chat_conformance",
         transport=transport,
-        stream_deadlines=ProviderStreamDeadlines(
-            transport_idle_timeout_s=0.02 if scenario == "idle_timeout" else 1.0,
-            absolute_stream_timeout_s=1.0,
-            semantic_progress_timeout_s=1.0,
-            protocol_idle_timeout_s=1.0,
-        ),
+        stream_deadlines=_conformance_deadlines(scenario),
     )
     return _async_transport_harness(provider, "chat-conformance", transport)
 
@@ -652,12 +644,7 @@ async def _gateway_factory(scenario: ProviderScenario) -> ProviderHarness:
         api_key="conformance-key",
         base_url="https://gateway.invalid/v1",
         transport=transport,
-        stream_deadlines=ProviderStreamDeadlines(
-            transport_idle_timeout_s=0.02 if scenario == "idle_timeout" else 1.0,
-            absolute_stream_timeout_s=1.0,
-            semantic_progress_timeout_s=1.0,
-            protocol_idle_timeout_s=1.0,
-        ),
+        stream_deadlines=_conformance_deadlines(scenario),
     )
     return _async_transport_harness(provider, "chat-conformance", transport)
 
@@ -668,12 +655,7 @@ async def _vertex_factory(scenario: ProviderScenario) -> ProviderHarness:
         project_id="conformance-project",
         credentials=_VertexCredentials(),
         transport=transport,
-        stream_deadlines=ProviderStreamDeadlines(
-            transport_idle_timeout_s=0.02 if scenario == "idle_timeout" else 1.0,
-            absolute_stream_timeout_s=1.0,
-            semantic_progress_timeout_s=1.0,
-            protocol_idle_timeout_s=1.0,
-        ),
+        stream_deadlines=_conformance_deadlines(scenario),
     )
     return _async_transport_harness(provider, "claude-conformance", transport)
 
@@ -686,24 +668,14 @@ async def _bedrock_factory(scenario: ProviderScenario) -> ProviderHarness:
         patcher.start()
         provider = BedrockProvider(
             region_name="us-east-1",
-            stream_deadlines=ProviderStreamDeadlines(
-                transport_idle_timeout_s=0.02 if scenario == "idle_timeout" else 1.0,
-                semantic_progress_timeout_s=1.0,
-                protocol_idle_timeout_s=1.0,
-                absolute_stream_timeout_s=1.0,
-            ),
+            stream_deadlines=_conformance_deadlines(scenario),
             stream_close_timeout_s=0.2,
         )
     else:
         provider = BedrockProvider(
             client=client,
             region_name="us-east-1",
-            stream_deadlines=ProviderStreamDeadlines(
-                transport_idle_timeout_s=0.02 if scenario == "idle_timeout" else 1.0,
-                absolute_stream_timeout_s=1.0,
-                semantic_progress_timeout_s=1.0,
-                protocol_idle_timeout_s=1.0,
-            ),
+            stream_deadlines=_conformance_deadlines(scenario),
             stream_close_timeout_s=0.2,
         )
 

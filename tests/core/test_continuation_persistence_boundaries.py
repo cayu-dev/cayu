@@ -13,6 +13,7 @@ from tests.core.test_temporary_service_target import side_admission
 import cayu
 
 MODULES = (
+    "_external_wait_records",
     "_session_continuation_store",
     "_temporary_continuation_store",
     "_temporary_service_target",

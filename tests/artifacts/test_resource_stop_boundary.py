@@ -205,6 +205,8 @@ def test_stopped_preparation_cannot_dispatch_after_late_authority(
 def test_cancelled_observer_preserves_late_primary_diagnostic_and_cleanup_failures(
     tmp_path, monkeypatch, capsys, caplog, diagnostic_failure, cleanup_failure, drain_cancel
 ):
+    # Keep finalizers from earlier tests outside this scenario's diagnostic capture.
+    gc.collect()
     store, artifact = make_store(tmp_path)
     primary = OSError("private-primary-canary")
     diagnostic = RuntimeError("private-diagnostic-canary")
@@ -322,6 +324,7 @@ def test_cancelled_observer_preserves_late_primary_diagnostic_and_cleanup_failur
     with warnings.catch_warnings(record=True) as emitted:
         warnings.simplefilter("always")
         asyncio.run(run())
+        gc.collect()
     assert not emitted
     assert not caplog.records
     captured = capsys.readouterr()

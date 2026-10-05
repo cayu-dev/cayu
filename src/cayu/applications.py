@@ -415,6 +415,7 @@ from cayu.runtime._execution_profile_identity_validation import (
     copy_secret_free_execution_profile_behavior_identity,
 )
 from cayu.runtime._execution_to_wait import _ExecutionToWait
+from cayu.runtime._external_execution_to_wait import _ExternalExecutionToWait
 from cayu.runtime._foreground_child_delivery import ForegroundChildDeliveryOwner
 from cayu.runtime._foreground_child_wait import ForegroundChildTerminal, ForegroundChildWait
 from cayu.runtime._fork_source_snapshot import (
@@ -7016,7 +7017,7 @@ class CayuApp:
         participant_context: CollaborationAccessContext | None = None,
         participant_permit_operation: str | None = None,
         participant_permit_commitment: str | None = None,
-        execution_to_wait: _ExecutionToWait | None = None,
+        execution_to_wait: _ExecutionToWait | _ExternalExecutionToWait | None = None,
         producer_output: _ProducerExecution | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not RunRequest:
@@ -7145,6 +7146,7 @@ class CayuApp:
         store_resolved_session_id: str | None = None,
         continuation_handoff: _ResumeAdmissionHandoff | None = None,
         participant_context: CollaborationAccessContext | None = None,
+        execution_to_wait: _ExternalExecutionToWait | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not ResumeRequest:
             raise TypeError("Runtime resume requires a ResumeRequest.")
@@ -7160,6 +7162,7 @@ class CayuApp:
             store_resolved_session_id=store_resolved_session_id,
             continuation_handoff=continuation_handoff,
             participant_context=participant_context,
+            execution_to_wait=execution_to_wait,
         )
         del request
         from cayu.resource_access import current_binding

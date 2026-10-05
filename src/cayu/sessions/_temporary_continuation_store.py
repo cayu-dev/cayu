@@ -45,7 +45,9 @@ if TYPE_CHECKING:
 def require_service_deadline(proposed: TemporaryServiceRecord, now: datetime) -> None:
     if int(now.timestamp() * 1000) >= proposed.intent.question.deadline_at_ms:
         raise ContinuationConflict("Temporary service question deadline has expired.")
-    if now >= datetime.fromisoformat(proposed.intent.ticket.deadline):
+    if proposed.intent.ticket.deadline is not None and now >= datetime.fromisoformat(
+        proposed.intent.ticket.deadline
+    ):
         raise ContinuationConflict("Temporary service original wait deadline has expired.")
 
 
@@ -79,6 +81,7 @@ def publish_service_record(
         or entry is None
         or entry.record_sha256 != digest(current)
         or entry.originating_writer_generation != before.ticket.writer_generation
+        or entry.purpose != before.ticket.purpose
         or entry.state != before.ticket.state
         or entry.service_receipt_epochs != service_receipt_epochs(before)
     ):

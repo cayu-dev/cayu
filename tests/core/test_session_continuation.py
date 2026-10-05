@@ -35,16 +35,25 @@ from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime._invocation_lifecycle import (
+    _authenticated_invocation_context,
+    invocation_checkpoint_state_sha256,
+    runtime_publication_checkpoint_mutation,
+)
+from cayu.runtime._session_continuation import admit_continuation
+from cayu.runtime._session_continuation_owner import LATCH_FAMILY, SessionContinuationOwner
+from cayu.runtime._session_continuation_scope import preparation_scope
+from cayu.sessions._execution_profile_checkpoint import (
+    active_invocation_execution_profile_from_checkpoint,
+    execution_profile_from_session_metadata,
+)
+from cayu.sessions._invocation_lifecycle import (
     AdmitInvocationCommand,
     AdmittedInvocationBinding,
     InvocationCheckpointPatch,
     InvocationMutationResult,
     PreparedInvocationBinding,
-    _authenticated_invocation_context,
-    invocation_checkpoint_state_sha256,
-    runtime_publication_checkpoint_mutation,
 )
-from cayu.runtime._session_continuation import (
+from cayu.sessions._session_continuation import (
     ContinuationConflict,
     ContinuationConsumption,
     ContinuationLatch,
@@ -56,19 +65,14 @@ from cayu.runtime._session_continuation import (
     ContinuationTicket,
     ContinuationUnavailable,
     ContinuationWait,
-    admit_continuation,
+    RetainedContinuationLatchReceiver,
     continuation_admission_digest,
     continuation_admission_inputs,
     continuation_namespace_id,
     continuation_operation_key,
     continuation_registration_operation,
 )
-from cayu.runtime._session_continuation_owner import LATCH_FAMILY, SessionContinuationOwner
-from cayu.runtime._session_continuation_scope import consumption_scope, preparation_scope
-from cayu.runtime.execution_profiles import (
-    active_invocation_execution_profile_from_checkpoint,
-    execution_profile_from_session_metadata,
-)
+from cayu.sessions._session_continuation_scope import consumption_scope
 from cayu.sessions.base import (
     ForkSessionRequest,
     InMemorySessionStore,
@@ -565,7 +569,7 @@ async def _preparation(store, ticket: ContinuationTicket) -> ContinuationPrepara
     )
 
 
-async def _context(store, session_id, *, admission=None, app=None):
+async def _context(store, session_id, *, admission=None, app=None, recovery_claim_id=None):
     session = await store.load(session_id)
     assert session is not None
     active = active_invocation_execution_profile_from_checkpoint(
@@ -602,6 +606,7 @@ async def _context(store, session_id, *, admission=None, app=None):
         loop_policies=(),
         request_loop_policies=(),
         budget_policy=None,
+        recovery_claim_id=recovery_claim_id,
         tool_capability_ceiling=tool_capability_ceiling_from_session_metadata(session.metadata),
     )
 
@@ -635,7 +640,8 @@ async def _admitted_store() -> tuple[InMemorySessionStore, Session, str]:
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
-def test_registered_owner_prepares_from_runtime_context(backend, tmp_path) -> None:
+@pytest.mark.parametrize("event_only", [False, True])
+def test_registered_owner_prepares_from_runtime_context(backend, event_only, tmp_path) -> None:
     async def run() -> None:
         store = (
             InMemorySessionStore()
@@ -654,6 +660,8 @@ def test_registered_owner_prepares_from_runtime_context(backend, tmp_path) -> No
                 model="continuation-model",
             )
             ticket = _ticket(admitted.session, admitted.active_invocation_profile.interaction_id)
+            if event_only:
+                ticket = ticket.model_copy(update={"deadline": None})
             invocation = await _context(store, admitted.session.id)
             owner = SessionContinuationOwner(
                 store=store,
@@ -842,7 +850,7 @@ def test_retirement_owner_retains_publication_through_cancellation(backend, tmp_
             )
             assert current is not None and current.retirement is None
             owner.owners.observation_timeout = 0.01
-            from cayu.runtime._session_continuation import ContinuationUnavailable
+            from cayu.sessions._session_continuation import ContinuationUnavailable
 
             with pytest.raises(ContinuationUnavailable):
                 await owner.retire(retirement, invocation=invocation)
@@ -1375,7 +1383,8 @@ def test_latched_replay_does_not_reacquire_the_receiving_owner() -> None:
     asyncio.run(run())
 
 
-def test_registered_receiver_owns_opaque_work_and_rejects_raw_lookalikes() -> None:
+@pytest.mark.parametrize("retained", [False, True])
+def test_registered_receiver_owns_opaque_work_and_rejects_raw_lookalikes(retained) -> None:
     async def run() -> None:
         store, session, interaction_id = await _admitted_store()
         ticket = _ticket(session, interaction_id)
@@ -1395,7 +1404,10 @@ def test_registered_receiver_owns_opaque_work_and_rejects_raw_lookalikes() -> No
         calls = 0
         source_latch = latch
 
-        class SourceOwner:
+        class SourceOwner(RetainedContinuationLatchReceiver):
+            async def _authenticate_latch_owned(self, latch):
+                return await self.authenticate_continuation_latch(latch)
+
             async def authenticate_continuation_latch(self, latch):
                 nonlocal calls
                 calls += 1
@@ -1419,7 +1431,20 @@ def test_registered_receiver_owns_opaque_work_and_rejects_raw_lookalikes() -> No
             ),
             redactor=SecretRedactor(),
         )
+        deliver = owner._latch_owned if retained else owner.latch
         try:
+            unqualified = SessionContinuationOwner(
+                store=store,
+                owner=ticket.owner,
+                receiver=_QualifiedReceiver(),
+                receiver_capability=owner.receiver_capability,
+                redactor=SecretRedactor(),
+            )
+            with pytest.raises(PermissionError):
+                await unqualified._latch_owned(latch)
+            with pytest.raises(PermissionError):
+                await unqualified._inspect_latch_owned(latch)
+            await unqualified.drain()
             with pytest.raises(PermissionError):
                 await store.latch_continuation(latch)
             with pytest.raises(PermissionError):
@@ -1438,7 +1463,7 @@ def test_registered_receiver_owns_opaque_work_and_rejects_raw_lookalikes() -> No
                     ),
                     events=[],
                 )
-            caller = asyncio.create_task(owner.latch(latch))
+            caller = asyncio.create_task(deliver(latch))
             async with asyncio.timeout(2):
                 while not dispatched.is_set():
                     await asyncio.sleep(0.001)
@@ -1449,7 +1474,7 @@ def test_registered_receiver_owns_opaque_work_and_rejects_raw_lookalikes() -> No
             assert caller.cancelled() and caller.cancelling() == 2
             assert "private cancellation canary" not in str(caught.value)
             assert len(owner.owners.pending) == 1
-            retry = asyncio.create_task(owner.latch(latch))
+            retry = asyncio.create_task(deliver(latch))
             await asyncio.sleep(0)
             assert calls == 1 and not retry.done()
             release.set()
@@ -1457,7 +1482,8 @@ def test_registered_receiver_owns_opaque_work_and_rejects_raw_lookalikes() -> No
             assert completed.latch == latch and calls == 1
             with pytest.raises(PermissionError):
                 await store.latch_continuation(latch)
-            assert await owner.latch(latch) == completed
+            assert await deliver(latch) == completed
+            assert await owner._inspect_latch_owned(latch) == completed
             assert calls == 1
         finally:
             release.set()
@@ -1978,6 +2004,8 @@ async def _test_continuation_admission_uses_typed_lifecycle_boundary(
                     assert type(winner) is InvocationMutationResult and not winner.replayed
                     from cayu.runtime._invocation_lifecycle import (
                         INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+                    )
+                    from cayu.sessions._invocation_lifecycle import (
                         superseding_invocation_admission_digest_from_state,
                     )
 
@@ -3106,7 +3134,7 @@ def test_owner_service_uses_real_resume_and_never_redispatches(
             request = ResumeRequest(
                 session_id=ticket.session_id, messages=[Message.text("user", "continue")]
             )
-            from cayu.runtime._session_continuation import ContinuationUnavailable
+            from cayu.sessions._session_continuation import ContinuationUnavailable
 
             incompatible_app = CayuApp(session_store=store, enable_logging=False)
             incompatible_app.register_provider(provider, default=True)
@@ -3276,7 +3304,7 @@ def test_owner_service_uses_real_resume_and_never_redispatches(
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
 def test_real_user_input_pause_blocks_continuation_admission(backend, tmp_path) -> None:
     async def run() -> None:
-        from cayu.runtime._session_continuation import ContinuationUnavailable
+        from cayu.sessions._session_continuation import ContinuationUnavailable
 
         store = (
             InMemorySessionStore()

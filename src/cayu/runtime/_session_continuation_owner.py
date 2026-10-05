@@ -64,6 +64,7 @@ from cayu.sessions._session_continuation import (
     ContinuationTicket,
     ContinuationUnavailable,
     ContinuationWait,
+    RetainedContinuationLatchReceiver,
     continuation_admission_digest,
     continuation_admission_inputs,
     continuation_digest,
@@ -282,12 +283,9 @@ class SessionContinuationOwner:
 
     async def _inspect_latch_owned(self, candidate: ContinuationLatch):
         """Exact retained latch readback; cannot create a latch or start execution."""
-        from cayu.collaboration._wait_coordinator import CollaborationWaitLatchReceiver
-
         latch = prepare_contract(ContinuationLatch, candidate, redactor=self.redactor)
-        if (
-            latch.ticket.owner != self.owner
-            or type(self.receiver) is not CollaborationWaitLatchReceiver
+        if latch.ticket.owner != self.owner or not isinstance(
+            self.receiver, RetainedContinuationLatchReceiver
         ):
             raise PermissionError("Retained latch readback requires its registered receiver.")
 
@@ -312,9 +310,7 @@ class SessionContinuationOwner:
             raise PermissionError("Continuation belongs to a different session owner.")
         authenticate = self.receiver.authenticate_continuation_latch
         if wait_for_settlement:
-            from cayu.collaboration._wait_coordinator import CollaborationWaitLatchReceiver
-
-            if type(self.receiver) is not CollaborationWaitLatchReceiver:
+            if not isinstance(self.receiver, RetainedContinuationLatchReceiver):
                 raise PermissionError("Retained latch observation requires its native receiver.")
             authenticate = self.receiver._authenticate_latch_owned
 
@@ -423,6 +419,43 @@ class SessionContinuationOwner:
             key=(binding.session_id, continuation_operation_key(ticket), "prepare"),
             expected=contract_bytes(ticket, redactor=self.redactor)
             + invocation.profile.fingerprint.encode(),
+        )
+
+    async def recover_writer(
+        self, candidate: ContinuationTicket, *, invocation: InvocationContext
+    ) -> ContinuationRecord:
+        """Attach an ARMING external ticket to the exact native recovery claim."""
+        return await self._recover_writer(candidate, invocation=invocation, park=False)
+
+    async def park_recovered(
+        self, candidate: ContinuationTicket, *, invocation: InvocationContext
+    ) -> ContinuationRecord:
+        """Park after the recovered runtime reaches its complete whole-turn boundary."""
+        return await self._recover_writer(candidate, invocation=invocation, park=True)
+
+    async def _recover_writer(
+        self, candidate: ContinuationTicket, *, invocation: InvocationContext, park: bool
+    ) -> ContinuationRecord:
+        from cayu.runtime._continuation_recovery import recovery_writer, recovery_writer_scope
+
+        ticket = prepare_contract(ContinuationTicket, candidate, redactor=self.redactor)
+        if ticket.owner != self.owner:
+            raise PermissionError("Continuation belongs to another registered session owner.")
+        writer = recovery_writer(ticket, invocation)
+
+        async def publish():
+            with recovery_writer_scope(ticket, invocation):
+                return await self.store._recover_continuation_writer(ticket, park=park)
+
+        return await self._observe(
+            publish,
+            key=(
+                ticket.session_id,
+                continuation_operation_key(ticket),
+                "recover-park" if park else "recover-writer",
+            ),
+            expected=contract_bytes(ticket, redactor=self.redactor)
+            + contract_bytes(writer, redactor=self.redactor),
         )
 
     async def park(

@@ -95,6 +95,9 @@ from cayu.sessions._invocation_lifecycle import (
     _compact_invocation_lifecycle_receipts as _compact_invocation_lifecycle_receipts,
 )
 from cayu.sessions._invocation_lifecycle import (
+    _ExternalExecutionOrigin as _ExternalExecutionOrigin,
+)
+from cayu.sessions._invocation_lifecycle import (
     _invocation_lifecycle_command_identity as _invocation_lifecycle_command_identity,
 )
 from cayu.sessions._invocation_lifecycle import (
@@ -939,10 +942,13 @@ def checkpoint_with_invocation_lifecycle_receipt(
         if _ledger is None
         else _ledger
     )
+    from cayu.runtime._external_wait_receipts import external_execution_origin
+
     receipt = _invocation_lifecycle_command_receipt(
         command,
         active_profile=active_profile,
         result_session=result_session,
+        external_execution_origin=external_execution_origin(command, ledger),
     )
     retained = {
         item.command_identity: item

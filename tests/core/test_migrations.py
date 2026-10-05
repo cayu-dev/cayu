@@ -112,7 +112,11 @@ def test_revision_112_adds_product_operations_without_fencing_older_writers() ->
     assert revision.kind is m.RevisionKind.ADDITIVE
     assert revision.compatible_from == 111
     # Older binaries never touch cayu_product_operations and keep operating.
-    m.validate(m.SchemaState(revision=112, compatible_from=111), app_latest=111)
+    m.validate(
+        m.SchemaState(revision=112, compatible_from=111),
+        app_latest=111,
+        app_min_supported=111,
+    )
 
 
 def test_revision_thirty_one_rejects_pre_input_contract_readers() -> None:

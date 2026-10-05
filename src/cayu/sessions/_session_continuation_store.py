@@ -14,6 +14,7 @@ from cayu.sessions._session_continuation import (
     CONTINUATION_MAX_EVENT_BYTES,
     CONTINUATION_MAX_EVENTS,
     CONTINUATION_MAX_LATCH_EVIDENCE_BYTES,
+    CONTINUATION_MAX_RECOVERY_WRITER_BYTES,
     CONTINUATION_MAX_RELEASED_RETIREMENT_BYTES,
     CONTINUATION_MAX_RETIREMENT_EVIDENCE_BYTES,
     CONTINUATION_MAX_SERVICE_REFERENCE_BYTES,
@@ -70,6 +71,7 @@ class _Entry(ContractValue):
     state: Literal["ARMING", "WAITING", "SERVICING", "CONSUMED", "RETIRED"]
     record_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
     originating_writer_generation: StrictInt = Field(ge=1, le=2**53 - 1)
+    purpose: StrictStr = Field(min_length=1, max_length=256)
     reserved_bytes: Literal[65536] = MAX_ENVELOPE_BYTES
     admission_claim_id: StrictStr | None = Field(default=None, min_length=1, max_length=128)
     admission_command_digest: StrictStr | None = None
@@ -95,7 +97,7 @@ class _Entry(ContractValue):
 
 
 class ContinuationRoot(ContractValue):
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     namespace: ContinuationNamespace
     entries: tuple[_Entry, ...] = Field(default=(), max_length=MAX_RETAINED_TICKETS)
     target_services: tuple[TemporaryServiceTargetReference, ...] = Field(
@@ -131,6 +133,7 @@ def require_reserved_capacity(preparation: ContinuationPreparation) -> None:
         + CONTINUATION_MAX_CONSUMPTION_EVIDENCE_BYTES
         + CONTINUATION_MAX_RETIREMENT_EVIDENCE_BYTES
         + CONTINUATION_MAX_RELEASED_RETIREMENT_BYTES
+        + (CONTINUATION_MAX_RECOVERY_WRITER_BYTES if ticket.purpose == "external-event-v1" else 0)
         + CONTINUATION_MAX_EVENTS * CONTINUATION_MAX_EVENT_BYTES
         + (
             0
@@ -159,8 +162,9 @@ def require_released_wait_invocation(
     ticket: ContinuationTicket,
     checkpoint: dict[str, Any] | None,
     *,
-    permit_operation: str,
-    permit_commitment: str,
+    permit_operation: str | None,
+    permit_commitment: str | None,
+    record: ContinuationRecord | None = None,
 ) -> ContinuationReleasedExecution:
     """Authenticate original admission and release using the native receipt owner."""
     from cayu.sessions._invocation_lifecycle import (
@@ -168,17 +172,45 @@ def require_released_wait_invocation(
         _invocation_lifecycle_receipt_from_checkpoint,
     )
 
+    if (permit_operation is None) != (permit_commitment is None) or (
+        permit_operation is None
+        and (
+            ticket.purpose != "external-event-v1"
+            or ticket.execution_admission_sha256 is not None
+            or ticket.collaboration_wait_sha256 is not None
+        )
+    ):
+        raise ContinuationConflict("Released wait has no supported execution identity.")
+
     identity = f"{ticket.session_id}:{ticket.session_instance_id}:{ticket.writer_generation}"
     admission = _invocation_lifecycle_receipt_from_checkpoint(
         checkpoint, command_identity="admit:" + identity
     )
+    if admission is None and permit_operation is None and ticket.writer_generation == 1:
+        admission = _invocation_lifecycle_receipt_from_checkpoint(
+            checkpoint, command_identity="create:" + identity
+        )
+    release_epoch = ticket.writer_generation
+    if record is not None and record.recovery_writer is not None:
+        from cayu.sessions._session_continuation import require_ticket_identity
+
+        require_ticket_identity(ticket, record.ticket)
+        if permit_operation is not None or record.services:
+            raise ContinuationConflict("Recovered wait release has unsupported execution history.")
+        release_epoch = record.recovery_writer.run_epoch
     release = _invocation_lifecycle_receipt_from_checkpoint(
-        checkpoint, command_identity="release:" + identity
+        checkpoint,
+        command_identity=f"release:{ticket.session_id}:{ticket.session_instance_id}:{release_epoch}",
     )
     if (
         admission is None
         or release is None
-        or admission.kind is not InvocationLifecycleCommandKind.ADMIT
+        or admission.kind
+        not in (
+            {InvocationLifecycleCommandKind.ADMIT, InvocationLifecycleCommandKind.CREATE}
+            if permit_operation is None
+            else {InvocationLifecycleCommandKind.ADMIT}
+        )
         or release.kind is not InvocationLifecycleCommandKind.RELEASE
         or admission.session_id != ticket.session_id
         or admission.session_instance_id != ticket.session_instance_id
@@ -188,8 +220,15 @@ def require_released_wait_invocation(
         or admission.participant_permit_commitment != permit_commitment
         or admission.active_profile.interaction_id != ticket.interaction_id
         or admission.active_profile.run_epoch != ticket.writer_generation
-        or release.active_profile != admission.active_profile
-        or release.result_session.run_epoch != ticket.writer_generation + 1
+        or release.active_profile
+        != admission.active_profile.model_copy(update={"run_epoch": release_epoch})
+        or release.result_session.run_epoch != release_epoch + 1
+        or (
+            record is not None
+            and record.recovery_writer is not None
+            and record.recovery_writer.profile_sha256
+            != admission.active_profile.profile.fingerprint
+        )
     ):
         raise ContinuationConflict("Execution wait lacks exact native writer-release evidence.")
     return ContinuationReleasedExecution(
@@ -270,6 +309,12 @@ def require_history(record: ContinuationRecord) -> None:
 def _event_kind(before: ContinuationRecord | None, after: ContinuationRecord):
     if before is None:
         return "prepared"
+    if after.recovery_writer != before.recovery_writer:
+        if before.model_copy(update={"recovery_writer": after.recovery_writer}) != after:
+            raise ContinuationConflict("Recovery succession changed other continuation evidence.")
+        # Like admission claims, recovery ownership may change repeatedly.
+        # Authenticate the current owner without exhausting terminal history.
+        return None
     if after.retirement_acknowledged != before.retirement_acknowledged:
         if (
             before.retirement_acknowledged
@@ -349,6 +394,7 @@ def index_publication(
                 entry is None
                 or entry.record_sha256 != digest(current_record)
                 or entry.originating_writer_generation != before.ticket.writer_generation
+                or entry.purpose != before.ticket.purpose
                 or entry.service_receipt_epochs != service_receipt_epochs(before)
                 or entry.service_digest
                 != (None if before.consumption is None else before.consumption.service_digest)
@@ -367,7 +413,13 @@ def index_publication(
                 if event_kind is None:
                     if before is None or before.events != record.events:
                         raise ContinuationConflict("Invalid compact continuation claim transition.")
-                    if (
+                    recovery_change = (
+                        record.recovery_writer is not None
+                        and before.recovery_writer != record.recovery_writer
+                        and before.model_copy(update={"recovery_writer": record.recovery_writer})
+                        == record
+                    )
+                    if not recovery_change and (
                         before.ticket != record.ticket
                         or before.latch != record.latch
                         or before.preparation != record.preparation
@@ -424,6 +476,7 @@ def index_publication(
             state=record.ticket.state,
             record_sha256=digest(raw),
             originating_writer_generation=record.ticket.writer_generation,
+            purpose=record.ticket.purpose,
             admission_claim_id=None if consumption is None else consumption.admission_claim_id,
             admission_command_digest=(
                 None if consumption is None else consumption.admission_command_digest
@@ -483,6 +536,17 @@ def pending_admission_receipt_identities(session: Session, checkpoint) -> frozen
         if entry.state in {"ARMING", "WAITING", "SERVICING"}
         for kind in ("admit", "release")
     )
+    # Initial external execution has CREATE, not ADMIT. If its writer dies
+    # before RELEASE, neither identity above protects the original epoch from
+    # ledger compaction. Recovery and released-writer retirement still need
+    # this exact creation receipt until the continuation is terminal.
+    original_creations = frozenset(
+        f"create:{session.id}:{session.instance_id}:1"
+        for entry in root.entries
+        if entry.purpose == "external-event-v1"
+        and entry.originating_writer_generation == 1
+        and entry.state in {"ARMING", "WAITING", "SERVICING"}
+    )
     # An exactly registered native service can outlive its failed observer.
     # Admission-only handoffs do not own native execution/release observation;
     # they retain their existing settlement boundary rather than borrowing the
@@ -521,7 +585,60 @@ def pending_admission_receipt_identities(session: Session, checkpoint) -> frozen
             and item.active_profile.profile == original.active_profile.profile
             and item.active_profile.run_epoch >= original.active_profile.run_epoch
         )
-    return final_admissions | service_receipts | target_receipts | original_receipts | consumed
+    return (
+        final_admissions
+        | service_receipts
+        | target_receipts
+        | original_receipts
+        | original_creations
+        | consumed
+    )
+
+
+def has_unparked_external_interaction(checkpoint, *, run_epoch: int) -> bool:
+    """Retain the original interaction while its native whole-turn wait is unfinished.
+
+    This is pause classification, not execution admission. Recovery still needs
+    the exact ticket, current host authorization and native claim/rebind.
+    """
+    from cayu.sessions._execution_profile_checkpoint import (
+        active_invocation_execution_profile_from_checkpoint,
+    )
+    from cayu.sessions._invocation_lifecycle import _invocation_lifecycle_receipt_from_checkpoint
+
+    raw = None if checkpoint is None else checkpoint.get(ROOT_KEY)
+    if raw is None:
+        return False
+    root = ContinuationRoot.model_validate(raw)
+    active = active_invocation_execution_profile_from_checkpoint(checkpoint)
+    if active is None or active.run_epoch != run_epoch:
+        return False
+    for entry in root.entries:
+        if entry.purpose != "external-event-v1" or entry.state != "ARMING":
+            continue
+        identity = (
+            f"{root.namespace.session_id}:{root.namespace.session_instance_id}:"
+            f"{entry.originating_writer_generation}"
+        )
+        admission = _invocation_lifecycle_receipt_from_checkpoint(
+            checkpoint, command_identity="admit:" + identity
+        )
+        if admission is None and entry.originating_writer_generation == 1:
+            admission = _invocation_lifecycle_receipt_from_checkpoint(
+                checkpoint, command_identity="create:" + identity
+            )
+        if (
+            admission is None
+            or admission.session_id != root.namespace.session_id
+            or admission.session_instance_id != root.namespace.session_instance_id
+            or admission.active_profile.session_id != active.session_id
+            or admission.active_profile.interaction_id != active.interaction_id
+            or admission.active_profile.profile != active.profile
+            or admission.active_profile.run_epoch > run_epoch
+        ):
+            raise ContinuationConflict("Unfinished external wait lost its original interaction.")
+        return True
+    return False
 
 
 def require_admission_claim(session: Session, checkpoint, command) -> None:
@@ -531,6 +648,7 @@ def require_admission_claim(session: Session, checkpoint, command) -> None:
     from cayu.sessions._temporary_continuation_scope import require_temporary_admission
 
     raw = None if checkpoint is None else checkpoint.get(ROOT_KEY)
+    claim = current_admission_claim()
     if raw is not None:
         root = ContinuationRoot.model_validate(raw)
         if (
@@ -541,6 +659,21 @@ def require_admission_claim(session: Session, checkpoint, command) -> None:
                 "Continuation admission index belongs to another incarnation."
             )
         servicing = tuple(entry for entry in root.entries if entry.state == "SERVICING")
+        external_pending = tuple(
+            entry
+            for entry in root.entries
+            if entry.purpose == "external-event-v1" and entry.state in {"ARMING", "WAITING"}
+        )
+        if external_pending and (
+            claim is None
+            or any(
+                entry.ticket_key != continuation_operation_key(claim.ticket)
+                for entry in external_pending
+            )
+        ):
+            raise ContinuationConflict(
+                "Pending external wait requires its exact continuation admission."
+            )
         if servicing:
             temporary = require_temporary_admission(command)
             if temporary is None or any(
@@ -551,7 +684,6 @@ def require_admission_claim(session: Session, checkpoint, command) -> None:
                     "Unsettled temporary service fences a competing invocation."
                 )
 
-    claim = current_admission_claim()
     if claim is None:
         return
     ticket = claim.ticket
@@ -630,6 +762,7 @@ def require_erasure_quiescence(*, session: Session, checkpoint, records: dict[st
         if (
             entry.record_sha256 != digest(raw)
             or entry.originating_writer_generation != record.ticket.writer_generation
+            or entry.purpose != record.ticket.purpose
             or entry.state != record.ticket.state
             or entry.service_receipt_epochs != service_receipt_epochs(record)
             or entry.service_digest

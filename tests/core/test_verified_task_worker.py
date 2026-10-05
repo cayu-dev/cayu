@@ -2338,6 +2338,8 @@ def test_worker_recovers_terminal_model_stage_after_process_exit(
                                     )
                                 }
                             )
+                        elif closed_fault == "event_boolean_step":
+                            result[0].event.payload["step"] = True
                         else:
                             result[0].event.payload["valid"] = False
                     return result
@@ -2464,6 +2466,7 @@ def test_worker_repairs_recovered_structured_model_result(
         "boolean_schema",
         "missing_event",
         "conflicting_event",
+        "event_boolean_step",
         "duplicate_event",
         "event_identity",
         "event_session",

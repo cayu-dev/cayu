@@ -81,7 +81,9 @@ class TemporaryServicePermitAuthority:
         remaining = min(
             intent.question.policy.service_timeout_ms / 1000,
             (intent.question.deadline_at_ms - now_ms) / 1000,
-            datetime.fromisoformat(intent.ticket.deadline).timestamp() - now_ms / 1000,
+            float("inf")
+            if intent.ticket.deadline is None
+            else datetime.fromisoformat(intent.ticket.deadline).timestamp() - now_ms / 1000,
         ) - (monotonic() - started)
         return ExecutionDeadline.after(
             max(0.0, remaining), source="clarification_service", scope="temporary_service"

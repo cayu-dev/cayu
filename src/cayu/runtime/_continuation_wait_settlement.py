@@ -16,6 +16,7 @@ from cayu.sessions.base import SessionOperationPublication
 if TYPE_CHECKING:
     from cayu.collaboration.waits import CollaborationWait
     from cayu.runtime._session_continuation_owner import SessionContinuationOwner
+    from cayu.sessions.external_waits import ExternalWaitRegistration
 
 
 def retirement_receipt(record: ContinuationRecord) -> ContinuationRecord:
@@ -34,15 +35,24 @@ def retirement_receipt(record: ContinuationRecord) -> ContinuationRecord:
 
 async def acknowledge_retirement(
     owner: SessionContinuationOwner,
-    wait: CollaborationWait,
+    wait: CollaborationWait | ExternalWaitRegistration,
     candidate: ContinuationRecord,
 ) -> None:
     """Only configured receiving code may turn foreign readback into native release."""
     from cayu.collaboration._preparation import prepare_contract
     from cayu.collaboration.waits import CollaborationWait
+    from cayu.sessions.external_waits import ExternalWaitRegistration
 
     record = prepare_contract(ContinuationRecord, candidate, redactor=owner.redactor)
-    wait = prepare_contract(CollaborationWait, wait, redactor=owner.redactor)
+    if type(wait) is ExternalWaitRegistration:
+        from cayu.external_waits import _snapshot
+        from cayu.runtime._external_wait_receiver import ExternalWaitLatchReceiver
+
+        if not isinstance(owner.receiver, ExternalWaitLatchReceiver):
+            raise PermissionError("External retirement requires its registered receiver.")
+        wait = _snapshot(wait, ExternalWaitRegistration)
+    else:
+        wait = prepare_contract(CollaborationWait, wait, redactor=owner.redactor)
     original = retirement_receipt(record)
     if (
         record.ticket.owner != owner.owner

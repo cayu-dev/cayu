@@ -20,6 +20,9 @@ from cayu.sessions._session_continuation import (
     CONTINUATION_MAX_LATCH_EVIDENCE_BYTES as CONTINUATION_MAX_LATCH_EVIDENCE_BYTES,
 )
 from cayu.sessions._session_continuation import (
+    CONTINUATION_MAX_RECOVERY_WRITER_BYTES as CONTINUATION_MAX_RECOVERY_WRITER_BYTES,
+)
+from cayu.sessions._session_continuation import (
     CONTINUATION_MAX_RELEASED_RETIREMENT_BYTES as CONTINUATION_MAX_RELEASED_RETIREMENT_BYTES,
 )
 from cayu.sessions._session_continuation import (
@@ -55,6 +58,9 @@ from cayu.sessions._session_continuation import ContinuationNamespace as Continu
 from cayu.sessions._session_continuation import ContinuationPreparation as ContinuationPreparation
 from cayu.sessions._session_continuation import ContinuationRecord as ContinuationRecord
 from cayu.sessions._session_continuation import (
+    ContinuationRecoveryWriter as ContinuationRecoveryWriter,
+)
+from cayu.sessions._session_continuation import (
     ContinuationReleasedExecution as ContinuationReleasedExecution,
 )
 from cayu.sessions._session_continuation import (
@@ -68,6 +74,9 @@ from cayu.sessions._session_continuation import (
 from cayu.sessions._session_continuation import ContinuationTicket as ContinuationTicket
 from cayu.sessions._session_continuation import ContinuationUnavailable as ContinuationUnavailable
 from cayu.sessions._session_continuation import ContinuationWait as ContinuationWait
+from cayu.sessions._session_continuation import (
+    RetainedContinuationLatchReceiver as RetainedContinuationLatchReceiver,
+)
 from cayu.sessions._session_continuation import _aware_time as _aware_time
 from cayu.sessions._session_continuation import _bounded_digest as _bounded_digest
 from cayu.sessions._session_continuation import (

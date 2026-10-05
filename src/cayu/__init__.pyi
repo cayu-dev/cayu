@@ -2360,6 +2360,17 @@ from cayu.execution_profiles import (
 from cayu.execution_profiles import (
     execution_profile_with_egress_authority as execution_profile_with_egress_authority,
 )
+from cayu.external_wait_host import ExternalWaitHost as ExternalWaitHost
+from cayu.external_wait_host import ExternalWaitHostFailure as ExternalWaitHostFailure
+from cayu.external_wait_host import ExternalWaitHostPage as ExternalWaitHostPage
+from cayu.external_wait_scheduler import TaskStoreWaitScheduler as TaskStoreWaitScheduler
+from cayu.external_waits import ExternalEventWaits as ExternalEventWaits
+from cayu.external_waits import ExternalWaitAccessPolicy as ExternalWaitAccessPolicy
+from cayu.external_waits import ExternalWaitAction as ExternalWaitAction
+from cayu.external_waits import ExternalWaitContext as ExternalWaitContext
+from cayu.external_waits import ExternalWaitProjector as ExternalWaitProjector
+from cayu.external_waits import ExternalWaitSnapshot as ExternalWaitSnapshot
+from cayu.external_waits import JsonExternalWaitProjector as JsonExternalWaitProjector
 from cayu.failure_evidence import FailureEvidence as FailureEvidence
 from cayu.immutable_inputs import (
     DEFAULT_IMMUTABLE_INPUT_MAX_FILE_BYTES as DEFAULT_IMMUTABLE_INPUT_MAX_FILE_BYTES,
@@ -3885,6 +3896,8 @@ from cayu.runtime.tool_effects import (
 from cayu.runtime.tool_effects import (
     ToolEffectReconciliationTarget as ToolEffectReconciliationTarget,
 )
+from cayu.session_external_waits import SessionExternalWaitAdapter as SessionExternalWaitAdapter
+from cayu.session_external_waits import SessionExternalWaitReceipt as SessionExternalWaitReceipt
 from cayu.sessions._execution_profile_checkpoint import (
     EXECUTION_PROFILE_METADATA_KEY as EXECUTION_PROFILE_METADATA_KEY,
 )
@@ -4168,6 +4181,25 @@ from cayu.sessions.exports import SessionExportBoundary as SessionExportBoundary
 from cayu.sessions.exports import SessionExportLimits as SessionExportLimits
 from cayu.sessions.exports import SessionExportSnapshot as SessionExportSnapshot
 from cayu.sessions.exports import SessionExportTooLarge as SessionExportTooLarge
+from cayu.sessions.external_waits import ExternalCorrelation as ExternalCorrelation
+from cayu.sessions.external_waits import ExternalCorrelationRequest as ExternalCorrelationRequest
+from cayu.sessions.external_waits import ExternalDeliveryReceipt as ExternalDeliveryReceipt
+from cayu.sessions.external_waits import ExternalEventDelivery as ExternalEventDelivery
+from cayu.sessions.external_waits import (
+    ExternalWaitCapacityExceeded as ExternalWaitCapacityExceeded,
+)
+from cayu.sessions.external_waits import ExternalWaitConflict as ExternalWaitConflict
+from cayu.sessions.external_waits import ExternalWaitLimits as ExternalWaitLimits
+from cayu.sessions.external_waits import ExternalWaitOutcome as ExternalWaitOutcome
+from cayu.sessions.external_waits import ExternalWaitPruneResult as ExternalWaitPruneResult
+from cayu.sessions.external_waits import ExternalWaitRegistration as ExternalWaitRegistration
+from cayu.sessions.external_waits import ExternalWaitRetirement as ExternalWaitRetirement
+from cayu.sessions.external_waits import (
+    ExternalWaitRetirementRequest as ExternalWaitRetirementRequest,
+)
+from cayu.sessions.external_waits import ExternalWaitScope as ExternalWaitScope
+from cayu.sessions.external_waits import ExternalWaitTimer as ExternalWaitTimer
+from cayu.sessions.external_waits import ExternalWaitUnavailable as ExternalWaitUnavailable
 from cayu.sessions.interactions import InteractionStatus as InteractionStatus
 from cayu.sessions.interactions import InteractionSummaryEvidence as InteractionSummaryEvidence
 from cayu.sessions.invocation import InvocationOrigin as InvocationOrigin
@@ -6802,10 +6834,34 @@ __all__ = [
     "ExternalContainerOperationAdapter",
     "ExternalContainerOutputV1",
     "ExternalContainerUsageV1",
+    "ExternalCorrelation",
+    "ExternalCorrelationRequest",
+    "ExternalDeliveryReceipt",
+    "ExternalEventDelivery",
+    "ExternalEventWaits",
     "ExternalProcessModelProvider",
     "ExternalProcessTargetIdentityV1",
     "ExternalTrialEnvelopeV1",
     "ExternalTrialIdentityV1",
+    "ExternalWaitAccessPolicy",
+    "ExternalWaitAction",
+    "ExternalWaitCapacityExceeded",
+    "ExternalWaitConflict",
+    "ExternalWaitContext",
+    "ExternalWaitHost",
+    "ExternalWaitHostFailure",
+    "ExternalWaitHostPage",
+    "ExternalWaitLimits",
+    "ExternalWaitOutcome",
+    "ExternalWaitProjector",
+    "ExternalWaitPruneResult",
+    "ExternalWaitRegistration",
+    "ExternalWaitRetirement",
+    "ExternalWaitRetirementRequest",
+    "ExternalWaitScope",
+    "ExternalWaitSnapshot",
+    "ExternalWaitTimer",
+    "ExternalWaitUnavailable",
     "FailureEvidence",
     "FileAttachment",
     "FileAttachmentKind",
@@ -6963,6 +7019,7 @@ __all__ = [
     "InvocationOrigin",
     "InvocationOriginClaim",
     "InvocationOriginTrust",
+    "JsonExternalWaitProjector",
     "JudgePrivacyPolicyV1",
     "JudgeProfileIdentityV1",
     "JudgeReferenceV1",
@@ -7992,6 +8049,8 @@ __all__ = [
     "SessionExportSnapshot",
     "SessionExportTooLarge",
     "SessionExportUnavailable",
+    "SessionExternalWaitAdapter",
+    "SessionExternalWaitReceipt",
     "SessionFailed",
     "SessionForkProfileRelationship",
     "SessionIdentity",
@@ -8209,6 +8268,7 @@ __all__ = [
     "TaskStatusCounts",
     "TaskStore",
     "TaskStoreDispatcher",
+    "TaskStoreWaitScheduler",
     "TaskTerminalKind",
     "TaskTerminalizationConflict",
     "TaskTerminalizationReceipt",

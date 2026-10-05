@@ -58,6 +58,7 @@ from cayu.runtime.event_side_effect_health import (
 from cayu.sessions import creation_fence
 from cayu.sessions._argument_continuity import ArgumentContinuity
 from cayu.sessions._durable_operation_ownership import DurableOperationOwnership
+from cayu.sessions._external_wait_memory import MemoryExternalWaitMixin
 from cayu.sessions.execution import SessionExecutionState
 from cayu.storage._creation_fence import MemoryCreationFenceMixin
 from cayu.storage._session_execution import MemorySessionExecutionMixin
@@ -75,6 +76,7 @@ if TYPE_CHECKING:
         CompletedTurnSnapshot,
         ContextViewPublicationSource,
     )
+    from cayu.sessions._external_wait_transition import ExternalWaitMutation
     from cayu.sessions._invocation_lifecycle import (
         AdmitInvocationCommand,
         CreateInvocationCommand,
@@ -126,6 +128,13 @@ if TYPE_CHECKING:
         ParticipantSessionCreationRequest,
     )
     from cayu.sessions.exports import SessionExportLimits, SessionExportSnapshot
+    from cayu.sessions.external_waits import (
+        ExternalWaitPruneResult,
+        ExternalWaitRecord,
+        ExternalWaitRetirement,
+        ExternalWaitRetirementRequest,
+        ExternalWaitScope,
+    )
 
 from pydantic import (
     BaseModel,
@@ -10273,6 +10282,7 @@ def _session_continuation_methods_owned(store: object) -> bool:
             "load_continuation_ticket",
             "lookup_continuation_ticket",
             "mark_continuation_waiting",
+            "_recover_continuation_writer",
             "latch_continuation",
             "consume_continuation",
             "_consume_continuation",
@@ -10372,6 +10382,7 @@ class SessionStore(ABC):
     # defaults keep discovery truthful for inherited methods that fail closed.
     session_export_version: ClassVar[int] = 0
     session_continuation_version: ClassVar[int] = 0
+    external_wait_version: ClassVar[int] = 0
     _producer_attachment_version: ClassVar[int] = 0
     supports_usage_aggregates: ClassVar[bool] = False
     supports_private_argument_continuity: ClassVar[bool] = False
@@ -12178,6 +12189,66 @@ class SessionStore(ABC):
             and _session_continuation_methods_owned(self)
         )
 
+    def supports_external_waits(self) -> bool:
+        return (
+            type(self.external_wait_version) is int
+            and self.external_wait_version == 1
+            and _session_owner_methods_owned(
+                self,
+                "external_wait_version",
+                (
+                    "_mutate_external_wait",
+                    "_read_external_wait",
+                    "_list_external_waits",
+                    "_retire_external_wait_scope",
+                    "_read_external_wait_retirement",
+                    "_prune_external_wait_scope",
+                    "create",
+                    "apply_invocation_lifecycle_command",
+                    "_require_external_creation_unlocked",
+                    "_require_external_creation",
+                    "_require_external_wait_admission_unlocked",
+                    "_require_external_wait_admission",
+                    "transition_status",
+                    "transition_status_and_checkpoint",
+                    "_connection",
+                    "delete_session",
+                    "validate_session_closure_admission",
+                    "_require_session_erasure_quiescence_unlocked",
+                    "_require_session_erasure_quiescence",
+                    "_require_external_wait_quiescence_unlocked",
+                ),
+            )
+        )
+
+    async def _read_external_wait_retirement(
+        self, scope: ExternalWaitScope
+    ) -> ExternalWaitRetirement | None:
+        raise NotImplementedError("Store does not qualify external waits.")
+
+    async def _retire_external_wait_scope(
+        self, request: ExternalWaitRetirementRequest
+    ) -> ExternalWaitRetirement:
+        raise NotImplementedError("Store does not qualify external waits.")
+
+    async def _prune_external_wait_scope(
+        self, retirement: ExternalWaitRetirement, *, limit: int
+    ) -> ExternalWaitPruneResult:
+        raise NotImplementedError("Store does not qualify external waits.")
+
+    async def _mutate_external_wait(self, command: ExternalWaitMutation) -> ExternalWaitRecord:
+        raise NotImplementedError("Store does not qualify external waits.")
+
+    async def _read_external_wait(
+        self, scope: ExternalWaitScope, correlation_key: str
+    ) -> ExternalWaitRecord | None:
+        raise NotImplementedError("Store does not qualify external waits.")
+
+    async def _list_external_waits(
+        self, scope: ExternalWaitScope, *, source: str, after: str, limit: int
+    ) -> tuple[ExternalWaitRecord, ...]:
+        raise NotImplementedError("Store does not qualify external waits.")
+
     def _supports_producer_attachment_protocol(self) -> bool:
         return (
             type(self._producer_attachment_version) is int
@@ -13002,6 +13073,84 @@ class SessionStore(ABC):
             raise SessionRunFenced("Continuation readback belongs to another session authority.")
         return record
 
+    async def _recover_continuation_writer(
+        self, ticket: ContinuationTicket, *, park: bool = False
+    ) -> ContinuationRecord:
+        """Retain genuine recovery succession without replacing ticket identity."""
+        from cayu.collaboration._preparation import prepare_contract
+        from cayu.runtime._continuation_recovery import require_recovery_writer
+        from cayu.sessions._session_continuation import (
+            ContinuationConflict,
+            ContinuationRecord,
+            ContinuationTicket,
+            ContinuationUnavailable,
+            continuation_operation_key,
+        )
+        from cayu.sessions._session_continuation_scope import publication_scope
+        from cayu.sessions._session_continuation_store import index_publication
+        from cayu.vaults.redaction import SecretRedactor
+
+        ticket = prepare_contract(ContinuationTicket, ticket, redactor=SecretRedactor())
+        if type(park) is not bool:
+            raise TypeError("Continuation recovery action must be explicit.")
+        key = continuation_operation_key(ticket)
+
+        commit_authority: tuple[Session, dict[str, Any] | None, ContinuationRecord] | None = None
+
+        def transform(current_session, checkpoint, current, now):
+            nonlocal commit_authority
+            if current is None:
+                raise ContinuationConflict("Continuation recovery lacks its durable preparation.")
+            record = ContinuationRecord.model_validate(current)
+            writer = require_recovery_writer(
+                ticket, current_session, checkpoint, record, now=now, require_attached_writer=park
+            )
+            commit_authority = (current_session, checkpoint, record)
+            if park and record.recovery_writer != writer:
+                raise ContinuationConflict(
+                    "Continuation parking lacks retained recovery succession."
+                )
+            updated = record.model_copy(update={"recovery_writer": writer})
+            if park and record.ticket.state == "ARMING":
+                updated = updated.model_copy(
+                    update={
+                        "ticket": record.ticket.model_copy(
+                            update={"state": "WAITING", "revision": record.ticket.revision + 1}
+                        )
+                    }
+                )
+            publication = SessionOperationPublication(
+                checkpoint={} if checkpoint is None else checkpoint,
+                operation_records={key: updated.model_dump(mode="json")},
+            )
+            return index_publication(current_session, checkpoint, current, publication, key=key)
+
+        def guard_time(now):
+            if commit_authority is None:
+                raise ContinuationConflict("Continuation recovery did not validate its writer.")
+            current_session, checkpoint, record = commit_authority
+            require_recovery_writer(
+                ticket, current_session, checkpoint, record, now=now, require_attached_writer=park
+            )
+
+        with publication_scope(key), _invocation_lifecycle_authority_read_scope():
+            await self.publish_session_operation_guarded_with_store_time(
+                ticket.session_id,
+                idempotency_key=key,
+                operation_transform=transform,
+                commit_guard=lambda: None,
+                commit_time_guard=guard_time,
+                events=[],
+            )
+        result = await self.load_continuation_ticket(
+            ticket.session_id,
+            registration_key=ticket.registration_key,
+            session_instance_id=ticket.session_instance_id,
+        )
+        if result is None:
+            raise ContinuationUnavailable("Continuation recovery succession is not readable.")
+        return result
+
     async def mark_continuation_waiting(self, ticket: ContinuationTicket) -> ContinuationRecord:
         """Publish the ARMING-to-WAITING transition under the ticket's CAS."""
 
@@ -13662,6 +13811,7 @@ class SessionStore(ABC):
                         checkpoint,
                         permit_operation=retirement_authority.permit_operation,
                         permit_commitment=retirement_authority.permit_commitment,
+                        record=record,
                     )
                 elif (
                     released_evidence.permit_operation != retirement_authority.permit_operation
@@ -15463,7 +15613,9 @@ def runtime_session_query(operation):
 
 
 @model_store_surface("sessions")
-class InMemorySessionStore(MemorySessionExecutionMixin, MemoryCreationFenceMixin, SessionStore):
+class InMemorySessionStore(
+    MemoryExternalWaitMixin, MemorySessionExecutionMixin, MemoryCreationFenceMixin, SessionStore
+):
     """In-process session store for tests, local development, and examples."""
 
     session_access_version: ClassVar[int | None] = 1
@@ -15509,6 +15661,7 @@ class InMemorySessionStore(MemorySessionExecutionMixin, MemoryCreationFenceMixin
 
     session_export_version: ClassVar[int] = 1
     session_continuation_version: ClassVar[int] = 1
+    external_wait_version: ClassVar[int] = 1
     _producer_attachment_version: ClassVar[int] = 1
     supports_session_closure_receipts: ClassVar[bool] = True
     supports_session_closure_detachment: ClassVar[bool] = True
@@ -17429,6 +17582,7 @@ class InMemorySessionStore(MemorySessionExecutionMixin, MemoryCreationFenceMixin
             raise TypeError("result_checkpoint_transform must be callable.")
         async with self._lock:
             session_id = request.session_id or str(uuid4())
+            self._require_external_creation_unlocked(request)
             if (
                 participant_provenance is _RECIPIENT_PROVENANCE_CAPABILITY
                 and creation_target is None
@@ -18913,6 +19067,7 @@ class InMemorySessionStore(MemorySessionExecutionMixin, MemoryCreationFenceMixin
 
     def _require_session_erasure_quiescence_unlocked(self, session: Session) -> None:
         """Shared admission for closure and final deletion; no mutations."""
+        self._require_external_wait_quiescence_unlocked(session)
         from cayu.collaboration import _session_export_store as session_exports
         from cayu.runtime._session_closure_records import require_terminal_protected_effect
         from cayu.sessions import _session_continuation_store as continuations
@@ -19428,6 +19583,8 @@ class InMemorySessionStore(MemorySessionExecutionMixin, MemoryCreationFenceMixin
                 raise SessionStatusConflict(
                     f"Session status transition not allowed: {session.status} -> {to_status}"
                 )
+            if to_status is SessionStatus.RUNNING:
+                self._require_external_wait_admission_unlocked(session)
 
             now = self._ownership_clock()
             if to_status is SessionStatus.RUNNING:
@@ -19593,6 +19750,8 @@ class InMemorySessionStore(MemorySessionExecutionMixin, MemoryCreationFenceMixin
                 raise SessionStatusConflict(
                     f"Session status transition not allowed: {session.status} -> {to_status}"
                 )
+            if to_status is SessionStatus.RUNNING:
+                self._require_external_wait_admission_unlocked(session)
             if expected_latest_interaction_event_id is not None:
                 latest_interactions = self._latest_interaction_event_records_by_sequence.get(
                     session_id,

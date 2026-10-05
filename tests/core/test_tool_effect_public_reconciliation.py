@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import warnings
 from base64 import urlsafe_b64encode
 from datetime import UTC, datetime
@@ -1162,6 +1163,10 @@ def test_public_reconciliation_consumes_verified_outcome_without_external_replay
             assert lookups == []
             review_policy.can_decide = True
         if fault_phase in {"unlisted-resource", "hostile-result"}:
+            # Collect earlier tests' unreachable resources before attributing
+            # diagnostics to this operation. Keep all warnings enabled below:
+            # warnings produced by reconciliation must still fail the test.
+            gc.collect()
             with warnings.catch_warnings(record=True) as caught_warnings:
                 warnings.simplefilter("always")
                 with pytest.raises(ValueError) as rejected:

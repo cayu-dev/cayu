@@ -8,6 +8,7 @@ must be authenticated by the SessionStore before they are accepted.
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -43,6 +44,7 @@ CONTINUATION_MAX_LATCH_EVIDENCE_BYTES = 8192
 CONTINUATION_MAX_CONSUMPTION_EVIDENCE_BYTES = 12288
 CONTINUATION_MAX_RETIREMENT_EVIDENCE_BYTES = 4096
 CONTINUATION_MAX_EVENTS = 8
+CONTINUATION_MAX_RECOVERY_WRITER_BYTES = 2048
 CONTINUATION_MAX_EVENT_BYTES = 512
 CONTINUATION_MAX_SERVICES = 32
 # Fixed hash/key encodings, closed enums and portable integer bounds make the
@@ -67,6 +69,24 @@ class ContinuationLatchReceiver(Protocol):
         self,
         latch: ContinuationLatch,
     ) -> ContinuationLatch: ...
+
+
+class RetainedContinuationLatchReceiver(ABC):
+    """Explicit registration contract for source-owned latch recovery.
+
+    Implementations authenticate the complete latch against their durable source
+    owner. The retained entrance must observe that owner's operation through
+    settlement; stopping a public observer must not abandon a dispatched write.
+    This is application configuration, never authority supplied in a latch.
+    """
+
+    @abstractmethod
+    async def authenticate_continuation_latch(self, latch: ContinuationLatch) -> ContinuationLatch:
+        """Authenticate through the source owner's bounded public observer."""
+
+    @abstractmethod
+    async def _authenticate_latch_owned(self, latch: ContinuationLatch) -> ContinuationLatch:
+        """Authenticate while retaining the source operation until it settles."""
 
 
 def _bounded_digest(value: str, field_name: str) -> str:
@@ -110,7 +130,7 @@ class ContinuationWait(ContractValue):
     predicate_kind: Literal["ALL_SUCCESS", "ALL_SETTLED", "ANY_SUCCESS", "QUORUM_SUCCESS"]
     predicate_version: StrictInt = Field(ge=1, le=MAX_PORTABLE_JSON_INTEGER)
     threshold: StrictInt | None = Field(default=None, ge=1, le=CONTINUATION_MAX_TARGETS)
-    deadline: StrictStr
+    deadline: StrictStr | None
     failure_policy: StrictStr = Field(min_length=1, max_length=128)
     service_policy: StrictStr = Field(min_length=1, max_length=128)
     wait_edge_revision: StrictInt = Field(ge=1, le=MAX_PORTABLE_JSON_INTEGER)
@@ -143,7 +163,7 @@ class ContinuationTicket(ContractValue):
     predicate_kind: Literal["ALL_SUCCESS", "ALL_SETTLED", "ANY_SUCCESS", "QUORUM_SUCCESS"]
     predicate_version: StrictInt = Field(ge=1, le=MAX_PORTABLE_JSON_INTEGER)
     threshold: StrictInt | None = Field(default=None, ge=1, le=CONTINUATION_MAX_TARGETS)
-    deadline: StrictStr
+    deadline: StrictStr | None
     failure_policy: StrictStr = Field(min_length=1, max_length=128)
     service_policy: StrictStr = Field(min_length=1, max_length=128)
     wait_edge_revision: StrictInt = Field(ge=1, le=MAX_PORTABLE_JSON_INTEGER)
@@ -159,8 +179,12 @@ class ContinuationTicket(ContractValue):
 
     @field_validator("deadline")
     @classmethod
-    def validate_deadline(cls, value: str) -> str:
-        return _aware_time(datetime.fromisoformat(value), "deadline").isoformat()
+    def validate_deadline(cls, value: str | None) -> str | None:
+        return (
+            None
+            if value is None
+            else _aware_time(datetime.fromisoformat(value), "deadline").isoformat()
+        )
 
     @field_validator("session_id", "session_instance_id", "registration_key", "interaction_id")
     @classmethod
@@ -400,13 +424,15 @@ class ContinuationRetirement(ContractValue):
 class ContinuationReleasedExecution(ContractValue):
     """Bounded native proof retained after the invocation ledger can be pruned."""
 
-    permit_operation: StrictStr = Field(pattern=r"^participant-execution:[0-9a-f]{64}$")
-    permit_commitment: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    permit_operation: StrictStr | None = Field(pattern=r"^participant-execution:[0-9a-f]{64}$")
+    permit_commitment: StrictStr | None = Field(pattern=r"^[0-9a-f]{64}$")
     admission_receipt_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
     release_receipt_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def bounded_evidence(self) -> ContinuationReleasedExecution:
+        if (self.permit_operation is None) != (self.permit_commitment is None):
+            raise ValueError("Released execution has incomplete permit evidence.")
         if (
             len(canonical_durable_json_bytes(self.model_dump(mode="json"), "released execution"))
             > CONTINUATION_MAX_RELEASED_RETIREMENT_BYTES
@@ -423,11 +449,23 @@ class ContinuationReleasedRetirement(ContractValue):
     """
 
     retirement: ContinuationRetirement
-    permit_operation: Identifier
-    permit_commitment: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    permit_operation: Identifier | None
+    permit_commitment: StrictStr | None = Field(pattern=r"^[0-9a-f]{64}$")
     settled_services: tuple[tuple[StrictStr, StrictStr], ...] = Field(
         default=(), max_length=CONTINUATION_MAX_SERVICES
     )
+
+    @model_validator(mode="after")
+    def complete_execution_identity(self) -> ContinuationReleasedRetirement:
+        if (self.permit_operation is None) != (self.permit_commitment is None):
+            raise ValueError("Released retirement has incomplete permit evidence.")
+        if self.permit_operation is None and (
+            self.retirement.ticket.purpose != "external-event-v1"
+            or self.retirement.ticket.execution_admission_sha256 is not None
+            or self.retirement.ticket.collaboration_wait_sha256 is not None
+        ):
+            raise ValueError("Ordinary released retirement requires an external-wait ticket.")
+        return self
 
 
 class ContinuationEvent(ContractValue):
@@ -485,6 +523,23 @@ class ContinuationServiceReference(ContractValue):
         return self
 
 
+class ContinuationRecoveryWriter(ContractValue):
+    """Current native recovery owner; never a replacement for the original ticket."""
+
+    run_epoch: StrictInt = Field(ge=1, le=MAX_PORTABLE_JSON_INTEGER)
+    recovery_claim_id: StrictStr = Field(min_length=1, max_length=256)
+    profile_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def bounded_evidence(self) -> ContinuationRecoveryWriter:
+        if (
+            len(canonical_durable_json_bytes(self.model_dump(mode="json"), "recovery writer"))
+            > CONTINUATION_MAX_RECOVERY_WRITER_BYTES
+        ):
+            raise ValueError("Continuation recovery writer exceeds reserved capacity.")
+        return self
+
+
 class ContinuationRecord(ContractValue):
     """One atomic aggregate for ticket, latch, consumption and retirement."""
 
@@ -497,6 +552,11 @@ class ContinuationRecord(ContractValue):
     retirement: ContinuationRetirement | None = None
     released_retirement: ContinuationReleasedExecution | None = None
     retirement_acknowledged: StrictBool = False
+    # Preserve the canonical bytes of pre-external-wait receipts. Their history
+    # and foreign acknowledgements commit the record without this optional field.
+    recovery_writer: ContinuationRecoveryWriter | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     events: tuple[ContinuationEvent, ...] = Field(default=(), max_length=CONTINUATION_MAX_EVENTS)
     services: tuple[ContinuationServiceReference, ...] = Field(
         default=(), max_length=CONTINUATION_MAX_SERVICES
@@ -504,6 +564,11 @@ class ContinuationRecord(ContractValue):
 
     @model_validator(mode="after")
     def validate_aggregate(self) -> ContinuationRecord:
+        if self.recovery_writer is not None and (
+            self.ticket.purpose != "external-event-v1"
+            or self.recovery_writer.run_epoch <= self.ticket.writer_generation
+        ):
+            raise ValueError("Continuation recovery writer conflicts with its origin.")
         keys = {item.key for item in self.services}
         if len(keys) != len(self.services) or any(
             item.generation != index for index, item in enumerate(self.services, 1)
@@ -564,6 +629,16 @@ class ContinuationRecord(ContractValue):
                 raise ValueError("A continuation cannot be consumed and retired together.")
         if self.released_retirement is not None and self.retirement is None:
             raise ValueError("Released retirement evidence requires a terminal retirement.")
+        if (
+            self.released_retirement is not None
+            and self.released_retirement.permit_operation is None
+            and (
+                self.ticket.purpose != "external-event-v1"
+                or self.ticket.execution_admission_sha256 is not None
+                or self.ticket.collaboration_wait_sha256 is not None
+            )
+        ):
+            raise ValueError("Ordinary release evidence cannot authorize a participant wait.")
         if self.retirement_acknowledged and self.released_retirement is None:
             raise ValueError("Retirement acknowledgement requires released execution evidence.")
         if self.ticket.state == "CONSUMED" and self.consumption is None:
@@ -713,7 +788,11 @@ def require_writer_generation(
 
 def continuation_writer_frontier(record: ContinuationRecord) -> tuple[int, bool]:
     """Return the authenticated writer and whether its release is already included."""
-    generation = record.ticket.writer_generation
+    generation = (
+        record.ticket.writer_generation
+        if record.recovery_writer is None
+        else record.recovery_writer.run_epoch
+    )
     already_released = False
     for service in record.services:
         if service.mode != "same_session":

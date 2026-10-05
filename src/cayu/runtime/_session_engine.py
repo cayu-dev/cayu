@@ -378,6 +378,7 @@ from cayu.runtime._execution_profile_identity_validation import (
     copy_secret_free_execution_profile_behavior_identity,
 )
 from cayu.runtime._execution_to_wait import _ExecutionToWait
+from cayu.runtime._external_execution_to_wait import _ExternalExecutionToWait
 from cayu.runtime._foreground_child_wait import (
     FOREGROUND_CHILD_TERMINAL_KEY,
     FOREGROUND_CHILD_WAIT_KEY,
@@ -4846,6 +4847,10 @@ def _pending_interaction_action_kind(
         return "user_input"
     if tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint) is not None:
         return "tool_recovery"
+    from cayu.sessions._session_continuation_store import has_unparked_external_interaction
+
+    if has_unparked_external_interaction(checkpoint, run_epoch=run_epoch):
+        return "external_wait_recovery"
     return None
 
 
@@ -6901,6 +6906,7 @@ class SessionEngine:
         request: IncompleteSessionRecoveryRequest,
         *,
         participant_context: CollaborationAccessContext | None = None,
+        execution_to_wait: _ExternalExecutionToWait | None = None,
     ) -> IncompleteSessionRecoveryResult:
         request = copy_incomplete_session_recovery_request(request)
         (
@@ -6956,6 +6962,7 @@ class SessionEngine:
                 active_through=active_through,
                 before_mutation=admit_before_mutation,
                 participant_context=participant_context,
+                execution_to_wait=execution_to_wait,
             )
         finally:
             if interaction_id is not None:
@@ -7207,6 +7214,7 @@ class SessionEngine:
         active_through: datetime | None,
         before_mutation: Callable[[], Awaitable[None]],
         participant_context: CollaborationAccessContext | None = None,
+        execution_to_wait: _ExternalExecutionToWait | None = None,
     ) -> IncompleteSessionRecoveryResult:
         retained_invocation_context: InvocationContext | None = None
 
@@ -7223,6 +7231,7 @@ class SessionEngine:
 
         result = await self._recovery_coordinator.recover_incomplete_session(
             request,
+            execution_to_wait=execution_to_wait,
             before_mutation=before_mutation,
             participant_context=participant_context,
             retain_open_interaction_invocation=(interaction_id is not None),
@@ -13285,7 +13294,7 @@ class SessionEngine:
         participant_context: CollaborationAccessContext | None = None,
         participant_permit_operation: str | None = None,
         participant_permit_commitment: str | None = None,
-        execution_to_wait: _ExecutionToWait | None = None,
+        execution_to_wait: _ExecutionToWait | _ExternalExecutionToWait | None = None,
         producer_output: _ProducerExecution | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(pause_after_initial_transcript) is not bool:
@@ -13383,8 +13392,19 @@ class SessionEngine:
         if session_id is None:
             raise AssertionError("Run request session identity was not assigned.")
         prepared_session_authority = runtime_prepared_session_authority(request)
+        external_execution = None
+        if type(execution_to_wait) is _ExternalExecutionToWait:
+            if participant_execution_key is not None or prepared_session_authority is not None:
+                raise PermissionError("External waits require ordinary root execution.")
+            external_execution = await execution_to_wait.prepare_initial(
+                request,
+                execution_profile,
+                request_sha256=self.work_attempt_source_request_sha256(request, kind="initial"),
+            )
         interaction_id = (
-            str(
+            external_execution.interaction_id
+            if external_execution is not None
+            else str(
                 uuid5(
                     NAMESPACE_URL,
                     f"cayu-participant-session:{session_id}:{participant_execution_key}",
@@ -13404,7 +13424,9 @@ class SessionEngine:
             interaction_id=interaction_id,
             policy_evidence=policy_evidence,
             event_id=(
-                str(
+                external_execution.interaction_event_id
+                if external_execution is not None
+                else str(
                     uuid5(
                         NAMESPACE_URL,
                         f"cayu-participant-session-event:{session_id}:{participant_execution_key}",
@@ -13419,6 +13441,14 @@ class SessionEngine:
             ),
             targeted_tool_grants=targeted_tool_grants,
         )
+        if external_execution is not None:
+            interaction_started_event = interaction_started_event.model_copy(
+                update={
+                    "timestamp": datetime.fromtimestamp(
+                        external_execution.prepared_at_ms / 1000, tz=UTC
+                    ),
+                }
+            )
         invocation_context: InvocationContext | None = None
         if participant_execution_key is not None:
             participant_session = await self.session_store.load(session_id)
@@ -13548,7 +13578,11 @@ class SessionEngine:
         elif prepared_session_authority is None:
             request = run_request_with_runtime_session_instance_authority(
                 request,
-                session_instance_id=str(uuid4()),
+                session_instance_id=(
+                    str(uuid4())
+                    if external_execution is None
+                    else external_execution.session_instance_id
+                ),
             )
             bind_runtime_session_create_claim(
                 request,
@@ -13605,18 +13639,25 @@ class SessionEngine:
                     catalogue=registered_agent.tool_catalogue,
                     ceiling=tool_capability_ceiling,
                 )
-            created = await self.session_store.apply_invocation_lifecycle_command(
-                CreateInvocationCommand(
-                    session_id=session_id,
-                    expected_session_instance_id=session_instance_id,
-                    request=request,
-                    identity=session_identity,
-                    active_profile=active_profile,
-                    interaction_started_event=interaction_started_event,
-                    interaction_source_messages=tuple(request.messages),
-                    tool_discovery_initialization=tool_discovery_initialization,
-                )
+            creation_command = CreateInvocationCommand(
+                session_id=session_id,
+                expected_session_instance_id=session_instance_id,
+                request=request,
+                identity=session_identity,
+                active_profile=active_profile,
+                interaction_started_event=interaction_started_event,
+                interaction_source_messages=tuple(request.messages),
+                tool_discovery_initialization=tool_discovery_initialization,
             )
+            if type(execution_to_wait) is _ExternalExecutionToWait:
+                assert external_execution is not None
+                created = await execution_to_wait.create_invocation(
+                    creation_command, external_execution
+                )
+            else:
+                created = await self.session_store.apply_invocation_lifecycle_command(
+                    creation_command
+                )
             if type(created) is not InvocationMutationResult:
                 raise RuntimeError("Invocation create returned an invalid result.")
             session = created.session
@@ -14637,6 +14678,7 @@ class SessionEngine:
         store_resolved_session_id: str | None = None,
         continuation_handoff: _ResumeAdmissionHandoff | None = None,
         participant_context: CollaborationAccessContext | None = None,
+        execution_to_wait: _ExternalExecutionToWait | None = None,
     ) -> AsyncGenerator[Event, None]:
         request = session_request_boundary.prepare_resume_request(
             request,
@@ -14683,6 +14725,7 @@ class SessionEngine:
             start_event_payload_extra={},
             start_task_on_enter=False,
             continuation_handoff=continuation_handoff,
+            execution_to_wait=execution_to_wait,
         )
         session_id = request.session_id
         del request
@@ -20169,6 +20212,7 @@ class SessionEngine:
         foreground_before_mutation: Callable[[], Awaitable[None]] | None = None,
         continuation_handoff: _ResumeAdmissionHandoff | None = None,
         participant_context: CollaborationAccessContext | None = None,
+        execution_to_wait: _ExternalExecutionToWait | None = None,
     ) -> AsyncGenerator[Event, None]:
         if request.failover is not None:
             self.session_store._require_model_failover_stage_protocol()
@@ -21576,7 +21620,15 @@ class SessionEngine:
                 adopted_runtime_identity=adopted_runtime_identity,
                 expected_active_profile=admission_source_active_profile,
             )
-            if continuation_handoff is None:
+            if execution_to_wait is not None:
+                if continuation_handoff is not None:
+                    raise PermissionError(
+                        "External parking cannot replace another admission handoff."
+                    )
+                admission_result = await execution_to_wait.admit_resume(
+                    admission_command, prepared_invocation_context
+                )
+            elif continuation_handoff is None:
                 admission_result = await self.session_store.apply_invocation_lifecycle_command(
                     admission_command
                 )
@@ -21996,6 +22048,7 @@ class SessionEngine:
             session=session,
             participant_context=participant_context,
             invocation_context=invocation_context,
+            execution_to_wait=execution_to_wait,
             model_failover=model_failover,
             messages=messages,
             messages_to_append=(
@@ -23960,6 +24013,7 @@ class SessionEngine:
             ),
             producer_replay=request.producer_replay,
             tool_completion_replay=request.tool_completion_replay,
+            execution_to_wait=request.execution_to_wait,
         )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:
@@ -23999,9 +24053,20 @@ class SessionEngine:
         participant_context: CollaborationAccessContext | None = None,
         producer_replay: _ProducerCompletionReplay | None = None,
         tool_completion_replay: ToolCompletionResult | None = None,
+        execution_to_wait: _ExternalExecutionToWait | None = None,
     ) -> AsyncGenerator[Event, None]:
+        from cayu.sessions._session_continuation_store import has_unparked_external_interaction
+
         if type(invocation_context) is not InvocationContext:
             raise TypeError("invocation_context must be an authenticated InvocationContext.")
+        checkpoint = await self.session_store.load_checkpoint(session.id)
+        # Approval/input resolution reconstructs native execution without the
+        # application's external-wait adapter. Its durable ticket still needs
+        # the completed turn's controls for later authenticated event servicing.
+        # This only retains evidence; it grants no parking or service authority.
+        retain_completion_controls = has_unparked_external_interaction(
+            checkpoint, run_epoch=session.run_epoch
+        )
         if tool_completion is None:
             tool_completion = await load_recorded_tool_completion_policy(
                 self.session_store,
@@ -24017,7 +24082,7 @@ class SessionEngine:
         if invocation_context.profile.model_failover is not None:
             continuation = await self._resolve_execution_profile_continuation(
                 session=session,
-                checkpoint=await self.session_store.load_checkpoint(session.id),
+                checkpoint=checkpoint,
                 registered_agent=registered_agent,
                 registered_provider=registered_provider,
                 request_loop_policies=invocation_context.request_loop_policies,
@@ -24099,6 +24164,8 @@ class SessionEngine:
             producer_replay=producer_replay,
             tool_completion_replay=tool_completion_replay,
             tool_completion=tool_completion,
+            execution_to_wait=execution_to_wait,
+            retain_completion_controls=retain_completion_controls,
         )
         for grant_event in targeted_tool_grant_events:
             yield grant_event
@@ -24230,9 +24297,10 @@ class SessionEngine:
         foreground_wait: ForegroundChildWait | None = None,
         model_failover: execution_profile_admission.ModelFailoverProfileResolution | None = None,
         participant_context: CollaborationAccessContext | None = None,
-        execution_to_wait: _ExecutionToWait | None = None,
+        execution_to_wait: _ExecutionToWait | _ExternalExecutionToWait | None = None,
         producer_replay: _ProducerCompletionReplay | None = None,
         tool_completion_replay: ToolCompletionResult | None = None,
+        retain_completion_controls: bool = False,
     ) -> AsyncGenerator[Event, None]:
         if type(invocation_context) is not InvocationContext:
             raise TypeError("invocation_context must be an authenticated InvocationContext.")
@@ -24765,6 +24833,72 @@ class SessionEngine:
         close_new_pending_round_on_interrupt = False
         initial_provider_dispatch_started = False
 
+        async def emit_structured_event(event: Event) -> Event:
+            if isinstance(execution_to_wait, _ExternalExecutionToWait):
+                return await execution_to_wait.publish_structured_event(
+                    invocation_context, self._event_writer, event
+                )
+            return await self._event_writer.emit(event)
+
+        async def publish_stop_interruption(
+            decision: BeforeStopDecision,
+        ) -> AsyncIterator[Event]:
+            nonlocal session
+            session, interrupted, _ = await self._publish_interaction_transition(
+                session=session,
+                invocation_context=invocation_context,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                to_status=SessionStatus.INTERRUPTED,
+                execution_profile=execution_profile,
+            )
+            if interrupted is not None:
+                yield interrupted
+            for event in await self._emit_turn_completed_once(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                status=SessionStatus.INTERRUPTED,
+                run_started_at=run_started_at,
+                usage_tracker=turn_usage_tracker,
+                active_run=active_run,
+                invocation_context=invocation_context,
+            ):
+                yield event
+            async for event in self._emit_terminal_event_with_hooks(
+                event=Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload={
+                        "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                        "reason": decision.reason,
+                        "policy_metadata": copy_json_value(decision.metadata, "policy_metadata"),
+                    },
+                ),
+                phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile,
+                invocation_context=invocation_context,
+            ):
+                yield event
+
+        async def park_external_completion() -> AsyncIterator[Event]:
+            # Successful structured/final-tool outcomes are whole-turn boundaries,
+            # just like before-stop COMPLETE. Park before terminalizing the writer.
+            assert isinstance(execution_to_wait, _ExternalExecutionToWait)
+            await execution_to_wait.park(invocation_context)
+            async for event in publish_stop_interruption(
+                BeforeStopDecision(
+                    action=BeforeStopAction.INTERRUPT,
+                    reason="Explicit continuation wait reached a whole-turn boundary.",
+                )
+            ):
+                yield event
+
         async def start_linked_task_if_needed(*, only_if_exists: bool = False) -> Event | None:
             nonlocal task_start_attempted, task_started
             if task_id is None or task_started or invocation_context.work_attempt is not None:
@@ -24811,6 +24945,24 @@ class SessionEngine:
                     if admitted.run_semantics is None:
                         raise RuntimeError("Elapsed execution stop has no admitted run semantics.")
                     raise ExecutionDeadlineExceeded(admitted.run_semantics.deadline, "session")
+            if (
+                isinstance(execution_to_wait, _ExternalExecutionToWait)
+                and invocation_context.recovery_claim_id is not None
+            ):
+                recovered_wait = await execution_to_wait.prepare(invocation_context)
+                if recovered_wait.ticket.state == "WAITING":
+                    await turn_usage_tracker.mark_current_position()
+                    # The native park already accepted the entire turn, including
+                    # stop policies. Finish its interrupted publication/cleanup;
+                    # do not reevaluate policies or dispatch another model step.
+                    async for event in publish_stop_interruption(
+                        BeforeStopDecision(
+                            action=BeforeStopAction.INTERRUPT,
+                            reason="Explicit continuation wait reached a whole-turn boundary.",
+                        )
+                    ):
+                        yield event
+                    return
             effective_deadline(
                 current_execution_deadline(), session.execution_deadline
             ).require_admission("session")
@@ -24857,6 +25009,7 @@ class SessionEngine:
             )
             session = model_boundary.session
             recovered_assistant_step: AssistantStepResult | None = None
+            recovered_structured_events = model_boundary.structured_output_events
             governed_closed_tool_round = (
                 invocation_context.work_attempt is not None
                 and model_boundary.pointer is not None
@@ -24864,7 +25017,58 @@ class SessionEngine:
                 and model_boundary.pending_tool_round is None
                 and model_boundary.transcript_cursor > model_boundary.pointer.transcript_end_cursor
             )
-            if producer_replay is not None:
+            if (
+                execution_to_wait is not None
+                and invocation_context.recovery_claim_id is not None
+                and isinstance(execution_to_wait, _ExternalExecutionToWait)
+            ):
+                recovered_semantics = await execution_to_wait.require_recovered_result(
+                    invocation_context, model_boundary
+                )
+                stage = model_boundary.completed_stage
+                assert stage is not None and model_boundary.pointer is not None
+                if model_boundary.pointer.tool_round_id is not None:
+                    # A closed round reuses its publication. An unfinished one
+                    # goes through recover_pending_tool_round below, which owns
+                    # effect reconciliation and fail-closed policy recovery.
+                    # Neither case reconstructs tool calls for fresh execution.
+                    if model_boundary.closed_tool_receipt is not None:
+                        recovered_structured_events = (
+                            await self._recovery_coordinator._load_closed_structured_output_events(
+                                session,
+                                stage,
+                                invocation_context,
+                                model_boundary.closed_tool_receipt,
+                                expected_spec=recovered_semantics.structured_output,
+                            )
+                        )
+                    completion_event = model_boundary.completion_event
+                    completed_step = (
+                        None if completion_event is None else completion_event.payload.get("step")
+                    )
+                    if (
+                        completion_event is None
+                        or completion_event.interaction_id
+                        != invocation_context.binding.interaction_id
+                        or type(completed_step) is not int
+                        or completed_step < 1
+                    ):
+                        raise RuntimeError("Closed external-wait tool round lost its model step.")
+                    initial_model_step_number = completed_step + 1
+                else:
+                    recovered_assistant_step = reconstruct_assistant_step_result(
+                        stage=stage,
+                        pointer=model_boundary.pointer,
+                        pending_round=None,
+                        session_id=session.id,
+                        interaction_id=invocation_context.binding.interaction_id,
+                        source_run_epoch=stage.source_run_epoch,
+                    )
+                    if recovered_assistant_step is None:
+                        raise RuntimeError(
+                            "External wait recovery lost its committed assistant result."
+                        )
+            elif producer_replay is not None:
                 from cayu.runtime._producer_completion_replay import _ProducerCompletionReplay
 
                 if type(producer_replay) is not _ProducerCompletionReplay:
@@ -25160,7 +25364,7 @@ class SessionEngine:
             recovered_structured_outcome = next(
                 (
                     event
-                    for event in model_boundary.structured_output_events
+                    for event in recovered_structured_events
                     if event.type
                     in {EventType.STRUCTURED_OUTPUT_VALIDATED, EventType.STRUCTURED_OUTPUT_FAILED}
                 ),
@@ -25168,7 +25372,7 @@ class SessionEngine:
             )
             recovered_structured_retry = any(
                 event.type is EventType.STRUCTURED_OUTPUT_RETRY
-                for event in model_boundary.structured_output_events
+                for event in recovered_structured_events
             )
             recovery_tail_message_count = len(messages_to_append)
             recovery_expected_transcript_cursor: int | None = None
@@ -25309,6 +25513,10 @@ class SessionEngine:
             ) and not messages_to_append:
                 if tool_completion_result is not None:
                     await self._stop_at_requested_tool_round_boundary(session)
+                if isinstance(execution_to_wait, _ExternalExecutionToWait):
+                    async for event in park_external_completion():
+                        yield event
+                    return
                 (
                     session,
                     interaction_completed_event,
@@ -25470,7 +25678,12 @@ class SessionEngine:
                     )
                     for reservation in reservations
                 )
-                if not background_provider_operation and tool_completion is None:
+                if (
+                    not background_provider_operation
+                    and tool_completion is None
+                    and not isinstance(execution_to_wait, _ExternalExecutionToWait)
+                    and not retain_completion_controls
+                ):
                     return ModelCompletionRecoveryContext(
                         interaction_id=interaction_id,
                         execution_profile_fingerprint=execution_profile_fingerprint,
@@ -26101,6 +26314,10 @@ class SessionEngine:
                             session.id,
                             validation.output,
                         )
+                        if isinstance(execution_to_wait, _ExternalExecutionToWait):
+                            async for event in park_external_completion():
+                                yield event
+                            return
                         (
                             session,
                             interaction_completed_event,
@@ -26179,7 +26396,7 @@ class SessionEngine:
                     close_new_pending_round_on_interrupt = False
                     await self._stop_at_requested_tool_round_boundary(session)
                     if structured_output is not None:
-                        yield await self._event_writer.emit(
+                        yield await emit_structured_event(
                             event_with_execution_profile_authority(
                                 _structured_output_validating_event(
                                     session=session,
@@ -26208,7 +26425,7 @@ class SessionEngine:
                                     session.id,
                                     validation.output,
                                 )
-                                yield await self._event_writer.emit(
+                                yield await emit_structured_event(
                                     event_with_execution_profile_authority(
                                         _structured_output_event(
                                             event_type=EventType.STRUCTURED_OUTPUT_VALIDATED,
@@ -26225,6 +26442,10 @@ class SessionEngine:
                                         execution_profile,
                                     )
                                 )
+                                if isinstance(execution_to_wait, _ExternalExecutionToWait):
+                                    async for event in park_external_completion():
+                                        yield event
+                                    return
                                 (
                                     session,
                                     interaction_completed_event,
@@ -26291,7 +26512,7 @@ class SessionEngine:
                                 break
                         else:
                             validation = structured_output_tool_required_validation()
-                        yield await self._event_writer.emit(
+                        yield await emit_structured_event(
                             event_with_execution_profile_authority(
                                 _structured_output_event(
                                     event_type=EventType.STRUCTURED_OUTPUT_FAILED,
@@ -26345,7 +26566,7 @@ class SessionEngine:
                                 runtime_message_transform,
                             )
                         )
-                        yield await self._event_writer.emit(
+                        yield await emit_structured_event(
                             event_with_execution_profile_authority(
                                 _structured_output_event(
                                     event_type=EventType.STRUCTURED_OUTPUT_RETRY,
@@ -26440,55 +26661,7 @@ class SessionEngine:
                             del continuation_transform
                             continue
                         if before_stop_decision.action == BeforeStopAction.INTERRUPT:
-                            (
-                                session,
-                                interaction_interrupted_event,
-                                _,
-                            ) = await self._publish_interaction_transition(
-                                session=session,
-                                invocation_context=invocation_context,
-                                agent_name=registered_agent.spec.name,
-                                environment_name=environment_name,
-                                to_status=SessionStatus.INTERRUPTED,
-                                execution_profile=execution_profile,
-                            )
-                            if interaction_interrupted_event is not None:
-                                yield interaction_interrupted_event
-                            for event in await self._emit_turn_completed_once(
-                                session=session,
-                                registered_agent=registered_agent,
-                                environment_name=environment_name,
-                                status=SessionStatus.INTERRUPTED,
-                                run_started_at=run_started_at,
-                                usage_tracker=turn_usage_tracker,
-                                active_run=active_run,
-                                invocation_context=invocation_context,
-                            ):
-                                yield event
-                            async for event in self._emit_terminal_event_with_hooks(
-                                event=Event(
-                                    type=EventType.SESSION_INTERRUPTED,
-                                    session_id=session.id,
-                                    agent_name=registered_agent.spec.name,
-                                    environment_name=environment_name,
-                                    payload={
-                                        "interruption_type": (
-                                            _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED
-                                        ),
-                                        "reason": before_stop_decision.reason,
-                                        "policy_metadata": copy_json_value(
-                                            before_stop_decision.metadata,
-                                            "policy_metadata",
-                                        ),
-                                    },
-                                ),
-                                phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
-                                session=session,
-                                registered_agent=registered_agent,
-                                registered_environment=registered_environment,
-                                execution_profile=execution_profile,
-                                invocation_context=invocation_context,
-                            ):
+                            async for event in publish_stop_interruption(before_stop_decision):
                                 yield event
                             return
                         if before_stop_decision.action == BeforeStopAction.FAIL:
@@ -26599,6 +26772,10 @@ class SessionEngine:
                 )
                 await self._stop_at_requested_tool_round_boundary(session)
                 if tool_completion_result is not None:
+                    if isinstance(execution_to_wait, _ExternalExecutionToWait):
+                        async for event in park_external_completion():
+                            yield event
+                        return
                     (
                         session,
                         interaction_completed_event,

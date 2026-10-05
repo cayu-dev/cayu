@@ -38,6 +38,7 @@ from cayu.runtime._durable_tool_round import (
 from cayu.sessions import _pending_tool_round as pending_rounds
 
 if TYPE_CHECKING:
+    from cayu.runtime._external_execution_to_wait import _ExternalExecutionToWait
     from cayu.runtime._producer_completion_replay import _ProducerCompletionReplay
 
 import cayu.sessions.pending_actions as pending_actions
@@ -1133,6 +1134,7 @@ class RecoverySessionRunRequest:
     preserve_failure_until_initial_provider_dispatch: bool = False
     participant_context: CollaborationAccessContext | None = None
     producer_replay: _ProducerCompletionReplay | None = None
+    execution_to_wait: _ExternalExecutionToWait | None = None
 
     def __post_init__(self) -> None:
         if type(self.invocation_context) is not InvocationContext:
@@ -1389,6 +1391,7 @@ class ModelCompletionBoundaryReconciliation:
     # Retain the exact validated publication and its original execution
     # identities for governed replay; this is evidence, not dispatch authority.
     completed_stage: ModelCompletionStage | None = None
+    closed_tool_receipt: RuntimePublicationReceipt | None = None
     structured_output_events: tuple[Event, ...] = ()
 
     @property
@@ -3421,11 +3424,15 @@ class RecoveryCoordinator:
             and pointer.tool_round_id is not None
             and transcript_window.cursor > pointer.transcript_end_cursor
         ):
+            governed_semantics = invocation_context.work_attempt.admission.run_semantics
+            if governed_semantics is None:
+                raise RuntimeError("Closed structured output requires governed run semantics.")
             structured_events = await self._load_closed_structured_output_events(
                 session,
                 completed_stage,
                 invocation_context,
                 None if tool_receipt is None else tool_receipt.model_copy(deep=True),
+                expected_spec=governed_semantics.structured_output,
             )
         await self._event_writer.fan_out_persisted([completion_event])
         return ModelCompletionBoundaryReconciliation(
@@ -3437,6 +3444,9 @@ class RecoveryCoordinator:
             transcript_cursor=transcript_window.cursor,
             recovery_events=recovery_events,
             completed_stage=completed_stage.model_copy(deep=True),
+            closed_tool_receipt=(
+                None if tool_receipt is None else tool_receipt.model_copy(deep=True)
+            ),
             structured_output_events=structured_events,
         )
 
@@ -3592,11 +3602,11 @@ class RecoveryCoordinator:
         stage: ModelCompletionStage,
         context: InvocationContext,
         expected_receipt: RuntimePublicationReceipt | None,
+        *,
+        expected_spec: StructuredOutputSpec | None,
     ) -> tuple[Event, ...]:
         """Read exact structured evidence for an already reconciled tool tail."""
-        if context.work_attempt is None or context.work_attempt.admission.run_semantics is None:
-            raise RuntimeError("Closed structured output requires governed run semantics.")
-        expected_spec = context.work_attempt.admission.run_semantics.structured_output
+        context.require_runtime_authority()
         if expected_spec is None:
             return ()
         if expected_spec.strategy is not StructuredOutputStrategy.TOOL:
@@ -3707,7 +3717,10 @@ class RecoveryCoordinator:
                 or actual.interaction_id != receipt.interaction_id
                 or actual.agent_name != event.agent_name
                 or actual.environment_name != event.environment_name
-                or actual.payload != expected_event.payload
+                or canonical_durable_json_bytes(actual.payload, "structured output evidence")
+                != canonical_durable_json_bytes(
+                    expected_event.payload, "structured output evidence"
+                )
             ):
                 raise RuntimeError("Closed structured output event conflicts with its receipt.")
             if actual.type in kinds:
@@ -16645,6 +16658,7 @@ class RecoveryCoordinator:
         retain_invocation_context: Callable[[InvocationContext], None] | None = None,
         preserve_interaction_id: str | None = None,
         _work_attempt: WorkAttemptInvocationAuthority | None = None,
+        execution_to_wait: _ExternalExecutionToWait | None = None,
     ) -> IncompleteSessionRecoveryResult:
         """Repair incomplete state, including an exact post-close child continuation.
 
@@ -16696,6 +16710,7 @@ class RecoveryCoordinator:
             ):
                 raise ValueError("Governed recovery session authority changed before admission.")
         recovered = await self._recover_incomplete_session_scoped(
+            execution_to_wait=execution_to_wait,
             participant_context=participant_context,
             _work_attempt=_work_attempt,
             preserve_interaction_id=preserve_interaction_id,
@@ -17276,6 +17291,7 @@ class RecoveryCoordinator:
         interrupt_for_manual_tool_recovery: bool = False,
         preserve_interaction_id: str | None = None,
         _work_attempt: WorkAttemptInvocationAuthority | None = None,
+        execution_to_wait: _ExternalExecutionToWait | None = None,
     ) -> IncompleteSessionRecoveryResult:
         from cayu.runtime._abandoned_session_recovery import require_abandoned_execution_matches
 
@@ -17312,6 +17328,7 @@ class RecoveryCoordinator:
                 )
 
         return await self._recover_incomplete_session_owned(
+            execution_to_wait=execution_to_wait,
             _work_attempt=_work_attempt,
             preserve_interaction_id=preserve_interaction_id,
             session=session,
@@ -17351,7 +17368,20 @@ class RecoveryCoordinator:
         interrupt_for_manual_tool_recovery: bool = False,
         preserve_interaction_id: str | None = None,
         _work_attempt: WorkAttemptInvocationAuthority | None = None,
+        execution_to_wait: _ExternalExecutionToWait | None = None,
     ) -> IncompleteSessionRecoveryResult:
+
+        external_recovery_record = None
+        external_recovery_cleanup = False
+        if execution_to_wait is not None:
+            from cayu.runtime._external_execution_to_wait import _ExternalExecutionToWait
+
+            if type(execution_to_wait) is not _ExternalExecutionToWait:
+                raise PermissionError("External recovery requires its registered runtime owner.")
+            (
+                external_recovery_record,
+                external_recovery_cleanup,
+            ) = await execution_to_wait.inspect_recovery(session)
 
         if (provider_disposition_task_id is None) != (
             provider_disposition_task_worker_id is None
@@ -17459,6 +17489,24 @@ class RecoveryCoordinator:
                 run_epoch=session.run_epoch,
             )
         ):
+            if external_recovery_record is not None:
+                current = await self._require_session(session.id)
+                if (
+                    current.instance_id == session.instance_id
+                    and current.run_epoch != session.run_epoch
+                ):
+                    # A competing owner advanced between the session and
+                    # checkpoint reads. Do not reinterpret that newer profile
+                    # or acquire another epoch from the stale wait snapshot.
+                    # The adapter separately reconciles the exact native ticket.
+                    return IncompleteSessionRecoveryResult(
+                        session_id=session.id,
+                        previous_status=previous_status,
+                        status=current.status,
+                        actions=(IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,),
+                        events=(),
+                        message="Another owner advanced external wait recovery.",
+                    )
             raise RuntimeError(
                 "Active invocation execution profile does not match the recovery epoch."
             )
@@ -17635,7 +17683,8 @@ class RecoveryCoordinator:
             )
             terminal_repair_required = terminal_repair
             has_pending_work = (
-                pending_approval is not None
+                execution_to_wait is not None
+                or pending_approval is not None
                 or pending_user_input is not None
                 or pending_tool_round is not None
                 or deferred_input is not None
@@ -17845,8 +17894,14 @@ class RecoveryCoordinator:
                     registered_agent,
                     registered_provider,
                     budget_policy=budget_policy_snapshot,
+                    request_loop_policies=(
+                        None
+                        if execution_to_wait is None
+                        else execution_to_wait.request_loop_policies
+                    ),
                     require_open_interaction=not (
-                        (
+                        execution_to_wait is not None
+                        or (
                             active_model_completion is not None
                             and active_model_completion.stage.purpose == "auxiliary-inference"
                             and session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES
@@ -17929,6 +17984,18 @@ class RecoveryCoordinator:
         def transfer_recovery_checkpoint(
             current_session: Session, current: dict[str, Any] | None
         ) -> dict[str, Any] | None:
+            if external_recovery_record is not None:
+                from cayu.runtime._continuation_recovery import (
+                    require_recovery_frontier,
+                    require_resolved_native_pause,
+                )
+
+                require_recovery_frontier(external_recovery_record, current_session, current)
+                # Recheck under the native claim transaction: the original turn
+                # may have paused after the read-only recovery inspection.
+                # A retained terminal control can still request ordinary cleanup.
+                if not external_recovery_cleanup:
+                    require_resolved_native_pause(current)
             if post_action_transfer is not None:
                 current = post_action_transfer(current_session, current)
             if provider_execution_transfer is not None:
@@ -17941,9 +18008,12 @@ class RecoveryCoordinator:
                 session=session,
                 inactive_for_seconds=inactive_for_seconds,
                 execution_profile_snapshot=execution_profile_snapshot,
+                target_status=SessionStatus.RUNNING if execution_to_wait is not None else None,
                 checkpoint_transform=(
                     transfer_recovery_checkpoint
-                    if post_action_transfer is not None or provider_execution_transfer is not None
+                    if post_action_transfer is not None
+                    or provider_execution_transfer is not None
+                    or external_recovery_record is not None
                     else None
                 ),
             )
@@ -17967,6 +18037,9 @@ class RecoveryCoordinator:
                     budget_policy=budget_policy_snapshot,
                     recovery_claim_id=claim.claim_id,
                     work_attempt=_work_attempt,
+                    request_loop_policies=(
+                        () if execution_to_wait is None else execution_to_wait.request_loop_policies
+                    ),
                 )
             if provider_disposition_after_admission is not None:
                 await provider_disposition_after_admission()
@@ -17987,7 +18060,85 @@ class RecoveryCoordinator:
                         invocation_context=invocation_context,
                         expected=terminal_binding_finalization,
                     )
-                if post_action_round is not None and post_action is not None:
+                external_cleanup = False
+                if execution_to_wait is not None:
+                    if invocation_context is None:
+                        raise RuntimeError("External wait recovery lost invocation authority.")
+                    external_cleanup = await execution_to_wait.recovery_cleanup_requested(
+                        invocation_context
+                    )
+                    if external_cleanup:
+                        await execution_to_wait.attach_cleanup_writer(invocation_context)
+                # Terminal external controls use ordinary interruption recovery,
+                # including its effect/environment cleanup guards, not another
+                # execution of the unfinished turn or its stop policies.
+                if execution_to_wait is not None and not external_cleanup:
+                    assert invocation_context is not None
+                    boundary = await self.reconcile_model_completion_boundary(
+                        claim.session,
+                        invocation_context=invocation_context,
+                        registered_agent=registered_agent,
+                        registered_provider=registered_provider,
+                        registered_environment=registered_environment,
+                    )
+                    semantics = await execution_to_wait.require_recovered_result(
+                        invocation_context, boundary
+                    )
+                    resumed = await self._event_writer.emit(
+                        Event(
+                            type=EventType.SESSION_RESUMED,
+                            session_id=session.id,
+                            agent_name=session.agent_name,
+                            environment_name=_environment_name(registered_environment),
+                            payload={
+                                "recovered_external_wait": True,
+                                "run_epoch": claim.session.run_epoch,
+                            },
+                        )
+                    )
+                    stream = self._run_session(
+                        RecoverySessionRunRequest(
+                            session=claim.session,
+                            invocation_context=invocation_context,
+                            messages=await self._session_store.load_transcript(session.id),
+                            messages_to_append=[],
+                            max_steps=semantics.max_steps,
+                            limits=semantics.limits,
+                            budget_limits=semantics.budget_limits,
+                            retry_policy=semantics.retry_policy,
+                            structured_output=semantics.structured_output,
+                            tool_completion=semantics.tool_completion,
+                            thinking=semantics.thinking,
+                            request_metadata=semantics.request_metadata,
+                            task_id=None,
+                            task_worker_id=None,
+                            task_handoff_id=None,
+                            start_event_type=None,
+                            start_event_payload={},
+                            start_task_on_enter=False,
+                            release_run_fence_on_exit=False,
+                            run_limit_accounting=semantics.run_limit_accounting,
+                            execution_to_wait=execution_to_wait,
+                        )
+                    )
+                    events = [*boundary.recovery_events, resumed]
+                    async with _close_delegated_event_stream(stream) as owned:
+                        async for event in owned:
+                            events.append(event)
+                    current = await self._require_session(session.id)
+                    return IncompleteSessionRecoveryResult(
+                        session_id=session.id,
+                        previous_status=previous_status,
+                        status=current.status,
+                        actions=(IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,),
+                        events=tuple(events),
+                        message="Recovered the external wait's committed whole-turn result.",
+                    )
+                if (
+                    not external_cleanup
+                    and post_action_round is not None
+                    and post_action is not None
+                ):
                     if invocation_context is None:
                         raise RuntimeError("Post-action continuation lost invocation authority.")
                     if post_action_round.limits is None or post_action_round.budget_limits is None:
@@ -18875,6 +19026,7 @@ class RecoveryCoordinator:
         required_expired_claim_id: str | None = None,
         execution_profile_snapshot: ActiveInvocationExecutionProfile | None = None,
         checkpoint_transform: CheckpointTransform | None = None,
+        target_status: SessionStatus | None = None,
     ) -> _IncompleteRecoveryClaim | None:
         if required_expired_claim_id is not None:
             required_expired_claim_id = require_clean_nonblank(
@@ -18994,6 +19146,7 @@ class RecoveryCoordinator:
                     statuses={session.status},
                     inactive_for_seconds=inactive_for_seconds,
                     checkpoint_transform=claim_checkpoint,
+                    target_status=target_status,
                 )
             )
             outcome = await await_shielded_task_outcome(fence_task)

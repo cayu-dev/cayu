@@ -28,6 +28,7 @@ from cayu.collaboration.waits import (
     source_key,
     wait_operation_key,
 )
+from cayu.sessions._session_continuation import RetainedContinuationLatchReceiver
 
 
 class _WaitObservationNotStarted(Exception):
@@ -582,7 +583,7 @@ def _elected_latch(snapshot: WaitSnapshot, redactor):
     )
 
 
-class CollaborationWaitLatchReceiver:
+class CollaborationWaitLatchReceiver(RetainedContinuationLatchReceiver):
     """Session continuation receiver backed by durable wait election state."""
 
     def __init__(self, *, store, initialized, redactor, owners=None) -> None:

@@ -512,6 +512,9 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(revision=113, kind=RevisionKind.ADDITIVE, compatible_from=111),
     # Application-default policy state and pending report ownership.
     Revision(revision=114, kind=RevisionKind.ADDITIVE, compatible_from=111),
+    # External waits retain session continuation responsibilities. All writers
+    # must preserve the receiving records and their deletion fences.
+    Revision(revision=115, kind=RevisionKind.BREAKING, compatible_from=115),
 )
 
 #: The revision an empty database is initialized to.

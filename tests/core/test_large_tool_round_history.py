@@ -223,7 +223,7 @@ def test_large_round_publishes_all_results_and_exactly_replays(tmp_path, backend
 import asyncio, json, sys
 from pathlib import Path
 from cayu.runtime._tool_round_publication import build_tool_round_publication_request
-from cayu.runtime._tool_round_recovery import PendingToolRound, pending_tool_round_identity
+from cayu.sessions._pending_tool_round import PendingToolRound, pending_tool_round_identity
 from cayu.storage.sqlite import SQLiteSessionStore
 async def replay():
     store = SQLiteSessionStore(sys.argv[1])
