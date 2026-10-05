@@ -786,11 +786,16 @@ def _describe_tool(
     return manifest
 
 
-def _policy_allows_explicitly(policy: ToolPolicy, tool_name: str) -> bool:
+def _policy_allows_explicitly(
+    policy: ToolPolicy, tool_name: str, *, _seen: frozenset[int] = frozenset()
+) -> bool:
     """Whether a maintained policy allows this tool by naming it in an allowlist."""
 
+    if id(policy) in _seen:
+        return False
+    seen = _seen | {id(policy)}
     if type(policy) is GuardedToolPolicy:
-        return _policy_allows_explicitly(policy.then, tool_name)
+        return _policy_allows_explicitly(policy.then, tool_name, _seen=seen)
     if type(policy) is StaticToolPolicy:
         return (
             policy.allow is not None and tool_name in policy.allow and tool_name not in policy.deny
@@ -798,7 +803,7 @@ def _policy_allows_explicitly(policy: ToolPolicy, tool_name: str) -> bool:
     from cayu.tools.structured_commands import StructuredCommandToolPolicy
 
     if type(policy) is StructuredCommandToolPolicy and policy._base_policy is not None:
-        return _policy_allows_explicitly(policy._base_policy, tool_name)
+        return _policy_allows_explicitly(policy._base_policy, tool_name, _seen=seen)
     return False
 
 
@@ -978,11 +983,11 @@ def _optional_type_name(value: object | None) -> str | None:
 
 
 def _parameter_policy_decision(
-    policy: ToolPolicy, tool_name: str
+    policy: ToolPolicy, tool_name: str, *, _seen: frozenset[int] = frozenset()
 ) -> Literal["deny", "require_approval"] | None:
     from cayu.tools.structured_commands import StructuredCommandToolPolicy
 
-    seen: set[int] = set()
+    seen = set(_seen)
     while type(policy) is StructuredCommandToolPolicy:
         if id(policy) in seen or policy._base_policy is None:
             return None
@@ -990,7 +995,11 @@ def _parameter_policy_decision(
         policy = policy._base_policy
     # Do not project built-in semantics onto an overriding extension subclass.
     if type(policy) is GuardedToolPolicy:
-        return _parameter_policy_decision(policy.then, tool_name)
+        if id(policy) in seen:
+            return None
+        return _parameter_policy_decision(
+            policy.then, tool_name, _seen=frozenset(seen) | {id(policy)}
+        )
     if (
         type(policy) is ParameterConstrainedToolPolicy
         and type(policy.decision) is ToolPolicyDecision
@@ -1003,9 +1012,13 @@ def _parameter_policy_decision(
     return None
 
 
-def _policy_environment_names(policy: ToolPolicy, tool_name: str) -> tuple[str, ...] | None:
+def _policy_environment_names(
+    policy: ToolPolicy, tool_name: str, *, _seen: frozenset[int] = frozenset()
+) -> tuple[str, ...] | None:
+    if id(policy) in _seen:
+        return None
     if type(policy) is GuardedToolPolicy:
-        return _policy_environment_names(policy.then, tool_name)
+        return _policy_environment_names(policy.then, tool_name, _seen=_seen | {id(policy)})
     if type(policy) is EnvironmentScopedToolPolicy:
         return tuple(sorted(policy.allow.get(tool_name, ())))
     return None
@@ -1020,15 +1033,14 @@ def _tool_policy_coverage(
 ) -> Literal["allowed", "denied", "approval_required", "conditional", "unknown"]:
     from cayu.tools.structured_commands import StructuredCommandToolPolicy
 
+    if id(policy) in _seen:
+        return "unknown"
+    seen = _seen | {id(policy)}
     if type(policy) is StructuredCommandToolPolicy:
-        if id(policy) in _seen:
-            return "unknown"
         base = (
             "allowed"
             if policy._base_policy is None
-            else _tool_policy_coverage(
-                policy._base_policy, tool_name, schema, _seen=_seen | {id(policy)}
-            )
+            else _tool_policy_coverage(policy._base_policy, tool_name, schema, _seen=seen)
         )
         # authorize() consumes the base decision first. Never turn an opaque
         # base into trusted coverage, even though the outer wrapper is built in.
@@ -1039,7 +1051,7 @@ def _tool_policy_coverage(
     # subclass can override authorize(), so treating it as its parent would
     # turn an unknown custom policy into trusted coverage.
     if type(policy) is GuardedToolPolicy:
-        coverage = _tool_policy_coverage(policy.then, tool_name, schema)
+        coverage = _tool_policy_coverage(policy.then, tool_name, schema, _seen=seen)
         if coverage == "allowed" and any(
             type(guard) is RequiredArguments and guard._rules.get(tool_name)
             for guard in policy.guards

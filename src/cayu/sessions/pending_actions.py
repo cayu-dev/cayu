@@ -28,6 +28,7 @@ from cayu.approvals.user_input import (
 )
 from cayu.events import Event, EventType
 from cayu.runtime import _approval_support as approval_support
+from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._event_projection import private_event_linkage_value
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.sessions import _pending_tool_round as pending_rounds
@@ -986,8 +987,25 @@ def _pending_tool_round_evidence(
     pending_round: pending_rounds.PendingToolRound,
 ) -> tool_call_evidence.ToolCallEvidenceLedger:
     identity = pending_rounds.pending_tool_round_identity(pending_round)
+    events = [record.event for record in reversed(records_desc)]
+    published_calls = {
+        call_id
+        for event in events
+        if type(call_id := event.payload.get("tool_call_id")) is str
+        and event.type in _TERMINAL_EVENT_TYPES
+        and pending_action_event_matches_tool_round(event, pending_round)
+    }
+    # A worker may die after staging a completed sibling but before publishing
+    # the round. That retained result is available to automatic recovery. Do
+    # not turn it into an unknown effect or duplicate an already public result;
+    # malformed public evidence must still require reconciliation.
+    events.extend(
+        _project_pending_action_event(event)
+        for event in tool_round_recovery.staged_terminal_events(pending_round)
+        if event.payload.get("tool_call_id") not in published_calls
+    )
     return tool_call_evidence.scan_projected_tool_call_evidence(
-        events=(record.event for record in reversed(records_desc)),
+        events=events,
         pending_calls=pending_round.tool_calls,
         in_scope=lambda event: identity.matches_payload(event.payload),
         candidate_scope=lambda event: pending_action_event_matches_tool_round(event, pending_round),

@@ -15,8 +15,11 @@ from cayu import (
     GuardedToolPolicy,
     RequiredArguments,
     StaticToolPolicy,
+    Tool,
+    ToolEffect,
     ToolPolicyDecision,
     ToolPolicyResult,
+    ToolSpec,
     UserInputTool,
     check_manifest,
 )
@@ -117,10 +120,16 @@ def test_checker_does_not_infer_coverage_from_custom_guards():
         async def check(self, request):
             raise AssertionError("Do not execute during inspect")
 
+    class ExternalTool(Tool):
+        spec = ToolSpec(name="send_message", effect=ToolEffect.EXTERNAL)
+
+        async def run(self, ctx, args):
+            raise AssertionError("Do not execute during inspect")
+
     app = CayuApp(enable_logging=False)
     app.register_agent(
         AgentSpec(name="assistant", model="fake"),
-        tools=[UserInputTool()],
+        tools=[ExternalTool()],
         tool_policy=GuardedToolPolicy(
             guards=[Uncalled()], then=AlwaysRequireApprovalToolPolicy(tools=["remember_knowledge"])
         ),

@@ -463,11 +463,14 @@ while True:
                         ).read_text() == "retained-command-effect"
                         return
                     if receipt_removed:
+                        # Losing the unresolved command's receipt invalidates
+                        # the plan. An already completed staged read cannot
+                        # authorize a partial repair of the mixed round.
+                        assert result.items[0].status.value == "blocked", result.model_dump_json()
+                        assert result.items[0].error_code == "StaleRecoveryPlanError"
+                        assert not result.items[0].recovery_actions
+                        assert await store.load_checkpoint("recovery-check") == before
                         if mixed_round:
-                            # The staged sibling permits repairing its workspace
-                            # observation, not settling the unknown command.
-                            assert "pending_tool_effect" in result.items[0].recovery_actions
-                            assert result.items[0].final_session_status.value == "interrupted"
                             retained = pending_tool_round_from_checkpoint(
                                 await store.load_checkpoint("recovery-check")
                             )
@@ -481,8 +484,6 @@ while True:
                                 for event in await store.load_events("recovery-check")
                             )
                             return
-                        assert result.items[0].status.value != "executed", result.model_dump_json()
-                        assert await store.load_checkpoint("recovery-check") == before
                         assert not any(
                             event.payload.get("recovered")
                             for event in await store.load_events("recovery-check")

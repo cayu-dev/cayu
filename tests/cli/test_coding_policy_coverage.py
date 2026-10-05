@@ -13,6 +13,7 @@ from cayu import (
     CayuApp,
     Environment,
     EnvironmentSpec,
+    GuardedToolPolicy,
     LocalWorkspace,
     Message,
     ModelStreamEvent,
@@ -43,7 +44,21 @@ class _ExternalTool(Tool):
 
 
 @pytest.mark.parametrize(
-    "kind", ["none", "allow", "deny", "approval", "rules", "custom", "subclass", "nested", "cycle"]
+    "kind",
+    [
+        "none",
+        "allow",
+        "deny",
+        "approval",
+        "rules",
+        "custom",
+        "subclass",
+        "nested",
+        "cycle",
+        "nested-cycle",
+        "guarded-cycle",
+        "mixed-cycle",
+    ],
 )
 def test_maintained_wrapper_preserves_exact_base_coverage(kind):
     class CustomPolicy(StaticToolPolicy):
@@ -72,6 +87,15 @@ def test_maintained_wrapper_preserves_exact_base_coverage(kind):
         policy = StructuredCommandToolPolicy(toolchain_profile=_profile(), base_policy=policy)
     if kind == "cycle":
         policy._base_policy = policy
+    if kind == "nested-cycle":
+        policy._base_policy = StructuredCommandToolPolicy(
+            toolchain_profile=_profile(), base_policy=policy
+        )
+    if kind == "guarded-cycle":
+        policy = GuardedToolPolicy(guards=[], then=policy)
+        policy._then = policy
+    if kind == "mixed-cycle":
+        policy._base_policy = GuardedToolPolicy(guards=[], then=policy)
     app = CayuApp(enable_logging=False)
     app.register_agent(
         AgentSpec(name="agent", model="fixture"),
@@ -98,6 +122,9 @@ def test_maintained_wrapper_preserves_exact_base_coverage(kind):
         "custom": ("unknown", "unknown"),
         "subclass": ("unknown", "unknown"),
         "cycle": ("unknown", "unknown"),
+        "nested-cycle": ("unknown", "unknown"),
+        "guarded-cycle": ("unknown", "unknown"),
+        "mixed-cycle": ("unknown", "unknown"),
     }[kind]
     tools = {tool.name: tool for tool in manifest.agents[0].tools}
     assert (tools["write_file"].policy_coverage, tools["run_command"].policy_coverage) == expected
@@ -105,7 +132,9 @@ def test_maintained_wrapper_preserves_exact_base_coverage(kind):
     assert AppManifest.model_validate_json(manifest.model_dump_json()) == manifest
     diagnostics = check_manifest(manifest).diagnostics
     assert sum(d.code == "EXTERNAL_TOOL_COVERAGE_UNKNOWN" for d in diagnostics) == (
-        2 if kind in {"custom", "subclass", "cycle"} else 0
+        2
+        if kind in {"custom", "subclass", "cycle", "nested-cycle", "guarded-cycle", "mixed-cycle"}
+        else 0
     )
     assert sum(d.code == "EXTERNAL_TOOL_UNGUARDED" for d in diagnostics) == (
         1 if kind in {"none", "allow", "nested"} else 0

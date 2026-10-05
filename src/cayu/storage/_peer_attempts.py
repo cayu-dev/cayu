@@ -41,11 +41,10 @@ def permits_parked_delivery_append(
     )
     from cayu.sessions._session_continuation import (
         ContinuationRecord,
-        continuation_digest,
         continuation_operation_key,
         require_record_writer_generation,
     )
-    from cayu.sessions._session_continuation_store import ROOT_KEY, ContinuationRoot
+    from cayu.sessions._session_continuation_store import ROOT_KEY, ContinuationRoot, digest
     from cayu.sessions.base import PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY
     from cayu.sessions.checkpoints import decode_runtime_checkpoint
 
@@ -54,6 +53,10 @@ def permits_parked_delivery_append(
     checkpoint = decode_runtime_checkpoint(checkpoint, session_id=session_id)
     if checkpoint is None or PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY in checkpoint:
         raise PeerContentUnavailable("Peer target wait has not settled its native writer.")
+    # Authenticate the exact persisted representation used by the native index.
+    # Contract snapshots include omitted optional defaults, so their digest need
+    # not match the stored aggregate's serialization.
+    record_sha256 = digest(record)
     record = ContinuationRecord.model_validate(record)
     root = ContinuationRoot.model_validate(checkpoint[ROOT_KEY])
     indexed = next(
@@ -64,7 +67,7 @@ def permits_parked_delivery_append(
         ),
         None,
     )
-    if indexed is None or indexed.record_sha256 != continuation_digest(record):
+    if indexed is None or indexed.record_sha256 != record_sha256:
         raise PeerContentConflict("Peer target wait lost its exact native index.")
     if (
         record.ticket.state != "WAITING"
