@@ -114,6 +114,18 @@ hint, and the structured `error.publication_error`. With `--no-wait`,
 `result.service_publication_pending=true` identifies an absent service or one still
 serving an older release. `rollback` still asks Cloud to publish the selected release.
 
+Cloud's deployment worker promotes a smoke-tested release on its own, so `deploy`'s
+promote request can race it. The request carries the Agent revision read before the
+upload; if another release (often the previous one, still finishing) is promoted in the
+meantime, Cloud answers HTTP 409 and then promotes the new release anyway. `deploy` treats
+that 409 as a race: it keeps reading the exact release until Cloud promotes it, then waits
+for the service as usual. It fails only when the release ends terminally (the normal
+`deployment_failed` result) or is still unpromoted when the wait ends, or at once under
+`--no-wait`. That failure has category `deployment_promotion_conflict`, Cloud's reason,
+the release `status`, and `status`, `timeline` and `promote` commands. Cloud 409 messages
+include Cloud's reason (for example "Application changed after the expected revision."),
+filtered like deployment failure text, instead of only "HTTP 409".
+
 For web Agents, `[web] ready_path = "/ready"` optionally replaces the default `/`. It is
 a local absolute path of printable ASCII without spaces or a fragment; percent-encode
 anything else. Cloud's Python stdlib container probe GETs the local web port with a

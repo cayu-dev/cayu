@@ -112,6 +112,41 @@ class _CloudRetrySubmissionError(CloudApiError):
         self.details = {"deployment_id": deployment_id, "retry_idempotency_key": retry_key}
 
 
+class _CloudPromotionConflictError(CloudApiError):
+    """Cloud refused the CLI's promote and has not promoted the release since."""
+
+    def __init__(
+        self,
+        cause: CloudApiError,
+        *,
+        application_id: str,
+        deployment_id: str,
+        recovery_arguments: Sequence[str],
+        status: str,
+    ) -> None:
+        reason = f" Cayu Cloud said: {cause.detail}" if cause.detail is not None else ""
+        super().__init__(
+            "deployment_promotion_conflict",
+            f"Cayu Cloud refused to promote this release and has not promoted it.{reason}",
+            status_code=cause.status_code,
+            detail=cause.detail,
+        )
+        self.details: dict[str, object] = {"status": status}
+        app = _cloud_application_id(application_id)
+        deployment = _cloud_deployment_id(deployment_id)
+        if app is not None:
+            self.details["application"] = app
+        if deployment is not None:
+            self.details["deployment_id"] = deployment
+        if app is not None and deployment is not None:
+            command = ["cayu", "cloud", *recovery_arguments, "deployment"]
+            suffix = [deployment, "--application", app]
+            self.details["commands"] = {
+                action: shlex.join([*command, action, *suffix])
+                for action in ("status", "timeline", "promote")
+            }
+
+
 class _CloudDeploymentFailureError(CloudApiError):
     """Safe structured Cayu Cloud deployment failure."""
 
@@ -350,6 +385,7 @@ def _cloud_failure(exc: Exception) -> int:
         (
             _CloudDeploymentDiagnosticUnavailableError,
             _CloudDeploymentFailureError,
+            _CloudPromotionConflictError,
             _CloudRetrySubmissionError,
         ),
     ):
@@ -1042,14 +1078,16 @@ def _deploy(
             monotonic=monotonic,
         )
     if not arguments.no_promote and deployment.get("status") == "smoke_tested":
-        application = client.request(
-            "POST",
-            f"/v1/applications/{application['id']}/deployments/{deployment['id']}/promote",
-            payload={"expected_application_revision": application["revision"]},
-        )
-        deployment = client.request(
-            "GET",
-            f"/v1/applications/{application['id']}/deployments/{deployment['id']}",
+        application, deployment = _promote_release(
+            client,
+            application=application,
+            deployment_id=str(deployment["id"]),
+            wait=not arguments.no_wait,
+            poll_seconds=arguments.poll_seconds,
+            recovery_arguments=_cloud_recovery_arguments(arguments),
+            wait_seconds=arguments.wait_seconds,
+            sleep=sleep,
+            monotonic=monotonic,
         )
     runtime_artifact = None
     runtime_artifact_id = deployment.get("runtime_artifact_id")
@@ -1586,6 +1624,67 @@ def _wait_for_deployment(
             )
         if monotonic() >= deadline:
             raise _CloudDeploymentStillRunningError(
+                application_id=application_id,
+                deployment_id=deployment_id,
+                recovery_arguments=recovery_arguments,
+                status=status,
+            )
+        sleep(poll_seconds)
+
+
+def _promote_release(
+    client: CloudApiClient,
+    *,
+    application: dict[str, Any],
+    deployment_id: str,
+    wait: bool,
+    poll_seconds: float,
+    recovery_arguments: Sequence[str],
+    wait_seconds: float,
+    sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Promote a smoke-tested release, tolerating Cloud promoting it concurrently.
+
+    Cloud's deployment worker promotes every smoke-tested release itself, reading the
+    Agent's revision fresh. The CLI's promote carries the revision it read before the
+    upload, so it loses that race whenever another release (often the previous one,
+    still finishing) was promoted in between: Cloud answers 409 and then promotes this
+    release anyway. A conflict is therefore only a failure when the release never
+    becomes the promoted one.
+    """
+
+    application_id = str(application["id"])
+    path = f"/v1/applications/{application_id}/deployments/{deployment_id}"
+    try:
+        promoted = client.request(
+            "POST",
+            f"{path}/promote",
+            payload={"expected_application_revision": application["revision"]},
+        )
+    except CloudApiError as exc:
+        if exc.status_code != 409:
+            raise
+        conflict = exc
+    else:
+        return promoted, client.request("GET", path)
+    deadline = monotonic() + wait_seconds
+    while True:
+        deployment = client.request("GET", path)
+        status = _deployment_status(deployment)
+        if status == "promoted":
+            return client.request("GET", f"/v1/applications/{application_id}"), deployment
+        if status in _DEPLOYMENT_FAILURES:
+            _raise_terminal_deployment(
+                application_id=application_id,
+                deployment_id=deployment_id,
+                status=status,
+                recovery_arguments=recovery_arguments,
+                failure=_deployment_failure(client, path=path),
+            )
+        if status != "smoke_tested" or not wait or monotonic() >= deadline:
+            raise _CloudPromotionConflictError(
+                conflict,
                 application_id=application_id,
                 deployment_id=deployment_id,
                 recovery_arguments=recovery_arguments,

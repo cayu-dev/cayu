@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import re
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -47,6 +48,11 @@ _SAFE_API_ERROR_DETAILS = {
         "command again."
     ),
 }
+
+
+# Cloud's stable rejection codes are short lowercase identifiers.
+_CLOUD_ERROR_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+_CONFLICT_DETAIL_LIMIT = 512
 
 
 def archived_agent_error() -> CloudApiError:
@@ -173,6 +179,8 @@ class CloudApiClient:
         if not 200 <= response.status_code < 300:
             structured = _structured_api_error(response)
             detail = _safe_api_error_detail(response.status_code, structured)
+            if detail is None and structured is None:
+                detail = _safe_conflict_detail(response)
             suffix = f": {detail}" if detail is not None else "."
             raise CloudApiError(
                 "api_request_rejected",
@@ -323,7 +331,24 @@ def _safe_api_error_detail(
                 for pair in pairs
             )
             return "Agent resources exceed supported sizes. Valid manifest pairs: " + options + "."
-    return _SAFE_API_ERROR_DETAILS.get((status_code, code))
+    allowlisted = _SAFE_API_ERROR_DETAILS.get((status_code, code))
+    if allowlisted is None and status_code == 409 and _CLOUD_ERROR_CODE.fullmatch(code):
+        return safe_text(detail.get("message"), _CONFLICT_DETAIL_LIMIT)
+    return allowlisted
+
+
+def _safe_conflict_detail(response: httpx.Response) -> str | None:
+    """Cloud's reason for a conflict, filtered the way deployment failure text is.
+
+    Cloud explains a 409 (a stale application revision, a release that has not passed
+    its gate, a pending lifecycle action, an idempotency or version conflict) in plain
+    text. Without it the CLI can only say "HTTP 409", which leaves the caller unable to
+    tell a race from a refusal.
+    """
+
+    if response.status_code != 409:
+        return None
+    return _plain_api_error_detail(response)
 
 
 def _plain_api_error_detail(response: httpx.Response) -> str | None:
