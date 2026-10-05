@@ -214,6 +214,17 @@ clock, optional knowledge store and closure adapters. `CayuApp` supplies those
 dependencies and public registration provenance. Runtime materialization,
 idle-resource release and shutdown keep their existing owners.
 
+`_application_task_creation.py` owns task creation and work-contract publication
+and lookup. Its operations take explicit task-store, session-store and redactor
+dependencies, without importing the application or execution controllers. They
+validate requests, resolve invocation provenance and authenticate store results,
+including exact contract identity and scheduled creation replay. Ordinary tasks
+remain usable without work contracts. Contract-bound mutations reuse the existing
+cancellation-quiescent store boundary; native transactions and scheduling keep
+their existing owners. `CayuApp` retains the public signatures and lifecycle
+tracking and releases request references before awaiting the operation so
+rejected sensitive input is not retained in its traceback.
+
 ```text
 CayuApp
   -> RuntimeEventWriter
