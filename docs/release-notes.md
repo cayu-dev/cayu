@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- `cayu cloud deploy` now accepts a `[storage]` table in `cayu-cloud.toml`, so a
+  project can acknowledge a rebuildable cache or index under `/data` with
+  `local_files = [{ path = "...", reason = "..." }]` as Cayu Cloud's source
+  admission asks. It was previously rejected as an unsupported field. The CLI
+  validates the table with Cloud's rules (only `local_files`, at most 50 entries,
+  each with a 1-256 character `path` and a 1-500 character `reason`) and fails with
+  `manifest_invalid` before uploading. The table reaches Cloud unchanged in the
+  uploaded source. Nonempty acknowledgements require the deployment root's
+  `cayu-cloud.toml`; custom manifest paths fail locally before upload because Cloud
+  would not read their acknowledgements. See
+  [Cayu Cloud CLI](cayu-cloud.md#local-file-acknowledgements).
 - Add `OidcBearerAuth` and `OidcSigningKeys` to `cayu.server`, in the new
   `cayu[oidc]` extra. They verify JWT bearer tokens from an OpenID Connect
   provider (Cognito, Auth0, Okta, Entra ID, Google, Workday) against its

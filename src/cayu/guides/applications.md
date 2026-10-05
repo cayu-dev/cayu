@@ -212,7 +212,10 @@ authorization, claims, and settlement) in the same database with
   sync cursors, in the configured database. Application tables may share it with
   their own table prefix; Cayu reserves `cayu_` for its tables.
 - `data/` locally and `/data` in a deployment hold files: artifacts, uploads, and
-  fixtures. Do not open SQLite files there for durable application state.
+  fixtures. Do not open SQLite files there for durable application state. Cayu Cloud
+  blocks such code at deploy time; acknowledge a rebuildable cache or index under
+  `/data` with `[storage] local_files = [{ path = "...", reason = "..." }]` in
+  `cayu-cloud.toml`.
 - Deployments set `CAYU_DATABASE_URL` to a migrated PostgreSQL database, run
   `cayu storage migrate` as a deploy step, and set `CAYU_REQUIRE_POSTGRES=1` so
   every Cayu SQLite store refuses to open.

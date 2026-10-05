@@ -15,6 +15,7 @@ import tarfile
 import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
+from typing import cast
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -123,6 +124,52 @@ class CloudSchedule:
     memory_mb: int | None = None
 
 
+@dataclass(frozen=True)
+class CloudLocalFile:
+    """A `[storage] local_files` acknowledgement of a rebuildable file under /data."""
+
+    path: str
+    reason: str
+
+
+_LOCAL_FILES_LIMIT = 50
+_STORAGE_TABLE_ERROR = "[storage] must contain only local_files, an array of at most 50 tables."
+_LOCAL_FILE_ENTRY_ERROR = (
+    "Each [storage] local_files entry needs a path (1-256 characters) "
+    "and a reason (1-500 characters)."
+)
+
+
+def _local_files(storage: object) -> tuple[CloudLocalFile, ...]:
+    # Mirrors Cayu Cloud's source admission so an invalid acknowledgement fails here instead
+    # of as storage_acknowledgement_invalid after upload.
+    if storage is None:
+        return ()
+    if not isinstance(storage, dict) or set(storage) - {"local_files"}:
+        raise CloudApiError("manifest_invalid", _STORAGE_TABLE_ERROR)
+    local_files = cast("dict[str, object]", storage).get("local_files", [])
+    if not isinstance(local_files, list) or len(local_files) > _LOCAL_FILES_LIMIT:
+        raise CloudApiError("manifest_invalid", _STORAGE_TABLE_ERROR)
+    entries = []
+    for item in local_files:
+        if not isinstance(item, dict) or set(item) - {"path", "reason"}:
+            raise CloudApiError("manifest_invalid", _LOCAL_FILE_ENTRY_ERROR)
+        entry = cast("dict[str, object]", item)
+        entries.append(_local_file(entry.get("path"), entry.get("reason")))
+    return tuple(entries)
+
+
+def _local_file(path: object, reason: object) -> CloudLocalFile:
+    if (
+        not isinstance(path, str)
+        or not 1 <= len(path.strip()) <= 256
+        or not isinstance(reason, str)
+        or not 1 <= len(reason.strip()) <= 500
+    ):
+        raise CloudApiError("manifest_invalid", _LOCAL_FILE_ENTRY_ERROR)
+    return CloudLocalFile(path=path.strip(), reason=reason.strip())
+
+
 def _process_resources(payload: dict[str, object]) -> dict[str, int]:
     resources = {}
     for name, minimum, maximum in (("cpu_millis", 100, 16_000), ("memory_mb", 128, 131_072)):
@@ -151,6 +198,7 @@ class CloudProjectManifest:
     worker: CloudProcess | None = None
     schedules: tuple[CloudSchedule, ...] = ()
     runtime_environment: dict[str, str] | None = None
+    local_files: tuple[CloudLocalFile, ...] = ()
 
     @classmethod
     def load(cls, path: Path) -> CloudProjectManifest:
@@ -186,6 +234,7 @@ class CloudProjectManifest:
             "web",
             "worker",
             "schedules",
+            "storage",
         }
         schema_version = payload.get("schema_version")
         if set(payload) - allowed or schema_version not in {1, 2}:
@@ -298,6 +347,7 @@ class CloudProjectManifest:
                     for item in schedules
                 ),
                 runtime_environment=dict(runtime_environment),
+                local_files=_local_files(payload.get("storage")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise CloudApiError(
@@ -393,6 +443,10 @@ class CloudProjectManifest:
                 raise CloudApiError("manifest_invalid", "Runtime schedule is invalid.")
         if len(set(item.name for item in self.schedules)) != len(self.schedules):
             raise CloudApiError("manifest_invalid", "Runtime schedule names must be unique.")
+        if len(self.local_files) > _LOCAL_FILES_LIMIT:
+            raise CloudApiError("manifest_invalid", _STORAGE_TABLE_ERROR)
+        for entry in self.local_files:
+            _local_file(entry.path, entry.reason)
 
     def deployment_payload(self, *, repository: str, revision: str) -> dict[str, object]:
         return {
@@ -799,6 +853,7 @@ def resolve_project(
                 "Local manifest must be inside the project directory.",
             ) from exc
         manifest = CloudProjectManifest.load(selected_manifest)
+        _validate_storage_manifest_path(manifest, selected_manifest.relative_to(project_root))
         bundle = _archive_project(project_root, required_file=selected_manifest)
         content_digest = "sha256:" + hashlib.sha256(bundle).hexdigest()
         digest = content_digest.removeprefix("sha256:")
@@ -830,6 +885,7 @@ def resolve_project(
     manifest = CloudProjectManifest.loads(
         _github_file(repository, revision=revision, path=selected_manifest.as_posix())
     )
+    _validate_storage_manifest_path(manifest, selected_manifest)
     return ResolvedCloudProject(
         root=None,
         manifest_path=selected_manifest,
@@ -837,6 +893,17 @@ def resolve_project(
         repository=repository,
         revision=revision,
     )
+
+
+def _validate_storage_manifest_path(manifest: CloudProjectManifest, path: Path) -> None:
+    # Source admission reads only the root file, not the selected CLI manifest path.
+    if manifest.local_files and path != Path("cayu-cloud.toml"):
+        raise CloudApiError(
+            "manifest_invalid",
+            "Storage local_files requires cayu-cloud.toml at the deployment root. "
+            "Move the manifest there as a regular file and deploy without --manifest; "
+            "Cloud reads storage acknowledgements only from that file.",
+        )
 
 
 class CloudSourceInputsError(CloudApiError):

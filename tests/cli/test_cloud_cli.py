@@ -3312,6 +3312,249 @@ port = 8000
     assert cloud_project.CloudProjectManifest.loads(manifest_text).web.ready_path == "/"
 
 
+_STORAGE_MANIFEST = """
+schema_version = 2
+application = "ledger-agent"
+name = "Ledger Agent"
+version = "1.0.0"
+entrypoint = "python app.py"
+capabilities = ["network"]
+cpu_millis = 512
+memory_mb = 1024
+timeout_seconds = 600
+environment = "python"
+compatibility = "cayu>=0.1"
+policy_version = "v1"
+"""
+
+
+@pytest.mark.parametrize("schema_version", [1, 2])
+def test_cloud_manifest_accepts_storage_local_file_acknowledgements(schema_version: int) -> None:
+    manifest = cloud_project.CloudProjectManifest.loads(
+        _STORAGE_MANIFEST.replace("schema_version = 2", f"schema_version = {schema_version}")
+        + """
+[storage]
+local_files = [
+  { path = " /data/cache/*.sqlite ", reason = " Rebuildable embedding cache " },
+  { path = "index.sqlite", reason = "Rebuilt from fixtures on start" },
+]
+"""
+    )
+    assert manifest.local_files == (
+        cloud_project.CloudLocalFile(
+            path="/data/cache/*.sqlite", reason="Rebuildable embedding cache"
+        ),
+        cloud_project.CloudLocalFile(path="index.sqlite", reason="Rebuilt from fixtures on start"),
+    )
+    # Cloud reads [storage] from the uploaded source, not from the deployment request.
+    assert "storage" not in json.dumps(
+        manifest.deployment_payload(repository="https://github.com/example/a", revision="a" * 40)
+    )
+
+
+@pytest.mark.parametrize(
+    "storage",
+    ["[storage]\n", "[storage]\nlocal_files = []\n"],
+)
+def test_cloud_manifest_accepts_empty_storage_table(storage: str) -> None:
+    manifest = cloud_project.CloudProjectManifest.loads(_STORAGE_MANIFEST + storage)
+    assert manifest.local_files == ()
+    assert cloud_project.CloudProjectManifest.loads(_STORAGE_MANIFEST).local_files == ()
+
+
+def test_cloud_manifest_accepts_storage_array_of_tables_syntax() -> None:
+    manifest = cloud_project.CloudProjectManifest.loads(
+        _STORAGE_MANIFEST
+        + '[[storage.local_files]]\npath = "/data/cache/*.db"\nreason = "Lookup cache"\n'
+    )
+    assert manifest.local_files == (
+        cloud_project.CloudLocalFile(path="/data/cache/*.db", reason="Lookup cache"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("storage", "message"),
+    [
+        ('storage = "cache"\n', "must contain only local_files"),
+        ("[storage]\ncaches = []\n", "must contain only local_files"),
+        ('[storage]\nlocal_files = { path = "a", reason = "b" }\n', "must contain only"),
+        (
+            "[storage]\nlocal_files = ["
+            + ", ".join('{ path = "a", reason = "b" }' for _ in range(51))
+            + "]\n",
+            "at most 50 tables",
+        ),
+        ('[storage]\nlocal_files = ["/data/cache.db"]\n', "needs a path"),
+        ('[storage]\nlocal_files = [{ path = "a.db" }]\n', "needs a path"),
+        ('[storage]\nlocal_files = [{ reason = "cache" }]\n', "needs a path"),
+        ('[storage]\nlocal_files = [{ path = "  ", reason = "cache" }]\n', "needs a path"),
+        ('[storage]\nlocal_files = [{ path = "a.db", reason = "" }]\n', "needs a path"),
+        ('[storage]\nlocal_files = [{ path = 1, reason = "cache" }]\n', "needs a path"),
+        (
+            f'[storage]\nlocal_files = [{{ path = "{"a" * 257}", reason = "cache" }}]\n',
+            "1-256 characters",
+        ),
+        (
+            f'[storage]\nlocal_files = [{{ path = "a.db", reason = "{"r" * 501}" }}]\n',
+            "1-500 characters",
+        ),
+        (
+            '[storage]\nlocal_files = [{ path = "a.db", reason = "cache", ttl = 1 }]\n',
+            "needs a path",
+        ),
+    ],
+)
+def test_cloud_manifest_rejects_invalid_storage_like_cloud_admission(
+    storage: str, message: str
+) -> None:
+    with pytest.raises(CloudApiError, match=re.escape(message)) as raised:
+        cloud_project.CloudProjectManifest.loads(_STORAGE_MANIFEST + storage)
+    assert raised.value.category == "manifest_invalid"
+
+
+def test_cloud_manifest_accepts_storage_at_length_limits() -> None:
+    manifest = cloud_project.CloudProjectManifest.loads(
+        _STORAGE_MANIFEST
+        + "[storage]\nlocal_files = ["
+        + ", ".join(f'{{ path = "{"p" * 256}", reason = "{"r" * 500}" }}' for _ in range(50))
+        + "]\n"
+    )
+    assert len(manifest.local_files) == 50
+
+
+@pytest.mark.parametrize("manifest_selection", ["default", "relative", "absolute"])
+def test_local_project_bundle_keeps_storage_acknowledgements_verbatim(
+    tmp_path: Path, manifest_selection: str
+) -> None:
+    _write_build_inputs(tmp_path)
+    manifest_text = (
+        _STORAGE_MANIFEST
+        + '[storage]\nlocal_files = [{ path = "/data/cache/*.sqlite", reason = "Cache" }]\n'
+    )
+    (tmp_path / "cayu-cloud.toml").write_text(manifest_text)
+    (tmp_path / "app.py").write_text("print('ok')\n")
+
+    manifest_path = {
+        "default": None,
+        "relative": Path("cayu-cloud.toml"),
+        "absolute": tmp_path / "cayu-cloud.toml",
+    }[manifest_selection]
+    project = cloud_project.resolve_project(
+        str(tmp_path), manifest_path=manifest_path, revision=None
+    )
+
+    assert project.manifest.local_files == (
+        cloud_project.CloudLocalFile(path="/data/cache/*.sqlite", reason="Cache"),
+    )
+    assert project.bundle is not None
+    with tarfile.open(fileobj=io.BytesIO(project.bundle), mode="r:gz") as archive:
+        uploaded = archive.extractfile("source/cayu-cloud.toml")
+        assert uploaded is not None
+        assert uploaded.read().decode() == manifest_text
+
+
+@pytest.mark.parametrize("source_kind", ["local", "repository"])
+@pytest.mark.parametrize("manifest_name", ["cloud-prod.toml", "deploy/cayu-cloud.toml"])
+def test_cloud_source_rejects_storage_acknowledgements_in_custom_manifest(
+    source_kind: str,
+    manifest_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_text = (
+        _STORAGE_MANIFEST
+        + '[storage]\nlocal_files = [{ path = "/data/cache/*.sqlite", reason = "Cache" }]\n'
+    )
+    if source_kind == "local":
+        selected = tmp_path / manifest_name
+        selected.parent.mkdir(parents=True, exist_ok=True)
+        selected.write_text(manifest_text)
+        (tmp_path / "cayu-cloud.toml").write_text(_STORAGE_MANIFEST)
+        source, revision = str(tmp_path), None
+    else:
+        source, revision = "https://github.com/example/project", "a" * 40
+
+        def github_file(repository: str, *, revision: str, path: str) -> str:
+            assert (repository, revision, path) == (source, "a" * 40, manifest_name)
+            return manifest_text
+
+        monkeypatch.setattr(cloud_project, "_github_file", github_file)
+
+    def unexpected_archive(*_args: object, **_kwargs: object) -> bytes:
+        raise AssertionError("invalid storage manifest reached source bundling")
+
+    monkeypatch.setattr(cloud_project, "_archive_project", unexpected_archive)
+    with pytest.raises(CloudApiError, match="cayu-cloud.toml at the deployment root") as raised:
+        cloud_project.resolve_project(source, manifest_path=Path(manifest_name), revision=revision)
+    assert raised.value.category == "manifest_invalid"
+
+
+@pytest.mark.parametrize("source_kind", ["local", "repository"])
+@pytest.mark.parametrize("storage", ["", "[storage]\n", "[storage]\nlocal_files = []\n"])
+def test_cloud_source_preserves_custom_manifests_without_storage_acknowledgements(
+    source_kind: str,
+    storage: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_text = _STORAGE_MANIFEST + storage
+    if source_kind == "local":
+        _write_build_inputs(tmp_path)
+        (tmp_path / "cloud-prod.toml").write_text(manifest_text)
+        source, revision = str(tmp_path), None
+    else:
+        source, revision = "https://github.com/example/project", "a" * 40
+
+        def github_file(repository: str, *, revision: str, path: str) -> str:
+            assert (repository, revision, path) == (source, "a" * 40, "cloud-prod.toml")
+            return manifest_text
+
+        monkeypatch.setattr(cloud_project, "_github_file", github_file)
+
+    project = cloud_project.resolve_project(
+        source, manifest_path=Path("cloud-prod.toml"), revision=revision
+    )
+    assert project.manifest.local_files == ()
+
+
+@pytest.mark.parametrize("manifest_path", [None, Path("cayu-cloud.toml")])
+def test_cloud_repository_accepts_storage_acknowledgements_in_root_manifest(
+    manifest_path: Path | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def github_file(repository: str, *, revision: str, path: str) -> str:
+        assert (repository, revision, path) == (
+            "https://github.com/example/project",
+            "a" * 40,
+            "cayu-cloud.toml",
+        )
+        return (
+            _STORAGE_MANIFEST
+            + '[storage]\nlocal_files = [{ path = "/data/cache/*.sqlite", reason = "Cache" }]\n'
+        )
+
+    monkeypatch.setattr(cloud_project, "_github_file", github_file)
+    project = cloud_project.resolve_project(
+        "https://github.com/example/project", manifest_path=manifest_path, revision="a" * 40
+    )
+    assert project.manifest.local_files == (
+        cloud_project.CloudLocalFile(path="/data/cache/*.sqlite", reason="Cache"),
+    )
+
+
+def test_cloud_local_source_rejects_storage_acknowledgements_in_symlinked_manifest(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "cloud-prod.toml").write_text(
+        _STORAGE_MANIFEST
+        + '[storage]\nlocal_files = [{ path = "/data/cache/*.sqlite", reason = "Cache" }]\n'
+    )
+    (tmp_path / "cayu-cloud.toml").symlink_to("cloud-prod.toml")
+    with pytest.raises(CloudApiError, match="cayu-cloud.toml at the deployment root") as raised:
+        cloud_project.resolve_project(str(tmp_path), manifest_path=None, revision=None)
+    assert raised.value.category == "manifest_invalid"
+
+
 def test_cloud_wait_observes_exact_release_through_absent_and_old_service() -> None:
     class Client:
         def __init__(self) -> None:

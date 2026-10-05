@@ -515,3 +515,35 @@ Cayu Cloud API returned HTTP 422: Agent resources exceed supported sizes. Valid 
 The CLI never prints Cloud's free-text `detail.message`. If a `manifest_invalid`
 rejection carries no usable `valid_pairs` (for example from an older Cayu Cloud
 release), it prints `Cayu Cloud rejected the manifest resources.` instead.
+
+## Local file acknowledgements
+
+Cayu Cloud's source admission blocks code that keeps durable application state in
+local database files under `/data` (`durable_file_state_detected`). A cache or
+rebuildable index that legitimately lives there can be acknowledged in
+`cayu-cloud.toml`, which turns a matching finding into a reviewed warning:
+
+```toml
+[storage]
+local_files = [
+  { path = "/data/cache/*.sqlite", reason = "Rebuildable embedding cache" },
+]
+```
+
+`[storage]` may contain only `local_files`, an array of at most 50 tables. Each entry
+needs a `path` glob of 1-256 characters and a `reason` of 1-500 characters (both
+measured after trimming whitespace); other keys are rejected. `cayu cloud deploy`
+applies the same rules as Cloud and fails locally with `manifest_invalid` instead of
+uploading a source that Cloud would reject with `storage_acknowledgement_invalid`.
+The table is accepted in schema versions 1 and 2, because Cloud scans every uploaded
+source. It is not sent in the deployment request: Cloud reads it from the uploaded
+`cayu-cloud.toml`, which matches findings by source file, database file name, or the
+runtime path under `/data`, and also uses it for the post-deploy `/data` audit shown
+as `storage_audit` in `cayu cloud service status`.
+
+Nonempty `local_files` acknowledgements must be in the deployment root's
+`cayu-cloud.toml`. A custom `--manifest` path containing acknowledgements is rejected
+with `manifest_invalid` before upload, for both local and repository sources. Move
+the manifest to the root as a regular file and deploy without `--manifest`. Custom
+manifests with no acknowledgements (including an empty `local_files` array) remain
+supported.
