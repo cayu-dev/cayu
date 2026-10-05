@@ -74,6 +74,7 @@ from cayu.runtime.verified_task_worker import (
 )
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
+from cayu.sessions import _staged_tool_terminal_reader as staged_terminal_reader
 from cayu.sessions.base import EventQuery, InMemorySessionStore, RunRequest, SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.admission import (
@@ -1217,7 +1218,7 @@ def test_worker_recovers_tool_publication_after_process_exit(
                     assert last_id not in terminal_ids
                     assert any(
                         staged.tool_call_id == last_id
-                        for staged in tool_round_recovery.staged_terminal_records(pending)
+                        for staged in staged_terminal_reader.staged_terminal_records(pending)
                     )
             assert (tmp_path / "effects.txt").read_text(encoding="utf-8") == "effect\n" * call_count
             await wait_for_verified_worker_lease_expiry(tasks, admission.claim.lease_expires_at)
@@ -2745,7 +2746,7 @@ def test_worker_keeps_unknown_model_dispatch_fenced_after_process_exit(
                     assert outcomes["record-effect"].result.structured["outcome_unknown"] is True
                     assert any(
                         staged.event.payload.get("secret_scope_incomplete") is True
-                        for staged in tool_round_recovery.staged_terminal_records(pending)
+                        for staged in staged_terminal_reader.staged_terminal_records(pending)
                     )
                 elif call_count == 2:
                     assert outcomes["record-effect"].result.structured == {"recorded": True}

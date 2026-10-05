@@ -28,6 +28,7 @@ from cayu.runtime._tool_round_staging import (
     _ToolRoundPublicationCoordinator,
 )
 from cayu.runtime.execution_units import ToolRoundIdentity
+from cayu.sessions import _staged_tool_terminal_reader as staged_terminal_reader
 from cayu.sessions.base import Session, SessionStore
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools.base import ToolResult
@@ -116,7 +117,7 @@ class ToolRoundContinuation:
         if self._coordinator is not None:
             await self._coordinator.reserve_capacity()
             await self._coordinator.restore_staged_capacity(
-                tool_round_recovery.checkpoint_staged_terminals(
+                staged_terminal_reader.checkpoint_staged_terminals(
                     await self._session_store.load_checkpoint(self._session.id),
                     tool_round_identity=self._identity,
                 )
@@ -236,7 +237,7 @@ class ToolRoundContinuation:
             return set()
 
         checkpoint = await self._session_store.load_checkpoint(self._session.id)
-        stages = tool_round_recovery.checkpoint_staged_terminals(
+        stages = staged_terminal_reader.checkpoint_staged_terminals(
             checkpoint,
             tool_round_identity=coordinator.tool_round_identity,
         )
@@ -338,7 +339,7 @@ class ToolRoundContinuation:
         expected_staged_ids = {
             call.id for call in self._tool_calls if call.id not in already_published_ids
         } | (already_published_ids & restarted_staged_ids)
-        current_stages = tool_round_recovery.checkpoint_staged_terminals(
+        current_stages = staged_terminal_reader.checkpoint_staged_terminals(
             await self._session_store.load_checkpoint(self._session.id),
             tool_round_identity=self._identity,
         )
@@ -350,7 +351,7 @@ class ToolRoundContinuation:
             )
         identity = coordinator.tool_round_identity
         checkpoint = await self._session_store.load_checkpoint(self._session.id)
-        staged_records = tool_round_recovery.checkpoint_staged_terminals(
+        staged_records = staged_terminal_reader.checkpoint_staged_terminals(
             checkpoint,
             tool_round_identity=identity,
         )

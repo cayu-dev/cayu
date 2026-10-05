@@ -66,8 +66,10 @@ from cayu.runtime.stop_policy import StopDecision
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
+from cayu.sessions import _staged_tool_terminal_reader as staged_terminal_reader
 from cayu.sessions.base import Session, SessionStatus, SessionStore
 from cayu.tools import _argument_publication as tool_argument_publication
+from cayu.tools import _terminal_controls as tool_terminal_controls
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools.base import ToolEffect, ToolResult
 from cayu.tools.catalogue import ToolExecutionContract
@@ -1143,7 +1145,7 @@ class DurableToolRound:
         confirmed_native_effect_records: dict[str, ToolEffectRecord] = {}
         staged_call_ids = {
             staged.tool_call_id
-            for staged in tool_round_recovery.staged_terminal_records(pending_round)
+            for staged in staged_terminal_reader.staged_terminal_records(pending_round)
         }
         for pending_tool_call in pending_round.tool_calls:
             if (
@@ -1236,7 +1238,7 @@ class DurableToolRound:
         # projection below may conservatively add coverage for calls that never
         # produced terminal evidence; that must not retroactively authenticate
         # a sibling result staged under an incomplete dynamic-secret scope.
-        recovery_staged_records = tool_round_recovery.staged_terminal_records(pending_round)
+        recovery_staged_records = staged_terminal_reader.staged_terminal_records(pending_round)
         if any(item.event.session_id != session.id for item in recovery_staged_records):
             raise RuntimeError("Staged recovery evidence belongs to a different session.")
         checkpoint, pending_round = await self._complete_recovery_assistant_publication(
@@ -2023,7 +2025,7 @@ def _interrupted_tool_call_outcome(
                 "tool_execution_boundary": "posix_process",
                 "tool_timeout_strength": "hard_process_deadline",
             }
-            tool_results.runtime_terminal_controls(process_controls)
+            tool_terminal_controls.runtime_terminal_controls(process_controls)
             tool_results.runtime_tool_execution_boundary_controls(process_controls)
             structured.update(process_controls)
     return runtime_records.ToolCallOutcome(
@@ -2048,7 +2050,7 @@ def _interrupted_tool_call_event(
     """Build the terminal event paired with the canonical interrupted result."""
 
     structured = dict(tool_call_outcome.result.structured or {})
-    terminal_controls = tool_results.runtime_terminal_controls(structured)
+    terminal_controls = tool_terminal_controls.runtime_terminal_controls(structured)
     terminal_controls.update(tool_results.runtime_tool_execution_boundary_controls(structured))
     return Event(
         type=(

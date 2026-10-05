@@ -5,6 +5,7 @@ from typing import Any, cast
 from cayu.artifacts.attachments import FILE_ATTACHMENT_TYPE
 from cayu.messages import Message
 from cayu.runtime import _tool_results as tool_results
+from cayu.tools import _terminal_controls as tool_terminal_controls
 from cayu.tools import _web_access_results as web_access_results
 from cayu.tools.result_projection import (
     _BUILTIN_TOOL_RESULT_ARTIFACT_REFERENCE_FIELDS,
@@ -657,7 +658,7 @@ def _recognized_runtime_terminal_controls(
     """Return only positively validated runtime-owned terminal controls."""
 
     try:
-        controls: dict[str, object] = tool_results.runtime_terminal_controls(structured)
+        controls: dict[str, object] = tool_terminal_controls.runtime_terminal_controls(structured)
         if controls or trust_boundary_only:
             controls.update(tool_results.runtime_tool_execution_boundary_controls(structured))
         return controls

@@ -460,6 +460,14 @@ Session inspection and runtime recovery use the same reader and canonical approv
 models. Approval resolution, checkpoint writes, live policy evaluation and event
 publication remain with their existing owners.
 
+`sessions/_staged_tool_terminal_reader.py` owns saved terminal-result reads and
+recovery-safe projections. Pending actions and runtime recovery share its ordering,
+detachment and incomplete-secret-scope handling. Checkpoint reads validate one
+ordinary or user-input round owner from a fresh snapshot. The shared validator in
+`tools/_terminal_controls.py` preserves typed terminal controls and redacts failure
+evidence. These components work without runtime recovery or result-processing
+owners; checkpoint writes, hooks and publication keep their existing owners.
+
 `sessions/_foreground_child_checkpoint.py` owns saved child waits, terminal
 selections and continuation records, plus their readers and close projections.
 It shares the canonical effect identity in `sessions/_tool_effect_intent.py` and

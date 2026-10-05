@@ -20,6 +20,7 @@ from cayu.runtime._event_projection import project_runtime_event
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.sessions.base import InMemorySessionStore, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools import _terminal_controls as tool_terminal_controls
 from cayu.tools.base import Tool, ToolEffect, ToolResult, ToolSpec
 from cayu.vaults.redaction import SecretRedactor
 
@@ -168,7 +169,7 @@ def test_secret_expiry_is_omitted_without_invalidating_failure_evidence():
         deadline=ExecutionDeadline(expires_at=datetime(2030, 1, 1, tzinfo=UTC)),
         deadline_phase="in_flight",
     )
-    controls = tool_results.runtime_terminal_controls(
+    controls = tool_terminal_controls.runtime_terminal_controls(
         {
             "terminal_outcome": "tool_execution_error",
             "tool_effect": "none",

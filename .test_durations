@@ -1,4 +1,8 @@
 {
+    "tests/core/test_staged_tool_terminal_reader.py::test_checkpoint_terminal_reads_are_detached_fresh_and_owner_scoped[pending_tool_round]": 0.01348645800317172,
+    "tests/core/test_staged_tool_terminal_reader.py::test_checkpoint_terminal_reads_are_detached_fresh_and_owner_scoped[pending_user_input]": 0.013581916995462961,
+    "tests/core/test_staged_tool_terminal_reader.py::test_saved_terminal_reader_works_without_runtime_owners": 0.7834941249893745,
+    "tests/core/test_staged_tool_terminal_reader.py::test_terminal_reader_and_control_helpers_have_one_canonical_owner": 0.0022470840049209073,
     "tests/core/test_foreground_child_checkpoint_boundary.py::test_foreground_checkpoint_reads_and_projects_without_runtime_owners": 1.02,
     "tests/core/test_foreground_child_checkpoint_boundary.py::test_foreground_checkpoint_models_have_canonical_identity_and_annotations": 0.155,
     "tests/core/test_application_task_creation.py::test_task_creation_composes_contracts_and_session_provenance[memory]": 0.014365416005603038,

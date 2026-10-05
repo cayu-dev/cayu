@@ -27,12 +27,12 @@ from cayu.approvals.user_input import (
     user_input_lifecycle_authority_from_checkpoint,
 )
 from cayu.events import Event, EventType
-from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._event_projection import private_event_linkage_value
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
+from cayu.sessions import _staged_tool_terminal_reader as staged_terminal_reader
 from cayu.sessions import _tool_call_evidence as tool_call_evidence
 from cayu.sessions.base import (
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
@@ -1003,7 +1003,7 @@ def _pending_tool_round_evidence(
     # malformed public evidence must still require reconciliation.
     events.extend(
         _project_pending_action_event(event)
-        for event in tool_round_recovery.staged_terminal_events(pending_round)
+        for event in staged_terminal_reader.staged_terminal_events(pending_round)
         if event.payload.get("tool_call_id") not in published_calls
     )
     return tool_call_evidence.scan_projected_tool_call_evidence(

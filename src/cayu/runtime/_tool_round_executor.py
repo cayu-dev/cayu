@@ -250,6 +250,7 @@ from cayu.sessions.base import (
 )
 from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools import _shared_artifact_results as shared_artifact_results
+from cayu.tools import _terminal_controls as tool_terminal_controls
 from cayu.tools import _web_access_results as web_access_results
 from cayu.tools._operation_boundary import (
     BoundedInvocationOperationRegistry,
@@ -6389,7 +6390,7 @@ class ToolRoundExecutor:
         )
         failure_result = failure.result
         failure_payload = dict(event.payload)
-        for field_name in tool_results.runtime_terminal_controls(failure_payload):
+        for field_name in tool_terminal_controls.runtime_terminal_controls(failure_payload):
             failure_payload.pop(field_name, None)
         failure_payload.pop("tool_result_projection", None)
         failure_payload["result"] = failure_result.model_dump()

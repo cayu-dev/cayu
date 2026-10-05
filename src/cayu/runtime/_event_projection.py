@@ -48,6 +48,7 @@ from cayu.runtime.public_authority import (
 )
 from cayu.runtime.retry_policy import RetryDecision, RetryDisposition, RetryReason, RetrySuppression
 from cayu.tools import _argument_publication as tool_argument_publication
+from cayu.tools import _terminal_controls as tool_terminal_controls
 from cayu.tools._shared_artifact_results import (
     SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD,
     SHARED_ARTIFACT_RESULT_EVENT_SCHEMA_PATHS,
@@ -6488,7 +6489,7 @@ def _restore_nested_controls(
     if type(original_structured) is dict:
         with suppress(TypeError, ValueError):
             validated_nested_controls.update(
-                tool_results.runtime_terminal_controls(original_structured)
+                tool_terminal_controls.runtime_terminal_controls(original_structured)
             )
         with suppress(TypeError, ValueError):
             validated_nested_controls.update(

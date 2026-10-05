@@ -55,6 +55,7 @@ from cayu.runtime._tool_effect_state import (
     is_command_policy_refusal_terminal,
 )
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
+from cayu.sessions import _staged_tool_terminal_reader as staged_terminal_reader
 from cayu.sessions._assistant_tool_round_publication import validate_tool_exposure_terminal_event
 from cayu.sessions.base import Session, SessionStore, runtime_publication_checkpoint_mutation
 from cayu.tools import _argument_publication as tool_argument_publication
@@ -426,7 +427,7 @@ class _ToolRoundPublicationCoordinator:
         stored = next(
             (
                 item
-                for item in tool_round_recovery.checkpoint_staged_terminals(
+                for item in staged_terminal_reader.checkpoint_staged_terminals(
                     checkpoint,
                     tool_round_identity=self._tool_round_identity,
                 )
@@ -699,7 +700,7 @@ class _ToolRoundPublicationCoordinator:
                 # durable stage keeps its pre-effect reservation fenced.
                 with suppress(BaseException):
                     checkpoint = await self._session_store.load_checkpoint(self._session_id)
-                    stored_stages = tool_round_recovery.checkpoint_staged_terminals(
+                    stored_stages = staged_terminal_reader.checkpoint_staged_terminals(
                         checkpoint,
                         tool_round_identity=self._tool_round_identity,
                     )
@@ -713,7 +714,7 @@ class _ToolRoundPublicationCoordinator:
                         self._record_durable_stage(stored)
                 raise
             checkpoint = await self._session_store.load_checkpoint(self._session_id)
-            stored_stages = tool_round_recovery.checkpoint_staged_terminals(
+            stored_stages = staged_terminal_reader.checkpoint_staged_terminals(
                 checkpoint,
                 tool_round_identity=self._tool_round_identity,
             )
@@ -803,7 +804,7 @@ class _ToolRoundPublicationCoordinator:
                 ),
             )
             checkpoint = await self._session_store.load_checkpoint(self._session_id)
-            stored_stages = tool_round_recovery.checkpoint_staged_terminals(
+            stored_stages = staged_terminal_reader.checkpoint_staged_terminals(
                 checkpoint,
                 tool_round_identity=self._tool_round_identity,
             )
@@ -857,7 +858,7 @@ class _ToolRoundPublicationCoordinator:
             # The projection has changed the checkpoint. Admit that result once,
             # then share its owner between reading and replacing staged terminals.
             updated = copy_durable_json_object(updated, "checkpoint")
-            owner_key, owner = tool_round_recovery._staged_terminal_owner_from_owned_checkpoint(
+            owner_key, owner = staged_terminal_reader._staged_terminal_owner_from_owned_checkpoint(
                 updated, tool_round_identity=identity
             )
             existing_stages = owner.staged_terminals

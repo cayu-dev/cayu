@@ -38,6 +38,8 @@ from cayu.runtime._durable_tool_round import (
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
+from cayu.sessions import _staged_tool_terminal_reader as staged_terminal_reader
+from cayu.tools import _terminal_controls as tool_terminal_controls
 
 if TYPE_CHECKING:
     from cayu.runtime._external_execution_to_wait import _ExternalExecutionToWait
@@ -14976,7 +14978,7 @@ class RecoveryCoordinator:
             *events,
             *(
                 staged.event
-                for staged in tool_round_recovery.staged_terminal_records(pending_round)
+                for staged in staged_terminal_reader.staged_terminal_records(pending_round)
             ),
         ]
         call_ids = [call.tool_call_id for call in pending_round.tool_calls]
@@ -15021,7 +15023,7 @@ class RecoveryCoordinator:
             call_id = event.payload.get("tool_call_id")
             if type(call_id) is not str or call_id not in expected:
                 return False
-            controls = tool_results.runtime_terminal_controls(event.payload)
+            controls = tool_terminal_controls.runtime_terminal_controls(event.payload)
             if (
                 controls.get("outcome_unknown", False)
                 or controls.get("manual_reconciliation_required", False)
@@ -18265,7 +18267,7 @@ class RecoveryCoordinator:
                         *lifecycle_events_for_round,
                         *(
                             item.event
-                            for item in tool_round_recovery.staged_terminal_records(pending)
+                            for item in staged_terminal_reader.staged_terminal_records(pending)
                         ),
                     ]
                     settled_call_ids = {
@@ -20260,7 +20262,7 @@ class RecoveryCoordinator:
             ]
             matching_safe_stages = [
                 item
-                for item in tool_round_recovery.staged_terminal_records(pending_round)
+                for item in staged_terminal_reader.staged_terminal_records(pending_round)
                 if item.tool_call_id == lifecycle.tool_call_id
             ]
         if len(matching_raw_stages) > 1 or len(matching_safe_stages) > 1:
@@ -20497,7 +20499,7 @@ class RecoveryCoordinator:
             if pending_round is None
             else [
                 item
-                for item in tool_round_recovery.staged_terminal_records(pending_round)
+                for item in staged_terminal_reader.staged_terminal_records(pending_round)
                 if item.tool_call_id == lifecycle.tool_call_id
             ]
         )

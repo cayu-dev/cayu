@@ -23,7 +23,7 @@ from tests.provider_traceback_assertions import is_cayu_source_filename
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
 import cayu.runtime._session_engine as session_engine_module
 import cayu.runtime._tool_round_executor as tool_round_executor_module
-import cayu.runtime._tool_round_recovery as tool_round_recovery_module
+import cayu.sessions._staged_tool_terminal_reader as staged_terminal_reader
 import cayu.tools._operation_boundary as operation_boundary_module
 import cayu.tools._runner as runner_module
 from cayu._exception_groups import (
@@ -8662,7 +8662,7 @@ def test_workspace_observation_recovery_authenticates_raw_stage_before_safe_proj
         )
         safe_stage = next(
             item
-            for item in tool_round_recovery_module.staged_terminal_records(pending_round)
+            for item in staged_terminal_reader.staged_terminal_records(pending_round)
             if item.tool_call_id == lifecycle.tool_call_id
         )
         assert lifecycle.tool_outcome_event_digest == workspace_observation_event_digest(

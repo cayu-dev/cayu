@@ -7,6 +7,7 @@ from cayu.approvals.tools import PendingToolCallApproval
 from cayu.runtime import _tool_round_recovery as recovery
 from cayu.runtime.execution_units import new_model_step_identity
 from cayu.sessions import _pending_tool_round as pending_rounds
+from cayu.sessions import _staged_tool_terminal_reader as staged_terminal_reader
 from cayu.sessions._assistant_tool_round_publication import StagedToolCallTerminal
 from cayu.tools.base import ToolResult
 
@@ -50,7 +51,7 @@ def test_quarantine_preserves_nonexecution_evidence(projection, event_type):
             staged_terminals=[StagedToolCallTerminal(tool_call_id="call", event=event)],
         )
         pending_before = pending.model_dump(mode="json")
-        [stage] = recovery.staged_terminal_records(pending)
+        [stage] = staged_terminal_reader.staged_terminal_records(pending)
         projected = stage.event
         assert stage.hooks_state == "finalized"
         assert pending.model_dump(mode="json") == pending_before
