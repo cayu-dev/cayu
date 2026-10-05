@@ -42,6 +42,7 @@ from sse_starlette.sse import EventSourceResponse
 if TYPE_CHECKING:
     from starlette.types import Receive, Scope, Send
 
+from cayu import _application_accounting as accounting
 from cayu._exception_groups import exception_tree_contains
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
@@ -6724,9 +6725,10 @@ def create_router(
             # Each read is incremental in the session store, so a polled page
             # costs the events appended since the last poll, not full histories.
             usage = [
-                cayu_app._expose_session_usage_snapshot(
+                accounting.expose_session_usage_snapshot(
                     session.id,
                     await session_store.read_usage_accounting(EventQuery(session_id=session.id)),
+                    project_session=cayu_app.project_session_id_for_exposure,
                 ).summary
                 for session in result.sessions
             ]
@@ -7131,7 +7133,12 @@ def create_router(
         if_none_match: Annotated[str | None, Header()] = None,
     ):
         try:
-            snapshot = await cayu_app._session_usage_snapshot(session_id)
+            snapshot = await accounting.read_session_usage_snapshot(
+                session_id,
+                session_store=cayu_app.session_store,
+                resolve_session=cayu_app._resolve_public_session_id,
+                project_session=cayu_app.project_session_id_for_exposure,
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
         headers = {"ETag": _session_usage_etag(snapshot), "Cache-Control": "private, no-cache"}

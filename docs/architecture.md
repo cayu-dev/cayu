@@ -235,6 +235,15 @@ registrations and projection hooks and keeps lifecycle tracking around each
 complete operation. The component can be used without constructing an application
 or loading execution controllers.
 
+`_application_accounting.py` owns session and causal-budget usage/cost readback
+with explicit session-store, identity-resolution and identifier-projection
+dependencies. It composes native accounting snapshots, session pagination and
+the existing pricing aggregation. Stores retain incremental reads and sequence
+boundaries; pricing rules retain their existing owner. `CayuApp` keeps the public
+reporting methods and lifecycle tracking. HTTP usage responses compose the same
+snapshot and projection functions, retaining generation/sequence evidence for
+ETags without calling private application reporting helpers.
+
 ```text
 CayuApp
   -> RuntimeEventWriter

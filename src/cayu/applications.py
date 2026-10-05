@@ -19,6 +19,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Self, TypeVar, cast
 from uuid import uuid4
 
+from cayu import _application_accounting as accounting
 from cayu import _application_context_views as context_views
 from cayu import _application_task_creation as task_creation
 from cayu._application_agent_registry import ApplicationAgentRegistry
@@ -482,7 +483,6 @@ from cayu.runtime._session_engine import (
 )
 from cayu.runtime._session_execution_presence import process_owner_id
 from cayu.runtime._session_message_coordinator import SessionMessageCoordinator
-from cayu.runtime._session_queries import query_all_sessions
 from cayu.runtime._session_request_boundary import _validate_resume_request, _validate_run_request
 from cayu.runtime._structured_output_tool_round import _has_structured_output_tool_call
 from cayu.runtime._task_store_operation_boundary import (
@@ -493,7 +493,6 @@ from cayu.runtime._tool_round_executor import (
     ToolRoundExecutor,
     ToolRoundLimitRequest,
 )
-from cayu.runtime._usage_accounting import UsageAccountingSnapshot
 from cayu.runtime._work_attempt_coordinator import WorkAttemptCoordinator
 from cayu.runtime._work_attempt_invocation import (
     WorkAttemptRecoveryOwnership,
@@ -626,7 +625,6 @@ from cayu.sessions.base import (
     Session,
     SessionMessageActionResult,
     SessionMessageInspection,
-    SessionOrder,
     SessionQuery,
     SessionRunFenced,
     SessionStatus,
@@ -7900,97 +7898,29 @@ class CayuApp:
 
     @_tracked_entrance
     async def get_session_usage(self, session_id: str) -> SessionUsageSummary:
-        return (await self._session_usage_snapshot(session_id)).summary
-
-    async def _session_usage_snapshot(self, session_id: str) -> UsageAccountingSnapshot:
-        """Return exposed session usage with its generation and accounted sequence."""
-        session_id = await self._resolve_public_session_id(
-            require_clean_nonblank(session_id, "session_id")
-        )
-        session = await self.session_store.load(session_id)
-        if session is None:
-            raise KeyError(f"Session not found: {session_id}") from None
-        return self._expose_session_usage_snapshot(
+        operation = accounting.read_session_usage_snapshot(
             session_id,
-            await self.session_store.read_usage_accounting(EventQuery(session_id=session_id)),
+            session_store=self.session_store,
+            resolve_session=self._resolve_public_session_id,
+            project_session=self.project_session_id_for_exposure,
         )
-
-    def _expose_session_usage_snapshot(
-        self, session_id: str, snapshot: UsageAccountingSnapshot
-    ) -> UsageAccountingSnapshot:
-        summary = snapshot.summary.model_copy(
-            update={"session_id": self.project_session_id_for_exposure(session_id)},
-            deep=True,
-        )
-        return snapshot.model_copy(update={"summary": summary})
+        del session_id
+        return (await operation).summary
 
     @_tracked_entrance
     async def get_causal_budget_usage(
         self,
         causal_budget_id: str,
     ) -> CausalBudgetUsageSummary:
-        causal_budget_id = await self._resolve_public_causal_budget_id(causal_budget_id)
-        sessions = await self._list_all_sessions(
-            SessionQuery(
-                causal_budget_id=causal_budget_id,
-                order_by=SessionOrder.CREATED_AT_ASC,
-            )
-        )
-        if not sessions:
-            raise KeyError("Causal budget not found") from None
-        session_ids = list(dict.fromkeys(session.id for session in sessions))
-        snapshot = await self.session_store.read_usage_accounting(
-            EventQuery(
-                causal_budget_id=causal_budget_id,
-                session_ids=tuple(session_ids),
-            ),
-            by_session=True,
-        )
-        per_session = {row.session_id: row for row in snapshot.session_summaries}
-        total = snapshot.summary
-        summary = CausalBudgetUsageSummary(
-            causal_budget_id=causal_budget_id,
-            session_ids=session_ids,
-            session_count=len(session_ids),
-            model_steps=total.model_steps,
-            unmeasured_model_attempts=total.unmeasured_model_attempts,
-            tool_calls=total.tool_calls,
-            provider_names=total.provider_names,
-            models=total.models,
-            usage=total.usage,
-            session_summaries=tuple(
-                per_session.get(session_id, SessionUsageSummary(session_id=session_id))
-                for session_id in session_ids
-            ),
-        )
-        public_session_ids = [
-            self.project_session_id_for_exposure(session_id) for session_id in summary.session_ids
-        ]
-        public_causal_budget_id = self.project_causal_budget_id_for_exposure(
+        operation = accounting.read_causal_budget_usage(
             causal_budget_id,
-            session_ids=(session.id for session in sessions),
+            session_store=self.session_store,
+            resolve_budget=self._resolve_public_causal_budget_id,
+            project_session=self.project_session_id_for_exposure,
+            project_budget=self.project_causal_budget_id_for_exposure,
         )
-        return summary.model_copy(
-            update={
-                "causal_budget_id": public_causal_budget_id,
-                "session_ids": public_session_ids,
-                "session_summaries": tuple(
-                    session_summary.model_copy(
-                        update={
-                            "session_id": self.project_session_id_for_exposure(
-                                session_summary.session_id
-                            )
-                        },
-                        deep=True,
-                    )
-                    for session_summary in summary.session_summaries
-                ),
-            },
-            deep=True,
-        )
-
-    async def _list_all_sessions(self, query: SessionQuery) -> list[Session]:
-        return await query_all_sessions(self.session_store, query)
+        del causal_budget_id
+        return await operation
 
     @_admitted_entrance
     async def run_event_watchers(
@@ -8164,25 +8094,16 @@ class CayuApp:
         *,
         currency: str = "USD",
     ) -> SessionCostSummary:
-        session_id = await self._resolve_public_session_id(
-            require_clean_nonblank(session_id, "session_id")
-        )
-        session = await self.session_store.load(session_id)
-        if session is None:
-            raise KeyError(f"Session not found: {session_id}") from None
-        snapshot = await self.session_store.read_cost_accounting(
-            EventQuery(session_id=session_id),
+        operation = accounting.read_session_cost(
+            session_id,
             pricing,
             currency=currency,
-            details=True,
+            session_store=self.session_store,
+            resolve_session=self._resolve_public_session_id,
+            project_session=self.project_session_id_for_exposure,
         )
-        summary = snapshot.details
-        if summary is None:
-            raise RuntimeError("Cost accounting store omitted requested details.")
-        return summary.model_copy(
-            update={"session_id": self.project_session_id_for_exposure(session_id)},
-            deep=True,
-        )
+        del session_id, pricing, currency
+        return await operation
 
     @_tracked_entrance
     async def get_causal_budget_cost(
@@ -8192,51 +8113,17 @@ class CayuApp:
         *,
         currency: str = "USD",
     ) -> CausalBudgetCostSummary:
-        causal_budget_id = await self._resolve_public_causal_budget_id(causal_budget_id)
-        sessions = await self._list_all_sessions(
-            SessionQuery(
-                causal_budget_id=causal_budget_id,
-                order_by=SessionOrder.CREATED_AT_ASC,
-            )
-        )
-        if not sessions:
-            raise KeyError("Causal budget not found") from None
-        from cayu.runtime._cost_accounting import causal_cost_summary
-
-        session_ids = list(dict.fromkeys(session.id for session in sessions))
-        snapshot = await self.session_store.read_cost_accounting(
-            EventQuery(causal_budget_id=causal_budget_id, session_ids=tuple(session_ids)),
+        operation = accounting.read_causal_budget_cost(
+            causal_budget_id,
             pricing,
             currency=currency,
-            details=True,
-            by_session=True,
+            session_store=self.session_store,
+            resolve_budget=self._resolve_public_causal_budget_id,
+            project_session=self.project_session_id_for_exposure,
+            project_budget=self.project_causal_budget_id_for_exposure,
         )
-        summary = causal_cost_summary(snapshot, causal_budget_id, session_ids)
-        public_causal_budget_id = self.project_causal_budget_id_for_exposure(
-            causal_budget_id,
-            session_ids=(session.id for session in sessions),
-        )
-        return summary.model_copy(
-            update={
-                "causal_budget_id": public_causal_budget_id,
-                "session_ids": [
-                    self.project_session_id_for_exposure(session_id)
-                    for session_id in summary.session_ids
-                ],
-                "session_costs": tuple(
-                    session_cost.model_copy(
-                        update={
-                            "session_id": self.project_session_id_for_exposure(
-                                session_cost.session_id
-                            )
-                        },
-                        deep=True,
-                    )
-                    for session_cost in summary.session_costs
-                ),
-            },
-            deep=True,
-        )
+        del causal_budget_id, pricing, currency
+        return await operation
 
     @_tracked_entrance
     async def emit_hook_event(

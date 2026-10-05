@@ -44118,5 +44118,21 @@
     "tests/artifacts/test_aws_s3.py::test_s3_read_cancelled_while_fetching_closes_the_body_before_cancellation[read_bytes-/metadata.json]": 0.05936612491495907,
     "tests/artifacts/test_aws_s3.py::test_s3_read_cancelled_while_fetching_closes_the_body_before_cancellation[read_range-/content]": 0.05934899998828769,
     "tests/core/test_remaining_owners_shutdown.py::test_the_session_operations_step_waits_for_detached_store_work": 0.20559370890259743,
-    "tests/core/test_remaining_owners_shutdown.py::test_an_environment_drain_that_settles_as_its_budget_runs_out_reports_settled": 0.12540070805698633
+    "tests/core/test_remaining_owners_shutdown.py::test_an_environment_drain_that_settles_as_its_budget_runs_out_reports_settled": 0.12540070805698633,
+    "tests/core/test_application_accounting.py::test_application_tracks_cancelled_accounting_until_store_settles[get_causal_budget_cost]": 0.10022650001337752,
+    "tests/core/test_application_accounting.py::test_application_tracks_cancelled_accounting_until_store_settles[get_causal_budget_usage]": 0.11069104199123103,
+    "tests/core/test_application_accounting.py::test_application_tracks_cancelled_accounting_until_store_settles[get_session_cost]": 0.10575183399487287,
+    "tests/core/test_application_accounting.py::test_application_tracks_cancelled_accounting_until_store_settles[get_session_usage]": 0.12331754200567957,
+    "tests/core/test_application_accounting.py::test_rejected_reports_do_not_expose_dependency_representations[get_causal_budget_cost-False]": 0.01858387498941738,
+    "tests/core/test_application_accounting.py::test_rejected_reports_do_not_expose_dependency_representations[get_causal_budget_cost-True]": 0.01804520798032172,
+    "tests/core/test_application_accounting.py::test_rejected_reports_do_not_expose_dependency_representations[get_causal_budget_usage-False]": 0.016783582992502488,
+    "tests/core/test_application_accounting.py::test_rejected_reports_do_not_expose_dependency_representations[get_causal_budget_usage-True]": 0.016326084005413577,
+    "tests/core/test_application_accounting.py::test_rejected_reports_do_not_expose_dependency_representations[get_session_cost-False]": 0.015793250990100205,
+    "tests/core/test_application_accounting.py::test_rejected_reports_do_not_expose_dependency_representations[get_session_cost-True]": 0.015897334000328556,
+    "tests/core/test_application_accounting.py::test_rejected_reports_do_not_expose_dependency_representations[get_session_usage-False]": 0.16230275000270922,
+    "tests/core/test_application_accounting.py::test_rejected_reports_do_not_expose_dependency_representations[get_session_usage-True]": 0.0169672920164885,
+    "tests/core/test_application_accounting.py::test_reporting_imports_without_application_or_execution_controllers": 1.3176609580114018,
+    "tests/core/test_application_accounting.py::test_reports_compose_without_application_and_keep_native_reads[memory]": 0.04303724999772385,
+    "tests/core/test_application_accounting.py::test_reports_compose_without_application_and_keep_native_reads[postgres]": 0.5902694160031388,
+    "tests/core/test_application_accounting.py::test_reports_compose_without_application_and_keep_native_reads[sqlite]": 0.2772559160075616
 }
