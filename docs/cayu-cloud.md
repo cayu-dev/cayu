@@ -25,7 +25,7 @@ cayu cloud service status --application my-agent
 - `init` and `deploy` for local project setup and publication;
 - `deployment logs|status|timeline|wait|promote` and `rollback` for immutable releases;
 - `runtimes list|status` for retained runtime artifacts;
-- `service destroy|logs|restart|sleep|status|wake` for Agent infrastructure;
+- `service credentials|destroy|logs|restart|sleep|status|wake` for Agent infrastructure;
 - `env list|set|unset` for Agent-owned configuration; and
 - `evidence list|show|verify` for local content-free command records.
 
@@ -315,6 +315,39 @@ operational handoffs, and automation:
 cayu cloud context use /private/path/cloud-context.json
 CAYU_CLOUD_API_KEY_FILE=/private/path/key cayu cloud doctor
 ```
+
+## Agent operator credentials
+
+Cayu Cloud gives every Agent its own login for its `/cayu/` control plane and injects it
+into the web process, worker, and schedules as `CAYU_OPERATOR_USERNAME` and
+`CAYU_OPERATOR_PASSWORD`. Read it with:
+
+```console
+cayu cloud service credentials --application my-agent
+```
+
+```json
+{
+  "ok": true,
+  "operation": "service.credentials",
+  "result": {
+    "env": {"password": "CAYU_OPERATOR_PASSWORD", "username": "CAYU_OPERATOR_USERNAME"},
+    "password": "...",
+    "username": "operator"
+  }
+}
+```
+
+The output contains a live credential. It is printed to standard output only: the command
+writes no local evidence record, and nothing else stores it. Only the Organization that owns
+the Agent can read it.
+
+An Agent that Cayu Cloud has not published since it started issuing these credentials exits
+`2` with code `operator_credentials_not_provisioned`; deploy it again and the next
+publication creates them. A Cayu Cloud that predates per-Agent credentials exits `2` with
+category `operator_credentials_unsupported`. To use a different login, set the same names
+with `cayu cloud env set` (the password as a `--secret`); Agent values win over Cloud's.
+The older environment-wide `AUTH_USER`/`AUTH_PASS` pair Cloud also injects is deprecated.
 
 ## Local deploy check
 

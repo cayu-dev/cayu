@@ -43,6 +43,10 @@ _SAFE_API_ERROR_DETAILS = {
     (409, "idempotency_conflict"): (
         "The idempotency key was already used for a different request."
     ),
+    (409, "operator_credentials_not_provisioned"): (
+        "The Agent has no operator credentials yet. Cayu Cloud creates them when it next "
+        "publishes the Agent; deploy it again with `cayu cloud deploy`."
+    ),
     (503, "organization_directory_unavailable"): (
         "Administrator access can't be confirmed right now; nothing changed. Run the same "
         "command again."

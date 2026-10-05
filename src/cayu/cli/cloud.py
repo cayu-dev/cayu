@@ -638,6 +638,10 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     )
     service_commands = service.add_subparsers(dest="service_command", required=True)
     service_descriptions = {
+        "credentials": (
+            "Show the Agent's own /cayu/ operator username and password. The output is a "
+            "credential: keep it out of logs and shared terminals."
+        ),
         "destroy": "Remove the Agent services and schedules but retain its releases.",
         "logs": "Read recent infrastructure logs from the Agent service.",
         "restart": "Restart the Agent service on its selected immutable release.",
@@ -1479,6 +1483,8 @@ def _service(
         result = client.request("POST", f"{path}/{action}")
     elif action == "logs":
         result = client.request("GET", f"{path}/logs")
+    elif action == "credentials":
+        result = _operator_credentials(client, application_id=application_id)
     else:
         result = client.request("DELETE", path)
         result_status = None if not result else _service_status(result)
@@ -1497,6 +1503,39 @@ def _service(
                 result = client.request("GET", path)
                 result_status = _service_status(result)
     return {"operation": f"service.{action}", "result": result}
+
+
+def _operator_credentials(client: CloudApiClient, *, application_id: str) -> dict[str, Any]:
+    """The Agent's per-Agent `/cayu/` login; printed to stdout only, never recorded."""
+
+    try:
+        response = client.request("GET", f"/v1/applications/{application_id}/operator-credentials")
+    except CloudApiError as exc:
+        # The Agent was just resolved, so a 404 here means a Cloud without this endpoint.
+        if exc.status_code == 404:
+            raise CloudCommandError(
+                "operator_credentials_unsupported",
+                "This Cayu Cloud does not support per-Agent operator credentials yet.",
+            ) from None
+        raise
+    username = response.get("username")
+    password = response.get("password")
+    environment = response.get("env")
+    if (
+        not isinstance(username, str)
+        or not username
+        or not isinstance(password, str)
+        or not password
+        or not isinstance(environment, dict)
+        or not isinstance(environment.get("username"), str)
+        or not isinstance(environment.get("password"), str)
+    ):
+        raise CloudApiError("api_response_invalid", "Operator credentials response is invalid.")
+    return {
+        "env": {"password": environment["password"], "username": environment["username"]},
+        "password": password,
+        "username": username,
+    }
 
 
 def _applications(
