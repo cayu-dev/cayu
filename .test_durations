@@ -1,4 +1,12 @@
 {
+    "tests/core/test_application_environment_registry.py::test_environment_registration_keeps_public_callsite_provenance[concrete]": 1.2,
+    "tests/core/test_application_environment_registry.py::test_environment_registration_keeps_public_callsite_provenance[factory]": 0.001,
+    "tests/core/test_application_environment_registry.py::test_environment_registry_composes_without_application_controllers": 2.526,
+    "tests/core/test_application_environment_registry.py::test_environment_registry_rejects_closure_conflicts_before_publication[concrete]": 0.035,
+    "tests/core/test_application_environment_registry.py::test_environment_registry_rejects_closure_conflicts_before_publication[factory]": 0.022,
+    "tests/core/test_application_environment_registry.py::test_environment_registry_requires_explicit_default_and_deduplicates_stores[concrete]": 0.014,
+    "tests/core/test_application_environment_registry.py::test_environment_registry_requires_explicit_default_and_deduplicates_stores[factory]": 0.014,
+    "tests/core/test_application_environment_registry.py::test_environment_registry_snapshots_factory_declarations_and_public_metadata": 0.003,
   "tests/core/test_knowledge_retrieval_results.py::test_retrieval_chunk_limit_validation_precedes_empty_input[max_bytes--1]": 0.000194708991330117,
   "tests/core/test_knowledge_retrieval_results.py::test_retrieval_chunk_limit_validation_precedes_empty_input[max_bytes-5]": 0.0001753329997882247,
   "tests/core/test_knowledge_retrieval_results.py::test_retrieval_chunk_limit_validation_precedes_empty_input[max_bytes-False]": 0.00018666600226424634,

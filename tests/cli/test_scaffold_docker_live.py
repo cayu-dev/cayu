@@ -231,7 +231,7 @@ def test_built_wheel_generated_docker_path_fails_repairs_passes_and_copies_back(
             task_store=InMemoryTaskStore(),
         )
 
-    registered_environment = app._environments["coding"]
+    registered_environment = app._environment_registry.registrations["coding"]
     factory = registered_environment.factory
     assert isinstance(factory, DockerCodingEnvironmentFactory)
     assert factory.docker_path == docker

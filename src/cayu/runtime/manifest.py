@@ -509,7 +509,7 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
     )
     environments = tuple(
         _describe_environment(app, name=name, registration=registration, project_root=root)
-        for name, registration in sorted(app._environments.items())
+        for name, registration in sorted(app._environment_registry.registrations.items())
     )
     stores = StoreManifest(
         session=_type_name(app.session_store),
@@ -521,7 +521,7 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
     )
     defaults = ApplicationDefaultsManifest(
         provider=app._provider_registry.default_name,
-        environment=app._default_environment_name,
+        environment=app._environment_registry.default_name,
     )
     runtime = RuntimeManifest(
         configuration=RuntimeConfigurationManifest(
@@ -826,7 +826,7 @@ def _describe_environment(
     described_object = registration.factory or environment
     return EnvironmentManifest(
         name=name,
-        is_default=name == app._default_environment_name,
+        is_default=name == app._environment_registry.default_name,
         factory_backed=registration.factory is not None,
         deferred=_factory_defers_materialization(registration.factory),
         workspace=_optional_type_name(environment.workspace),

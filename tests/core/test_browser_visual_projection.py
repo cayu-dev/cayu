@@ -90,7 +90,7 @@ def test_visual_image_projection_authenticates_bytes_and_policy(
             return await _resolved_file_attachments(
                 messages=messages,
                 session=session,
-                registered_environment=app._environments["browser"],
+                registered_environment=app._environment_registry.registrations["browser"],
                 max_file_attachment_bytes=100,
                 max_total_file_attachment_bytes=100,
                 max_file_attachments_per_request=1,

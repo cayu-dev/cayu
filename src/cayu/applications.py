@@ -10,10 +10,9 @@ import mimetypes
 import traceback as traceback_module
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import datetime
 from hashlib import sha256
-from itertools import islice
 from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
@@ -34,6 +33,7 @@ from cayu._application_agent_registry import (
 from cayu._application_agent_registry import (
     _registered_agent_contains_mcp_source as _registered_agent_contains_mcp_source,
 )
+from cayu._application_environment_registry import ApplicationEnvironmentRegistry
 from cayu._application_provider_registry import ApplicationProviderRegistry
 from cayu._application_registration import (
     _copy_registered_tool as _copy_registered_tool,
@@ -46,9 +46,6 @@ from cayu._application_registration import (
 )
 from cayu._application_registration import (
     _validate_agent_spec as _validate_agent_spec,
-)
-from cayu._application_registration import (
-    _validate_environment_spec as _validate_environment_spec,
 )
 from cayu._application_registration import (
     _validate_registered_tool as _validate_registered_tool,
@@ -313,8 +310,7 @@ from cayu.egress.transitions import (
     _drain_parked_egress_authority_allocations,
 )
 from cayu.environments.admission import ExecutionRequirements
-from cayu.environments.base import Environment, EnvironmentSpec, copy_environment
-from cayu.environments.bindings import copy_bound_workspace
+from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.environments.factory import EnvironmentFactory
 from cayu.events import (
     Event,
@@ -519,9 +515,6 @@ from cayu.runtime.event_side_effect_health import (
     PersistedEventSideEffectPage,
     PersistedEventSideEffectQuery,
 )
-from cayu.runtime.execution_identity import (
-    copy_execution_profile_behavior_identity,
-)
 from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicy,
 )
@@ -565,10 +558,7 @@ from cayu.runtime.retry_policy import (
     copy_retry_policy,
 )
 from cayu.runtime.session_closure import (
-    ArtifactSessionClosureStore,
     BudgetSessionClosureStore,
-    KnowledgeSessionClosureStore,
-    SessionClosureCoordinator,
     SessionClosureExport,
     SessionClosureExportIncomplete,
     SessionClosurePolicy,
@@ -982,13 +972,6 @@ def _fork_source_snapshot_from_material(
         checkpoint_projection.clear()
 
 
-@dataclass(frozen=True, slots=True)
-class _ArtifactStoreRegistration:
-    store_id: str
-    store: ArtifactStore
-    fingerprint: str
-
-
 _CAYU_CONFIG_FIELD_OWNERS = {
     "evals.max_concurrency": "cayu.configuration.EvalConfig",
     "run.max_steps": "cayu.configuration.RunDefaults",
@@ -1390,9 +1373,14 @@ class CayuApp:
         if self.task_store is not None:
             owned_store_ids.append(TaskSessionClosureStore(self.task_store))
         owned_store_ids.append(BudgetSessionClosureStore())
-        self._session_closure_external_stores = tuple(owned_store_ids)
         self._secret_redactor = resolved_secret_redactor
-        self._session_closure = self._build_session_closure()
+        self._environment_registry = ApplicationEnvironmentRegistry(
+            session_store=self.session_store,
+            secret_redactor=self._secret_redactor,
+            clock=self._clock,
+            session_closure_stores=tuple(owned_store_ids),
+            knowledge_store=self.knowledge_store,
+        )
         self.knowledge_access_scope = (
             None
             if knowledge_access_scope is None
@@ -1495,11 +1483,8 @@ class CayuApp:
         )
         self._knowledge_publication_scope = KnowledgePublicationScope()
         self._provider_registry = ApplicationProviderRegistry(secret_redactor=self._secret_redactor)
-        self._environments: dict[str, runtime_records.RegisteredEnvironment] = {}
         # Idle-resource releases still running after a drain or close deadline.
         self._idle_resource_releases: dict[str, tuple[bool, asyncio.Task[None]]] = {}
-        self._artifact_store_registrations_by_id: dict[str, _ArtifactStoreRegistration] = {}
-        self._default_environment_name: str | None = None
         if session_execution is not None:
             if type(session_execution) is not SessionExecutionConfig:
                 raise TypeError("session_execution must be SessionExecutionConfig.")
@@ -4603,47 +4588,6 @@ class CayuApp:
 
         return self._secret_redactor.redact_uppercase_text(value)
 
-    def _build_session_closure(
-        self,
-        *,
-        artifact_store_registration: _ArtifactStoreRegistration | None = None,
-    ) -> SessionClosureCoordinator:
-        """Validate prospective closure inventory without publishing registration state."""
-        registrations = dict(getattr(self, "_artifact_store_registrations_by_id", {}))
-        if artifact_store_registration is not None:
-            registrations[artifact_store_registration.store_id] = artifact_store_registration
-        stores = list(self._session_closure_external_stores)
-        # Registrations already deduplicate raw artifact IDs. Closure adapters
-        # use a separate, qualified namespace; never omit a registered store by
-        # comparing its raw ID with an unrelated adapter's identity. The
-        # coordinator rejects genuine duplicate adapter identities below.
-        for registration in registrations.values():
-            stores.append(ArtifactSessionClosureStore(registration.store))
-        if self.knowledge_store is not None:
-            # Inventory shared references before session artifacts are erased.
-            first_artifact = next(
-                (
-                    index
-                    for index, store in enumerate(stores)
-                    if type(store) is ArtifactSessionClosureStore
-                ),
-                len(stores),
-            )
-            stores.insert(
-                first_artifact,
-                KnowledgeSessionClosureStore(
-                    self.knowledge_store,
-                    self.session_store,
-                    tuple(store for store in stores if type(store) is ArtifactSessionClosureStore),
-                ),
-            )
-        return SessionClosureCoordinator(
-            self.session_store,
-            dependent_stores=tuple(stores),
-            clock=self._clock,
-            secret_redactor=self._secret_redactor,
-        )
-
     @_tracked_entrance
     async def inspect_session_closure(
         self,
@@ -4653,7 +4597,9 @@ class CayuApp:
     ):
         """Inspect all explicitly configured Cayu-owned closure stores."""
 
-        manifest = await self._session_closure.inspect(session_id, policy=policy)
+        manifest = await self._environment_registry.session_closure.inspect(
+            session_id, policy=policy
+        )
         return project_closure_manifest(
             manifest,
             redactor=self._secret_redactor,
@@ -4670,7 +4616,7 @@ class CayuApp:
     ) -> SessionClosureReport:
         """Perform a bounded, dependent-first session closure."""
 
-        report = await self._session_closure.erase(
+        report = await self._environment_registry.session_closure.erase(
             session_id,
             policy=policy,
             expected_plan_id=expected_plan_id,
@@ -4689,7 +4635,9 @@ class CayuApp:
         policy: SessionClosurePolicy | None = None,
     ):
         """Validate closure admission before any external cleanup begins."""
-        manifest = await self._session_closure.validate(session_id, policy=policy)
+        manifest = await self._environment_registry.session_closure.validate(
+            session_id, policy=policy
+        )
         return project_closure_manifest(
             manifest,
             redactor=self._secret_redactor,
@@ -4707,7 +4655,7 @@ class CayuApp:
         """Export bounded closure records, requiring opt-in for incomplete diagnostics."""
 
         try:
-            export = await self._session_closure.export(
+            export = await self._environment_registry.session_closure.export(
                 session_id, policy=policy, allow_partial=allow_partial
             )
         except SessionClosureExportIncomplete as exc:
@@ -5687,7 +5635,7 @@ class CayuApp:
             return False
         owned: list[tuple[str, asyncio.Task[None]]] = []
         released = True
-        for name, registration in tuple(self._environments.items()):
+        for name, registration in tuple(self._environment_registry.registrations.items()):
             factory = registration.factory
             if factory is None:
                 continue
@@ -6079,47 +6027,9 @@ class CayuApp:
         *,
         default: bool = False,
     ) -> Environment:
-        if not isinstance(environment, Environment):
-            raise TypeError("Environment registration requires an Environment.")
-        if not isinstance(default, bool):
-            raise TypeError("Environment default flag must be a bool.")
-        stored_environment = copy_environment(environment)
-        stored_spec = _validate_environment_spec(
-            stored_environment.spec,
-            redactor=self._secret_redactor,
+        return self._environment_registry.register(
+            environment, default=default, registration_site=_registration_site()
         )
-        if stored_spec.name in self._environments:
-            raise ValueError(f"Environment already registered: {stored_spec.name}")
-        artifact_store = stored_environment.artifact_store
-        artifact_store_registration = self._validate_artifact_store_registration(artifact_store)
-
-        registration_source, registration_symbol = _registration_site()
-        registered_environment = runtime_records.RegisteredEnvironment(
-            spec=stored_spec,
-            environment=stored_environment,
-            runner_execution_profile_identity=copy_secret_free_execution_profile_behavior_identity(
-                None
-                if stored_environment.runner is None
-                else stored_environment.runner.execution_profile_identity,
-                redactor=self._secret_redactor,
-                field_name="environment.runner.execution_profile_identity",
-            ),
-            registration_source=registration_source,
-            registration_symbol=registration_symbol,
-        )
-        closure = self._session_closure
-        if artifact_store_registration is not None:
-            closure = self._build_session_closure(
-                artifact_store_registration=artifact_store_registration
-            )
-        self._environments[stored_spec.name] = registered_environment
-        if artifact_store_registration is not None:
-            self._artifact_store_registrations_by_id[artifact_store_registration.store_id] = (
-                artifact_store_registration
-            )
-            self._session_closure = closure
-        self._select_default_environment_if_requested(stored_spec.name, default=default)
-        return environment
 
     def register_environment_factory(
         self,
@@ -6129,88 +6039,13 @@ class CayuApp:
         artifact_store: ArtifactStore | None = None,
         default: bool = False,
     ) -> EnvironmentFactory:
-        if not isinstance(spec, EnvironmentSpec):
-            raise TypeError("Environment factory registration requires an EnvironmentSpec.")
-        if not isinstance(factory, EnvironmentFactory):
-            raise TypeError("Environment factory registration requires an EnvironmentFactory.")
-        if not isinstance(default, bool):
-            raise TypeError("Environment factory default flag must be a bool.")
-        stored_spec = _validate_environment_spec(
+        return self._environment_registry.register_factory(
             spec,
-            redactor=self._secret_redactor,
+            factory,
+            artifact_store=artifact_store,
+            default=default,
+            registration_site=_registration_site(),
         )
-        if stored_spec.name in self._environments:
-            raise ValueError(f"Environment already registered: {stored_spec.name}")
-        factory_secret_resolution_scope = factory.secret_resolution_scope
-        if factory_secret_resolution_scope not in ("static", "dynamic"):
-            raise ValueError(
-                "Environment factory secret_resolution_scope must be static or dynamic."
-            )
-        stored_environment = Environment(stored_spec, artifact_store=artifact_store)
-        artifact_store_registration = self._validate_artifact_store_registration(artifact_store)
-
-        registration_source, registration_symbol = _registration_site()
-        registered_environment = runtime_records.RegisteredEnvironment(
-            spec=stored_spec,
-            environment=stored_environment,
-            factory=factory,
-            factory_backed=True,
-            factory_secret_resolution_scope=factory_secret_resolution_scope,
-            factory_execution_profile_identity=copy_secret_free_execution_profile_behavior_identity(
-                factory.execution_profile_identity,
-                redactor=self._secret_redactor,
-                field_name="environment_factory.execution_profile_identity",
-            ),
-            registration_source=registration_source,
-            registration_symbol=registration_symbol,
-        )
-        closure = self._session_closure
-        if artifact_store_registration is not None:
-            closure = self._build_session_closure(
-                artifact_store_registration=artifact_store_registration
-            )
-        self._environments[stored_spec.name] = registered_environment
-        if artifact_store_registration is not None:
-            self._artifact_store_registrations_by_id[artifact_store_registration.store_id] = (
-                artifact_store_registration
-            )
-            self._session_closure = closure
-        self._select_default_environment_if_requested(stored_spec.name, default=default)
-        return factory
-
-    def _validate_artifact_store_registration(
-        self,
-        artifact_store: ArtifactStore | None,
-    ) -> _ArtifactStoreRegistration | None:
-        if artifact_store is None:
-            return None
-        artifact_store_id = require_clean_nonblank(artifact_store.id, "artifact_store.id")
-        artifact_store_id = require_unicode_scalar_text(
-            artifact_store_id,
-            "artifact_store.id",
-        )
-        registered = self._artifact_store_registrations_by_id.get(artifact_store_id)
-        if registered is not None and registered.store is not artifact_store:
-            raise ValueError(
-                "Artifact store id already belongs to a different registered store: "
-                f"{artifact_store_id}"
-            )
-        if registered is not None:
-            return registered
-        return _ArtifactStoreRegistration(
-            store_id=artifact_store_id,
-            store=artifact_store,
-            fingerprint=f"sha256:{sha256(artifact_store_id.encode('utf-8')).hexdigest()}",
-        )
-
-    def _select_default_environment_if_requested(
-        self,
-        environment_name: str,
-        *,
-        default: bool,
-    ) -> None:
-        if default:
-            self._default_environment_name = environment_name
 
     def get_agent(self, name: str) -> runtime_records.RegisteredAgent:
         return self._agent_registry.get_agent(name)
@@ -6394,7 +6229,7 @@ class CayuApp:
 
     def list_environments(self) -> tuple[str, ...]:
         """Return the names of all registered environments (concrete or factory), sorted."""
-        return tuple(sorted(self._environments))
+        return self._environment_registry.names()
 
     def has_registered_artifact_store(self) -> bool:
         """Return whether any registered environment exposes artifact storage.
@@ -6402,13 +6237,11 @@ class CayuApp:
         The registration paths maintain this value, so the check is constant-time
         and does not copy registration metadata or materialize environment factories.
         """
-
-        return bool(self._artifact_store_registrations_by_id)
+        return self._environment_registry.has_registered_artifact_store()
 
     def artifact_store_registration_count(self) -> int:
         """Return the exact registration count without projecting store identities."""
-
-        return len(self._artifact_store_registrations_by_id)
+        return self._environment_registry.artifact_store_registration_count()
 
     def artifact_store_registration_fingerprints(
         self,
@@ -6421,56 +6254,11 @@ class CayuApp:
         accepted at registration. They let protected diagnostics correlate shared
         registrations without returning a local path or application-defined id.
         """
-
-        if type(limit) is not int:
-            raise TypeError("Artifact store fingerprint limit must be an integer.")
-        if limit < 1:
-            raise ValueError("Artifact store fingerprint limit must be positive.")
-        registrations = self._artifact_store_registrations_by_id
-        fingerprints = tuple(
-            registration.fingerprint for registration in islice(registrations.values(), limit)
-        )
-        return fingerprints, len(registrations)
+        return self._environment_registry.artifact_store_registration_fingerprints(limit=limit)
 
     def list_environment_registrations(self) -> tuple[runtime_records.RegisteredEnvironment, ...]:
         """Return registered environment metadata without materializing factories."""
-        registrations: list[runtime_records.RegisteredEnvironment] = []
-        for name in sorted(self._environments):
-            registered_environment = self._environments[name]
-            registrations.append(
-                runtime_records.RegisteredEnvironment(
-                    spec=registered_environment.spec.model_copy(deep=True),
-                    environment=copy_environment(registered_environment.environment),
-                    runner_execution_profile_identity=(
-                        copy_execution_profile_behavior_identity(
-                            registered_environment.runner_execution_profile_identity
-                        )
-                    ),
-                    factory_execution_profile_identity=(
-                        copy_execution_profile_behavior_identity(
-                            registered_environment.factory_execution_profile_identity
-                        )
-                    ),
-                    factory=registered_environment.factory,
-                    factory_backed=registered_environment.factory_backed,
-                    factory_secret_resolution_scope=registered_environment.factory_secret_resolution_scope,
-                    bound_workspace=(
-                        copy_bound_workspace(registered_environment.bound_workspace)
-                        if registered_environment.bound_workspace is not None
-                        else None
-                    ),
-                    binding_payload=copy_json_value(
-                        registered_environment.binding_payload,
-                        "binding_payload",
-                    )
-                    if registered_environment.binding_payload is not None
-                    else None,
-                    registration_source=registered_environment.registration_source,
-                    registration_symbol=registered_environment.registration_symbol,
-                    binding_generation_id=registered_environment.binding_generation_id,
-                )
-            )
-        return tuple(registrations)
+        return self._environment_registry.list_registrations()
 
     def _get_registered_agent(self, name: str) -> runtime_records.RegisteredAgentState:
         return self._agent_registry._get_registered_agent(name)
@@ -6479,35 +6267,10 @@ class CayuApp:
         return self._get_registered_provider(name).provider
 
     def get_environment(self, name: str | None = None) -> runtime_records.RegisteredEnvironment:
-        registered_environment = self._get_registered_environment(name)
-        if registered_environment is None:
-            raise RuntimeError("No environment registered.")
-        if registered_environment.factory is not None:
-            raise RuntimeError(
-                "Environment is factory-backed and is only concrete for a session: "
-                f"{registered_environment.spec.name}"
-            )
-        return runtime_records.RegisteredEnvironment(
-            spec=registered_environment.spec.model_copy(deep=True),
-            environment=copy_environment(registered_environment.environment),
-            runner_execution_profile_identity=copy_execution_profile_behavior_identity(
-                registered_environment.runner_execution_profile_identity
-            ),
-            factory_execution_profile_identity=copy_execution_profile_behavior_identity(
-                registered_environment.factory_execution_profile_identity
-            ),
-            binding_generation_id=registered_environment.binding_generation_id,
-        )
+        return self._environment_registry.get_concrete(name)
 
     def get_environment_factory(self, name: str | None = None) -> EnvironmentFactory:
-        registered_environment = self._get_registered_environment(name)
-        if registered_environment is None:
-            raise RuntimeError("No environment registered.")
-        if registered_environment.factory is None:
-            raise RuntimeError(
-                f"Environment is not factory-backed: {registered_environment.spec.name}"
-            )
-        return registered_environment.factory
+        return self._environment_registry.get_factory(name)
 
     @_tracked_entrance
     async def attach_file(
@@ -6750,16 +6513,7 @@ class CayuApp:
         self,
         name: str | None = None,
     ) -> runtime_records.RegisteredEnvironment | None:
-        if name is not None:
-            environment_name = require_clean_nonblank(name, "environment.name")
-        else:
-            environment_name = self._default_environment_name
-        if environment_name is None:
-            return None
-        try:
-            return self._environments[environment_name]
-        except KeyError as exc:
-            raise KeyError(f"Environment not registered: {environment_name}") from exc
+        return self._environment_registry.get(name)
 
     def _get_registered_environment_for_session(
         self,

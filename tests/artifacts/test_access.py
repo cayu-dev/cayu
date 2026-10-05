@@ -169,7 +169,7 @@ def test_model_attachment_reuse_requires_artifact_classification(tmp_path, backe
                     )
                 ],
                 session=session,
-                registered_environment=app._environments["files"],
+                registered_environment=app._environment_registry.registrations["files"],
                 max_file_attachment_bytes=100,
                 max_total_file_attachment_bytes=100,
                 max_file_attachments_per_request=1,

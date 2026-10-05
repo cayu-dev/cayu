@@ -201,7 +201,18 @@ registry; manifests use its matching rules when describing ambiguous routing.
 Isolated replay installs copied declaration maps with recorded providers while
 preserving admitted identities and the default. The registry composes directly
 with a secret redactor, without importing application or execution controllers.
-Environment registration retains its existing owner.
+
+`ApplicationEnvironmentRegistry` owns environment and factory declarations,
+explicit default selection, artifact-store identities and the session-closure
+inventory built from those declarations. Both registration paths validate the
+prospective closure coordinator before publishing any environment, artifact
+store or default. Shared artifact stores remain deduplicated by identity;
+qualified closure adapter identities and knowledge-before-artifact ordering
+are preserved. Metadata inspection copies declarations without materializing
+factories. The component composes directly with a session store, redactor,
+clock, optional knowledge store and closure adapters. `CayuApp` supplies those
+dependencies and public registration provenance. Runtime materialization,
+idle-resource release and shutdown keep their existing owners.
 
 ```text
 CayuApp

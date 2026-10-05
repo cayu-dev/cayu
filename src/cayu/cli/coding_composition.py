@@ -4297,7 +4297,7 @@ def test_generated_docker_composition_is_finite_trusted_and_factory_backed(
         workspace_root=_repository(tmp_path / "source"),
     )
 
-    registered_environment = app._environments["coding"]
+    registered_environment = app._environment_registry.registrations["coding"]
     assert registered_environment.factory_backed is True
     factory = registered_environment.factory
     assert isinstance(factory, DockerCodingEnvironmentFactory)
@@ -5916,7 +5916,7 @@ def test_coding_execution_identities_fail_closed_and_bind_reviewer_version(
         artifact_store=LocalArtifactStore(tmp_path / "identity-artifacts"),
         knowledge_store=custom_clock_store,
     )
-    assert app._environments["coding"].spec.execution_profile_identity is None
+    assert app._environment_registry.registrations["coding"].spec.execution_profile_identity is None
 
     reviewer = AgentSpec(name="reviewer", model="model")
     first = composition._subagent_tool_identity(

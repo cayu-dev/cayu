@@ -3354,7 +3354,7 @@ def test_invocation_context_preserves_exact_live_authority_references() -> None:
 
     environment = Environment(EnvironmentSpec(name="unexpected-environment"))
     app.register_environment(environment)
-    registered_environment = app._environments[environment.spec.name]
+    registered_environment = app._environment_registry.registrations[environment.spec.name]
     with pytest.raises(ValueError, match="does not permit an environment"):
         context.with_registered_environment(
             registered_environment,

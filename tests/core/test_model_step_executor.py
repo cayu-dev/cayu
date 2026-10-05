@@ -732,7 +732,7 @@ def test_attachment_resolution_fails_open_only_for_prompt_files(
         Environment(EnvironmentSpec(name="local"), artifact_store=store),
         default=True,
     )
-    registered_environment = app._environments["local"]
+    registered_environment = app._environment_registry.registrations["local"]
     session = Session(
         id="sess_resolve",
         agent_name="assistant",

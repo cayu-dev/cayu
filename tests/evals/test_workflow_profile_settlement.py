@@ -28,7 +28,7 @@ def _profile_app():
         ),
         default=True,
     )
-    return app, app._environments["settlement"].workspace_mutation_fence
+    return app, app._environment_registry.registrations["settlement"].workspace_mutation_fence
 
 
 @pytest.mark.parametrize("remaining_seconds", [0.0, 0.05])

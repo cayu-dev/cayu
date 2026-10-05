@@ -1201,8 +1201,8 @@ class _StoreRacingRuntimeApplicationFactory(_CanonicalRuntimeApplicationFactory)
             prepared = await original_prepare(*args, **kwargs)
             prepare_calls += 1
             if prepare_calls == 1:
-                registered = app._environments["intervention"]
-                app._environments["intervention"] = replace(
+                registered = app._environment_registry.registrations["intervention"]
+                app._environment_registry._environments["intervention"] = replace(
                     registered,
                     environment=Environment(
                         registered.environment.spec,

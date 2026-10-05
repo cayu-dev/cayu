@@ -85,7 +85,6 @@ def test_registration_helpers_preserve_legacy_import_and_pickle_identity() -> No
 
     for name in (
         "_validate_agent_spec",
-        "_validate_environment_spec",
         "_validate_registered_tool",
         "_copy_registered_tool",
         "_registered_tool_descriptor",

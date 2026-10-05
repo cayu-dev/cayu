@@ -89,12 +89,12 @@ def test_qualified_adapter_rejection_preserves_registration_state(tmp_path, kind
             Environment(EnvironmentSpec(name="first"), artifact_store=initial),
             default=existing_default,
         )
-        environments = dict(app._environments)
-        artifacts = dict(app._artifact_store_registrations_by_id)
+        environments = dict(app._environment_registry.registrations)
+        artifacts = dict(app._environment_registry._artifact_store_registrations_by_id)
         fingerprints = app.artifact_store_registration_fingerprints(limit=64)
-        coordinator = app._session_closure
+        coordinator = app._environment_registry.session_closure
         inventory = (await app.inspect_session_closure(root)).records
-        default = app._default_environment_name
+        default = app._environment_registry.default_name
 
         def register(store):
             spec = EnvironmentSpec(name="local")
@@ -110,12 +110,12 @@ def test_qualified_adapter_rejection_preserves_registration_state(tmp_path, kind
             register(conflicting)
 
         assert app.list_environments() == ("first",)
-        assert app._environments == environments
-        assert app._artifact_store_registrations_by_id == artifacts
+        assert app._environment_registry.registrations == environments
+        assert app._environment_registry._artifact_store_registrations_by_id == artifacts
         assert app.artifact_store_registration_count() == 1
         assert app.artifact_store_registration_fingerprints(limit=64) == fingerprints
-        assert app._default_environment_name == default
-        assert app._session_closure is coordinator
+        assert app._environment_registry.default_name == default
+        assert app._environment_registry.session_closure is coordinator
         assert (await app.inspect_session_closure(root)).records == inventory
 
         corrected = LocalArtifactStore(tmp_path / "corrected", store_id="corrected")
@@ -123,7 +123,7 @@ def test_qualified_adapter_rejection_preserves_registration_state(tmp_path, kind
         register(corrected)
         assert app.list_environments() == ("first", "local")
         assert app.artifact_store_registration_count() == 2
-        assert app._default_environment_name == "local"
+        assert app._environment_registry.default_name == "local"
         if kind == "concrete":
             assert app.get_environment().spec.name == "local"
         else:

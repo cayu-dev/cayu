@@ -325,7 +325,7 @@ def test_compatible_provenance_cannot_authorize_unavailable_derived_artifact(
             await _resolved_file_attachments(
                 messages=messages,
                 session=session,
-                registered_environment=app._environments["local"],
+                registered_environment=app._environment_registry.registrations["local"],
                 max_file_attachment_bytes=100,
                 max_total_file_attachment_bytes=200,
                 max_file_attachments_per_request=2,

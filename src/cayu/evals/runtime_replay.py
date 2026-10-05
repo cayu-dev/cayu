@@ -1276,7 +1276,10 @@ def _require_candidate_boundary(
         raise _ReplayUnavailable(RuntimeReplayReason.CANDIDATE_AGENT_UNAVAILABLE)
     if provider_name not in app._provider_registry.registrations:
         raise _ReplayUnavailable(RuntimeReplayReason.CANDIDATE_MODEL_TARGET_UNAVAILABLE)
-    if app._default_environment_name is not None or app._environments:
+    if (
+        app._environment_registry.default_name is not None
+        or app._environment_registry.registrations
+    ):
         raise _ReplayUnavailable(RuntimeReplayReason.CANDIDATE_ENVIRONMENT_UNSUPPORTED)
     if app.knowledge_store is not None:
         raise _ReplayUnavailable(RuntimeReplayReason.CANDIDATE_KNOWLEDGE_CONTEXT_UNSUPPORTED)
@@ -1472,7 +1475,6 @@ def _isolated_app(
     isolated._session_engine._execution_profile_process_identity = (
         app._execution_profile_process_identity
     )
-    isolated._default_environment_name = None
     if provider_batches is not None and (
         request_billing_identities is None or completion_billing_identities is None
     ):

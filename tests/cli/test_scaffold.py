@@ -677,7 +677,7 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
             task_store=InMemoryTaskStore(),
         )
 
-    environment = app._environments["coding"]
+    environment = app._environment_registry.registrations["coding"]
     assert environment.factory_backed is True
     assert isinstance(environment.factory, DockerCodingEnvironmentFactory)
     primary = app._agents["docker-coder"]
@@ -1045,7 +1045,7 @@ def test_pinned_sandbox_registers_the_docker_factory_without_git(
             session_store=InMemorySessionStore(),
             task_store=InMemoryTaskStore(),
         )
-        factory = app._environments["sandbox"].factory
+        factory = app._environment_registry.registrations["sandbox"].factory
 
     assert isinstance(factory, DockerCodingEnvironmentFactory)
     assert factory.git_baseline is False
