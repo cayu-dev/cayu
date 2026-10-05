@@ -9,7 +9,9 @@
   `AuthenticatedAccess` dependency, or, through `product_dependency()`, an
   `AuthenticatedProductAccess` dependency that takes the tenant from a verified
   claim. `OidcBearerAuth.from_environment()` reads `CAYU_OIDC_ISSUER` and
-  `CAYU_OIDC_AUDIENCE`. Browser sign-in flows are not included.
+  `CAYU_OIDC_AUDIENCE`, and like `BasicAuth.from_environment()` raises
+  `AuthConfigurationError` when they are missing or unusable. Browser sign-in
+  flows are not included.
 - Projects from `cayu new` can now be deployed with `cayu cloud init` and
   `cayu cloud deploy` and start. Every preset depends on `cayu[postgres,server]`,
   and the `agent` and `coding` presets set `[tool.cayu.serve].auth` to the new

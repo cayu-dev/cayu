@@ -150,9 +150,12 @@ auth = "operator_auth:AUTH"
 
 `from_environment()` reads the issuer URL from `CAYU_OIDC_ISSUER` and the
 expected audience from `CAYU_OIDC_AUDIENCE` (a comma-separated list is
-accepted) when `cayu serve` loads the target. If either is unset or empty, the
+accepted) when `cayu serve` loads the target. If either is unset or empty, or
+the issuer isn't a usable HTTPS URL, it raises `AuthConfigurationError` (a
+`ValueError`) that names the variable and never includes its value, and the
 command exits before it builds the application; it does not fall back to open
-access. Pass other variable names as the first two arguments, and any
+access. `cayu serve --dev` doesn't load the target, so local development needs
+neither variable. Pass other variable names as the first two arguments, and any
 constructor option as a keyword argument.
 
 Each request must send `Authorization: Bearer <JWT>`. The verifier:

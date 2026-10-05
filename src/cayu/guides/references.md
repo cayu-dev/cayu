@@ -266,8 +266,9 @@ inspection run `uv run cayu serve --dev` and open
 `CAYU_OPERATOR_USERNAME` and `CAYU_OPERATOR_PASSWORD` at startup and refuses to
 start without them (on Cayu Cloud, `cayu cloud service credentials --application
 APP` shows them). The target may be any request-to-`AuthContext` dependency, such
-as `BasicAuth.from_environment(...)` with other variables or an OIDC/JWT check
-against your identity provider; it guards operator access to the control plane,
+as `BasicAuth.from_environment(...)` with other variables or, with
+`cayu[oidc]`, `OidcBearerAuth.from_environment()` for bearer tokens from your
+identity provider; it guards operator access to the control plane,
 not end-user product login, which belongs in the service preset's
 `AuthenticatedProductAccess`. Use `mount_cayu(..., path="/cayu")` when an
 existing FastAPI product owns the host server; that mount requires

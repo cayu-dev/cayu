@@ -32,6 +32,7 @@ from jwt.algorithms import ECAlgorithm, RSAAlgorithm
 from cayu.applications import CayuApp
 from cayu.runtime.checks import check_public_service_deployment
 from cayu.server import (
+    AuthConfigurationError,
     AuthContext,
     AuthenticatedAccess,
     AuthenticatedProductAccess,
@@ -937,17 +938,88 @@ def test_from_environment_reads_issuer_and_audiences(rsa_key: rsa.RSAPrivateKey)
     assert auth.audience == ("api://cayu", "other")
     assert auth.tenant_claim == ("org_id",)
 
-    with pytest.raises(ValueError, match="CAYU_OIDC_ISSUER and CAYU_OIDC_AUDIENCE are unset"):
-        OidcBearerAuth.from_environment(environ={})
-    with pytest.raises(ValueError, match="AUD is unset") as raised:
+
+@pytest.mark.parametrize(
+    ("environ", "expected"),
+    [
+        ({}, "CAYU_OIDC_ISSUER and CAYU_OIDC_AUDIENCE are unset or empty"),
+        ({"CAYU_OIDC_AUDIENCE": "api://secret-audience"}, "CAYU_OIDC_ISSUER is unset or empty"),
+        (
+            {"CAYU_OIDC_ISSUER": "https://secret-issuer.example/", "CAYU_OIDC_AUDIENCE": "  "},
+            "CAYU_OIDC_AUDIENCE is unset or empty",
+        ),
+        (
+            {"CAYU_OIDC_ISSUER": "http://secret-issuer.example", "CAYU_OIDC_AUDIENCE": "a"},
+            "CAYU_OIDC_ISSUER cannot be used as the OIDC issuer: `issuer` must be an https:// URL",
+        ),
+        (
+            {
+                "CAYU_OIDC_ISSUER": "https://secret-issuer.example/?tenant=x",
+                "CAYU_OIDC_AUDIENCE": "a",
+            },
+            "CAYU_OIDC_ISSUER cannot be used as the OIDC issuer: `issuer` must not contain a query",
+        ),
+        (
+            {"CAYU_OIDC_ISSUER": "https://secret-issuer.example/", "CAYU_OIDC_AUDIENCE": " , ,"},
+            "CAYU_OIDC_AUDIENCE does not name an audience",
+        ),
+    ],
+)
+def test_from_environment_reports_configuration_errors_without_values(
+    environ: dict[str, str], expected: str
+) -> None:
+    with pytest.raises(AuthConfigurationError) as raised:
+        OidcBearerAuth.from_environment(environ=environ)
+
+    message = str(raised.value)
+    assert expected in message
+    assert "secret-issuer" not in message
+    assert "secret-audience" not in message
+    assert "tenant=x" not in message
+    assert isinstance(raised.value, ValueError)
+    if "unset or empty" in message:
+        assert "does not fall back to open access" in message
+        assert "`cayu serve --dev`" in message
+
+
+def test_from_environment_keeps_value_error_for_programming_errors() -> None:
+    environ = {"ISS": ISSUER, "AUD": AUDIENCE}
+    with pytest.raises(ValueError, match="must differ") as same:
+        OidcBearerAuth.from_environment("ISS", "ISS", environ=environ)
+    with pytest.raises(ValueError, match="environment variable name") as blank:
+        OidcBearerAuth.from_environment(" ", "AUD", environ=environ)
+    with pytest.raises(ValueError, match="max_token_bytes") as option:
+        OidcBearerAuth.from_environment("ISS", "AUD", environ=environ, max_token_bytes=0)
+    for raised in (same, blank, option):
+        assert not isinstance(raised.value, AuthConfigurationError)
+
+
+@pytest.mark.parametrize("issuer", [ISSUER, "http://127.0.0.1:8123"])
+@pytest.mark.parametrize("allow_insecure_loopback", [1, "true", None])
+def test_from_environment_rejects_non_boolean_loopback_option_as_programming_error(
+    issuer: str, allow_insecure_loopback: object
+) -> None:
+    environ = {"CAYU_OIDC_ISSUER": issuer, "CAYU_OIDC_AUDIENCE": AUDIENCE}
+
+    with pytest.raises(ValueError, match="`allow_insecure_loopback` must be a boolean") as raised:
         OidcBearerAuth.from_environment(
-            "ISS", "AUD", environ={"ISS": "https://secret-issuer.example/", "AUD": "  "}
+            environ=environ, allow_insecure_loopback=allow_insecure_loopback
         )
-    assert "secret-issuer" not in str(raised.value)
-    with pytest.raises(ValueError, match="https://"):
-        OidcBearerAuth.from_environment(
-            environ={"CAYU_OIDC_ISSUER": "http://idp.example.com", "CAYU_OIDC_AUDIENCE": "a"}
-        )
+
+    assert type(raised.value) is ValueError
+
+
+def test_from_environment_issuer_check_follows_the_loopback_option() -> None:
+    environ = {"CAYU_OIDC_ISSUER": "http://127.0.0.1:8123", "CAYU_OIDC_AUDIENCE": AUDIENCE}
+    with pytest.raises(AuthConfigurationError, match="CAYU_OIDC_ISSUER cannot be used"):
+        OidcBearerAuth.from_environment(environ=environ)
+
+    auth = OidcBearerAuth.from_environment(environ=environ, allow_insecure_loopback=True)
+    assert auth.issuer == "http://127.0.0.1:8123"
+
+    keys = OidcSigningKeys("http://127.0.0.1:8123", allow_insecure_loopback=True)
+    shared = OidcBearerAuth.from_environment(environ=environ, signing_keys=keys)
+    assert shared.signing_keys is keys
 
 
 def test_shared_signing_keys_serve_separate_policies(rsa_key: rsa.RSAPrivateKey) -> None:

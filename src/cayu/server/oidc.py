@@ -44,6 +44,7 @@ from pydantic import ValidationError
 
 from cayu._validation import copy_bounded_durable_json_value
 from cayu.server.auth import (
+    AuthConfigurationError,
     AuthContext,
     _quote_http_string,
     _require_basic_auth_realm,
@@ -566,9 +567,12 @@ class OidcBearerAuth:
         The issuer variable holds the exact issuer URL; the audience variable
         holds one audience or a comma-separated list. Both are read once, when
         this method is called. A variable that is unset, empty, or
-        whitespace-only raises ``ValueError`` naming it (never its value); there
-        is no fallback to open access. Other keyword arguments go to the
-        constructor. ``environ`` replaces ``os.environ`` as the source.
+        whitespace-only, or that holds an unusable issuer URL or no audience,
+        raises ``AuthConfigurationError`` naming it (never its value); there is
+        no fallback to open access. Invalid arguments to this method are
+        programming errors and still raise ``ValueError``. Other keyword
+        arguments go to the constructor. ``environ`` replaces ``os.environ`` as
+        the source.
         """
 
         names = (
@@ -586,16 +590,38 @@ class OidcBearerAuth:
         ]
         if missing:
             verb = "is" if len(missing) == 1 else "are"
-            raise ValueError(
+            raise AuthConfigurationError(
                 f"OIDC bearer authentication is not configured: {' and '.join(missing)} "
                 f"{verb} unset or empty. Set {names[0]} to the issuer URL and {names[1]} "
                 "to the expected audience before starting the server; it does not fall "
-                "back to open access."
+                "back to open access. For trusted local development, run "
+                "`cayu serve --dev` instead."
             )
         issuer = str(values[0]).strip()
+        signing_keys = options.get("signing_keys")
+        if isinstance(signing_keys, OidcSigningKeys):
+            allow_insecure_loopback = signing_keys.allow_insecure_loopback
+        else:
+            allow_insecure_loopback = options.get("allow_insecure_loopback", False)
+            if type(allow_insecure_loopback) is not bool:
+                raise ValueError("`allow_insecure_loopback` must be a boolean.")
+        try:
+            _require_endpoint_url(
+                issuer,
+                "issuer",
+                allow_insecure_loopback=allow_insecure_loopback,
+                is_issuer=True,
+            )
+        except ValueError as exc:
+            raise AuthConfigurationError(
+                f"{names[0]} cannot be used as the OIDC issuer: {exc}"
+            ) from None
         audiences = [part.strip() for part in str(values[1]).split(",") if part.strip()]
         if not audiences:
-            raise ValueError(f"{names[1]} does not name an audience.")
+            raise AuthConfigurationError(
+                f"{names[1]} does not name an audience. Set it to the expected audience, "
+                "or a comma-separated list of audiences."
+            )
         return cls(
             issuer=issuer,
             audience=audiences[0] if len(audiences) == 1 else audiences,

@@ -159,6 +159,13 @@ def test_the_lock_cloud_installs_from_must_include_the_server_extra(
         ("AUTH = 'not callable'\n", ("failed", ("SERVE_AUTH_TARGET_UNRESOLVABLE",))),
         # Credentials only Cloud has make the target unavailable here, not failed.
         ("import os\nAUTH = os.environ['OIDC_ISSUER_ONLY_ON_CLOUD']\n", ("unavailable", ())),
+        # So does a built-in OIDC target whose variables are set only on Cloud.
+        (
+            "from cayu.server import OidcBearerAuth\n\n"
+            "AUTH = OidcBearerAuth.from_environment('OIDC_ISSUER_ONLY_ON_CLOUD', "
+            "'OIDC_AUDIENCE_ONLY_ON_CLOUD')\n",
+            ("unavailable", ()),
+        ),
     ],
 )
 def test_a_custom_auth_target_must_resolve_to_a_callable(
