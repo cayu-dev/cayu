@@ -3133,7 +3133,10 @@ def copy_request_budget_limits(
     usage of the one model step that is in flight when the read-then-act
     check passes.
     """
-    if type(limits) in (list, tuple) and len(limits) > MAX_REQUEST_BUDGET_LIMITS:
+    if (
+        type(limits) in (list, tuple)
+        and len(cast("list | tuple", limits)) > MAX_REQUEST_BUDGET_LIMITS
+    ):
         raise ValueError(
             f"budget_limits cannot contain more than {MAX_REQUEST_BUDGET_LIMITS} limits."
         )

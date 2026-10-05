@@ -19,8 +19,10 @@ from types import MappingProxyType
 from typing import cast
 
 CASE_ID = "closed-integer-range-v1"
-SEED_BASE_REVISION = "219ebbfb37f09b0a08e9ca98ad4474bf4640c06f"
+_DEFAULT_BASE_REVISION = "219ebbfb37f09b0a08e9ca98ad4474bf4640c06f"
+SEED_BASE_REVISION = _DEFAULT_BASE_REVISION
 ALLOWED_CHANGE_PATHS = ("range_ops.py", "tests/test_range_ops.py")
+CHECK_PATHS = (".",)
 
 SEED_FILES = MappingProxyType(
     {
@@ -52,6 +54,14 @@ testpaths = ["tests"]
 """,
     }
 )
+
+_DEFAULT_BASE_FILES = MappingProxyType(
+    {
+        path: (hashlib.sha256(content.encode()).hexdigest(), len(content.encode()), "100644")
+        for path, content in SEED_FILES.items()
+    }
+)
+BASE_FILES = _DEFAULT_BASE_FILES
 
 # Exhaust the declared finite domain, including degenerate ranges and both sides
 # of every endpoint. Ordering is part of the corpus identity and response contract.
@@ -89,13 +99,25 @@ def check_behavioral_responses(responses: object) -> BehavioralOutcome:
 def corpus_fingerprint() -> str:
     """Pin seeded bytes, permitted edits, ordered inputs and independent answers."""
 
-    material = {
+    material: dict[str, object] = {
         "case_id": CASE_ID,
         "seed_files": dict(SEED_FILES),
         "allowed_change_paths": ALLOWED_CHANGE_PATHS,
         "probes": PROBES,
         "expected_responses": EXPECTED_RESPONSES,
     }
+    # Keep the frozen three-file corpus identity; other exact repository bindings
+    # must not share it, even when their behavioral probes are identical.
+    if (
+        SEED_BASE_REVISION != _DEFAULT_BASE_REVISION
+        or BASE_FILES != _DEFAULT_BASE_FILES
+        or CHECK_PATHS != (".",)
+    ):
+        material["repository_binding"] = {
+            "base_revision": SEED_BASE_REVISION,
+            "base_files": dict(BASE_FILES),
+            "check_paths": CHECK_PATHS,
+        }
     encoded = json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 

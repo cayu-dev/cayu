@@ -82,6 +82,9 @@ def test_host_roles_separate_credentials_and_persist_owners(files, role):
         assert mount["type"] == "bind" and mount["bind"] == {"create_host_path": False}
         assert mount["source"] == target or ":?" in mount["source"]
     assert service["environment"]["CAYU_WORKSPACE_ROOT"] == "/repository"
+    assert service["environment"].get("CAYU_MAINTENANCE_WORKER_OWNER") == (
+        "docker" if role == "coding" else None
+    )
 
 
 def test_database_is_private_persistent_and_explicit(files):

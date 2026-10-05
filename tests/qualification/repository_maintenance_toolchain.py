@@ -17,7 +17,11 @@ from cayu.runners.base import ExecCommand
 from cayu.runners.docker_workload import DockerImageIdentity
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.tools.named_checks import NamedCheck
-from tests.qualification.repository_maintenance_case import SEED_FILES, corpus_fingerprint
+from tests.qualification.repository_maintenance_case import (
+    BASE_FILES,
+    CHECK_PATHS,
+    corpus_fingerprint,
+)
 from tests.qualification.repository_maintenance_probe import (
     PROBE_MODEL_PREVIEW_BYTES,
     PROBE_PROGRAM_PATH,
@@ -30,12 +34,15 @@ from tests.qualification.repository_maintenance_probe import (
 def maintenance_checks() -> tuple[NamedCheck, ...]:
     """Return fixed independent acceptance and project-test declarations."""
 
+    captured = CHECK_PATHS != (".",)
+    ruff_paths = ("--isolated", *CHECK_PATHS) if captured else CHECK_PATHS
+    pytest_options = ("-c", "/dev/null", "--rootdir=.", "-o", "pythonpath=.") if captured else ()
     return (
         NamedCheck(
             name="format",
             description="Verify formatting of the target repository without edits.",
             command=ExecCommand.process(
-                "/opt/cayu-project/.venv/bin/ruff", "format", "--check", "--no-cache", "."
+                "/opt/cayu-project/.venv/bin/ruff", "format", "--check", "--no-cache", *ruff_paths
             ),
             timeout_s=30,
             max_output_bytes=32 * 1024,
@@ -50,7 +57,7 @@ def maintenance_checks() -> tuple[NamedCheck, ...]:
             name="lint",
             description="Run target repository static checks.",
             command=ExecCommand.process(
-                "/opt/cayu-project/.venv/bin/ruff", "check", "--no-cache", "."
+                "/opt/cayu-project/.venv/bin/ruff", "check", "--no-cache", *ruff_paths
             ),
             timeout_s=30,
             max_output_bytes=32 * 1024,
@@ -66,6 +73,7 @@ def maintenance_checks() -> tuple[NamedCheck, ...]:
             command=ExecCommand.process(
                 "/opt/cayu-project/.venv/bin/pytest",
                 "-q",
+                *pytest_options,
                 "-p",
                 "no:cacheprovider",
                 "tests/test_range_ops.py",
@@ -136,11 +144,12 @@ def maintenance_toolchain(
         dependency_inputs=(
             DockerCodingDependencyInput(
                 path="pyproject.toml",
-                content_sha256="sha256:"
-                + sha256(SEED_FILES["pyproject.toml"].encode()).hexdigest(),
-                max_bytes=16 * 1024,
+                content_sha256="sha256:" + BASE_FILES["pyproject.toml"][0],
+                max_bytes=max(16 * 1024, BASE_FILES["pyproject.toml"][1]),
             ),
-        ),
+        )
+        if "pyproject.toml" in BASE_FILES
+        else (),
         command_authorities=tuple(sorted(authorities, key=lambda item: item.selector)),
         admission_probes=(
             DockerCodingAdmissionProbe(

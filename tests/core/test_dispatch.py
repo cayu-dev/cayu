@@ -7482,6 +7482,7 @@ def test_concurrent_workers_claim_distinct_dispatch_tasks(postgres_dsn: str) -> 
                 task_store=tasks,
                 task_type=task_type,
             )
+            submitted = []
             for session_id in ("sess_pg_a", "sess_pg_b"):
                 async for _ in h.app.run(
                     RunRequest(
@@ -7491,11 +7492,14 @@ def test_concurrent_workers_claim_distinct_dispatch_tasks(postgres_dsn: str) -> 
                     )
                 ):
                     pass
-                await h.app.dispatch(_dispatch_request(session_id, f"d_{session_id}"))
+                submitted.append(
+                    await h.app.dispatch(_dispatch_request(session_id, f"d_{session_id}"))
+                )
 
             async def process(worker_id: str):
                 try:
-                    return await h.dispatcher.process_next(h.app, worker_id=worker_id)
+                    handle = await h.dispatcher.process_next(h.app, worker_id=worker_id)
+                    return None if handle is None else handle.status
                 except TaskExecutionSettlementPending as pending:
                     settlement = pending.settlement
                 # Loaded PostgreSQL runners can outlast the bounded observation
@@ -7508,10 +7512,19 @@ def test_concurrent_workers_claim_distinct_dispatch_tasks(postgres_dsn: str) -> 
                             assert pending.settlement is settlement
 
             results = await asyncio.gather(process("worker_a"), process("worker_b"))
-            claimed = [r for r in results if r is not None]
-            assert len(claimed) == 2
-            assert {r.session_id for r in claimed} == {"sess_pg_a", "sess_pg_b"}
-            assert all(r.status == DispatchStatus.COMPLETED for r in claimed)
+            # Settlement retry returns the observed execution status, not a new
+            # DispatchHandle. Read the exact queued tasks for durable identities.
+            assert results == [DispatchStatus.COMPLETED, DispatchStatus.COMPLETED]
+            retained = [
+                await tasks.load_task(handle.metadata["queue_task_id"]) for handle in submitted
+            ]
+            assert all(task is not None for task in retained)
+            assert len({task.id for task in retained}) == 2
+            assert {task.input["dispatch"]["request"]["session_id"] for task in retained} == {
+                "sess_pg_a",
+                "sess_pg_b",
+            }
+            assert all(task.status == TaskStatus.COMPLETED for task in retained)
         finally:
             await tasks.close()
 

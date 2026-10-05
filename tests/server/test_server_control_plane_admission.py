@@ -27,7 +27,7 @@ from cayu.server.routes import (
 from cayu.sessions.base import InMemorySessionStore, SessionStore
 from cayu.storage.migrations import SchemaMode
 
-CONTROL_PLANE_PROMPT_MAX_BYTES = 64 * 1024
+CONTROL_PLANE_PROMPT_MAX_BYTES = 960 * 1024
 CONTROL_PLANE_METADATA_MAX_BYTES = 64 * 1024
 CONTROL_PLANE_METADATA_MAX_MEMBERS = 1024
 CONTROL_PLANE_REQUEST_MAX_BYTES = 1024 * 1024
@@ -303,7 +303,9 @@ def test_control_plane_validation_response_does_not_reflect_rejected_prompt() ->
     )
 
     assert response.status_code == 422
-    assert response.json() == {"detail": "Invalid control-plane request."}
+    assert response.json() == {
+        "detail": f"prompt exceeds the maximum encoded size of {CONTROL_PLANE_PROMPT_MAX_BYTES} bytes."
+    }
     assert response.headers["cache-control"] == "private, no-store"
     assert secret not in response.text
     assert asyncio.run(store.load("invalid-prompt-session")) is None
@@ -351,7 +353,9 @@ def _assert_rejected_control_plane_request_does_not_mutate_store(
         },
     )
     assert response.status_code == 422
-    assert response.json() == {"detail": "Invalid control-plane request."}
+    assert response.json() == {
+        "detail": f"prompt exceeds the maximum encoded size of {CONTROL_PLANE_PROMPT_MAX_BYTES} bytes."
+    }
 
     async def verify() -> None:
         try:

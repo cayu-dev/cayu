@@ -10,6 +10,27 @@ from cayu.tasks.base import TaskQuery, TaskStatus
 from cayu.tasks.worker import run_task_worker
 
 
+async def wait_for_publication(entered, worker, *, deadline):
+    """Observe the barrier within the admitted deadline, exposing early failure."""
+    remaining = deadline.remaining_seconds()
+    assert remaining is not None, "The qualification must have a finite original deadline."
+    waiter = asyncio.create_task(entered.wait())
+    try:
+        done, _ = await asyncio.wait(
+            (waiter, worker), timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+        )
+        if worker in done:
+            # Retain the actual exception/cancellation rather than hiding it
+            # behind a later observation timeout. A normal early exit also fails.
+            await worker
+            raise AssertionError("Coding worker exited before the publication barrier.")
+        assert waiter in done, "Publication was not reached within the original deadline."
+        await waiter
+    finally:
+        waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
+
+
 async def exercise_coding_worker(
     application, task, queued, monkeypatch, *, deadline, reservations, rejected=False
 ):
@@ -50,7 +71,7 @@ async def exercise_coding_worker(
         )
     )
     try:
-        await asyncio.wait_for(entered.wait(), timeout=60)
+        await wait_for_publication(entered, worker, deadline=deadline)
         session = await application.app.session_store.load(task.session_id)
         assert session is not None and session.status is SessionStatus.COMPLETED
         assert session.parent_session_id == task.parent_session_id

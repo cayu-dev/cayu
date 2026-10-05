@@ -1,7 +1,6 @@
 """Named process adapters; Runtime and CLI retain their existing ownership."""
 
 import asyncio
-from uuid import uuid4
 
 from app import AGENT  # ty: ignore[unresolved-import]
 from integrations.maintenance_git_host import configured_git_broker  # ty: ignore[unresolved-import]
@@ -17,6 +16,7 @@ from operations.maintenance_github import (  # ty: ignore[unresolved-import]
 )
 from operations.maintenance_worker import handle_coding_task  # ty: ignore[unresolved-import]
 
+from cayu.guides.coding_host_owner import maintenance_worker_id
 from cayu.tasks.base import TaskQuery
 from cayu.tasks.worker import run_task_worker
 from tests.qualification.repository_maintenance_deployment import bind_maintenance_deployment
@@ -64,7 +64,7 @@ async def _lifetime(deployment, stop, task_type, handler_builder):
             app,
             app.task_store,
             handle,
-            worker_id=f"{task_type}-{uuid4().hex}",
+            worker_id=await maintenance_worker_id(task_type),
             query=TaskQuery(type=task_type),
             stop=stop,
             recover_interrupted_handoffs=False,

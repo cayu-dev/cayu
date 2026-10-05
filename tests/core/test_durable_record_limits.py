@@ -214,14 +214,6 @@ def test_reconstructed_request_metadata_obeys_shared_byte_limit(kind) -> None:
         }
     )
     maximum_metadata_bytes = DURABLE_METADATA_LIMITS.max_bytes
-    if kind == "model_completion":
-        from cayu._validation import canonical_durable_json_bytes
-
-        empty = model.model_validate({**fields, "request_metadata": {}})
-        envelope_bytes = (
-            len(canonical_durable_json_bytes(empty.model_dump(mode="json"), "context")) - 2
-        )
-        maximum_metadata_bytes -= envelope_bytes
     metadata = _metadata_bytes(maximum_metadata_bytes, character="€")
     accepted = model.model_validate({**fields, "request_metadata": metadata})
     assert model.model_validate_json(accepted.model_dump_json()) == accepted
@@ -231,19 +223,20 @@ def test_reconstructed_request_metadata_obeys_shared_byte_limit(kind) -> None:
         model.model_validate_json(json.dumps(persisted, ensure_ascii=False))
     error = extract_durable_value_error(caught.value)
     assert error is not None and error.limit == DURABLE_METADATA_LIMITS.max_bytes
-    assert error.field_name == (
-        "model_completion_recovery_context" if kind == "model_completion" else "request_metadata"
-    )
+    assert error.field_name == "request_metadata"
 
 
-def test_model_recovery_preserves_stricter_metadata_entry_limit() -> None:
+def test_model_recovery_preserves_admitted_metadata_entries() -> None:
     from cayu.runtime._model_step_executor import ModelCompletionRecoveryContext
 
-    assert ModelCompletionRecoveryContext(
-        request_metadata={str(index): None for index in range(256)}
+    request = RunRequest(
+        agent_name="agent",
+        messages=[Message.text("user", "run")],
+        metadata={str(index): None for index in range(257)},
     )
-    with pytest.raises(ValidationError, match="more than 256 entries"):
-        ModelCompletionRecoveryContext(request_metadata={str(index): None for index in range(257)})
+    context = ModelCompletionRecoveryContext(request_metadata=request.metadata)
+    restored = ModelCompletionRecoveryContext.model_validate_json(context.model_dump_json())
+    assert restored.request_metadata == request.metadata
 
 
 @pytest.mark.parametrize("kind", ["execution_profile", "tool_capability"])

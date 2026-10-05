@@ -1,5 +1,6 @@
 """Read-only reserved-task observations, never effect or recovery authority."""
 
+import re
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -49,6 +50,12 @@ def _owner(worker_id, phase):
     # Only the generated roles' opaque IDs are projected. Other owners remain
     # explicitly present without echoing arbitrary application-controlled text.
     prefix = f"maintenance.{phase.value}-"
+    docker_prefix = f"maintenance.{phase.value}:docker:"
+    if worker_id.startswith(docker_prefix) and re.fullmatch(
+        r"[0-9a-f]{64}:[0-9a-f]{64}", worker_id.removeprefix(docker_prefix)
+    ):
+        # Recorded identity, not proof of a live or stopped container generation.
+        return {"kind": "registered_role", "id": worker_id}
     if len(worker_id) == len(prefix) + 32 and worker_id.startswith(prefix):
         suffix = worker_id[len(prefix) :]
         try:

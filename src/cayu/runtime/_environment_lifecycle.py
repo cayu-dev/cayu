@@ -5783,7 +5783,7 @@ class EnvironmentLifecycle:
         session: Session,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment,
-        environment_name: str,
+        environment_name: str | None,
         binding_generation_id: str,
         execution_profile: ExecutionProfileIdentity | None,
         session_start_events: list[Event],

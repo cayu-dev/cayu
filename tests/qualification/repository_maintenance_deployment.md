@@ -28,6 +28,49 @@ unrelated user data. Runtime and broker directories must be writable; only the
 coding role receives a writable source mount. Missing bind paths are errors.
 Keep private files outside these directories and outside all source packages.
 
+### Bind an existing qualification repository
+
+The default generator uses the three-file seed. To qualify the same bounded bug
+inside an existing, explicitly authorized repository, capture its exact clean
+base **before** emitting the application. Do not replace that repository with the
+seed or edit generated constants independently.
+
+```python
+from pathlib import Path
+from tests.qualification.repository_maintenance_application import maintenance_project_files
+from tests.qualification.repository_maintenance_fixture import capture_repository_fixture
+
+# Operator-reviewed inputs, not product-route arguments or delivery permission.
+fixture = capture_repository_fixture(checkout, expected_base=approved_base_sha)
+files = maintenance_project_files(database="postgres", fixture=fixture)
+```
+
+This is a qualification-generator entrance from the reviewed repository; the
+emitted consumer uses installed public Cayu APIs and has no test-suite imports.
+`checkout` is a `Path` to a clean local checkout and `approved_base_sha` is its
+explicitly authorized full commit ID. Capture is read-only and records every
+tracked file's digest, length and executable mode. Both behavioral seed files
+must match the fixed case; other files, including repository-owned workflows,
+remain intact. Symlinks, submodules, dirty or untracked/ignored files and
+oversized manifests are refused. Capture requires exclusive operator custody
+of the checkout; it does not lock against concurrent writers.
+
+The generated application checks that manifest before first execution, binds
+it into the request's corpus/toolchain identity, and requires unrelated files to
+remain unchanged at result verification. Replay uses the original admitted
+request, not a newly captured base. An explicit fixture disables synthetic seed
+materialization: repeated trials need fresh clean checkouts of the same approved
+base. Application dependency builds remain separate from target repository
+files. Git/GitHub delivery still requires its own exact destination configuration
+and approvals; capture does not fetch, push, create a branch or open a PR.
+
+For this optional binding, formatting/lint checks target only the two admitted
+case paths with isolated Ruff configuration; the fixed test uses explicit pytest
+configuration and repository-root imports even without a target `pyproject.toml`.
+The complete 105-response independent probe is unchanged. These check commands
+are frozen in the corpus/toolchain identity before intake, not relaxed after a
+failure. Unrelated legacy formatting is neither repaired nor claimed as passed.
+
 ## Build and record immutable inputs
 
 Emit this project using the reviewed **installed Cayu wheel**. Confirm its

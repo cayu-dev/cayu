@@ -9,6 +9,7 @@ from pathlib import Path
 
 from cayu.cli.scaffold import project_files
 from tests.qualification.repository_maintenance_compose import compose_assets
+from tests.qualification.repository_maintenance_fixture import MaintenanceRepositoryFixture
 from tests.qualification.repository_maintenance_probe import probe_program
 
 _HERE = Path(__file__).parent
@@ -56,15 +57,31 @@ def _specialize_python(
     return ast.unparse(module) + "\n"
 
 
-def maintenance_project_files(*, database: str = "postgres") -> dict[str, str]:
+def maintenance_project_files(
+    *, database: str = "postgres", fixture: MaintenanceRepositoryFixture | None = None
+) -> dict[str, str]:
     """Produce the exact custom consumer; do not build images or create stores."""
 
+    if fixture is not None:
+        if type(fixture) is not MaintenanceRepositoryFixture:
+            raise TypeError("An explicit qualification repository fixture is required.")
+        fixture = MaintenanceRepositoryFixture(fixture.base_revision, fixture.files)
     files = project_files(
         "maintenance-app",
         preset="coding",
         execution="docker",
         coding_toolchain="python",
         with_capabilities=("github-delivery",),
+    )
+    # The local-only qualification double must share production's workspace
+    # bounds. RunnerWorkspace's default is smaller than the coding transfer
+    # contract and would turn checks on larger preserved files into partials.
+    files["tests/test_coding_composition.py"] = _replace_once(
+        files["tests/test_coding_composition.py"],
+        "            python_executable=sys.executable,\n",
+        "            python_executable=sys.executable,\n"
+        "            default_read_limit_bytes=factory.transfer_limits.max_file_bytes,\n"
+        "            default_list_limit=factory.transfer_limits.max_files,\n",
     )
     # This consumer's host-only Git integration accepts native secret refs;
     # the coding composition and its environment never receive these objects.
@@ -208,6 +225,19 @@ def build_maintenance_app() -> CayuApp:
         _HERE / "repository_maintenance_auth.py"
     ).read_text()
     http = (_HERE / "repository_maintenance_http.py").read_text()
+    reconciliation = (_HERE / "repository_maintenance_reconciliation.py").read_text()
+    for original, emitted in (
+        ("identity", "domain.maintenance_identity"),
+        ("request", "domain.maintenance_request"),
+        ("intake", "operations.maintenance_intake"),
+        ("results", "operations.maintenance_results"),
+    ):
+        reconciliation = reconciliation.replace(
+            f"tests.qualification.repository_maintenance_{original}", emitted
+        )
+    files["operations/maintenance_reconciliation.py"] = reconciliation.replace(
+        "  # ty: ignore[unresolved-import]", ""
+    )
     for original, emitted in (
         ("auth", "integrations.maintenance_auth"),
         ("budget", "domain.maintenance_budget"),
@@ -222,6 +252,7 @@ def build_maintenance_app() -> CayuApp:
         ("intake", "operations.maintenance_intake"),
         ("runs", "operations.maintenance_runs"),
         ("results", "operations.maintenance_results"),
+        ("reconciliation", "operations.maintenance_reconciliation"),
     ):
         http = http.replace(f"tests.qualification.repository_maintenance_{original}", emitted)
     files["operations/maintenance_http.py"] = http.replace("  # ty: ignore[unresolved-import]", "")
@@ -524,6 +555,17 @@ async def run_verified_github_delivery(
     files["domain/maintenance_case.py"] = _specialize_python(
         case, remove=("materialize_seed_repository",)
     )
+    if fixture is not None:
+        files["domain/maintenance_case.py"] += (
+            f"\nSEED_BASE_REVISION = {fixture.base_revision!r}\n"
+            f"BASE_FILES = MappingProxyType({{path: (digest, size, mode) "
+            f"for path, digest, size, mode in {fixture.files!r}}})\n"
+            "CHECK_PATHS = ALLOWED_CHANGE_PATHS\n"
+        )
+        files["evals/maintenance_seed.py"] = (
+            "def materialize_seed_repository(destination):\n"
+            '    raise ValueError("Use a clean checkout of the explicitly captured Git base.")\n'
+        )
     probe = (
         (_HERE / "repository_maintenance_probe.py")
         .read_text()
@@ -697,7 +739,15 @@ def _named_checks(profile):
         "from domain.coding_product import CodingProductTask\n"
         "from domain.maintenance_case import SEED_BASE_REVISION\n"
         "from domain.maintenance_request import default_maintenance_settlement\n"
-        "from domain.maintenance_acceptance import MaintenanceAcceptance, verify_maintenance_result\n",
+        "from domain.maintenance_acceptance import (\n"
+        "    MaintenanceAcceptance, verify_maintenance_base, verify_maintenance_result,\n"
+        ")\n",
+    )
+    files["workflows/coding_product.py"] = _replace_once(
+        files["workflows/coding_product.py"],
+        "        else:\n            source_git_baseline = admitted.source.git_baseline\n",
+        "            await verify_maintenance_base(self.source_workspace)\n"
+        "        else:\n            source_git_baseline = admitted.source.git_baseline\n",
     )
     files["workflows/coding_product.py"] = _replace_once(
         files["workflows/coding_product.py"],

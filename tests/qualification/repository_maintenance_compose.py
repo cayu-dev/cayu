@@ -82,6 +82,7 @@ def compose_assets() -> dict[str, str]:
             "env_file": env_files,
             "environment": {
                 "CAYU_WORKSPACE_ROOT": "/repository",
+                **({"CAYU_MAINTENANCE_WORKER_OWNER": "docker"} if role == "coding" else {}),
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "PYTHONUNBUFFERED": "1",
             },

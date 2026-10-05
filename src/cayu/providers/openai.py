@@ -349,7 +349,10 @@ def _openai_message_names_hosted_tool(text: str) -> bool:
 
 
 def _is_openai_hosted_tool_entry(tool: object) -> bool:
-    return isinstance(tool, Mapping) and tool.get("type") in _OPENAI_HOSTED_TOOL_TYPES
+    return (
+        isinstance(tool, Mapping)
+        and cast("Mapping[object, object]", tool).get("type") in _OPENAI_HOSTED_TOOL_TYPES
+    )
 
 
 def openai_hosted_tool_rejection_error(

@@ -84,6 +84,34 @@ validator cannot positively establish quiescence and exact effect evidence, keep
 the task fenced, retain the resources and report the incident as unresolved.
 Do not copy the local test harness's synthetic cleanup evidence into production.
 
+### Settle the original coding task after positive native recovery
+
+The Compose coding role records its Docker container ID and StartedAt generation
+as the native task worker identity. Keep that container inspectable until task
+reconciliation has committed. A missing container, expired lease or killed process
+alone is not proof that its model/tool effects stopped.
+
+After native recovery has durably released the exact coding invocation, inspect
+`GET /operator/runs/{id}/coding/cancellation?tenant={tenant}` using operator
+authentication. This bounded observer requires positive stopped-generation and
+settled maintained-tool evidence. Unknown/custom effects remain fenced. A 409
+means the evidence is not eligible; a 503 means inspection is unavailable.
+Neither response authorizes reset, redispatch or manual state changes.
+
+POST the returned `plan_fingerprint` and one stable `reconciliation_id` to the
+same route. The application revalidates current evidence, then asks the native
+task store to settle the original cancellation. The response contains the native
+`receipt_id` and `coding_task_status: cancelled`, not a successful coding result.
+Retain the exact POST body for acknowledgement-loss replay after restart. Changed
+plan, actor or reconciliation identity is refused. Receipt replay does not require
+recreating a container that was already positively observed before settlement.
+
+Inspect the existing task and cost routes afterward. Cost remains recorded causal
+Runtime evidence, not proof of billing completeness or task success. Final verified
+delivery stays unavailable for cancelled coding. This operation neither disposes
+resources nor releases a new execution: native recovery must supply release and
+effect evidence first. It adds no automatic retry or continuation engine.
+
 ## Restart at pending approval
 
 Stop/restart after Git preparation is durable and before approval. Observe the same

@@ -7,6 +7,89 @@ application image/toolchain, prepared PostgreSQL schemas, shared durable budget,
 configured provider and explicit spending authority. It does not create schemas,
 approve delivery, push Git, open a PR or merge.
 
+## Retain the original workflow failure before building the corpus
+
+A coding session and its enclosing application workflow are different evidence
+roots. Calling `trajectory_from_session` on the coding session does not capture
+the enclosing workflow's verification verdict. For a failure originating in a
+workflow evaluation, retain the original private `EvalRun`, then use its saved
+attempt with `capture_workflow_eval_attempt`. Do not reconstruct a missing attempt
+by running the application again or inventing a trial anchor.
+
+The following composes the existing target and native evaluator. Run it inside
+the original `maintenance_eval_plan` scope, with the same configured stores open.
+`reviewed_instruction` is the exact reviewed input; `report_path` is a new private
+report path. This executes one explicitly authorized original trial. It is not a
+read-only command for an arbitrary old production session.
+
+```python
+from cayu.evals.assertions import FinalOutputMatches
+from cayu.evals.corpus import (
+    EvaluationSourceIdentityV1,
+    FinalOutputEqualsAssertionSpec,
+)
+from cayu.evals.reporting import load_eval_run, write_eval_run_json
+from cayu.evals.runner import EvalCase, EvalSuite, run_workflow_eval_suite
+from cayu.evals.workflow_recovery import (
+    capture_workflow_eval_attempt,
+    score_workflow_eval_capture,
+)
+from cayu.messages import Message
+
+async def capture_original_failure(plan, reviewed_instruction, report_path):
+    target = plan.workflow_target
+    messages = (Message.text("user", reviewed_instruction),)
+    request = target.request_base.model_copy(update={"messages": list(messages)})
+    original = await run_workflow_eval_suite(
+        target,
+        EvalSuite(id="maintenance-coding", cases=[EvalCase(
+            id="inclusive-endpoint",
+            request=request,
+            assertions=[FinalOutputMatches("^verified$")],
+        )]),
+        trials=1, max_concurrency=1, case_timeout_seconds=180,
+        retain_trajectory=True,
+    )
+    # Retain successes and errors too; neither can be relabelled a failed case.
+    write_eval_run_json(original, report_path)
+    if original.status != "failed":
+        raise ValueError("Original trial is not a captured acceptance failure.")
+    saved = load_eval_run(report_path)
+    trial = saved.cases[0].trials[0]
+    capture = await capture_workflow_eval_attempt(
+        target, trial, messages=messages, bounds=target.capture_bounds,
+    )
+    score = await score_workflow_eval_capture(
+        target, capture,
+        (FinalOutputEqualsAssertionSpec(id="independent-verdict", expected="verified"),),
+    )
+    manifest = target.app.describe()
+    source = EvaluationSourceIdentityV1(
+        application_release_id=target.application_release_id,
+        app_manifest_schema_version=manifest.schema_version,
+        app_manifest_fingerprint=manifest.fingerprint,
+        evidence_revision="sha256:" + capture.evidence_sha256,
+    )
+    return capture, score, source
+```
+
+Retain and review the returned capture and score alongside the unchanged original
+report before passing `source` to `maintenance_coding_corpus` below. The source
+identity is diagnostic provenance derived from that capture, not execution or
+recovery authority. Capture and deterministic scoring do not redispatch the
+workflow. A missing or conflicting original attempt is a refusal, not permission
+to synthesize evidence. Use the same frozen corpus for both candidate versions.
+
+This recipe captures the **coding-stage application workflow**, including its
+independent verification outcome. It does not turn the coding-stage target into
+a full delivery evaluation. For complete product qualification, separately run
+the authenticated intake, coding worker, Git preparation/approval/delivery worker,
+GitHub approval/delivery worker and final-result readback. Direct calls to delivery
+components prove component behavior, not completion of those queued application
+tasks or successful public result projection. Controlled external-service fixtures
+can exercise that wiring without creating a real remote PR; label their effects
+and approvals as controlled. Keep delivery optional in the reusable library.
+
 Review the original failure's private source and input before constructing the
 corpus. Use the existing `EvaluationSourceIdentityV1` from that reviewed source;
 do not manufacture a source identity from arbitrary uploaded JSON. Keep raw

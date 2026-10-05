@@ -294,7 +294,9 @@ def _value_end(line: str, start: int) -> int:
             return len(line)
         position = closing + 1
         if closing >= end:
-            end = _WORD.match(line, closing).end()
+            tail = _WORD.match(line, closing)
+            assert tail is not None  # The closing quote itself is a word character.
+            end = tail.end()
     return end
 
 

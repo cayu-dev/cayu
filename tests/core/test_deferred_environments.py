@@ -78,6 +78,45 @@ def _placeholder(runner) -> RunnerWorkspace:
     return RunnerWorkspace(runner, workspace_id="deferred-target", python_executable=sys.executable)
 
 
+@pytest.mark.parametrize("supports_streaming", [False, True])
+def test_deferred_binary_stream_requires_materialized_capability(tmp_path, supports_streaming):
+    import io
+
+    from cayu.runners.base import Runner
+
+    class CommandOnly(Runner):
+        async def exec(self, command, **kwargs):
+            raise AssertionError("Binary execution must not fall back to ordinary exec.")
+
+    concrete = LocalRunner(tmp_path) if supports_streaming else CommandOnly()
+
+    async def materialize(mode):
+        assert mode == "use"
+        return concrete, None
+
+    deferred = DeferredMaterialization(materialize, default_cwd=str(tmp_path))
+
+    async def scenario():
+        output = io.BytesIO()
+        try:
+            command = ExecCommand(argv=[sys.executable, "-c", "print('binary-once')"])
+            if supports_streaming:
+                result = await deferred.runner.exec_stream(command, stdout=output)
+                assert result.exit_code == 0
+                assert output.getvalue() == b"binary-once\n"
+            else:
+                with pytest.raises(RuntimeError, match="does not support binary streams"):
+                    await deferred.runner.exec_stream(command, stdout=output)
+                assert output.getvalue() == b""
+            assert deferred.materialized_runner is concrete
+            assert not output.closed
+        finally:
+            await deferred.runner.close()
+        assert concrete.is_closed
+
+    asyncio.run(scenario())
+
+
 class DeferredLocalFactory(EnvironmentFactory):
     """Deferred factory over local directories: a stand-in for a container."""
 

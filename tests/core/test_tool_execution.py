@@ -333,7 +333,8 @@ def test_builtin_mutating_tools_are_not_parallel_safe() -> None:
     assert DeleteFileTool.spec.effect is ToolEffect.EXTERNAL
     assert WriteFileTool.spec.effect is ToolEffect.EXTERNAL
     assert RememberKnowledgeTool.spec.effect is ToolEffect.EXTERNAL
-    assert ReadFileTool.spec.effect is ToolEffect.EXTERNAL
+    # Native file attachments use content-addressed artifact identities.
+    assert ReadFileTool.spec.effect is ToolEffect.IDEMPOTENT
     assert ListFilesTool.spec.effect is ToolEffect.NONE
     assert ListArtifactsTool.spec.effect is ToolEffect.NONE
     assert SearchKnowledgeTool.spec.effect is ToolEffect.NONE

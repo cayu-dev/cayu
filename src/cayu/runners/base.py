@@ -572,7 +572,7 @@ def _builtin_error_text(error: BaseException) -> str | None:
     formatter = next(
         (namespace["__str__"] for namespace in namespaces if "__str__" in namespace), None
     )
-    if not any(formatter is allowed for allowed in _PLAIN_FIELD_FORMATTERS):
+    if formatter is None or not any(formatter is allowed for allowed in _PLAIN_FIELD_FORMATTERS):
         return None
     args = _BASE_EXCEPTION_ARGS.__get__(error, type(error))
     if type(args) is not tuple or not all(type(arg) in {str, int} for arg in args):

@@ -491,6 +491,24 @@ async def test_public_service_cleanup_without_host_request_in_fresh_process(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+async def test_public_service_rejects_conflicting_native_wait_index(
+    backend, tmp_path, request, monkeypatch
+):
+    await test_public_question_uses_real_assistant_export(
+        backend,
+        tmp_path,
+        request,
+        monkeypatch,
+        temporary_service=True,
+        public_reply=False,
+        post_admission=False,
+        side_session=False,
+        verify_index_integrity=True,
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
 async def test_public_service_requires_native_append_evidence(
     backend, tmp_path, request, monkeypatch
 ):
@@ -633,6 +651,7 @@ async def test_public_question_uses_real_assistant_export(
     maintenance_driver=None,
     question_driver=None,
     delivery_prepared_driver=None,
+    verify_index_integrity=False,
 ):
     if prune_history == "lost_native_ack":
         from cayu.runtime._session_continuation import ContinuationConflict
@@ -1508,6 +1527,30 @@ async def test_public_question_uses_real_assistant_export(
                     assert pending["state"] == "pending"
                 export_policy.pause_peer = False
                 export_policy.revoked = False  # explicit test-policy restoration
+                # The receiving transaction's index authenticates its exact
+                # stored record. A public delivery must refuse a conflicting
+                # index before any append, even when the source is authorized.
+                from cayu.storage import _peer_attempts
+
+                permits_parked = _peer_attempts.permits_parked_delivery_append
+
+                def conflicting_index(request, checkpoint, record, **identity):
+                    from copy import deepcopy
+
+                    from cayu.sessions._session_continuation_store import ROOT_KEY
+
+                    changed = deepcopy(checkpoint)
+                    changed[ROOT_KEY]["entries"][0]["record_sha256"] = "0" * 64
+                    return permits_parked(request, changed, record, **identity)
+
+                if verify_index_integrity:
+                    with monkeypatch.context() as patch:
+                        patch.setattr(
+                            _peer_attempts, "permits_parked_delivery_append", conflicting_index
+                        )
+                        with pytest.raises(CollaborationUnavailable):
+                            await current.deliver_clarification(delivery, context=context)
+                assert await store.read_peer_content_attempt(peer) is None
                 append = current._session_engine.append_peer_content
                 append_calls = 0
 

@@ -22,7 +22,11 @@ from typing import TYPE_CHECKING, Any, BinaryIO, Literal
 from cayu._validation import require_clean_nonblank
 from cayu.environments.bindings import BoundWorkspace, WorkspaceBinding
 from cayu.runners import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, Runner
-from cayu.runners.base import RunnerExecutionAdmissionObserver, RunnerUnavailableError
+from cayu.runners.base import (
+    RunnerBinaryStreamCapability,
+    RunnerExecutionAdmissionObserver,
+    RunnerUnavailableError,
+)
 from cayu.workspaces.revisions import WorkspaceIdentity, WorkspaceRevisionObservation
 
 if TYPE_CHECKING:
@@ -31,8 +35,9 @@ if TYPE_CHECKING:
         ExecutionEnvironmentAuthority,
         ExecutionRequirements,
     )
+    from cayu.environments.bindings import WorkspaceSnapshot
     from cayu.runners import ExecResult
-    from cayu.workspaces import Workspace, WorkspaceSnapshot
+    from cayu.workspaces import Workspace
     from cayu.workspaces.revisions import WorkspaceWriterIsolationEvidence
 
 MaterializationMode = Literal["use", "recover"]
@@ -289,6 +294,7 @@ class DeferredMaterialization:
                 else:
                     # Created for an admission collection whose caller admitted it.
                     binding = created.binding
+                    runner = created.runner
                 if bind:
                     bound = None
                     request = self._bind_request
@@ -479,6 +485,8 @@ class DeferredRunner(Runner):
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ) -> ExecResult:
         target = await self._target()
+        if not isinstance(target, RunnerBinaryStreamCapability):
+            raise RuntimeError("The materialized runner does not support binary streams.")
         return await target.exec_stream(
             command,
             cwd=cwd,

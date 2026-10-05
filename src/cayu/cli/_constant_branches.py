@@ -109,6 +109,8 @@ def _refuse_shared_lines(tree: ast.Module, source: str, edits: Sequence[_Edit]) 
             if not isinstance(block, list):
                 continue
             for first, second in pairwise(block):
+                if not isinstance(first, ast.stmt) or not isinstance(second, ast.stmt):
+                    continue
                 if first.end_lineno == second.lineno:
                     shared.add(second.lineno)
     if not shared:
@@ -226,6 +228,9 @@ def _same_scope_nodes(roots) -> list[ast.AST]:
 def _scope_nodes(scope: ast.AST) -> list[ast.AST]:
     """Return every node evaluated in *scope* itself."""
 
+    assert isinstance(
+        scope, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+    )
     body = scope.body
     return _same_scope_nodes(body if isinstance(body, list) else [body])
 
@@ -274,7 +279,7 @@ def _require_removable(
     problem = _removal_problem(removed, _scope_of(node, parents, tree))
     if problem is not None:
         raise ConstantBranchError(
-            f"Constant branch simplification failed: the dead branch at line {node.lineno} "
+            f"Constant branch simplification failed: the dead branch at line {_position(node, 'lineno')} "
             f"contains {problem}, so removing it would change the code around it. "
             "This is a Cayu scaffold bug; keep such statements out of capability branches."
         )
@@ -377,7 +382,8 @@ class _SafeReads:
         if _deletes(ast.walk(self._tree), name):
             return False
         return any(
-            statement.lineno < top.lineno and name in _unconditional_bindings(statement)
+            statement.lineno < _position(top, "lineno")
+            and name in _unconditional_bindings(statement)
             for statement in self._tree.body
         )
 
@@ -408,6 +414,7 @@ def _scope_locals(tree: ast.Module) -> dict[tuple[str, ...], frozenset[str]]:
 
 
 def _parameters(function: ast.AST) -> frozenset[str]:
+    assert isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
     arguments = function.args
     return frozenset(
         argument.arg
@@ -527,7 +534,7 @@ def _without_newly_unused_imports(
         if len(kept) == len(statement.names):
             continue
         start = text.line_start(statement.lineno)
-        end = text.line_end(statement.end_lineno)
+        end = text.line_end(_position(statement, "end_lineno"))
         if not kept:
             edits.append(_Edit(start, end, ""))
             continue
@@ -585,7 +592,7 @@ def _without_newly_unused_imports(
         edits.append(
             _Edit(
                 text.line_start(statement.lineno),
-                text.line_end(statement.end_lineno),
+                text.line_end(_position(statement, "end_lineno")),
                 f"{text.indent(statement.lineno)}pass\n" if emptied else "",
             )
         )
@@ -683,6 +690,14 @@ def _resolved_truth(node: ast.expr, *, is_safe: Callable[[str], bool] | None) ->
     return None
 
 
+def _position(node: ast.AST, field: str) -> int:
+    """Require the source coordinates supplied by ast.parse for an edited node."""
+    value = getattr(node, field, None)
+    if type(value) is not int:
+        raise ConstantBranchError("Constant branch node has no source position.")
+    return value
+
+
 class _Source:
     def __init__(self, source: str) -> None:
         self.source = source
@@ -702,8 +717,8 @@ class _Source:
 
     def span(self, node: ast.AST) -> tuple[int, int]:
         return (
-            self.index(node.lineno, node.col_offset),
-            self.index(node.end_lineno, node.end_col_offset),
+            self.index(_position(node, "lineno"), _position(node, "col_offset")),
+            self.index(_position(node, "end_lineno"), _position(node, "end_col_offset")),
         )
 
     def segment(self, node: ast.AST) -> str:
@@ -719,7 +734,7 @@ class _Source:
     def header_end_line(self, test: ast.expr) -> int:
         """Return the line holding the ``:`` that ends a compound statement header."""
 
-        index = self.index(test.end_lineno, test.end_col_offset)
+        index = self.index(_position(test, "end_lineno"), _position(test, "end_col_offset"))
         while index < len(self.source):
             character = self.source[index]
             if character == ":":
@@ -814,11 +829,11 @@ def _if_edit(
         )
     indent = text.indent(node.lineno)
     start = text.line_start(node.lineno)
-    end = text.line_end(node.end_lineno)
+    end = text.line_end(_position(node, "end_lineno"))
     is_elif = text.lines[node.lineno - 1].lstrip().startswith("elif")
     if truth:
         first = header_end + 1
-        last = node.body[-1].end_lineno
+        last = _position(node.body[-1], "end_lineno")
         amount = len(text.indent(node.body[0].lineno)) - len(indent)
         replacement = text.dedented(first, last, amount)
         if is_elif:
@@ -841,7 +856,7 @@ def _if_edit(
         return _Edit(start, end, f"{indent}{prefix}{remainder}")
     else_line = next(
         lineno
-        for lineno in range(node.body[-1].end_lineno + 1, alternative.lineno + 1)
+        for lineno in range(_position(node.body[-1], "end_lineno") + 1, alternative.lineno + 1)
         if text.lines[lineno - 1].startswith(f"{indent}else")
     )
     amount = len(text.indent(alternative.lineno)) - len(indent)
@@ -849,12 +864,13 @@ def _if_edit(
         return _Edit(
             start,
             end,
-            f"{indent}else:\n" + text.dedented(else_line + 1, node.orelse[-1].end_lineno, 0),
+            f"{indent}else:\n"
+            + text.dedented(else_line + 1, _position(node.orelse[-1], "end_lineno"), 0),
         )
     return _Edit(
         start,
         end,
-        text.dedented(else_line + 1, node.orelse[-1].end_lineno, amount),
+        text.dedented(else_line + 1, _position(node.orelse[-1], "end_lineno"), amount),
     )
 
 

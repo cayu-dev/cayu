@@ -419,12 +419,60 @@ def test_public_workflow_seals_verifies_and_replays(
     managed_worker,
     workflow_eval,
     restart_approval,
+    repository_fixture=False,
 ):
     """Local binding integration, not proof of Docker isolation or model quality."""
     if managed_worker:
         monkeypatch.setenv("CAYU_MODEL", "maintenance-fixture")
     source = tmp_path / "source"
     materialize_seed_repository(source)
+    if repository_fixture:
+        from tests.qualification.repository_maintenance_fixture import capture_repository_fixture
+
+        (source / "unrelated.bin").write_bytes(bytes(range(256)) * 2200)
+        (source / "unrelated.sh").write_text("#!/bin/sh\nexit 0\n")
+        (source / "unrelated.sh").chmod(0o755)
+        if repository_fixture == "without-project":
+            (source / "pyproject.toml").unlink()
+        local_git(source, "add", "--all")
+        local_git(
+            source,
+            "-c",
+            "user.name=Qualification",
+            "-c",
+            "user.email=q@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "Unrelated base files",
+        )
+        base = local_git(source, "rev-parse", "HEAD")
+        captured = capture_repository_fixture(source, expected_base=base)
+        if repository_fixture == "stale-base":
+            captured = replace(captured, base_revision="0" * 40)
+        if repository_fixture == "stale-manifest":
+            captured = replace(
+                captured,
+                files=tuple(
+                    (p, "0" * 64 if p == "unrelated.bin" else d, s, m)
+                    for p, d, s, m in captured.files
+                ),
+            )
+        if repository_fixture == "stale-size":
+            captured = replace(
+                captured,
+                files=tuple(
+                    (p, d, s + 1 if p == "unrelated.bin" else s, m) for p, d, s, m in captured.files
+                ),
+            )
+        for relative, content in maintenance_project_files(
+            database=backend, fixture=captured
+        ).items():
+            destination = project / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(content)
+        initial_git_state = (local_git(source, "show-ref"), local_git(source, "write-tree"))
     remote = tmp_path / "remote.git"
     if backend == "sqlite":
         local_git(tmp_path, "clone", "--quiet", "--bare", str(source), str(remote))
@@ -495,6 +543,16 @@ def test_public_workflow_seals_verifies_and_replays(
     ]
     provider = ScriptedModelProvider(scripts)
     with project_context(project):
+        if repository_fixture:
+            profile = importlib.import_module(
+                "environments.maintenance_toolchain"
+            ).maintenance_toolchain(
+                image_identity=DockerImageIdentity(
+                    reference="example.invalid/coding@sha256:" + "a" * 64
+                ),
+                architecture="amd64",
+                build_context_sha256="sha256:" + "b" * 64,
+            )
         operations = importlib.import_module("operations.coding")
         app_module = importlib.import_module("app")
         domain = importlib.import_module("domain.coding_product")
@@ -571,6 +629,18 @@ def test_public_workflow_seals_verifies_and_replays(
         )
 
         async def scenario(task=task):
+            if repository_fixture in {"stale-base", "stale-manifest", "stale-size"}:
+                with pytest.raises(ValueError):
+                    await application.run(task)
+                assert not provider.requests
+                assert not runners
+                assert (
+                    local_git(source, "show-ref"),
+                    local_git(source, "write-tree"),
+                ) == initial_git_state
+                assert local_git(source, "status", "--porcelain") == ""
+                assert local_git(remote, "show-ref") == local_git(source, "show-ref")
+                return
             if workflow_eval in {"repeated", "dirty-repeated"}:
                 dirty_first = workflow_eval == "dirty-repeated"
                 await exercise_repeated_coding_eval(
@@ -692,6 +762,20 @@ def test_public_workflow_seals_verifies_and_replays(
                 verified = await application.verify(task, publication)
                 assert verified.result_digest == publication.result_reference.digest
                 assert await application.verify(task, publication) == verified
+                if repository_fixture:
+                    assert publication.candidate.initial_git.head_revision == base
+                    assert (
+                        local_git(source, "show-ref"),
+                        local_git(source, "write-tree"),
+                    ) == initial_git_state
+                    assert (source / "unrelated.bin").read_bytes() == bytes(range(256)) * 2200
+                    assert (source / "unrelated.sh").stat().st_mode & 0o111
+                    (source / "unrelated.bin").write_bytes(b"unauthorized change")
+                    try:
+                        with pytest.raises(acceptance.MaintenanceAcceptanceRejected):
+                            await application.verify(task, publication)
+                    finally:
+                        (source / "unrelated.bin").write_bytes(bytes(range(256)) * 2200)
             assert await application.app.drain_environment_cleanups() is True
             assert runners and all(runner.closed for runner in runners)
 
@@ -712,6 +796,19 @@ def test_public_workflow_seals_verifies_and_replays(
                 await session_store.close()
                 await task_store.close()
                 await application.app.knowledge_store.close()
+                if repository_fixture:
+                    assert local_git(
+                        remote,
+                        "ls-tree",
+                        "refs/heads/cayu/verified-delivery",
+                        "--",
+                        "unrelated.bin",
+                        "unrelated.sh",
+                    ) == local_git(remote, "ls-tree", base, "--", "unrelated.bin", "unrelated.sh")
+                    assert (
+                        local_git(source, "show-ref"),
+                        local_git(source, "write-tree"),
+                    ) == initial_git_state
                 reconstructed, reopened_sessions, reopened_tasks = build_application()
                 try:
                     if managed_worker:

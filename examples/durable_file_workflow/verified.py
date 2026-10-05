@@ -662,7 +662,7 @@ def lose_proposal_acknowledgement(app: CayuApp, *, on_proposal: int) -> None:
         return proposal
 
     # Patching one app instance keeps the fault out of the reusable components.
-    app.submit_work_attempt_proposal = commit_then_lose_reply  # ty: ignore[invalid-assignment]
+    app.submit_work_attempt_proposal = commit_then_lose_reply
 
 
 @dataclass

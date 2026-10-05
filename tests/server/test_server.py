@@ -14286,7 +14286,7 @@ def test_run_stream_failure_emits_terminal_structured_error_frame() -> None:
             ),
             1,
         )
-        raise RuntimeError("run exploded with secret-token " + "x" * 1000)
+        raise RuntimeError("run exploded with secret-token " + "x" * SSE_ERROR_TEXT_MAX_BYTES)
 
     app.run = broken_run
 

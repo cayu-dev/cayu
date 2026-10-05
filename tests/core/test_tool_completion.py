@@ -886,8 +886,9 @@ def test_unconfigured_approval_keeps_checkpoint_read_budget():
         assert events[-1].type == EventType.SESSION_COMPLETED
         assert tool.calls == [{"value": "first"}, {"value": "second"}]
         assert len(provider.requests) == 2
-        # The existing continuation uses 31 reads; disabled completion adds none.
-        assert calls["load_checkpoint"] <= 31
+        # The native continuation now also reads its external-interaction owner
+        # in _run_recovered_session. Disabled tool completion still adds none.
+        assert calls["load_checkpoint"] <= 32
 
     asyncio.run(scenario())
 

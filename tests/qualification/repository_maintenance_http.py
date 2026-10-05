@@ -11,6 +11,7 @@ from operations.maintenance_requests import (  # ty: ignore[unresolved-import]
     capture_accepted_request,
 )
 
+from cayu.coding_products import CodingProductReconstructionRequiredError
 from cayu.server import AuthenticatedAccess, mount_cayu
 from cayu.tasks.base import Task, TaskStatus
 from tests.qualification.repository_maintenance_auth import MaintenanceAccess
@@ -43,6 +44,10 @@ from tests.qualification.repository_maintenance_intake import (
     load_owned_coding_task,
 )
 from tests.qualification.repository_maintenance_operator import inspect_reserved_tasks
+from tests.qualification.repository_maintenance_reconciliation import (
+    inspect_cancellation,
+    reconcile_cancellation,
+)
 from tests.qualification.repository_maintenance_request import bounded_text, encode_request
 from tests.qualification.repository_maintenance_results import MaintenanceResultUnavailable
 from tests.qualification.repository_maintenance_runs import ReservationConflict
@@ -59,6 +64,24 @@ def _unique(pairs):
 
 def _nonfinite(_value):
     raise ValueError
+
+
+def _reconciliation_fields(body):
+    if set(body) != {"plan_fingerprint", "reconciliation_id"}:
+        raise HTTPException(status_code=422, detail="Invalid reconciliation request.")
+    fingerprint, key = body["plan_fingerprint"], body["reconciliation_id"]
+    if (
+        type(fingerprint) is not str
+        or len(fingerprint) != 71
+        or not fingerprint.startswith("sha256:")
+        or any(c not in "0123456789abcdef" for c in fingerprint[7:])
+        or type(key) is not str
+        or not 1 <= len(key) <= 128
+        or key.strip() != key
+        or any(ord(c) < 32 or ord(c) == 127 for c in key)
+    ):
+        raise HTTPException(status_code=422, detail="Invalid reconciliation request.")
+    return fingerprint, key
 
 
 async def _json_body(request):
@@ -229,6 +252,44 @@ def build_maintenance_server(
     async def inspect_tasks(public_id: str, request: Request):
         _actor, identity = await operator_identity(public_id, request)
         return await inspect_reserved_tasks(application.app, identity)
+
+    @server.get("/operator/runs/{public_id}/coding/cancellation")
+    async def inspect_coding_cancellation(public_id: str, request: Request):
+        actor, identity = await operator_identity(public_id, request)
+        try:
+            return await inspect_cancellation(
+                application, reservations, identity, actor_subject=actor.subject
+            )
+        except (ValueError, FileNotFoundError, CodingProductReconstructionRequiredError):
+            raise HTTPException(
+                status_code=409, detail="Cancellation evidence unavailable."
+            ) from None
+        except Exception:
+            raise HTTPException(
+                status_code=503, detail="Cancellation inspection unavailable."
+            ) from None
+
+    @server.post("/operator/runs/{public_id}/coding/cancellation")
+    async def reconcile_coding_cancellation(public_id: str, request: Request):
+        actor, identity = await operator_identity(public_id, request)
+        fingerprint, key = _reconciliation_fields(await _json_body(request))
+        try:
+            return await reconcile_cancellation(
+                application,
+                reservations,
+                identity,
+                actor_subject=actor.subject,
+                plan_fingerprint=fingerprint,
+                reconciliation_id=key,
+            )
+        except (ValueError, FileNotFoundError, CodingProductReconstructionRequiredError):
+            raise HTTPException(
+                status_code=409, detail="Conflicting cancellation evidence."
+            ) from None
+        except Exception:
+            raise HTTPException(
+                status_code=503, detail="Cancellation settlement unavailable."
+            ) from None
 
     @server.get("/operator/runs/{public_id}/delivery")
     async def inspect_delivery(public_id: str, request: Request):

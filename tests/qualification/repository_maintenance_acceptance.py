@@ -18,13 +18,14 @@ from cayu.tasks.contracts import CompletionResultReference, CompletionVerdict, W
 from cayu.workspaces.base import Workspace
 from cayu.workspaces.revisions import (
     WorkspaceRevisionObservation,
+    WorkspaceRevisionObservationLimits,
     WorkspaceRevisionObservationStatus,
     observe_deterministic_workspace,
 )
 from tests.qualification.repository_maintenance_case import (
     ALLOWED_CHANGE_PATHS,
+    BASE_FILES,
     SEED_BASE_REVISION,
-    SEED_FILES,
     BehavioralOutcome,
     corpus_fingerprint,
 )
@@ -35,6 +36,39 @@ from tests.qualification.repository_maintenance_toolchain import maintenance_che
 class MaintenanceAcceptanceRejected(ValueError):
     def __init__(self) -> None:
         super().__init__("Repository-maintenance acceptance evidence is incomplete or conflicting.")
+
+
+async def verify_maintenance_base(workspace: Workspace) -> None:
+    """Verify the complete captured source before first admission, never replay."""
+    observed = await observe_deterministic_workspace(
+        workspace, observer="maintenance-base", limits=WorkspaceRevisionObservationLimits()
+    )
+    if (
+        observed.status is not WorkspaceRevisionObservationStatus.SUPPORTED
+        or observed.path_scope != "complete"
+        or {entry.path for entry in observed.paths} != set(BASE_FILES)
+        or any(
+            entry.kind != "file"
+            or entry.content_sha256 != BASE_FILES[entry.path][0]
+            or entry.worktree_mode != BASE_FILES[entry.path][2]
+            for entry in observed.paths
+        )
+    ):
+        raise MaintenanceAcceptanceRejected()
+    for path, (digest, size, mode) in BASE_FILES.items():
+        read = await workspace.read_bytes(path, max_bytes=size + 1)
+        if (
+            read.truncated
+            or read.total_bytes != size
+            or len(read.content) != size
+            or read.git_mode != mode
+            or sha256(read.content).hexdigest() != digest
+        ):
+            raise MaintenanceAcceptanceRejected()
+    if observed != await observe_deterministic_workspace(
+        workspace, observer="maintenance-base", limits=WorkspaceRevisionObservationLimits()
+    ):
+        raise MaintenanceAcceptanceRejected()
 
 
 @dataclass(frozen=True)
@@ -126,14 +160,17 @@ async def verify_maintenance_result(
             or observation.path_scope != "complete"
             or observation.revision != revision
             or observation.identity.workspace_id != request.source.workspace_id
-            or {item.path for item in observation.paths} != set(SEED_FILES)
+            or {item.path for item in observation.paths} != set(BASE_FILES)
             or any(item.kind != "file" or item.content_sha256 is None for item in observation.paths)
         ):
             raise MaintenanceAcceptanceRejected()
     initial_paths = {item.path: item for item in initial.paths}
     final_paths = {item.path: item for item in final.paths}
-    for path, content in SEED_FILES.items():
-        if initial_paths[path].content_sha256 != sha256(content.encode()).hexdigest():
+    for path, (digest, _size, mode) in BASE_FILES.items():
+        if (
+            initial_paths[path].content_sha256 != digest
+            or initial_paths[path].worktree_mode != mode
+        ):
             raise MaintenanceAcceptanceRejected()
         if path not in ALLOWED_CHANGE_PATHS and final_paths[path] != initial_paths[path]:
             raise MaintenanceAcceptanceRejected()
@@ -182,10 +219,12 @@ async def verify_maintenance_result(
             raise MaintenanceAcceptanceRejected()
         if phase == 0:
             for path, entry in final_paths.items():
-                read = await workspace.read_bytes(path, max_bytes=16 * 1024 + 1)
+                maximum = 16 * 1024 if path in ALLOWED_CHANGE_PATHS else BASE_FILES[path][1]
+                read = await workspace.read_bytes(path, max_bytes=maximum + 1)
                 if (
                     read.truncated
-                    or read.total_bytes > 16 * 1024
+                    or read.total_bytes > maximum
+                    or read.git_mode != entry.worktree_mode
                     or sha256(read.content).hexdigest() != entry.content_sha256
                 ):
                     raise MaintenanceAcceptanceRejected()

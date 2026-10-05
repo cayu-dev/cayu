@@ -25,7 +25,7 @@ import time
 import weakref
 from collections.abc import Sequence
 from contextlib import suppress
-from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar, cast
 from uuid import uuid4
 
 if TYPE_CHECKING:
@@ -222,7 +222,8 @@ class WarmSparePool(Generic[SpareT]):
         # Best effort for applications that never drain or close: at normal
         # interpreter exit, remove this pool's idle spares synchronously when
         # the backend can. A killed process leaves them to a later pool's reap.
-        self._exit_hook = functools.partial(_remove_idle_spares_at_exit, weakref.ref(self))
+        pool_ref = weakref.ref(cast("WarmSparePool[Any]", self))
+        self._exit_hook = functools.partial(_remove_idle_spares_at_exit, pool_ref)
         atexit.register(self._exit_hook)
         # A collected pool has nothing left to remove; drop its exit hook then.
         weakref.finalize(self, atexit.unregister, self._exit_hook).atexit = False

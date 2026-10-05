@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from importlib import import_module
 from itertools import pairwise
 from pathlib import PurePosixPath, PureWindowsPath
-from typing import Protocol
+from typing import Any, Protocol
 
 from cayu._validation import require_nonblank, require_unicode_scalar_text
 from cayu.artifacts._images import (
@@ -3173,7 +3173,13 @@ async def _put_content_addressed_artifact(
     content: bytes,
     *,
     artifact_id: str,
-    **kwargs: object,
+    filename: str,
+    content_type: str | None = None,
+    scope: ArtifactScope = ArtifactScope.SESSION,
+    session_id: str | None = None,
+    agent_name: str | None = None,
+    environment_name: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> ArtifactMetadata:
     """Store at the content-addressed id, or at a fresh id if that id holds other bytes.
 
@@ -3183,10 +3189,23 @@ async def _put_content_addressed_artifact(
     so a transient error never writes a second copy.
     """
 
+    async def put(identity: str | None) -> ArtifactMetadata:
+        return await artifact_store.put_bytes(
+            content,
+            artifact_id=identity,
+            filename=filename,
+            content_type=content_type,
+            scope=scope,
+            session_id=session_id,
+            agent_name=agent_name,
+            environment_name=environment_name,
+            metadata=metadata,
+        )
+
     try:
-        return await artifact_store.put_bytes(content, artifact_id=artifact_id, **kwargs)
+        return await put(artifact_id)
     except ArtifactIdentityConflictError:
-        return await artifact_store.put_bytes(content, **kwargs)
+        return await put(None)
 
 
 def _derivation_key(*, source_hash: str, operation: str, params: str) -> str:

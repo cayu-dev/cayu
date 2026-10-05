@@ -398,12 +398,14 @@ class _SearchEvidenceTool(Tool):
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         del ctx, args
+        from cayu.evals.json_subset import EVAL_TOOL_JSON_MAX_BYTES
+
         return ToolResult(
             content="Search completed.",
             structured={
                 "status": "ok",
                 "count": self.count,
-                **({"payload": "x" * 5000} if self.oversized else {}),
+                **({"payload": "x" * EVAL_TOOL_JSON_MAX_BYTES} if self.oversized else {}),
             },
         )
 

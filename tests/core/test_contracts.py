@@ -3928,6 +3928,8 @@ def test_local_artifact_store_repairs_matching_partial_deterministic_write(tmp_p
 
 
 def test_local_artifact_store_rejects_malformed_partial_metadata(tmp_path):
+    from cayu.artifacts.base import ArtifactIdentityConflictError
+
     store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
     artifact_id = f"art_{'c' * 32}"
     partial = store.root / artifact_id
@@ -3935,7 +3937,7 @@ def test_local_artifact_store_rejects_malformed_partial_metadata(tmp_path):
     (partial / "content").write_bytes(b"retry-safe-content")
     (partial / "metadata.json").write_text("{malformed", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="metadata is not valid JSON"):
+    with pytest.raises(ArtifactIdentityConflictError, match="Incomplete artifact metadata"):
         asyncio.run(
             store.put_bytes(
                 b"retry-safe-content",

@@ -811,7 +811,7 @@ def _factory_defers_materialization(factory: object | None) -> bool:
     if factory is None:
         return False
     try:
-        declared = factory.deferred_materialization  # type: ignore[attr-defined]
+        declared = getattr(factory, "deferred_materialization", None)
     except Exception:
         return False
     return declared is True

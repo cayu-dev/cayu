@@ -16,6 +16,7 @@ from cayu.delivery.git import (
     RemoteGitDeliveryApproval,
     RemoteGitDeliveryError,
     RemoteGitDeliveryLimits,
+    RemoteGitDeliveryReconstructionRequiredError,
     RemoteGitDeliveryRequest,
     RemoteGitDeliveryState,
     RemoteGitRepositoryAuthority,
@@ -27,7 +28,6 @@ from cayu.delivery.git import (
 from cayu.server import ProductPrincipal
 from cayu.tasks.base import TaskQuery, TaskStatus
 from cayu.tasks.worker import run_task_worker
-from tests.qualification.repository_maintenance_case import SEED_BASE_REVISION
 from tests.qualification.repository_maintenance_github_case import exercise_github_delivery
 from tests.qualification.repository_maintenance_restart_case import exercise_approval_restart
 
@@ -67,6 +67,19 @@ def build_journey_http(application, reservations, *, tenant, subject):
     )
 
 
+def changed_destination_request(request: RemoteGitDeliveryRequest) -> RemoteGitDeliveryRequest:
+    """Keep each negative probe separate when trials share the artifact store."""
+    return request.model_copy(
+        update={
+            "delivery_id": f"{request.delivery_id}-changed-destination",
+            "idempotency_key": f"{request.idempotency_key}-changed-destination",
+            "repository": request.repository.model_copy(
+                update={"destination_ref": "refs/heads/cayu/changed-destination"}
+            ),
+        }
+    )
+
+
 async def exercise_local_delivery(
     application,
     task,
@@ -99,6 +112,8 @@ async def exercise_local_delivery(
         )
 
     broker = build_broker()
+    base_files = importlib.import_module("domain.maintenance_case").BASE_FILES
+    file_bounds = [max(16384, entry[1]) for entry in base_files.values()]
     policy = "sha256:" + sha256(b"local-qualification-explicit-human-approval").hexdigest()
     configured = {
         "repository": RemoteGitRepositoryAuthority(
@@ -107,7 +122,7 @@ async def exercise_local_delivery(
             remote_alias="origin",
             remote_identity="fixture-remote",
             base_ref="refs/heads/main",
-            expected_base_commit=SEED_BASE_REVISION,
+            expected_base_commit=publication.candidate.initial_git.head_revision,
             destination_ref="refs/heads/cayu/verified-delivery",
         ).model_dump(mode="json"),
         "commit": RemoteGitCommitAuthority(
@@ -127,7 +142,9 @@ async def exercise_local_delivery(
             redaction_profile_fingerprint=policy,
         ).model_dump(mode="json"),
         "limits": RemoteGitDeliveryLimits(
-            max_paths=3, max_file_bytes=16384, max_total_file_bytes=49152
+            max_paths=len(base_files),
+            max_file_bytes=max(file_bounds),
+            max_total_file_bytes=sum(file_bounds),
         ).model_dump(mode="json"),
     }
     configuration = importlib.import_module("configuration.maintenance")
@@ -199,7 +216,7 @@ async def exercise_local_delivery(
                         == 1
                     )
                 completed = await application.app.task_store.load_task(queued.id)
-                assert completed.status is TaskStatus.COMPLETED
+                assert completed.status is TaskStatus.COMPLETED, completed.error
                 assert completed.worker_id is None and completed.lease_expires_at is None
                 assert completed.result["request_fingerprint"] == native.fingerprint
                 pending = await broker.repository.load_result(
@@ -283,6 +300,7 @@ async def exercise_local_delivery(
         limits=limits,
     )
     refs_before = local_git(remote, "show-ref")
+    commits_before = int(local_git(remote, "rev-list", "--count", "--all"))
     if incorrect_probe:
         rejection = importlib.import_module(
             "domain.maintenance_acceptance"
@@ -314,6 +332,14 @@ async def exercise_local_delivery(
     assert broker.repository is not previous_broker.repository
     reconstructed = await broker.repository.load_prepared(request)
     assert reconstructed == prepared
+    conflicting = request.model_copy(
+        update={
+            "repository": request.repository.model_copy(update={"expected_base_commit": "0" * 40})
+        }
+    )
+    with pytest.raises(RemoteGitDeliveryReconstructionRequiredError, match="conflicts"):
+        await broker.repository.load_prepared(conflicting)
+    assert local_git(remote, "show-ref") == refs_before
     assert await broker.repository.load_result(request, awaiting.result.digest) == awaiting
     prepared = reconstructed
     assert prepared is not None
@@ -337,17 +363,7 @@ async def exercise_local_delivery(
         assert local_git(remote, "show-ref") == refs_before
     finally:
         source_file.write_bytes(approved_bytes)
-    changed_destination = request.model_copy(
-        update={
-            "delivery_id": "changed-destination",
-            "idempotency_key": "changed-destination",
-            "repository": request.repository.model_copy(
-                update={
-                    "destination_ref": "refs/heads/cayu/changed-destination",
-                }
-            ),
-        }
-    )
+    changed_destination = changed_destination_request(request)
     denied = await workflow.run_verified_git_delivery(
         application,
         task,
@@ -424,11 +440,14 @@ async def exercise_local_delivery(
         local_git(remote, "rev-parse", request.repository.destination_ref)
         == delivered.result.next_commit
     )
-    assert local_git(remote, "rev-parse", "refs/heads/main") == SEED_BASE_REVISION
+    assert (
+        local_git(remote, "rev-parse", "refs/heads/main")
+        == publication.candidate.initial_git.head_revision
+    )
     assert "lower <= value <= upper" in local_git(
         remote, "show", f"{delivered.result.next_commit}:range_ops.py"
     )
-    assert local_git(remote, "rev-list", "--count", "--all") == "2"
+    assert int(local_git(remote, "rev-list", "--count", "--all")) == commits_before + 1
     if not lose_push_ack or queued_request is not None:
         if queued_request is not None:
             intake = importlib.import_module("operations.maintenance_git_intake")
