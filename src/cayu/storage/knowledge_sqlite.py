@@ -33,6 +33,7 @@ from cayu._validation import (
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
+from cayu.knowledge import _retrieval_results
 from cayu.knowledge._access_rules import (
     _knowledge_change_audiences,
     _knowledge_maintenance_access_snapshot,
@@ -234,7 +235,6 @@ from cayu.storage._knowledge_closure import (
 from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage.memory import (
     KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY,
-    _bounded_knowledge_evidence,
     _knowledge_change_now,
     _knowledge_semantic_watch_identity,
     _validate_knowledge_search_frontier,
@@ -2439,7 +2439,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     revision=entry.revision,
                     limit=max_records,
                 )
-        selected = _bounded_knowledge_evidence(
+        selected = _retrieval_results._bounded_knowledge_evidence(
             stored,
             max_records=max_records,
             max_bytes=max_bytes,
@@ -3040,7 +3040,9 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     return []
                 chunks = self._load_chunks_unlocked(clean_id, revision=entry.revision)
         if chunk_index is not None:
-            chunks = _center_chunk_window(chunks, chunk_index=chunk_index, max_chunks=max_chunks)
+            chunks = _retrieval_results._center_chunk_window(
+                chunks, chunk_index=chunk_index, max_chunks=max_chunks
+            )
         start_index = 0 if chunk_index is None else max(0, chunk_index - around)
         end_index = None if chunk_index is None else chunk_index + around
         return _bounded_chunks(
@@ -3562,7 +3564,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 else _preview_for_match(entry, chunk, terms)
             )
             preview_bytes = len(preview_text.encode("utf-8"))
-            preview = _truncate_text_to_bytes(preview_text, remaining)
+            preview = _retrieval_results._truncate_text_to_bytes(preview_text, remaining)
             if not preview:
                 truncated = True
                 break
@@ -3612,7 +3614,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 break
             preview_source = entry.title or entry.text
             preview_bytes = len(preview_source.encode("utf-8"))
-            preview = _truncate_text_to_bytes(preview_source, remaining)
+            preview = _retrieval_results._truncate_text_to_bytes(preview_source, remaining)
             if not preview:
                 truncated = True
                 break
@@ -6773,20 +6775,6 @@ def _copy_entry_chunks(
     return sorted(copied_chunks, key=lambda chunk: chunk.chunk_index)
 
 
-def _center_chunk_window(
-    chunks: list[KnowledgeChunk],
-    *,
-    chunk_index: int,
-    max_chunks: int,
-) -> list[KnowledgeChunk]:
-    if len(chunks) <= max_chunks:
-        return chunks
-    closest = sorted(
-        chunks, key=lambda chunk: (abs(chunk.chunk_index - chunk_index), chunk.chunk_index)
-    )
-    return sorted(closest[:max_chunks], key=lambda chunk: chunk.chunk_index)
-
-
 def _bounded_chunks(
     chunks: list[KnowledgeChunk],
     *,
@@ -6807,7 +6795,7 @@ def _bounded_chunks(
         copied = copy_knowledge_chunk(chunk)
         chunk_bytes = len(copied.text.encode("utf-8"))
         if chunk_bytes > remaining:
-            truncated_text = _truncate_text_to_bytes(copied.text, remaining)
+            truncated_text = _retrieval_results._truncate_text_to_bytes(copied.text, remaining)
             if not truncated_text:
                 break
             selected.append(
@@ -6903,15 +6891,6 @@ def _plural_search_token(token: str) -> str:
     if token.endswith("y") and len(token) > 1 and token[-2] not in "aeiou":
         return token[:-1] + "ies"
     return token + "s"
-
-
-def _truncate_text_to_bytes(text: str, max_bytes: int) -> str:
-    if max_bytes <= 0:
-        return ""
-    encoded = text.encode("utf-8")
-    if len(encoded) <= max_bytes:
-        return text
-    return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
 def _validate_positive_int(value: int, field_name: str) -> None:

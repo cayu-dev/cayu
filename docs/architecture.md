@@ -619,7 +619,12 @@ ordering, embedding-provider calls and transaction ownership.
 `knowledge/_search_scoring.py` owns shared keyword matching and entry/title/chunk
 scoring, including phrase field boundaries, exclusions and best-match selection.
 Memory and PostgreSQL compose these rules with the existing query tokenization;
-authorized candidate selection, native ranking and bounded results stay in the stores.
+authorized candidate selection and native ranking stay in the stores.
+`knowledge/_retrieval_results.py` builds bounded search hits, chunk previews and
+evidence from authorized candidates. Memory, SQLite and PostgreSQL share these
+rules while retaining their existing read operations, native result construction
+and validation boundaries. The shared rules preserve byte and item limits, rank,
+score metadata, detached records and completeness flags.
 The existing `cayu`, `cayu.storage` and `cayu.storage.memory` imports resolve to
 the same canonical types, including persisted legacy pickle class paths.
 

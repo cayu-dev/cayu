@@ -239,6 +239,10 @@ from cayu.knowledge._relation_queries import (
     _knowledge_lineage_query_fingerprint,
     _knowledge_relation_query_fingerprint,
 )
+from cayu.knowledge._retrieval_results import (
+    _bounded_knowledge_evidence,
+    _search_result_from_scored_embeddings,
+)
 from cayu.knowledge._revision_rules import (
     _copy_chunks_for_revision,
     _copy_evidence_for_revision,
@@ -897,10 +901,8 @@ from cayu.storage._task_scheduling_schema import POSTGRES_SCHEDULING_DDL
 from cayu.storage.knowledge_transition import require_empty_knowledge_revision_transition
 from cayu.storage.memory import (
     KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY,
-    _bounded_knowledge_evidence,
     _knowledge_change_now,
     _knowledge_semantic_watch_identity,
-    _search_result_from_scored_embeddings,
     _semantic_query_text,
     _validate_knowledge_search_frontier,
 )
