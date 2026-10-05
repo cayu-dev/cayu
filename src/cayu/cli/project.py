@@ -184,8 +184,9 @@ def _discover_configured_project(
     configuration_example: str,
     explicit_target_example: str | None,
     discovery_keys: tuple[str, ...] = ("factory",),
+    start: Path | None = None,
 ) -> _ConfiguredCayuProject:
-    discovered = discover_cayu_project_configuration(discovery_keys=discovery_keys)
+    discovered = discover_cayu_project_configuration(discovery_keys=discovery_keys, start=start)
     if discovered is not None:
         if "factory" not in discovered.config:
             raise ProjectError(
@@ -228,14 +229,19 @@ def resolve_project(
     *,
     command: str = "cayu",
     suggest_explicit_target: bool = True,
+    start: Path | None = None,
 ) -> CayuProject:
+    """Resolve the Cayu project from ``start`` (default: the working directory) upward."""
+
     if explicit_target is not None:
-        return CayuProject(root=Path.cwd().resolve(), target=explicit_target)
+        root = Path.cwd() if start is None else start
+        return CayuProject(root=root.resolve(), target=explicit_target)
 
     configured = _discover_configured_project(
         command=command,
         configuration_example='[tool.cayu] factory = "module:build_app"',
         explicit_target_example=("module:build_app" if suggest_explicit_target else None),
+        start=start,
     )
     return CayuProject(
         root=configured.root,

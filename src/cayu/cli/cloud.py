@@ -69,6 +69,14 @@ class CloudCommandError(RuntimeError):
         self.category = category
 
 
+class _CloudDeployCheckError(CloudCommandError):
+    """The local deploy check found problems that stop the public service starting."""
+
+    def __init__(self, message: str, *, details: dict[str, object]) -> None:
+        super().__init__("deploy_check_failed", message)
+        self.details = details.copy()
+
+
 class _CloudServiceHealthError(CloudApiError):
     """Safe structured Agent service health failure."""
 
@@ -348,6 +356,8 @@ def _cloud_failure(exc: Exception) -> int:
         error.update(exc.details)
     if isinstance(exc, _CloudDeploymentFailureError):
         error["failure"] = exc.failure
+    if isinstance(exc, _CloudDeployCheckError):
+        error.update(exc.details)
     if isinstance(
         exc,
         (
@@ -511,6 +521,14 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         default=True,
         help="Retry a replayed Cloud-side terminal failure with a fresh submission key (default: enabled).",
     )
+    deploy.add_argument(
+        "--skip-deploy-check",
+        action="store_true",
+        help=(
+            "Upload even when the local `cayu check --deploy` finds problems that stop a "
+            "public service starting on Cayu Cloud."
+        ),
+    )
     deploy.add_argument("--poll-seconds", type=_positive_finite_seconds, default=5.0)
     deploy.add_argument("--wait-seconds", type=_positive_finite_seconds, default=1800.0)
     deploy.set_defaults(_cloud_preflight=_preflight_deploy_wait)
@@ -654,15 +672,23 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
         preflight(arguments)
     if arguments.command == "init":
         initialized = initialize_project(arguments.path, force=arguments.force)
-        return {
-            "operation": "init",
-            "result": {
-                "application": initialized.application,
-                "manifest": str(initialized.manifest_path),
-                "name": initialized.name,
-                "runtime": initialized.runtime,
-            },
+        result: dict[str, Any] = {
+            "application": initialized.application,
+            "manifest": str(initialized.manifest_path),
+            "name": initialized.name,
+            "runtime": initialized.runtime,
         }
+        from cayu.cli._cloud_deploy_check import init_deploy_check_notice, run_cloud_deploy_check
+
+        check = run_cloud_deploy_check(
+            initialized.manifest_path.parent, serves_web=initialized.runtime == "web"
+        )
+        if check.status != "not_applicable":
+            result["deploy_check"] = check.public_dict()
+        notice = init_deploy_check_notice(check)
+        if notice is not None:
+            result["warnings"] = [notice]
+        return {"operation": "init", "result": result}
     if arguments.command == "login":
         return _login(arguments)
     if arguments.command == "logout":
@@ -706,6 +732,7 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
             manifest_path=arguments.manifest,
             revision=arguments.revision,
         )
+        deploy_check = _deploy_check(project, skip=arguments.skip_deploy_check)
     if arguments.command == "doctor":
         context_path = _selected_context_path(arguments.context)
         context = _read_context(context_path) if context_path is not None else {}
@@ -741,6 +768,7 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
             client=client,
             recorder=recorder,
             project=project,
+            deploy_check=deploy_check,
         )
     if arguments.command == "deployment":
         return _deployment(arguments, client=client)
@@ -861,12 +889,42 @@ def _clear_active_context() -> dict[str, Any]:
     }
 
 
+def _deploy_check(project: ResolvedCloudProject, *, skip: bool) -> dict[str, Any] | None:
+    """Run the local deploy check before anything is uploaded; refuse on blocking findings."""
+
+    if project.root is None:
+        # A repository source is built from its remote revision, not this checkout.
+        return None
+    from cayu.cli._cloud_deploy_check import (
+        DEPLOY_CHECK_ENVIRONMENT_HINT,
+        deploy_check_refusal,
+        run_cloud_deploy_check,
+    )
+
+    serves_web = project.manifest.web is not None
+    if skip:
+        return {"status": "skipped"} if serves_web else None
+    check = run_cloud_deploy_check(project.root, serves_web=serves_web)
+    if check.status == "not_applicable":
+        return None
+    if check.status == "failed":
+        raise _CloudDeployCheckError(
+            deploy_check_refusal(check),
+            details={
+                "deploy_check": check.public_dict(),
+                "hint": DEPLOY_CHECK_ENVIRONMENT_HINT,
+            },
+        )
+    return check.public_dict()
+
+
 def _deploy(
     arguments: argparse.Namespace,
     *,
     client: CloudApiClient,
     recorder: EvidenceRecorder,
     project: ResolvedCloudProject,
+    deploy_check: dict[str, Any] | None = None,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
@@ -1042,6 +1100,8 @@ def _deploy(
     }
     if retry is not None:
         result["retry"] = retry
+    if deploy_check is not None:
+        result["deploy_check"] = deploy_check
     safe_result = recorder.redact(result)
     response: dict[str, Any] = {
         "evidence_id": None,

@@ -262,6 +262,49 @@ cayu cloud context use /private/path/cloud-context.json
 CAYU_CLOUD_API_KEY_FILE=/private/path/key cayu cloud doctor
 ```
 
+## Local deploy check
+
+Cayu Cloud starts a public service (a project with `[tool.cayu] service_factory`) with
+`cayu serve`, which refuses to start a production service while `cayu check --deploy`
+reports a `PUBLIC_SERVICE_*` finding: placeholder or development product or operator
+access, or non-durable identity, session or task storage. The web process would exit 1
+on Cloud and keep restarting.
+
+Before uploading a local directory whose `cayu-cloud.toml` declares `[web]`, `cayu cloud
+deploy` runs the same check in-process, in production mode. If it reports any of those
+findings, the deploy exits `2` with category `deploy_check_failed` and nothing is
+uploaded. The JSON error has `error.deploy_check.blocking` (each finding's `code`,
+`severity`, `path`, `message`, `hint` and `documentation_anchor`, for example
+`cayu guide diagnostics#public-service-product-access-unsafe`), the command to rerun,
+and a `hint`. Other check findings don't block the deploy. A successful deploy reports
+`result.deploy_check.status` as `passed`, `skipped` or `unavailable`.
+
+The check uses the environment of the shell running `cayu cloud deploy`; it can't read
+Cayu Cloud secrets. If access or storage is configured through `cayu cloud env`, set the
+same variables locally for the deploy, the way the service scaffold's own verification
+command does:
+
+```console
+PRODUCT_AUTH_TOKENS_JSON=... CAYU_OPERATOR_BEARER_TOKEN=... cayu cloud deploy .
+```
+
+Pass `--skip-deploy-check` to upload anyway when you know Cloud supplies what the local
+check can't see, or when you intentionally deploy a release that won't start.
+
+The check runs in the Python environment running `cayu`, so run the deploy from the
+project environment (for example `uv run cayu cloud deploy .`). If the project can't be
+booted there, for example because its dependencies aren't installed, the deploy continues
+with `result.deploy_check.status` `unavailable` and the reason, since Cloud builds the
+release in its own environment. Source diagnostics that prevent safely importing the
+service also report `unavailable`, never `passed`. Other source findings, such as a
+missing README, do not suppress the service safety checks. Repository sources and projects
+without a public service or a `[web]` process are not checked.
+
+`cayu cloud init` runs the same check for a public service. When it finds a problem, for
+example access that is still a placeholder, or can't run, the result includes
+`deploy_check` and a `warnings` entry naming the `cayu check --deploy --fail-on warning
+--json` command to run before deploying.
+
 ## Agent environment variables
 
 Cloud-managed variables belong to the long-lived Agent, not to one immutable release.

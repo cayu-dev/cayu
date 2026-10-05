@@ -284,12 +284,16 @@ def test_cloud_deploy_does_not_follow_saved_nonproduction_url(
         client: CloudApiClient,
         recorder: object,
         project: object,
+        deploy_check: object,
     ) -> dict[str, object]:
         del recorder, project
+        assert deploy_check is None
         deployments.append(client.api_url)
         return {"operation": "deploy", "result": {}}
 
-    monkeypatch.setattr(cloud_cli, "resolve_project", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        cloud_cli, "resolve_project", lambda *_args, **_kwargs: SimpleNamespace(root=None)
+    )
     monkeypatch.setattr(cloud_cli, "_deploy", deploy)
     monkeypatch.setattr(
         WorkOSDeviceAuthClient,
@@ -354,12 +358,16 @@ def test_cloud_deploy_uses_production_despite_environment_endpoint(
         client: CloudApiClient,
         recorder: object,
         project: object,
+        deploy_check: object,
     ) -> dict[str, object]:
         del recorder, project
+        assert deploy_check is None
         deployments.append(client.api_url)
         return {"operation": "deploy", "result": {}}
 
-    monkeypatch.setattr(cloud_cli, "resolve_project", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        cloud_cli, "resolve_project", lambda *_args, **_kwargs: SimpleNamespace(root=None)
+    )
     monkeypatch.setattr(cloud_cli, "_deploy", deploy)
 
     assert (

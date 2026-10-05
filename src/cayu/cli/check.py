@@ -8,6 +8,7 @@ from typing import Any
 
 from cayu.cli._output import add_output_options, output_destination
 from cayu.cli.project import (
+    CayuProject,
     ProjectError,
     build_project_app,
     build_project_service,
@@ -90,14 +91,35 @@ def _run_check(args: argparse.Namespace) -> int:
         message = f"Unknown check tags: {', '.join(sorted(unknown))}."
         _render_invocation_error(message, as_json=args.output_format == "json")
         return 2
-    source_errors = False
     try:
         project = resolve_project(args.target, command="cayu check")
+        report = check_project(project, tags=requested_tags, deploy_only=args.deploy)
+    except Exception as exc:
+        message = (
+            str(exc)
+            if isinstance(exc, ProjectError)
+            else f"Application factory failed ({type(exc).__name__}): {exc}"
+        )
+        _render_invocation_error(message, as_json=args.output_format == "json")
+        return 2
+    return _render_report(args, report)
+
+
+def check_project(
+    project: CayuProject,
+    *,
+    tags: frozenset[str] = frozenset(),
+    deploy_only: bool = False,
+) -> ProjectCheckReport:
+    """Check a production project, retaining source-only reports when it cannot load."""
+
+    source_errors = False
+    try:
         all_source_diagnostics = check_declared_scaffold_source(project.root)
         source_diagnostics = filter_findings(
             all_source_diagnostics,
-            tags=requested_tags,
-            deploy_only=args.deploy,
+            tags=tags,
+            deploy_only=deploy_only,
         )
         # Never import code that failed the import-safety check, whatever the
         # requested tags. Blocking findings are always reported, even outside the
@@ -109,18 +131,15 @@ def _run_check(args: argparse.Namespace) -> int:
             outside_selection = tuple(
                 item for item in blocking_source_diagnostics if item not in source_diagnostics
             )
-            return _render_report(
-                args,
-                _source_only_report(
-                    (
-                        *source_diagnostics,
-                        *outside_selection,
-                        application_not_imported_diagnostic(
-                            len(blocking_source_diagnostics),
-                            outside_selection=len(outside_selection),
-                        ),
-                    )
-                ),
+            return _source_only_report(
+                (
+                    *source_diagnostics,
+                    *outside_selection,
+                    application_not_imported_diagnostic(
+                        len(blocking_source_diagnostics),
+                        outside_selection=len(outside_selection),
+                    ),
+                )
             )
         # Only reported errors may stand in for a factory failure below.
         source_errors = any(
@@ -166,27 +185,20 @@ def _run_check(args: argparse.Namespace) -> int:
                 manifest,
                 service_manifest=None if service is None else service.manifest,
                 project_control_plane=check_evidence,
-                tags=requested_tags,
-                deploy_only=args.deploy,
+                tags=tags,
+                deploy_only=deploy_only,
             )
         finally:
             close_project_control_plane_context(control_plane_context)
     except Exception as exc:
         if source_errors and not isinstance(exc, ProjectError):
             # Source drift often explains a factory failure; keep it visible.
-            return _render_report(
-                args,
-                _source_only_report((*source_diagnostics, application_load_failed_diagnostic(exc))),
+            return _source_only_report(
+                (*source_diagnostics, application_load_failed_diagnostic(exc))
             )
-        message = (
-            str(exc)
-            if isinstance(exc, ProjectError)
-            else f"Application factory failed ({type(exc).__name__}): {exc}"
-        )
-        _render_invocation_error(message, as_json=args.output_format == "json")
-        return 2
+        raise
 
-    return _render_report(args, report)
+    return report
 
 
 def build_project_check_report(

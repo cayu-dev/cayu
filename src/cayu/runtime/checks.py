@@ -43,6 +43,19 @@ BUILTIN_DIAGNOSTIC_CODES = (
     "TOOL_INPUT_SCHEMA_RUNTIME_UNSUPPORTED",
     "TOOL_APPROVAL_VALIDITY_RULE",
 )
+# Every code `check_public_service_deployment` reports. `cayu serve` refuses to start a
+# production public service while any of them is reported.
+PUBLIC_SERVICE_DEPLOYMENT_CODES = frozenset(
+    {
+        "PUBLIC_SERVICE_DEVELOPMENT_MODE",
+        "PUBLIC_SERVICE_IDENTITY_STORE_NOT_DURABLE",
+        "PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE",
+        "PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE",
+        "PUBLIC_SERVICE_SESSION_STORE_NOT_DURABLE",
+        "PUBLIC_SERVICE_TASK_STORE_NOT_DURABLE",
+        "PUBLIC_SERVICE_TASK_STORE_REQUIRED",
+    }
+)
 _WORKSPACE_TOOL_NAMES = frozenset(
     {
         "apply_patch",
@@ -700,16 +713,7 @@ def _service_evidence(
             host_owned_behavior="unverified_outside_contract",
             security_verification_command="pytest -q tests/test_public_service_security.py",
         )
-    unsafe_codes = {
-        "PUBLIC_SERVICE_DEVELOPMENT_MODE",
-        "PUBLIC_SERVICE_IDENTITY_STORE_NOT_DURABLE",
-        "PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE",
-        "PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE",
-        "PUBLIC_SERVICE_SESSION_STORE_NOT_DURABLE",
-        "PUBLIC_SERVICE_TASK_STORE_NOT_DURABLE",
-        "PUBLIC_SERVICE_TASK_STORE_REQUIRED",
-    }
-    configured = not any(item.code in unsafe_codes for item in diagnostics)
+    configured = not any(item.code in PUBLIC_SERVICE_DEPLOYMENT_CODES for item in diagnostics)
     return ServiceCheckEvidence(
         control_plane_access=(
             "verified_authenticated"

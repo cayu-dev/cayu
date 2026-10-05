@@ -301,6 +301,12 @@ For `cayu cloud deploy`, run `uv lock` in the selected project root and include 
 including Git ignore rules; a local wheel build alone does not establish Cloud build
 readiness. The deploy command does not generate locks or modify the source for you.
 
+For a public service with a `[web]` process, `cayu cloud deploy` also runs the same
+deploy check in-process before uploading and refuses (`deploy_check_failed`) when it
+reports a `PUBLIC_SERVICE_*` finding, because `cayu serve` would refuse to start the
+release. The check sees only the local environment, so set the service's authentication
+configuration for the deploy as for `cayu check`, or pass `--skip-deploy-check` on purpose.
+
 ## Cloud build diagnostics
 
 An identical `cayu cloud deploy .` may replay an earlier immutable attempt. Failed or
