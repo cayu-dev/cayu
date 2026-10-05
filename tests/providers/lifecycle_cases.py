@@ -50,6 +50,8 @@ def lifecycle_events(protocol: Protocol, scenario: str) -> list[dict[str, Any]] 
     if case == "conflicting_terminal_metadata":
         repeated = deepcopy(terminal[-1])
         if protocol == "chat":
+            # Adding absent usage is valid; replacing terminal usage is not.
+            terminal[-1]["usage"] = {"prompt_tokens": 1, "completion_tokens": 1}
             repeated["usage"] = {"prompt_tokens": 1, "completion_tokens": 99}
         elif protocol == "bedrock":
             repeated["messageStop"]["additionalModelResponseFields"] = {"changed": True}

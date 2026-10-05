@@ -43178,5 +43178,16 @@
     "tests/cli/test_cloud_deploy_serve_check.py::test_the_lock_cloud_installs_from_must_include_the_server_extra[extras2-expected2]": 0.0016495419840794057,
     "tests/cli/test_cloud_deploy_serve_check.py::test_the_lock_cloud_installs_from_must_include_the_server_extra[extras3-expected3]": 0.0016770829970482737,
     "tests/cli/test_cloud_deploy_serve_check.py::test_the_lock_cloud_installs_from_must_include_the_server_extra[extras4-expected4]": 0.001671710007940419,
-    "tests/cli/test_cloud_deploy_serve_check.py::test_the_lock_cloud_installs_from_must_include_the_server_extra[extras5-expected5]": 0.0013094579917378724
+    "tests/cli/test_cloud_deploy_serve_check.py::test_the_lock_cloud_installs_from_must_include_the_server_extra[extras5-expected5]": 0.0013094579917378724,
+    "tests/core/test_chat_completions_provider.py::test_chat_completions_stream_accepts_openrouter_finish_and_usage_repeat[asyncio]": 0.0013795000122627243,
+    "tests/core/test_chat_completions_provider.py::test_chat_completions_stream_keeps_usage_bearing_terminal_repeat_separate_from_tail[asyncio-after-tail-openrouter]": 0.0006727500003762543,
+    "tests/core/test_chat_completions_provider.py::test_chat_completions_stream_keeps_usage_bearing_terminal_repeat_separate_from_tail[asyncio-after-tail-plain]": 0.000605876004556194,
+    "tests/core/test_chat_completions_provider.py::test_chat_completions_stream_keeps_usage_bearing_terminal_repeat_separate_from_tail[asyncio-before-tail-openrouter]": 0.000769708989537321,
+    "tests/core/test_chat_completions_provider.py::test_chat_completions_stream_keeps_usage_bearing_terminal_repeat_separate_from_tail[asyncio-before-tail-plain]": 0.0006545839860336855,
+    "tests/core/test_chat_completions_provider.py::test_chat_completions_stream_rejects_openrouter_usage_repeat_with_new_finish[asyncio]": 0.0008017920044949278,
+    "tests/core/test_chat_completions_provider.py::test_chat_completions_stream_rejects_output_on_repeated_finish_chunk[asyncio]": 0.0006484180048573762,
+    "tests/core/test_chat_completions_provider.py::test_chat_completions_stream_rejects_usage_repeat_metadata_conflicts[asyncio-logprobs-openrouter]": 0.0006715840136166662,
+    "tests/core/test_chat_completions_provider.py::test_chat_completions_stream_rejects_usage_repeat_metadata_conflicts[asyncio-logprobs-plain]": 0.0006530409882543609,
+    "tests/core/test_chat_completions_provider.py::test_chat_completions_stream_rejects_usage_repeat_metadata_conflicts[asyncio-usage-openrouter]": 0.0006594159931410104,
+    "tests/core/test_chat_completions_provider.py::test_chat_completions_stream_rejects_usage_repeat_metadata_conflicts[asyncio-usage-plain]": 0.000674542025080882
 }

@@ -1070,6 +1070,26 @@ def _chat_stream_terminal(
     )
 
 
+# OpenRouter adds ``native_finish_reason`` beside the normalized finish_reason.
+_CHAT_TERMINAL_CHOICE_KEYS = frozenset(
+    {"index", "delta", "finish_reason", "logprobs", "native_finish_reason"}
+)
+
+
+def _chat_delta_is_inert(delta: Any) -> bool:
+    """Whether a delta carries no output, e.g. OpenRouter's ``{"content": "", "role": ...}``."""
+    if delta is None:
+        return True
+    if not isinstance(delta, Mapping):
+        return False
+    return all(
+        value is None
+        or (key == "role" and value == "assistant")
+        or (key == "content" and value == "")
+        for key, value in delta.items()
+    )
+
+
 def _chat_lifecycle_error(violation: StreamViolation) -> Exception:
     message = {
         StreamViolation.RESPONSE_CONFLICT: "stream emitted conflicting response ids",
@@ -1150,10 +1170,20 @@ async def chat_completions_stream_events(
             )
         elif (
             native_terminal is not None
-            and choice.get("delta") in (None, {})
-            and set(choice).issubset({"index", "delta", "finish_reason", "logprobs"})
+            and _chat_delta_is_inert(choice.get("delta"))
+            and set(choice).issubset(_CHAT_TERMINAL_CHOICE_KEYS)
         ):
-            kind = StreamTransitionKind.TERMINAL
+            if (
+                lifecycle.terminal is not None
+                and event.get("usage") is not None
+                and lifecycle.terminal == _chat_stream_terminal({**event, "usage": None}, choice)
+            ):
+                # Only newly attached usage may differ from the first terminal.
+                # Exact repeats retain their separate allowance, and conflicts
+                # still go through the canonical terminal comparison.
+                kind = StreamTransitionKind.USAGE
+            else:
+                kind = StreamTransitionKind.TERMINAL
         else:
             kind = StreamTransitionKind.SEMANTIC
         accepted = lifecycle.accept(
@@ -1257,7 +1287,7 @@ async def chat_completions_stream_events(
             chunk_tool_calls = delta.get("tool_calls")
             if tool_calls.record(chunk_tool_calls):
                 observe_provider_semantic_progress(ProviderProgressKind.TOOL_CALL)
-        if native_terminal is not None:
+        if native_terminal is not None and kind is not StreamTransitionKind.USAGE:
             if not accepted.terminal_started:
                 lifecycle.accept(
                     StreamTransition(StreamTransitionKind.TERMINAL, terminal=native_terminal)

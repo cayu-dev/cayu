@@ -9975,7 +9975,7 @@ identity fails before its output or accounting is accepted.
 | --- | --- | --- | --- |
 | OpenAI Responses and Subscription | Explicit or implicit start; no late/repeated start | Rejected | None |
 | Anthropic Messages and Vertex | One explicit `message_start` | Rejected | None; ping/unknown events are discarded without progress |
-| Chat Completions | Implicit start | At most one exact canonical terminal-metadata repeat | At most one usage-only or metadata-only frame |
+| Chat Completions | Implicit start | At most one exact canonical terminal-metadata repeat | At most one usage-only or metadata-only frame, including a repeated inert finish that adds previously absent usage |
 | Bedrock Converse | Explicit or implicit `messageStart` | At most one exact `messageStop` repeat | One metadata event total, before or after stop |
 
 Post-terminal text, reasoning, tool fragments and new-response events are not
@@ -10405,6 +10405,15 @@ remain valid, while later text, reasoning, choices, or tool fragments fail the
 model attempt before deferred tool calls are released. Gemini's single chunk
 that carries both a `stop` finish reason and tool-call fragments remains one
 atomic terminal chunk and normalizes to `tool_calls`.
+
+OpenRouter's empty assistant delta and `native_finish_reason` are compatible
+with an inert terminal chunk. A repeated inert finish may attach previously
+absent usage when the normalized finish reason and all other canonical terminal
+metadata match; it consumes the one accounting-tail allowance. A finish repeat
+that changes already recorded terminal usage or other canonical terminal
+metadata remains a protocol error. An exact canonical terminal repeat, including
+one that already carries usage, retains its separate repeat allowance and does
+not replace accounting received in a usage tail.
 
 Anthropic and Vertex Messages streams likewise require exactly one
 `message_start`; content and message deltas require that start, and

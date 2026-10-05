@@ -3992,6 +3992,128 @@ async def test_chat_completions_stream_allows_identity_bound_usage_tail() -> Non
     assert events[-1].payload["usage"]["total_tokens"] == 3
 
 
+def _openrouter_finish_chunk(**extra: Any) -> dict[str, Any]:
+    # Shape OpenRouter streams for every model: the finish chunk keeps an empty
+    # assistant delta and adds native_finish_reason, then repeats with usage.
+    return {
+        "id": "gen-1",
+        "object": "chat.completion.chunk",
+        "model": "openai/gpt-6-luna",
+        "provider": "OpenAI",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": "", "role": "assistant"},
+                "finish_reason": "stop",
+                "native_finish_reason": "completed",
+            }
+        ],
+        **extra,
+    }
+
+
+@pytest.mark.anyio
+async def test_chat_completions_stream_accepts_openrouter_finish_and_usage_repeat() -> None:
+    usage = {"prompt_tokens": 19, "completion_tokens": 7, "total_tokens": 26}
+
+    async def raw_events():
+        yield {
+            "id": "gen-1",
+            "model": "openai/gpt-6-luna",
+            "provider": "OpenAI",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": "Hi there", "role": "assistant"},
+                    "finish_reason": None,
+                    "native_finish_reason": None,
+                }
+            ],
+        }
+        yield _openrouter_finish_chunk()
+        yield _openrouter_finish_chunk(service_tier="default", usage=usage)
+
+    events = [event async for event in chat_completions_stream_events(raw_events())]
+
+    assert [event.type for event in events] == [
+        ModelStreamEventType.TEXT_DELTA,
+        ModelStreamEventType.COMPLETED,
+    ]
+    assert events[0].delta == "Hi there"
+    assert events[1].completion is not None
+    assert events[1].completion.finish_reason == ModelFinishReason.STOP
+    assert events[1].payload["usage"] == usage
+
+
+@pytest.mark.anyio
+async def test_chat_completions_stream_rejects_openrouter_usage_repeat_with_new_finish() -> None:
+    async def raw_events():
+        yield _openrouter_finish_chunk()
+        chunk = _openrouter_finish_chunk(usage={"total_tokens": 1})
+        chunk["choices"][0]["finish_reason"] = "length"
+        yield chunk
+
+    with pytest.raises(ChatCompletionsProtocolError, match="conflicting finish_reason"):
+        [event async for event in chat_completions_stream_events(raw_events())]
+
+
+@pytest.mark.anyio
+async def test_chat_completions_stream_rejects_output_on_repeated_finish_chunk() -> None:
+    async def raw_events():
+        yield _openrouter_finish_chunk()
+        chunk = _openrouter_finish_chunk(usage={"total_tokens": 1})
+        chunk["choices"][0]["delta"] = {"content": "late", "role": "assistant"}
+        yield chunk
+
+    with pytest.raises(ChatCompletionsProtocolError, match="after finish_reason"):
+        [event async for event in chat_completions_stream_events(raw_events())]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("openrouter", [False, True], ids=["plain", "openrouter"])
+@pytest.mark.parametrize("conflict", ["usage", "logprobs"])
+async def test_chat_completions_stream_rejects_usage_repeat_metadata_conflicts(
+    openrouter: bool, conflict: str
+) -> None:
+    first = _openrouter_finish_chunk() if openrouter else _finish_chunk("stop")
+    repeated = _openrouter_finish_chunk() if openrouter else _finish_chunk("stop")
+    repeated["usage"] = {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+    if conflict == "usage":
+        first["usage"] = {"prompt_tokens": 2, "completion_tokens": 10, "total_tokens": 12}
+    else:
+        first["choices"][0]["logprobs"] = {"content": [{"token": "a", "logprob": -1}]}
+        repeated["choices"][0]["logprobs"] = {"content": [{"token": "b", "logprob": -2}]}
+
+    async def raw_events():
+        yield first
+        yield repeated
+
+    with pytest.raises(ChatCompletionsProtocolError, match="conflicting finish_reason"):
+        [event async for event in chat_completions_stream_events(raw_events())]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("openrouter", [False, True], ids=["plain", "openrouter"])
+@pytest.mark.parametrize("repeat_before_usage", [False, True], ids=["after-tail", "before-tail"])
+async def test_chat_completions_stream_keeps_usage_bearing_terminal_repeat_separate_from_tail(
+    openrouter: bool, repeat_before_usage: bool
+) -> None:
+    terminal = _openrouter_finish_chunk() if openrouter else _finish_chunk("stop")
+    terminal["usage"] = {"prompt_tokens": 2, "completion_tokens": 10, "total_tokens": 12}
+    final_usage = {"prompt_tokens": 2, "completion_tokens": 11, "total_tokens": 13}
+    tail = {"id": terminal["id"], "model": terminal["model"], "choices": [], "usage": final_usage}
+
+    async def raw_events():
+        yield terminal
+        yield terminal if repeat_before_usage else tail
+        yield tail if repeat_before_usage else terminal
+
+    events = [event async for event in chat_completions_stream_events(raw_events())]
+
+    assert [event.type for event in events] == [ModelStreamEventType.COMPLETED]
+    assert events[0].payload["usage"] == final_usage
+
+
 @pytest.mark.parametrize("wrapped", [False, True], ids=["direct", "transparent-wrapper"])
 def test_cayu_app_preserves_chat_http_completion_before_real_tail_cancellation(
     monkeypatch: pytest.MonkeyPatch,
