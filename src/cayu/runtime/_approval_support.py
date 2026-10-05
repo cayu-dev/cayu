@@ -1,17 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import datetime
 from types import MappingProxyType
 from typing import Any, Literal, NamedTuple
-
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cayu._command_diagnostics import COMMAND_DENIAL_HINTS
 from cayu._validation import (
     copy_durable_json_value,
     copy_durable_metadata,
-    require_durable_clean_nonblank,
 )
 from cayu.approvals.tools import (
     PendingToolApproval,
@@ -39,7 +36,6 @@ from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_iden
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
-from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
 from cayu.sessions.base import (
     Session,
     SessionStore,
@@ -50,7 +46,6 @@ from cayu.tools.base import ToolResult
 from cayu.tools.policy import ToolPolicyDecision, ToolPolicyResult
 from cayu.vaults.redaction import SecretRedactor
 
-APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY = "approval_resolution_intent"
 APPROVAL_INTERRUPT_CLOSE_INTENT_KEY = "approval_close_intent"
 
 
@@ -143,65 +138,6 @@ def event_with_pending_approval_authority(
     return event
 
 
-class ApprovalResolutionIntent(BaseModel):
-    """Immutable resolution authority retained with one pending approval."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    approval_id: str
-    tool_call_id: str
-    tool_round_id: str
-    model_step_id: str
-    model_attempt_id: str
-    decision: ToolApprovalDecision
-    pause_resolved_at: datetime | None = Field(default=None, exclude_if=lambda value: value is None)
-    # ``None`` loads checkpoints written before request digests existed. It is
-    # intentionally non-authoritative and must never be upgraded after the fact.
-    resolution_request_digest: str | None = None
-    # Reviewed tool arguments remain immutable even as the paired round's
-    # publication coverage advances. Legacy/unreviewed claims do not acquire
-    # this authority retroactively.
-    reviewed_approval_digest: str | None = Field(
-        default=None, exclude_if=lambda value: value is None
-    )
-
-    @field_validator("pause_resolved_at")
-    @classmethod
-    def validate_pause_resolved_at(cls, value: datetime | None) -> datetime | None:
-        if value is None:
-            return None
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("pause_resolved_at must be timezone-aware.")
-        return value.astimezone(UTC)
-
-    @field_validator("approval_id", "tool_call_id")
-    @classmethod
-    def validate_nonblank_identity(cls, value: str, info) -> str:
-        return require_durable_clean_nonblank(value, info.field_name)
-
-    @field_validator("resolution_request_digest", "reviewed_approval_digest")
-    @classmethod
-    def validate_resolution_request_digest(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        if (
-            type(value) is not str
-            or len(value) != 64
-            or any(character not in "0123456789abcdef" for character in value)
-        ):
-            raise ValueError("resolution_request_digest must be a lowercase SHA-256 digest.")
-        return value
-
-    @model_validator(mode="after")
-    def validate_execution_identity(self) -> ApprovalResolutionIntent:
-        ToolRoundIdentity(
-            tool_round_id=self.tool_round_id,
-            model_step_id=self.model_step_id,
-            model_attempt_id=self.model_attempt_id,
-        )
-        return self
-
-
 def approval_resolution_intent_for(
     approval: PendingToolApproval,
     *,
@@ -209,12 +145,12 @@ def approval_resolution_intent_for(
     resolution_request_digest: str | None,
     reviewed_approval_digest: str | None = None,
     pause_resolved_at: datetime | None = None,
-) -> ApprovalResolutionIntent:
+) -> pending_approval_reader.ApprovalResolutionIntent:
     if type(approval) is not PendingToolApproval:
         raise TypeError("Pending approval must be a PendingToolApproval.")
     if type(decision) is not ToolApprovalDecision:
         raise TypeError("Approval resolution decision must be a ToolApprovalDecision.")
-    return ApprovalResolutionIntent(
+    return pending_approval_reader.ApprovalResolutionIntent(
         approval_id=approval.approval_id,
         tool_call_id=approval.tool_call_id,
         tool_round_id=approval.tool_round_id,
@@ -246,39 +182,8 @@ def approval_resolution_request_digest(request: ToolApprovalRequest) -> str:
     )
 
 
-def approval_resolution_intent_from_checkpoint(
-    checkpoint: dict[str, Any] | None,
-    *,
-    redactor: SecretRedactor | None = None,
-) -> ApprovalResolutionIntent | None:
-    if checkpoint is None:
-        return None
-    copied = copy_durable_json_value(checkpoint, "checkpoint")
-    value = copied.get(APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY)
-    if value is None:
-        return None
-    if redactor is not None and durable_value_contains_secret(
-        value,
-        redactor=redactor,
-        path=(APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY,),
-    ):
-        raise ValueError(
-            "Approval resolution intent contains a workload secret and cannot be executed."
-        )
-    if type(value) is not dict:
-        raise ValueError("Approval resolution intent checkpoint must be an object.")
-    try:
-        return ApprovalResolutionIntent.model_validate(value)
-    except Exception:
-        if redactor is None:
-            raise
-        raise ValueError(
-            "Approval resolution intent checkpoint is invalid and cannot be executed."
-        ) from None
-
-
 def require_resolution_intent_matches_approval(
-    intent: ApprovalResolutionIntent,
+    intent: pending_approval_reader.ApprovalResolutionIntent,
     *,
     approval: PendingToolApproval,
 ) -> None:
@@ -323,7 +228,9 @@ def checkpoint_with_approval_resolution_intent(
         reviewed_approval_digest=reviewed_approval_digest,
         pause_resolved_at=pause_resolved_at,
     )
-    current = approval_resolution_intent_from_checkpoint(copied, redactor=redactor)
+    current = pending_approval_reader.approval_resolution_intent_from_checkpoint(
+        copied, redactor=redactor
+    )
     if current is not None:
         require_resolution_intent_matches_approval(current, approval=approval)
         if current.decision is not decision:
@@ -337,7 +244,9 @@ def checkpoint_with_approval_resolution_intent(
         if current.reviewed_approval_digest != reviewed_approval_digest:
             raise RuntimeError("Tool approval cannot replace its accepted content binding.")
         expected = current
-    copied[APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY] = expected.model_dump(mode="json")
+    copied[pending_approval_reader.APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY] = expected.model_dump(
+        mode="json"
+    )
     return copied
 
 
@@ -490,7 +399,7 @@ async def checkpoint_without_pending_approval(
     checkpoint = await session_store.load_checkpoint(session_id)
     copied = {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
     copied.pop(pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY, None)
-    copied.pop(APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY, None)
+    copied.pop(pending_approval_reader.APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY, None)
     return copied
 
 
@@ -522,7 +431,9 @@ def _checkpoint_with_exact_pending_approval_round(
         != [call.model_dump(mode="json") for call in approval.tool_calls]
     ):
         raise RuntimeError("Pending tool approval round changed before exact checkpoint clearing.")
-    intent = approval_resolution_intent_from_checkpoint(copied, redactor=redactor)
+    intent = pending_approval_reader.approval_resolution_intent_from_checkpoint(
+        copied, redactor=redactor
+    )
     if intent is not None:
         require_resolution_intent_matches_approval(intent, approval=approval)
     return copied
@@ -544,7 +455,7 @@ def checkpoint_without_exact_pending_approval(
         runtime_session=runtime_session,
     )
     copied.pop(pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY)
-    copied.pop(APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY, None)
+    copied.pop(pending_approval_reader.APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY, None)
     return copied
 
 
@@ -564,7 +475,7 @@ def checkpoint_without_exact_pending_approval_round(
         runtime_session=runtime_session,
     )
     copied.pop(pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY)
-    copied.pop(APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY, None)
+    copied.pop(pending_approval_reader.APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY, None)
     copied.pop(pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
     return copied
 
@@ -1326,7 +1237,7 @@ def _pending_approval_and_round_for_atomic_claim(
             "Pending approval call is neither authoritatively approval-gated "
             "nor explicitly ambiguous."
         )
-    resolution_intent = approval_resolution_intent_from_checkpoint(
+    resolution_intent = pending_approval_reader.approval_resolution_intent_from_checkpoint(
         checkpoint,
         redactor=redactor,
     )

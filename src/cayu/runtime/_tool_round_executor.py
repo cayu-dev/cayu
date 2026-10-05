@@ -183,7 +183,6 @@ from cayu.runtime._session_control import (
 )
 from cayu.runtime._session_queries import query_all_event_records
 from cayu.runtime._tool_effect_state import (
-    ToolEffectIntent,
     ToolEffectReconciliationCleanupFailure,
     ToolEffectReconciliationRequired,
     ToolEffectRecord,
@@ -229,6 +228,7 @@ from cayu.sessions._checkpoint_secret_validation import (
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
+from cayu.sessions._tool_effect_intent import ToolEffectIntent
 from cayu.sessions.base import (
     _MCP_MANIFEST_BASELINE_MAX_TOOLS,
     INHERIT_INTERACTION,
@@ -2191,7 +2191,7 @@ class ToolRoundExecutor:
                 raise RuntimeError("Pending tool round changed before approval publication.")
             if pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY in current:
                 raise RuntimeError("Session already has a pending tool approval.")
-            if approval_support.APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY in current:
+            if pending_approval_reader.APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY in current:
                 raise RuntimeError("Session has an orphaned approval resolution intent.")
             current[pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = planned_round_payload
             current[pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY] = approval_payload
@@ -2402,7 +2402,7 @@ class ToolRoundExecutor:
                 raise RuntimeError("Pending tool round changed before policy publication.")
             if pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY in current:
                 raise RuntimeError("Session already has a pending tool approval.")
-            if approval_support.APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY in current:
+            if pending_approval_reader.APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY in current:
                 raise RuntimeError("Session has an orphaned approval resolution intent.")
             current[pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = planned_round_payload
             return copy_durable_json_object(current, "checkpoint")

@@ -11,7 +11,6 @@ from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.runtime._tool_effect_state import (
     ToolEffectConflict,
-    ToolEffectIntent,
     ToolEffectObservation,
     ToolEffectRecord,
     ToolEffectStateOwner,
@@ -19,6 +18,7 @@ from cayu.runtime._tool_effect_state import (
     validate_tool_effect_uncertainty_event,
 )
 from cayu.runtime.tool_effects import ToolEffectReceipt, ToolEffectReconciliationResult
+from cayu.sessions._tool_effect_intent import ToolEffectIntent
 from cayu.sessions.base import (
     InMemorySessionStore,
     RunRequest,

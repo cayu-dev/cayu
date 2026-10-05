@@ -34791,7 +34791,7 @@ def _prepare_runtime_publication(
 
     _validate_workspace_observation_publication(copied_request, session_id=session_id)
     if copied_request.kind in {"approval-close", "user-input-close"}:
-        from cayu.runtime._foreground_child_wait import (
+        from cayu.sessions._foreground_child_checkpoint import (
             FOREGROUND_CHILD_POST_ACTION_CONTINUATION_KEY,
         )
 
@@ -35108,7 +35108,7 @@ def _validate_user_input_checkpoint_mutation(
             PENDING_USER_INPUT_CHECKPOINT_KEY,
             USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY,
         }
-        from cayu.runtime._foreground_child_wait import (
+        from cayu.sessions._foreground_child_checkpoint import (
             FOREGROUND_CHILD_POST_ACTION_CONTINUATION_KEY,
             ForegroundChildPostActionContinuation,
             post_action_continuation_round_from_checkpoint,
@@ -35135,7 +35135,7 @@ def _validate_user_input_checkpoint_mutation(
                 raise ValueError("User-input close continuation conflicts with its durable round.")
             closing_keys.add(FOREGROUND_CHILD_POST_ACTION_CONTINUATION_KEY)
         if "foreground_parent_continuation" in operations:
-            from cayu.runtime._foreground_gate_continuation import gate_close_continuation
+            from cayu.sessions._foreground_child_checkpoint import gate_close_continuation
 
             parent_marker = operations["foreground_parent_continuation"]
             round_evidence = post_action_continuation_round_from_checkpoint(current)

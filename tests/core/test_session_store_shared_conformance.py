@@ -6971,7 +6971,7 @@ def test_session_store_conformance_pre_digest_approval_claim_fails_closed(
             assert tool_calls == []
 
             checkpoint = await store.load_checkpoint(session_id)
-            intent = approval_support.approval_resolution_intent_from_checkpoint(
+            intent = pending_approval_reader.approval_resolution_intent_from_checkpoint(
                 checkpoint,
                 redactor=SecretRedactor(),
             )
@@ -6984,14 +6984,14 @@ def test_session_store_conformance_pre_digest_approval_claim_fails_closed(
             legacy_checkpoint = await store.load_checkpoint(session_id)
             assert legacy_checkpoint is not None
             legacy_intent = dict(
-                legacy_checkpoint[approval_support.APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY]
+                legacy_checkpoint[pending_approval_reader.APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY]
             )
             legacy_intent.pop("resolution_request_digest")
             await store.checkpoint(
                 session_id,
                 {
                     **legacy_checkpoint,
-                    approval_support.APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY: legacy_intent,
+                    pending_approval_reader.APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY: legacy_intent,
                 },
             )
 
@@ -7041,7 +7041,7 @@ def test_session_store_conformance_pre_digest_approval_claim_fails_closed(
             interrupted = await store.load(session_id)
             assert interrupted is not None
             assert interrupted.status is SessionStatus.INTERRUPTED
-            assert approval_support.approval_resolution_intent_from_checkpoint(
+            assert pending_approval_reader.approval_resolution_intent_from_checkpoint(
                 await store.load_checkpoint(session_id),
                 redactor=SecretRedactor(),
             ) == approval_support.approval_resolution_intent_for(
@@ -7060,7 +7060,7 @@ def test_session_store_conformance_pre_digest_approval_claim_fails_closed(
             assert binding.bind_calls == 2
             assert tool_calls == []
             final_checkpoint = await store.load_checkpoint(session_id)
-            assert approval_support.approval_resolution_intent_from_checkpoint(
+            assert pending_approval_reader.approval_resolution_intent_from_checkpoint(
                 final_checkpoint,
                 redactor=SecretRedactor(),
             ) == approval_support.approval_resolution_intent_for(
@@ -11288,7 +11288,7 @@ def test_session_store_conformance_approval_event_ack_loss_rejects_request_drift
             )
             assert recovered.actions == (IncompleteSessionRecoveryAction.PENDING_APPROVAL,)
             checkpoint = await store.load_checkpoint(session_id)
-            intent = approval_support.approval_resolution_intent_from_checkpoint(
+            intent = pending_approval_reader.approval_resolution_intent_from_checkpoint(
                 checkpoint,
                 redactor=redactor,
             )
@@ -11466,7 +11466,7 @@ def test_session_store_conformance_legacy_history_cannot_be_poisoned_by_retry(
                 ),
             )
             assert (
-                approval_support.approval_resolution_intent_from_checkpoint(
+                pending_approval_reader.approval_resolution_intent_from_checkpoint(
                     await store.load_checkpoint(session_id),
                     redactor=SecretRedactor(),
                 )
@@ -11532,7 +11532,7 @@ def test_session_store_conformance_legacy_history_cannot_be_poisoned_by_retry(
                 )
                 assert tool_calls == []
                 assert (
-                    approval_support.approval_resolution_intent_from_checkpoint(
+                    pending_approval_reader.approval_resolution_intent_from_checkpoint(
                         await store.load_checkpoint(session_id),
                         redactor=SecretRedactor(),
                     )
@@ -11563,7 +11563,7 @@ def test_session_store_conformance_legacy_history_cannot_be_poisoned_by_retry(
             assert binding.bind_calls == 1
             assert tool_calls == []
             assert (
-                approval_support.approval_resolution_intent_from_checkpoint(
+                pending_approval_reader.approval_resolution_intent_from_checkpoint(
                     await store.load_checkpoint(session_id),
                     redactor=SecretRedactor(),
                 )
@@ -11585,7 +11585,7 @@ def test_session_store_conformance_legacy_history_cannot_be_poisoned_by_retry(
             assert tool_calls == []
             final_checkpoint = await store.load_checkpoint(session_id)
             assert (
-                approval_support.approval_resolution_intent_from_checkpoint(
+                pending_approval_reader.approval_resolution_intent_from_checkpoint(
                     final_checkpoint,
                     redactor=SecretRedactor(),
                 )
@@ -11765,7 +11765,7 @@ def test_session_store_conformance_lossy_legacy_grant_cannot_authorize_pending_s
                 == approval
             )
             assert (
-                approval_support.approval_resolution_intent_from_checkpoint(
+                pending_approval_reader.approval_resolution_intent_from_checkpoint(
                     checkpoint,
                     redactor=redactor,
                 )

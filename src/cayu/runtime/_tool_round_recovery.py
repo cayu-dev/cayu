@@ -586,7 +586,7 @@ def checkpoint_without_pending_tool_round(
     # A completed tool event alone does not authorize retiring that owner.
     if copied_checkpoint.get(WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY):
         raise RuntimeError("Cannot retire a tool round with unsettled workspace observations.")
-    from cayu.runtime._foreground_child_wait import (
+    from cayu.sessions._foreground_child_checkpoint import (
         FOREGROUND_CHILD_TERMINAL_KEY,
         FOREGROUND_CHILD_WAIT_KEY,
         foreground_child_state_from_checkpoint,

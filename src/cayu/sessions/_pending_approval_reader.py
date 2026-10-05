@@ -2,16 +2,26 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any, Literal
 
-from cayu._validation import copy_durable_json_value
-from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval, ToolPolicyEvidence
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from cayu._validation import copy_durable_json_value, require_durable_clean_nonblank
+from cayu.approvals.tools import (
+    PendingToolApproval,
+    PendingToolCallApproval,
+    ToolApprovalDecision,
+    ToolPolicyEvidence,
+)
+from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
 from cayu.tools.policy import ToolPolicyDecision
 from cayu.vaults.redaction import SecretRedactor, contains_redacted_secret
 
 PENDING_TOOL_APPROVAL_CHECKPOINT_KEY = "pending_tool_approval"
+APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY = "approval_resolution_intent"
 
 
 def tool_round_secret_resolution_scope(
@@ -195,3 +205,93 @@ def effective_tool_policy_evidence(
     }:
         return ToolPolicyEvidence.AUTHORITATIVE
     return ToolPolicyEvidence.UNREGISTERED
+
+
+class ApprovalResolutionIntent(BaseModel):
+    """Immutable resolution authority retained with one pending approval."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    approval_id: str
+    tool_call_id: str
+    tool_round_id: str
+    model_step_id: str
+    model_attempt_id: str
+    decision: ToolApprovalDecision
+    pause_resolved_at: datetime | None = Field(default=None, exclude_if=lambda value: value is None)
+    # ``None`` loads checkpoints written before request digests existed. It is
+    # intentionally non-authoritative and must never be upgraded after the fact.
+    resolution_request_digest: str | None = None
+    # Reviewed tool arguments remain immutable even as the paired round's
+    # publication coverage advances. Legacy/unreviewed claims do not acquire
+    # this authority retroactively.
+    reviewed_approval_digest: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+    @field_validator("pause_resolved_at")
+    @classmethod
+    def validate_pause_resolved_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("pause_resolved_at must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @field_validator("approval_id", "tool_call_id")
+    @classmethod
+    def validate_nonblank_identity(cls, value: str, info) -> str:
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("resolution_request_digest", "reviewed_approval_digest")
+    @classmethod
+    def validate_resolution_request_digest(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if (
+            type(value) is not str
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError("resolution_request_digest must be a lowercase SHA-256 digest.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_execution_identity(self) -> ApprovalResolutionIntent:
+        ToolRoundIdentity(
+            tool_round_id=self.tool_round_id,
+            model_step_id=self.model_step_id,
+            model_attempt_id=self.model_attempt_id,
+        )
+        return self
+
+
+def approval_resolution_intent_from_checkpoint(
+    checkpoint: dict[str, Any] | None,
+    *,
+    redactor: SecretRedactor | None = None,
+) -> ApprovalResolutionIntent | None:
+    if checkpoint is None:
+        return None
+    copied = copy_durable_json_value(checkpoint, "checkpoint")
+    value = copied.get(APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY)
+    if value is None:
+        return None
+    if redactor is not None and durable_value_contains_secret(
+        value,
+        redactor=redactor,
+        path=(APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY,),
+    ):
+        raise ValueError(
+            "Approval resolution intent contains a workload secret and cannot be executed."
+        )
+    if type(value) is not dict:
+        raise ValueError("Approval resolution intent checkpoint must be an object.")
+    try:
+        return ApprovalResolutionIntent.model_validate(value)
+    except Exception:
+        if redactor is None:
+            raise
+        raise ValueError(
+            "Approval resolution intent checkpoint is invalid and cannot be executed."
+        ) from None

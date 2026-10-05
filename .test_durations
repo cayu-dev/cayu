@@ -1,4 +1,6 @@
 {
+    "tests/core/test_foreground_child_checkpoint_boundary.py::test_foreground_checkpoint_reads_and_projects_without_runtime_owners": 1.02,
+    "tests/core/test_foreground_child_checkpoint_boundary.py::test_foreground_checkpoint_models_have_canonical_identity_and_annotations": 0.155,
     "tests/core/test_application_task_creation.py::test_task_creation_composes_contracts_and_session_provenance[memory]": 0.014365416005603038,
     "tests/core/test_application_task_creation.py::test_task_creation_composes_contracts_and_session_provenance[postgres]": 0.5983125420170836,
     "tests/core/test_application_task_creation.py::test_task_creation_composes_contracts_and_session_provenance[sqlite]": 0.17126358399400488,

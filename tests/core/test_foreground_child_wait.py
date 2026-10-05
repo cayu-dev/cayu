@@ -9,11 +9,11 @@ from cayu.applications import CayuApp
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.runtime._event_projection import prepare_new_runtime_event, project_runtime_event
-from cayu.runtime._foreground_child_wait import (
+from cayu.runtime._foreground_child_wait import event_with_foreground_child_wait_authority
+from cayu.sessions._foreground_child_checkpoint import (
     ForegroundChildResumeRequest,
     ForegroundChildTerminal,
     ForegroundChildWait,
-    event_with_foreground_child_wait_authority,
     foreground_child_state_from_checkpoint,
 )
 from cayu.sessions.base import ResumeRequest

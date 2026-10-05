@@ -120,11 +120,11 @@ def test_foreground_child_action_suspends_and_automatically_continues_parent(
             children = await store.list_sessions(SessionQuery(parent_session_id="parent"))
             assert len(children.sessions) == 1
             child = children.sessions[0]
-            from cayu.runtime._foreground_child_wait import ForegroundChildWait
             from cayu.runtime.execution_profiles import (
                 active_invocation_execution_profile_from_checkpoint,
                 active_invocation_execution_profile_is_released,
             )
+            from cayu.sessions._foreground_child_checkpoint import ForegroundChildWait
 
             for paused_id in ("parent", child.id):
                 paused = await store.load(paused_id)
@@ -351,7 +351,7 @@ def test_foreground_child_action_suspends_and_automatically_continues_parent(
                 "parent", f"tool-round:{wait.parent_effect.tool_round_id}"
             )
             assert receipt is not None
-            from cayu.runtime._foreground_child_wait import (
+            from cayu.sessions._foreground_child_checkpoint import (
                 FOREGROUND_PARENT_CONTINUATION_KEY,
                 ForegroundChildTerminal,
                 ForegroundParentContinuation,

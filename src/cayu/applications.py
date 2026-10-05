@@ -411,7 +411,6 @@ from cayu.runtime._execution_profile_identity_validation import (
 from cayu.runtime._execution_to_wait import _ExecutionToWait
 from cayu.runtime._external_execution_to_wait import _ExternalExecutionToWait
 from cayu.runtime._foreground_child_delivery import ForegroundChildDeliveryOwner
-from cayu.runtime._foreground_child_wait import ForegroundChildTerminal, ForegroundChildWait
 from cayu.runtime._fork_source_snapshot import (
     fork_source_checkpoint_projection,
     fork_source_checkpoint_sha256,
@@ -587,6 +586,7 @@ from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
     execution_profile_from_session_metadata,
 )
+from cayu.sessions._foreground_child_checkpoint import ForegroundChildTerminal, ForegroundChildWait
 from cayu.sessions._session_continuation import ContinuationTicket
 from cayu.sessions.base import (
     _RECIPIENT_PROVENANCE_CAPABILITY,

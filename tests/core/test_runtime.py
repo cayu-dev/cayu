@@ -28974,7 +28974,8 @@ async def _seed_crashed_spawn_parent(
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime import _tool_execution as tool_execution
     from cayu.runtime import _tool_round_recovery as tool_round_recovery
-    from cayu.runtime._tool_effect_state import ToolEffectIntent, ToolEffectStateOwner
+    from cayu.runtime._tool_effect_state import ToolEffectStateOwner
+    from cayu.sessions._tool_effect_intent import ToolEffectIntent
 
     child_identity = SessionIdentity(provider_name="fake", model="fake-model")
     parent_interaction_id = "interaction-parent-crashed-spawn"

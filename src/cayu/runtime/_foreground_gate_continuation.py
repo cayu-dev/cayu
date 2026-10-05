@@ -15,20 +15,17 @@ from cayu.approvals.user_input import (
     UserInputResponse,
     user_input_lifecycle_authority_from_checkpoint,
 )
-from cayu.runtime import _approval_support as approval_support
-from cayu.runtime._foreground_child_wait import (
-    FOREGROUND_CHILD_TERMINAL_KEY,
-    ForegroundChildResumeRequest,
-    ForegroundChildTerminal,
-    ForegroundChildWait,
-    ForegroundParentContinuation,
-    foreground_child_state_from_checkpoint,
-    post_action_continuation_round_from_checkpoint,
-)
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
+)
+from cayu.sessions._foreground_child_checkpoint import (
+    FOREGROUND_CHILD_TERMINAL_KEY,
+    ForegroundChildTerminal,
+    ForegroundChildWait,
+    ForegroundParentContinuation,
+    foreground_child_state_from_checkpoint,
 )
 from cayu.sessions.base import (
     Session,
@@ -201,44 +198,9 @@ def gate_input_response_from_recovery(request: UserInputRecoveryRequest) -> User
     )
 
 
-def gate_close_continuation(checkpoint, *, pending, publication_id, metadata):
-    wait, selected = foreground_child_state_from_checkpoint(checkpoint)
-    if wait is None:
-        return None
-    if selected is None or pending.tool_round_id != wait.parent_effect.tool_round_id:
-        raise SessionRunFenced("Gate closure lacks its selected child outcome.")
-    pending = post_action_continuation_round_from_checkpoint(checkpoint)
-    if pending is None:
-        raise SessionRunFenced("Gate closure lost its original round.")
-    if pending.max_steps is None or pending.limits is None or pending.budget_limits is None:
-        raise SessionRunFenced("Gate closure lacks original execution semantics.")
-    pending_input, _ = user_input_lifecycle_authority_from_checkpoint(checkpoint)
-    completed_model_step = pending.model_step if pending_input is None else pending_input.model_step
-    if type(completed_model_step) is not int:
-        raise SessionRunFenced("Gate closure lacks its consumed model step.")
-    return ForegroundParentContinuation(
-        terminal=selected,
-        publication_id=publication_id,
-        completed_model_step=completed_model_step,
-        run_limit_accounting=pending.run_limit_accounting,
-        task_id=pending.task_id,
-        request=ForegroundChildResumeRequest(
-            session_id=wait.parent_effect.session_id,
-            messages=[],
-            metadata=metadata,
-            max_steps=pending.max_steps,
-            limits=pending.limits,
-            budget_limits=pending.budget_limits,
-            retry_policy=pending.retry_policy,
-            structured_output=pending.structured_output,
-            thinking=pending.thinking,
-        ),
-    ).model_dump(mode="json")
-
-
 def _intent(checkpoint, kind):
     if kind == "approval":
-        intent = approval_support.approval_resolution_intent_from_checkpoint(checkpoint)
+        intent = pending_approval_reader.approval_resolution_intent_from_checkpoint(checkpoint)
         return intent, None
     _, intent = user_input_lifecycle_authority_from_checkpoint(checkpoint)
     return intent, None if intent is None else intent.answer_request_digest

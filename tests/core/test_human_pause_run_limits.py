@@ -32,6 +32,7 @@ from cayu.budgets._run_limit_accounting import (
 )
 from cayu.budgets.usage import SessionUsageSummary
 from cayu.runtime._run_limit_accounting import restore_run_limit_accounting_context
+from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.storage.migrations import SchemaMode
 
 
@@ -500,7 +501,9 @@ def test_resolution_claim_retries_keep_first_durable_pause_end(pause_kind):
                 redactor=redactor,
                 pause_resolved_at=later,
             )
-            intent = approvals.approval_resolution_intent_from_checkpoint(second_checkpoint)
+            intent = pending_approval_reader.approval_resolution_intent_from_checkpoint(
+                second_checkpoint
+            )
         else:
             pending = PendingUserInput.model_validate(checkpoint["pending_user_input"])
             kwargs = dict(

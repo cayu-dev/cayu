@@ -40,12 +40,11 @@ from cayu.runtime.tool_effects import (
     ToolEffectConflict,
     ToolEffectReceipt,
     ToolEffectReconciliationResult,
-    _bounded_text,
     _copy_string_map,
     copy_tool_effect_receipt,
 )
+from cayu.sessions import _tool_effect_intent as tool_effect_intent
 from cayu.sessions.base import (
-    MAX_SESSION_ID_BYTES,
     EventQuery,
     RuntimePublicationMutation,
     Session,
@@ -96,46 +95,6 @@ class ToolEffectReconciliationCleanupFailure(ToolEffectReconciliationRequired):
             "External tool uncertainty and observation cleanup failure.",
             [primary, cleanup],
         )
-
-
-class ToolEffectIntent(BaseModel):
-    """Immutable identity of the actual effective call, not its model proposal."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    session_id: StrictStr
-    session_instance_id: StrictStr
-    source_run_epoch: StrictInt = Field(ge=0)
-    interaction_id: StrictStr
-    model_step_id: StrictStr
-    model_attempt_id: StrictStr
-    tool_round_id: StrictStr
-    tool_call_id: StrictStr
-    agent_name: StrictStr
-    tool_name: StrictStr
-    idempotency_key: StrictStr
-    effect: Literal["external"] = "external"
-    execution_profile_fingerprint: StrictStr
-    schema_digest: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
-    arguments_digest: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
-    approval_id: StrictStr | None = None
-    pause_id: StrictStr | None = None
-    environment_name: StrictStr | None = None
-    allocation_fingerprint: StrictStr | None = None
-    reconciler_fingerprint: StrictStr | None = None
-    targeted_invocation_digest: StrictStr | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
-
-    @field_validator("*", mode="after")
-    @classmethod
-    def bound_identity(cls, value, info):
-        if isinstance(value, str):
-            return _bounded_text(
-                value,
-                info.field_name,
-                maximum=MAX_SESSION_ID_BYTES if info.field_name == "session_id" else 256,
-                identifier=True,
-            )
-        return value
 
 
 class ToolEffectTerminal(BaseModel):
@@ -217,7 +176,7 @@ class ToolEffectRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     schema_version: StrictInt = Field(default=1, ge=1, le=1)
-    intent: ToolEffectIntent
+    intent: tool_effect_intent.ToolEffectIntent
     revision: StrictInt = Field(ge=0)
     state: EffectState
     dispatch_id: StrictStr | None = None
@@ -322,7 +281,7 @@ def _copy_model(value, model):
         raise TypeError("Effect state requires an exact runtime model.")
     fields = {name: getattr(value, name) for name in model.model_fields}
     if model is ToolEffectRecord:
-        fields["intent"] = _copy_model(value.intent, ToolEffectIntent)
+        fields["intent"] = _copy_model(value.intent, tool_effect_intent.ToolEffectIntent)
         if value.terminal is not None:
             fields["terminal"] = _copy_model(value.terminal, ToolEffectTerminal)
         if value.observation is not None:
@@ -334,8 +293,8 @@ def _copy_model(value, model):
     return model(**fields)
 
 
-def effect_storage_key(intent: ToolEffectIntent) -> str:
-    intent = _copy_model(intent, ToolEffectIntent)
+def effect_storage_key(intent: tool_effect_intent.ToolEffectIntent) -> str:
+    intent = _copy_model(intent, tool_effect_intent.ToolEffectIntent)
     return _call_storage_key(
         intent.session_id,
         intent.session_instance_id,
@@ -538,8 +497,8 @@ class ToolEffectStateOwner:
             raise ToolEffectReconciliationRequired()
         raise ToolEffectConflict("Manual recovery cannot replace durable external-effect evidence.")
 
-    async def load(self, intent: ToolEffectIntent) -> ToolEffectRecord | None:
-        intent = _copy_model(intent, ToolEffectIntent)
+    async def load(self, intent: tool_effect_intent.ToolEffectIntent) -> ToolEffectRecord | None:
+        intent = _copy_model(intent, tool_effect_intent.ToolEffectIntent)
         raw = await self._store.load_session_operation(
             intent.session_id, effect_storage_key(intent)
         )
@@ -553,12 +512,12 @@ class ToolEffectStateOwner:
     @timed_phase("effect_state")
     async def prepare(
         self,
-        intent: ToolEffectIntent,
+        intent: tool_effect_intent.ToolEffectIntent,
         *,
         run_epoch: int,
         child_recovery_arguments: dict[str, Any] | None = None,
     ) -> ToolEffectRecord:
-        intent = _copy_model(intent, ToolEffectIntent)
+        intent = _copy_model(intent, tool_effect_intent.ToolEffectIntent)
         return await self._publish(
             intent=intent,
             expected=None,
@@ -574,7 +533,7 @@ class ToolEffectStateOwner:
     @timed_phase("effect_state")
     async def begin(
         self,
-        intent: ToolEffectIntent,
+        intent: tool_effect_intent.ToolEffectIntent,
         *,
         run_epoch: int,
         child_recovery_arguments: dict[str, Any] | None = None,
@@ -681,7 +640,7 @@ class ToolEffectStateOwner:
     async def _publish(
         self,
         *,
-        intent: ToolEffectIntent,
+        intent: tool_effect_intent.ToolEffectIntent,
         expected: ToolEffectRecord | None,
         state: EffectState,
         dispatch_id: str | None,

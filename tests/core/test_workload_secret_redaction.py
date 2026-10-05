@@ -5316,7 +5316,7 @@ def test_approval_resolution_digest_is_typed_private_checkpoint_state() -> None:
     )
     digest = approval_support.approval_resolution_request_digest(request)
     checkpoint = {
-        approval_support.APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY: {
+        pending_approval_reader.APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY: {
             "approval_id": request.approval_id,
             "tool_call_id": request.tool_call_id,
             "tool_round_id": request.tool_round_id,

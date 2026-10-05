@@ -450,6 +450,14 @@ Session inspection and runtime recovery use the same reader and canonical approv
 models. Approval resolution, checkpoint writes, live policy evaluation and event
 publication remain with their existing owners.
 
+`sessions/_foreground_child_checkpoint.py` owns saved child waits, terminal
+selections and continuation records, plus their readers and close projections.
+It shares the canonical effect identity in `sessions/_tool_effect_intent.py` and
+the saved approval-resolution intent in `sessions/_pending_approval_reader.py`.
+These components work without the runtime wait, effect-state or approval owners.
+Runtime still authenticates live parent/child authority, resolves actions and
+executes continuations; storage retains atomic publication and fencing.
+
 `sessions/checkpoints.py` owns root checkpoint decoding and schema migrations.
 The adjacent private modules `_model_completion_publication`, `_terminal_evidence`,
 `_invocation_terminal_decision`, and `_provider_operation_cancellation_claim` own

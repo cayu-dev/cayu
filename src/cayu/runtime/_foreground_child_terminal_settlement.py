@@ -9,11 +9,11 @@ from cayu.runtime._child_session_identity import (
     ChildSessionRecoveryMatcher,
     generate_child_session_id,
 )
-from cayu.runtime._foreground_child_wait import (
+from cayu.runtime._tool_effect_state import ToolEffectStateOwner
+from cayu.sessions._foreground_child_checkpoint import (
     ForegroundChildWait,
     foreground_child_state_from_checkpoint,
 )
-from cayu.runtime._tool_effect_state import ToolEffectStateOwner
 from cayu.sessions.base import (
     EventQuery,
     IncompleteSessionRecoveryRequest,

@@ -235,8 +235,6 @@ from cayu.runtime._event_writer import (
 from cayu.runtime._execution_profile_admission import ModelFailoverProfileResolution
 from cayu.runtime._foreground_child_wait import (
     ForegroundChildActionRequired,
-    ForegroundChildTerminal,
-    ForegroundChildWait,
     event_with_foreground_child_wait_authority,
 )
 from cayu.runtime._foreground_gate_continuation import ForegroundGatePolicyOwner, GateReplay
@@ -395,6 +393,7 @@ from cayu.sessions._execution_profile_checkpoint import (
     checkpoint_with_active_invocation_execution_profile,
     execution_profile_from_session_metadata,
 )
+from cayu.sessions._foreground_child_checkpoint import ForegroundChildTerminal, ForegroundChildWait
 from cayu.sessions._invocation_lifecycle import (
     AdmittedInvocationBinding,
     InvocationLifecycleCommandConflict,
@@ -1760,7 +1759,7 @@ class RecoveryCoordinator:
             interaction_id = approval.approval_id
             scope = approval.secret_resolution_scope
             content = [approval.model_dump(mode="json"), pending_round.model_dump(mode="json")]
-            resolution_intent = approval_support.approval_resolution_intent_from_checkpoint(
+            resolution_intent = pending_approval_reader.approval_resolution_intent_from_checkpoint(
                 checkpoint, redactor=self._secret_redactor
             )
             question, options = None, ()
@@ -1872,7 +1871,7 @@ class RecoveryCoordinator:
                 SessionStatus.INTERRUPTING,
             }:
                 return unavailable
-            approval_intent = approval_support.approval_resolution_intent_from_checkpoint(
+            approval_intent = pending_approval_reader.approval_resolution_intent_from_checkpoint(
                 checkpoint, redactor=self._secret_redactor
             )
             _pending, intent = user_input_lifecycle_authority_from_checkpoint(
@@ -6441,7 +6440,7 @@ class RecoveryCoordinator:
             redactor=self._secret_redactor,
             runtime_session=loaded_session,
         )
-        candidate_intent = approval_support.approval_resolution_intent_from_checkpoint(
+        candidate_intent = pending_approval_reader.approval_resolution_intent_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
         )
@@ -6539,7 +6538,7 @@ class RecoveryCoordinator:
         )
         pending_approval: PendingToolApproval | None = None
         pending_round: pending_rounds.PendingToolRound | None = None
-        claimed_intent: approval_support.ApprovalResolutionIntent | None = None
+        claimed_intent: pending_approval_reader.ApprovalResolutionIntent | None = None
 
         def claim_exact_approval(
             _current_session: Session,
@@ -6556,7 +6555,7 @@ class RecoveryCoordinator:
             )
             if pending_approval != candidate_approval or pending_round != candidate_round:
                 raise RuntimeError("Pending tool approval changed before it was claimed.")
-            current_intent = approval_support.approval_resolution_intent_from_checkpoint(
+            current_intent = pending_approval_reader.approval_resolution_intent_from_checkpoint(
                 checkpoint,
                 redactor=self._secret_redactor,
             )
@@ -6618,7 +6617,7 @@ class RecoveryCoordinator:
                 ),
                 runtime_session=_current_session,
             )
-            claimed_intent = approval_support.approval_resolution_intent_from_checkpoint(
+            claimed_intent = pending_approval_reader.approval_resolution_intent_from_checkpoint(
                 claimed_checkpoint,
                 redactor=self._secret_redactor,
             )
@@ -7835,7 +7834,7 @@ class RecoveryCoordinator:
             redactor=self._secret_redactor,
             runtime_session=loaded_session,
         )
-        candidate_intent = approval_support.approval_resolution_intent_from_checkpoint(
+        candidate_intent = pending_approval_reader.approval_resolution_intent_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
         )
@@ -7897,7 +7896,7 @@ class RecoveryCoordinator:
         )
         pending_approval: PendingToolApproval | None = None
         pending_round: pending_rounds.PendingToolRound | None = None
-        claimed_resolution_intent: approval_support.ApprovalResolutionIntent | None = None
+        claimed_resolution_intent: pending_approval_reader.ApprovalResolutionIntent | None = None
 
         def claim_exact_approval(
             _current_session: Session,
@@ -7917,7 +7916,7 @@ class RecoveryCoordinator:
             self._require_human_review_decision(
                 request.review_reference, _current_session, checkpoint, denying=True
             )
-            current_intent = approval_support.approval_resolution_intent_from_checkpoint(
+            current_intent = pending_approval_reader.approval_resolution_intent_from_checkpoint(
                 checkpoint,
                 redactor=self._secret_redactor,
             )
@@ -9443,7 +9442,7 @@ class RecoveryCoordinator:
                 redactor=self._secret_redactor,
                 runtime_session=session,
             )
-            from cayu.runtime._foreground_gate_continuation import gate_close_continuation
+            from cayu.sessions._foreground_child_checkpoint import gate_close_continuation
 
             gate_continuation = gate_close_continuation(
                 source_checkpoint,
@@ -9455,7 +9454,7 @@ class RecoveryCoordinator:
                 target_checkpoint.pop("foreground_child_wait", None)
                 target_checkpoint.pop("foreground_child_terminal", None)
                 target_checkpoint["foreground_parent_continuation"] = gate_continuation
-            from cayu.runtime._foreground_child_wait import (
+            from cayu.sessions._foreground_child_checkpoint import (
                 FOREGROUND_CHILD_POST_ACTION_CONTINUATION_KEY,
                 post_action_continuation_for_close,
             )
@@ -9900,7 +9899,7 @@ class RecoveryCoordinator:
         deferred_messages: list[Message] | None = None,
         emit_resume_event: bool = True,
         enforce_expiry: bool = True,
-        claimed_resolution_intent: approval_support.ApprovalResolutionIntent | None = None,
+        claimed_resolution_intent: pending_approval_reader.ApprovalResolutionIntent | None = None,
         recovery_closure_only: bool = False,
         invocation_context: InvocationContext | None = None,
         foreground_gate: GateReplay | None = None,
@@ -10080,7 +10079,7 @@ class RecoveryCoordinator:
                 raise RuntimeError(
                     "Tool approval resolution request identity was not durably claimed."
                 )
-            current_intent = approval_support.approval_resolution_intent_from_checkpoint(
+            current_intent = pending_approval_reader.approval_resolution_intent_from_checkpoint(
                 current_checkpoint,
                 redactor=self._secret_redactor,
             )
@@ -10832,7 +10831,7 @@ class RecoveryCoordinator:
                 redactor=self._secret_redactor,
                 runtime_session=session,
             )
-            from cayu.runtime._foreground_gate_continuation import gate_close_continuation
+            from cayu.sessions._foreground_child_checkpoint import gate_close_continuation
 
             gate_continuation = gate_close_continuation(
                 source_checkpoint,
@@ -10842,7 +10841,7 @@ class RecoveryCoordinator:
             )
             if gate_continuation is not None:
                 target_checkpoint["foreground_parent_continuation"] = gate_continuation
-            from cayu.runtime._foreground_child_wait import (
+            from cayu.sessions._foreground_child_checkpoint import (
                 FOREGROUND_CHILD_POST_ACTION_CONTINUATION_KEY,
                 post_action_continuation_for_close,
             )
@@ -12103,7 +12102,7 @@ class RecoveryCoordinator:
         execution_profile_snapshot: ActiveInvocationExecutionProfile,
         budget_policy: BudgetPolicy | None,
         deferred_messages: list[Message],
-        claimed_resolution_intent: approval_support.ApprovalResolutionIntent | None,
+        claimed_resolution_intent: pending_approval_reader.ApprovalResolutionIntent | None,
         invocation_context: InvocationContext | None = None,
         participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
@@ -17555,7 +17554,7 @@ class RecoveryCoordinator:
             consume_on_rejection=True,
             runtime_session=session,
         )
-        from cayu.runtime._foreground_child_wait import (
+        from cayu.sessions._foreground_child_checkpoint import (
             FOREGROUND_CHILD_POST_ACTION_CONTINUATION_KEY,
             post_action_continuation_from_checkpoint,
         )
@@ -23198,7 +23197,7 @@ class RecoveryCoordinator:
             raise ForegroundSubagentRecoveryRequired(
                 child_session_id=child.id, tool_round_id=tool_round_id, tool_call_id=tool_call_id
             )
-        from cayu.runtime._foreground_child_wait import (
+        from cayu.sessions._foreground_child_checkpoint import (
             foreground_child_state_from_checkpoint,
         )
 

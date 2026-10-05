@@ -511,7 +511,7 @@ def _build_tool_round_publication_request(
         pending_round=copied_pending_round,
         durable_events=durable_events,
     )
-    from cayu.runtime._foreground_child_wait import (
+    from cayu.sessions._foreground_child_checkpoint import (
         FOREGROUND_CHILD_POST_ACTION_CONTINUATION_KEY,
         FOREGROUND_CHILD_TERMINAL_KEY,
         FOREGROUND_PARENT_CONTINUATION_KEY,
@@ -565,7 +565,7 @@ def _build_tool_round_publication_request(
         for operation in mutation.operations
         if operation.key == PENDING_TOOL_ROUND_CHECKPOINT_KEY
     ]
-    from cayu.runtime._foreground_child_wait import (
+    from cayu.sessions._foreground_child_checkpoint import (
         FOREGROUND_CHILD_TERMINAL_KEY,
         FOREGROUND_CHILD_WAIT_KEY,
     )

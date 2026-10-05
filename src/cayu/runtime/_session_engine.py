@@ -382,16 +382,8 @@ from cayu.runtime._execution_profile_identity_validation import (
 from cayu.runtime._execution_to_wait import _ExecutionToWait
 from cayu.runtime._external_execution_to_wait import _ExternalExecutionToWait
 from cayu.runtime._foreground_child_wait import (
-    FOREGROUND_CHILD_TERMINAL_KEY,
-    FOREGROUND_CHILD_WAIT_KEY,
-    FOREGROUND_PARENT_CONTINUATION_KEY,
     ForegroundChildActionRequired,
-    ForegroundChildResumeRequest,
-    ForegroundChildTerminal,
-    ForegroundChildWait,
-    ForegroundParentContinuation,
     event_with_foreground_child_wait_authority,
-    foreground_child_state_from_checkpoint,
 )
 from cayu.runtime._foreground_subagent_recovery import ForegroundSubagentRecoveryRequired
 from cayu.runtime._fork_source_snapshot import (
@@ -616,6 +608,16 @@ from cayu.sessions._execution_profile_checkpoint import (
     checkpoint_with_active_invocation_execution_profile,
     execution_profile_from_session_metadata,
     execution_profile_session_metadata,
+)
+from cayu.sessions._foreground_child_checkpoint import (
+    FOREGROUND_CHILD_TERMINAL_KEY,
+    FOREGROUND_CHILD_WAIT_KEY,
+    FOREGROUND_PARENT_CONTINUATION_KEY,
+    ForegroundChildResumeRequest,
+    ForegroundChildTerminal,
+    ForegroundChildWait,
+    ForegroundParentContinuation,
+    foreground_child_state_from_checkpoint,
 )
 from cayu.sessions._invocation_lifecycle import (
     AdmitInvocationCommand,
@@ -4098,7 +4100,9 @@ def _checkpoint_with_pending_session_interrupt(
                 or approval_round is None
                 or approval_round.assistant_message_state != "quarantined"
                 or terminal_decision is None
-                or approval_support.approval_resolution_intent_from_checkpoint(copied_checkpoint)
+                or pending_approval_reader.approval_resolution_intent_from_checkpoint(
+                    copied_checkpoint
+                )
                 is not None
             ):
                 raise SessionRunFenced("Approval stop lost its exact unclaimed pause.")
@@ -4835,9 +4839,7 @@ def _pending_interaction_action_kind(
 ) -> str | None:
     """Use the same durable gate classification for pause and terminal election."""
 
-    from cayu.runtime._foreground_child_wait import (
-        foreground_child_state_from_checkpoint,
-    )
+    from cayu.sessions._foreground_child_checkpoint import foreground_child_state_from_checkpoint
 
     if foreground_child_state_from_checkpoint(checkpoint)[0] is not None:
         return "waiting_on_child_action"
@@ -19443,7 +19445,7 @@ class SessionEngine:
                 if (
                     pending_approval_reader.pending_approval_from_checkpoint(interrupt_checkpoint)
                     != interrupted_pending_approval
-                    or approval_support.approval_resolution_intent_from_checkpoint(
+                    or pending_approval_reader.approval_resolution_intent_from_checkpoint(
                         interrupt_checkpoint
                     )
                     is not None

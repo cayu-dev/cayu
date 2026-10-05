@@ -1320,7 +1320,7 @@ def _delegated_action_from_records(
     records_desc: list[EventRecord],
     checkpoint: dict[str, Any] | None,
 ) -> PendingActionRecord | None:
-    from cayu.runtime._foreground_child_wait import ForegroundChildWait
+    from cayu.sessions._foreground_child_checkpoint import ForegroundChildWait
 
     if session.status is not SessionStatus.INTERRUPTED or checkpoint is None:
         return None
