@@ -336,3 +336,34 @@ def test_missing_readme_does_not_hide_unsafe_service_access(
         "PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE",
         "PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE",
     }
+
+
+def test_serve_auth_on_a_public_service_blocks_because_cayu_serve_rejects_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CLOUD_CHECK_TEST_ACCESS", "configured")
+    project = _service_project(tmp_path / "svc")
+    with (project / "pyproject.toml").open("a") as stream:
+        stream.write('\n[tool.cayu.serve]\nauth = "cloud_check_service:authenticate"\n')
+
+    check = run_cloud_deploy_check(
+        project, serves_web=True, web_command="cayu serve --host 0.0.0.0 --port 8000"
+    )
+
+    assert check.status == "failed"
+    assert check.codes == ("SERVE_AUTH_WITH_SERVICE_FACTORY",)
+
+
+def test_a_public_service_without_the_server_extra_is_blocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CLOUD_CHECK_TEST_ACCESS", "configured")
+    project = _service_project(tmp_path / "svc")
+    pyproject = project / "pyproject.toml"
+    pyproject.write_text(pyproject.read_text().replace('["cayu[server]"]', '["cayu"]'))
+
+    check = run_cloud_deploy_check(
+        project, serves_web=True, web_command="cayu serve --host 0.0.0.0 --port 8000"
+    )
+
+    assert check.codes == ("SERVE_SERVER_EXTRA_MISSING",)

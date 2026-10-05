@@ -520,13 +520,13 @@ def build_app():
 
 @pytest.mark.parametrize("host", ["127.0.0.1", "::1", "localhost", "LOCALHOST"])
 def test_dev_host_check_accepts_loopback_names(host: str) -> None:
-    serve_cli._require_loopback_dev_host(host)
+    serve_cli.require_loopback_dev_host(host)
 
 
 @pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.10", "localhost.example.com"])
 def test_dev_host_check_refuses_non_loopback_hosts(host: str) -> None:
     with pytest.raises(serve_cli.ServeError, match="non-loopback host"):
-        serve_cli._require_loopback_dev_host(host)
+        serve_cli.require_loopback_dev_host(host)
 
 
 def _write_scaffold(root: Path, name: str, *, preset: str = "agent") -> None:

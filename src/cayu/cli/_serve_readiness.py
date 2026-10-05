@@ -1,6 +1,6 @@
 """Static checks and safe edits that let a deployed `cayu serve` start.
 
-A deployed `cayu serve` needs the `server` extra of `cayu` installed and, unless a
+A deployed `cayu serve` needs Cayu's server dependencies installed and, unless a
 maintained service factory owns access, a `[tool.cayu.serve].auth` target. These
 helpers read `pyproject.toml` without importing the project or `cayu.server`, so
 they work where the server extra is not installed locally.
@@ -16,6 +16,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+import shlex
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -37,6 +38,8 @@ _REQUIREMENT = re.compile(
 _SPECIFIER = re.compile(r"\s*(?P<op>~=|===|==|!=|<=|>=|<|>)\s*(?P<version>[^\s,;()]+)\s*\Z")
 _VERSION = re.compile(r"v?(?:(?P<epoch>\d+)!)?(?P<release>\d+(?:\.\d+)*)(?P<suffix>.*)\Z", re.I)
 _SERVE_HEADER = re.compile(r"^\[\s*tool\s*\.\s*cayu\s*\.\s*serve\s*\][ \t]*(?:#[^\n]*)?$", re.M)
+# Each of these runtime extras includes every dependency in the server extra.
+_SERVER_RUNTIME_EXTRAS = frozenset({"server", "server-settings", "all", "oidc"})
 
 ServerExtraStatus = Literal[
     "present",
@@ -50,7 +53,7 @@ AuthStatus = Literal["configured", "missing", "service_factory", "invalid"]
 
 @dataclass(frozen=True)
 class ServerExtraState:
-    """Whether `[project].dependencies` installs `cayu[server]`."""
+    """Whether `[project].dependencies` installs Cayu's server dependencies."""
 
     status: ServerExtraStatus
     requirement: str | None = None
@@ -141,7 +144,10 @@ class ServeSetupPlan:
 
 
 def is_cayu_serve_command(command: str | None) -> bool:
-    words = (command or "").split()
+    try:
+        words = shlex.split(command or "")
+    except ValueError:
+        words = (command or "").split()
     return words[:2] == ["cayu", "serve"]
 
 
@@ -160,7 +166,9 @@ def server_extra_state(document: Mapping[str, Any]) -> ServerExtraState:
     matches = [item for item in dependencies if _requirement_name(item) == "cayu"]
     if not matches:
         return ServerExtraState("no_cayu_dependency")
-    with_server = [item for item in matches if "server" in _requirement_extras(item)]
+    with_server = [
+        item for item in matches if _SERVER_RUNTIME_EXTRAS.intersection(_requirement_extras(item))
+    ]
     if with_server:
         return ServerExtraState("present", requirement=with_server[0])
     if len(matches) != 1:
@@ -215,7 +223,7 @@ def plan_serve_setup(text: str, *, root: Path | None = None) -> ServeSetupPlan:
         assert extra.requirement is not None and extra.replacement is not None
         replaced = _replace_string_literal(updated, extra.requirement, extra.replacement)
         if replaced is None:
-            manual.append(_extra_edit(extra))
+            manual.append(server_extra_edit(extra))
         else:
             updated = replaced
             dependencies = expected["project"]["dependencies"]
@@ -225,7 +233,7 @@ def plan_serve_setup(text: str, *, root: Path | None = None) -> ServeSetupPlan:
                 f"{json.dumps(extra.replacement)}"
             )
     elif extra.status != "present":
-        manual.append(_extra_edit(extra))
+        manual.append(server_extra_edit(extra))
 
     # The ready-made target is named only when every release the project may
     # install ships it; otherwise a project module composes BasicAuth directly.
@@ -235,14 +243,14 @@ def plan_serve_setup(text: str, *, root: Path | None = None) -> ServeSetupPlan:
     if auth.status == "missing":
         added = _add_auth_target(updated, auth_target)
         if added is None:
-            manual.append(_auth_edit(document, ships_environment_auth))
+            manual.append(serve_auth_edit(document, ships_environment_auth))
         else:
             updated = added
             cayu = expected.setdefault("tool", {}).setdefault("cayu", {})
             cayu.setdefault("serve", {})["auth"] = auth_target
             changes.append(f"[tool.cayu.serve].auth = {json.dumps(auth_target)}")
     elif auth.status == "invalid":
-        manual.append(_auth_edit(document, ships_environment_auth))
+        manual.append(serve_auth_edit(document, ships_environment_auth))
 
     if changes and not manual:
         try:
@@ -255,9 +263,9 @@ def plan_serve_setup(text: str, *, root: Path | None = None) -> ServeSetupPlan:
         # Describe every needed edit rather than writing a partial change.
         manual = []
         if extra.status != "present":
-            manual.append(_extra_edit(extra))
+            manual.append(server_extra_edit(extra))
         if auth.status in {"missing", "invalid"}:
-            manual.append(_auth_edit(document, ships_environment_auth))
+            manual.append(serve_auth_edit(document, ships_environment_auth))
         changes = []
     adds_auth = auth.status == "missing" and bool(changes)
     return ServeSetupPlan(
@@ -409,7 +417,7 @@ def _add_auth_target(text: str, target: str) -> str | None:
     return f"{prefix}\n[tool.cayu.serve]\n{line}"
 
 
-def _extra_edit(extra: ServerExtraState) -> str:
+def server_extra_edit(extra: ServerExtraState) -> str:
     if extra.status in {"missing_extra", "ambiguous"} and extra.requirement is not None:
         replacement = extra.replacement or _with_server_extra(extra.requirement)
         return (
@@ -428,7 +436,7 @@ def _extra_edit(extra: ServerExtraState) -> str:
     )
 
 
-def _auth_edit(document: Mapping[str, Any], ships_environment_auth: bool) -> str:
+def serve_auth_edit(document: Mapping[str, Any], ships_environment_auth: bool) -> str:
     if ships_environment_auth:
         return (
             "Set [tool.cayu.serve].auth to an authentication target, for example:\n"
@@ -449,6 +457,54 @@ def _auth_edit(document: Mapping[str, Any], ships_environment_auth: bool) -> str
         "[tool.cayu.serve]\n"
         f"auth = {json.dumps(ENVIRONMENT_OPERATOR_AUTH_TARGET)}"
     )
+
+
+def lock_installs_server_extra(lock_text: str, project_name: str) -> bool | None:
+    """Whether `uv.lock` installs Cayu's server dependencies for the project's own package.
+
+    Cayu Cloud installs with `uv sync --frozen`, which trusts the lock over
+    `pyproject.toml`. Returns ``None`` when the lock does not show the answer.
+    """
+
+    try:
+        lock = tomllib.loads(lock_text)
+    except tomllib.TOMLDecodeError:
+        return None
+    packages = lock.get("package")
+    if not isinstance(packages, list):
+        return None
+    normalized = _normalize_name(project_name)
+    for package in packages:
+        if not isinstance(package, Mapping) or _normalize_name(package.get("name")) != normalized:
+            continue
+        source = package.get("source")
+        if not isinstance(source, Mapping) or "." not in (
+            source.get("editable"),
+            source.get("virtual"),
+        ):
+            continue
+        dependencies = package.get("dependencies")
+        if not isinstance(dependencies, list):
+            return None
+        entries = [
+            item
+            for item in dependencies
+            if isinstance(item, Mapping) and _normalize_name(item.get("name")) == "cayu"
+        ]
+        if not entries:
+            return None
+        return any(
+            _normalize_name(extra) in _SERVER_RUNTIME_EXTRAS
+            for item in entries
+            for extra in item.get("extra", ())
+        )
+    return None
+
+
+def _normalize_name(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return re.sub(r"[-_.]+", "-", value).lower()
 
 
 def _uv_settings(document: Mapping[str, Any]) -> Mapping[str, Any]:

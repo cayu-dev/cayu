@@ -489,6 +489,7 @@ class InitializedCloudProject:
     name: str
     runtime: str
     serve: dict[str, object] | None = None
+    command: str | None = None
 
 
 def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudProject:
@@ -589,6 +590,7 @@ def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudPr
         serve=None
         if serve_setup is None
         else _serve_setup_report(serve_setup, created_auth_module=writes_auth_module),
+        command=command,
     )
 
 

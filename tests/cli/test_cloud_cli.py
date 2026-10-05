@@ -444,6 +444,8 @@ recovery_inactive_after_seconds = 900
     manifest = cloud_project.CloudProjectManifest.load(manifest_path)
     assert output["operation"] == "init"
     serve = output["result"].pop("serve")
+    # The project has no uv.lock to compare, so the serve check passes on pyproject.toml.
+    assert output["result"].pop("deploy_check")["status"] == "passed"
     assert output["result"] == {
         "application": "research-agent",
         "manifest": str(manifest_path),

@@ -5,10 +5,11 @@ from __future__ import annotations
 import argparse
 import importlib
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 
 from cayu._operator_credentials import (
     ENVIRONMENT_OPERATOR_AUTH_TARGET,
@@ -52,6 +53,38 @@ def add_serve_parser(subparsers: argparse._SubParsersAction) -> None:
             "for deployment."
         ),
     )
+    add_serve_arguments(parser)
+
+
+class _ServeArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> NoReturn:
+        raise ServeError(f"cayu serve: {message}")
+
+    def exit(self, status: int = 0, message: str | None = None) -> NoReturn:
+        raise ServeError(message or f"cayu serve exited with status {status}.")
+
+
+def parse_serve_arguments(arguments: Sequence[str]) -> argparse.Namespace:
+    """Parse the arguments after `cayu serve` exactly as the command does.
+
+    Raises `ServeError` instead of exiting, so a tool that only reads a `cayu serve`
+    command line, such as a deploy check, sees the same options and errors.
+    """
+
+    parser = _ServeArgumentParser(prog="cayu serve", add_help=False)
+    add_serve_arguments(parser)
+    return parser.parse_args(list(arguments))
+
+
+def serve_auth_target(args: argparse.Namespace, configured: str | None) -> str | None:
+    """The auth target `cayu serve` loads outside `--dev`: `--auth` overrides the config."""
+
+    return configured if args.auth is None else args.auth
+
+
+def add_serve_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the `cayu serve` options to `parser`."""
+
     parser.add_argument(
         "--host",
         default="127.0.0.1",
@@ -81,13 +114,13 @@ def run_serve(args: argparse.Namespace) -> int:
     exit_code = 0
     try:
         if args.dev:
-            _require_loopback_dev_host(args.host)
+            require_loopback_dev_host(args.host)
         project = resolve_project(
             command="cayu serve",
             suggest_explicit_target=False,
         )
         settings = _serve_settings(project.root)
-        auth_target = settings.auth_target if args.auth is None else args.auth
+        auth_target = serve_auth_target(args, settings.auth_target)
         if project.service_target is None and not args.dev and auth_target is None:
             raise ServeError(
                 "Refusing to start an unauthenticated server. Pass --dev only for "
@@ -201,7 +234,9 @@ def run_serve(args: argparse.Namespace) -> int:
     return exit_code
 
 
-def _require_loopback_dev_host(host: str) -> None:
+def require_loopback_dev_host(host: str) -> None:
+    """Refuse `--dev` on any host but loopback, as `cayu serve` does."""
+
     try:
         is_loopback = ip_address(host).is_loopback
     except ValueError:

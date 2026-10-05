@@ -387,10 +387,36 @@ service also report `unavailable`, never `passed`. Other source findings, such a
 missing README, do not suppress the service safety checks. Repository sources and projects
 without a public service or a `[web]` process are not checked.
 
-`cayu cloud init` runs the same check for a public service. When it finds a problem, for
-example access that is still a placeholder, or can't run, the result includes
-`deploy_check` and a `warnings` entry naming the `cayu check --deploy --fail-on warning
---json` command to run before deploying.
+When the manifest's web command is `cayu serve`, the deploy also checks that
+`cayu serve` can start outside `--dev`, for any project, not only a public service.
+The command's arguments are parsed with `cayu serve`'s own parser, and the auth
+target checked is the one `cayu serve` would load: `--auth MODULE:ATTRIBUTE` when the
+command passes it, otherwise `[tool.cayu.serve].auth`. These checks read project files
+and don't need `cayu[server]` installed locally:
+
+| Code | Blocks when |
+| --- | --- |
+| `SERVE_SERVER_EXTRA_MISSING` | `[project].dependencies` has no `cayu` requirement with the `server` extra or an extra that includes its dependencies (`all`, `server-settings`, or `oidc`). |
+| `SERVE_LOCK_MISSING_SERVER_EXTRA` | `pyproject.toml` declares server dependencies through one of those extras but `uv.lock` doesn't; Cloud installs from `uv.lock`. Run `uv lock`. |
+| `SERVE_COMMAND_INVALID` | `cayu serve` would reject the web command's arguments, for example `--dev` with `--auth`, an unknown option, or an unclosed quote. |
+| `SERVE_DEV_MODE` | The web command passes `--dev`. `cayu serve` refuses it on a non-loopback host such as `0.0.0.0`, and on loopback it is unauthenticated and unreachable from Cloud. |
+| `SERVE_AUTH_MISSING` | Neither `--auth` nor `[tool.cayu.serve].auth` names a target and there is no `service_factory`, or `[tool.cayu.serve].auth` is not a non-empty string (which `cayu serve` rejects even with `--auth`). |
+| `SERVE_AUTH_TARGET_UNRESOLVABLE` | The effective target's project module or attribute doesn't exist, it isn't callable, or it is the ready-made target and the declared `cayu` requirement allows 0.8.1 or older, which don't ship it. |
+| `SERVE_AUTH_WITH_SERVICE_FACTORY` | A public service also sets `[tool.cayu.serve].auth` or `--auth`, which `cayu serve` rejects. |
+
+Any callable auth dependency is accepted, not only Basic auth. The ready-made
+`cayu.server.environment_auth:OPERATOR_BASIC_AUTH` target is accepted by name without
+reading `CAYU_OPERATOR_USERNAME` or `CAYU_OPERATOR_PASSWORD`, because Cloud provides
+them, but only when the declared `cayu` requirement excludes 0.8.1 and older. The
+unmodified `server_auth.py` that `cayu cloud init` writes is accepted by name for the
+same reason. Any other target is imported in the project context; if it can't be loaded here
+for another reason, such as an environment variable or package only Cloud has, the
+check reports `unavailable` with the reason instead of failing.
+
+`cayu cloud init` runs the same checks. When it finds a problem, for example public
+service access that is still a placeholder or a `uv.lock` to refresh after init added
+the `server` extra, or can't run, the result includes `deploy_check` and a `warnings`
+entry describing what to fix before deploying.
 
 ## Agent environment variables
 

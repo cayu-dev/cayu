@@ -728,7 +728,9 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
         from cayu.cli._cloud_deploy_check import init_deploy_check_notice, run_cloud_deploy_check
 
         check = run_cloud_deploy_check(
-            initialized.manifest_path.parent, serves_web=initialized.runtime == "web"
+            initialized.manifest_path.parent,
+            serves_web=initialized.runtime == "web",
+            web_command=initialized.command if initialized.runtime == "web" else None,
         )
         if check.status != "not_applicable":
             result["deploy_check"] = check.public_dict()
@@ -951,7 +953,11 @@ def _deploy_check(project: ResolvedCloudProject, *, skip: bool) -> dict[str, Any
     serves_web = project.manifest.web is not None
     if skip:
         return {"status": "skipped"} if serves_web else None
-    check = run_cloud_deploy_check(project.root, serves_web=serves_web)
+    check = run_cloud_deploy_check(
+        project.root,
+        serves_web=serves_web,
+        web_command=project.manifest.web.command if project.manifest.web is not None else None,
+    )
     if check.status == "not_applicable":
         return None
     if check.status == "failed":

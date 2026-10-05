@@ -43136,5 +43136,18 @@
     "tests/core/test_external_wait_pause_controls.py::test_host_preserves_native_pause_until_resolution[approval-sqlite]": 6.212635041010799,
     "tests/core/test_external_wait_pause_controls.py::test_host_preserves_native_pause_until_resolution[user_input-memory]": 5.424095791007858,
     "tests/core/test_external_wait_pause_controls.py::test_host_preserves_native_pause_until_resolution[user_input-postgres]": 9.178179042006377,
-    "tests/core/test_external_wait_pause_controls.py::test_host_preserves_native_pause_until_resolution[user_input-sqlite]": 6.121082542013028
+    "tests/core/test_external_wait_pause_controls.py::test_host_preserves_native_pause_until_resolution[user_input-sqlite]": 6.121082542013028,
+    "tests/cli/test_cloud_deploy_serve_check.py::test_extras_that_include_server_dependencies_are_servable[all]": 0.0028805000038119033,
+    "tests/cli/test_cloud_deploy_serve_check.py::test_extras_that_include_server_dependencies_are_servable[oidc]": 0.0012624999799299985,
+    "tests/cli/test_cloud_deploy_serve_check.py::test_extras_that_include_server_dependencies_are_servable[server-settings]": 0.001238208991708234,
+    "tests/cli/test_cloud_deploy_serve_check.py::test_extras_that_include_server_dependencies_are_servable[server_settings]": 0.001447791000828147,
+    "tests/cli/test_cloud_deploy_serve_check.py::test_server_supersets_still_require_server_dependencies_in_the_lock[all]": 0.0011512919882079586,
+    "tests/cli/test_cloud_deploy_serve_check.py::test_server_supersets_still_require_server_dependencies_in_the_lock[oidc]": 0.001147414994193241,
+    "tests/cli/test_cloud_deploy_serve_check.py::test_server_supersets_still_require_server_dependencies_in_the_lock[server-settings]": 0.0014805000100750476,
+    "tests/cli/test_cloud_deploy_serve_check.py::test_the_lock_cloud_installs_from_must_include_the_server_extra[extras0-expected0]": 0.0011136670073028654,
+    "tests/cli/test_cloud_deploy_serve_check.py::test_the_lock_cloud_installs_from_must_include_the_server_extra[extras1-expected1]": 0.001408042007824406,
+    "tests/cli/test_cloud_deploy_serve_check.py::test_the_lock_cloud_installs_from_must_include_the_server_extra[extras2-expected2]": 0.0016495419840794057,
+    "tests/cli/test_cloud_deploy_serve_check.py::test_the_lock_cloud_installs_from_must_include_the_server_extra[extras3-expected3]": 0.0016770829970482737,
+    "tests/cli/test_cloud_deploy_serve_check.py::test_the_lock_cloud_installs_from_must_include_the_server_extra[extras4-expected4]": 0.001671710007940419,
+    "tests/cli/test_cloud_deploy_serve_check.py::test_the_lock_cloud_installs_from_must_include_the_server_extra[extras5-expected5]": 0.0013094579917378724
 }
