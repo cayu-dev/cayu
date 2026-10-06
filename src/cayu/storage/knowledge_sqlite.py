@@ -229,6 +229,7 @@ from cayu.knowledge.search import (
     copy_knowledge_list_query,
     copy_knowledge_query,
 )
+from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
@@ -285,7 +286,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         self._clock = utc_clock(clock)
         self._schema_mode = schema_mode
         self._lock = TimedStoreLock()
-        self._connection = sqlite_support.connect(db_path)
+        self._connection = sqlite_connection.connect(db_path)
         try:
             sqlite_support.reconcile_schema(
                 self._connection,

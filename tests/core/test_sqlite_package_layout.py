@@ -162,3 +162,40 @@ for name in (
         timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_sqlite_connection_setup_works_without_schema_or_store_adapters():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+from contextlib import closing
+from pathlib import Path
+
+from cayu.storage import _sqlite_connection
+
+for name in ("cayu.sessions.base", "cayu.tasks.base", "cayu.storage._sqlite_functions"):
+    assert name not in sys.modules, name
+
+with closing(_sqlite_connection.connect(Path(":memory:"))) as connection:
+    assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+    assert connection.execute("SELECT cayu_is_clean_nonblank_text('valid')").fetchone()[0] == 1
+
+for name in (
+    "cayu.storage._sqlite_support",
+    "cayu.storage.sqlite",
+    "cayu.storage.tasks_sqlite",
+    "cayu.storage.postgres",
+):
+    assert name not in sys.modules, name
+""",
+        ],
+        env={**os.environ, "PYTHONPATH": str(Path(cayu.__file__).resolve().parent.parent)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

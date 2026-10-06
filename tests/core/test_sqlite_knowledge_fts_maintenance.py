@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from cayu.sessions.base import RunRequest, SessionIdentity
+from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
@@ -50,7 +51,7 @@ def _reconcile_through_revision_37(
 
 
 def _migrate_legacy_through_revision_37(db_path: Path) -> None:
-    connection = sqlite_support.connect(db_path)
+    connection = sqlite_connection.connect(db_path)
     try:
         _reconcile_through_revision_37(
             connection,
@@ -63,7 +64,7 @@ def _migrate_legacy_through_revision_37(db_path: Path) -> None:
 def _assert_peer_writer_can_begin(db_path: Path) -> None:
     """Prove a failed migration released SQLite's writer lock at any schema revision."""
 
-    peer = sqlite_support.connect(db_path)
+    peer = sqlite_connection.connect(db_path)
     try:
         peer.execute("PRAGMA busy_timeout = 100")
         peer.execute("BEGIN IMMEDIATE")
@@ -85,7 +86,7 @@ def _chunks(entry_id: str, *texts: str) -> list[KnowledgeChunk]:
 
 
 def _downgrade_knowledge_layout_to_revision_36(db_path: Path) -> None:
-    connection = sqlite_support.connect(db_path)
+    connection = sqlite_connection.connect(db_path)
     try:
         # This helper deliberately dismantles revision 42's mutually dependent
         # entry/revision tables to fabricate a historical revision-36 database.
@@ -325,7 +326,7 @@ def _assert_ordered_transaction_failures(
 def test_sqlite_transaction_successful_rollback_preserves_primary_context(
     tmp_path: Path,
 ) -> None:
-    connection = sqlite_support.connect(tmp_path / "primary-context.sqlite")
+    connection = sqlite_connection.connect(tmp_path / "primary-context.sqlite")
     connection.execute("CREATE TABLE evidence (value TEXT NOT NULL)")
     connection.commit()
     try:
@@ -593,7 +594,7 @@ def test_revision_37_failure_rolls_back_legacy_schema_and_search(
         "_validate_revision_37_knowledge_fts_data",
         fail_after_rebuild,
     )
-    connection = sqlite_support.connect(db_path)
+    connection = sqlite_connection.connect(db_path)
     try:
         with pytest.raises(RuntimeError, match="injected revision-37"):
             _reconcile_through_revision_37(
@@ -653,7 +654,7 @@ def test_revision_37_transaction_boundary_failure_rolls_back_and_retries(
 
     asyncio.run(seed())
     _downgrade_knowledge_layout_to_revision_36(db_path)
-    connection = sqlite_support.connect(db_path)
+    connection = sqlite_connection.connect(db_path)
     boundary = _MigrationBoundaryConnection(connection, failure=failure)
     previous_sigint_handler = signal.signal(signal.SIGINT, signal.default_int_handler)
     try:
@@ -701,7 +702,7 @@ def test_revision_37_commit_acknowledgement_loss_preserves_committed_migration(
 
     asyncio.run(seed())
     _downgrade_knowledge_layout_to_revision_36(db_path)
-    connection = sqlite_support.connect(db_path)
+    connection = sqlite_connection.connect(db_path)
     boundary = _MigrationBoundaryConnection(connection, failure="after_commit")
     try:
         with pytest.raises(sqlite3.OperationalError, match="acknowledgement loss"):
@@ -742,7 +743,7 @@ def test_revision_37_commit_and_rollback_failure_fences_connection_and_retries(
 
     asyncio.run(seed())
     _downgrade_knowledge_layout_to_revision_36(db_path)
-    connection = sqlite_support.connect(db_path)
+    connection = sqlite_connection.connect(db_path)
     boundary = _MigrationBoundaryConnection(
         connection,
         failure="before_commit",
@@ -766,7 +767,7 @@ def test_revision_37_commit_and_rollback_failure_fences_connection_and_retries(
 
     # Closing the uncertain owner releases the writer without publishing any of
     # the interrupted schema or FTS rebuild.
-    check = sqlite_support.connect(db_path)
+    check = sqlite_connection.connect(db_path)
     try:
         assert check.execute("PRAGMA user_version").fetchone()[0] == 36
         assert (
@@ -785,7 +786,7 @@ def test_revision_37_commit_and_rollback_failure_fences_connection_and_retries(
 
     _assert_peer_writer_can_begin(db_path)
 
-    retry = sqlite_support.connect(db_path)
+    retry = sqlite_connection.connect(db_path)
     try:
         _reconcile_through_revision_37(retry, schema_migrations.SchemaMode.MIGRATE)
         assert retry.execute("PRAGMA user_version").fetchone()[0] == 37
@@ -1393,12 +1394,13 @@ def test_sigkill_during_revision_37_migration_rolls_back_and_retries(
 import pathlib
 import sys
 import time
+from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_support as support
 from cayu.storage import migrations
 
 db_path = pathlib.Path(sys.argv[1])
 marker = pathlib.Path(sys.argv[2])
-connection = support.connect(db_path)
+connection = sqlite_connection.connect(db_path)
 published = False
 
 def pause_in_transaction():

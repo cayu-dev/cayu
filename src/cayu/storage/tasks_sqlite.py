@@ -72,6 +72,7 @@ from cayu.runtime.work_attempt_lifecycle import (
     work_attempt_preparation_hold_sha256,
 )
 from cayu.sessions.invocation import SessionInvocationBinding, TaskInvocation
+from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
@@ -451,7 +452,7 @@ class SQLiteTaskStore(TaskStore):
             raise TypeError("schema_mode must be a SchemaMode.")
 
         self.path = db_path
-        diagnostic_source_missing = sqlite_support.diagnostic_sqlite_source_missing(db_path)
+        diagnostic_source_missing = sqlite_connection.diagnostic_sqlite_source_missing(db_path)
         self._diagnostic_source_missing = diagnostic_source_missing
         self._schema_mode = schema.SchemaMode.CREATE if diagnostic_source_missing else schema_mode
         self._clock = utc_clock(clock)
@@ -6334,7 +6335,7 @@ class SQLiteTaskStore(TaskStore):
             self._connection.close()
 
     def _connect(self, path: Path) -> sqlite3.Connection:
-        return sqlite_support.connect(path)
+        return sqlite_connection.connect(path)
 
     def _initialize_schema(self) -> None:
         sqlite_support.reconcile_schema(

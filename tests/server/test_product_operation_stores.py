@@ -25,6 +25,7 @@ from cayu.server import (
     ProductResultReceiptConflict,
     ServiceIdentityStoreKind,
 )
+from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 
@@ -506,7 +507,7 @@ def test_sqlite_store_requires_migration_from_revision_111(tmp_path, monkeypatch
     monkeypatch.setattr(
         schema, "REVISIONS", tuple(item for item in revisions if item.revision <= 111)
     )
-    connection = sqlite_support.connect(path)
+    connection = sqlite_connection.connect(path)
     try:
         sqlite_support.reconcile_schema(
             connection, schema.SchemaMode.MIGRATE, app_min_supported=111

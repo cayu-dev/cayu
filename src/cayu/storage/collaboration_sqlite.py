@@ -13,6 +13,7 @@ from typing import TypeVar
 from cayu.collaboration._ownership import _MutationOwners
 from cayu.collaboration.base import CollaborationStore
 from cayu.collaboration.participants import CollaborationUnavailable
+from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_support as sqlite
 from cayu.storage._collaboration_repository import _SQLRepository
 from cayu.storage._phase_timing import TimedStoreLock
@@ -49,7 +50,7 @@ class SQLiteCollaborationStore(CollaborationStore):
         self._io_lock = TimedStoreLock()
         self._owners = _MutationOwners()
         self._close_task: asyncio.Task[None] | None = None
-        self._connection = sqlite.connect(Path(path))
+        self._connection = sqlite_connection.connect(Path(path))
         try:
             sqlite.reconcile_schema(self._connection, schema_mode, app_min_supported=111)
         except BaseException:

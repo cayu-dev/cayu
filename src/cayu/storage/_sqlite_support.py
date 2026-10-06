@@ -1,37 +1,27 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
-from pathlib import Path
 from typing import Any, NoReturn, cast
-from urllib.parse import quote
 from uuid import uuid4
 
-from cayu._validation import (
-    require_clean_nonblank,
-    require_execution_unit_id,
-)
 from cayu.events import Event
 from cayu.knowledge.records import (
     MAX_KNOWLEDGE_CHUNK_ID_BYTES,
     MAX_KNOWLEDGE_ENTRY_ID_BYTES,
 )
-from cayu.messages import Message
 from cayu.sessions.base import (
     PENDING_ACTION_EVENT_TYPE_VALUES,
     TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
     deferred_interaction_input_from_storage_payload,
     deferred_interaction_input_storage_payload,
-    transcript_search_document,
-    transcript_search_session_token,
 )
+from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import migrations as schema
 from cayu.storage._accounting_schema import SQLITE_ACCOUNTING_DDL, SQLITE_AUXILIARY_ACCOUNTING_DDL
@@ -48,10 +38,7 @@ from cayu.storage._collaboration_wait_schema import (
     validate_sqlite_wait_discovery,
 )
 from cayu.storage._context_selection_schema import validate_sqlite_context_selection_schema
-from cayu.storage._diagnostic_inspection import (
-    DiagnosticStoreInspectionChanged,
-    current_diagnostic_store_inspection,
-)
+from cayu.storage._diagnostic_inspection import current_diagnostic_store_inspection
 from cayu.storage._external_wait_schema import SQLITE_EXTERNAL_WAIT_DDL
 from cayu.storage._model_policy_schema import SQLITE_MODEL_POLICY_DDL
 from cayu.storage._participant_bindings_schema import (
@@ -77,265 +64,6 @@ from cayu.tasks.base import (
 from cayu.tasks.records import Task, TaskStatus
 
 _INTERRUPTED_HANDOFF_MIGRATION_BATCH_SIZE = 256
-
-
-def connect(
-    path: Path,
-    *,
-    read_only: bool = False,
-    immutable: bool = False,
-) -> sqlite3.Connection:
-    from cayu.storage._phase_timing import timed_sqlite_connection
-
-    if type(read_only) is not bool:
-        raise TypeError("read_only must be a bool.")
-    if type(immutable) is not bool:
-        raise TypeError("immutable must be a bool.")
-    if immutable and not read_only:
-        raise ValueError("Immutable SQLite connections must be read-only.")
-    if (
-        current_diagnostic_store_inspection() is not None
-        and not read_only
-        and str(path) != ":memory:"
-    ):
-        return connect_read_only_inspection(path)
-    if str(path) == ":memory:":
-        if read_only:
-            raise ValueError("Read-only connections require a file-backed SQLite database.")
-    elif not read_only:
-        path.parent.mkdir(parents=True, exist_ok=True)
-    if read_only:
-        # A dedicated read-only connection lets queries run in worker threads
-        # without contending with the writer connection's transactions (WAL
-        # readers never block on the writer). query_only guards against any
-        # accidental write slipping onto the read path. Immutable inspection is
-        # reserved for closed, probe-free diagnostic use that must create no WAL
-        # sidecars; it is not the live concurrent-reader mode.
-        immutable_query = "&immutable=1" if immutable else ""
-        uri = f"file:{quote(str(path.resolve()), safe='/')}?mode=ro{immutable_query}"
-        connection = sqlite3.connect(uri, uri=True, check_same_thread=False)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout = 5000")
-        connection.execute("PRAGMA query_only = ON")
-        _register_sqlite_functions(connection)
-        return timed_sqlite_connection(connection)
-    connection = sqlite3.connect(path, check_same_thread=False)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA busy_timeout = 5000")
-    if str(path) != ":memory:":
-        connection.execute("PRAGMA journal_mode = WAL")
-    _register_sqlite_functions(connection)
-    return timed_sqlite_connection(connection)
-
-
-def _is_in_memory(connection: sqlite3.Connection) -> bool:
-    return any(
-        row[1] == "main" and row[2] == ""
-        for row in connection.execute("PRAGMA database_list").fetchall()
-    )
-
-
-@dataclass(frozen=True)
-class _SQLiteFileIdentity:
-    device: int
-    inode: int
-    size: int
-    modified_ns: int
-
-
-def _sqlite_file_identity(path: Path) -> _SQLiteFileIdentity | None:
-    try:
-        stat_result = path.stat()
-    except FileNotFoundError:
-        return None
-    return _SQLiteFileIdentity(
-        device=stat_result.st_dev,
-        inode=stat_result.st_ino,
-        size=stat_result.st_size,
-        modified_ns=stat_result.st_mtime_ns,
-    )
-
-
-def diagnostic_sqlite_source_missing(path: Path) -> bool:
-    """Register a diagnostic absence guard for a missing file-backed database."""
-
-    inspection = current_diagnostic_store_inspection()
-    if inspection is None or str(path) == ":memory:":
-        return False
-    resolved = path.resolve()
-    observed_paths = (resolved, Path(f"{resolved}-wal"), Path(f"{resolved}-shm"))
-    before = tuple(_sqlite_file_identity(item) for item in observed_paths)
-    if any(identity is not None for identity in before):
-        return False
-
-    def verify_source_remained_missing() -> None:
-        after = tuple(_sqlite_file_identity(item) for item in observed_paths)
-        if after != before:
-            raise DiagnosticStoreInspectionChanged(
-                "A missing SQLite diagnostic source appeared during collection."
-            )
-
-    inspection.add_verifier(verify_source_remained_missing)
-    return True
-
-
-def connect_read_only_inspection(path: Path) -> sqlite3.Connection:
-    """Open a non-mutating SQLite diagnostic view without ignoring live WAL data."""
-
-    if str(path) == ":memory:":
-        raise ValueError("Diagnostic inspection requires a file-backed SQLite database.")
-    resolved = path.resolve()
-    wal_path = Path(f"{resolved}-wal")
-    shm_path = Path(f"{resolved}-shm")
-    before = tuple(_sqlite_file_identity(item) for item in (resolved, wal_path, shm_path))
-    if before[0] is None:
-        raise FileNotFoundError(os.fspath(resolved))
-
-    # A live WAL database must use SQLite's locking-aware read-only mode so the
-    # committed WAL frames remain visible. A static database can use immutable
-    # mode, which guarantees inspection creates no journal sidecars.
-    wal_exists = before[1] is not None
-    shm_exists = before[2] is not None
-    if wal_exists != shm_exists:
-        raise sqlite3.OperationalError("SQLite WAL inspection sidecars are incomplete.")
-    live_wal = wal_exists and shm_exists
-    inspection = current_diagnostic_store_inspection()
-    connection = connect(resolved, read_only=True, immutable=not live_wal)
-    if inspection is not None and not live_wal:
-
-        def verify_static_snapshot() -> None:
-            after = tuple(_sqlite_file_identity(item) for item in (resolved, wal_path, shm_path))
-            if after != before:
-                raise DiagnosticStoreInspectionChanged(
-                    "A static SQLite diagnostic snapshot changed during collection."
-                )
-
-        inspection.add_verifier(verify_static_snapshot)
-    return connection
-
-
-def _register_sqlite_functions(connection: sqlite3.Connection) -> None:
-    from cayu.sessions.pending_actions import pending_action_lookup_key
-
-    def lookup_key(value: object) -> str | None:
-        return pending_action_lookup_key(value) if type(value) is str else None
-
-    def is_clean_nonblank_text(value: object) -> int:
-        if type(value) is not str:
-            return 0
-        try:
-            require_clean_nonblank(value, "value")
-        except ValueError:
-            return 0
-        return 1
-
-    def is_execution_unit_id(value: object, field_name: object) -> int:
-        if type(value) is not str or type(field_name) is not str:
-            return 0
-        try:
-            require_execution_unit_id(value, field_name)
-        except (TypeError, ValueError):
-            return 0
-        return 1
-
-    def transcript_text(message_json: object) -> str:
-        if type(message_json) is not str:
-            raise ValueError("Transcript message JSON must be text.")
-        try:
-            payload = json.loads(message_json)
-            message = Message.model_validate(payload)
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ValueError("Transcript message JSON is invalid.") from exc
-        return transcript_search_document(message)
-
-    def transcript_session_token(session_id: object) -> str:
-        if type(session_id) is not str:
-            raise ValueError("Transcript session id must be text.")
-        return transcript_search_session_token(session_id)
-
-    connection.create_function(
-        "cayu_pending_action_lookup_key",
-        1,
-        lookup_key,
-        deterministic=True,
-    )
-    connection.create_function(
-        "cayu_is_clean_nonblank_text",
-        1,
-        is_clean_nonblank_text,
-        deterministic=True,
-    )
-    connection.create_function(
-        "cayu_is_execution_unit_id",
-        2,
-        is_execution_unit_id,
-        deterministic=True,
-    )
-    connection.create_function(
-        "cayu_transcript_search_document",
-        1,
-        transcript_text,
-        deterministic=True,
-    )
-    connection.create_function(
-        "cayu_transcript_session_token",
-        1,
-        transcript_session_token,
-        deterministic=True,
-    )
-    connection.create_function(
-        "cayu_transcript_search_tokenizer_version",
-        0,
-        lambda: TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
-        deterministic=True,
-    )
-    connection.create_function(
-        "cayu_canonical_accounting_json",
-        1,
-        lambda value: (
-            None
-            if value is None
-            else json.dumps(
-                json.loads(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False
-            )
-        ),
-        deterministic=True,
-    )
-    connection.create_aggregate(
-        "cayu_exact_usage_sum",
-        13,
-        cast("Any", _ExactUsageSum),
-    )
-
-
-class _ExactUsageSum:
-    """Sum normalized counters and canonical outputs from a prior exact sum."""
-
-    # A SQLite table has at most 2**63 - 1 rows and each accepted JSON integer is
-    # at most 2**63 - 1, so every possible sum fits in 38 decimal digits.
-    _DECIMAL_WIDTH = 38
-
-    def __init__(self) -> None:
-        self._totals = [0] * 13
-
-    def step(self, *values: object) -> None:
-        for index, value in enumerate(values):
-            if type(value) is int and value >= 0:
-                self._totals[index] += value
-            elif (
-                type(value) is str
-                and len(value) == self._DECIMAL_WIDTH
-                and value.isascii()
-                and value.isdecimal()
-            ):
-                self._totals[index] += int(value)
-
-    def finalize(self) -> str:
-        return json.dumps(
-            [str(total).zfill(self._DECIMAL_WIDTH) for total in self._totals],
-            separators=(",", ":"),
-        )
 
 
 # Baseline-revision (ADR 0001 revision 1) DDL. Every table carries the cayu_ prefix
@@ -6428,7 +6156,9 @@ def reconcile_schema(
       validate. The default for SQLite (dev / test / local durability).
     - ``migrate``: apply pending forward revisions, then validate.
     """
-    if current_diagnostic_store_inspection() is not None and not _is_in_memory(connection):
+    if current_diagnostic_store_inspection() is not None and not sqlite_connection._is_in_memory(
+        connection
+    ):
         schema_mode = schema.SchemaMode.VALIDATE
     state = read_schema_state(connection)
     if schema_mode is schema.SchemaMode.MIGRATE:

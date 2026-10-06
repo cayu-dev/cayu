@@ -2633,7 +2633,8 @@ def test_sqlite_usage_rollup_handles_malformed_normalized_usage_like_memory(tmp_
 
 
 def test_sqlite_usage_rollup_plan_bounds_the_index_by_type_and_time(tmp_path) -> None:
-    from cayu.storage import _session_store_sql, _sqlite_aggregates, _sqlite_support
+    from cayu.storage import _session_store_sql, _sqlite_aggregates
+    from cayu.storage import _sqlite_connection as sqlite_connection
     from cayu.storage.sqlite import _SQL_DIALECT
 
     database_path = tmp_path / "aggregate-plan.sqlite"
@@ -2663,7 +2664,7 @@ def test_sqlite_usage_rollup_plan_bounds_the_index_by_type_and_time(tmp_path) ->
             session_ids=("session-one",),
         )
     )
-    connection = _sqlite_support.connect(database_path, read_only=True)
+    connection = sqlite_connection.connect(database_path, read_only=True)
     try:
         details = [
             row[3] for row in connection.execute(f"EXPLAIN QUERY PLAN {sql}", params).fetchall()
@@ -2718,7 +2719,8 @@ def test_sqlite_usage_rollup_plan_bounds_the_index_by_type_and_time(tmp_path) ->
 
 
 def test_sqlite_pricing_projection_rejects_oversized_rows_before_transfer(tmp_path) -> None:
-    from cayu.storage import _session_store_sql, _sqlite_aggregates, _sqlite_support
+    from cayu.storage import _session_store_sql, _sqlite_aggregates
+    from cayu.storage import _sqlite_connection as sqlite_connection
     from cayu.storage.sqlite import _SQL_DIALECT
 
     database_path = tmp_path / "aggregate-pricing-bound.sqlite"
@@ -2748,7 +2750,7 @@ def test_sqlite_pricing_projection_rejects_oversized_rows_before_transfer(tmp_pa
         query=query,
         max_input_bytes=64,
     )
-    connection = _sqlite_support.connect(database_path, read_only=True)
+    connection = sqlite_connection.connect(database_path, read_only=True)
     try:
         rows = connection.execute(sql, params).fetchall()
     finally:
@@ -2769,7 +2771,8 @@ def test_sqlite_pricing_projection_rejects_oversized_rows_before_transfer(tmp_pa
 def test_sqlite_pricing_projection_discards_unclean_bedrock_evidence_before_bounds(
     tmp_path,
 ) -> None:
-    from cayu.storage import _session_store_sql, _sqlite_aggregates, _sqlite_support
+    from cayu.storage import _session_store_sql, _sqlite_aggregates
+    from cayu.storage import _sqlite_connection as sqlite_connection
     from cayu.storage.sqlite import _SQL_DIALECT
 
     database_path = tmp_path / "aggregate-clean-evidence.sqlite"
@@ -2796,7 +2799,7 @@ def test_sqlite_pricing_projection_discards_unclean_bedrock_evidence_before_boun
         query=query,
         max_input_bytes=512,
     )
-    connection = _sqlite_support.connect(database_path, read_only=True)
+    connection = sqlite_connection.connect(database_path, read_only=True)
     try:
         rows = connection.execute(sql, params).fetchall()
     finally:

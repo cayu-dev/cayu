@@ -43,7 +43,7 @@ from cayu.runtime._phase_timing import (
 )
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions.base import IncompleteSessionRecoveryRequest
-from cayu.storage import _sqlite_support
+from cayu.storage import _sqlite_connection
 from cayu.storage.migrations import SchemaMode
 from cayu.tools.base import ToolEffect
 from cayu.tools.policy import ToolPolicy, ToolPolicyDecision, ToolPolicyResult
@@ -278,9 +278,9 @@ class _DelayedConnection:
 
 
 def test_fixed_commit_delay_is_storage_time_not_tool_execution(monkeypatch, sqlite_resources):
-    connect = _sqlite_support.sqlite3.connect
+    connect = _sqlite_connection.sqlite3.connect
     monkeypatch.setattr(
-        _sqlite_support.sqlite3,
+        _sqlite_connection.sqlite3,
         "connect",
         lambda *a, **kw: _DelayedConnection(connect(*a, **kw), 0.01, []),
     )
@@ -304,10 +304,10 @@ def test_fixed_commit_delay_is_storage_time_not_tool_execution(monkeypatch, sqli
 def test_timing_adds_no_durable_writes_and_disabled_path_has_no_records(
     monkeypatch, sqlite_resources
 ):
-    connect = _sqlite_support.sqlite3.connect
+    connect = _sqlite_connection.sqlite3.connect
     writes = []
     monkeypatch.setattr(
-        _sqlite_support.sqlite3,
+        _sqlite_connection.sqlite3,
         "connect",
         lambda *a, **kw: _DelayedConnection(connect(*a, **kw), 0, writes),
     )

@@ -13,6 +13,7 @@ from cayu.runtime._policy_storage import (
     transition,
 )
 from cayu.runtime._policy_wire import require
+from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_support as support
 from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage._sqlite_connection import _run_off_thread_with_connection_ownership
@@ -25,7 +26,7 @@ class SQLiteModelPolicyStore(ModelPolicyStore):
         require_sqlite_store_allowed("SQLiteModelPolicyStore")
         self._lock = TimedStoreLock()
         self._closed = False
-        self._connection = support.connect(Path(path))
+        self._connection = sqlite_connection.connect(Path(path))
         try:
             support.reconcile_schema(
                 self._connection, schema_mode, app_min_supported=POLICY_STORAGE_REVISION

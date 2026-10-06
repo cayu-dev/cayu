@@ -48,6 +48,7 @@ from cayu.sessions.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
 from cayu.storage import _session_store_sql as session_store_sql
+from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
@@ -2470,14 +2471,14 @@ def test_sqlite_profiled_dispatch_stores_reject_revision_thirty_nine(tmp_path, m
         connection.close()
 
     opened = []
-    connect = sqlite_storage.sqlite_support.connect
+    connect = sqlite_connection.connect
 
     def track_connection(*args, **kwargs):
         connection = connect(*args, **kwargs)
         opened.append(connection)
         return connection
 
-    monkeypatch.setattr(sqlite_storage.sqlite_support, "connect", track_connection)
+    monkeypatch.setattr(sqlite_connection, "connect", track_connection)
     try:
         for store_type, minimum_revision in (
             (SQLiteSessionStore, sqlite_storage._SQLITE_SESSION_MIN_REQUIRED_REVISION),
@@ -3509,7 +3510,7 @@ def test_sqlite_revision_95_migrates_task_group_quiescence_schema(tmp_path, monk
         "REVISIONS",
         tuple(revision for revision in revisions if revision.revision <= 95),
     )
-    connection = sqlite_support.connect(db_path)
+    connection = sqlite_connection.connect(db_path)
     try:
         sqlite_support.reconcile_schema(
             connection, schema_migrations.SchemaMode.MIGRATE, app_min_supported=95
@@ -3788,7 +3789,7 @@ def test_sqlite_migrate_revision_is_atomic_on_failure(tmp_path):
     def _boom(_conn: sqlite3.Connection) -> None:
         raise RuntimeError("simulated crash during revision 4")
 
-    connection = sqlite_support.connect(db_path)
+    connection = sqlite_connection.connect(db_path)
     try:
         original = dict(sqlite_support._MIGRATION_HOOKS)
         sqlite_support._MIGRATION_HOOKS[4] = _boom
@@ -4435,7 +4436,7 @@ def test_sqlite_connect_rejects_read_only_in_memory_database():
     from pathlib import Path
 
     with pytest.raises(ValueError, match="file-backed"):
-        sqlite_support.connect(Path(":memory:"), read_only=True)
+        sqlite_connection.connect(Path(":memory:"), read_only=True)
 
 
 def _make_event(session_id: str, *, seq: int, timestamp) -> Event:

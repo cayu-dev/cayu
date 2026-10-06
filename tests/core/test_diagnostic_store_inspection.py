@@ -8,8 +8,11 @@ import pytest
 
 from cayu import Message, RunRequest, SQLiteSessionStore
 from cayu.sessions.base import SessionIdentity
-from cayu.storage import _sqlite_support
-from cayu.storage._diagnostic_inspection import diagnostic_store_inspection
+from cayu.storage import _sqlite_connection as sqlite_connection
+from cayu.storage._diagnostic_inspection import (
+    DiagnosticStoreInspectionChanged,
+    diagnostic_store_inspection,
+)
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.evals_sqlite import SQLiteEvalStore
 from cayu.storage.event_watchers import SQLiteEventWatcherStore
@@ -36,7 +39,7 @@ def test_sqlite_diagnostic_inspection_rejects_incomplete_wal_sidecars(
         diagnostic_store_inspection(),
         pytest.raises(sqlite3.OperationalError, match="sidecars are incomplete"),
     ):
-        _sqlite_support.connect_read_only_inspection(database)
+        sqlite_connection.connect_read_only_inspection(database)
 
     assert wal.read_bytes() == b"incomplete-wal-canary"
     assert not Path(f"{database}-shm").exists()
@@ -170,3 +173,82 @@ def test_diagnostic_inspection_allows_control_plane_read_only_memory_eval_store(
         inspection.verify()
 
     asyncio.run(store.close())
+
+
+def test_diagnostic_inspection_sees_committed_live_wal_frames(tmp_path: Path) -> None:
+    database = tmp_path / "live.sqlite"
+
+    async def exercise() -> None:
+        writer = SQLiteSessionStore(database)
+        try:
+            await writer.create(
+                RunRequest(
+                    session_id="live-wal-session",
+                    agent_name="writer",
+                    messages=[Message.text("user", "committed in WAL")],
+                ),
+                identity=SessionIdentity(provider_name="test", model="model"),
+            )
+            assert Path(f"{database}-wal").stat().st_size > 0
+            assert Path(f"{database}-shm").exists()
+            with diagnostic_store_inspection() as inspection:
+                reader = SQLiteSessionStore(database)
+                try:
+                    session = await reader.load_state("live-wal-session")
+                    assert session is not None
+                    assert session.id == "live-wal-session"
+                    inspection.verify()
+                finally:
+                    await reader.close()
+        finally:
+            await writer.close()
+
+    asyncio.run(exercise())
+
+
+def test_diagnostic_inspection_rejects_a_changed_static_database(tmp_path: Path) -> None:
+    database = tmp_path / "static.sqlite"
+    store = SQLiteSessionStore(database)
+    asyncio.run(store.close())
+    assert not Path(f"{database}-wal").exists()
+
+    with diagnostic_store_inspection() as inspection:
+        reader = SQLiteSessionStore(database)
+        try:
+            # An external writer changes the source after the diagnostic view opens.
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute("CREATE TABLE external_change (value TEXT)")
+                connection.commit()
+            finally:
+                connection.close()
+            with pytest.raises(ExceptionGroup) as error:
+                inspection.verify()
+            assert error.value.exceptions
+            assert all(
+                isinstance(failure, DiagnosticStoreInspectionChanged)
+                and "static SQLite diagnostic snapshot changed" in str(failure)
+                for failure in error.value.exceptions
+            )
+        finally:
+            asyncio.run(reader.close())
+
+
+def test_diagnostic_inspection_rejects_a_missing_database_appearing(tmp_path: Path) -> None:
+    database = tmp_path / "missing.sqlite"
+    with diagnostic_store_inspection() as inspection:
+        reader = SQLiteSessionStore(database)
+        try:
+            assert not database.exists()
+            connection = sqlite3.connect(database)
+            connection.close()
+            with pytest.raises(ExceptionGroup) as error:
+                inspection.verify()
+            assert error.value.exceptions
+            assert all(
+                isinstance(failure, DiagnosticStoreInspectionChanged)
+                and "missing SQLite diagnostic source appeared" in str(failure)
+                for failure in error.value.exceptions
+            )
+        finally:
+            asyncio.run(reader.close())

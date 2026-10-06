@@ -19,6 +19,7 @@ from cayu.server import (
     ServiceIdentityStoreKind,
 )
 from cayu.storage import _product_operations as rules
+from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 from cayu.storage._phase_timing import TimedStoreLock
@@ -78,7 +79,7 @@ class SQLiteProductOperationStore:
         self._clock = utc_clock(clock)
         self._lock = TimedStoreLock()
         self._closed = False
-        self._connection = sqlite_support.connect(db_path)
+        self._connection = sqlite_connection.connect(db_path)
         try:
             sqlite_support.reconcile_schema(
                 self._connection,

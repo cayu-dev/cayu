@@ -493,6 +493,7 @@ from cayu.sessions.interactions import (
 from cayu.sessions.invocation import SessionInvocation
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _sqlite_aggregates as sqlite_aggregates
+from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
@@ -1827,7 +1828,7 @@ class SQLiteSessionStore(
         if type(read_only) is not bool:
             raise TypeError("read_only must be a bool.")
         configured_read_only = read_only
-        diagnostic_source_missing = sqlite_support.diagnostic_sqlite_source_missing(db_path)
+        diagnostic_source_missing = sqlite_connection.diagnostic_sqlite_source_missing(db_path)
         if (
             sqlite_support.current_diagnostic_store_inspection() is not None
             and str(db_path) != ":memory:"
@@ -18392,12 +18393,12 @@ class SQLiteSessionStore(
             self._connection.close()
 
     def _connect(self, path: Path) -> sqlite3.Connection:
-        return sqlite_support.connect(path)
+        return sqlite_connection.connect(path)
 
     def _connect_read_only(self, path: Path) -> sqlite3.Connection:
         if sqlite_support.current_diagnostic_store_inspection() is not None:
-            return sqlite_support.connect_read_only_inspection(path)
-        return sqlite_support.connect(path, read_only=True)
+            return sqlite_connection.connect_read_only_inspection(path)
+        return sqlite_connection.connect(path, read_only=True)
 
     def _initialize_schema(self) -> None:
         sqlite_support.reconcile_schema(

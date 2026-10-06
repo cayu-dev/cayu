@@ -37,10 +37,11 @@ def test_budget_readback_does_not_inherit_qualification_over_changed_owners(meth
 
 
 def test_sqlite_reservation_inventory_uses_exact_session_index(tmp_path):
+    from cayu.storage import _sqlite_connection as sqlite_connection
     from cayu.storage import _sqlite_support
 
     path = tmp_path / "index.sqlite"
-    connection = _sqlite_support.connect(path)
+    connection = sqlite_connection.connect(path)
     try:
         _sqlite_support.reconcile_schema(connection)
         _sqlite_support._validate_reservation_inventory_index(connection)

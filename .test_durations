@@ -1,4 +1,7 @@
 {
+    "tests/core/test_diagnostic_store_inspection.py::test_diagnostic_inspection_rejects_a_changed_static_database": 0.143,
+    "tests/core/test_diagnostic_store_inspection.py::test_diagnostic_inspection_rejects_a_missing_database_appearing": 0.091,
+    "tests/core/test_diagnostic_store_inspection.py::test_diagnostic_inspection_sees_committed_live_wal_frames": 0.144,
     "tests/cli/test_cloud_cli.py::test_cloud_local_source_rejects_storage_acknowledgements_in_symlinked_manifest": 0.0009580409969203174,
     "tests/cli/test_cloud_cli.py::test_cloud_manifest_accepts_empty_storage_table[[storage]\\n]": 0.00023987499298527837,
     "tests/cli/test_cloud_cli.py::test_cloud_manifest_accepts_empty_storage_table[[storage]\\nlocal_files = []\\n]": 0.0002481670235283673,
@@ -34,6 +37,7 @@
     "tests/cli/test_cloud_cli.py::test_local_project_bundle_keeps_storage_acknowledgements_verbatim[absolute]": 0.023584459006087855,
     "tests/cli/test_cloud_cli.py::test_local_project_bundle_keeps_storage_acknowledgements_verbatim[default]": 0.024390665959799662,
     "tests/cli/test_cloud_cli.py::test_local_project_bundle_keeps_storage_acknowledgements_verbatim[relative]": 0.024573541013523936,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_connection_setup_works_without_schema_or_store_adapters": 1.202,
     "tests/core/test_sqlite_package_layout.py::test_sqlite_records_import_without_schema_or_store_adapters": 1.182,
     "tests/core/test_staged_tool_terminal_reader.py::test_checkpoint_terminal_reads_are_detached_fresh_and_owner_scoped[pending_tool_round]": 0.01348645800317172,
     "tests/core/test_staged_tool_terminal_reader.py::test_checkpoint_terminal_reads_are_detached_fresh_and_owner_scoped[pending_user_input]": 0.013581916995462961,

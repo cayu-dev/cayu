@@ -146,6 +146,7 @@ from cayu.evals.suite_authoring import (
     EvalSuiteDocument,
     eval_suite_document_from_json,
 )
+from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
@@ -493,7 +494,7 @@ class SQLiteEvalStore(EvalStore):
                 "writer_contention_policy must be an exact SQLiteEvalWriterContentionPolicy."
             )
         diagnostic_inspection = sqlite_support.current_diagnostic_store_inspection() is not None
-        diagnostic_source_missing = sqlite_support.diagnostic_sqlite_source_missing(db_path)
+        diagnostic_source_missing = sqlite_connection.diagnostic_sqlite_source_missing(db_path)
         if diagnostic_inspection:
             if str(db_path) == ":memory:" or diagnostic_source_missing:
                 schema_mode = schema.SchemaMode.CREATE
@@ -509,9 +510,9 @@ class SQLiteEvalStore(EvalStore):
         self._lock = TimedStoreLock()
         effective_db_path = Path(":memory:") if diagnostic_source_missing else db_path
         self._connection = (
-            sqlite_support.connect_read_only_inspection(effective_db_path)
+            sqlite_connection.connect_read_only_inspection(effective_db_path)
             if read_only
-            else sqlite_support.connect(effective_db_path)
+            else sqlite_connection.connect(effective_db_path)
         )
         try:
             sqlite_support.reconcile_schema(
@@ -539,9 +540,9 @@ class SQLiteEvalStore(EvalStore):
         else:
             try:
                 self._read_connection = (
-                    sqlite_support.connect_read_only_inspection(effective_db_path)
+                    sqlite_connection.connect_read_only_inspection(effective_db_path)
                     if read_only
-                    else sqlite_support.connect(effective_db_path, read_only=True)
+                    else sqlite_connection.connect(effective_db_path, read_only=True)
                 )
                 self._read_lock = TimedStoreLock()
                 self._read_executor = ThreadPoolExecutor(

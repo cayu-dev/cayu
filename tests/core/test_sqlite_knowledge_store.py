@@ -33,6 +33,7 @@ from tests.core.knowledge_publication_conformance import (
 )
 
 from cayu._validation import DurableValueError, extract_durable_value_error
+from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
@@ -1561,7 +1562,7 @@ def test_sqlite_knowledge_schema_rejects_a_dangling_current_revision(tmp_path) -
 
     asyncio.run(create())
 
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     try:
         with pytest.raises(sqlite3.IntegrityError), sqlite_support._transaction(connection):
             connection.execute(
@@ -1605,7 +1606,7 @@ def test_sqlite_revision_schema_validation_rejects_missing_structural_objects(
     store = SQLiteKnowledgeStore(database, access_scope=_ACCESS_SCOPE)
     asyncio.run(store.close())
 
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     try:
         connection.execute(drop_sql)
         connection.commit()
@@ -1789,7 +1790,7 @@ def test_sqlite_revision_60_refuses_populated_knowledge_without_backfill(
     tmp_path,
 ) -> None:
     database = tmp_path / "revision-59-to-60-populated.sqlite"
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     entry = KnowledgeEntry(id="preserved-entry", text="Must remain untouched.")
     try:
         _reconcile_sqlite_through_revision_59(connection)
@@ -1808,7 +1809,7 @@ def test_sqlite_revision_60_refuses_populated_knowledge_without_backfill(
             access_scope=_ACCESS_SCOPE,
         )
 
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     try:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 59
         assert (
@@ -1833,7 +1834,7 @@ def test_sqlite_revision_60_initializes_empty_pre_relation_schema_directly(
     tmp_path,
 ) -> None:
     database = tmp_path / "revision-59-to-60-empty.sqlite"
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     try:
         _reconcile_sqlite_through_revision_59(connection)
     finally:
@@ -1846,7 +1847,7 @@ def test_sqlite_revision_60_initializes_empty_pre_relation_schema_directly(
     )
     store._connection.close()
 
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     try:
         assert (
             connection.execute("PRAGMA user_version").fetchone()[0]
@@ -1888,7 +1889,7 @@ def test_sqlite_revision_63_refuses_populated_knowledge_without_interpretation(
     tmp_path,
 ) -> None:
     database = tmp_path / "revision-62-to-63-populated.sqlite"
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     entry = KnowledgeEntry(id="revision-62-entry", text="Must remain untouched.")
     try:
         _reconcile_sqlite_through_revision_62(connection)
@@ -1907,7 +1908,7 @@ def test_sqlite_revision_63_refuses_populated_knowledge_without_interpretation(
             access_scope=_ACCESS_SCOPE,
         )
 
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     try:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 62
         assert (
@@ -1930,7 +1931,7 @@ def test_sqlite_revision_63_refuses_populated_knowledge_without_interpretation(
 
 def test_sqlite_revision_63_initializes_empty_knowledge_schema_directly(tmp_path) -> None:
     database = tmp_path / "revision-62-to-63-empty.sqlite"
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     try:
         _reconcile_sqlite_through_revision_62(connection)
     finally:
@@ -1943,7 +1944,7 @@ def test_sqlite_revision_63_initializes_empty_knowledge_schema_directly(tmp_path
     )
     store._connection.close()
 
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     try:
         assert (
             connection.execute("PRAGMA user_version").fetchone()[0]
@@ -1969,7 +1970,7 @@ def test_sqlite_revision_63_initializes_empty_knowledge_schema_directly(tmp_path
 
 def test_sqlite_revision_65_refuses_populated_knowledge_without_backfill(tmp_path) -> None:
     database = tmp_path / "revision-64-to-65-populated.sqlite"
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     entry = KnowledgeEntry(id="revision-64-entry", text="Must remain untouched.")
     try:
         _reconcile_sqlite_through_revision_64(connection)
@@ -1988,7 +1989,7 @@ def test_sqlite_revision_65_refuses_populated_knowledge_without_backfill(tmp_pat
             access_scope=_ACCESS_SCOPE,
         )
 
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     try:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 64
         columns = {
@@ -2019,7 +2020,7 @@ def test_sqlite_revision_67_adds_empty_proposal_storage_without_backfill(tmp_pat
             await store.close()
 
     asyncio.run(seed())
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     try:
         connection.execute("DROP TABLE cayu_knowledge_maintenance_proposals")
         connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 67")
@@ -2028,7 +2029,7 @@ def test_sqlite_revision_67_adds_empty_proposal_storage_without_backfill(tmp_pat
     finally:
         connection.close()
 
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     try:
         _reconcile_sqlite_through_revision_67(connection)
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 67
@@ -2053,7 +2054,7 @@ def test_sqlite_revision_75_refuses_populated_knowledge_without_backfill(
     tmp_path,
 ) -> None:
     database = tmp_path / "revision-74-to-75-populated.sqlite"
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     entry = KnowledgeEntry(
         id="revision-74-entry",
         text="Revision 75 must not infer activation authority.",
@@ -2075,7 +2076,7 @@ def test_sqlite_revision_75_refuses_populated_knowledge_without_backfill(
             access_scope=_ACCESS_SCOPE,
         )
 
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     try:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 74
         assert (
@@ -2107,7 +2108,7 @@ def test_sqlite_revision_75_initializes_empty_knowledge_schema_directly(
     tmp_path,
 ) -> None:
     database = tmp_path / "revision-74-to-75-empty.sqlite"
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     try:
         _reconcile_sqlite_through_revision_74(connection)
     finally:
@@ -2120,7 +2121,7 @@ def test_sqlite_revision_75_initializes_empty_knowledge_schema_directly(
     )
     store._connection.close()
 
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     try:
         assert (
             connection.execute("PRAGMA user_version").fetchone()[0]
@@ -2148,7 +2149,7 @@ def test_sqlite_revision_75_rejects_malformed_activation_storage(tmp_path) -> No
     database = tmp_path / "revision-75-malformed-activation.sqlite"
     store = SQLiteKnowledgeStore(database, access_scope=_ACCESS_SCOPE)
     store._connection.close()
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     try:
         connection.execute("DROP TABLE cayu_knowledge_activation_receipts")
         connection.execute(
@@ -2166,7 +2167,7 @@ def test_sqlite_revision_75_rejects_malformed_activation_retirement_storage(tmp_
     database = tmp_path / "revision-75-malformed-activation-retirement.sqlite"
     store = SQLiteKnowledgeStore(database, access_scope=_ACCESS_SCOPE)
     store._connection.close()
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     try:
         connection.execute("DROP TABLE cayu_knowledge_activation_retirements")
         connection.execute(
@@ -2184,7 +2185,7 @@ def test_sqlite_revision_67_rejects_malformed_proposal_storage(tmp_path) -> None
     database = tmp_path / "revision-67-malformed-proposals.sqlite"
     store = SQLiteKnowledgeStore(database, access_scope=_ACCESS_SCOPE)
     store._connection.close()
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     try:
         connection.execute("DROP TABLE cayu_knowledge_maintenance_proposals")
         connection.execute(
@@ -2202,7 +2203,7 @@ def test_sqlite_revision_63_rejects_a_malformed_maintenance_table(tmp_path) -> N
     database = tmp_path / "revision-63-malformed-maintenance.sqlite"
     store = SQLiteKnowledgeStore(database, access_scope=_ACCESS_SCOPE)
     store._connection.close()
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     try:
         connection.execute("DROP TABLE cayu_knowledge_maintenance_decisions")
         connection.execute(
@@ -2220,7 +2221,7 @@ def test_sqlite_revision_63_requires_lowercase_sha_constraints(tmp_path) -> None
     database = tmp_path / "revision-63-weak-maintenance-hashes.sqlite"
     store = SQLiteKnowledgeStore(database, access_scope=_ACCESS_SCOPE)
     store._connection.close()
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     try:
         row = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' "
@@ -2250,7 +2251,7 @@ def test_sqlite_revision_43_rejects_out_of_contract_revision_42_identities(
     tmp_path,
 ) -> None:
     database = tmp_path / "revision-42-oversized-identity.sqlite"
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     entry = KnowledgeEntry(id="bounded-entry", text="Valid revision-42 entry.")
     oversized_chunk_id = "c" * (MAX_KNOWLEDGE_CHUNK_ID_BYTES + 1)
     try:
@@ -2278,14 +2279,14 @@ def test_sqlite_revision_43_rejects_out_of_contract_revision_42_identities(
     finally:
         connection.close()
 
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     try:
         with pytest.raises(schema_migrations.SchemaTooOld, match="bounds knowledge"):
             _reconcile_sqlite_through_revision_43(connection)
     finally:
         connection.close()
 
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     try:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 42
         assert (
@@ -2303,7 +2304,7 @@ def test_sqlite_revision_migration_refuses_populated_legacy_knowledge_unchanged(
     tmp_path,
 ) -> None:
     database = tmp_path / "populated-revision-41.sqlite"
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     try:
         _reconcile_sqlite_through_revision_41(connection)
         connection.execute(
@@ -2362,7 +2363,7 @@ def test_sqlite_revision_migration_refuses_populated_legacy_knowledge_unchanged(
                 access_scope=_ACCESS_SCOPE,
             )
 
-        connection = sqlite_support.connect(database)
+        connection = sqlite_connection.connect(database)
         connection.execute("BEGIN IMMEDIATE")
         connection.rollback()
         assert raised.value.assessment.populated_tables == (
@@ -2398,7 +2399,7 @@ def test_sqlite_revision_migration_refuses_populated_unversioned_knowledge_befor
     tmp_path,
 ) -> None:
     database = tmp_path / "populated-unversioned.sqlite"
-    connection = sqlite_support.connect(database)
+    connection = sqlite_connection.connect(database)
     try:
         connection.execute(
             "CREATE TABLE cayu_knowledge_entries (id TEXT PRIMARY KEY, text TEXT NOT NULL)"
@@ -2421,7 +2422,7 @@ def test_sqlite_revision_migration_refuses_populated_unversioned_knowledge_befor
                 access_scope=_ACCESS_SCOPE,
             )
 
-        connection = sqlite_support.connect(database)
+        connection = sqlite_connection.connect(database)
         assert (
             connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' "

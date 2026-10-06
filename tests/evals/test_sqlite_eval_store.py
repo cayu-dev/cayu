@@ -51,6 +51,7 @@ from cayu.evals.store import (
     EvalRunTrialCheckpoint,
     EvalStoreTransientContention,
 )
+from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
 from cayu.storage.evals_sqlite import SQLiteEvalStore, SQLiteEvalWriterContentionPolicy
@@ -816,7 +817,7 @@ def test_sqlite_eval_store_migrates_empty_revision_fifty_six_without_verifier_pr
     tmp_path,
 ) -> None:
     path = tmp_path / "evals-revision-56.db"
-    connection = sqlite_support.connect(path)
+    connection = sqlite_connection.connect(path)
     revisions = schema_migrations.REVISIONS
     try:
         schema_migrations.REVISIONS = tuple(
@@ -853,7 +854,7 @@ def test_sqlite_eval_store_requires_current_schema(
     tmp_path,
 ) -> None:
     path = tmp_path / "evals-revision-56-validate.db"
-    connection = sqlite_support.connect(path)
+    connection = sqlite_connection.connect(path)
     revisions = schema_migrations.REVISIONS
     try:
         schema_migrations.REVISIONS = tuple(

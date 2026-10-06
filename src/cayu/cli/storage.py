@@ -36,6 +36,7 @@ from cayu.cli.store_targets import (
 )
 from cayu.runtime.public_authority import public_authority_alias_codec_from_environment
 from cayu.sessions.exports import SessionExportLimits
+from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import jsonl_export, migration_authority
 from cayu.storage import migrations as schema
@@ -625,7 +626,7 @@ def _sqlite_input_empty(path: Path, state: schema.SchemaState) -> bool:
         return False
     if not path.exists():
         return True
-    connection = sqlite_support.connect(path, read_only=True)
+    connection = sqlite_connection.connect(path, read_only=True)
     try:
         row = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE name LIKE ? ESCAPE '\\' LIMIT 1",
@@ -867,7 +868,7 @@ def _migrate_sqlite_locked(
             if source_mode is not None:
                 os.chmod(staging_path, source_mode)
             if args.reset_empty_recall_state:
-                reset_connection = sqlite_support.connect(staging_path)
+                reset_connection = sqlite_connection.connect(staging_path)
                 try:
                     sqlite_support.reset_empty_recall_state(reset_connection)
                 finally:
@@ -1141,7 +1142,7 @@ def _preflight_sqlite_migration(
         _validate_breaking_acknowledgements(state, planned, args.acknowledge_breaking)
         _validate_recall_reset_input(state, planned, args.reset_empty_recall_state)
         return state
-    connection = sqlite_support.connect(path, read_only=True)
+    connection = sqlite_connection.connect(path, read_only=True)
     try:
         state = sqlite_support.read_schema_state(connection)
         planned = schema.validate_migration_input(state)
@@ -1414,7 +1415,7 @@ def _validate_postgres_migration_receipt(
 def _read_sqlite_schema_state(path: Path) -> schema.SchemaState:
     if not path.exists():
         return schema.SchemaState(revision=schema.UNINITIALIZED, compatible_from=0)
-    connection = sqlite_support.connect(path, read_only=True)
+    connection = sqlite_connection.connect(path, read_only=True)
     try:
         return sqlite_support.read_schema_state(connection)
     finally:
@@ -1626,7 +1627,7 @@ def _write_sqlite_snapshot(source: Path | None, destination: Path) -> None:
             target.execute("PRAGMA application_id")
             target.commit()
         else:
-            origin = sqlite_support.connect(source, read_only=True)
+            origin = sqlite_connection.connect(source, read_only=True)
             try:
                 origin.backup(target)
             finally:
@@ -1639,7 +1640,7 @@ def _write_sqlite_snapshot(source: Path | None, destination: Path) -> None:
 def _validate_sqlite_migration_result(
     path: Path,
 ) -> tuple[schema.SchemaState, dict[str, object]]:
-    connection = sqlite_support.connect(path, read_only=True)
+    connection = sqlite_connection.connect(path, read_only=True)
     try:
         state = sqlite_support.read_schema_state(connection)
         integrity_rows = tuple(str(row[0]) for row in connection.execute("PRAGMA integrity_check"))

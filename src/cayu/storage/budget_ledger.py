@@ -57,6 +57,7 @@ from cayu.runtime.execution_units import (
 from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage.targets import require_sqlite_store_allowed
 
+from . import _sqlite_connection as sqlite_connection
 from . import _sqlite_records as sqlite_records
 from . import _sqlite_support as sqlite_support
 from . import migrations as schema
@@ -95,7 +96,7 @@ class SQLiteBudgetLedger(BudgetLedger):
         self._lock = TimedStoreLock()
         self._clock = utc_clock(clock)
         self._reservation_ttl_seconds = _validate_reservation_ttl(reservation_ttl_seconds)
-        self._connection = sqlite_support.connect(db_path)
+        self._connection = sqlite_connection.connect(db_path)
         self._connection.row_factory = sqlite3.Row
         sqlite_support.reconcile_schema(
             self._connection,
