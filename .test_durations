@@ -44200,5 +44200,6 @@
     "tests/core/test_model_preparation_interruption.py::test_stuck_pre_dispatch_store_is_bounded_and_remains_supervised[True-overall]": 0.0662017080176156,
     "tests/core/test_model_preparation_interruption.py::test_stuck_pre_dispatch_store_is_bounded_and_remains_supervised[True-step]": 0.06554770801449195,
     "tests/core/test_model_preparation_interruption.py::test_pre_dispatch_capacity_refusal_keeps_classified_failure[False]": 0.04,
-    "tests/core/test_model_preparation_interruption.py::test_pre_dispatch_capacity_refusal_keeps_classified_failure[True]": 0.04
+    "tests/core/test_model_preparation_interruption.py::test_pre_dispatch_capacity_refusal_keeps_classified_failure[True]": 0.04,
+    "tests/core/test_runtime_phase_timing.py::test_timing_records_and_their_phases_share_one_clock": 3.018449499970302
 }

@@ -364,8 +364,11 @@ class _Builder:
         if self.closed:
             return
         self.closed = True
-        now = datetime.now(UTC)
         elapsed = max(0, monotonic() - self.started)
+        # Derived on the monotonic timeline the phases use, so every phase lies
+        # within the record and its bounds match its duration even when the
+        # wall clock drifts or is adjusted during the round.
+        now = self.wall_time(self.started + elapsed)
         safe = self.recorder.reference
         session_id = safe(self.session_id, "session_id")
         if self.preparation:

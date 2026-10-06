@@ -942,3 +942,42 @@ def test_interrupted_structured_output_close_is_not_recorded_as_recovered():
         assert phases["round_commit"].duration_seconds > 0
 
     asyncio.run(scenario())
+
+
+def test_timing_records_and_their_phases_share_one_clock(monkeypatch, sqlite_resources):
+    from datetime import timedelta
+
+    from cayu.runtime import _phase_timing
+
+    real_now = datetime.now
+    anchor_wall, anchor_mono = real_now(UTC), time.monotonic()
+
+    class DriftingWallClock(datetime):
+        """A wall clock that advances at half the monotonic rate."""
+
+        @classmethod
+        def now(cls, tz=None):
+            return anchor_wall + timedelta(seconds=(time.monotonic() - anchor_mono) / 2)
+
+    monkeypatch.setattr(_phase_timing, "datetime", DriftingWallClock)
+
+    def assert_one_timeline(record):
+        assert record.completed_at - record.started_at == timedelta(seconds=record.duration_seconds)
+        for phase in record.phases:
+            if phase.duration_seconds:
+                assert record.started_at <= phase.first_started_at
+                assert phase.last_completed_at <= record.completed_at
+
+    async def scenario():
+        async with sqlite_resources as resources:
+            store = resources.own(SQLiteSessionStore(resources.path("clock.sqlite")))
+            app = _app(store)
+            await _run(app)
+            (record,) = await app.inspect_recent_tool_round_timing("timing")
+            assert_one_timeline(record)
+            preparations = await app.inspect_recent_model_step_preparation_timing("timing")
+            assert preparations
+            for preparation in preparations:
+                assert_one_timeline(preparation)
+
+    asyncio.run(scenario())
