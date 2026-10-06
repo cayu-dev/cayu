@@ -542,9 +542,8 @@ identity and digest helpers, and deterministic validation.
 selection, transition and capacity checks. Record construction works without
 loading runtime or store implementations; admission-command validation composes
 the shared invocation contracts. Existing runtime imports and public exports
-resolve to the same definitions. Runtime retains authenticated operation-record
-guarding, admission and dispatch, and checkpoint publication; native stores
-retain their transaction boundaries.
+resolve to the same definitions. Runtime retains admission and dispatch, and
+checkpoint publication; native stores retain their transaction boundaries.
 
 `sessions/_session_continuation_scope.py` and `_temporary_continuation_scope.py`
 own the shared authority contexts and store-facing checks. Runtime producers and
@@ -562,6 +561,10 @@ Continuation persistence rules live alongside those contracts in
 bounded checkpoint index, record/history comparisons, native receipt projection,
 and preparation of source/receiving-session updates. Each component remains
 independently importable from its session module.
+The continuation store component also validates reserved operation-record keys
+against their namespace, continuation, temporary-service or side-session target
+records. It requires the shared authenticated publication scope and exact record
+identity; validation does not grant read or execution authority.
 Native stores invoke these rules inside their existing lock or transaction.
 Joint preparation validates both sessions before either update is applied;
 runtime dispatch and collaboration permit registration retain their own owners.

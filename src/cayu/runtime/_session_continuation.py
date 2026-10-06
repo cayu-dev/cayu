@@ -1,4 +1,4 @@
-"""Continuation publication guards, admission and compatibility imports."""
+"""Continuation admission and compatibility imports."""
 
 from __future__ import annotations
 
@@ -118,47 +118,6 @@ if TYPE_CHECKING:
     from cayu.sessions.base import SessionStore
 
 
-def require_operation_record_owner(key: str, record: object) -> None:
-    """Validate the reserved continuation key without granting read authority."""
-
-    if not key.startswith(CONTINUATION_OPERATION_PREFIX):
-        return
-    from cayu.sessions._session_continuation_scope import require_publication
-
-    if type(record) is not dict:
-        raise ContinuationConflict("Continuation operation record is not an object.")
-    from cayu.sessions._temporary_service_target import (
-        TARGET_PREFIX,
-        TemporaryServiceTarget,
-        target_service_key,
-    )
-
-    if key.startswith(TARGET_PREFIX):
-        require_publication(key)
-        target = TemporaryServiceTarget.model_validate(record)
-        if target_service_key(target.service.intent.operation) != key:
-            raise ContinuationConflict("Side-session target key conflicts with its operation.")
-        return
-    if key.startswith(CONTINUATION_SERVICE_PREFIX):
-        from cayu.sessions._temporary_continuation import (
-            TemporaryServiceRecord,
-            temporary_service_key,
-        )
-
-        parsed_service = TemporaryServiceRecord.model_validate(record)
-        require_publication(continuation_operation_key(parsed_service.intent.ticket))
-        if temporary_service_key(parsed_service.intent.operation) != key:
-            raise ContinuationConflict("Temporary service key conflicts with its operation.")
-        return
-    require_publication(key)
-    if key == CONTINUATION_NAMESPACE_KEY:
-        ContinuationNamespace.model_validate(record)
-        return
-    parsed = record_from_json(record)
-    if continuation_operation_key(parsed.ticket) != key:
-        raise ContinuationConflict("Continuation operation key is not content-bound.")
-
-
 async def admit_continuation(
     store: SessionStore,
     consumption: ContinuationConsumption,
@@ -274,7 +233,6 @@ __all__ = [
     "latch_identity",
     "record_from_json",
     "require_latch_identity",
-    "require_operation_record_owner",
     "require_ticket_identity",
     "require_writer_generation",
 ]

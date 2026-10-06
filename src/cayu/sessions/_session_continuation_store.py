@@ -21,6 +21,7 @@ from cayu.sessions._session_continuation import (
     CONTINUATION_MAX_SERVICES,
     CONTINUATION_NAMESPACE_KEY,
     CONTINUATION_OPERATION_PREFIX,
+    CONTINUATION_SERVICE_PREFIX,
     ContinuationConflict,
     ContinuationEvent,
     ContinuationNamespace,
@@ -29,6 +30,7 @@ from cayu.sessions._session_continuation import (
     ContinuationReleasedExecution,
     ContinuationTicket,
     continuation_operation_key,
+    record_from_json,
 )
 from cayu.sessions._session_continuation_scope import (
     continuation_authority_visible,
@@ -49,6 +51,47 @@ MAX_RETAINED_TICKETS = 64
 MAX_RETAINED_CONTINUATION_RECORDS = (
     1 + MAX_RETAINED_TICKETS * (1 + CONTINUATION_MAX_SERVICES) + MAX_TARGET_SERVICES
 )
+
+
+def require_operation_record_owner(key: str, record: object) -> None:
+    """Validate the reserved continuation key without granting read authority."""
+
+    if not key.startswith(CONTINUATION_OPERATION_PREFIX):
+        return
+    from cayu.sessions._session_continuation_scope import require_publication
+
+    if type(record) is not dict:
+        raise ContinuationConflict("Continuation operation record is not an object.")
+    from cayu.sessions._temporary_service_target import (
+        TARGET_PREFIX,
+        TemporaryServiceTarget,
+        target_service_key,
+    )
+
+    if key.startswith(TARGET_PREFIX):
+        require_publication(key)
+        target = TemporaryServiceTarget.model_validate(record)
+        if target_service_key(target.service.intent.operation) != key:
+            raise ContinuationConflict("Side-session target key conflicts with its operation.")
+        return
+    if key.startswith(CONTINUATION_SERVICE_PREFIX):
+        from cayu.sessions._temporary_continuation import (
+            TemporaryServiceRecord,
+            temporary_service_key,
+        )
+
+        parsed_service = TemporaryServiceRecord.model_validate(record)
+        require_publication(continuation_operation_key(parsed_service.intent.ticket))
+        if temporary_service_key(parsed_service.intent.operation) != key:
+            raise ContinuationConflict("Temporary service key conflicts with its operation.")
+        return
+    require_publication(key)
+    if key == CONTINUATION_NAMESPACE_KEY:
+        ContinuationNamespace.model_validate(record)
+        return
+    parsed = record_from_json(record)
+    if continuation_operation_key(parsed.ticket) != key:
+        raise ContinuationConflict("Continuation operation key is not content-bound.")
 
 
 def collect_retained_record(records: dict[str, Any], key: str, value: Any) -> None:

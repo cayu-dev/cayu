@@ -30453,10 +30453,10 @@ def _validate_invocation_release_settlement_receipt_authority(
 
 def _validate_session_operation_record_keys(records: Mapping[str, Any]) -> None:
     from cayu.collaboration._session_export_store import require_operation_record_owner
-    from cayu.runtime._session_continuation import (
+    from cayu.sessions._browser_control_checkpoint import require_browser_control_operation_owner
+    from cayu.sessions._session_continuation_store import (
         require_operation_record_owner as require_continuation_record_owner,
     )
-    from cayu.sessions._browser_control_checkpoint import require_browser_control_operation_owner
 
     for key in records:
         _reject_reserved_runtime_publication_key(key, "operation_records key")
