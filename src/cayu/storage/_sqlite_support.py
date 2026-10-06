@@ -4,7 +4,6 @@ import json
 import re
 import sqlite3
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Any, NoReturn, cast
@@ -4688,7 +4687,7 @@ def reset_empty_recall_state(connection: sqlite3.Connection) -> None:
     """Rebuild empty revision-69/71 recall tables from this Runtime's DDL."""
 
     preflight_empty_recall_state_reset(connection)
-    with _transaction(connection):
+    with sqlite_connection._transaction(connection):
         for table in _EMPTY_RECALL_RESET_TABLES:
             connection.execute(f"DROP TABLE IF EXISTS {table}")
         for revision in (69, 71):
@@ -5764,7 +5763,7 @@ def _validate_revision_17_indexes(
 
 def _repair_missing_revision_17_indexes(connection: sqlite3.Connection) -> None:
     """Recreate missing required indexes even when revision 17 is already recorded."""
-    with _transaction(connection):
+    with sqlite_connection._transaction(connection):
         _validate_revision_17_indexes(connection, require_all=False)
         existing_names = {
             row[0]
@@ -5826,7 +5825,7 @@ def _validate_workflow_replay_indexes(
 
 
 def _repair_missing_workflow_replay_indexes(connection: sqlite3.Connection) -> None:
-    with _transaction(connection):
+    with sqlite_connection._transaction(connection):
         _validate_workflow_replay_indexes(connection, require_all=False)
         existing_names = {
             row[0]
@@ -5924,7 +5923,7 @@ def _validate_reservation_event_index(
 
 
 def _repair_missing_reservation_event_index(connection: sqlite3.Connection) -> None:
-    with _transaction(connection):
+    with sqlite_connection._transaction(connection):
         _validate_reservation_event_index(connection, require=False)
         row = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
@@ -5979,7 +5978,7 @@ def _validate_pending_action_scope_indexes(
 
 
 def _repair_missing_pending_action_scope_indexes(connection: sqlite3.Connection) -> None:
-    with _transaction(connection):
+    with sqlite_connection._transaction(connection):
         _validate_pending_action_scope_indexes(connection, require_all=False)
         existing_names = {
             row[0]
@@ -10457,109 +10456,6 @@ def read_schema_state(connection: sqlite3.Connection) -> schema.SchemaState:
     return schema.SchemaState(revision=row[0], compatible_from=row[1])
 
 
-@contextmanager
-def _transaction(
-    connection: sqlite3.Connection,
-    *,
-    begin_immediate: bool = True,
-) -> Iterator[None]:
-    """Run a block inside one owned SQLite transaction (BEGIN/COMMIT/ROLLBACK).
-
-    Most revisions apply DDL, their data hook, and their revision marker
-    atomically. Large revision-17 backfills instead use this helper for short,
-    independently committed batches and explicit ready markers, making a crash
-    resumable without holding one write lock for the entire data set.
-
-    ``executescript`` cannot be used here: it force-commits any open transaction,
-    so revision DDL is executed statement-by-statement.
-
-    ``begin_immediate=False`` starts a deferred transaction. Read paths use it
-    to hydrate one authorization-checked result from a stable WAL snapshot;
-    writes still take the immediate writer reservation before inspecting state.
-    """
-    failure: BaseException | None = None
-    suppress_implicit_context = False
-    transaction_started = False
-    try:
-        if begin_immediate:
-            connection.execute("BEGIN IMMEDIATE")
-        else:
-            connection.execute("BEGIN")
-        transaction_started = True
-        yield
-        connection.commit()
-    except BaseException as primary:
-        if transaction_started:
-            failure = _settle_failed_transaction(connection, primary)
-            suppress_implicit_context = failure is not primary
-        else:
-            # A boundary wrapper can raise after SQLite accepted BEGIN. Probe
-            # conservatively so that owned work is rolled back, while a closed
-            # or otherwise unreadable connection preserves the original BEGIN
-            # failure instead of manufacturing a cleanup aggregate.
-            try:
-                began_despite_error = connection.in_transaction
-            except BaseException:
-                failure = primary
-            else:
-                failure = (
-                    _settle_failed_transaction(connection, primary)
-                    if began_despite_error
-                    else primary
-                )
-                suppress_implicit_context = failure is not primary
-    if failure is not None:
-        # A context-manager body exception remains Python's active implicit
-        # context while __exit__ runs. Suppress that incidental chain because the
-        # primary is already a cleanup aggregate's first explicit member. Preserve
-        # an unchanged primary's own causal evidence when rollback succeeds.
-        if suppress_implicit_context:
-            raise failure from None
-        raise failure
-
-
-def _settle_failed_transaction(
-    connection: sqlite3.Connection,
-    primary: BaseException,
-) -> BaseException:
-    """Roll back ``primary`` or fence a connection whose cleanup is uncertain."""
-    try:
-        in_transaction = connection.in_transaction
-    except BaseException as state_error:
-        state_error.__context__ = None
-        return _fence_failed_transaction(connection, primary, state_error)
-    if not in_transaction:
-        # A commit may have completed before its caller observed the failure.
-        return primary
-    try:
-        connection.rollback()
-    except BaseException as rollback_error:
-        # The primary is already an explicit member of the aggregate. Remove only
-        # Python's incidental handler context so it is represented exactly once.
-        rollback_error.__context__ = None
-        return _fence_failed_transaction(connection, primary, rollback_error)
-    return primary
-
-
-def _fence_failed_transaction(
-    connection: sqlite3.Connection,
-    primary: BaseException,
-    cleanup_error: BaseException,
-) -> BaseException:
-    failures = [primary, cleanup_error]
-    try:
-        # Closing a SQLite connection abandons its active transaction and releases
-        # writer ownership. The closed connection then fails closed on later use.
-        connection.close()
-    except BaseException as close_error:
-        close_error.__context__ = None
-        failures.append(close_error)
-    return BaseExceptionGroup(
-        "SQLite transaction failed and cleanup could not prove rollback",
-        failures,
-    )
-
-
 def _iter_statements(script: str) -> Iterator[str]:
     """Yield complete statements while preserving trigger bodies and literals."""
     pending: list[str] = []
@@ -10609,7 +10505,7 @@ def _reject_unprofiled_verified_work_records(connection: sqlite3.Connection) -> 
 
 
 def _apply_baseline(connection: sqlite3.Connection) -> None:
-    with _transaction(connection):
+    with sqlite_connection._transaction(connection):
         for statement in _iter_statements(_BASELINE_DDL):
             connection.execute(statement)
         _record_revision(connection, schema.revision(schema.BASELINE_REVISION))
@@ -10765,7 +10661,7 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
         _apply_revision_seventeen(connection, rev)
         return
     if rev.revision == 23:
-        with _transaction(connection):
+        with sqlite_connection._transaction(connection):
             _validate_reservation_event_index(connection, require=False)
             _validate_pending_action_scope_indexes(connection, require_all=False)
             for statement in _iter_statements(_MIGRATION_STEPS[23]):
@@ -10783,7 +10679,7 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             connection.execute(f"PRAGMA user_version = {rev.revision}")
         return
     if rev.revision == 29:
-        with _transaction(connection):
+        with sqlite_connection._transaction(connection):
             _validate_workflow_replay_indexes(connection, require_all=False)
             for statement in _iter_statements(_MIGRATION_STEPS[29]):
                 connection.execute(statement)
@@ -10792,7 +10688,7 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             connection.execute(f"PRAGMA user_version = {rev.revision}")
         return
     if rev.revision == 38:
-        with _transaction(connection):
+        with sqlite_connection._transaction(connection):
             for statement in _iter_statements(_MIGRATION_STEPS[38]):
                 connection.execute(statement)
             _validate_task_terminalization_receipt_table(connection)
@@ -10802,7 +10698,7 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
     if rev.revision == 72:
         _apply_revision_seventy_two(connection, rev)
         return
-    with _transaction(connection):
+    with sqlite_connection._transaction(connection):
         if rev.revision == 42:
             # Recheck under the same immediate writer transaction that owns the
             # destructive reset DDL. A legacy writer cannot populate an empty
@@ -10966,7 +10862,7 @@ def _apply_revision_seventy_two(
     connection.execute("PRAGMA foreign_keys = OFF")
     connection.execute("PRAGMA legacy_alter_table = ON")
     try:
-        with _transaction(connection):
+        with sqlite_connection._transaction(connection):
             for statement in _iter_statements(_MIGRATION_STEPS[72]):
                 connection.execute(statement)
             _validate_eval_run_max_concurrency_schema(connection)
@@ -10987,7 +10883,7 @@ def _apply_revision_seventeen(
     # CREATE INDEX IF NOT EXISTS silently accepts a wrong same-name index.
     # Validate before any staged work so a conflict cannot be followed by a
     # falsely recorded successful migration.
-    with _transaction(connection):
+    with sqlite_connection._transaction(connection):
         _validate_revision_17_indexes(connection, require_all=False)
         for table, column, decl in _MIGRATION_ADD_COLUMNS[17]:
             _add_column_if_missing(connection, table, column, decl)
@@ -10996,7 +10892,7 @@ def _apply_revision_seventeen(
 
     after_session_id: str | None = None
     while True:
-        with _transaction(connection):
+        with sqlite_connection._transaction(connection):
             next_session_id = _backfill_pending_action_checkpoint_batch(
                 connection,
                 after_session_id,
@@ -11020,7 +10916,7 @@ def _apply_revision_seventeen(
     event_types = sorted(PENDING_ACTION_EVENT_TYPE_VALUES)
     event_type_placeholders = ", ".join("?" for _ in event_types)
     while True:
-        with _transaction(connection):
+        with sqlite_connection._transaction(connection):
             next_sequence = _backfill_pending_action_event_batch(connection, after_sequence)
             event_remaining = (
                 next_sequence is None
@@ -11039,7 +10935,7 @@ def _apply_revision_seventeen(
             break
         after_sequence = 0
 
-    with _transaction(connection):
+    with sqlite_connection._transaction(connection):
         _validate_revision_17_indexes(connection, require_all=True)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")

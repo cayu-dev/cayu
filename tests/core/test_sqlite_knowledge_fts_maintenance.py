@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -332,7 +333,7 @@ def test_sqlite_transaction_successful_rollback_preserves_primary_context(
     try:
         with (
             pytest.raises(RuntimeError, match="primary transaction failure") as caught,
-            sqlite_support._transaction(connection),
+            sqlite_connection._transaction(connection),
         ):
             connection.execute("INSERT INTO evidence (value) VALUES ('partial')")
             try:
@@ -345,6 +346,62 @@ def test_sqlite_transaction_successful_rollback_preserves_primary_context(
         assert connection.execute("SELECT value FROM evidence").fetchall() == []
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize("cleanup_failure", ["state", "rollback"])
+def test_sqlite_transaction_fencing_preserves_cancellation_and_close_failure(
+    tmp_path: Path, cleanup_failure: str
+) -> None:
+    database = tmp_path / "uncertain-transaction.sqlite"
+    native = sqlite_connection.connect(database)
+    native.execute("CREATE TABLE evidence (value TEXT NOT NULL)")
+    native.commit()
+    primary = asyncio.CancelledError("cancelled write")
+    cause = RuntimeError("original cause")
+    cleanup_error = sqlite3.OperationalError("cleanup failed")
+    close_error = sqlite3.OperationalError("close acknowledgement lost")
+
+    class FailingConnection:
+        @property
+        def in_transaction(self):
+            if cleanup_failure == "state":
+                raise cleanup_error
+            return native.in_transaction
+
+        def execute(self, sql):
+            return native.execute(sql)
+
+        def commit(self):
+            native.commit()
+
+        def rollback(self):
+            raise cleanup_error
+
+        def close(self):
+            native.close()
+            raise close_error
+
+    try:
+        with (
+            pytest.raises(BaseExceptionGroup) as caught,
+            sqlite_connection._transaction(FailingConnection()),
+        ):
+            native.execute("INSERT INTO evidence VALUES ('partial')")
+            raise primary from cause
+        assert caught.value.exceptions == (primary, cleanup_error, close_error)
+        assert primary.__cause__ is cause
+        assert cleanup_error.__context__ is None
+        assert close_error.__context__ is None
+        assert caught.value.__suppress_context__
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            native.execute("SELECT 1")
+        with closing(sqlite_connection.connect(database)) as peer:
+            peer.execute("PRAGMA busy_timeout = 100")
+            peer.execute("BEGIN IMMEDIATE")
+            assert peer.execute("SELECT value FROM evidence").fetchall() == []
+            peer.rollback()
+    finally:
+        native.close()
 
 
 def _assert_exact_fts_mapping(

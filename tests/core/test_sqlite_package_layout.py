@@ -199,3 +199,52 @@ for name in (
         timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_sqlite_transactions_work_without_schema_or_store_adapters():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sqlite3
+import sys
+from contextlib import closing
+
+from cayu.storage import _sqlite_connection
+
+with closing(sqlite3.connect(":memory:")) as connection:
+    with _sqlite_connection._transaction(connection):
+        connection.execute("CREATE TABLE records (value TEXT)")
+        connection.execute("INSERT INTO records VALUES ('committed')")
+    failure = RuntimeError("roll back this write")
+    try:
+        with _sqlite_connection._transaction(connection):
+            connection.execute("INSERT INTO records VALUES ('rolled back')")
+            raise failure
+    except RuntimeError as caught:
+        assert caught is failure
+    else:
+        raise AssertionError("transaction failure was suppressed")
+    assert not connection.in_transaction
+    with _sqlite_connection._transaction(connection, begin_immediate=False):
+        assert connection.execute("SELECT value FROM records").fetchall() == [("committed",)]
+
+for name in (
+    "cayu.storage._sqlite_support",
+    "cayu.storage._sqlite_functions",
+    "cayu.sessions.base",
+    "cayu.tasks.base",
+    "cayu.storage.sqlite",
+    "cayu.storage.tasks_sqlite",
+    "cayu.storage.postgres",
+):
+    assert name not in sys.modules, name
+""",
+        ],
+        env={**os.environ, "PYTHONPATH": str(Path(cayu.__file__).resolve().parent.parent)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

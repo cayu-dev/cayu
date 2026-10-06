@@ -251,7 +251,7 @@ class SQLiteAgentWorkContextStore(AgentWorkContextStore):
             expected_revision,
         )
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 replay = self._load_publication_unlocked(context.operation_id)
                 if replay is not None:
                     if replay.request_sha256 != request_sha256:
@@ -328,7 +328,7 @@ class SQLiteAgentWorkContextStore(AgentWorkContextStore):
             _positive_revision(expected_revision, "expected_revision")
         checkpoint = copy_agent_recall_checkpoint(checkpoint)
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 occupied = self._connection.execute(
                     """
                     SELECT 1 FROM cayu_agent_recall_deliveries WHERE operation_id = ?
@@ -381,7 +381,7 @@ class SQLiteAgentWorkContextStore(AgentWorkContextStore):
         delivery = copy_agent_recall_delivery(delivery)
         key = delivery.key()
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 evaluation_row = self._connection.execute(
                     "SELECT 1 FROM cayu_agent_recall_subscription_evaluations "
                     "WHERE processing_operation_id = ?",
@@ -482,7 +482,7 @@ class SQLiteAgentWorkContextStore(AgentWorkContextStore):
             lease_seconds=lease_seconds,
         )
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 replay = self._connection.execute(
                     "SELECT delivery_id, worker_id, request_sha256, attempt "
                     "FROM cayu_agent_recall_delivery_claims WHERE claim_id = ?",
@@ -584,7 +584,7 @@ class SQLiteAgentWorkContextStore(AgentWorkContextStore):
         claim = copy_agent_recall_delivery_claim(claim)
         _validate_delivery_lease_seconds(lease_seconds)
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 current = self._load_delivery_unlocked(claim.delivery_id)
                 if current is None:
                     raise AgentRecallDeliveryConflict("unknown_delivery")
@@ -614,7 +614,7 @@ class SQLiteAgentWorkContextStore(AgentWorkContextStore):
             released_at=released_at,
         )
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 current = self._load_delivery_unlocked(claim.delivery_id)
                 if current is None:
                     raise AgentRecallDeliveryConflict("unknown_delivery")
@@ -671,7 +671,7 @@ class SQLiteAgentWorkContextStore(AgentWorkContextStore):
         claim = copy_agent_recall_delivery_claim(claim)
         acknowledgement_id = _bounded_identity(acknowledgement_id, "acknowledgement_id")
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 current = self._load_delivery_unlocked(claim.delivery_id)
                 if current is None:
                     raise AgentRecallDeliveryConflict("unknown_delivery")
@@ -707,7 +707,7 @@ class SQLiteAgentWorkContextStore(AgentWorkContextStore):
             expected_revision,
         )
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 replay = self._load_subscription_publication_unlocked(subscription.operation_id)
                 if replay is not None:
                     if replay.request_sha256 != request_sha256:
@@ -843,7 +843,7 @@ class SQLiteAgentWorkContextStore(AgentWorkContextStore):
             lease_seconds=lease_seconds,
         )
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 replay = self._connection.execute(
                     "SELECT subscription_id, runner_id, request_sha256, attempt "
                     "FROM cayu_agent_recall_subscription_claims WHERE claim_id = ?",
@@ -952,7 +952,7 @@ class SQLiteAgentWorkContextStore(AgentWorkContextStore):
     ) -> AgentRecallSubscriptionRecord:
         claim = copy_agent_recall_subscription_claim(claim)
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 current = self._load_subscription_state_unlocked(claim.subscription_id)
                 if current is None:
                     raise AgentRecallSubscriptionConflict("unknown_subscription")
@@ -981,7 +981,7 @@ class SQLiteAgentWorkContextStore(AgentWorkContextStore):
             released_at=released_at,
         )
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 current = self._load_subscription_state_unlocked(claim.subscription_id)
                 if current is None:
                     raise AgentRecallSubscriptionConflict("unknown_subscription")
@@ -1050,7 +1050,7 @@ class SQLiteAgentWorkContextStore(AgentWorkContextStore):
             evaluated_at=evaluated_at,
         )
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 replay = self._load_subscription_evaluation_unlocked(evaluation_id)
                 if replay is not None:
                     if replay.request_sha256 != request_sha256:
@@ -1171,7 +1171,7 @@ class SQLiteAgentWorkContextStore(AgentWorkContextStore):
             lease_seconds=lease_seconds,
         )
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 replay = self._connection.execute(
                     "SELECT wake_id, runner_id, request_sha256, attempt "
                     "FROM cayu_agent_recall_subscription_wake_claims WHERE claim_id = ?",
@@ -1267,7 +1267,7 @@ class SQLiteAgentWorkContextStore(AgentWorkContextStore):
     ) -> AgentRecallSubscriptionWake:
         claim = copy_agent_recall_subscription_wake_claim(claim)
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 current = self._load_subscription_wake_unlocked(claim.wake_id)
                 if current is None:
                     raise AgentRecallSubscriptionConflict("unknown_wake")
@@ -1296,7 +1296,7 @@ class SQLiteAgentWorkContextStore(AgentWorkContextStore):
             released_at=released_at,
         )
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 current = self._load_subscription_wake_unlocked(claim.wake_id)
                 if current is None:
                     raise AgentRecallSubscriptionConflict("unknown_wake")
@@ -1352,7 +1352,7 @@ class SQLiteAgentWorkContextStore(AgentWorkContextStore):
         claim = copy_agent_recall_subscription_wake_claim(claim)
         acknowledgement_id = _bounded_identity(acknowledgement_id, "acknowledgement_id")
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 current = self._load_subscription_wake_unlocked(claim.wake_id)
                 if current is None:
                     raise AgentRecallSubscriptionConflict("unknown_wake")

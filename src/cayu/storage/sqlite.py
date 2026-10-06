@@ -7267,7 +7267,7 @@ class SQLiteSessionStore(
                         )
                 self._connection.commit()
             except sqlite3.IntegrityError as exc:
-                transaction_failure = sqlite_support._settle_failed_transaction(
+                transaction_failure = sqlite_connection._settle_failed_transaction(
                     self._connection,
                     exc,
                 )
@@ -7300,7 +7300,7 @@ class SQLiteSessionStore(
                     ) from exc
                 raise
             except BaseException as primary:
-                transaction_failure = sqlite_support._settle_failed_transaction(
+                transaction_failure = sqlite_connection._settle_failed_transaction(
                     self._connection,
                     primary,
                 )
@@ -8278,7 +8278,7 @@ class SQLiteSessionStore(
                     status_changed=not queued,
                 )
             except BaseException as primary:
-                transaction_failure = sqlite_support._settle_failed_transaction(
+                transaction_failure = sqlite_connection._settle_failed_transaction(
                     connection,
                     primary,
                 )
@@ -8510,7 +8510,7 @@ class SQLiteSessionStore(
         require_invocation_release_store_authority(copied)
 
         def statement(connection: sqlite3.Connection) -> Any:
-            with sqlite_support._transaction(connection):
+            with sqlite_connection._transaction(connection):
                 session = _load_session(connection, copied.session_id)
                 if session is None:
                     raise KeyError(f"Session not found: {copied.session_id}")
@@ -18273,7 +18273,7 @@ class SQLiteSessionStore(
                     )
                 connection.commit()
             except BaseException as primary:
-                transaction_failure = sqlite_support._settle_failed_transaction(
+                transaction_failure = sqlite_connection._settle_failed_transaction(
                     connection,
                     primary,
                 )

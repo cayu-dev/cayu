@@ -1,4 +1,7 @@
 {
+    "tests/core/test_sqlite_knowledge_fts_maintenance.py::test_sqlite_transaction_fencing_preserves_cancellation_and_close_failure[rollback]": 0.002,
+    "tests/core/test_sqlite_knowledge_fts_maintenance.py::test_sqlite_transaction_fencing_preserves_cancellation_and_close_failure[state]": 0.002,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_transactions_work_without_schema_or_store_adapters": 0.058,
     "tests/core/test_diagnostic_store_inspection.py::test_diagnostic_inspection_rejects_a_changed_static_database": 0.143,
     "tests/core/test_diagnostic_store_inspection.py::test_diagnostic_inspection_rejects_a_missing_database_appearing": 0.091,
     "tests/core/test_diagnostic_store_inspection.py::test_diagnostic_inspection_sees_committed_live_wal_frames": 0.144,

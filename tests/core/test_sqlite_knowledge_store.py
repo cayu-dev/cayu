@@ -1564,7 +1564,7 @@ def test_sqlite_knowledge_schema_rejects_a_dangling_current_revision(tmp_path) -
 
     connection = sqlite_connection.connect(database)
     try:
-        with pytest.raises(sqlite3.IntegrityError), sqlite_support._transaction(connection):
+        with pytest.raises(sqlite3.IntegrityError), sqlite_connection._transaction(connection):
             connection.execute(
                 "UPDATE cayu_knowledge_entries SET current_revision = ? WHERE id = ?",
                 (2, "entry"),
@@ -1794,7 +1794,7 @@ def test_sqlite_revision_60_refuses_populated_knowledge_without_backfill(
     entry = KnowledgeEntry(id="preserved-entry", text="Must remain untouched.")
     try:
         _reconcile_sqlite_through_revision_59(connection)
-        with sqlite_support._transaction(connection):
+        with sqlite_connection._transaction(connection):
             _insert_pre_revision_65_entry(connection, entry)
     finally:
         connection.close()
@@ -1893,7 +1893,7 @@ def test_sqlite_revision_63_refuses_populated_knowledge_without_interpretation(
     entry = KnowledgeEntry(id="revision-62-entry", text="Must remain untouched.")
     try:
         _reconcile_sqlite_through_revision_62(connection)
-        with sqlite_support._transaction(connection):
+        with sqlite_connection._transaction(connection):
             _insert_pre_revision_65_entry(connection, entry)
     finally:
         connection.close()
@@ -1974,7 +1974,7 @@ def test_sqlite_revision_65_refuses_populated_knowledge_without_backfill(tmp_pat
     entry = KnowledgeEntry(id="revision-64-entry", text="Must remain untouched.")
     try:
         _reconcile_sqlite_through_revision_64(connection)
-        with sqlite_support._transaction(connection):
+        with sqlite_connection._transaction(connection):
             _insert_pre_revision_65_entry(connection, entry)
     finally:
         connection.close()
@@ -2061,7 +2061,7 @@ def test_sqlite_revision_75_refuses_populated_knowledge_without_backfill(
     )
     try:
         _reconcile_sqlite_through_revision_74(connection)
-        with sqlite_support._transaction(connection):
+        with sqlite_connection._transaction(connection):
             _insert_pre_revision_65_entry(connection, entry)
     finally:
         connection.close()
@@ -2256,7 +2256,7 @@ def test_sqlite_revision_43_rejects_out_of_contract_revision_42_identities(
     oversized_chunk_id = "c" * (MAX_KNOWLEDGE_CHUNK_ID_BYTES + 1)
     try:
         _reconcile_sqlite_through_revision_42(connection)
-        with sqlite_support._transaction(connection):
+        with sqlite_connection._transaction(connection):
             _insert_pre_revision_65_entry(connection, entry)
             connection.execute(
                 """

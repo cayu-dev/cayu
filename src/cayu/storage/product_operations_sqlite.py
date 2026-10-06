@@ -134,7 +134,7 @@ class SQLiteProductOperationStore:
         )
 
         def reserve(connection: sqlite3.Connection) -> ProductOperationReservation:
-            with sqlite_support._transaction(connection):
+            with sqlite_connection._transaction(connection):
                 row = connection.execute(
                     f"SELECT * FROM {PRODUCT_OPERATIONS_TABLE} WHERE idempotency_key = ?",
                     (requested.idempotency_key,),
@@ -187,7 +187,7 @@ class SQLiteProductOperationStore:
 
     async def _find(self, sql: str, parameters: tuple[str, ...]) -> ProductOperation | None:
         def find(connection: sqlite3.Connection) -> ProductOperation | None:
-            with sqlite_support._transaction(connection, begin_immediate=False):
+            with sqlite_connection._transaction(connection, begin_immediate=False):
                 row = connection.execute(sql, parameters).fetchone()
             return None if row is None else rules.operation_from_row(row)
 
@@ -205,7 +205,7 @@ class SQLiteProductOperationStore:
         lease_ms = rules.lease_seconds(lease_seconds) * 1000
 
         def claim(connection: sqlite3.Connection) -> ProductOperationExecutionClaim | None:
-            with sqlite_support._transaction(connection):
+            with sqlite_connection._transaction(connection):
                 row = connection.execute(_SELECT_OPERATION, (work_id,)).fetchone()
                 if row is None:
                     return None
@@ -250,7 +250,7 @@ class SQLiteProductOperationStore:
         lease_ms = rules.lease_seconds(lease_seconds) * 1000
 
         def heartbeat(connection: sqlite3.Connection) -> bool:
-            with sqlite_support._transaction(connection):
+            with sqlite_connection._transaction(connection):
                 row = connection.execute(
                     "SELECT status, execution_claim_id, execution_claim_expires_at "
                     f"FROM {PRODUCT_OPERATIONS_TABLE} WHERE work_id = ?",
@@ -285,7 +285,7 @@ class SQLiteProductOperationStore:
         claim_id = rules.identity(claim_id, "claim_id")
 
         def release(connection: sqlite3.Connection) -> bool:
-            with sqlite_support._transaction(connection):
+            with sqlite_connection._transaction(connection):
                 row = connection.execute(
                     "SELECT status, execution_claim_id "
                     f"FROM {PRODUCT_OPERATIONS_TABLE} WHERE work_id = ?",
@@ -325,7 +325,7 @@ class SQLiteProductOperationStore:
         encoded = rules.encode_receipt(receipt)
 
         def record(connection: sqlite3.Connection) -> ProductResultReceipt:
-            with sqlite_support._transaction(connection):
+            with sqlite_connection._transaction(connection):
                 row = connection.execute(_SELECT_OPERATION, (work_id,)).fetchone()
                 if row is None:
                     raise RuntimeError("Product work disappeared during result publication.")
@@ -363,7 +363,7 @@ class SQLiteProductOperationStore:
         recovery_status = rules.recovery_status(recovery_status)
 
         def record(connection: sqlite3.Connection) -> ProductOperation:
-            with sqlite_support._transaction(connection):
+            with sqlite_connection._transaction(connection):
                 row = connection.execute(_SELECT_OPERATION, (work_id,)).fetchone()
                 if row is None:
                     raise RuntimeError("Product work disappeared during recovery reporting.")
@@ -402,7 +402,7 @@ class SQLiteProductOperationStore:
         status, result = rules.settlement(status, result)
 
         def finish(connection: sqlite3.Connection) -> ProductOperation:
-            with sqlite_support._transaction(connection):
+            with sqlite_connection._transaction(connection):
                 row = connection.execute(_SELECT_OPERATION, (work_id,)).fetchone()
                 if row is None:
                     raise RuntimeError("Product work disappeared during completion.")

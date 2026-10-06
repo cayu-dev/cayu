@@ -9,8 +9,8 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from cayu._validation import MAX_PORTABLE_JSON_INTEGER
+from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_records as sqlite_records
-from cayu.storage import _sqlite_support as sql
 from cayu.storage import _sqlite_task_groups as groups
 from cayu.tasks._graph_admission import prepare_graph_admission
 from cayu.tasks._graphs import (
@@ -361,7 +361,7 @@ def record_transition(
 async def load_graph(store: SQLiteTaskStore, graph_id: str) -> TaskGraphSnapshot | None:
     graph_id = graph_identifier(graph_id)
     async with store._lock:
-        with sql._transaction(store._connection, begin_immediate=False):
+        with sqlite_connection._transaction(store._connection, begin_immediate=False):
             row = store._connection.execute(
                 "SELECT receipt_json FROM cayu_task_graphs WHERE graph_id = ?", (graph_id,)
             ).fetchone()
@@ -416,7 +416,7 @@ async def list_events(
     if type(limit) is not int or not 1 <= limit <= 1000:
         raise ValueError("Invalid graph event page size.")
     async with store._lock:
-        with sql._transaction(store._connection, begin_immediate=False):
+        with sqlite_connection._transaction(store._connection, begin_immediate=False):
             from cayu.tasks.access import require_collection
 
             access_row = store._connection.execute(

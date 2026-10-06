@@ -64,7 +64,7 @@ class SQLiteCollaborationStore(CollaborationStore):
         async with self._lock:
             if self._owners.closed and asyncio.current_task() not in self._owners.pending:
                 raise CollaborationUnavailable("Collaboration store is closing.")
-            transaction = sqlite._transaction(self._connection, begin_immediate=write)
+            transaction = sqlite_connection._transaction(self._connection, begin_immediate=write)
 
             # Keep transaction ownership through physical settlement, including
             # cancellation while BEGIN or finalization is running off-thread.

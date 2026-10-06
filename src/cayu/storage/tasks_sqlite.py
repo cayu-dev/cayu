@@ -470,7 +470,7 @@ class SQLiteTaskStore(TaskStore):
             raise
 
     def _verified_transaction_unlocked(self):
-        return sqlite_support._transaction(self._connection)
+        return sqlite_connection._transaction(self._connection)
 
     def _load_local_execution_attempt_unlocked(
         self,

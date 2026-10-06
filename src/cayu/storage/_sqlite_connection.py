@@ -1,4 +1,4 @@
-"""SQLite connection setup, diagnostic access and off-thread ownership."""
+"""SQLite connections, transactions, diagnostics and off-thread ownership."""
 
 from __future__ import annotations
 
@@ -6,8 +6,9 @@ import asyncio
 import contextvars
 import os
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import Executor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar, cast
@@ -225,3 +226,106 @@ def connect_read_only_inspection(path: Path) -> sqlite3.Connection:
 
         inspection.add_verifier(verify_static_snapshot)
     return connection
+
+
+@contextmanager
+def _transaction(
+    connection: sqlite3.Connection,
+    *,
+    begin_immediate: bool = True,
+) -> Iterator[None]:
+    """Run a block inside one owned SQLite transaction (BEGIN/COMMIT/ROLLBACK).
+
+    Most revisions apply DDL, their data hook, and their revision marker
+    atomically. Large revision-17 backfills instead use this helper for short,
+    independently committed batches and explicit ready markers, making a crash
+    resumable without holding one write lock for the entire data set.
+
+    ``executescript`` cannot be used here: it force-commits any open transaction,
+    so revision DDL is executed statement-by-statement.
+
+    ``begin_immediate=False`` starts a deferred transaction. Read paths use it
+    to hydrate one authorization-checked result from a stable WAL snapshot;
+    writes still take the immediate writer reservation before inspecting state.
+    """
+    failure: BaseException | None = None
+    suppress_implicit_context = False
+    transaction_started = False
+    try:
+        if begin_immediate:
+            connection.execute("BEGIN IMMEDIATE")
+        else:
+            connection.execute("BEGIN")
+        transaction_started = True
+        yield
+        connection.commit()
+    except BaseException as primary:
+        if transaction_started:
+            failure = _settle_failed_transaction(connection, primary)
+            suppress_implicit_context = failure is not primary
+        else:
+            # A boundary wrapper can raise after SQLite accepted BEGIN. Probe
+            # conservatively so that owned work is rolled back, while a closed
+            # or otherwise unreadable connection preserves the original BEGIN
+            # failure instead of manufacturing a cleanup aggregate.
+            try:
+                began_despite_error = connection.in_transaction
+            except BaseException:
+                failure = primary
+            else:
+                failure = (
+                    _settle_failed_transaction(connection, primary)
+                    if began_despite_error
+                    else primary
+                )
+                suppress_implicit_context = failure is not primary
+    if failure is not None:
+        # A context-manager body exception remains Python's active implicit
+        # context while __exit__ runs. Suppress that incidental chain because the
+        # primary is already a cleanup aggregate's first explicit member. Preserve
+        # an unchanged primary's own causal evidence when rollback succeeds.
+        if suppress_implicit_context:
+            raise failure from None
+        raise failure
+
+
+def _settle_failed_transaction(
+    connection: sqlite3.Connection,
+    primary: BaseException,
+) -> BaseException:
+    """Roll back ``primary`` or fence a connection whose cleanup is uncertain."""
+    try:
+        in_transaction = connection.in_transaction
+    except BaseException as state_error:
+        state_error.__context__ = None
+        return _fence_failed_transaction(connection, primary, state_error)
+    if not in_transaction:
+        # A commit may have completed before its caller observed the failure.
+        return primary
+    try:
+        connection.rollback()
+    except BaseException as rollback_error:
+        # The primary is already an explicit member of the aggregate. Remove only
+        # Python's incidental handler context so it is represented exactly once.
+        rollback_error.__context__ = None
+        return _fence_failed_transaction(connection, primary, rollback_error)
+    return primary
+
+
+def _fence_failed_transaction(
+    connection: sqlite3.Connection,
+    primary: BaseException,
+    cleanup_error: BaseException,
+) -> BaseException:
+    failures = [primary, cleanup_error]
+    try:
+        # Closing a SQLite connection abandons its active transaction and releases
+        # writer ownership. The closed connection then fails closed on later use.
+        connection.close()
+    except BaseException as close_error:
+        close_error.__context__ = None
+        failures.append(close_error)
+    return BaseExceptionGroup(
+        "SQLite transaction failed and cleanup could not prove rollback",
+        failures,
+    )

@@ -335,7 +335,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             chunks=copied_chunks,
         )
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 existing_entry = self._load_entry_unlocked(entry.id)
                 if existing_entry is not None:
                     _require_knowledge_entry_access(
@@ -390,7 +390,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         entry = copy_knowledge_entry(entry)
         _validate_revision_append(entry, expected_revision=expected_revision)
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 self._append_revision_unlocked(
                     entry,
                     expected_revision=expected_revision,
@@ -419,7 +419,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         if max_bytes is not None:
             _validate_positive_int(max_bytes, "max_bytes")
         async with self._lock:
-            with sqlite_support._transaction(
+            with sqlite_connection._transaction(
                 self._connection,
                 begin_immediate=False,
             ):
@@ -491,7 +491,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         )
         expected_labels = copy_label_map(expected_labels or {}, "expected_labels")
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 entry = self._load_entry_unlocked(clean_id)
                 if entry is None:
                     raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
@@ -562,7 +562,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         if type(hard) is not bool:
             raise ValueError("`hard` must be a boolean.")
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 entry = self._load_entry_unlocked(clean_id)
                 if entry is None:
                     if not hard:
@@ -666,7 +666,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             now=cutoff,
         )
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 rows = self._connection.execute(
                     "SELECT id FROM cayu_knowledge_current_entries "
                     "AS e WHERE expires_at IS NOT NULL AND expires_at <= ? "
@@ -759,7 +759,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 access_scope=scope,
             )
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 existing_receipt = self._load_publication_receipt_unlocked(
                     operation_id,
                     access_scope=scope,
@@ -928,7 +928,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         operation_id = _knowledge_publication_operation_id(operation_id)
         async with self._lock:
-            with sqlite_support._transaction(
+            with sqlite_connection._transaction(
                 self._connection,
                 begin_immediate=False,
             ):
@@ -959,7 +959,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         )
         expected_labels = copy_label_map(expected_labels or {}, "expected_labels")
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 existing_receipt = self._load_activation_receipt_unlocked(
                     request.operation_id,
                     access_scope=scope,
@@ -1092,7 +1092,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             operation_id=operation_id,
         )
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 existing_receipt = self._load_relation_receipt_unlocked(
                     operation_id,
                     access_scope=scope,
@@ -1248,7 +1248,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         fingerprint = _knowledge_relation_query_fingerprint(query, scope)
         cursor = _decode_knowledge_relation_cursor(query.cursor, fingerprint=fingerprint)
         async with self._lock:
-            with sqlite_support._transaction(self._connection, begin_immediate=False):
+            with sqlite_connection._transaction(self._connection, begin_immediate=False):
                 reference = self._load_entry_in_scope_unlocked(
                     query.reference.entry_id,
                     scope,
@@ -1333,7 +1333,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         )
         cursor = _decode_knowledge_lineage_cursor(query.cursor, fingerprint=fingerprint)
         async with self._lock:
-            with sqlite_support._transaction(self._connection, begin_immediate=False):
+            with sqlite_connection._transaction(self._connection, begin_immediate=False):
                 access_now = datetime.now(UTC)
                 reference_exact = self._load_entry_unlocked(
                     query.reference.entry_id,
@@ -1558,7 +1558,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         operation = "publish_maintenance_proposal"
         _require_knowledge_entry_access(scope, copied_entry, operation=operation)
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 existing = self._load_maintenance_proposal_record_unlocked(
                     operation_id,
                     access_scope=scope,
@@ -1681,7 +1681,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         proposal_id = _knowledge_maintenance_identity(proposal_id, "proposal_id")
         async with self._lock:
-            with sqlite_support._transaction(self._connection, begin_immediate=False):
+            with sqlite_connection._transaction(self._connection, begin_immediate=False):
                 row = self._connection.execute(
                     "SELECT operation_id FROM cayu_knowledge_maintenance_proposals "
                     "WHERE proposal_id = ?",
@@ -1770,7 +1770,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             raise KnowledgeAccessDenied("record_maintenance_governance_route")
         proposal = copied.request.proposal
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 publication = self._load_maintenance_proposal_record_unlocked(
                     copied.request.publication_operation_id,
                     access_scope=scope,
@@ -1910,7 +1910,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             raise KnowledgeAccessDenied("record_semantic_watch_outcome")
         operation_id = copied.invocation.operation_id
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 existing = self._load_semantic_watch_receipt_unlocked(
                     operation_id,
                     access_scope=scope,
@@ -2010,7 +2010,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         )
         operation = "apply_maintenance_decision"
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 publication_rows = self._connection.execute(
                     "SELECT operation_id FROM cayu_knowledge_maintenance_proposals "
                     "WHERE proposal_id = ? OR replacement_entry_id = ? "
@@ -2270,7 +2270,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         proposal_id = _knowledge_maintenance_identity(proposal_id, "proposal_id")
         async with self._lock:
-            with sqlite_support._transaction(self._connection, begin_immediate=False):
+            with sqlite_connection._transaction(self._connection, begin_immediate=False):
                 publication_row = self._connection.execute(
                     "SELECT operation_id FROM cayu_knowledge_maintenance_proposals "
                     "WHERE proposal_id = ?",
@@ -2340,7 +2340,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         inventory = KnowledgeClosureInventory(query)
         revisions: set[tuple[str, int]] = set()
         async with self._lock:
-            with sqlite_support._transaction(self._connection, begin_immediate=False):
+            with sqlite_connection._transaction(self._connection, begin_immediate=False):
                 for start in range(0, max(len(query.sources), len(query.source_uris)), 100):
                     batch = query.sources[start : start + 100]
                     uri_batch = query.source_uris[start : start + 100]
@@ -2422,7 +2422,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         _validate_positive_int(max_records, "max_records")
         _validate_positive_int(max_bytes, "max_bytes")
         async with self._lock:
-            with sqlite_support._transaction(self._connection, begin_immediate=False):
+            with sqlite_connection._transaction(self._connection, begin_immediate=False):
                 entry = self._load_entry_in_scope_unlocked(
                     entry_id,
                     scope,
@@ -2466,7 +2466,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         _validate_knowledge_change_sequence(after_sequence, "after_sequence")
         _validate_knowledge_change_limit(limit)
         async with self._lock:
-            with sqlite_support._transaction(self._connection, begin_immediate=False):
+            with sqlite_connection._transaction(self._connection, begin_immediate=False):
                 high_water = self._accessible_change_high_water_unlocked(scope)
                 if after_sequence > high_water:
                     row = self._connection.execute(
@@ -2511,7 +2511,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         lease_seconds = _knowledge_change_lease_seconds(lease_seconds)
         scope_sha256 = _knowledge_access_scope_sha256(scope)
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 current_time = self._clock()
                 state = self._load_change_consumer_unlocked(consumer_id)
                 if state is None:
@@ -2602,7 +2602,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         consumer_id = _knowledge_change_identity(consumer_id, "consumer_id")
         _validate_knowledge_change_sequence(baseline_sequence, "baseline_sequence")
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 current_time = self._clock()
                 row = self._connection.execute(
                     "SELECT COALESCE(MAX(sequence), 0) AS current_sequence "
@@ -2635,7 +2635,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         claim_sha256 = _knowledge_change_claim_sha256(claim)
         scope_sha256 = _knowledge_access_scope_sha256(scope)
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 current_time = self._clock()
                 state = self._load_change_consumer_unlocked(claim.consumer_id)
                 if state is None or state.access_scope_sha256 != scope_sha256:
@@ -2685,7 +2685,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         claim = copy_knowledge_change_claim(claim)
         scope_sha256 = _knowledge_access_scope_sha256(scope)
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 current_time = self._clock()
                 state = self._load_change_consumer_unlocked(claim.consumer_id)
                 if state is None or state.access_scope_sha256 != scope_sha256:
@@ -2745,7 +2745,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         identity_sha256 = _knowledge_embedding_identity_sha256(update.identity)
         update_sha256 = _knowledge_index_readiness_update_sha256(update)
         async with self._lock:
-            with sqlite_support._transaction(self._connection):
+            with sqlite_connection._transaction(self._connection):
                 replay_row = self._connection.execute(
                     "SELECT * FROM cayu_knowledge_index_readiness_events WHERE operation_id = ?",
                     (operation_id,),
@@ -2867,7 +2867,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         identity = copy_knowledge_embedding_identity(identity)
         async with self._lock:
-            with sqlite_support._transaction(self._connection, begin_immediate=False):
+            with sqlite_connection._transaction(self._connection, begin_immediate=False):
                 if not self._index_identity_is_accessible_unlocked(scope, identity):
                     return None
                 row = self._connection.execute(
@@ -2922,7 +2922,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         """
         access_params = [*exact_access_params, *current_access_params]
         async with self._lock:
-            with sqlite_support._transaction(self._connection, begin_immediate=False):
+            with sqlite_connection._transaction(self._connection, begin_immediate=False):
                 high_water_row = self._connection.execute(
                     "SELECT COALESCE(MAX(event.sequence), 0) AS high_water "
                     + accessible_from
@@ -3027,7 +3027,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         _validate_positive_int(max_chunks, "max_chunks")
         _validate_positive_int(max_bytes, "max_bytes")
         async with self._lock:
-            with sqlite_support._transaction(
+            with sqlite_connection._transaction(
                 self._connection,
                 begin_immediate=False,
             ):
@@ -3130,7 +3130,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         none_fts_query = _sqlite_knowledge_none_fts_query(knowledge_query)
         if revision_refs is not None:
             async with self._lock:
-                with sqlite_support._transaction(
+                with sqlite_connection._transaction(
                     self._connection,
                     begin_immediate=False,
                 ):
@@ -3159,7 +3159,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         where_sql += access_sql
         params.extend(access_params)
         async with self._lock:
-            with sqlite_support._transaction(
+            with sqlite_connection._transaction(
                 self._connection,
                 begin_immediate=False,
             ):
@@ -3345,7 +3345,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         where_sql += access_sql
         params.extend(access_params)
         async with self._lock:
-            with sqlite_support._transaction(
+            with sqlite_connection._transaction(
                 self._connection,
                 begin_immediate=False,
             ):
