@@ -146,6 +146,7 @@ from cayu.evals.suite_authoring import (
     EvalSuiteDocument,
     eval_suite_document_from_json,
 )
+from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 from cayu.storage._phase_timing import TimedStoreLock
@@ -243,11 +244,11 @@ _RESULT_RECORD_COLUMNS = """
 
 
 def _format_datetime(value: datetime) -> str:
-    return sqlite_support.format_datetime(value)
+    return sqlite_records.format_datetime(value)
 
 
 def _parse_optional_datetime(value: str | None) -> datetime | None:
-    return None if value is None else sqlite_support.parse_datetime(value)
+    return None if value is None else sqlite_records.parse_datetime(value)
 
 
 def _is_sqlite_writer_contention(error: sqlite3.Error) -> bool:
@@ -290,7 +291,7 @@ def _run_observation_from_row(row: sqlite3.Row) -> EvalRunObservation:
         run_id=row["run_id"],
         status=status,
         attempt_count=row["ownership_epoch"],
-        updated_at=sqlite_support.parse_datetime(row["updated_at"]),
+        updated_at=sqlite_records.parse_datetime(row["updated_at"]),
         ownership=ownership,
     )
 
@@ -359,7 +360,7 @@ def _run_record_from_row(row: sqlite3.Row) -> EvalRunRecord:
     if status in {EvalRunStatus.RUNNING, EvalRunStatus.CANCELLING}:
         ownership = EvalRunOwnership(
             epoch=row["ownership_epoch"],
-            lease_expires_at=sqlite_support.parse_datetime(row["lease_expires_at"]),
+            lease_expires_at=sqlite_records.parse_datetime(row["lease_expires_at"]),
         )
     result = None
     if row["result_revision"] is not None:
@@ -381,8 +382,8 @@ def _run_record_from_row(row: sqlite3.Row) -> EvalRunRecord:
         ),
         status=status,
         attempt_count=row["ownership_epoch"],
-        created_at=sqlite_support.parse_datetime(row["created_at"]),
-        updated_at=sqlite_support.parse_datetime(row["updated_at"]),
+        created_at=sqlite_records.parse_datetime(row["created_at"]),
+        updated_at=sqlite_records.parse_datetime(row["updated_at"]),
         started_at=_parse_optional_datetime(row["started_at"]),
         finished_at=_parse_optional_datetime(row["finished_at"]),
         cancel_requested_at=_parse_optional_datetime(row["cancel_requested_at"]),
@@ -420,7 +421,7 @@ def _result_record_from_row(row: sqlite3.Row) -> EvalResultRecord:
         status=row["result_status"],
         score=row["result_score"],
         document_bytes=row["document_bytes"],
-        created_at=sqlite_support.parse_datetime(row["created_at"]),
+        created_at=sqlite_records.parse_datetime(row["created_at"]),
     )
 
 
@@ -438,7 +439,7 @@ def _baseline_record_from_row(row: sqlite3.Row) -> EvalBaselineRecord:
         result_revision=row["result_revision"],
         generation=row["generation"],
         updated_by=row["updated_by"],
-        updated_at=sqlite_support.parse_datetime(row["updated_at"]),
+        updated_at=sqlite_records.parse_datetime(row["updated_at"]),
     )
 
 
@@ -451,7 +452,7 @@ def _baseline_mutation_from_row(row: sqlite3.Row) -> EvalBaselineMutationRecord:
         selected_result_revision=row["selected_result_revision"],
         resulting_generation=row["resulting_generation"],
         actor_id=row["actor_id"],
-        created_at=sqlite_support.parse_datetime(row["created_at"]),
+        created_at=sqlite_records.parse_datetime(row["created_at"]),
     )
 
 
@@ -3126,7 +3127,7 @@ class SQLiteEvalStore(EvalStore):
             assertion_count=row["assertion_count"],
             expanded_assertion_result_count=row["expanded_assertion_result_count"],
             document_bytes=row["document_bytes"],
-            created_at=sqlite_support.parse_datetime(row["created_at"]),
+            created_at=sqlite_records.parse_datetime(row["created_at"]),
         )
 
     @classmethod
@@ -3164,7 +3165,7 @@ class SQLiteEvalStore(EvalStore):
             artifact_requirement_count=row["artifact_requirement_count"],
             secret_requirement_count=row["secret_requirement_count"],
             document_bytes=row["document_bytes"],
-            created_at=sqlite_support.parse_datetime(row["created_at"]),
+            created_at=sqlite_records.parse_datetime(row["created_at"]),
         )
 
     @classmethod
@@ -3203,7 +3204,7 @@ class SQLiteEvalStore(EvalStore):
             trials=row["trials"],
             timeout_seconds=row["timeout_seconds"],
             document_bytes=row["document_bytes"],
-            created_at=sqlite_support.parse_datetime(row["created_at"]),
+            created_at=sqlite_records.parse_datetime(row["created_at"]),
         )
 
     @staticmethod

@@ -134,3 +134,31 @@ def test_sqlite_task_store_keeps_support_bundle_schema_readiness(tmp_path):
             await store.close()
 
     asyncio.run(collect())
+
+
+def test_sqlite_records_import_without_schema_or_store_adapters():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+
+from cayu.storage import _sqlite_records
+
+assert _sqlite_records.json_dumps({"text": "café"}) == '{"text":"café"}'
+for name in (
+    "cayu.storage._sqlite_support",
+    "cayu.storage.sqlite",
+    "cayu.storage.tasks_sqlite",
+    "cayu.storage.postgres",
+):
+    assert name not in sys.modules, name
+""",
+        ],
+        env={**os.environ, "PYTHONPATH": str(Path(cayu.__file__).resolve().parent.parent)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

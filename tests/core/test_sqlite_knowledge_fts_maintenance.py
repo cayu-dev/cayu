@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from cayu.sessions.base import RunRequest, SessionIdentity
+from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
 from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore
@@ -403,8 +404,8 @@ def _seed_unrelated_corpus(
             (
                 entry.id,
                 entry.namespace,
-                sqlite_support.format_datetime(entry.created_at),
-                sqlite_support.format_datetime(entry.updated_at),
+                sqlite_records.format_datetime(entry.created_at),
+                sqlite_records.format_datetime(entry.updated_at),
             ),
         )
         connection.execute(
@@ -428,8 +429,8 @@ def _seed_unrelated_corpus(
                 str(entry.status),
                 str(entry.created_by_type),
                 entry.created_by,
-                sqlite_support.format_datetime(entry.created_at),
-                sqlite_support.format_datetime(entry.updated_at),
+                sqlite_records.format_datetime(entry.created_at),
+                sqlite_records.format_datetime(entry.updated_at),
                 entry.source_type,
                 entry.source_uri,
                 entry.source_id,

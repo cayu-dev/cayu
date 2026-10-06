@@ -408,7 +408,8 @@ def test_health_expired_claim_and_acknowledgement_race(session_store_case):
 
 def test_sqlite_health_uses_aggregate_and_covering_index(tmp_path):
     from cayu.runtime.event_side_effect_health import health_sql
-    from cayu.storage import SQLiteSessionStore, _sqlite_support
+    from cayu.storage import SQLiteSessionStore
+    from cayu.storage import _sqlite_records as sqlite_records
 
     async def run():
         store = SQLiteSessionStore(tmp_path / "health.sqlite")
@@ -431,7 +432,7 @@ def test_sqlite_health_uses_aggregate_and_covering_index(tmp_path):
                     row[3]
                     for row in connection.execute(
                         "EXPLAIN QUERY PLAN " + health_sql("?"),
-                        (_sqlite_support.format_datetime(datetime.now(UTC)),),
+                        (sqlite_records.format_datetime(datetime.now(UTC)),),
                     )
                 ]
 

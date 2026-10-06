@@ -34,6 +34,7 @@
     "tests/cli/test_cloud_cli.py::test_local_project_bundle_keeps_storage_acknowledgements_verbatim[absolute]": 0.023584459006087855,
     "tests/cli/test_cloud_cli.py::test_local_project_bundle_keeps_storage_acknowledgements_verbatim[default]": 0.024390665959799662,
     "tests/cli/test_cloud_cli.py::test_local_project_bundle_keeps_storage_acknowledgements_verbatim[relative]": 0.024573541013523936,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_records_import_without_schema_or_store_adapters": 1.182,
     "tests/core/test_staged_tool_terminal_reader.py::test_checkpoint_terminal_reads_are_detached_fresh_and_owner_scoped[pending_tool_round]": 0.01348645800317172,
     "tests/core/test_staged_tool_terminal_reader.py::test_checkpoint_terminal_reads_are_detached_fresh_and_owner_scoped[pending_user_input]": 0.013581916995462961,
     "tests/core/test_staged_tool_terminal_reader.py::test_saved_terminal_reader_works_without_runtime_owners": 0.7834941249893745,

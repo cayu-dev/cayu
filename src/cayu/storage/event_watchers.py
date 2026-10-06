@@ -39,6 +39,7 @@ from cayu.storage import migrations as schema
 from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage.targets import require_sqlite_store_allowed
 
+from . import _sqlite_records as sqlite_records
 from . import _sqlite_support as sqlite_support
 
 _SQLITE_MIN_REQUIRED_REVISION = 81
@@ -299,7 +300,7 @@ class SQLiteEventWatcherStore(EventWatcherStore):
                         WHERE watcher_name = ? AND event_sequence = ?
                         """,
                         (
-                            sqlite_support.format_datetime(resolved_at),
+                            sqlite_records.format_datetime(resolved_at),
                             watcher_name,
                             event_sequence,
                         ),
@@ -338,7 +339,7 @@ class SQLiteEventWatcherStore(EventWatcherStore):
                 dead_letter.event_id,
                 dead_letter.attempts,
                 dead_letter.error,
-                sqlite_support.format_datetime(dead_letter.dead_lettered_at),
+                sqlite_records.format_datetime(dead_letter.dead_lettered_at),
                 _format_optional_datetime(dead_letter.resolved_at),
             ),
         )
@@ -396,7 +397,7 @@ class SQLiteEventWatcherStore(EventWatcherStore):
                 _format_optional_datetime(state.lease_expires_at),
                 state.last_error,
                 state.dead_lettered_count,
-                sqlite_support.format_datetime(state.updated_at),
+                sqlite_records.format_datetime(state.updated_at),
             ),
         )
 
@@ -417,7 +418,7 @@ def _state_from_row(row: sqlite3.Row) -> EventWatcherState:
         lease_expires_at=_parse_optional_datetime(row["lease_expires_at"]),
         last_error=row["last_error"],
         dead_lettered_count=row["dead_lettered_count"],
-        updated_at=sqlite_support.parse_datetime(row["updated_at"]),
+        updated_at=sqlite_records.parse_datetime(row["updated_at"]),
     )
 
 
@@ -428,7 +429,7 @@ def _dead_letter_from_row(row: sqlite3.Row) -> EventWatcherDeadLetter:
         event_sequence=row["event_sequence"],
         attempts=row["attempts"],
         error=row["error"],
-        dead_lettered_at=sqlite_support.parse_datetime(row["dead_lettered_at"]),
+        dead_lettered_at=sqlite_records.parse_datetime(row["dead_lettered_at"]),
         resolved_at=_parse_optional_datetime(row["resolved_at"]),
     )
 
@@ -487,10 +488,10 @@ def _clean_error(value: str) -> str:
 def _format_optional_datetime(value: datetime | None) -> str | None:
     if value is None:
         return None
-    return sqlite_support.format_datetime(value)
+    return sqlite_records.format_datetime(value)
 
 
 def _parse_optional_datetime(value: str | None) -> datetime | None:
     if value is None:
         return None
-    return sqlite_support.parse_datetime(value)
+    return sqlite_records.parse_datetime(value)

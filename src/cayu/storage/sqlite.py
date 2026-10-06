@@ -493,11 +493,13 @@ from cayu.sessions.interactions import (
 from cayu.sessions.invocation import SessionInvocation
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _sqlite_aggregates as sqlite_aggregates
+from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 from cayu.storage._sqlite_connection import (
     _run_off_thread_with_connection_ownership as _run_off_thread_with_connection_ownership,
 )
+from cayu.storage._validated_cache import validated_row_cache
 from cayu.storage.tasks_sqlite import (
     _SQLITE_TASK_MIN_REQUIRED_REVISION as _SQLITE_TASK_MIN_REQUIRED_REVISION,
 )
@@ -551,7 +553,7 @@ _SQLITE_SESSION_MIN_REQUIRED_REVISION = 113
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
-    datetime_param=sqlite_support.format_datetime,
+    datetime_param=sqlite_records.format_datetime,
 )
 _T = TypeVar("_T")
 
@@ -567,7 +569,7 @@ def _sqlite_recall_receipt(row: sqlite3.Row) -> RecallReceipt:
         or receipt.session_id != row["session_id"]
         or receipt.interaction_id != row["interaction_id"]
         or receipt.model_step_id != row["model_step_id"]
-        or receipt.created_at != sqlite_support.parse_datetime(row["created_at"])
+        or receipt.created_at != sqlite_records.parse_datetime(row["created_at"])
         or len(document) != row["document_bytes"]
     ):
         raise RuntimeError("SQLite recall receipt index columns conflict with its document.")
@@ -589,8 +591,8 @@ def _sqlite_context_exposure(row: sqlite3.Row) -> ContextExposure:
         or exposure.provider_attempt_id != row["provider_attempt_id"]
         or str(exposure.state) != row["state"]
         or exposure.state_revision != row["state_revision"]
-        or exposure.created_at != sqlite_support.parse_datetime(row["created_at"])
-        or exposure.updated_at != sqlite_support.parse_datetime(row["updated_at"])
+        or exposure.created_at != sqlite_records.parse_datetime(row["created_at"])
+        or exposure.updated_at != sqlite_records.parse_datetime(row["updated_at"])
         or len(document) != row["document_bytes"]
     ):
         raise RuntimeError("SQLite context exposure index columns conflict with its document.")
@@ -799,14 +801,14 @@ def _touch_session_activity(
     if expected_run_epoch is None:
         cursor = connection.execute(
             "UPDATE cayu_sessions SET last_activity_at = ? WHERE id = ?",
-            (sqlite_support.format_datetime(activity_at), session_id),
+            (sqlite_records.format_datetime(activity_at), session_id),
         )
         if cursor.rowcount != 1:
             raise KeyError(f"Session not found: {session_id}")
         return
     cursor = connection.execute(
         "UPDATE cayu_sessions SET last_activity_at = ? WHERE id = ? AND run_epoch = ?",
-        (sqlite_support.format_datetime(activity_at), session_id, expected_run_epoch),
+        (sqlite_records.format_datetime(activity_at), session_id, expected_run_epoch),
     )
     if cursor.rowcount != 1:
         _raise_session_write_conflict(connection, session_id, expected_run_epoch)
@@ -839,7 +841,7 @@ def _load_session(connection: sqlite3.Connection, session_id: str) -> Session | 
     ).fetchone()
     if row is None:
         return None
-    return sqlite_support.session_from_row(
+    return sqlite_records.session_from_row(
         row,
         labels=_load_labels(connection, session_id),
     )
@@ -882,13 +884,13 @@ def _session_topology_node_from_sqlite_row(row: sqlite3.Row) -> SessionTopologyN
         ),
         environment_name=row["environment_name"],
         status=SessionStatus(row["status"]),
-        created_at=sqlite_support.parse_datetime(row["created_at"]),
-        updated_at=sqlite_support.parse_datetime(row["updated_at"]),
-        last_activity_at=sqlite_support.parse_datetime(row["last_activity_at"]),
+        created_at=sqlite_records.parse_datetime(row["created_at"]),
+        updated_at=sqlite_records.parse_datetime(row["updated_at"]),
+        last_activity_at=sqlite_records.parse_datetime(row["last_activity_at"]),
     )
 
 
-@sqlite_support.validated_row_cache
+@validated_row_cache
 def _checkpoint_from_json(value: str) -> dict[str, Any]:
     return copy_durable_json_object(json.loads(value), "checkpoint")
 
@@ -1234,11 +1236,11 @@ def _targeted_tool_grant_from_row(row: sqlite3.Row) -> TargetedToolGrantRecord:
         ("tool_name", record.tool_name),
         ("catalogue_revision", record.catalogue_revision),
         ("descriptor_version", record.descriptor_version),
-        ("issued_at", sqlite_support.format_datetime(record.issued_at)),
-        ("expires_at", sqlite_support.format_datetime(record.expires_at)),
+        ("issued_at", sqlite_records.format_datetime(record.issued_at)),
+        ("expires_at", sqlite_records.format_datetime(record.expires_at)),
         ("max_calls", record.max_calls),
         ("used_calls", record.used_calls),
-        ("revoked_at", sqlite_support.format_optional_datetime(record.revoked_at)),
+        ("revoked_at", sqlite_records.format_optional_datetime(record.revoked_at)),
     )
     if any(row[field_name] != expected for field_name, expected in indexed):
         raise ValueError("Stored targeted tool grant conflicts with indexed authority.")
@@ -1256,7 +1258,7 @@ def _targeted_tool_use_from_row(row: sqlite3.Row) -> TargetedToolUseBinding:
         ("outer_tool_call_id", binding.outer_tool_call_id),
         ("arguments_sha256", binding.arguments_sha256),
         ("invocation_id", binding.invocation_id),
-        ("bound_at", sqlite_support.format_datetime(binding.bound_at)),
+        ("bound_at", sqlite_records.format_datetime(binding.bound_at)),
     )
     if any(row[field_name] != expected for field_name, expected in indexed):
         raise ValueError("Stored targeted tool use conflicts with indexed authority.")
@@ -1296,15 +1298,15 @@ def _persisted_event_side_effect_delivery_from_row(
         lease_expires_at=(
             None
             if row["lease_expires_at"] is None
-            else sqlite_support.parse_datetime(row["lease_expires_at"])
+            else sqlite_records.parse_datetime(row["lease_expires_at"])
         ),
         next_attempt_at=(
             None
             if row["next_attempt_at"] is None
-            else sqlite_support.parse_datetime(row["next_attempt_at"])
+            else sqlite_records.parse_datetime(row["next_attempt_at"])
         ),
         last_error=row["last_error"],
-        updated_at=sqlite_support.parse_datetime(row["updated_at"]),
+        updated_at=sqlite_records.parse_datetime(row["updated_at"]),
     )
 
 
@@ -1405,12 +1407,12 @@ def _insert_event_rows_in_transaction(
                 event.id,
                 event.interaction_id,
                 str(event.type),
-                sqlite_support.format_datetime(event.timestamp),
+                sqlite_records.format_datetime(event.timestamp),
                 event.agent_name,
                 event.environment_name,
                 event.workflow_name,
                 event.tool_name,
-                sqlite_support.json_dumps(event.payload),
+                sqlite_records.json_dumps(event.payload),
                 lookup_key,
                 projection,
                 projection_bytes,
@@ -1487,8 +1489,8 @@ def _record_invocation_terminal_event_receipts(
                 (
                     session_id,
                     receipt_key,
-                    sqlite_support.json_dumps(receipt_record),
-                    sqlite_support.format_datetime(activity_at),
+                    sqlite_records.json_dumps(receipt_record),
+                    sqlite_records.format_datetime(activity_at),
                 )
                 for receipt_key, receipt_record in terminal_receipts
             ],
@@ -1668,7 +1670,7 @@ def _queued_session_message_from_row(row: sqlite3.Row | dict[str, Any]) -> Sessi
         accepted_run_epoch=row["accepted_run_epoch"],
         accepted_transcript_cursor=row["accepted_transcript_cursor"],
         accepted_event_id=row["accepted_event_id"],
-        accepted_at=sqlite_support.parse_datetime(row["accepted_at"]),
+        accepted_at=sqlite_records.parse_datetime(row["accepted_at"]),
         requested_by=(
             None
             if requested_by is None
@@ -1680,7 +1682,7 @@ def _queued_session_message_from_row(row: sqlite3.Row | dict[str, Any]) -> Sessi
         delivered_at=(
             None
             if row["delivered_at"] is None
-            else sqlite_support.parse_datetime(row["delivered_at"])
+            else sqlite_records.parse_datetime(row["delivered_at"])
         ),
     )
 
@@ -1744,7 +1746,7 @@ class SQLiteSessionStore(
                 raise SessionAccessDenied()
             labels = self._load_labels_for_sessions_unlocked([session_id], connection=connection)
             return bounds.require_read(
-                sqlite_support.session_from_row(row, labels=labels[session_id])
+                sqlite_records.session_from_row(row, labels=labels[session_id])
             )
 
         def snapshot(connection):
@@ -2637,12 +2639,12 @@ class SQLiteSessionStore(
                             record.tool_name,
                             record.catalogue_revision,
                             record.descriptor_version,
-                            sqlite_support.format_datetime(record.issued_at),
-                            sqlite_support.format_datetime(record.expires_at),
+                            sqlite_records.format_datetime(record.issued_at),
+                            sqlite_records.format_datetime(record.expires_at),
                             record.max_calls,
                             record.used_calls,
                             None,
-                            sqlite_support.json_dumps(record.model_dump(mode="json")),
+                            sqlite_records.json_dumps(record.model_dump(mode="json")),
                         ),
                     )
                     resolved.append(record)
@@ -3045,8 +3047,8 @@ class SQLiteSessionStore(
                         binding.outer_tool_call_id,
                         binding.arguments_sha256,
                         binding.invocation_id,
-                        sqlite_support.format_datetime(binding.bound_at),
-                        sqlite_support.json_dumps(binding.model_dump(mode="json")),
+                        sqlite_records.format_datetime(binding.bound_at),
+                        sqlite_records.json_dumps(binding.model_dump(mode="json")),
                     ),
                 )
                 connection.execute(
@@ -3054,7 +3056,7 @@ class SQLiteSessionStore(
                     "WHERE grant_id = ? AND used_calls = ?",
                     (
                         updated.used_calls,
-                        sqlite_support.json_dumps(updated.model_dump(mode="json")),
+                        sqlite_records.json_dumps(updated.model_dump(mode="json")),
                         grant_id,
                         record.used_calls,
                     ),
@@ -3199,7 +3201,7 @@ class SQLiteSessionStore(
                 ).fetchone()
                 latest_bound_at = latest_use_row["latest_bound_at"]
                 if latest_bound_at is not None and (
-                    sqlite_support.parse_datetime(str(latest_bound_at)) > revoked_at
+                    sqlite_records.parse_datetime(str(latest_bound_at)) > revoked_at
                 ):
                     raise ValueError("revoked_at cannot precede a bound targeted tool use.")
                 updated = TargetedToolGrantRecord.model_validate(
@@ -3211,8 +3213,8 @@ class SQLiteSessionStore(
                     "UPDATE cayu_targeted_tool_grants SET revoked_at = ?, record_json = ? "
                     "WHERE grant_id = ? AND revoked_at IS NULL",
                     (
-                        sqlite_support.format_datetime(revoked_at),
-                        sqlite_support.json_dumps(updated.model_dump(mode="json")),
+                        sqlite_records.format_datetime(revoked_at),
+                        sqlite_records.json_dumps(updated.model_dump(mode="json")),
                         grant_id,
                     ),
                 )
@@ -3506,7 +3508,7 @@ class SQLiteSessionStore(
                     if parent_session is not None:
                         for owner in self._closure_lineage_owners_unlocked((parent_session.id,)):
                             _check_closure_lineage_owner(owner, (parent_session.id,))
-                    session = sqlite_support.session_from_request(
+                    session = sqlite_records.session_from_request(
                         request,
                         identity=identity,
                         parent_session=parent_session,
@@ -3565,12 +3567,12 @@ class SQLiteSessionStore(
                             session.runtime_version,
                             session.environment_name,
                             str(session.status),
-                            sqlite_support.format_datetime(session.created_at),
-                            sqlite_support.format_datetime(session.updated_at),
-                            sqlite_support.format_datetime(session.last_activity_at),
+                            sqlite_records.format_datetime(session.created_at),
+                            sqlite_records.format_datetime(session.updated_at),
+                            sqlite_records.format_datetime(session.last_activity_at),
                             session.run_epoch,
-                            sqlite_support.json_dumps(session.invocation.model_dump(mode="json")),
-                            sqlite_support.json_dumps(session.metadata),
+                            sqlite_records.json_dumps(session.invocation.model_dump(mode="json")),
+                            sqlite_records.json_dumps(session.metadata),
                         ),
                     )
                     if participant_binding_factory is not None:
@@ -3620,8 +3622,8 @@ class SQLiteSessionStore(
                                 binding.authorization_commitment,
                                 binding.initial_input_commitment,
                                 binding.execution_profile_commitment,
-                                sqlite_support.json_dumps(binding.model_dump(mode="json")),
-                                sqlite_support.json_dumps(receipt.model_dump(mode="json")),
+                                sqlite_records.json_dumps(binding.model_dump(mode="json")),
+                                sqlite_records.json_dumps(receipt.model_dump(mode="json")),
                             ),
                         )
                         if recipient_selection is not None:
@@ -3661,7 +3663,7 @@ class SQLiteSessionStore(
                                         session.id,
                                         str(message.role),
                                         None,
-                                        sqlite_support.json_dumps(message.model_dump(mode="json")),
+                                        sqlite_records.json_dumps(message.model_dump(mode="json")),
                                         transcript_search_document(message),
                                     )
                                     for message in request.messages
@@ -3690,8 +3692,8 @@ class SQLiteSessionStore(
                                 (
                                     session.id,
                                     key,
-                                    sqlite_support.json_dumps(record),
-                                    sqlite_support.format_datetime(session.updated_at),
+                                    sqlite_records.json_dumps(record),
+                                    sqlite_records.format_datetime(session.updated_at),
                                 )
                                 for key, record in initial_operation_records.items()
                             ],
@@ -3702,7 +3704,7 @@ class SQLiteSessionStore(
                             INSERT INTO cayu_session_labels (session_id, key, value)
                             VALUES (?, ?, ?)
                             """,
-                            sqlite_support.session_label_row_values(session),
+                            sqlite_records.session_label_row_values(session),
                         )
                     if admission is not None:
                         started_event, source_messages = admission
@@ -3733,12 +3735,12 @@ class SQLiteSessionStore(
                                 started_event.id,
                                 interaction_id,
                                 str(started_event.type),
-                                sqlite_support.format_datetime(started_event.timestamp),
+                                sqlite_records.format_datetime(started_event.timestamp),
                                 started_event.agent_name,
                                 started_event.environment_name,
                                 started_event.workflow_name,
                                 started_event.tool_name,
-                                sqlite_support.json_dumps(started_event.payload),
+                                sqlite_records.json_dumps(started_event.payload),
                                 lookup_key,
                                 projection,
                                 projection_bytes,
@@ -3756,7 +3758,7 @@ class SQLiteSessionStore(
                             (
                                 session.id,
                                 interaction_id,
-                                sqlite_support.json_dumps(
+                                sqlite_records.json_dumps(
                                     deferred_interaction_input_storage_payload(deferred_input)
                                 ),
                             ),
@@ -3771,7 +3773,7 @@ class SQLiteSessionStore(
                                 pending_action_metrics_ready
                             ) VALUES (?, ?, ?, ?, ?, ?, ?)
                             """,
-                            sqlite_support.checkpoint_row_values(
+                            sqlite_records.checkpoint_row_values(
                                 session.id,
                                 _initial_transcript_pending_checkpoint(
                                     session,
@@ -3801,7 +3803,7 @@ class SQLiteSessionStore(
                                     pending_action_metrics_ready
                                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
                                 """,
-                                sqlite_support.checkpoint_row_values(
+                                sqlite_records.checkpoint_row_values(
                                     session.id,
                                     transformed,
                                     session.updated_at,
@@ -3837,7 +3839,7 @@ class SQLiteSessionStore(
                                 pending_action_flags = excluded.pending_action_flags,
                                 pending_action_metrics_ready = excluded.pending_action_metrics_ready
                             """,
-                            sqlite_support.checkpoint_row_values(
+                            sqlite_records.checkpoint_row_values(
                                 session.id,
                                 _checkpoint_transform_result_preserving_completion_result_event_publications(
                                     current_checkpoint,
@@ -4129,7 +4131,7 @@ class SQLiteSessionStore(
         if len(publication_key.encode("utf-8")) > 512:
             raise ValueError("publication_key must be at most 512 UTF-8 bytes.")
         publication_key = require_clean_nonblank(publication_key, "publication_key")
-        manifest_json = sqlite_support.json_dumps(manifest.model_dump(mode="json"))
+        manifest_json = sqlite_records.json_dumps(manifest.model_dump(mode="json"))
         owner = manifest.source_owner
         async with self._context_view_transaction():
             existing = self._connection.execute(
@@ -4370,7 +4372,7 @@ class SQLiteSessionStore(
                         event.owner.incarnation,
                         event.pin_commitment,
                         event.ownership_revision,
-                        sqlite_support.json_dumps(event.model_dump(mode="json")),
+                        sqlite_records.json_dumps(event.model_dump(mode="json")),
                     ),
                 )
             existing = self._connection.execute(
@@ -4545,7 +4547,7 @@ class SQLiteSessionStore(
                     receipt.pin_commitment,
                     receipt.expires_at_ms,
                     receipt.ownership_revision,
-                    sqlite_support.json_dumps(receipt.model_dump(mode="json")),
+                    sqlite_records.json_dumps(receipt.model_dump(mode="json")),
                 ),
             )
             self._connection.commit()
@@ -4679,7 +4681,7 @@ class SQLiteSessionStore(
                     "UPDATE cayu_context_view_selections SET state = 'expired', receipt_json = ? "
                     "WHERE selection_key = ? AND ownership_revision = ?",
                     (
-                        sqlite_support.json_dumps(expired.model_dump(mode="json")),
+                        sqlite_records.json_dumps(expired.model_dump(mode="json")),
                         request.selection_key,
                         request.expected_revision,
                     ),
@@ -4700,7 +4702,7 @@ class SQLiteSessionStore(
                         event.owner.incarnation,
                         event.pin_commitment,
                         event.ownership_revision,
-                        sqlite_support.json_dumps(event.model_dump(mode="json")),
+                        sqlite_records.json_dumps(event.model_dump(mode="json")),
                     ),
                 )
                 self._connection.commit()
@@ -4731,7 +4733,7 @@ class SQLiteSessionStore(
                 },
                 deep=True,
             )
-            updated_json = sqlite_support.json_dumps(updated.model_dump(mode="json"))
+            updated_json = sqlite_records.json_dumps(updated.model_dump(mode="json"))
             event = ContextViewLifecycleEvent(
                 event_id="sha256:"
                 + sha256(f"context-view-event:{request.operation_key}".encode()).hexdigest(),
@@ -4744,7 +4746,7 @@ class SQLiteSessionStore(
                 pin_commitment=updated.pin_commitment,
                 ownership_revision=updated.ownership_revision,
             )
-            event_json = sqlite_support.json_dumps(event.model_dump(mode="json"))
+            event_json = sqlite_records.json_dumps(event.model_dump(mode="json"))
             self._require_context_view_lifecycle_capacity(
                 updated.view.view_id, additional_slots=int(next_state != "released")
             )
@@ -5211,7 +5213,7 @@ class SQLiteSessionStore(
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    sqlite_support.session_to_row_values(fork),
+                    sqlite_records.session_to_row_values(fork),
                 )
                 if initial_operation_records:
                     self._connection.executemany(
@@ -5222,8 +5224,8 @@ class SQLiteSessionStore(
                             (
                                 fork.id,
                                 key,
-                                sqlite_support.json_dumps(record),
-                                sqlite_support.format_datetime(fork.updated_at),
+                                sqlite_records.json_dumps(record),
+                                sqlite_records.format_datetime(fork.updated_at),
                             )
                             for key, record in initial_operation_records.items()
                         ],
@@ -5234,7 +5236,7 @@ class SQLiteSessionStore(
                         INSERT INTO cayu_session_labels (session_id, key, value)
                         VALUES (?, ?, ?)
                         """,
-                        sqlite_support.session_label_row_values(fork),
+                        sqlite_records.session_label_row_values(fork),
                     )
                 if copied_messages:
                     self._connection.executemany(
@@ -5253,7 +5255,7 @@ class SQLiteSessionStore(
                                 fork.id,
                                 str(message.role),
                                 copied_interaction_ids[index],
-                                sqlite_support.json_dumps(message.model_dump(mode="json")),
+                                sqlite_records.json_dumps(message.model_dump(mode="json")),
                                 transcript_search_document(message),
                             )
                             for index, message in enumerate(copied_messages)
@@ -5271,7 +5273,7 @@ class SQLiteSessionStore(
                         )
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
-                        sqlite_support.checkpoint_row_values(
+                        sqlite_records.checkpoint_row_values(
                             fork.id, copied_checkpoint, fork.updated_at
                         ),
                     )
@@ -5290,12 +5292,12 @@ class SQLiteSessionStore(
                                 event.id,
                                 event.interaction_id,
                                 str(event.type),
-                                sqlite_support.format_datetime(event.timestamp),
+                                sqlite_records.format_datetime(event.timestamp),
                                 event.agent_name,
                                 event.environment_name,
                                 event.workflow_name,
                                 event.tool_name,
-                                sqlite_support.json_dumps(event.payload),
+                                sqlite_records.json_dumps(event.payload),
                                 lookup_key,
                                 projection,
                                 projection_bytes,
@@ -5363,8 +5365,8 @@ class SQLiteSessionStore(
             return SessionStateSnapshot(
                 id=row["id"],
                 status=SessionStatus(row["status"]),
-                updated_at=sqlite_support.parse_datetime(row["updated_at"]),
-                last_activity_at=sqlite_support.parse_datetime(row["last_activity_at"]),
+                updated_at=sqlite_records.parse_datetime(row["updated_at"]),
+                last_activity_at=sqlite_records.parse_datetime(row["last_activity_at"]),
             )
 
         return await self._run_read(query)
@@ -5429,7 +5431,7 @@ class SQLiteSessionStore(
                         copied.session_id,
                         copied.interaction_id,
                         copied.model_step_id,
-                        sqlite_support.format_datetime(copied.created_at),
+                        sqlite_records.format_datetime(copied.created_at),
                         document.decode("utf-8"),
                         len(document),
                     ),
@@ -5490,7 +5492,7 @@ class SQLiteSessionStore(
                 parameters.append(copied_query.model_step_id)
             if after is not None:
                 clauses.append("(created_at, receipt_id) > (?, ?)")
-                created_at = sqlite_support.format_datetime(after[0])
+                created_at = sqlite_records.format_datetime(after[0])
                 parameters.extend((created_at, after[1]))
             where = " AND ".join(clauses)
             rows = connection.execute(
@@ -5653,8 +5655,8 @@ class SQLiteSessionStore(
                         copied.provider_attempt_id,
                         str(copied.state),
                         copied.state_revision,
-                        sqlite_support.format_datetime(copied.created_at),
-                        sqlite_support.format_datetime(copied.updated_at),
+                        sqlite_records.format_datetime(copied.created_at),
+                        sqlite_records.format_datetime(copied.updated_at),
                         document.decode("utf-8"),
                         len(document),
                     ),
@@ -5765,7 +5767,7 @@ class SQLiteSessionStore(
                 parameters.append(copied_query.model_step_id)
             if after is not None:
                 clauses.append("(created_at, exposure_id) > (?, ?)")
-                created_at = sqlite_support.format_datetime(after[0])
+                created_at = sqlite_records.format_datetime(after[0])
                 parameters.extend((created_at, after[1]))
             where = " AND ".join(clauses)
             rows = connection.execute(
@@ -5870,7 +5872,7 @@ class SQLiteSessionStore(
                     (
                         str(updated.state),
                         updated.state_revision,
-                        sqlite_support.format_datetime(updated.updated_at),
+                        sqlite_records.format_datetime(updated.updated_at),
                         updated_document.decode("utf-8"),
                         len(updated_document),
                         session_id,
@@ -5956,9 +5958,9 @@ class SQLiteSessionStore(
                 ),
                 environment_name=row["environment_name"],
                 status=SessionStatus(row["status"]),
-                created_at=sqlite_support.parse_datetime(row["created_at"]),
-                updated_at=sqlite_support.parse_datetime(row["updated_at"]),
-                last_activity_at=sqlite_support.parse_datetime(row["last_activity_at"]),
+                created_at=sqlite_records.parse_datetime(row["created_at"]),
+                updated_at=sqlite_records.parse_datetime(row["updated_at"]),
+                last_activity_at=sqlite_records.parse_datetime(row["last_activity_at"]),
                 run_epoch=row["run_epoch"],
                 labels={label_row["key"]: label_row["value"] for label_row in label_rows},
                 label_count=label_count,
@@ -6540,7 +6542,7 @@ class SQLiteSessionStore(
                     _check_closure_lineage_owner(owner, (session_id,))
                 epoch_clause = "" if expected_run_epoch is None else " AND run_epoch = ?"
                 params: list[object] = [
-                    sqlite_support.format_datetime(updated_at),
+                    sqlite_records.format_datetime(updated_at),
                     session_id,
                 ]
                 if expected_run_epoch is not None:
@@ -6576,8 +6578,8 @@ class SQLiteSessionStore(
                             (
                                 session_id,
                                 key,
-                                sqlite_support.json_dumps(record),
-                                sqlite_support.format_datetime(updated_at),
+                                sqlite_records.json_dumps(record),
+                                sqlite_records.format_datetime(updated_at),
                             ),
                         )
                 loaded = self._load_unlocked(session_id)
@@ -6625,8 +6627,8 @@ class SQLiteSessionStore(
                 self._connection.execute(
                     "UPDATE cayu_sessions SET metadata_json = ?, updated_at = ? WHERE id = ?",
                     (
-                        sqlite_support.json_dumps(new_metadata),
-                        sqlite_support.format_datetime(updated_at),
+                        sqlite_records.json_dumps(new_metadata),
+                        sqlite_records.format_datetime(updated_at),
                         session_id,
                     ),
                 )
@@ -6672,8 +6674,8 @@ class SQLiteSessionStore(
                 placeholders = ", ".join("?" for _ in allowed_statuses)
                 params: list[object] = [
                     str(to_status),
-                    sqlite_support.format_datetime(updated_at),
-                    sqlite_support.format_datetime(updated_at),
+                    sqlite_records.format_datetime(updated_at),
+                    sqlite_records.format_datetime(updated_at),
                     1 if to_status == SessionStatus.RUNNING else 0,
                     session_id,
                     *[str(status) for status in allowed_statuses],
@@ -6951,8 +6953,8 @@ class SQLiteSessionStore(
                 placeholders = ", ".join("?" for _ in allowed_statuses)
                 transition_values = (
                     str(to_status),
-                    sqlite_support.format_datetime(updated_at),
-                    sqlite_support.format_datetime(updated_at),
+                    sqlite_records.format_datetime(updated_at),
+                    sqlite_records.format_datetime(updated_at),
                     1 if to_status == SessionStatus.RUNNING else 0,
                 )
                 if prepared_model_transition is None and transition_metadata is None:
@@ -6994,7 +6996,7 @@ class SQLiteSessionStore(
                             target_model,
                             prepared_adopted_runtime_identity.runtime_name,
                             prepared_adopted_runtime_identity.runtime_version,
-                            sqlite_support.json_dumps(transition_metadata),
+                            sqlite_records.json_dumps(transition_metadata),
                             session_id,
                             *(str(status) for status in allowed_statuses),
                         ),
@@ -7012,7 +7014,7 @@ class SQLiteSessionStore(
                             *transition_values,
                             prepared_model_transition.target.provider_name,
                             prepared_model_transition.target.model,
-                            sqlite_support.json_dumps(transition_metadata),
+                            sqlite_records.json_dumps(transition_metadata),
                             session_id,
                             *(str(status) for status in allowed_statuses),
                         ),
@@ -7027,7 +7029,7 @@ class SQLiteSessionStore(
                         """,
                         (
                             *transition_values,
-                            sqlite_support.json_dumps(transition_metadata),
+                            sqlite_records.json_dumps(transition_metadata),
                             session_id,
                             *(str(status) for status in allowed_statuses),
                         ),
@@ -7145,8 +7147,8 @@ class SQLiteSessionStore(
                             (
                                 session_id,
                                 key,
-                                sqlite_support.json_dumps(record),
-                                sqlite_support.format_datetime(updated_at),
+                                sqlite_records.json_dumps(record),
+                                sqlite_records.format_datetime(updated_at),
                             )
                             for key, record in publication.operation_records.items()
                         ],
@@ -7170,7 +7172,7 @@ class SQLiteSessionStore(
                             pending_action_flags = excluded.pending_action_flags,
                             pending_action_metrics_ready = excluded.pending_action_metrics_ready
                         """,
-                        sqlite_support.checkpoint_row_values(
+                        sqlite_records.checkpoint_row_values(
                             session_id, transformed_checkpoint, updated_at
                         ),
                     )
@@ -7211,12 +7213,12 @@ class SQLiteSessionStore(
                                 admission_event.id,
                                 admission_event.interaction_id,
                                 str(admission_event.type),
-                                sqlite_support.format_datetime(admission_event.timestamp),
+                                sqlite_records.format_datetime(admission_event.timestamp),
                                 admission_event.agent_name,
                                 admission_event.environment_name,
                                 admission_event.workflow_name,
                                 admission_event.tool_name,
-                                sqlite_support.json_dumps(admission_event.payload),
+                                sqlite_records.json_dumps(admission_event.payload),
                                 lookup_key,
                                 projection,
                                 projection_bytes,
@@ -7241,7 +7243,7 @@ class SQLiteSessionStore(
                             (
                                 session_id,
                                 interaction_id,
-                                sqlite_support.json_dumps(
+                                sqlite_records.json_dumps(
                                     deferred_interaction_input_storage_payload(deferred_input)
                                 ),
                             ),
@@ -7256,7 +7258,7 @@ class SQLiteSessionStore(
                                     session_id,
                                     str(message.role),
                                     interaction_id,
-                                    sqlite_support.json_dumps(message.model_dump(mode="json")),
+                                    sqlite_records.json_dumps(message.model_dump(mode="json")),
                                     transcript_search_document(message),
                                 )
                                 for message in source_messages
@@ -7394,12 +7396,12 @@ class SQLiteSessionStore(
                         copied_event.id,
                         copied_event.interaction_id,
                         str(copied_event.type),
-                        sqlite_support.format_datetime(copied_event.timestamp),
+                        sqlite_records.format_datetime(copied_event.timestamp),
                         copied_event.agent_name,
                         copied_event.environment_name,
                         copied_event.workflow_name,
                         copied_event.tool_name,
-                        sqlite_support.json_dumps(copied_event.payload),
+                        sqlite_records.json_dumps(copied_event.payload),
                         lookup_key,
                         projection,
                         projection_bytes,
@@ -7463,10 +7465,10 @@ class SQLiteSessionStore(
                     WHERE id = ? AND status IN ({placeholders}) AND last_activity_at <= ?
                     """,
                     (
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.format_datetime(now),
                         session_id,
                         *(str(status) for status in allowed_statuses),
-                        sqlite_support.format_datetime(inactive_before),
+                        sqlite_records.format_datetime(inactive_before),
                     ),
                 )
                 self._connection.commit()
@@ -7561,7 +7563,7 @@ class SQLiteSessionStore(
                         pending_action_flags = excluded.pending_action_flags,
                         pending_action_metrics_ready = excluded.pending_action_metrics_ready
                     """,
-                    sqlite_support.checkpoint_row_values(session_id, transformed, now),
+                    sqlite_records.checkpoint_row_values(session_id, transformed, now),
                 )
                 self._connection.commit()
                 return loaded
@@ -7628,7 +7630,7 @@ class SQLiteSessionStore(
                 self._connection.execute(
                     "UPDATE cayu_sessions SET run_epoch = run_epoch + 1, "
                     "last_activity_at = ? WHERE id = ?",
-                    (sqlite_support.format_datetime(updated_at), session_id),
+                    (sqlite_records.format_datetime(updated_at), session_id),
                 )
                 fenced = loaded.model_copy(
                     update={
@@ -7669,7 +7671,7 @@ class SQLiteSessionStore(
                         pending_action_flags = excluded.pending_action_flags,
                         pending_action_metrics_ready = excluded.pending_action_metrics_ready
                     """,
-                    sqlite_support.checkpoint_row_values(
+                    sqlite_records.checkpoint_row_values(
                         session_id,
                         transformed,
                         updated_at,
@@ -7734,15 +7736,15 @@ class SQLiteSessionStore(
                         "pending_action_tool_call_count = excluded.pending_action_tool_call_count, "
                         "pending_action_flags = excluded.pending_action_flags, "
                         "pending_action_metrics_ready = excluded.pending_action_metrics_ready",
-                        sqlite_support.checkpoint_row_values(session_id, checkpoint, updated_at),
+                        sqlite_records.checkpoint_row_values(session_id, checkpoint, updated_at),
                     )
                 cursor = self._connection.execute(
                     "UPDATE cayu_sessions SET status = ?, updated_at = ?, "
                     "last_activity_at = ?, run_epoch = run_epoch + ? WHERE id = ?",
                     (
                         str(to_status),
-                        sqlite_support.format_datetime(updated_at),
-                        sqlite_support.format_datetime(updated_at),
+                        sqlite_records.format_datetime(updated_at),
+                        sqlite_records.format_datetime(updated_at),
                         1 if to_status == SessionStatus.RUNNING and mutation is None else 0,
                         session_id,
                     ),
@@ -8020,7 +8022,7 @@ class SQLiteSessionStore(
                         keeps_running=queued or target_status is SessionStatus.RUNNING,
                     )
                 updated_at = self._ownership_clock()
-                formatted_updated_at = sqlite_support.format_datetime(updated_at)
+                formatted_updated_at = sqlite_records.format_datetime(updated_at)
                 settlement_record = None
                 settlement_storage_key = None
                 if settlement_request is not None:
@@ -8137,7 +8139,7 @@ class SQLiteSessionStore(
                                 pending_action_flags = excluded.pending_action_flags,
                                 pending_action_metrics_ready = excluded.pending_action_metrics_ready
                             """,
-                            sqlite_support.checkpoint_row_values(
+                            sqlite_records.checkpoint_row_values(
                                 session_id,
                                 transformed_checkpoint,
                                 updated_at,
@@ -8151,7 +8153,7 @@ class SQLiteSessionStore(
                         (
                             session_id,
                             settlement_storage_key,
-                            sqlite_support.json_dumps(settlement_record),
+                            sqlite_records.json_dumps(settlement_record),
                             formatted_updated_at,
                         ),
                     )
@@ -8186,12 +8188,12 @@ class SQLiteSessionStore(
                             committed_event.id,
                             committed_event.interaction_id,
                             str(committed_event.type),
-                            sqlite_support.format_datetime(committed_event.timestamp),
+                            sqlite_records.format_datetime(committed_event.timestamp),
                             committed_event.agent_name,
                             committed_event.environment_name,
                             committed_event.workflow_name,
                             committed_event.tool_name,
-                            sqlite_support.json_dumps(committed_event.payload),
+                            sqlite_records.json_dumps(committed_event.payload),
                             lookup_key,
                             projection,
                             projection_bytes,
@@ -8218,7 +8220,7 @@ class SQLiteSessionStore(
                         "pending_action_tool_call_count = excluded.pending_action_tool_call_count, "
                         "pending_action_flags = excluded.pending_action_flags, "
                         "pending_action_metrics_ready = excluded.pending_action_metrics_ready",
-                        sqlite_support.checkpoint_row_values(
+                        sqlite_records.checkpoint_row_values(
                             session_id,
                             settled_checkpoint,
                             updated_at,
@@ -8250,7 +8252,7 @@ class SQLiteSessionStore(
                     (
                         session_id,
                         receipt_storage_key,
-                        sqlite_support.json_dumps(receipt_record),
+                        sqlite_records.json_dumps(receipt_record),
                         formatted_updated_at,
                     ),
                 )
@@ -8263,7 +8265,7 @@ class SQLiteSessionStore(
                         (
                             session_id,
                             steering_key,
-                            sqlite_support.json_dumps(completion_record),
+                            sqlite_records.json_dumps(completion_record),
                             formatted_updated_at,
                         ),
                     )
@@ -8623,7 +8625,7 @@ class SQLiteSessionStore(
                     "pending_action_tool_call_count = excluded.pending_action_tool_call_count, "
                     "pending_action_flags = excluded.pending_action_flags, "
                     "pending_action_metrics_ready = excluded.pending_action_metrics_ready",
-                    sqlite_support.checkpoint_row_values(
+                    sqlite_records.checkpoint_row_values(
                         copied.session_id,
                         updated_checkpoint,
                         session.updated_at,
@@ -8871,12 +8873,12 @@ class SQLiteSessionStore(
                         copied_event.id,
                         copied_event.interaction_id,
                         str(copied_event.type),
-                        sqlite_support.format_datetime(copied_event.timestamp),
+                        sqlite_records.format_datetime(copied_event.timestamp),
                         copied_event.agent_name,
                         copied_event.environment_name,
                         copied_event.workflow_name,
                         copied_event.tool_name,
-                        sqlite_support.json_dumps(copied_event.payload),
+                        sqlite_records.json_dumps(copied_event.payload),
                         lookup_key,
                         projection,
                         projection_bytes,
@@ -9000,12 +9002,12 @@ class SQLiteSessionStore(
                             event.id,
                             event.interaction_id,
                             str(event.type),
-                            sqlite_support.format_datetime(event.timestamp),
+                            sqlite_records.format_datetime(event.timestamp),
                             event.agent_name,
                             event.environment_name,
                             event.workflow_name,
                             event.tool_name,
-                            sqlite_support.json_dumps(event.payload),
+                            sqlite_records.json_dumps(event.payload),
                             lookup_key,
                             projection,
                             projection_bytes,
@@ -9028,7 +9030,7 @@ class SQLiteSessionStore(
                     session_id,
                     copied_events,
                 )
-                updated_at = sqlite_support.format_datetime(self._ownership_clock())
+                updated_at = sqlite_records.format_datetime(self._ownership_clock())
                 for key, baseline in updates.items():
                     connection.execute(
                         """
@@ -9044,7 +9046,7 @@ class SQLiteSessionStore(
                         (
                             key,
                             baseline.generation,
-                            sqlite_support.json_dumps(baseline.model_dump(mode="json")),
+                            sqlite_records.json_dumps(baseline.model_dump(mode="json")),
                             updated_at,
                         ),
                     )
@@ -9113,7 +9115,7 @@ class SQLiteSessionStore(
                 connection.execute("BEGIN IMMEDIATE")
                 now = self._ownership_clock()
                 lease_expires_at = now + timedelta(seconds=float(lease_seconds))
-                formatted_now = sqlite_support.format_datetime(now)
+                formatted_now = sqlite_records.format_datetime(now)
                 filters = [
                     "(status = 'pending' "
                     "OR (status = 'failed' AND "
@@ -9155,8 +9157,8 @@ class SQLiteSessionStore(
                     (
                         attempt,
                         claim_id,
-                        sqlite_support.format_datetime(lease_expires_at),
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.format_datetime(lease_expires_at),
+                        sqlite_records.format_datetime(now),
                         delivery_row["session_id"],
                         delivery_row["event_id"],
                     ),
@@ -9229,7 +9231,7 @@ class SQLiteSessionStore(
                     "UPDATE cayu_persisted_event_side_effects SET status = 'dead_lettered', "
                     "next_attempt_at = NULL, updated_at = ? WHERE session_id = ? AND event_id = ?",
                     (
-                        sqlite_support.format_datetime(retired.updated_at),
+                        sqlite_records.format_datetime(retired.updated_at),
                         expected.session_id,
                         expected.event_id,
                     ),
@@ -9317,15 +9319,15 @@ class SQLiteSessionStore(
                     "WHERE session_id = ? AND event_id = ? AND status = 'leased' "
                     "AND claim_id = ? AND attempts = ? AND lease_expires_at > ?",
                     (
-                        sqlite_support.format_datetime(
+                        sqlite_records.format_datetime(
                             now + timedelta(seconds=float(lease_seconds))
                         ),
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.format_datetime(now),
                         claim.session_id,
                         claim.event_id,
                         claim.claim_id,
                         claim.attempt,
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.format_datetime(now),
                     ),
                 )
                 if cursor.rowcount != 1:
@@ -9377,10 +9379,10 @@ class SQLiteSessionStore(
                         (
                             None
                             if next_attempt_at is None
-                            else sqlite_support.format_datetime(next_attempt_at)
+                            else sqlite_records.format_datetime(next_attempt_at)
                         ),
                         error,
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.format_datetime(now),
                         int(deferred),
                         claim.session_id,
                         claim.event_id,
@@ -9419,7 +9421,7 @@ class SQLiteSessionStore(
         def query(connection: sqlite3.Connection) -> PersistedEventSideEffectHealth:
             now = self._ownership_clock().astimezone(UTC)
             row = connection.execute(
-                side_effect_health.health_sql("?"), (sqlite_support.format_datetime(now),)
+                side_effect_health.health_sql("?"), (sqlite_records.format_datetime(now),)
             ).fetchone()
             return side_effect_health.finish_health(dict(row), now)
 
@@ -9435,7 +9437,7 @@ class SQLiteSessionStore(
         def read(connection: sqlite3.Connection) -> PersistedEventSideEffectPage:
             now = self._ownership_clock().astimezone(UTC)
             sql, params = side_effect_health.page_sql(
-                query, sqlite_support.format_datetime(now), "?"
+                query, sqlite_records.format_datetime(now), "?"
             )
             rows = connection.execute(sql, params).fetchall()
             return side_effect_health.page(
@@ -9485,7 +9487,7 @@ class SQLiteSessionStore(
                     "(next_attempt_at IS NULL OR next_attempt_at <= ?)) "
                     "OR (status = 'leased' AND lease_expires_at <= ?))"
                 )
-                formatted_now = sqlite_support.format_datetime(self._ownership_clock())
+                formatted_now = sqlite_records.format_datetime(self._ownership_clock())
                 params.extend([formatted_now, formatted_now])
             where = "" if not clauses else "WHERE " + " AND ".join(clauses)
             params.append(limit)
@@ -9718,7 +9720,7 @@ class SQLiteSessionStore(
                     actor=request.requested_by,
                     accepted_event=accepted_event,
                 )
-                proof = sqlite_support.json_dumps(
+                proof = sqlite_records.json_dumps(
                     message_queue.terminal_receipt(status, event, request)
                 )
                 connection.execute(
@@ -9837,20 +9839,20 @@ class SQLiteSessionStore(
                         (
                             None
                             if request.message is None
-                            else sqlite_support.json_dumps(request.message.model_dump(mode="json"))
+                            else sqlite_records.json_dumps(request.message.model_dump(mode="json"))
                         ),
                         str(request.delivery_mode),
                         (
                             None
                             if request.requested_by is None
-                            else sqlite_support.json_dumps(
+                            else sqlite_records.json_dumps(
                                 resolution_actor_payload(request.requested_by)
                             )
                         ),
                         loaded.run_epoch,
                         transcript_cursor,
                         accepted_event_id,
-                        sqlite_support.format_datetime(accepted_at),
+                        sqlite_records.format_datetime(accepted_at),
                     ),
                 )
                 ordering_key = cursor.lastrowid
@@ -9859,7 +9861,7 @@ class SQLiteSessionStore(
                 connection.execute(
                     "UPDATE cayu_session_message_queue SET conditions_json = ? WHERE queue_id = ?",
                     (
-                        sqlite_support.json_dumps(request.conditions.model_dump(mode="json")),
+                        sqlite_records.json_dumps(request.conditions.model_dump(mode="json")),
                         queue_id,
                     ),
                 )
@@ -9912,12 +9914,12 @@ class SQLiteSessionStore(
                         accepted_event.id,
                         accepted_event.interaction_id,
                         str(accepted_event.type),
-                        sqlite_support.format_datetime(accepted_event.timestamp),
+                        sqlite_records.format_datetime(accepted_event.timestamp),
                         accepted_event.agent_name,
                         accepted_event.environment_name,
                         accepted_event.workflow_name,
                         accepted_event.tool_name,
-                        sqlite_support.json_dumps(accepted_event.payload),
+                        sqlite_records.json_dumps(accepted_event.payload),
                         lookup_key,
                         projection,
                         projection_bytes,
@@ -10136,7 +10138,7 @@ class SQLiteSessionStore(
                                 pending_action_metrics_ready =
                                     excluded.pending_action_metrics_ready
                             """,
-                            sqlite_support.checkpoint_row_values(
+                            sqlite_records.checkpoint_row_values(
                                 session_id,
                                 repaired_checkpoint,
                                 self._ownership_clock(),
@@ -10249,11 +10251,11 @@ class SQLiteSessionStore(
                             (
                                 None
                                 if interaction_started_event is None
-                                else sqlite_support.json_dumps(
+                                else sqlite_records.json_dumps(
                                     interaction_started_event.model_dump(mode="json")
                                 )
                             ),
-                            sqlite_support.format_datetime(self._ownership_clock()),
+                            sqlite_records.format_datetime(self._ownership_clock()),
                         ),
                     )
                     connection.execute(
@@ -10300,7 +10302,7 @@ class SQLiteSessionStore(
                         "WHERE queue_id = ? AND status = 'queued'",
                         (
                             str(rejection),
-                            sqlite_support.json_dumps(
+                            sqlite_records.json_dumps(
                                 message_queue.terminal_receipt(rejection, event)
                             ),
                             queued.queue_id,
@@ -10401,7 +10403,7 @@ class SQLiteSessionStore(
                             session_id,
                             str(message.role),
                             interaction_id,
-                            sqlite_support.json_dumps(message.model_dump(mode="json")),
+                            sqlite_records.json_dumps(message.model_dump(mode="json")),
                             transcript_search_document(message),
                         )
                         for message in transcript_messages
@@ -10417,7 +10419,7 @@ class SQLiteSessionStore(
                             updated.delivered_run_epoch,
                             updated.delivered_transcript_cursor,
                             updated.delivered_event_id,
-                            sqlite_support.format_datetime(delivered_at),
+                            sqlite_records.format_datetime(delivered_at),
                             updated.queue_id,
                         ),
                     )
@@ -10441,12 +10443,12 @@ class SQLiteSessionStore(
                             event.id,
                             event.interaction_id,
                             str(event.type),
-                            sqlite_support.format_datetime(event.timestamp),
+                            sqlite_records.format_datetime(event.timestamp),
                             event.agent_name,
                             event.environment_name,
                             event.workflow_name,
                             event.tool_name,
-                            sqlite_support.json_dumps(event.payload),
+                            sqlite_records.json_dumps(event.payload),
                             lookup_key,
                             projection,
                             projection_bytes,
@@ -10501,17 +10503,17 @@ class SQLiteSessionStore(
                         (
                             None
                             if interaction_started_event is None
-                            else sqlite_support.json_dumps(
+                            else sqlite_records.json_dumps(
                                 interaction_started_event.model_dump(mode="json")
                             )
                         ),
-                        sqlite_support.json_dumps(
+                        sqlite_records.json_dumps(
                             [message.queue_id for message in updated_messages]
                         ),
-                        sqlite_support.json_dumps(
+                        sqlite_records.json_dumps(
                             [event.model_dump(mode="json") for event in persisted_events]
                         ),
-                        sqlite_support.format_datetime(delivered_at),
+                        sqlite_records.format_datetime(delivered_at),
                     ),
                 )
                 connection.execute(
@@ -10537,7 +10539,7 @@ class SQLiteSessionStore(
                             pending_action_flags = excluded.pending_action_flags,
                             pending_action_metrics_ready = excluded.pending_action_metrics_ready
                         """,
-                        sqlite_support.checkpoint_row_values(
+                        sqlite_records.checkpoint_row_values(
                             session_id,
                             rebound_checkpoint,
                             delivered_at,
@@ -10684,7 +10686,7 @@ class SQLiteSessionStore(
                         pending_action_flags = excluded.pending_action_flags,
                         pending_action_metrics_ready = excluded.pending_action_metrics_ready
                     """,
-                    sqlite_support.checkpoint_row_values(
+                    sqlite_records.checkpoint_row_values(
                         session_id,
                         repaired_checkpoint,
                         self._ownership_clock(),
@@ -11087,8 +11089,8 @@ class SQLiteSessionStore(
                         (
                             session_id,
                             dispatch_key,
-                            sqlite_support.json_dumps(dispatch_record),
-                            sqlite_support.format_datetime(published_at),
+                            sqlite_records.json_dumps(dispatch_record),
+                            sqlite_records.format_datetime(published_at),
                         ),
                     )
                 assert dispatch_record is not None
@@ -11167,11 +11169,11 @@ class SQLiteSessionStore(
                                 (
                                     session_id,
                                     consumption_key,
-                                    sqlite_support.json_dumps(material),
-                                    sqlite_support.format_datetime(published_at),
+                                    sqlite_records.json_dumps(material),
+                                    sqlite_records.format_datetime(published_at),
                                 ),
                             )
-                formatted_at = sqlite_support.format_datetime(published_at)
+                formatted_at = sqlite_records.format_datetime(published_at)
                 cursor = connection.execute(
                     "UPDATE cayu_sessions SET updated_at = ?, last_activity_at = ? WHERE id = ?",
                     (formatted_at, formatted_at, session_id),
@@ -11388,7 +11390,7 @@ class SQLiteSessionStore(
                     terminal_storage_key=prepared.terminal_storage_key,
                 )
                 assert stage is not None
-                formatted_at = sqlite_support.format_datetime(prepared_at)
+                formatted_at = sqlite_records.format_datetime(prepared_at)
                 if route_checkpoint is not None:
                     connection.execute(
                         "INSERT INTO cayu_checkpoints (session_id, state_json, updated_at, "
@@ -11401,7 +11403,7 @@ class SQLiteSessionStore(
                         "pending_action_tool_call_count = excluded.pending_action_tool_call_count, "
                         "pending_action_flags = excluded.pending_action_flags, "
                         "pending_action_metrics_ready = excluded.pending_action_metrics_ready",
-                        sqlite_support.checkpoint_row_values(
+                        sqlite_records.checkpoint_row_values(
                             session_id, route_checkpoint, prepared_at
                         ),
                     )
@@ -11412,7 +11414,7 @@ class SQLiteSessionStore(
                     (
                         session_id,
                         prepared.preparation_storage_key,
-                        sqlite_support.json_dumps(record),
+                        sqlite_records.json_dumps(record),
                         formatted_at,
                     ),
                 )
@@ -11457,7 +11459,7 @@ class SQLiteSessionStore(
                         (
                             session_id,
                             retry_settlement_storage_key,
-                            sqlite_support.json_dumps(retry_settlement_record),
+                            sqlite_records.json_dumps(retry_settlement_record),
                             formatted_at,
                         ),
                     )
@@ -11470,7 +11472,7 @@ class SQLiteSessionStore(
                     (
                         session_id,
                         MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
-                        sqlite_support.json_dumps(active_record),
+                        sqlite_records.json_dumps(active_record),
                         formatted_at,
                     ),
                 )
@@ -11616,7 +11618,7 @@ class SQLiteSessionStore(
                     stage=stage,
                     current_run_epoch=loaded.run_epoch,
                 )
-                formatted_at = sqlite_support.format_datetime(completed_at)
+                formatted_at = sqlite_records.format_datetime(completed_at)
                 connection.execute(
                     "INSERT INTO cayu_session_operations "
                     "(session_id, idempotency_key, record_json, updated_at) "
@@ -11624,7 +11626,7 @@ class SQLiteSessionStore(
                     (
                         session_id,
                         prepared.terminal_storage_key,
-                        sqlite_support.json_dumps(terminal_record),
+                        sqlite_records.json_dumps(terminal_record),
                         formatted_at,
                     ),
                 )
@@ -11778,7 +11780,7 @@ class SQLiteSessionStore(
                     stage_id=prepared.stage_id,
                     storage_key=prepared.abandonment_storage_key,
                 )
-                formatted_at = sqlite_support.format_datetime(abandoned_at)
+                formatted_at = sqlite_records.format_datetime(abandoned_at)
                 connection.execute(
                     "INSERT INTO cayu_session_operations "
                     "(session_id, idempotency_key, record_json, updated_at) "
@@ -11788,7 +11790,7 @@ class SQLiteSessionStore(
                     (
                         session_id,
                         prepared.abandonment_storage_key,
-                        sqlite_support.json_dumps(abandonment_record),
+                        sqlite_records.json_dumps(abandonment_record),
                         formatted_at,
                     ),
                 )
@@ -12217,7 +12219,7 @@ class SQLiteSessionStore(
                         session_id,
                         str(message.role),
                         request.interaction_id,
-                        sqlite_support.json_dumps(message_payload),
+                        sqlite_records.json_dumps(message_payload),
                         transcript_search_document(message),
                     )
                     for message, message_payload in zip(
@@ -12241,12 +12243,12 @@ class SQLiteSessionStore(
                             event.id,
                             event.interaction_id,
                             str(event.type),
-                            sqlite_support.format_datetime(event.timestamp),
+                            sqlite_records.format_datetime(event.timestamp),
                             event.agent_name,
                             event.environment_name,
                             event.workflow_name,
                             event.tool_name,
-                            sqlite_support.json_dumps(event_payload["payload"]),
+                            sqlite_records.json_dumps(event_payload["payload"]),
                             lookup_key,
                             projection,
                             projection_bytes,
@@ -12257,7 +12259,7 @@ class SQLiteSessionStore(
                 checkpoint_values = (
                     None
                     if stored_target_checkpoint is None or not request.mutation.operations
-                    else sqlite_support.checkpoint_row_values(
+                    else sqlite_records.checkpoint_row_values(
                         session_id,
                         stored_target_checkpoint,
                         published_at,
@@ -12270,10 +12272,10 @@ class SQLiteSessionStore(
                     transcript_start_cursor=transcript_start_cursor,
                     published_at=published_at,
                 )
-                receipt_json = sqlite_support.json_dumps(
+                receipt_json = sqlite_records.json_dumps(
                     _runtime_publication_receipt_record(receipt)
                 )
-                formatted_published_at = sqlite_support.format_datetime(published_at)
+                formatted_published_at = sqlite_records.format_datetime(published_at)
 
                 if transcript_rows:
                     connection.executemany(
@@ -12336,7 +12338,7 @@ class SQLiteSessionStore(
                             (
                                 session_id,
                                 key,
-                                sqlite_support.json_dumps(record),
+                                sqlite_records.json_dumps(record),
                                 formatted_published_at,
                             )
                             for key, record in operation_mutation_records.items()
@@ -12368,7 +12370,7 @@ class SQLiteSessionStore(
                         (
                             session_id,
                             _model_completion_stage.winner_storage_key,
-                            sqlite_support.json_dumps(winner),
+                            sqlite_records.json_dumps(winner),
                             formatted_published_at,
                         ),
                     )
@@ -12527,7 +12529,7 @@ class SQLiteSessionStore(
                 plans = plan_preparation(prepared, snapshots, now)
                 # Serialize and validate every row before starting either write.
                 checkpoints = {
-                    session_id: sqlite_support.checkpoint_row_values(
+                    session_id: sqlite_records.checkpoint_row_values(
                         session_id, plan.checkpoint, now
                     )
                     for session_id, plan in plans.items()
@@ -12536,8 +12538,8 @@ class SQLiteSessionStore(
                     (
                         session_id,
                         key,
-                        sqlite_support.json_dumps(record),
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.json_dumps(record),
+                        sqlite_records.format_datetime(now),
                     )
                     for session_id, plan in plans.items()
                     for key, record in plan.operation_records.items()
@@ -12798,12 +12800,12 @@ class SQLiteSessionStore(
                             event.id,
                             event.interaction_id,
                             str(event.type),
-                            sqlite_support.format_datetime(event.timestamp),
+                            sqlite_records.format_datetime(event.timestamp),
                             event.agent_name,
                             event.environment_name,
                             event.workflow_name,
                             event.tool_name,
-                            sqlite_support.json_dumps(event.payload),
+                            sqlite_records.json_dumps(event.payload),
                             lookup_key,
                             projection,
                             projection_bytes,
@@ -12828,7 +12830,7 @@ class SQLiteSessionStore(
                         pending_action_flags = excluded.pending_action_flags,
                         pending_action_metrics_ready = excluded.pending_action_metrics_ready
                     """,
-                    sqlite_support.checkpoint_row_values(session_id, transformed, updated_at),
+                    sqlite_records.checkpoint_row_values(session_id, transformed, updated_at),
                 )
                 if operation_records:
                     connection.executemany(
@@ -12845,8 +12847,8 @@ class SQLiteSessionStore(
                             (
                                 session_id,
                                 key,
-                                sqlite_support.json_dumps(record),
-                                sqlite_support.format_datetime(updated_at),
+                                sqlite_records.json_dumps(record),
+                                sqlite_records.format_datetime(updated_at),
                             )
                             for key, record in operation_records.items()
                         ],
@@ -14643,7 +14645,7 @@ class SQLiteSessionStore(
         """
         if not isinstance(before, datetime):
             raise TypeError("prune_events 'before' must be a datetime.")
-        cutoff = sqlite_support.format_datetime(before)
+        cutoff = sqlite_records.format_datetime(before)
         if session_id is not None:
             session_id = require_clean_nonblank(session_id, "session_id")
 
@@ -15051,7 +15053,7 @@ class SQLiteSessionStore(
                             parent_session_id=parent.id,
                         )
                         cursor_clause = "AND (created_at > ? OR (created_at = ? AND id > ?))"
-                        formatted_cursor = sqlite_support.format_datetime(cursor_created_at)
+                        formatted_cursor = sqlite_records.format_datetime(cursor_created_at)
                         cursor_params = [formatted_cursor, formatted_cursor, cursor_id]
                     branch_queries.append(
                         f"""
@@ -15133,7 +15135,7 @@ class SQLiteSessionStore(
                     query.cursor,
                     parent_session_id=query.parent_session_id,
                 )
-                formatted_cursor = sqlite_support.format_datetime(cursor_created_at)
+                formatted_cursor = sqlite_records.format_datetime(cursor_created_at)
                 cursor_clause = "AND (created_at > ? OR (created_at = ? AND id > ?))"
                 params.extend((formatted_cursor, formatted_cursor, cursor_id))
             params.append(query.limit + 1)
@@ -15159,7 +15161,7 @@ class SQLiteSessionStore(
                 base = SessionLineageNode(
                     id=row["id"],
                     parent_session_id=query.parent_session_id,
-                    created_at=sqlite_support.parse_datetime(row["created_at"]),
+                    created_at=sqlite_records.parse_datetime(row["created_at"]),
                 )
                 origin_rows = connection.execute(
                     """
@@ -15265,7 +15267,7 @@ class SQLiteSessionStore(
                     retained_ids,
                 ).fetchall()
                 children_by_id = {
-                    str(child_row["id"]): sqlite_support.session_from_row(
+                    str(child_row["id"]): sqlite_records.session_from_row(
                         child_row,
                         labels={},
                     )
@@ -15394,7 +15396,7 @@ class SQLiteSessionStore(
                     status = SessionStatus(row["status"])
                     counts[status] = row["status_count"]
             return SessionOperationalSnapshot(
-                as_of=sqlite_support.parse_datetime(rows[0]["as_of"]),
+                as_of=sqlite_records.parse_datetime(rows[0]["as_of"]),
                 total_count=sum(counts.values()),
                 counts_by_status=SessionStatusCounts.model_validate(counts),
                 accuracy=EXACT_AGGREGATE.model_copy(),
@@ -15571,7 +15573,7 @@ class SQLiteSessionStore(
             filters.append("(cayu_checkpoints.pending_action_flags & 8) <> 0")
         if query.cursor is not None:
             cursor_dt, cursor_id = decode_session_cursor(query.cursor)
-            cursor_value = sqlite_support.format_datetime(cursor_dt)
+            cursor_value = sqlite_records.format_datetime(cursor_dt)
             filters.append(
                 """
                 (
@@ -16173,11 +16175,11 @@ class SQLiteSessionStore(
                 has_more_candidates = len(candidate_rows) > inspected_candidate_limit
                 inspected_rows = candidate_rows[:inspected_candidate_limit]
                 candidate_sessions = {
-                    row["id"]: sqlite_support.pending_action_session_from_row(row, labels={})
+                    row["id"]: sqlite_records.pending_action_session_from_row(row, labels={})
                     for row in inspected_rows
                 }
                 inspected_ids = [row["id"] for row in inspected_rows]
-                selected_ids_json = sqlite_support.json_dumps(inspected_ids)
+                selected_ids_json = sqlite_records.json_dumps(inspected_ids)
 
                 checkpoint_preflight_by_session_id: dict[str, tuple[int, int]] = {}
                 if inspected_ids:
@@ -16235,7 +16237,7 @@ class SQLiteSessionStore(
                 if preflight_eligible_ids:
                     for row in connection.execute(
                         source_size_sql,
-                        (sqlite_support.json_dumps(preflight_eligible_ids),),
+                        (sqlite_records.json_dumps(preflight_eligible_ids),),
                     ).fetchall():
                         sequence_values = json.loads(row["matched_event_sequences_json"])
                         if type(sequence_values) is not list or any(
@@ -16301,8 +16303,8 @@ class SQLiteSessionStore(
                     rows = connection.execute(
                         materialize_sql,
                         (
-                            sqlite_support.json_dumps(materializable_ids),
-                            sqlite_support.json_dumps(materializable_sequences),
+                            sqlite_records.json_dumps(materializable_ids),
+                            sqlite_records.json_dumps(materializable_sequences),
                         ),
                     ).fetchall()
                     for row in rows:
@@ -16533,7 +16535,7 @@ class SQLiteSessionStore(
                 connection=connection,
             )
             sessions = [
-                sqlite_support.session_from_row(
+                sqlite_records.session_from_row(
                     row,
                     labels=labels_by_session_id.get(row["id"], {}),
                 )
@@ -16597,7 +16599,7 @@ class SQLiteSessionStore(
                             session_id,
                             str(message.role),
                             interaction_id,
-                            sqlite_support.json_dumps(message.model_dump(mode="json")),
+                            sqlite_records.json_dumps(message.model_dump(mode="json")),
                             transcript_search_document(message),
                         )
                         for message in copied_messages
@@ -16875,12 +16877,12 @@ class SQLiteSessionStore(
                             target_id,
                             request.operation_key,
                             request.occurrence.payload.text,
-                            sqlite_support.json_dumps(message.model_dump(mode="json")),
+                            sqlite_records.json_dumps(message.model_dump(mode="json")),
                             str(delivery_mode),
                             session.run_epoch,
                             cursor,
                             accepted_event_id,
-                            sqlite_support.format_datetime(accepted_at),
+                            sqlite_records.format_datetime(accepted_at),
                         ),
                     ).lastrowid
                     if type(ordering_key) is not int:
@@ -16926,10 +16928,10 @@ class SQLiteSessionStore(
                             target_id,
                             accepted_event.id,
                             str(accepted_event.type),
-                            sqlite_support.format_datetime(accepted_event.timestamp),
+                            sqlite_records.format_datetime(accepted_event.timestamp),
                             accepted_event.agent_name,
                             accepted_event.environment_name,
-                            sqlite_support.json_dumps(accepted_event.payload),
+                            sqlite_records.json_dumps(accepted_event.payload),
                             lookup_key,
                             projection,
                             projection_bytes,
@@ -16938,7 +16940,7 @@ class SQLiteSessionStore(
                     connection.execute(
                         "UPDATE cayu_session_message_queue SET conditions_json = ? WHERE queue_id = ?",
                         (
-                            sqlite_support.json_dumps(
+                            sqlite_records.json_dumps(
                                 SessionMessageConditions().model_dump(mode="json")
                             ),
                             queue_id,
@@ -16964,8 +16966,8 @@ class SQLiteSessionStore(
                         key,
                         request.operation_key,
                         commitment,
-                        sqlite_support.json_dumps(result.model_dump(mode="json")),
-                        sqlite_support.json_dumps(request.model_dump(mode="json")),
+                        sqlite_records.json_dumps(result.model_dump(mode="json")),
+                        sqlite_records.json_dumps(request.model_dump(mode="json")),
                     ),
                 )
                 connection.execute(
@@ -17063,7 +17065,7 @@ class SQLiteSessionStore(
                             "UPDATE cayu_peer_content_exposures SET commitment_json = ?, receipt_json = ? WHERE exposure_id = ?",
                             (
                                 commitment,
-                                sqlite_support.json_dumps(receipt.model_dump(mode="json")),
+                                sqlite_records.json_dumps(receipt.model_dump(mode="json")),
                                 request.exposure_id,
                             ),
                         )
@@ -17092,7 +17094,7 @@ class SQLiteSessionStore(
                         request.operation_key,
                         key,
                         commitment,
-                        sqlite_support.json_dumps(receipt.model_dump(mode="json")),
+                        sqlite_records.json_dumps(receipt.model_dump(mode="json")),
                     ),
                 )
                 connection.commit()
@@ -17143,7 +17145,7 @@ class SQLiteSessionStore(
                         request.operation_key,
                         key,
                         identity,
-                        sqlite_support.json_dumps(receipt.model_dump(mode="json")),
+                        sqlite_records.json_dumps(receipt.model_dump(mode="json")),
                     ),
                 )
                 connection.commit()
@@ -17241,8 +17243,8 @@ class SQLiteSessionStore(
                         key,
                         request.operation_key,
                         commitment,
-                        sqlite_support.json_dumps(result.model_dump(mode="json")),
-                        sqlite_support.json_dumps(request.model_dump(mode="json")),
+                        sqlite_records.json_dumps(result.model_dump(mode="json")),
+                        sqlite_records.json_dumps(request.model_dump(mode="json")),
                     ),
                 )
                 connection.execute(
@@ -17443,7 +17445,7 @@ class SQLiteSessionStore(
                             session_id,
                             str(message.role),
                             None if index < prefix_count else interaction_id,
-                            sqlite_support.json_dumps(message.model_dump(mode="json")),
+                            sqlite_records.json_dumps(message.model_dump(mode="json")),
                             transcript_search_document(message),
                         )
                         for index, message in enumerate(replacement)
@@ -17479,7 +17481,7 @@ class SQLiteSessionStore(
                             pending_action_metrics_ready =
                                 excluded.pending_action_metrics_ready
                         """,
-                        sqlite_support.checkpoint_row_values(
+                        sqlite_records.checkpoint_row_values(
                             session_id,
                             checkpoint,
                             updated_at,
@@ -17537,7 +17539,7 @@ class SQLiteSessionStore(
                             session_id,
                             str(message.role),
                             interaction_id,
-                            sqlite_support.json_dumps(message.model_dump(mode="json")),
+                            sqlite_records.json_dumps(message.model_dump(mode="json")),
                             transcript_search_document(message),
                         )
                         for message in messages
@@ -17644,7 +17646,7 @@ class SQLiteSessionStore(
                                 session_id,
                                 str(message.role),
                                 interaction_id,
-                                sqlite_support.json_dumps(message.model_dump(mode="json")),
+                                sqlite_records.json_dumps(message.model_dump(mode="json")),
                                 transcript_search_document(message),
                             )
                             for message in copied_messages
@@ -17668,7 +17670,7 @@ class SQLiteSessionStore(
                         pending_action_flags = excluded.pending_action_flags,
                         pending_action_metrics_ready = excluded.pending_action_metrics_ready
                     """,
-                    sqlite_support.checkpoint_row_values(session_id, transformed, updated_at),
+                    sqlite_records.checkpoint_row_values(session_id, transformed, updated_at),
                 )
                 connection.commit()
             except Exception:
@@ -18206,7 +18208,7 @@ class SQLiteSessionStore(
                         pending_action_flags = excluded.pending_action_flags,
                         pending_action_metrics_ready = excluded.pending_action_metrics_ready
                     """,
-                    sqlite_support.checkpoint_row_values(session_id, replacement, updated_at),
+                    sqlite_records.checkpoint_row_values(session_id, replacement, updated_at),
                 )
                 connection.commit()
             except BaseException:
@@ -18266,7 +18268,7 @@ class SQLiteSessionStore(
                             pending_action_flags = excluded.pending_action_flags,
                             pending_action_metrics_ready = excluded.pending_action_metrics_ready
                         """,
-                        sqlite_support.checkpoint_row_values(session_id, transformed, updated_at),
+                        sqlite_records.checkpoint_row_values(session_id, transformed, updated_at),
                     )
                 connection.commit()
             except BaseException as primary:
@@ -18332,7 +18334,7 @@ class SQLiteSessionStore(
                             pending_action_flags = excluded.pending_action_flags,
                             pending_action_metrics_ready = excluded.pending_action_metrics_ready
                         """,
-                        sqlite_support.checkpoint_row_values(session_id, transformed, now),
+                        sqlite_records.checkpoint_row_values(session_id, transformed, now),
                     )
                 connection.commit()
             except BaseException:

@@ -79,7 +79,7 @@ from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
-from cayu.storage import _sqlite_support as sqlite_support
+from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
@@ -1847,7 +1847,7 @@ def test_admission_rejects_expired_queue_lease_despite_behind_verified_work_cloc
                 with store._connection:
                     store._connection.execute(
                         "UPDATE cayu_tasks SET lease_expires_at = ? WHERE id = ?",
-                        (sqlite_support.format_datetime(expired_at), task.id),
+                        (sqlite_records.format_datetime(expired_at), task.id),
                     )
         session_id = f"expired-admission-queue-clock-session-{backend}"
         request = _prepare_request(
@@ -4267,7 +4267,7 @@ def test_migrated_source_only_session_input_keeps_recovery_fenced(tmp_path) -> N
                 "UPDATE cayu_deferred_interaction_inputs SET source_messages_json = ? "
                 "WHERE session_id = ?",
                 (
-                    sqlite_support.json_dumps(payload["source_messages"]),
+                    sqlite_records.json_dumps(payload["source_messages"]),
                     admitted.session_id,
                 ),
             )
@@ -5910,7 +5910,7 @@ def test_public_rejected_continue_admission_preserves_contract_and_adds_interact
                 connection.execute(
                     "UPDATE cayu_work_attempt_admissions SET admission_json = ? "
                     "WHERE admission_id = ?",
-                    (sqlite_support.json_dumps(payload), second.admission_id),
+                    (sqlite_records.json_dumps(payload), second.admission_id),
                 )
                 connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 62")
                 connection.execute("PRAGMA user_version = 61")

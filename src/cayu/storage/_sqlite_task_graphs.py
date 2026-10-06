@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from cayu._validation import MAX_PORTABLE_JSON_INTEGER
+from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_support as sql
 from cayu.storage import _sqlite_task_groups as groups
 from cayu.tasks._graph_admission import prepare_graph_admission
@@ -297,7 +298,7 @@ def record_transition(
                 "SELECT task_id FROM cayu_task_group_retry_lineage WHERE graph_id = ?)",
                 (graph_id,),
             ).fetchall()
-            descendants = {task.id: task for task in map(sql.task_from_row, rows)}
+            descendants = {task.id: task for task in map(sqlite_records.task_from_row, rows)}
             if descendants.keys() != lineage_roots.keys():
                 raise TaskGraphUnavailable("Retry descendant evidence is missing.")
             tasks.update(descendants)
@@ -344,7 +345,7 @@ def record_transition(
                 settlement.idempotency_key,
                 settlement.request_sha256,
                 settlement.model_dump_json(),
-                sql.format_datetime(settlement.committed_at),
+                sqlite_records.format_datetime(settlement.committed_at),
             ),
         )
     insert_events(store, transition.events)

@@ -72,6 +72,7 @@ from cayu.runtime.work_attempt_lifecycle import (
     work_attempt_preparation_hold_sha256,
 )
 from cayu.sessions.invocation import SessionInvocationBinding, TaskInvocation
+from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 from cayu.storage._phase_timing import TimedStoreLock
@@ -502,9 +503,9 @@ class SQLiteTaskStore(TaskStore):
             or record.recovery_generation != row["recovery_generation"]
             or record.recovery_owner_id != row["recovery_owner_id"]
             or record.recovery_owner_expires_at
-            != sqlite_support.parse_optional_datetime(row["recovery_owner_expires_at"])
-            or record.created_at != sqlite_support.parse_datetime(row["created_at"])
-            or record.updated_at != sqlite_support.parse_datetime(row["updated_at"])
+            != sqlite_records.parse_optional_datetime(row["recovery_owner_expires_at"])
+            or record.created_at != sqlite_records.parse_datetime(row["created_at"])
+            or record.updated_at != sqlite_records.parse_datetime(row["updated_at"])
         ):
             raise LocalExecutionAttemptConflict(
                 "Stored local execution attempt indexes conflict with canonical content."
@@ -550,10 +551,10 @@ class SQLiteTaskStore(TaskStore):
             int(record.retry_admissible),
             record.recovery_generation,
             record.recovery_owner_id,
-            sqlite_support.format_optional_datetime(record.recovery_owner_expires_at),
-            sqlite_support.json_dumps(record.model_dump(mode="json", warnings=False)),
-            sqlite_support.format_datetime(record.created_at),
-            sqlite_support.format_datetime(record.updated_at),
+            sqlite_records.format_optional_datetime(record.recovery_owner_expires_at),
+            sqlite_records.json_dumps(record.model_dump(mode="json", warnings=False)),
+            sqlite_records.format_datetime(record.created_at),
+            sqlite_records.format_datetime(record.updated_at),
         )
         if insert:
             self._connection.execute(
@@ -697,7 +698,7 @@ class SQLiteTaskStore(TaskStore):
             ]
             if after is not None:
                 predicate += " AND (created_at > ? OR (created_at = ? AND attempt_id > ?))"
-                created_at = sqlite_support.format_datetime(after.created_at)
+                created_at = sqlite_records.format_datetime(after.created_at)
                 parameters.extend(
                     (
                         created_at,
@@ -788,7 +789,7 @@ class SQLiteTaskStore(TaskStore):
             or attempt.task_id != row["task_id"]
             or attempt.ordinal != row["ordinal"]
             or attempt.request_sha256 != row["request_sha256"]
-            or attempt.started_at != sqlite_support.parse_datetime(row["started_at"])
+            or attempt.started_at != sqlite_records.parse_datetime(row["started_at"])
         ):
             raise WorkCompletionConflict(
                 "Stored work-attempt indexes conflict with canonical content."
@@ -831,7 +832,7 @@ class SQLiteTaskStore(TaskStore):
             or admission.claim.claim_id != row["current_claim_id"]
             or admission.claim.generation != row["current_generation"]
             or admission.claim.lease_expires_at
-            != sqlite_support.parse_datetime(row["lease_expires_at"])
+            != sqlite_records.parse_datetime(row["lease_expires_at"])
         ):
             raise WorkAttemptAdmissionConflict(
                 "Stored work-attempt admission indexes conflict with canonical content."
@@ -850,7 +851,7 @@ class SQLiteTaskStore(TaskStore):
             or durable_claim.generation != row["durable_claim_generation"]
             or durable_claim.request_sha256 != row["durable_claim_request_sha256"]
             or durable_claim.lease_expires_at
-            != sqlite_support.parse_datetime(row["durable_claim_lease_expires_at"])
+            != sqlite_records.parse_datetime(row["durable_claim_lease_expires_at"])
             or row["durable_claim_is_current"] != 1
         ):
             raise WorkAttemptAdmissionConflict(
@@ -888,7 +889,7 @@ class SQLiteTaskStore(TaskStore):
             or claim.admission_id != row["admission_id"]
             or claim.generation != row["generation"]
             or claim.request_sha256 != row["request_sha256"]
-            or claim.lease_expires_at != sqlite_support.parse_datetime(row["lease_expires_at"])
+            or claim.lease_expires_at != sqlite_records.parse_datetime(row["lease_expires_at"])
         ):
             raise WorkAttemptAdmissionConflict(
                 "Stored execution-claim indexes conflict with canonical content."
@@ -908,8 +909,8 @@ class SQLiteTaskStore(TaskStore):
                 claim.admission_id,
                 claim.generation,
                 claim.request_sha256,
-                sqlite_support.format_datetime(claim.lease_expires_at),
-                sqlite_support.json_dumps(claim.model_dump(mode="json", warnings=False)),
+                sqlite_records.format_datetime(claim.lease_expires_at),
+                sqlite_records.json_dumps(claim.model_dump(mode="json", warnings=False)),
             ),
         )
 
@@ -925,8 +926,8 @@ class SQLiteTaskStore(TaskStore):
                 admission.state.value,
                 admission.claim.claim_id,
                 admission.claim.generation,
-                sqlite_support.format_datetime(admission.claim.lease_expires_at),
-                sqlite_support.json_dumps(admission.model_dump(mode="json", warnings=False)),
+                sqlite_records.format_datetime(admission.claim.lease_expires_at),
+                sqlite_records.json_dumps(admission.model_dump(mode="json", warnings=False)),
                 admission.admission_id,
             ),
         )
@@ -967,7 +968,7 @@ class SQLiteTaskStore(TaskStore):
             or proposal.attempt_id != row["attempt_id"]
             or proposal.task_id != row["task_id"]
             or proposal.request_sha256 != row["request_sha256"]
-            or proposal.proposed_at != sqlite_support.parse_datetime(row["proposed_at"])
+            or proposal.proposed_at != sqlite_records.parse_datetime(row["proposed_at"])
         ):
             raise WorkCompletionConflict(
                 "Stored completion-proposal indexes conflict with canonical content."
@@ -1005,7 +1006,7 @@ class SQLiteTaskStore(TaskStore):
             or profile.attempt_id != row["attempt_id"]
             or profile.profile.fingerprint != row["profile_fingerprint"]
             or profile.request_sha256 != row["request_sha256"]
-            or profile.prepared_at != sqlite_support.parse_datetime(row["prepared_at"])
+            or profile.prepared_at != sqlite_records.parse_datetime(row["prepared_at"])
         ):
             raise WorkCompletionConflict(
                 "Stored completion-verifier profile indexes conflict with canonical content."
@@ -1064,7 +1065,7 @@ class SQLiteTaskStore(TaskStore):
             or claim.attempt_number != row["attempt_number"]
             or claim.verifier_profile_fingerprint != row["verifier_profile_fingerprint"]
             or claim.request_sha256 != row["request_sha256"]
-            or claim.lease_expires_at != sqlite_support.parse_datetime(row["lease_expires_at"])
+            or claim.lease_expires_at != sqlite_records.parse_datetime(row["lease_expires_at"])
         ):
             raise WorkCompletionConflict(
                 "Stored verification-claim indexes conflict with canonical content."
@@ -1108,7 +1109,7 @@ class SQLiteTaskStore(TaskStore):
             or decision.verdict.value != row["verdict"]
             or decision.gap_fingerprint != row["gap_fingerprint"]
             or decision.request_sha256 != row["request_sha256"]
-            or decision.decided_at != sqlite_support.parse_datetime(row["decided_at"])
+            or decision.decided_at != sqlite_records.parse_datetime(row["decided_at"])
         ):
             raise WorkCompletionConflict(
                 "Stored completion-decision indexes conflict with canonical content."
@@ -1136,7 +1137,7 @@ class SQLiteTaskStore(TaskStore):
             or receipt.idempotency_key != row["idempotency_key"]
             or receipt.decision_id != row["decision_id"]
             or receipt.request_sha256 != row["request_sha256"]
-            or receipt.applied_at != sqlite_support.parse_datetime(row["applied_at"])
+            or receipt.applied_at != sqlite_records.parse_datetime(row["applied_at"])
         ):
             raise WorkCompletionConflict(
                 "Stored decision-application receipt indexes conflict with canonical content."
@@ -1152,7 +1153,7 @@ class SQLiteTaskStore(TaskStore):
         self._connection.execute(
             "INSERT OR IGNORE INTO cayu_task_session_execution_authority "
             "(session_id, authority_kind, committed_at) VALUES (?, ?, ?)",
-            (session_id, authority_kind, sqlite_support.format_datetime(now)),
+            (session_id, authority_kind, sqlite_records.format_datetime(now)),
         )
         row = self._connection.execute(
             "SELECT authority_kind FROM cayu_task_session_execution_authority WHERE session_id = ?",
@@ -1198,28 +1199,28 @@ class SQLiteTaskStore(TaskStore):
                 task.session_id,
                 task.session_instance_id,
                 task.worker_id,
-                sqlite_support.format_optional_datetime(task.lease_expires_at),
+                sqlite_records.format_optional_datetime(task.lease_expires_at),
                 task.status_reason,
                 None
                 if task.status_payload is None
-                else sqlite_support.json_dumps(task.status_payload),
-                None if task.result is None else sqlite_support.json_dumps(task.result),
-                None if task.error is None else sqlite_support.json_dumps(task.error),
-                sqlite_support.format_datetime(task.updated_at),
-                sqlite_support.format_optional_datetime(task.started_at),
-                sqlite_support.format_optional_datetime(task.completed_at),
+                else sqlite_records.json_dumps(task.status_payload),
+                None if task.result is None else sqlite_records.json_dumps(task.result),
+                None if task.error is None else sqlite_records.json_dumps(task.error),
+                sqlite_records.format_datetime(task.updated_at),
+                sqlite_records.format_optional_datetime(task.started_at),
+                sqlite_records.format_optional_datetime(task.completed_at),
                 None
                 if task.retry_series is None
-                else sqlite_support.json_dumps(task.retry_series.model_dump(mode="json")),
+                else sqlite_records.json_dumps(task.retry_series.model_dump(mode="json")),
                 None
                 if task.work_contract is None
-                else sqlite_support.json_dumps(
+                else sqlite_records.json_dumps(
                     task.work_contract.model_dump(mode="json", warnings=False)
                 ),
-                sqlite_support.format_optional_datetime(task.available_at),
+                sqlite_records.format_optional_datetime(task.available_at),
                 None
                 if task.schedule is None
-                else sqlite_support.json_dumps(task.schedule.model_dump(mode="json")),
+                else sqlite_records.json_dumps(task.schedule.model_dump(mode="json")),
                 task.id,
             ),
         )
@@ -1250,7 +1251,7 @@ class SQLiteTaskStore(TaskStore):
                         contract.contract_id,
                         contract.version,
                         contract.fingerprint,
-                        sqlite_support.json_dumps(contract.model_dump(mode="json", warnings=False)),
+                        sqlite_records.json_dumps(contract.model_dump(mode="json", warnings=False)),
                     ),
                 )
                 return copy_work_contract(contract)
@@ -1288,7 +1289,7 @@ class SQLiteTaskStore(TaskStore):
                 raise TaskTopologyInconsistent(
                     "Contracted session authority has no matching durable task."
                 )
-            return sqlite_support.task_from_row(row)
+            return sqlite_records.task_from_row(row)
 
     async def admit_ordinary_session_execution(self, session_id: str) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -1655,8 +1656,8 @@ class SQLiteTaskStore(TaskStore):
                         admission.prepare_request_sha256,
                         admission.claim.claim_id,
                         admission.claim.generation,
-                        sqlite_support.format_datetime(admission.claim.lease_expires_at),
-                        sqlite_support.json_dumps(
+                        sqlite_records.format_datetime(admission.claim.lease_expires_at),
+                        sqlite_records.json_dumps(
                             admission.model_dump(mode="json", warnings=False)
                         ),
                     ),
@@ -1751,8 +1752,8 @@ class SQLiteTaskStore(TaskStore):
                         attempt.task_id,
                         attempt.ordinal,
                         attempt.request_sha256,
-                        sqlite_support.format_datetime(attempt.started_at),
-                        sqlite_support.json_dumps(attempt.model_dump(mode="json", warnings=False)),
+                        sqlite_records.format_datetime(attempt.started_at),
+                        sqlite_records.json_dumps(attempt.model_dump(mode="json", warnings=False)),
                     ),
                 )
                 self._update_work_attempt_admission_unlocked(activated)
@@ -1821,7 +1822,7 @@ class SQLiteTaskStore(TaskStore):
             or receipt.task.id != row["task_id"]
             or receipt.request_sha256 != row["request_sha256"]
             or int(receipt.retired_contract_binding) != row["retired_contract_binding"]
-            or receipt.settled_at != sqlite_support.parse_datetime(row["settled_at"])
+            or receipt.settled_at != sqlite_records.parse_datetime(row["settled_at"])
         ):
             raise WorkAttemptAdmissionConflict(
                 "Lifecycle receipt indexes conflict with canonical content."
@@ -2073,7 +2074,7 @@ class SQLiteTaskStore(TaskStore):
                         task.id,
                         request_sha256,
                         int(receipt.retired_contract_binding),
-                        sqlite_support.format_datetime(receipt.settled_at),
+                        sqlite_records.format_datetime(receipt.settled_at),
                         encoded,
                     ),
                 )
@@ -2143,8 +2144,8 @@ class SQLiteTaskStore(TaskStore):
                     "SET lease_expires_at = ?, claim_json = ? "
                     "WHERE claim_id = ? AND is_current = 1",
                     (
-                        sqlite_support.format_datetime(renewed_claim.lease_expires_at),
-                        sqlite_support.json_dumps(
+                        sqlite_records.format_datetime(renewed_claim.lease_expires_at),
+                        sqlite_records.json_dumps(
                             renewed_claim.model_dump(mode="json", warnings=False)
                         ),
                         renewed_claim.claim_id,
@@ -2461,8 +2462,8 @@ class SQLiteTaskStore(TaskStore):
                         attempt.task_id,
                         attempt.ordinal,
                         attempt.request_sha256,
-                        sqlite_support.format_datetime(attempt.started_at),
-                        sqlite_support.json_dumps(attempt.model_dump(mode="json", warnings=False)),
+                        sqlite_records.format_datetime(attempt.started_at),
+                        sqlite_records.json_dumps(attempt.model_dump(mode="json", warnings=False)),
                     ),
                 )
                 return attempt.model_copy(deep=True)
@@ -2534,8 +2535,8 @@ class SQLiteTaskStore(TaskStore):
                         proposal.attempt_id,
                         proposal.task_id,
                         proposal.request_sha256,
-                        sqlite_support.format_datetime(proposal.proposed_at),
-                        sqlite_support.json_dumps(proposal.model_dump(mode="json", warnings=False)),
+                        sqlite_records.format_datetime(proposal.proposed_at),
+                        sqlite_records.json_dumps(proposal.model_dump(mode="json", warnings=False)),
                     ),
                 )
                 return proposal.model_copy(deep=True)
@@ -2650,8 +2651,8 @@ class SQLiteTaskStore(TaskStore):
                         proposal.attempt_id,
                         proposal.task_id,
                         proposal.request_sha256,
-                        sqlite_support.format_datetime(proposal.proposed_at),
-                        sqlite_support.json_dumps(proposal.model_dump(mode="json", warnings=False)),
+                        sqlite_records.format_datetime(proposal.proposed_at),
+                        sqlite_records.json_dumps(proposal.model_dump(mode="json", warnings=False)),
                     ),
                 )
                 self._update_work_attempt_admission_unlocked(released)
@@ -2780,8 +2781,8 @@ class SQLiteTaskStore(TaskStore):
                         record.attempt_id,
                         record.profile.fingerprint,
                         record.request_sha256,
-                        sqlite_support.format_datetime(record.prepared_at),
-                        sqlite_support.json_dumps(record.model_dump(mode="json", warnings=False)),
+                        sqlite_records.format_datetime(record.prepared_at),
+                        sqlite_records.json_dumps(record.model_dump(mode="json", warnings=False)),
                     ),
                 )
                 return copy_completion_verifier_profile_record(record)
@@ -2916,8 +2917,8 @@ class SQLiteTaskStore(TaskStore):
                         claim.attempt_number,
                         claim.verifier_profile_fingerprint,
                         claim.request_sha256,
-                        sqlite_support.format_datetime(claim.lease_expires_at),
-                        sqlite_support.json_dumps(claim.model_dump(mode="json", warnings=False)),
+                        sqlite_records.format_datetime(claim.lease_expires_at),
+                        sqlite_records.json_dumps(claim.model_dump(mode="json", warnings=False)),
                     ),
                 )
                 return claim.model_copy(deep=True)
@@ -2985,8 +2986,8 @@ class SQLiteTaskStore(TaskStore):
                     "SET lease_expires_at = ?, claim_json = ? "
                     "WHERE claim_id = ? AND is_current = 1",
                     (
-                        sqlite_support.format_datetime(renewed.lease_expires_at),
-                        sqlite_support.json_dumps(renewed.model_dump(mode="json", warnings=False)),
+                        sqlite_records.format_datetime(renewed.lease_expires_at),
+                        sqlite_records.json_dumps(renewed.model_dump(mode="json", warnings=False)),
                         renewed.claim_id,
                     ),
                 )
@@ -3082,8 +3083,8 @@ class SQLiteTaskStore(TaskStore):
                         decision.verdict.value,
                         decision.gap_fingerprint,
                         decision.request_sha256,
-                        sqlite_support.format_datetime(decision.decided_at),
-                        sqlite_support.json_dumps(decision.model_dump(mode="json", warnings=False)),
+                        sqlite_records.format_datetime(decision.decided_at),
+                        sqlite_records.json_dumps(decision.model_dump(mode="json", warnings=False)),
                     ),
                 )
                 return decision.model_copy(deep=True)
@@ -3195,8 +3196,8 @@ class SQLiteTaskStore(TaskStore):
                         receipt.idempotency_key,
                         receipt.decision_id,
                         receipt.request_sha256,
-                        sqlite_support.format_datetime(receipt.applied_at),
-                        sqlite_support.json_dumps(receipt.model_dump(mode="json", warnings=False)),
+                        sqlite_records.format_datetime(receipt.applied_at),
+                        sqlite_records.json_dumps(receipt.model_dump(mode="json", warnings=False)),
                     ),
                 )
                 return updated.model_copy(deep=True)
@@ -3292,7 +3293,7 @@ class SQLiteTaskStore(TaskStore):
                 (
                     event.task_id,
                     event.sequence,
-                    sqlite_support.json_dumps(event.model_dump(mode="json")),
+                    sqlite_records.json_dumps(event.model_dump(mode="json")),
                 )
                 for event in events
             ],
@@ -3342,7 +3343,7 @@ class SQLiteTaskStore(TaskStore):
                     (
                         request.task_id,
                         request.operation_id,
-                        sqlite_support.json_dumps(receipt.model_dump(mode="json")),
+                        sqlite_records.json_dumps(receipt.model_dump(mode="json")),
                     ),
                 )
         self._publish_task_admission_broadcast()
@@ -3418,7 +3419,7 @@ class SQLiteTaskStore(TaskStore):
                         "UPDATE cayu_task_retry_settlements SET receipt_json = ? "
                         "WHERE task_id = ? AND idempotency_key = ?",
                         (
-                            sqlite_support.json_dumps(settled.model_dump(mode="json")),
+                            sqlite_records.json_dumps(settled.model_dump(mode="json")),
                             updated.id,
                             settlement_key,
                         ),
@@ -3440,7 +3441,7 @@ class SQLiteTaskStore(TaskStore):
                     (
                         updated.id,
                         request.operation_id,
-                        sqlite_support.json_dumps(receipt.model_dump(mode="json")),
+                        sqlite_records.json_dumps(receipt.model_dump(mode="json")),
                     ),
                 )
                 return receipt
@@ -3466,7 +3467,7 @@ class SQLiteTaskStore(TaskStore):
                         *clauses,
                     ]
                 )
-                stamp = sqlite_support.format_datetime(now)
+                stamp = sqlite_records.format_datetime(now)
                 due = self._connection.execute(
                     f"SELECT MIN(available_at) FROM cayu_tasks WHERE {scope} "
                     "AND status = 'pending' AND available_at > ? "
@@ -3492,8 +3493,8 @@ class SQLiteTaskStore(TaskStore):
                 ).fetchone()
                 return TaskScheduleWakeup(
                     as_of=now,
-                    next_available_at=sqlite_support.parse_optional_datetime(due),
-                    next_expiry_at=sqlite_support.parse_optional_datetime(expiry),
+                    next_available_at=sqlite_records.parse_optional_datetime(due),
+                    next_expiry_at=sqlite_records.parse_optional_datetime(expiry),
                     maintenance_required=bool(maintenance),
                 )
 
@@ -3570,7 +3571,7 @@ class SQLiteTaskStore(TaskStore):
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                sqlite_support.task_to_row_values(task),
+                sqlite_records.task_to_row_values(task),
             )
         except sqlite3.IntegrityError as exc:
             if self._task_exists_unlocked(task.id):
@@ -3714,7 +3715,7 @@ class SQLiteTaskStore(TaskStore):
                 else "work_contract_json IS NULL"
             )
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        order_sql = sqlite_support.task_order_sql(query.order_by)
+        order_sql = sqlite_records.task_order_sql(query.order_by)
         params.extend([query.limit, query.offset])
 
         async with self._lock:
@@ -3728,7 +3729,7 @@ class SQLiteTaskStore(TaskStore):
                 """,
                 params,
             ).fetchall()
-            return [sqlite_support.task_from_row(row) for row in rows]
+            return [sqlite_records.task_from_row(row) for row in rows]
 
     async def load_session_closure_claim(self, session_id: str) -> TaskSessionClosureClaim | None:
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -3904,13 +3905,13 @@ class SQLiteTaskStore(TaskStore):
                         scope_id=branch_id,
                     )
                     cursor_clause = "AND (created_at > ? OR (created_at = ? AND id > ?))"
-                    formatted = sqlite_support.format_datetime(cursor_created_at)
+                    formatted = sqlite_records.format_datetime(cursor_created_at)
                     cursor_params = [formatted, formatted, cursor_id]
                 branch_queries.append(
                     f"""
                     SELECT branch_order, candidate.*
                     FROM (
-                        SELECT ? AS branch_order, {sqlite_support.TASK_TOPOLOGY_COLUMNS}
+                        SELECT ? AS branch_order, {sqlite_records.TASK_TOPOLOGY_COLUMNS}
                         FROM cayu_tasks
                         WHERE {scope_column} = ?
                           {cursor_clause}
@@ -3936,7 +3937,7 @@ class SQLiteTaskStore(TaskStore):
             ).fetchall()
             for row in rows:
                 candidates[row["branch_order"]].append(
-                    sqlite_support.task_topology_node_from_row(row)
+                    sqlite_records.task_topology_node_from_row(row)
                 )
             return candidates
 
@@ -3948,21 +3949,21 @@ class SQLiteTaskStore(TaskStore):
                 ).fetchone()
                 if observed_row is None:
                     raise RuntimeError("SQLite did not return a topology snapshot timestamp.")
-                observed_at = sqlite_support.parse_datetime(observed_row[0])
+                observed_at = sqlite_records.parse_datetime(observed_row[0])
 
                 expanded_parents: list[TaskTopologyNode] = []
                 if query.expanded_parent_ids:
                     placeholders = ", ".join("?" for _ in query.expanded_parent_ids)
                     rows = self._connection.execute(
                         f"""
-                        SELECT {sqlite_support.TASK_TOPOLOGY_COLUMNS}
+                        SELECT {sqlite_records.TASK_TOPOLOGY_COLUMNS}
                         FROM cayu_tasks
                         WHERE id IN ({placeholders})
                         """,
                         query.expanded_parent_ids,
                     ).fetchall()
                     parents_by_id = {
-                        row["topology_id"]: sqlite_support.task_topology_node_from_row(row)
+                        row["topology_id"]: sqlite_records.task_topology_node_from_row(row)
                         for row in rows
                     }
                     for parent_id in query.expanded_parent_ids:
@@ -4057,7 +4058,7 @@ class SQLiteTaskStore(TaskStore):
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
         def query_snapshot(connection: sqlite3.Connection) -> TaskOperationalSnapshot:
-            snapshot_as_of = sqlite_support.format_datetime(self._clock())
+            snapshot_as_of = sqlite_records.format_datetime(self._clock())
             rows = connection.execute(
                 f"""
                 WITH
@@ -4127,7 +4128,7 @@ class SQLiteTaskStore(TaskStore):
                     status = TaskStatus(row["status"])
                     counts[status] = row["status_count"]
             return TaskOperationalSnapshot(
-                as_of=sqlite_support.parse_datetime(rows[0]["as_of"]),
+                as_of=sqlite_records.parse_datetime(rows[0]["as_of"]),
                 total_count=sum(counts.values()),
                 counts_by_status=TaskStatusCounts.model_validate(counts),
                 claimable_pending_count=rows[0]["claimable_pending_count"],
@@ -4417,22 +4418,22 @@ class SQLiteTaskStore(TaskStore):
                         (
                             None
                             if request.result is None
-                            else sqlite_support.json_dumps(request.result)
+                            else sqlite_records.json_dumps(request.result)
                         ),
                         (
                             None
                             if request.error is None
-                            else sqlite_support.json_dumps(request.error)
+                            else sqlite_records.json_dumps(request.error)
                         ),
-                        sqlite_support.format_datetime(now),
-                        sqlite_support.format_datetime(now),
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.format_datetime(now),
+                        sqlite_records.format_datetime(now),
+                        sqlite_records.format_datetime(now),
                         request.task_id,
                         str(TaskStatus.CLAIMED),
                         str(TaskStatus.RUNNING),
                         request.worker_id,
                         request.handoff_id,
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.format_datetime(now),
                     ),
                 )
                 if cursor.rowcount != 1:
@@ -4454,8 +4455,8 @@ class SQLiteTaskStore(TaskStore):
                         request_sha256,
                         request.worker_id,
                         request.kind.value,
-                        sqlite_support.json_dumps(terminal_task.model_dump(mode="json")),
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.json_dumps(terminal_task.model_dump(mode="json")),
+                        sqlite_records.format_datetime(now),
                     ),
                 )
                 self._connection.commit()
@@ -4566,8 +4567,8 @@ class SQLiteTaskStore(TaskStore):
                         request_sha256,
                         request.worker_id,
                         request.kind.value,
-                        sqlite_support.json_dumps(terminal_task.model_dump(mode="json")),
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.json_dumps(terminal_task.model_dump(mode="json")),
+                        sqlite_records.format_datetime(now),
                     ),
                 )
                 self._connection.commit()
@@ -4652,14 +4653,14 @@ class SQLiteTaskStore(TaskStore):
                     """,
                     (
                         request.handoff_id,
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.format_datetime(now),
                         request.task_id,
                         str(TaskStatus.RUNNING),
                         request.session_id,
                         request.session_instance_id,
                         request.worker_id,
-                        sqlite_support.format_datetime(request.lease_expires_at),
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.format_datetime(request.lease_expires_at),
+                        sqlite_records.format_datetime(now),
                     ),
                 )
                 if cursor.rowcount != 1:
@@ -4681,9 +4682,9 @@ class SQLiteTaskStore(TaskStore):
                         request.task_id,
                         request.handoff_id,
                         request_sha256,
-                        sqlite_support.json_dumps(request.model_dump(mode="json")),
-                        sqlite_support.json_dumps(released.model_dump(mode="json")),
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.json_dumps(request.model_dump(mode="json")),
+                        sqlite_records.json_dumps(released.model_dump(mode="json")),
+                        sqlite_records.format_datetime(now),
                     ),
                 )
                 self._connection.commit()
@@ -4731,7 +4732,7 @@ class SQLiteTaskStore(TaskStore):
         after_clause = ""
         after_params: tuple[str, ...] = ()
         if after is not None:
-            after_timestamp = sqlite_support.format_datetime(after[0])
+            after_timestamp = sqlite_records.format_datetime(after[0])
             after_clause = "AND (lease_expires_at > ? OR (lease_expires_at = ? AND id > ?)) "
             after_params = (after_timestamp, after_timestamp, after[1])
         async with self._lock:
@@ -4748,12 +4749,12 @@ class SQLiteTaskStore(TaskStore):
                 "ORDER BY lease_expires_at ASC, id ASC LIMIT ?",
                 (
                     str(TaskStatus.RUNNING),
-                    sqlite_support.format_datetime(self._ownership_clock()),
+                    sqlite_records.format_datetime(self._ownership_clock()),
                     *after_params,
                     limit,
                 ),
             ).fetchall()
-            return [sqlite_support.task_from_row(row) for row in rows]
+            return [sqlite_records.task_from_row(row) for row in rows]
 
     async def load_expired_interrupted_task_handoff_candidate(
         self,
@@ -4773,10 +4774,10 @@ class SQLiteTaskStore(TaskStore):
                 (
                     task_id,
                     str(TaskStatus.RUNNING),
-                    sqlite_support.format_datetime(self._ownership_clock()),
+                    sqlite_records.format_datetime(self._ownership_clock()),
                 ),
             ).fetchone()
-            return None if row is None else sqlite_support.task_from_row(row)
+            return None if row is None else sqlite_records.task_from_row(row)
 
     async def claim_interrupted_task_continuation(
         self,
@@ -4818,7 +4819,7 @@ class SQLiteTaskStore(TaskStore):
                         (prior_claim_row["task_id"],),
                     ).fetchone()
                     existing = (
-                        None if existing_row is None else sqlite_support.task_from_row(existing_row)
+                        None if existing_row is None else sqlite_records.task_from_row(existing_row)
                     )
                     if (
                         prior_claim_row["worker_id"] != worker_id
@@ -4865,7 +4866,7 @@ class SQLiteTaskStore(TaskStore):
                     self._connection.commit()
                     return result
                 cursor = (
-                    None if after is None else (sqlite_support.format_datetime(after[0]), after[1])
+                    None if after is None else (sqlite_records.format_datetime(after[0]), after[1])
                 )
                 after_sql = ""
                 after_params: tuple[str, ...] = ()
@@ -4894,7 +4895,7 @@ class SQLiteTaskStore(TaskStore):
                 filtered = 0
                 last_observed: Task | None = None
                 for index, row in enumerate(rows):
-                    observed = sqlite_support.task_from_row(row)
+                    observed = sqlite_records.task_from_row(row)
                     last_observed = observed
                     if not _task_matches_claim_filter(observed, query):
                         filtered += 1
@@ -4940,7 +4941,7 @@ class SQLiteTaskStore(TaskStore):
                             handoff_id_sha256,
                             observed.id,
                             worker_id,
-                            sqlite_support.format_datetime(now),
+                            sqlite_records.format_datetime(now),
                         ),
                     )
                     update_cursor = self._connection.execute(
@@ -4950,9 +4951,9 @@ class SQLiteTaskStore(TaskStore):
                         "AND lease_expires_at IS NULL AND interrupted_handoff_id = ?",
                         (
                             worker_id,
-                            sqlite_support.format_datetime(lease_expires_at),
+                            sqlite_records.format_datetime(lease_expires_at),
                             handoff_id,
-                            sqlite_support.format_datetime(now),
+                            sqlite_records.format_datetime(now),
                             observed.id,
                             str(TaskStatus.RUNNING),
                             observed.interrupted_handoff_id,
@@ -5069,8 +5070,8 @@ class SQLiteTaskStore(TaskStore):
                             rejection.task_id,
                             rejection.reconciliation_idempotency_key,
                             rejection.request_sha256,
-                            sqlite_support.json_dumps(rejection.model_dump(mode="json")),
-                            sqlite_support.format_datetime(rejection.recorded_at),
+                            sqlite_records.json_dumps(rejection.model_dump(mode="json")),
+                            sqlite_records.format_datetime(rejection.recorded_at),
                         ),
                     )
                     self._connection.commit()
@@ -5096,18 +5097,18 @@ class SQLiteTaskStore(TaskStore):
                     """,
                     (
                         str(settled.status),
-                        sqlite_support.json_dumps(settled.status_payload),
-                        sqlite_support.json_dumps(settled.error),
-                        sqlite_support.format_optional_datetime(settled.started_at),
-                        sqlite_support.format_optional_datetime(settled.completed_at),
-                        sqlite_support.format_datetime(settled.updated_at),
+                        sqlite_records.json_dumps(settled.status_payload),
+                        sqlite_records.json_dumps(settled.error),
+                        sqlite_records.format_optional_datetime(settled.started_at),
+                        sqlite_records.format_optional_datetime(settled.completed_at),
+                        sqlite_records.format_datetime(settled.updated_at),
                         request.task_id,
                         str(TaskStatus.CLAIMED),
                         str(TaskStatus.RUNNING),
                         request.expected_status_reason,
                         request.original_worker_id,
-                        sqlite_support.format_datetime(request.original_lease_expires_at),
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.format_datetime(request.original_lease_expires_at),
+                        sqlite_records.format_datetime(now),
                     ),
                 )
                 if cursor.rowcount != 1:
@@ -5144,8 +5145,8 @@ class SQLiteTaskStore(TaskStore):
                         receipt.request_sha256,
                         receipt.worker_id,
                         receipt.kind.value,
-                        sqlite_support.json_dumps(receipt.task.model_dump(mode="json")),
-                        sqlite_support.format_datetime(receipt.committed_at),
+                        sqlite_records.json_dumps(receipt.task.model_dump(mode="json")),
+                        sqlite_records.format_datetime(receipt.committed_at),
                     ),
                 )
                 self._connection.commit()
@@ -5212,26 +5213,26 @@ class SQLiteTaskStore(TaskStore):
                     (
                         str(settled.status),
                         settled.status_reason,
-                        sqlite_support.json_dumps(settled.status_payload),
+                        sqlite_records.json_dumps(settled.status_payload),
                         (
                             None
                             if settled.result is None
-                            else sqlite_support.json_dumps(settled.result)
+                            else sqlite_records.json_dumps(settled.result)
                         ),
                         (
                             None
                             if settled.error is None
-                            else sqlite_support.json_dumps(settled.error)
+                            else sqlite_records.json_dumps(settled.error)
                         ),
-                        sqlite_support.format_optional_datetime(settled.started_at),
-                        sqlite_support.format_optional_datetime(settled.completed_at),
-                        sqlite_support.format_datetime(settled.updated_at),
-                        sqlite_support.json_dumps(settled.retry_series.model_dump(mode="json")),
+                        sqlite_records.format_optional_datetime(settled.started_at),
+                        sqlite_records.format_optional_datetime(settled.completed_at),
+                        sqlite_records.format_datetime(settled.updated_at),
+                        sqlite_records.json_dumps(settled.retry_series.model_dump(mode="json")),
                         request.task_id,
                         str(TaskStatus.CLAIMED),
                         str(TaskStatus.RUNNING),
                         request.worker_id,
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.format_datetime(now),
                     ),
                 )
                 if cursor.rowcount != 1:
@@ -5253,7 +5254,7 @@ class SQLiteTaskStore(TaskStore):
                             work_contract_json, schedule_json
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                        sqlite_support.task_to_row_values(successor),
+                        sqlite_records.task_to_row_values(successor),
                     )
                 receipt = TaskRetrySettlementResult(
                     task_id=request.task_id,
@@ -5281,8 +5282,8 @@ class SQLiteTaskStore(TaskStore):
                         request.task_id,
                         request.idempotency_key,
                         request_sha256,
-                        sqlite_support.json_dumps(receipt.model_dump(mode="json")),
-                        sqlite_support.format_datetime(receipt.committed_at),
+                        sqlite_records.json_dumps(receipt.model_dump(mode="json")),
+                        sqlite_records.format_datetime(receipt.committed_at),
                     ),
                 )
                 self._connection.commit()
@@ -5387,8 +5388,8 @@ class SQLiteTaskStore(TaskStore):
                             rejection.task_id,
                             rejection.reconciliation_idempotency_key,
                             rejection.request_sha256,
-                            sqlite_support.json_dumps(rejection.model_dump(mode="json")),
-                            sqlite_support.format_datetime(rejection.recorded_at),
+                            sqlite_records.json_dumps(rejection.model_dump(mode="json")),
+                            sqlite_records.format_datetime(rejection.recorded_at),
                         ),
                     )
                     self._connection.commit()
@@ -5415,19 +5416,19 @@ class SQLiteTaskStore(TaskStore):
                     (
                         str(settled.status),
                         settled.status_reason,
-                        sqlite_support.json_dumps(settled.status_payload),
-                        sqlite_support.json_dumps(settled.error),
-                        sqlite_support.format_optional_datetime(settled.started_at),
-                        sqlite_support.format_optional_datetime(settled.completed_at),
-                        sqlite_support.format_datetime(settled.updated_at),
-                        sqlite_support.json_dumps(settled.retry_series.model_dump(mode="json")),
+                        sqlite_records.json_dumps(settled.status_payload),
+                        sqlite_records.json_dumps(settled.error),
+                        sqlite_records.format_optional_datetime(settled.started_at),
+                        sqlite_records.format_optional_datetime(settled.completed_at),
+                        sqlite_records.format_datetime(settled.updated_at),
+                        sqlite_records.json_dumps(settled.retry_series.model_dump(mode="json")),
                         request.task_id,
                         str(TaskStatus.CLAIMED),
                         str(TaskStatus.RUNNING),
                         request.expected_status_reason,
                         request.original_worker_id,
-                        sqlite_support.format_datetime(request.original_lease_expires_at),
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.format_datetime(request.original_lease_expires_at),
+                        sqlite_records.format_datetime(now),
                     ),
                 )
                 if cursor.rowcount != 1:
@@ -5450,8 +5451,8 @@ class SQLiteTaskStore(TaskStore):
                         request.task_id,
                         request.cancellation_idempotency_key,
                         request_sha256,
-                        sqlite_support.json_dumps(receipt.model_dump(mode="json")),
-                        sqlite_support.format_datetime(receipt.committed_at),
+                        sqlite_records.json_dumps(receipt.model_dump(mode="json")),
+                        sqlite_records.format_datetime(receipt.committed_at),
                     ),
                 )
                 self._connection.commit()
@@ -5511,18 +5512,18 @@ class SQLiteTaskStore(TaskStore):
                     (
                         str(settled.status),
                         settled.status_reason,
-                        sqlite_support.json_dumps(settled.status_payload),
-                        sqlite_support.json_dumps(settled.error),
-                        sqlite_support.format_optional_datetime(settled.started_at),
-                        sqlite_support.format_optional_datetime(settled.completed_at),
-                        sqlite_support.format_datetime(settled.updated_at),
-                        sqlite_support.json_dumps(settled.retry_series.model_dump(mode="json")),
+                        sqlite_records.json_dumps(settled.status_payload),
+                        sqlite_records.json_dumps(settled.error),
+                        sqlite_records.format_optional_datetime(settled.started_at),
+                        sqlite_records.format_optional_datetime(settled.completed_at),
+                        sqlite_records.format_datetime(settled.updated_at),
+                        sqlite_records.json_dumps(settled.retry_series.model_dump(mode="json")),
                         task_id,
                         str(TaskStatus.CLAIMED),
                         str(TaskStatus.RUNNING),
                         worker_id,
-                        sqlite_support.format_datetime(expected_lease),
-                        sqlite_support.format_datetime(lease_now),
+                        sqlite_records.format_datetime(expected_lease),
+                        sqlite_records.format_datetime(lease_now),
                     ),
                 )
                 if cursor.rowcount != 1:
@@ -5536,8 +5537,8 @@ class SQLiteTaskStore(TaskStore):
                         receipt.task_id,
                         receipt.idempotency_key,
                         receipt.request_sha256,
-                        sqlite_support.json_dumps(receipt.model_dump(mode="json")),
-                        sqlite_support.format_datetime(receipt.committed_at),
+                        sqlite_records.json_dumps(receipt.model_dump(mode="json")),
+                        sqlite_records.format_datetime(receipt.committed_at),
                     ),
                 )
                 self._connection.commit()
@@ -5754,7 +5755,7 @@ class SQLiteTaskStore(TaskStore):
                     """,
                     (
                         str(TaskStatus.PENDING),
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.format_datetime(now),
                         task_id,
                         str(TaskStatus.PAUSED),
                         str(TaskStatus.BLOCKED),
@@ -5825,7 +5826,7 @@ class SQLiteTaskStore(TaskStore):
         )
         # Claiming is always FIFO by creation time, independent of the query's
         # display ordering, so the oldest pending task is dispatched first.
-        order_sql = sqlite_support.task_order_sql(TaskOrder.CREATED_AT_ASC)
+        order_sql = sqlite_records.task_order_sql(TaskOrder.CREATED_AT_ASC)
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
@@ -5859,7 +5860,7 @@ class SQLiteTaskStore(TaskStore):
                     (
                         str(TaskStatus.PENDING),
                         str(TaskRetrySeriesDisposition.ACTIVE),
-                        sqlite_support.format_datetime(availability_now),
+                        sqlite_records.format_datetime(availability_now),
                     ),
                 ).fetchall()
                 for expired_row in expired_rows:
@@ -5882,12 +5883,12 @@ class SQLiteTaskStore(TaskStore):
                         (
                             str(expiration.task.status),
                             expiration.task.status_reason,
-                            sqlite_support.json_dumps(expiration.task.status_payload),
-                            sqlite_support.json_dumps(expiration.task.error),
-                            sqlite_support.format_optional_datetime(expiration.task.started_at),
-                            sqlite_support.format_optional_datetime(expiration.task.completed_at),
-                            sqlite_support.format_datetime(expiration.task.updated_at),
-                            sqlite_support.json_dumps(
+                            sqlite_records.json_dumps(expiration.task.status_payload),
+                            sqlite_records.json_dumps(expiration.task.error),
+                            sqlite_records.format_optional_datetime(expiration.task.started_at),
+                            sqlite_records.format_optional_datetime(expiration.task.completed_at),
+                            sqlite_records.format_datetime(expiration.task.updated_at),
+                            sqlite_records.json_dumps(
                                 expiration.task.retry_series.model_dump(mode="json")
                             ),
                             expiration.task_id,
@@ -5906,8 +5907,8 @@ class SQLiteTaskStore(TaskStore):
                             expiration.task_id,
                             expiration.idempotency_key,
                             expiration.request_sha256,
-                            sqlite_support.json_dumps(expiration.model_dump(mode="json")),
-                            sqlite_support.format_datetime(expiration.committed_at),
+                            sqlite_records.json_dumps(expiration.model_dump(mode="json")),
+                            sqlite_records.format_datetime(expiration.committed_at),
                         ),
                     )
                     self._record_task_transition_unlocked(expired_task, expiration.task)
@@ -5921,9 +5922,9 @@ class SQLiteTaskStore(TaskStore):
                     """,
                     [
                         str(TaskStatus.PENDING),
-                        sqlite_support.format_datetime(availability_now),
+                        sqlite_records.format_datetime(availability_now),
                         *(
-                            [sqlite_support.format_datetime(availability_now)]
+                            [sqlite_records.format_datetime(availability_now)]
                             if retry_worker_id_is_bounded
                             else []
                         ),
@@ -5967,8 +5968,8 @@ class SQLiteTaskStore(TaskStore):
                     (
                         str(TaskStatus.CLAIMED),
                         worker_id,
-                        sqlite_support.format_datetime(lease_expires_at),
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.format_datetime(lease_expires_at),
+                        sqlite_records.format_datetime(now),
                         task_id,
                         str(TaskStatus.PENDING),
                     ),
@@ -6001,8 +6002,8 @@ class SQLiteTaskStore(TaskStore):
                     settlement.task_id,
                     settlement.idempotency_key,
                     settlement.request_sha256,
-                    sqlite_support.json_dumps(settlement.model_dump(mode="json")),
-                    sqlite_support.format_datetime(settlement.committed_at),
+                    sqlite_records.json_dumps(settlement.model_dump(mode="json")),
+                    sqlite_records.format_datetime(settlement.committed_at),
                 ),
             )
 
@@ -6011,7 +6012,7 @@ class SQLiteTaskStore(TaskStore):
     ) -> None:
         clauses, params = self._task_filter_clauses(query.model_copy(update={"status": None}))
         scope = " AND ".join(["session_id IS NULL", *clauses])
-        stamp = sqlite_support.format_datetime(as_of)
+        stamp = sqlite_records.format_datetime(as_of)
         rows = self._connection.execute(
             f"SELECT id FROM cayu_tasks WHERE {scope} "
             "AND status IN ('paused', 'blocked', 'needs_attention', 'waiting_dependencies', 'waiting_group') "
@@ -6090,15 +6091,15 @@ class SQLiteTaskStore(TaskStore):
                       )
                     """,
                     (
-                        sqlite_support.format_datetime(lease_expires_at),
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.format_datetime(lease_expires_at),
+                        sqlite_records.format_datetime(now),
                         task_id,
                         worker_id,
                         handoff_id,
                         str(TaskStatus.CLAIMED),
                         str(TaskStatus.RUNNING),
-                        sqlite_support.format_datetime(expected_lease),
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.format_datetime(expected_lease),
+                        sqlite_records.format_datetime(now),
                         task_id,
                     ),
                 )
@@ -6157,14 +6158,14 @@ class SQLiteTaskStore(TaskStore):
                     """,
                     (
                         str(TaskStatus.PENDING),
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.format_datetime(now),
                         task_id,
                         worker_id,
                         str(TaskStatus.CLAIMED),
                         _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
                         _TASK_CANCELLATION_REQUESTED_REASON,
-                        sqlite_support.format_datetime(expected_lease),
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.format_datetime(expected_lease),
+                        sqlite_records.format_datetime(now),
                         task_id,
                     ),
                 )
@@ -6227,13 +6228,13 @@ class SQLiteTaskStore(TaskStore):
                       )
                     """,
                     (
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.format_datetime(now),
                         task_id,
                         worker_id,
                         str(TaskStatus.RUNNING),
                         _TASK_CANCELLATION_REQUESTED_REASON,
-                        sqlite_support.format_datetime(expected_lease),
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.format_datetime(expected_lease),
+                        sqlite_records.format_datetime(now),
                         task_id,
                     ),
                 )
@@ -6292,7 +6293,7 @@ class SQLiteTaskStore(TaskStore):
                     """,
                     [
                         str(TaskStatus.CLAIMED),
-                        sqlite_support.format_datetime(now),
+                        sqlite_records.format_datetime(now),
                         _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
                         _TASK_CANCELLATION_REQUESTED_REASON,
                         *params,
@@ -6349,7 +6350,7 @@ class SQLiteTaskStore(TaskStore):
         ).fetchone()
         if row is None:
             return None
-        return sqlite_support.task_from_row(row)
+        return sqlite_records.task_from_row(row)
 
     def _task_parent_for_create_unlocked(
         self,
@@ -6466,7 +6467,7 @@ class SQLiteTaskStore(TaskStore):
             )
             cancellation_owner_params = [
                 worker_id,
-                sqlite_support.format_datetime(expected_lease_expires_at),
+                sqlite_records.format_datetime(expected_lease_expires_at),
                 handoff_id,
             ]
         if (
@@ -6505,8 +6506,8 @@ class SQLiteTaskStore(TaskStore):
                     """,
                     (
                         cancellation_requested.status_reason,
-                        sqlite_support.json_dumps(cancellation_requested.status_payload),
-                        sqlite_support.format_datetime(cancellation_requested.updated_at),
+                        sqlite_records.json_dumps(cancellation_requested.status_payload),
+                        sqlite_records.format_datetime(cancellation_requested.updated_at),
                         task_id,
                         str(TaskStatus.CLAIMED),
                         str(TaskStatus.RUNNING),
@@ -6553,8 +6554,8 @@ class SQLiteTaskStore(TaskStore):
                 """,
                 (
                     cancellation_requested.status_reason,
-                    sqlite_support.json_dumps(cancellation_requested.status_payload),
-                    sqlite_support.format_datetime(cancellation_requested.updated_at),
+                    sqlite_records.json_dumps(cancellation_requested.status_payload),
+                    sqlite_records.format_datetime(cancellation_requested.updated_at),
                     task_id,
                     str(TaskStatus.CLAIMED),
                     str(TaskStatus.RUNNING),
@@ -6597,7 +6598,7 @@ class SQLiteTaskStore(TaskStore):
                 "\n                  AND lease_expires_at IS NOT NULL AND lease_expires_at > ?"
                 "\n                  AND interrupted_handoff_id IS ?"
             )
-            owner_params = [worker_id, sqlite_support.format_datetime(now), handoff_id]
+            owner_params = [worker_id, sqlite_records.format_datetime(now), handoff_id]
         cursor = self._connection.execute(
             f"""
             UPDATE cayu_tasks
@@ -6626,25 +6627,25 @@ class SQLiteTaskStore(TaskStore):
                 (
                     None
                     if terminal_task.status_payload is None
-                    else sqlite_support.json_dumps(terminal_task.status_payload)
+                    else sqlite_records.json_dumps(terminal_task.status_payload)
                 ),
                 (
                     None
                     if terminal_task.result is None
-                    else sqlite_support.json_dumps(terminal_task.result)
+                    else sqlite_records.json_dumps(terminal_task.result)
                 ),
                 (
                     None
                     if terminal_task.error is None
-                    else sqlite_support.json_dumps(terminal_task.error)
+                    else sqlite_records.json_dumps(terminal_task.error)
                 ),
-                sqlite_support.format_optional_datetime(terminal_task.started_at),
-                sqlite_support.format_optional_datetime(terminal_task.completed_at),
-                sqlite_support.format_datetime(terminal_task.updated_at),
+                sqlite_records.format_optional_datetime(terminal_task.started_at),
+                sqlite_records.format_optional_datetime(terminal_task.completed_at),
+                sqlite_records.format_datetime(terminal_task.updated_at),
                 (
                     None
                     if terminal_task.retry_series is None
-                    else sqlite_support.json_dumps(
+                    else sqlite_records.json_dumps(
                         terminal_task.retry_series.model_dump(mode="json")
                     )
                 ),
@@ -6665,8 +6666,8 @@ class SQLiteTaskStore(TaskStore):
                     cancellation.task_id,
                     cancellation.idempotency_key,
                     cancellation.request_sha256,
-                    sqlite_support.json_dumps(cancellation.model_dump(mode="json")),
-                    sqlite_support.format_datetime(cancellation.committed_at),
+                    sqlite_records.json_dumps(cancellation.model_dump(mode="json")),
+                    sqlite_records.format_datetime(cancellation.committed_at),
                 ),
             )
         if cursor.rowcount != 1:
@@ -6739,8 +6740,8 @@ class SQLiteTaskStore(TaskStore):
                     (
                         str(status),
                         reason,
-                        None if payload is None else sqlite_support.json_dumps(payload),
-                        sqlite_support.format_datetime(now),
+                        None if payload is None else sqlite_records.json_dumps(payload),
+                        sqlite_records.format_datetime(now),
                         task_id,
                         str(TaskStatus.PENDING),
                         str(TaskStatus.CLAIMED),
@@ -6876,7 +6877,7 @@ def _sqlite_task_terminalization_receipt(
             kind=row["terminal_kind"],
             request_sha256=row["request_sha256"],
             task=Task.model_validate(json.loads(row["task_json"])),
-            committed_at=sqlite_support.parse_datetime(row["committed_at"]),
+            committed_at=sqlite_records.parse_datetime(row["committed_at"]),
         )
     except Exception as exc:
         raise TaskTerminalizationConflict("Task terminalization receipt is malformed.") from exc
@@ -6893,7 +6894,7 @@ def _sqlite_interrupted_task_handoff_receipt(
             request=TaskInterruptedHandoffRequest.model_validate(json.loads(row["request_json"])),
             request_sha256=row["request_sha256"],
             task=Task.model_validate(json.loads(row["task_json"])),
-            committed_at=sqlite_support.parse_datetime(row["committed_at"]),
+            committed_at=sqlite_records.parse_datetime(row["committed_at"]),
         )
         if receipt.request.task_id != task_id or receipt.request.handoff_id != handoff_id:
             raise ValueError("Interrupted-task handoff receipt conflicts with its storage key.")

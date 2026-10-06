@@ -63,7 +63,7 @@ async def memory_terminalize(
 async def sqlite_terminalize(
     store: SQLiteSessionStore, request: ZeroWorkInterruptionRequest
 ) -> ZeroWorkInterruptionPublication | None:
-    from cayu.storage import _sqlite_support as support
+    from cayu.storage import _sqlite_records as sqlite_records
     from cayu.storage.sqlite import _append_events_in_transaction, _event_from_row
 
     sid = request.session.id
@@ -122,19 +122,24 @@ async def sqlite_terminalize(
                 (
                     str(publication.session.status),
                     publication.session.run_epoch,
-                    support.format_datetime(now),
-                    support.format_datetime(now),
+                    sqlite_records.format_datetime(now),
+                    sqlite_records.format_datetime(now),
                     sid,
                 ),
             )
             conn.execute(
                 "INSERT INTO cayu_checkpoints (session_id, state_json, updated_at, pending_action_source_bytes, pending_action_tool_call_count, pending_action_flags, pending_action_metrics_ready) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET state_json = excluded.state_json, updated_at = excluded.updated_at, pending_action_source_bytes = excluded.pending_action_source_bytes, pending_action_tool_call_count = excluded.pending_action_tool_call_count, pending_action_flags = excluded.pending_action_flags, pending_action_metrics_ready = excluded.pending_action_metrics_ready",
-                support.checkpoint_row_values(sid, publication.checkpoint, now),
+                sqlite_records.checkpoint_row_values(sid, publication.checkpoint, now),
             )
             conn.executemany(
                 "INSERT INTO cayu_session_operations (session_id, idempotency_key, record_json, updated_at) VALUES (?, ?, ?, ?)",
                 [
-                    (sid, key, support.json_dumps(record), support.format_datetime(now))
+                    (
+                        sid,
+                        key,
+                        sqlite_records.json_dumps(record),
+                        sqlite_records.format_datetime(now),
+                    )
                     for key, record in publication.operations.items()
                 ],
             )

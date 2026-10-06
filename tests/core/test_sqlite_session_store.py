@@ -48,6 +48,7 @@ from cayu.sessions.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
 from cayu.storage import _session_store_sql as session_store_sql
+from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
 from cayu.storage import sqlite as sqlite_storage
@@ -1954,7 +1955,7 @@ def test_sqlite_revision_62_migrates_deferred_interaction_payload(tmp_path) -> N
     try:
         connection.execute(
             "UPDATE cayu_deferred_interaction_inputs SET source_messages_json = ?",
-            (sqlite_support.json_dumps([source.model_dump(mode="json")]),),
+            (sqlite_records.json_dumps([source.model_dump(mode="json")]),),
         )
         connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 62")
         connection.execute("PRAGMA user_version = 61")
@@ -1999,7 +2000,7 @@ def test_sqlite_revision_62_migrates_deferred_interaction_payload(tmp_path) -> N
     try:
         connection.execute(
             "UPDATE cayu_deferred_interaction_inputs SET source_messages_json = ?",
-            (sqlite_support.json_dumps(payload),),
+            (sqlite_records.json_dumps(payload),),
         )
         connection.commit()
     finally:

@@ -229,6 +229,7 @@ from cayu.knowledge.search import (
     copy_knowledge_list_query,
     copy_knowledge_query,
 )
+from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 from cayu.storage._knowledge_closure import (
@@ -673,7 +674,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     "WHERE proposal.replacement_entry_id = e.id"
                     ") "
                     f"{access_sql} ORDER BY e.id COLLATE BINARY",
-                    [sqlite_support.format_datetime(cutoff), *access_params],
+                    [sqlite_records.format_datetime(cutoff), *access_params],
                 ).fetchall()
                 expired_ids = [str(row["id"]) for row in rows]
                 if not expired_ids:
@@ -1263,7 +1264,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                         " AND (relation.created_at > ? OR "
                         "(relation.created_at = ? AND relation.id COLLATE BINARY > ?))"
                     )
-                    created_at = sqlite_support.format_datetime(cursor.created_at)
+                    created_at = sqlite_records.format_datetime(cursor.created_at)
                     cursor_params.extend([created_at, created_at, cursor.relation_id])
                 rows = self._connection.execute(
                     f"""
@@ -1379,7 +1380,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                         " AND (relation.created_at > ? OR "
                         "(relation.created_at = ? AND relation.id COLLATE BINARY > ?))"
                     )
-                    created_at = sqlite_support.format_datetime(cursor.created_at)
+                    created_at = sqlite_records.format_datetime(cursor.created_at)
                     cursor_params.extend([created_at, created_at, cursor.relation_id])
                 frontier_sql = ""
                 frontier_params: list[object] = []
@@ -1490,7 +1491,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     entry_id=str(row["object_entry_id"]),
                     revision=int(row["object_revision"]),
                 ),
-                created_at=sqlite_support.parse_datetime(str(row["created_at"])),
+                created_at=sqlite_records.parse_datetime(str(row["created_at"])),
                 reference=query.reference,
                 subject_current=KnowledgeRevisionRef(
                     entry_id=str(row["subject_entry_id"]),
@@ -1861,7 +1862,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                         receipt.proposal_id,
                         receipt.proposal_fingerprint,
                         copied.request.fingerprint,
-                        sqlite_support.format_datetime(receipt.committed_at),
+                        sqlite_records.format_datetime(receipt.committed_at),
                         receipt.model_dump_json(warnings=False),
                         _knowledge_maintenance_access_snapshot_json(snapshot),
                     ),
@@ -1968,7 +1969,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                             receipt.operation_id,
                             receipt.invocation_sha256,
                             receipt.request_sha256,
-                            sqlite_support.format_datetime(receipt.committed_at),
+                            sqlite_records.format_datetime(receipt.committed_at),
                             receipt.model_dump_json(warnings=False),
                             scope.model_dump_json(warnings=False),
                         ),
@@ -2822,7 +2823,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                         update.failure_code,
                         operation_id,
                         update_sha256,
-                        sqlite_support.format_datetime(published_at),
+                        sqlite_records.format_datetime(published_at),
                     ),
                 )
                 if cursor.lastrowid is None:  # pragma: no cover - sqlite invariant
@@ -3674,8 +3675,8 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 entry.id,
                 entry.namespace,
                 entry.revision,
-                sqlite_support.format_datetime(entry.created_at),
-                sqlite_support.format_datetime(entry.updated_at),
+                sqlite_records.format_datetime(entry.created_at),
+                sqlite_records.format_datetime(entry.updated_at),
             ),
         )
         self._insert_revision_unlocked(entry)
@@ -3755,7 +3756,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             """,
             (
                 entry.revision,
-                sqlite_support.format_datetime(entry.updated_at),
+                sqlite_records.format_datetime(entry.updated_at),
                 entry.id,
                 expected_revision,
             ),
@@ -4098,7 +4099,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     raise RuntimeError("SQLite knowledge outbox baseline is missing.")
                 before_requires_include_expired = (
                     before_entry.expires_at
-                    <= sqlite_support.parse_datetime(baseline_row["applied_at"])
+                    <= sqlite_records.parse_datetime(baseline_row["applied_at"])
                 )
         cursor = self._connection.execute(
             """
@@ -4117,7 +4118,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 kind.value,
                 entry.id,
                 entry.revision,
-                sqlite_support.format_datetime(committed_at),
+                sqlite_records.format_datetime(committed_at),
                 operation_id,
             ),
         )
@@ -4232,7 +4233,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 KnowledgeChangeKind.RELATION_PUBLISHED.value,
                 relation.subject.entry_id,
                 relation.subject.revision,
-                sqlite_support.format_datetime(committed_at),
+                sqlite_records.format_datetime(committed_at),
                 operation_id,
                 relation.id,
             ),
@@ -4338,7 +4339,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 operation_id=row["operation_id"],
                 relation_ids=relation_ids,
                 request_sha256=row["request_sha256"],
-                committed_at=sqlite_support.parse_datetime(row["committed_at"]),
+                committed_at=sqlite_records.parse_datetime(row["committed_at"]),
             )
             if type(raw_snapshots) is not list or len(raw_snapshots) != len(receipt.relation_ids):
                 raise ValueError("Relation receipt access snapshots are malformed.")
@@ -4383,7 +4384,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 receipt.operation_id,
                 json.dumps(receipt.relation_ids, ensure_ascii=False, separators=(",", ":")),
                 receipt.request_sha256,
-                sqlite_support.format_datetime(receipt.committed_at),
+                sqlite_records.format_datetime(receipt.committed_at),
                 json.dumps(snapshots, ensure_ascii=False, separators=(",", ":")),
             ),
         )
@@ -4497,7 +4498,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 or receipt.accepted_plan_fingerprint != accepted_plan.fingerprint
                 or receipt.request_sha256 != prepared_sha256
                 or receipt.replacement != proposal.replacement
-                or receipt.committed_at != sqlite_support.parse_datetime(row["committed_at"])
+                or receipt.committed_at != sqlite_records.parse_datetime(row["committed_at"])
                 or receipt.replayed
             ):
                 raise ValueError("Proposal publication indexes conflict with content.")
@@ -4541,7 +4542,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 receipt.proposal_fingerprint,
                 receipt.accepted_plan_fingerprint,
                 receipt.request_sha256,
-                sqlite_support.format_datetime(receipt.committed_at),
+                sqlite_records.format_datetime(receipt.committed_at),
                 proposal.model_dump_json(warnings=False),
                 accepted_plan.model_dump_json(warnings=False),
                 receipt.model_dump_json(warnings=False),
@@ -4583,7 +4584,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 or receipt.proposal_id != str(row["proposal_id"])
                 or receipt.proposal_fingerprint != str(row["proposal_fingerprint"])
                 or receipt.authority.request.fingerprint != str(row["request_sha256"])
-                or receipt.committed_at != sqlite_support.parse_datetime(row["committed_at"])
+                or receipt.committed_at != sqlite_records.parse_datetime(row["committed_at"])
                 or receipt.replayed
                 or receipt.authority.decision.disposition
                 is not KnowledgeMaintenanceGovernanceDisposition.ROUTE_TO_REVIEW
@@ -4630,7 +4631,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 receipt.operation_id != operation_id
                 or receipt.invocation_sha256 != str(row["invocation_sha256"])
                 or receipt.request_sha256 != str(row["request_sha256"])
-                or receipt.committed_at != sqlite_support.parse_datetime(row["committed_at"])
+                or receipt.committed_at != sqlite_records.parse_datetime(row["committed_at"])
                 or receipt.replayed
                 or receipt.authority.invocation.access_scope != stored_scope
             ):
@@ -4686,7 +4687,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 or proposal.fingerprint != decision.proposal_fingerprint
                 or proposal.fingerprint != receipt.proposal_fingerprint
                 or receipt.request_sha256 != row["request_sha256"]
-                or receipt.committed_at != sqlite_support.parse_datetime(row["committed_at"])
+                or receipt.committed_at != sqlite_records.parse_datetime(row["committed_at"])
             ):
                 raise ValueError("Maintenance record indexes conflict with content.")
             _validate_knowledge_maintenance_record(proposal, decision, receipt)
@@ -4728,7 +4729,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 receipt.proposal_id,
                 receipt.proposal_fingerprint,
                 receipt.request_sha256,
-                sqlite_support.format_datetime(receipt.committed_at),
+                sqlite_records.format_datetime(receipt.committed_at),
                 proposal.model_dump_json(warnings=False),
                 decision.model_dump_json(warnings=False),
                 receipt.model_dump_json(warnings=False),
@@ -4893,15 +4894,15 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 (
                     None
                     if state.claimed_at is None
-                    else sqlite_support.format_datetime(state.claimed_at)
+                    else sqlite_records.format_datetime(state.claimed_at)
                 ),
                 (
                     None
                     if state.lease_expires_at is None
-                    else sqlite_support.format_datetime(state.lease_expires_at)
+                    else sqlite_records.format_datetime(state.lease_expires_at)
                 ),
                 state.last_acknowledged_claim_id,
-                sqlite_support.format_datetime(state.updated_at),
+                sqlite_records.format_datetime(state.updated_at),
             ),
         )
 
@@ -4945,7 +4946,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 claim.claim_id,
                 claim_sha256,
                 claim.change.sequence,
-                sqlite_support.format_datetime(acknowledged_at),
+                sqlite_records.format_datetime(acknowledged_at),
             ),
         )
 
@@ -5051,9 +5052,9 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 entry_revision=row["entry_revision"],
                 expected_revision=row["expected_revision"],
                 request_sha256=row["request_sha256"],
-                entry_created_at=sqlite_support.parse_datetime(row["entry_created_at"]),
-                entry_updated_at=sqlite_support.parse_datetime(row["entry_updated_at"]),
-                committed_at=sqlite_support.parse_datetime(row["committed_at"]),
+                entry_created_at=sqlite_records.parse_datetime(row["entry_created_at"]),
+                entry_updated_at=sqlite_records.parse_datetime(row["entry_updated_at"]),
+                committed_at=sqlite_records.parse_datetime(row["committed_at"]),
             )
         except Exception:
             raise KnowledgePublicationConflict("malformed_receipt") from None
@@ -5095,9 +5096,9 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 entry_revision=row["entry_revision"],
                 expected_revision=row["expected_revision"],
                 request_sha256=row["request_sha256"],
-                entry_created_at=sqlite_support.parse_datetime(row["entry_created_at"]),
-                entry_updated_at=sqlite_support.parse_datetime(row["entry_updated_at"]),
-                committed_at=sqlite_support.parse_datetime(row["committed_at"]),
+                entry_created_at=sqlite_records.parse_datetime(row["entry_created_at"]),
+                entry_updated_at=sqlite_records.parse_datetime(row["entry_updated_at"]),
+                committed_at=sqlite_records.parse_datetime(row["committed_at"]),
             )
         except Exception:
             raise KnowledgePublicationConflict("malformed_receipt") from None
@@ -5128,9 +5129,9 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 receipt.entry_revision,
                 receipt.expected_revision,
                 receipt.request_sha256,
-                sqlite_support.format_datetime(receipt.entry_created_at),
-                sqlite_support.format_datetime(receipt.entry_updated_at),
-                sqlite_support.format_datetime(receipt.committed_at),
+                sqlite_records.format_datetime(receipt.entry_created_at),
+                sqlite_records.format_datetime(receipt.entry_updated_at),
+                sqlite_records.format_datetime(receipt.committed_at),
                 _knowledge_access_snapshot_json(_knowledge_access_snapshot(entry)),
             ),
         )
@@ -5224,7 +5225,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 or receipt.entry_revision != row["entry_revision"]
                 or receipt.expected_revision != row["expected_revision"]
                 or receipt.publication_request_sha256 != row["publication_request_sha256"]
-                or receipt.committed_at != sqlite_support.parse_datetime(row["committed_at"])
+                or receipt.committed_at != sqlite_records.parse_datetime(row["committed_at"])
             ):
                 raise ValueError("Activation receipt columns disagree with its JSON envelope.")
         except Exception:
@@ -5247,7 +5248,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             if (
                 retirement.entry_id != row["entry_id"]
                 or retirement.entry_revision != row["entry_revision"]
-                or retirement.retired_at != sqlite_support.parse_datetime(row["retired_at"])
+                or retirement.retired_at != sqlite_records.parse_datetime(row["retired_at"])
             ):
                 raise ValueError("Activation retirement columns disagree with its envelope.")
         except Exception:
@@ -5268,7 +5269,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             (
                 retirement.entry_id,
                 retirement.entry_revision,
-                sqlite_support.format_datetime(retirement.retired_at),
+                sqlite_records.format_datetime(retirement.retired_at),
                 _knowledge_activation_retirement_json(retirement),
             ),
         )
@@ -5299,7 +5300,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 receipt.entry_revision,
                 receipt.expected_revision,
                 receipt.publication_request_sha256,
-                sqlite_support.format_datetime(receipt.committed_at),
+                sqlite_records.format_datetime(receipt.committed_at),
                 _knowledge_activation_receipt_json(receipt),
                 _knowledge_access_snapshot_json(_knowledge_access_snapshot(access_entry)),
             ),
@@ -5929,7 +5930,7 @@ def _knowledge_access_scope_filter_sql(
             clauses.append("0")
     if not scope.include_expired:
         clauses.append(f"({entry_alias}.expires_at IS NULL OR {entry_alias}.expires_at > ?)")
-        params.append(sqlite_support.format_datetime(datetime.now(UTC) if now is None else now))
+        params.append(sqlite_records.format_datetime(datetime.now(UTC) if now is None else now))
     return " AND " + " AND ".join(clauses), params
 
 
@@ -6031,7 +6032,7 @@ def _knowledge_metadata_filter_sql(
         params.extend(impact_targets)
     if not include_expired:
         clauses.append("(e.expires_at IS NULL OR e.expires_at > ?)")
-        params.append(sqlite_support.format_datetime(datetime.now(UTC)))
+        params.append(sqlite_records.format_datetime(datetime.now(UTC)))
     if not clauses:
         return "", params
     return " AND " + " AND ".join(clauses), params
@@ -6258,8 +6259,8 @@ def _entry_row_values(entry: KnowledgeEntry) -> tuple[object, ...]:
         str(entry.status),
         str(entry.created_by_type),
         entry.created_by,
-        sqlite_support.format_datetime(entry.created_at),
-        sqlite_support.format_datetime(entry.updated_at),
+        sqlite_records.format_datetime(entry.created_at),
+        sqlite_records.format_datetime(entry.updated_at),
         entry.source_type,
         entry.source_uri,
         entry.source_id,
@@ -6267,10 +6268,10 @@ def _entry_row_values(entry: KnowledgeEntry) -> tuple[object, ...]:
         entry.importance,
         entry.importance_source,
         entry.confidence,
-        sqlite_support.format_optional_datetime(entry.last_used_at),
-        sqlite_support.format_optional_datetime(entry.expires_at),
+        sqlite_records.format_optional_datetime(entry.last_used_at),
+        sqlite_records.format_optional_datetime(entry.expires_at),
         entry.title,
-        sqlite_support.json_dumps(entry.metadata),
+        sqlite_records.json_dumps(entry.metadata),
         knowledge_entry_payload_bytes(entry),
     )
 
@@ -6293,8 +6294,8 @@ def _entry_from_row(
         status=KnowledgeStatus(row["status"]),
         created_by_type=KnowledgeActorType(row["created_by_type"]),
         created_by=row["created_by"],
-        created_at=sqlite_support.parse_datetime(row["created_at"]),
-        updated_at=sqlite_support.parse_datetime(row["updated_at"]),
+        created_at=sqlite_records.parse_datetime(row["created_at"]),
+        updated_at=sqlite_records.parse_datetime(row["updated_at"]),
         source_type=row["source_type"],
         source_uri=row["source_uri"],
         source_id=row["source_id"],
@@ -6302,8 +6303,8 @@ def _entry_from_row(
         importance=row["importance"],
         importance_source=row["importance_source"],
         confidence=row["confidence"],
-        last_used_at=sqlite_support.parse_optional_datetime(row["last_used_at"]),
-        expires_at=sqlite_support.parse_optional_datetime(row["expires_at"]),
+        last_used_at=sqlite_records.parse_optional_datetime(row["last_used_at"]),
+        expires_at=sqlite_records.parse_optional_datetime(row["expires_at"]),
         title=row["title"],
         aspects=aspects,
         impact_targets=impact_targets,
@@ -6320,7 +6321,7 @@ def _chunk_row_values(chunk: KnowledgeChunk) -> tuple[object, ...]:
         chunk.text,
         chunk.content_hash,
         chunk.source_uri,
-        sqlite_support.json_dumps(chunk.metadata),
+        sqlite_records.json_dumps(chunk.metadata),
     )
 
 
@@ -6360,7 +6361,7 @@ def _index_readiness_from_row(row: sqlite3.Row) -> KnowledgeIndexReadiness:
         attempt_id=str(row["attempt_id"]),
         failure_code=(None if row["failure_code"] is None else str(row["failure_code"])),
         operation_id=str(row["operation_id"]),
-        published_at=sqlite_support.parse_datetime(str(row["published_at"])),
+        published_at=sqlite_records.parse_datetime(str(row["published_at"])),
     )
 
 
@@ -6376,10 +6377,10 @@ def _evidence_row_values(evidence: KnowledgeEvidence) -> tuple[object, ...]:
         evidence.source_uri,
         evidence.source_revision,
         evidence.source_hash,
-        sqlite_support.json_dumps(evidence.locator),
+        sqlite_records.json_dumps(evidence.locator),
         evidence.disposition.value,
-        sqlite_support.format_datetime(evidence.created_at),
-        sqlite_support.json_dumps(evidence.metadata),
+        sqlite_records.format_datetime(evidence.created_at),
+        sqlite_records.json_dumps(evidence.metadata),
     )
 
 
@@ -6397,7 +6398,7 @@ def _evidence_from_row(row: sqlite3.Row) -> KnowledgeEvidence:
         source_hash=row["source_hash"],
         locator=json.loads(row["locator_json"]),
         disposition=KnowledgeEvidenceDisposition(row["disposition"]),
-        created_at=sqlite_support.parse_datetime(row["created_at"]),
+        created_at=sqlite_records.parse_datetime(row["created_at"]),
         metadata=json.loads(row["metadata_json"]),
     )
 
@@ -6423,8 +6424,8 @@ def _relation_row_values(relation: KnowledgeRelation) -> tuple[object, ...]:
         relation.created_by_type.value,
         relation.created_by,
         relation.policy_id,
-        sqlite_support.format_datetime(relation.created_at),
-        sqlite_support.json_dumps(relation.metadata),
+        sqlite_records.format_datetime(relation.created_at),
+        sqlite_records.json_dumps(relation.metadata),
     )
 
 
@@ -6443,7 +6444,7 @@ def _relation_from_row(row: sqlite3.Row) -> KnowledgeRelation:
         created_by_type=KnowledgeActorType(row["created_by_type"]),
         created_by=row["created_by"],
         policy_id=row["policy_id"],
-        created_at=sqlite_support.parse_datetime(row["created_at"]),
+        created_at=sqlite_records.parse_datetime(row["created_at"]),
         metadata=json.loads(row["metadata_json"]),
     )
 
@@ -6455,7 +6456,7 @@ def _change_from_row(row: sqlite3.Row) -> KnowledgeChange:
         kind=KnowledgeChangeKind(row["kind"]),
         entry_id=row["entry_id"],
         entry_revision=row["entry_revision"],
-        committed_at=sqlite_support.parse_datetime(row["committed_at"]),
+        committed_at=sqlite_records.parse_datetime(row["committed_at"]),
         operation_id=row["operation_id"],
         relation_id=row["relation_id"],
     )
@@ -6470,10 +6471,10 @@ def _change_consumer_from_row(row: sqlite3.Row) -> KnowledgeChangeConsumerState:
         pending_claim_id=row["pending_claim_id"],
         pending_worker_id=row["pending_worker_id"],
         pending_attempt=row["pending_attempt"],
-        claimed_at=sqlite_support.parse_optional_datetime(row["claimed_at"]),
-        lease_expires_at=sqlite_support.parse_optional_datetime(row["lease_expires_at"]),
+        claimed_at=sqlite_records.parse_optional_datetime(row["claimed_at"]),
+        lease_expires_at=sqlite_records.parse_optional_datetime(row["lease_expires_at"]),
         last_acknowledged_claim_id=row["last_acknowledged_claim_id"],
-        updated_at=sqlite_support.parse_datetime(row["updated_at"]),
+        updated_at=sqlite_records.parse_datetime(row["updated_at"]),
     )
 
 

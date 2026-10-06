@@ -33,6 +33,7 @@ from tests.core.knowledge_publication_conformance import (
 )
 
 from cayu._validation import DurableValueError, extract_durable_value_error
+from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
 from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore
@@ -155,8 +156,8 @@ def _insert_pre_revision_65_entry(
             entry.id,
             entry.namespace,
             entry.revision,
-            sqlite_support.format_datetime(entry.created_at),
-            sqlite_support.format_datetime(entry.updated_at),
+            sqlite_records.format_datetime(entry.created_at),
+            sqlite_records.format_datetime(entry.updated_at),
         ),
     )
     has_payload_bytes = "payload_bytes" in {
@@ -173,8 +174,8 @@ def _insert_pre_revision_65_entry(
         str(entry.status),
         str(entry.created_by_type),
         entry.created_by,
-        sqlite_support.format_datetime(entry.created_at),
-        sqlite_support.format_datetime(entry.updated_at),
+        sqlite_records.format_datetime(entry.created_at),
+        sqlite_records.format_datetime(entry.updated_at),
         entry.source_type,
         entry.source_uri,
         entry.source_id,
@@ -182,10 +183,10 @@ def _insert_pre_revision_65_entry(
         entry.importance,
         entry.importance_source,
         entry.confidence,
-        sqlite_support.format_optional_datetime(entry.last_used_at),
-        sqlite_support.format_optional_datetime(entry.expires_at),
+        sqlite_records.format_optional_datetime(entry.last_used_at),
+        sqlite_records.format_optional_datetime(entry.expires_at),
         entry.title,
-        sqlite_support.json_dumps(entry.metadata),
+        sqlite_records.json_dumps(entry.metadata),
     )
     connection.execute(
         f"""

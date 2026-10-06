@@ -57,6 +57,7 @@ from cayu.runtime.execution_units import (
 from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage.targets import require_sqlite_store_allowed
 
+from . import _sqlite_records as sqlite_records
 from . import _sqlite_support as sqlite_support
 from . import migrations as schema
 
@@ -454,7 +455,7 @@ class SQLiteBudgetLedger(BudgetLedger):
         reservation_ids = _validate_reservation_id_batch(reservation_ids)
         dispatch_id = require_clean_nonblank(dispatch_id, "dispatch_id")
         supplied_dispatched_at = (
-            sqlite_support.parse_datetime(sqlite_support.format_datetime(dispatched_at))
+            sqlite_records.parse_datetime(sqlite_records.format_datetime(dispatched_at))
             if dispatched_at is not None
             else None
         )
@@ -591,7 +592,7 @@ class SQLiteBudgetLedger(BudgetLedger):
         reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
         actual_amount = _validate_amount(actual_amount, "actual_amount")
         reconciled_at = (
-            sqlite_support.parse_datetime(sqlite_support.format_datetime(occurred_at))
+            sqlite_records.parse_datetime(sqlite_records.format_datetime(occurred_at))
             if occurred_at is not None
             else self._clock()
         )
@@ -714,7 +715,7 @@ class SQLiteBudgetLedger(BudgetLedger):
                 filters.append("session_id = ?")
                 parameters.append(session_id)
             if after is not None:
-                formatted_settled_at = sqlite_support.format_datetime(after.settled_at)
+                formatted_settled_at = sqlite_records.format_datetime(after.settled_at)
                 filters.append("(settled_at > ? OR (settled_at = ? AND settlement_id > ?))")
                 parameters.extend(
                     [
@@ -794,8 +795,8 @@ class SQLiteBudgetLedger(BudgetLedger):
         now: datetime,
     ) -> Decimal:
         since, until = limit.window.bounds(now=now)
-        cutoff = None if since is None else sqlite_support.format_datetime(since)
-        upper_cutoff = None if until is None else sqlite_support.format_datetime(until)
+        cutoff = None if since is None else sqlite_records.format_datetime(since)
+        upper_cutoff = None if until is None else sqlite_records.format_datetime(until)
         legacy = self._connection.execute(
             """
             SELECT 1
@@ -885,7 +886,7 @@ class SQLiteBudgetLedger(BudgetLedger):
             ORDER BY reservation_id
             """,
             (
-                sqlite_support.format_datetime(cutoff),
+                sqlite_records.format_datetime(cutoff),
                 limit.budget_limit_id,
             ),
         ).fetchall()
@@ -909,8 +910,8 @@ class SQLiteBudgetLedger(BudgetLedger):
             self._update_record_unlocked(released)
 
     def _insert_record_unlocked(self, record: BudgetReservationRecord) -> None:
-        now = sqlite_support.format_datetime(record.created_at)
-        updated_at = sqlite_support.format_datetime(record.updated_at)
+        now = sqlite_records.format_datetime(record.created_at)
+        updated_at = sqlite_records.format_datetime(record.updated_at)
         self._connection.execute(
             """
             INSERT INTO cayu_budget_reservations (
@@ -960,13 +961,13 @@ class SQLiteBudgetLedger(BudgetLedger):
                     if record.billing_identity is None
                     else record.billing_identity.model_dump_json()
                 ),
-                sqlite_support.json_dumps(record.settlement_event_payload),
+                sqlite_records.json_dumps(record.settlement_event_payload),
                 record.settlement_fallback.model_dump_json(),
                 record.dispatch_id,
                 (
                     None
                     if record.dispatched_at is None
-                    else sqlite_support.format_datetime(record.dispatched_at)
+                    else sqlite_records.format_datetime(record.dispatched_at)
                 ),
                 str(record.reserved_amount),
                 None if record.actual_amount is None else str(record.actual_amount),
@@ -978,7 +979,7 @@ class SQLiteBudgetLedger(BudgetLedger):
         )
 
     def _update_record_unlocked(self, record: BudgetReservationRecord) -> None:
-        updated_at = sqlite_support.format_datetime(record.updated_at)
+        updated_at = sqlite_records.format_datetime(record.updated_at)
         cursor = self._connection.execute(
             """
             UPDATE cayu_budget_reservations
@@ -1002,7 +1003,7 @@ class SQLiteBudgetLedger(BudgetLedger):
                 (
                     None
                     if record.dispatched_at is None
-                    else sqlite_support.format_datetime(record.dispatched_at)
+                    else sqlite_records.format_datetime(record.dispatched_at)
                 ),
                 record.status,
                 record.reason,
@@ -1068,14 +1069,14 @@ class SQLiteBudgetLedger(BudgetLedger):
             dispatched_at=(
                 None
                 if row["dispatched_at"] is None
-                else sqlite_support.parse_datetime(row["dispatched_at"])
+                else sqlite_records.parse_datetime(row["dispatched_at"])
             ),
             reserved_amount=Decimal(row["reserved_amount"]),
             actual_amount=(None if row["actual_amount"] is None else Decimal(row["actual_amount"])),
             status=row["status"],
             reason=row["reason"],
-            created_at=sqlite_support.parse_datetime(row["created_at"]),
-            updated_at=sqlite_support.parse_datetime(row["updated_at"]),
+            created_at=sqlite_records.parse_datetime(row["created_at"]),
+            updated_at=sqlite_records.parse_datetime(row["updated_at"]),
         )
 
     def _insert_or_validate_settlement_unlocked(
@@ -1100,7 +1101,7 @@ class SQLiteBudgetLedger(BudgetLedger):
                 stored.settlement_id,
                 stored.reservation_id,
                 stored.session_id,
-                sqlite_support.format_datetime(stored.reconciliation.settled_at),
+                sqlite_records.format_datetime(stored.reconciliation.settled_at),
                 payload,
             ),
         )
