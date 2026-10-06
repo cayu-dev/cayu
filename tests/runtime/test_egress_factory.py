@@ -129,6 +129,12 @@ from cayu.runtime._binding_cleanup import (
 )
 from cayu.testing.base import verify_provider_credential_isolation
 
+# A drain returns as soon as its work settles, so a check that work did settle
+# needs no tight deadline: this budget only bounds a failing run. Measured under
+# CPU load, these drains took up to ~330 ms; 2 s leaves margin for slower CI
+# runners. Checks that a blocked cleanup does not settle keep short budgets.
+_SETTLED_DRAIN_TIMEOUT_S = 2.0
+
 REAL_SECRET = "sk_test_51FactoryRealSecret"
 POLICY_NAME = "provider-example"
 
@@ -4241,7 +4247,7 @@ def test_app_lazily_retries_retained_egress_cleanup_before_new_environment_work(
         # Under a loaded event loop the successful retry may still be awaiting
         # its final harvest when the unrelated run returns.
         assert adapter.finalize_calls == 2
-        assert await app.drain_environment_cleanups(timeout_s=0.2) is True
+        assert await app.drain_environment_cleanups(timeout_s=_SETTLED_DRAIN_TIMEOUT_S) is True
         assert_sync_resources_owned(
             source,
             target,
@@ -4542,7 +4548,7 @@ def test_app_retains_failed_unadopted_cleanup_until_later_retry_succeeds() -> No
         # Synchronize with positive native settlement; propagate its real error
         # immediately and never cancel the owner merely because observation ends.
         await asyncio.wait_for(asyncio.shield(cleanup), 5)
-        assert await app.drain_environment_cleanups(timeout_s=0.2) is True
+        assert await app.drain_environment_cleanups(timeout_s=_SETTLED_DRAIN_TIMEOUT_S) is True
         return first, contender, adapter, provider, app, egress_events
 
     first, contender, adapter, provider, app, egress_events = asyncio.run(run())

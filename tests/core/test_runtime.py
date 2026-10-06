@@ -378,6 +378,12 @@ from cayu.vaults.static import StaticVault
 from cayu.workspaces.base import Workspace, WorkspaceListResult, WorkspaceReadResult
 from cayu.workspaces.local import LocalWorkspace
 
+# A drain returns as soon as its work settles, so a check that work did settle
+# needs no tight deadline: this budget only bounds a failing run. Measured under
+# CPU load, these drains took up to ~330 ms; 2 s leaves margin for slower CI
+# runners. Checks that a blocked cleanup does not settle keep short budgets.
+_SETTLED_DRAIN_TIMEOUT_S = 2.0
+
 
 class _TestKnowledgeStore(InMemoryKnowledgeStore):
     def __init__(self, *args, **kwargs) -> None:
@@ -6423,7 +6429,7 @@ def test_environment_factory_result_release_is_bounded(tmp_path):
             is captured_cleanup_profiles[0]
         )
         finish_release.set()
-        assert await app.drain_environment_cleanups(timeout_s=0.2) is True
+        assert await app.drain_environment_cleanups(timeout_s=_SETTLED_DRAIN_TIMEOUT_S) is True
         assert release_completed.is_set()
         assert app._environment_lifecycle._deferred_factory_cleanup_profiles == {}
         return events
@@ -6549,7 +6555,7 @@ def test_environment_factory_fallback_release_is_bounded(tmp_path):
             app._environment_lifecycle._pending_environment_owner_admissions
         )
         runner.finish_close.set()
-        assert await app.drain_environment_cleanups(timeout_s=0.2) is True
+        assert await app.drain_environment_cleanups(timeout_s=_SETTLED_DRAIN_TIMEOUT_S) is True
         assert runner.close_completed.is_set()
         return events
 
@@ -8241,7 +8247,7 @@ def test_binding_failure_retains_timed_out_factory_release_owner(tmp_path):
         assert len(factory.requests) == 1
 
         finish_release.set()
-        assert await app.drain_environment_cleanups(timeout_s=0.2) is True
+        assert await app.drain_environment_cleanups(timeout_s=_SETTLED_DRAIN_TIMEOUT_S) is True
         return first, contender, release_actions, release_completed.is_set(), app
 
     first, contender, release_actions, release_completed, app = asyncio.run(run())

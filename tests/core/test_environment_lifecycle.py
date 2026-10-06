@@ -71,6 +71,12 @@ from cayu.sessions.base import (
 from cayu.workspaces.base import Workspace
 from cayu.workspaces.local import LocalWorkspace
 
+# A drain returns as soon as its work settles, so a check that work did settle
+# needs no tight deadline: this budget only bounds a failing run. Measured under
+# CPU load, these drains took up to ~330 ms; 2 s leaves margin for slower CI
+# runners. Checks that a blocked cleanup does not settle keep short budgets.
+_SETTLED_DRAIN_TIMEOUT_S = 2.0
+
 
 def _preserve_session_control_state(
     checkpoint: dict[str, Any],
@@ -1439,7 +1445,7 @@ def test_cancelled_binding_does_not_repeat_deferred_factory_release() -> None:
         assert session_id in app._environment_lifecycle._deferred_factory_cleanup_tasks
 
         factory.allow_release.set()
-        assert await app.drain_environment_cleanups(timeout_s=0.2) is True
+        assert await app.drain_environment_cleanups(timeout_s=_SETTLED_DRAIN_TIMEOUT_S) is True
         return factory, app
 
     factory, app = asyncio.run(scenario())
@@ -2133,7 +2139,7 @@ def test_deferred_factory_failure_retains_capacity_until_cleanup_settles() -> No
         assert "deferred-owner" in app._environment_lifecycle._deferred_factory_cleanup_tasks
 
         factory.release.set()
-        assert await app.drain_environment_cleanups(timeout_s=0.2) is True
+        assert await app.drain_environment_cleanups(timeout_s=_SETTLED_DRAIN_TIMEOUT_S) is True
         with pytest.raises(RuntimeError, match="authoritative initial transcript"):
             _ = [
                 event
@@ -2244,7 +2250,7 @@ def test_explicit_drain_retries_same_failed_factory_cleanup_owner() -> None:
             ),
         )
         factory.allow_cleanup = True
-        assert await app.drain_environment_cleanups(timeout_s=0.2) is True
+        assert await app.drain_environment_cleanups(timeout_s=_SETTLED_DRAIN_TIMEOUT_S) is True
         with pytest.raises(RuntimeError, match="authoritative initial transcript"):
             _ = [
                 event
@@ -2388,7 +2394,7 @@ def test_grouped_factory_leaf_cleanups_retain_capacity_until_all_settle() -> Non
         assert factory.calls == 1
 
         factory.allow_second_cleanup.set()
-        assert await app.drain_environment_cleanups(timeout_s=0.2) is True
+        assert await app.drain_environment_cleanups(timeout_s=_SETTLED_DRAIN_TIMEOUT_S) is True
         completed = await _collect_events(
             app,
             RunRequest(
@@ -2537,7 +2543,7 @@ def test_failed_sync_bind_reserves_target_until_factory_release_settles(
         if events is None:
             events = await failed_run
         else:
-            assert await app.drain_environment_cleanups(timeout_s=0.2) is True
+            assert await app.drain_environment_cleanups(timeout_s=_SETTLED_DRAIN_TIMEOUT_S) is True
             assert deferred_settlement is not None
             assert deferred_settlement.done()
             assert not deferred_settlement.cancelled()
@@ -2864,7 +2870,7 @@ def test_failed_sync_bind_retries_release_successor_without_repeating_callback(
         assert factory.cleanup_calls == 2
 
         factory.allow_cleanup = True
-        assert await app.drain_environment_cleanups(timeout_s=0.2) is True
+        assert await app.drain_environment_cleanups(timeout_s=_SETTLED_DRAIN_TIMEOUT_S) is True
         rebound = await contender.bind(
             contender_source,
             None,
@@ -3252,7 +3258,7 @@ def test_timed_out_factory_release_adopts_late_cleanup_settlement() -> None:
         )
         assert factory.calls == 1
         factory.allow_settlement.set()
-        assert await app.drain_environment_cleanups(timeout_s=0.2) is True
+        assert await app.drain_environment_cleanups(timeout_s=_SETTLED_DRAIN_TIMEOUT_S) is True
         return first, contender, factory, app
 
     first, contender, factory, app = asyncio.run(run())
