@@ -108,6 +108,11 @@ from cayu.execution_profiles import (
     ExecutionProfileIdentity,
     event_with_execution_profile_authority,
 )
+from cayu.execution_units import (
+    ModelAttemptIdentity,
+    ToolRoundIdentity,
+    copy_tool_round_identity,
+)
 from cayu.knowledge._publication import KnowledgePublicationScope
 from cayu.mcp.tools import McpToolAdapter, McpToolset
 from cayu.messages import Message
@@ -200,11 +205,6 @@ from cayu.runtime._tool_round_staging import (
     _terminal_publication_work_estimate,
     _tool_terminal_payload_limits,
     _validate_and_synchronize_tool_result_event,
-)
-from cayu.runtime.execution_units import (
-    ModelAttemptIdentity,
-    ToolRoundIdentity,
-    copy_tool_round_identity,
 )
 from cayu.runtime.mcp_manifest_policy import (
     McpManifestPolicy,

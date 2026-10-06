@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from cayu.execution_units import new_model_step_identity
 from cayu.messages import Message, MessageRole, ProviderStatePart, TextPart
 from cayu.providers import (
     ModelCompletion,
@@ -12,7 +13,6 @@ from cayu.providers import (
     normalize_model_completion,
 )
 from cayu.runtime._runtime_records import ToolCallRequest
-from cayu.runtime.execution_units import new_model_step_identity
 from cayu.runtime.model_steps import (
     AssistantStepResult,
     StepClassificationType,

@@ -14,11 +14,11 @@ from tests.core.test_tool_round_publication_failure_matrix import _TwoCallProvid
 from tests.core.test_tool_round_publication_failure_matrix import store_factory as store_factory
 
 from cayu import AgentSpec, CayuApp, Event, EventType, Message
+from cayu.execution_units import new_model_step_identity
 from cayu.runtime import _runtime_records as records
 from cayu.runtime import _tool_execution as execution
 from cayu.runtime import _tool_round_recovery as recovery
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.runtime.execution_units import new_model_step_identity
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import (

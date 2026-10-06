@@ -197,6 +197,12 @@ from cayu.execution_profiles import (
     ExecutionProfileIdentity,
     ExecutionProfileRejectionResult,
 )
+from cayu.execution_units import (
+    ModelAttemptIdentity,
+    ToolRoundIdentity,
+    copy_model_attempt_identity,
+    copy_tool_round_identity,
+)
 from cayu.knowledge._access_rules import (
     _knowledge_change_audiences,
     _knowledge_maintenance_access_snapshot,
@@ -479,12 +485,6 @@ from cayu.runtime._child_session_notifications import (
 from cayu.runtime._task_admission_wakeup import TaskAdmissionWakeup
 from cayu.runtime._task_lease_authority import managed_task_lease_mutation
 from cayu.runtime.evidence_spool import EvidenceSpool
-from cayu.runtime.execution_units import (
-    ModelAttemptIdentity,
-    ToolRoundIdentity,
-    copy_model_attempt_identity,
-    copy_tool_round_identity,
-)
 from cayu.runtime.local_execution_attempts import (
     LocalExecutionAttemptAuthority,
     LocalExecutionAttemptConflict,

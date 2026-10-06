@@ -55,6 +55,7 @@ from cayu.context.structured_output import (
 )
 from cayu.context.thinking import ThinkingConfig
 from cayu.events import Event, EventType
+from cayu.execution_units import ModelAttemptIdentity
 from cayu.messages import Message, ThinkingPart
 from cayu.observability.events import EventSink, InMemoryEventSink
 from cayu.observability.hooks import RuntimeHook, RuntimeHookContext, RuntimeHookPhase
@@ -88,7 +89,6 @@ from cayu.runtime.execution_profiles import (
     direct_tool_capability_ceiling_component,
     execution_profile_with_component,
 )
-from cayu.runtime.execution_units import ModelAttemptIdentity
 from cayu.runtime.provider_operations import (
     ProviderOperationAccountingStatus,
     ProviderOperationCancellationStatus,

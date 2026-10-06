@@ -36,8 +36,8 @@ from cayu.cli.store_targets import (
     resolve_session_store_target,
 )
 from cayu.events import EventType
+from cayu.execution_units import ToolRoundIdentity
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
-from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.provider_operations import inspect_provider_operation
 from cayu.runtime.public_authority import public_authority_alias_codec_from_environment
 from cayu.sessions.base import (

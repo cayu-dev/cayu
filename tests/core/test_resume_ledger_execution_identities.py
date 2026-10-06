@@ -8,11 +8,11 @@ from cayu.approvals.tools import (
     ToolApprovalDecision,
 )
 from cayu.events import Event, EventType
+from cayu.execution_units import ToolRoundIdentity
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
-from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.tools.base import ToolResult
 

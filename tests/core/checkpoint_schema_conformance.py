@@ -10,6 +10,7 @@ from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.approvals.user_input import AmbiguousUserInputPauseAuthorityError, UserInputResponse
 from cayu.events import EventType
+from cayu.execution_units import new_model_step_identity
 from cayu.messages import Message, ProviderStatePart, ToolCallPart
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import _runtime_records as runtime_records
@@ -18,7 +19,6 @@ from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
 )
-from cayu.runtime.execution_units import new_model_step_identity
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import (
     IncompleteSessionRecoveryAction,

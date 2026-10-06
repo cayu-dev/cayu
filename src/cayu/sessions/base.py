@@ -269,6 +269,11 @@ from cayu.execution_profiles import (
     execution_profile_runtime_component,
     inherited_execution_profile_component_changes,
 )
+from cayu.execution_units import (
+    ModelAttemptIdentity,
+    ToolRoundIdentity,
+    copy_tool_round_identity,
+)
 from cayu.memory.evidence import (
     MAX_RECALL_RECEIPT_ITEMS,
     ContextExposure,
@@ -329,11 +334,6 @@ from cayu.runtime.build_provenance import (
     copy_runtime_build_provenance,
     legacy_runtime_build_provenance,
     runtime_build_provenance_identity,
-)
-from cayu.runtime.execution_units import (
-    ModelAttemptIdentity,
-    ToolRoundIdentity,
-    copy_tool_round_identity,
 )
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.public_authority import (

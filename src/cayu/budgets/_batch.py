@@ -18,7 +18,7 @@ from cayu.budgets.base import (
     _EffectiveBudgetLimit,
     _reservation_result,
 )
-from cayu.runtime.execution_units import ModelAttemptIdentity
+from cayu.execution_units import ModelAttemptIdentity
 
 
 @dataclass(frozen=True)

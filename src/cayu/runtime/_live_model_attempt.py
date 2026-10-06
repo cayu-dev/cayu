@@ -42,6 +42,7 @@ from cayu.context.structured_output import (
 from cayu.environments.admission import ExecutionAdmissionError
 from cayu.events import Event, EventType, copy_event, event_with_runtime_generated_id
 from cayu.execution_profiles import ExecutionProfileIdentity, event_with_execution_profile_authority
+from cayu.execution_units import ModelAttemptIdentity, copy_model_attempt_identity
 from cayu.memory.evidence import ContextExposureEvidenceKind, ContextExposureState
 from cayu.messages import ProviderStatePart
 from cayu.providers._credential_boundary import (
@@ -142,7 +143,6 @@ from cayu.runtime._structured_output_tool_round import (
     _redact_structured_output_validation,
     _validate_structured_output_tool_round,
 )
-from cayu.runtime.execution_units import ModelAttemptIdentity, copy_model_attempt_identity
 from cayu.runtime.model_steps import AssistantStepResult, classify_assistant_step
 from cayu.runtime.provider_operations import (
     ProviderOperationEvidenceError,

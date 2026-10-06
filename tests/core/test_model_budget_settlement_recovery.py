@@ -29,12 +29,12 @@ from cayu.budgets.pricing import (
 )
 from cayu.context.base import CheckpointCompactionContextPolicy, ModelCompactor
 from cayu.events import Event, EventType
+from cayu.execution_units import ModelAttemptIdentity
 from cayu.messages import Message
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime._event_projection import public_event_sequence
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
-from cayu.runtime.execution_units import ModelAttemptIdentity
 from cayu.sessions.base import (
     EventQuery,
     IncompleteSessionRecoveryRequest,

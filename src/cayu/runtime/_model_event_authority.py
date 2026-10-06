@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from cayu.events import Event, event_with_runtime_payload_authority
-from cayu.runtime.execution_units import (
+from cayu.execution_units import (
     ModelAttemptIdentity,
     ModelStepIdentity,
     copy_model_attempt_identity,

@@ -60,6 +60,11 @@ from cayu.budgets.usage import (
 )
 from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.events import EventType
+from cayu.execution_units import (
+    ModelAttemptIdentity,
+    copy_model_attempt_identity,
+    strip_runtime_owned_execution_identity,
+)
 from cayu.messages import (
     CitationPart,
     FilePart,
@@ -99,11 +104,6 @@ from cayu.runtime._model_errors import (
     resolve_request_billing_identity,
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.runtime.execution_units import (
-    ModelAttemptIdentity,
-    copy_model_attempt_identity,
-    strip_runtime_owned_execution_identity,
-)
 from cayu.runtime.retry_policy import (
     RetryDecision,
     RetryDisposition,

@@ -12,6 +12,7 @@ from cayu.execution_profiles import (
     ExecutionProfileIdentity,
     event_with_execution_profile_authority,
 )
+from cayu.execution_units import ToolRoundIdentity
 from cayu.runtime._approval_support import tool_call_request_from_pending
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._tool_effect_state import (
@@ -24,7 +25,6 @@ from cayu.runtime._tool_round_executor import (
     _targeted_tool_invocation_payload,
 )
 from cayu.runtime._tool_round_staging import _event_with_tool_round_authority
-from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.tool_effects import ToolEffectConflict
 from cayu.sessions._pending_tool_round import PendingToolRound
 from cayu.sessions.base import Session, SessionStore

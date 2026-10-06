@@ -170,6 +170,12 @@ from cayu.execution_profiles import (
     ExecutionProfileIdentity,
     event_with_execution_profile_authority,
 )
+from cayu.execution_units import (
+    ModelAttemptIdentity,
+    ModelStepIdentity,
+    ToolRoundIdentity,
+    copy_tool_round_identity,
+)
 from cayu.failure_evidence import FailureEvidence, exception_evidence
 from cayu.memory.evidence import ContextExposureEvidenceKind, ContextExposureState
 from cayu.messages import Message, MessageRole, ToolCallPart, ToolResultPart, detach_message
@@ -345,12 +351,6 @@ from cayu.runtime._tool_round_staging import (
 )
 from cayu.runtime._work_attempt_invocation import WorkAttemptInvocationAuthority
 from cayu.runtime._work_attempt_session_mutation import record_work_attempt_execution_stop
-from cayu.runtime.execution_units import (
-    ModelAttemptIdentity,
-    ModelStepIdentity,
-    ToolRoundIdentity,
-    copy_tool_round_identity,
-)
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.provider_operations import (
     ProviderOperationEvidenceError,

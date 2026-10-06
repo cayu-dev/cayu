@@ -15,6 +15,7 @@ from cayu.execution_profiles import (
     ExecutionProfileIdentity,
     event_with_execution_profile_authority,
 )
+from cayu.execution_units import ToolRoundIdentity
 from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_execution as tool_execution
@@ -27,7 +28,6 @@ from cayu.runtime._tool_round_staging import (
     _staged_terminal_argument_projections,
     _ToolRoundPublicationCoordinator,
 )
-from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.sessions import _staged_tool_terminal_reader as staged_terminal_reader
 from cayu.sessions.base import Session, SessionStore
 from cayu.tools._redaction import InvocationRedactorSnapshot

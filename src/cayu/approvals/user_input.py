@@ -39,8 +39,8 @@ from cayu.events import (
     event_with_runtime_nested_payload_authority,
     event_with_runtime_payload_authority,
 )
+from cayu.execution_units import ToolRoundIdentity
 from cayu.messages import Message, detach_message
-from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.sessions._assistant_tool_round_publication import (

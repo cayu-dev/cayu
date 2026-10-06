@@ -8,6 +8,11 @@ from uuid import uuid4
 
 from cayu._validation import copy_json_value
 from cayu.budgets.usage import strip_provider_billing_identity
+from cayu.execution_units import (
+    ToolRoundIdentity,
+    copy_tool_round_identity,
+    strip_runtime_owned_execution_identity,
+)
 from cayu.messages import (
     CitationPart,
     FilePart,
@@ -24,11 +29,6 @@ from cayu.messages import (
 )
 from cayu.runtime import _message_redaction as message_redaction
 from cayu.runtime._runtime_records import ToolCallOutcome, ToolCallRequest
-from cayu.runtime.execution_units import (
-    ToolRoundIdentity,
-    copy_tool_round_identity,
-    strip_runtime_owned_execution_identity,
-)
 from cayu.sessions.base import SessionStore
 from cayu.vaults import SecretRedactor
 

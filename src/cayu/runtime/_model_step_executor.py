@@ -152,6 +152,14 @@ from cayu.execution_profiles import (
     ExecutionProfileIdentity,
     event_with_execution_profile_authority,
 )
+from cayu.execution_units import (
+    ModelAttemptIdentity,
+    ModelStepIdentity,
+    copy_model_attempt_identity,
+    copy_model_step_identity,
+    new_model_step_identity,
+    strip_runtime_owned_execution_identity,
+)
 from cayu.memory.evidence import ContextExposure, ContextExposureEvidenceKind, ContextExposureState
 from cayu.messages import (
     FilePart,
@@ -426,14 +434,6 @@ from cayu.runtime._session_control import (
     ActiveSessionRun,
     SessionControl,
     SessionInterruptedByRequest,
-)
-from cayu.runtime.execution_units import (
-    ModelAttemptIdentity,
-    ModelStepIdentity,
-    copy_model_attempt_identity,
-    copy_model_step_identity,
-    new_model_step_identity,
-    strip_runtime_owned_execution_identity,
 )
 from cayu.runtime.model_steps import (
     AssistantStepResult,

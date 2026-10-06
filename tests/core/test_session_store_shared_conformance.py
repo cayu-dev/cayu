@@ -126,6 +126,7 @@ from cayu.events import (
     event_with_runtime_envelope_authority,
     event_with_runtime_payload_authority,
 )
+from cayu.execution_units import ModelAttemptIdentity, ToolRoundIdentity
 from cayu.memory.attribution import MemoryAttributionStatus
 from cayu.memory.base import AutomaticRecallPolicy
 from cayu.memory.context import AutomaticRecallContextPolicy, AutomaticRecallSourceConfig
@@ -207,7 +208,6 @@ from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
     execution_profile_from_session_metadata,
 )
-from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
 from cayu.runtime.provider_operations import (
     ProviderOperationInspectionStatus,
     ProviderOperationResolutionAction,

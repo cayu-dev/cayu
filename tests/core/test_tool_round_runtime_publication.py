@@ -21,6 +21,7 @@ from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.context.base import ContextPolicy, ContextRequest, validate_context_messages
 from cayu.events import Event, EventType
+from cayu.execution_units import ToolRoundIdentity
 from cayu.messages import Message, ToolResultPart
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime import _runtime_records as runtime_records
@@ -30,7 +31,6 @@ from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
 )
-from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.sessions._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     model_step_publication_from_checkpoint,

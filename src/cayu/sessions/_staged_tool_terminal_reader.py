@@ -8,7 +8,7 @@ from cayu._validation import copy_durable_json_value
 from cayu.approvals.tools import ToolPolicyEvidence
 from cayu.approvals.user_input import PendingUserInput
 from cayu.events import Event, EventType, copy_event
-from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
+from cayu.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._assistant_tool_round_publication import (

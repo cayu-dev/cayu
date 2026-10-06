@@ -20,6 +20,7 @@ from cayu.budgets.usage import session_usage_summary
 from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME, StructuredOutputSpec
 from cayu.environments import Environment, EnvironmentSpec
 from cayu.events import Event, EventType
+from cayu.execution_units import new_model_step_identity
 from cayu.messages import FilePart, Message, TextPart
 from cayu.providers import (
     ModelProvider,
@@ -27,7 +28,6 @@ from cayu.providers import (
     ModelRequest,
     ModelStreamEvent,
 )
-from cayu.runtime.execution_units import new_model_step_identity
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions.base import (
     EventOrder,

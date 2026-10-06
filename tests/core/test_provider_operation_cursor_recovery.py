@@ -14,6 +14,7 @@ from cayu.applications import CayuApp
 from cayu.budgets.usage import session_usage_summary
 from cayu.context.thinking import ThinkingConfig
 from cayu.events import Event, EventType
+from cayu.execution_units import ModelAttemptIdentity
 from cayu.messages import Message, ThinkingPart
 from cayu.providers import (
     ModelProvider,
@@ -37,7 +38,6 @@ from cayu.providers._credential_boundary import ProviderStreamCleanupError
 from cayu.runtime._model_step_executor import ModelCompletionRecoveryContext
 from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.runtime.execution_units import ModelAttemptIdentity
 from cayu.runtime.provider_operations import (
     ProviderOperationEvidenceError,
     ProviderOperationInspectionStatus,

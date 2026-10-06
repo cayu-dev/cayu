@@ -35,6 +35,7 @@ from cayu.budgets.run_limits import RunLimits
 from cayu.context.structured_output import StructuredOutputSpec, StructuredOutputStrategy
 from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.events import Event, EventType
+from cayu.execution_units import ToolRoundIdentity
 from cayu.messages import Message, ToolResultPart
 from cayu.observability.hooks import RuntimeHook, ToolCallHookContext
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
@@ -45,7 +46,6 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileMismatchError,
     active_invocation_execution_profile_from_checkpoint,
 )
-from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions.base import (
     EventQuery,

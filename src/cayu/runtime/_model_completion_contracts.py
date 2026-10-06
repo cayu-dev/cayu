@@ -35,6 +35,7 @@ from cayu.context.structured_output import (
 )
 from cayu.context.thinking import ThinkingConfig
 from cayu.events import Event, EventType, copy_event
+from cayu.execution_units import copy_tool_round_identity
 from cayu.memory.evidence import ContextExposure, ContextExposureState
 from cayu.messages import Message, detach_message
 from cayu.providers.base import (
@@ -55,7 +56,6 @@ from cayu.runtime._memory_evidence import (
 )
 from cayu.runtime._model_execution_selection import ModelFailoverAttempt
 from cayu.runtime._run_limits import BudgetStepReservation
-from cayu.runtime.execution_units import copy_tool_round_identity
 from cayu.runtime.model_steps import AssistantStepResult
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.tool_completion import ToolCompletionPolicy

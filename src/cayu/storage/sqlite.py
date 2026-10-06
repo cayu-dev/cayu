@@ -100,6 +100,7 @@ from cayu.execution_profiles import (
     ExecutionProfileIdentity,
     ExecutionProfileRejectionResult,
 )
+from cayu.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.memory.evidence import (
     MAX_RECALL_RECEIPT_ITEMS,
     ContextExposure,
@@ -136,7 +137,6 @@ from cayu.runtime._child_session_notifications import (
     child_session_notification_storage_key,
 )
 from cayu.runtime.evidence_spool import EvidenceSpool, _settled_evidence_reads_required
-from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, parse_public_authority_alias
 from cayu.runtime.service_manifest import RuntimeStoreDurability
 from cayu.sessions._execution_profile_checkpoint import (

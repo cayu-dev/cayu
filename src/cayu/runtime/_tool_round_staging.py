@@ -38,6 +38,7 @@ from cayu.execution_profiles import (
     ExecutionProfileIdentity,
     event_with_execution_profile_fingerprint_authority,
 )
+from cayu.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.failure_evidence import FailureEvidence
 from cayu.mcp.tools import McpToolAdapter
 from cayu.observability.hooks import RuntimeHookPhase, _runtime_hook_supports_phase
@@ -54,7 +55,6 @@ from cayu.runtime._tool_effect_state import (
     ToolEffectTerminal,
     is_command_policy_refusal_terminal,
 )
-from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.sessions import _staged_tool_terminal_reader as staged_terminal_reader
 from cayu.sessions._assistant_tool_round_publication import validate_tool_exposure_terminal_event
 from cayu.sessions.base import Session, SessionStore, runtime_publication_checkpoint_mutation

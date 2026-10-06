@@ -26,6 +26,7 @@ from cayu.events import (
     event_payload_authority_is_runtime_generated,
     event_with_runtime_payload_authority,
 )
+from cayu.execution_units import ToolRoundIdentity
 from cayu.messages import Message
 from cayu.observability.hooks import AfterToolCallDecision, RuntimeHook, ToolCallHookContext
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
@@ -53,7 +54,6 @@ from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
     build_execution_profile_identity,
 )
-from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions.base import InMemorySessionStore, RunRequest, Session, SessionStatus
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence

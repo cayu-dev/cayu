@@ -5,8 +5,7 @@ from typing import Any, cast
 import pytest
 from pydantic import ValidationError
 
-from cayu.messages import ToolCallPart, ToolResultPart
-from cayu.runtime.execution_units import (
+from cayu.execution_units import (
     BudgetLimitIdentity,
     ModelAttemptIdentity,
     ModelStepIdentity,
@@ -16,6 +15,7 @@ from cayu.runtime.execution_units import (
     copy_tool_round_identity,
     new_model_step_identity,
 )
+from cayu.messages import ToolCallPart, ToolResultPart
 
 
 def test_model_execution_identities_are_opaque_distinct_and_linked() -> None:

@@ -274,6 +274,15 @@ from cayu.execution_profiles import (
     inherited_execution_profile_component_changes,
     unavailable_execution_profile_components,
 )
+from cayu.execution_units import (
+    ModelAttemptIdentity,
+    ModelStepIdentity,
+    ToolRoundIdentity,
+    copy_model_attempt_identity,
+    copy_model_step_identity,
+    new_model_step_identity,
+    strip_runtime_owned_execution_identity,
+)
 from cayu.failure_evidence import FailureEvidence, exception_evidence
 from cayu.messages import (
     Message,
@@ -551,15 +560,6 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyError,
     _ExecutionProfileAdmissionRequestRejected,
     _with_runtime_execution_profile_decision_authority,
-)
-from cayu.runtime.execution_units import (
-    ModelAttemptIdentity,
-    ModelStepIdentity,
-    ToolRoundIdentity,
-    copy_model_attempt_identity,
-    copy_model_step_identity,
-    new_model_step_identity,
-    strip_runtime_owned_execution_identity,
 )
 from cayu.runtime.loop_policies import (
     BeforeStopAction,

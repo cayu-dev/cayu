@@ -53,6 +53,7 @@ from tests.runner_cancellation import cancelled_error_with_artifacts
 import cayu.applications as runtime_app_module
 import cayu.budgets.base as budgets_module
 import cayu.context.base as runtime_context_module
+import cayu.execution_units as execution_units_module
 import cayu.providers._credential_boundary as credential_boundary_module
 import cayu.providers.deadlines as provider_deadlines_module
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
@@ -64,7 +65,6 @@ import cayu.runtime._session_control as session_control_module
 import cayu.runtime._session_engine as session_engine_module
 import cayu.runtime._tool_round_executor as tool_round_executor_module
 import cayu.runtime.execution_profiles as execution_profiles_module
-import cayu.runtime.execution_units as execution_units_module
 import cayu.sessions._model_completion_publication as model_completion_publication_module
 import cayu.sessions.base as sessions_module
 from cayu._exception_groups import (
@@ -171,6 +171,7 @@ from cayu.environments.factory import (
     EnvironmentFactoryResult,
 )
 from cayu.events import Event, EventType
+from cayu.execution_units import ToolRoundIdentity
 from cayu.messages import (
     FilePart,
     Message,
@@ -259,7 +260,6 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
 )
-from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
@@ -37697,7 +37697,7 @@ def test_cayu_app_resolves_approved_tool_call_and_continues_session():
 
 def test_stale_tool_approval_resolver_cannot_claim_repaused_session():
     from cayu.approvals.tools import PendingToolCallApproval
-    from cayu.runtime.execution_units import new_model_step_identity
+    from cayu.execution_units import new_model_step_identity
 
     class BlockingApprovalClaimStore(InMemorySessionStore):
         invocation_lifecycle_command_version = 1

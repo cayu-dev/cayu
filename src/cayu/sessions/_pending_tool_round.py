@@ -35,8 +35,8 @@ from cayu.context.structured_output import (
     copy_structured_output_spec,
 )
 from cayu.context.thinking import ThinkingConfig
+from cayu.execution_units import ToolRoundIdentity
 from cayu.messages import Message, detach_message
-from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.sessions._assistant_tool_round_publication import (
     AssistantToolRoundPublication,

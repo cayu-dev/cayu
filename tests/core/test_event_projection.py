@@ -56,6 +56,7 @@ from cayu.events import (
     event_with_runtime_nested_payload_authority,
     event_with_runtime_payload_authority,
 )
+from cayu.execution_units import ToolRoundIdentity
 from cayu.observability.events import EventSink
 from cayu.runtime._event_projection import (
     PRIVATE_EVENT_AUTHORITY,
@@ -79,7 +80,6 @@ from cayu.runtime._tool_identity import tool_idempotency_key
 from cayu.runtime.execution_profiles import (
     event_with_execution_profile_fingerprint_authority,
 )
-from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     PublicAuthorityAliasKeyring,

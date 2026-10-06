@@ -50,7 +50,7 @@ from cayu.budgets.base import (
     new_budget_reservation_id,
 )
 from cayu.budgets.billing import BillingIdentity, copy_billing_identity
-from cayu.runtime.execution_units import (
+from cayu.execution_units import (
     ModelAttemptIdentity,
     copy_model_attempt_identity,
 )

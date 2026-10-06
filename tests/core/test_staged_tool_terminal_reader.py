@@ -12,7 +12,7 @@ from tests.core.test_tool_round_publication import _lifecycle_events, _quarantin
 
 import cayu
 from cayu.approvals.user_input import PendingUserInput
-from cayu.runtime.execution_units import ToolRoundIdentity
+from cayu.execution_units import ToolRoundIdentity
 from cayu.sessions import _staged_tool_terminal_reader as reader
 from cayu.sessions._assistant_tool_round_publication import StagedToolCallTerminal
 from cayu.sessions._pending_tool_round import PendingToolRound, pending_tool_round_identity
@@ -46,7 +46,7 @@ sys.meta_path.insert(0, BlockOwners())
 
 from cayu.approvals.tools import PendingToolCallApproval
 from cayu.events import Event, EventType
-from cayu.runtime.execution_units import ToolRoundIdentity
+from cayu.execution_units import ToolRoundIdentity
 from cayu.sessions import _staged_tool_terminal_reader as reader
 from cayu.sessions._assistant_tool_round_publication import StagedToolCallTerminal
 from cayu.sessions._pending_tool_round import PendingToolRound

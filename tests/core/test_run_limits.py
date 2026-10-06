@@ -38,6 +38,10 @@ from cayu.budgets.billing import BillingIdentity
 from cayu.budgets.pricing import ModelPrice, PriceBook
 from cayu.budgets.run_limits import RunLimits
 from cayu.events import Event, EventType
+from cayu.execution_units import (
+    ModelAttemptIdentity,
+    new_model_step_identity,
+)
 from cayu.messages import Message
 from cayu.providers import (
     ModelProvider,
@@ -56,10 +60,6 @@ from cayu.runtime._run_limits import (
     LimitEvaluation,
     RunLimitController,
     RunLimitGate,
-)
-from cayu.runtime.execution_units import (
-    ModelAttemptIdentity,
-    new_model_step_identity,
 )
 from cayu.runtime.stop_policy import StopLimit
 from cayu.sessions.base import (

@@ -22,6 +22,7 @@ from cayu.execution_profiles import (
     ExecutionProfileIdentity,
     event_with_execution_profile_authority,
 )
+from cayu.execution_units import ModelAttemptIdentity
 from cayu.providers._credential_boundary import aclosing_provider_stream
 from cayu.providers.base import (
     ModelProvider,
@@ -53,7 +54,6 @@ from cayu.runtime._provider_operation_cancellation_owner import (
 )
 from cayu.runtime._provider_stream import _close_async_iterator
 from cayu.runtime._session_control import SessionInterruptedByRequest
-from cayu.runtime.execution_units import ModelAttemptIdentity
 from cayu.runtime.provider_operation_cancellation import (
     ProviderOperationCancellationAdmissionsSealed,
     ProviderOperationCancellationLifecycle,

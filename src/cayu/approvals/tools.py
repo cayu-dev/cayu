@@ -42,7 +42,7 @@ from cayu.configuration import MAX_STEPS
 from cayu.context.structured_output import StructuredOutputSpec, copy_structured_output_spec
 from cayu.context.thinking import ThinkingConfig
 from cayu.events import Event, EventType
-from cayu.runtime.execution_units import ToolRoundIdentity
+from cayu.execution_units import ToolRoundIdentity
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.tools._argument_publication import pause_checkpoint_validation_view

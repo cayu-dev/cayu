@@ -12,7 +12,7 @@ from cayu.budgets.base import (
     model_completion_budget_settlements,
 )
 from cayu.events import Event, EventType
-from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
+from cayu.execution_units import ModelAttemptIdentity, ToolRoundIdentity
 from cayu.tools.inference import validate_inference_purpose
 
 if TYPE_CHECKING:

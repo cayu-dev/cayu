@@ -426,6 +426,13 @@ single composition root.
 
 ### Session checkpoint evidence
 
+`execution_units.py` owns shared model-step, model-attempt, tool-round and
+budget-limit identities, including ID generation, validation, copying and removal
+of caller-supplied authority fields. Checkpoint readers, approvals, budgets, native
+stores and runtime use the same records without importing execution owners for
+these contracts. Supported root and runtime imports resolve to those same objects;
+runtime dispatch and native transactional validation retain their current owners.
+
 `_event_schema.py` owns event payload policies, the shared schema registry and
 private linkage reads. It can inspect event identity without importing execution
 or store owners. Pending-action evidence and runtime projection share its registry.

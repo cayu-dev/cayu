@@ -17,6 +17,7 @@ from cayu import (
 from cayu.budgets.usage import normalize_usage_metrics
 from cayu.context.thinking import MIN_THINKING_BUDGET_TOKENS, thinking_config_payload
 from cayu.events import Event, EventType
+from cayu.execution_units import new_model_step_identity
 from cayu.messages import MessageRole, ProviderStatePart, TextPart, copy_message_part
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent, ModelStreamEventType
 from cayu.providers.anthropic import (
@@ -39,7 +40,6 @@ from cayu.providers.openai import (
     openai_response_events,
 )
 from cayu.runtime._transcript import AssistantThinkingPart, _materialize_thinking
-from cayu.runtime.execution_units import new_model_step_identity
 from cayu.runtime.model_steps import (
     AssistantStepResult,
     StepClassificationType,

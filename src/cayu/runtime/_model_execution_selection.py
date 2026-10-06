@@ -13,6 +13,7 @@ from typing import Any
 from cayu.execution_profiles import (
     ExecutionProfileIdentity,
 )
+from cayu.execution_units import ModelAttemptIdentity, copy_model_attempt_identity
 from cayu.providers.base import ModelProviderError
 from cayu.runtime._execution_profile_admission import ModelFailoverProfileResolution
 from cayu.runtime._invocation_lifecycle import (
@@ -28,7 +29,6 @@ from cayu.runtime._model_failover_stage import (
     model_failover_target_for_stored_stage,
 )
 from cayu.runtime._runtime_records import RegisteredAgentState, RegisteredProvider
-from cayu.runtime.execution_units import ModelAttemptIdentity, copy_model_attempt_identity
 from cayu.runtime.retry_policy import RetryDecision
 from cayu.sessions._invocation_lifecycle import (
     AdmittedInvocationBinding,

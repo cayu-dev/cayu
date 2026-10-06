@@ -15,6 +15,7 @@ from cayu.budgets.base import BudgetLimit, BudgetPolicy, BudgetReservation, InMe
 from cayu.budgets.pricing import ModelPrice, PriceBook
 from cayu.budgets.run_limits import RunLimits
 from cayu.budgets.usage import SessionUsageSummary, session_usage_summary
+from cayu.execution_units import ModelAttemptIdentity
 from cayu.providers import (
     ModelProviderError,
     ModelRequest,
@@ -32,7 +33,6 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileComponentClass,
     ExecutionProfileMismatchError,
 )
-from cayu.runtime.execution_units import ModelAttemptIdentity
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.stop_policy import auxiliary_token_admission
 from cayu.storage.sqlite import SQLiteSessionStore

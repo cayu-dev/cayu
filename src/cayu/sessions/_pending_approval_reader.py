@@ -14,7 +14,7 @@ from cayu.approvals.tools import (
     ToolApprovalDecision,
     ToolPolicyEvidence,
 )
-from cayu.runtime.execution_units import ToolRoundIdentity
+from cayu.execution_units import ToolRoundIdentity
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
 from cayu.tools.policy import ToolPolicyDecision
