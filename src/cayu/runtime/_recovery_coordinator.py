@@ -35,6 +35,7 @@ from cayu.runtime._durable_tool_round import (
 from cayu.runtime._durable_tool_round import (
     _interrupted_tool_round_results as _interrupted_tool_round_results,
 )
+from cayu.sessions import _completion_finalization as completion_finalization
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
@@ -228,7 +229,6 @@ from cayu.runtime._durable_subagents import (
 from cayu.runtime._environment_lifecycle import (
     EnvironmentLifecycle,
     exception_failure_payload,
-    pending_completion_finalization_from_checkpoint,
 )
 from cayu.runtime._event_writer import (
     RuntimeEventWriter,
@@ -17451,8 +17451,8 @@ class RecoveryCoordinator:
             # Refuse before claiming a replacement epoch; explicit stop/cleanup
             # retains its separate owner and does not require answer replay.
             await self._require_participant_execution(session, participant_context)
-        pending_completion_finalization = pending_completion_finalization_from_checkpoint(
-            checkpoint
+        pending_completion_finalization = (
+            completion_finalization.pending_completion_finalization_from_checkpoint(checkpoint)
         )
         ambiguous_user_input = ambiguous_pending_user_input_from_checkpoint(checkpoint)
         if ambiguous_user_input is not None:
@@ -21149,7 +21149,10 @@ class RecoveryCoordinator:
                     claim is None
                     or claim[0] != recovery_claim_id
                     or claim[1] <= store_now
-                    or pending_completion_finalization_from_checkpoint(checkpoint) != marker
+                    or completion_finalization.pending_completion_finalization_from_checkpoint(
+                        checkpoint
+                    )
+                    != marker
                 ):
                     raise SessionRunFenced(
                         "Completion finalization recovery lost its exact durable marker."
@@ -21375,8 +21378,8 @@ class RecoveryCoordinator:
         actions: list[IncompleteSessionRecoveryAction] = []
         events: list[Event] = []
         checkpoint = await self._session_store.load_checkpoint(session.id)
-        pending_completion_finalization = pending_completion_finalization_from_checkpoint(
-            checkpoint
+        pending_completion_finalization = (
+            completion_finalization.pending_completion_finalization_from_checkpoint(checkpoint)
         )
         provider_interrupt_payload = _provider_cancellation_interrupt_payload(checkpoint)
         pending_approval = pending_approval_reader.pending_approval_from_checkpoint(

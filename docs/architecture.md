@@ -426,6 +426,13 @@ single composition root.
 
 ### Session checkpoint evidence
 
+`sessions/_completion_finalization.py` owns the saved cleanup marker key, reader
+and validation, including detached results and the encoded byte limit. Session
+queue publication and runtime recovery share this component without importing
+environment lifecycle execution to read the marker. Reading validates evidence;
+native stores retain transaction and authority checks, and runtime retains
+environment allocation, cleanup and recovery decisions.
+
 `sessions/_tool_call_evidence.py` owns the shared event scan used by pending-action
 queries and runtime recovery. It matches pending calls, classifies starts and
 terminal evidence, and detects conflicting or manually reconciled history.

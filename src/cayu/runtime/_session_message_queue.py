@@ -37,10 +37,10 @@ class OversizedStorageValue:
 
 def require_open_admission(status: str, checkpoint: object) -> None:
     """Validate the shared queue gate under the receiving transaction."""
-    from cayu.sessions.base import (
+    from cayu.sessions._completion_finalization import (
         PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
-        SessionStatusConflict,
     )
+    from cayu.sessions.base import SessionStatusConflict
 
     if status not in {"pending", "running"}:
         raise SessionStatusConflict(

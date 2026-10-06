@@ -37,6 +37,7 @@ from cayu.runtime._work_attempt_invocation import (
     _WorkAttemptRecoveryAlreadyActive,
     _WorkAttemptRuntimeAuthority,
 )
+from cayu.sessions import _completion_finalization as completion_finalization
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
@@ -369,7 +370,6 @@ from cayu.runtime._environment_lifecycle import (
     EnvironmentBindingFinalizeResult,
     EnvironmentLifecycle,
     exception_failure_payload,
-    pending_completion_finalization_from_checkpoint,
     render_initial_system_prompt_with_contributions,
 )
 from cayu.runtime._event_writer import (
@@ -11552,7 +11552,7 @@ class SessionEngine:
             return False
         session, checkpoint = await self._load_work_attempt_execution_snapshot(admission)
         active = active_invocation_execution_profile_from_checkpoint(checkpoint)
-        marker = pending_completion_finalization_from_checkpoint(checkpoint)
+        marker = completion_finalization.pending_completion_finalization_from_checkpoint(checkpoint)
         if not (
             active is not None
             and active_invocation_execution_profile_matches_session_epoch(
@@ -12079,7 +12079,10 @@ class SessionEngine:
                     or (workspace_stop and active.run_epoch == expected_epoch)
                     or session.status not in {SessionStatus.FAILED, SessionStatus.INTERRUPTED}
                     or (workspace_stop and session.status is not SessionStatus.FAILED)
-                    or pending_completion_finalization_from_checkpoint(checkpoint) is not None
+                    or completion_finalization.pending_completion_finalization_from_checkpoint(
+                        checkpoint
+                    )
+                    is not None
                 ):
                     raise WorkAttemptRecoveryRequired("Stopped work-attempt cleanup is unproven.")
                 expected_epoch = active.run_epoch
@@ -12144,7 +12147,8 @@ class SessionEngine:
                 admission.execution_stop.request.reason == "workspace_finalization_recovery"
                 and session.status is not SessionStatus.FAILED
             )
-            or pending_completion_finalization_from_checkpoint(checkpoint) is not None
+            or completion_finalization.pending_completion_finalization_from_checkpoint(checkpoint)
+            is not None
         ):
             return None
         return await self.load_work_attempt_release_evidence(admission)

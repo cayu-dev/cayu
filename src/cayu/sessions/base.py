@@ -55,8 +55,12 @@ from cayu.runtime.event_side_effect_health import (
     PersistedEventSideEffectPage,
     PersistedEventSideEffectQuery,
 )
+from cayu.sessions import _completion_finalization as completion_finalization
 from cayu.sessions import creation_fence
 from cayu.sessions._argument_continuity import ArgumentContinuity
+from cayu.sessions._completion_finalization import (
+    PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY as PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
+)
 from cayu.sessions._durable_operation_ownership import DurableOperationOwnership
 from cayu.sessions._external_wait_memory import MemoryExternalWaitMixin
 from cayu.sessions.execution import SessionExecutionState
@@ -5705,7 +5709,6 @@ RUNTIME_PUBLICATION_SCHEMA_VERSION = 2
 RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS = 128
 RUNTIME_PUBLICATION_MAX_TRANSCRIPT_MESSAGES = 512
 RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS = 512
-PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY = "pending_completion_finalization"
 _PENDING_TOOL_ROUND_CHECKPOINT_KEY = "pending_tool_round"
 _TOOL_ROUND_TERMINAL_EVENT_TYPES = frozenset(
     {
@@ -30708,9 +30711,7 @@ def _prepare_queue_completion_checkpoint_mutation(
     copied = copy_durable_json_object(value, "checkpoint_mutation")
     _validate_completion_finalization_mutation_shape(copied)
     mutation = RuntimePublicationMutation.model_validate(copied)
-    from cayu.runtime._environment_lifecycle import pending_completion_finalization_from_checkpoint
-
-    pending_completion_finalization_from_checkpoint(
+    completion_finalization.pending_completion_finalization_from_checkpoint(
         {PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY: mutation.operations[0].value}
     )
     return mutation

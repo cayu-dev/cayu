@@ -198,6 +198,7 @@ from cayu.runtime._invocation_lifecycle import (
 )
 from cayu.runtime._tool_execution_requirements import effective_execution_requirements
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
+from cayu.sessions import _completion_finalization as completion_finalization
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
@@ -212,7 +213,6 @@ from cayu.sessions._terminal_evidence import (
     classify_current_terminal_evidence,
 )
 from cayu.sessions.base import (
-    PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
     CheckpointTransform,
     EventOrder,
     EventQuery,
@@ -269,7 +269,6 @@ _PRE_EXPOSURE_ADMISSION_SETTLEMENT_TIMEOUT_SECONDS = 1.0
 _LAZY_ENVIRONMENT_CLEANUP_ADMISSION_BUDGET_SECONDS = 0.01
 _FINAL_WORKSPACE_OBSERVATION_TIMEOUT_SECONDS = 30.0
 _MAX_RETAINED_FINAL_WORKSPACE_OBSERVATIONS = 64
-_MAX_COMPLETION_FINALIZATION_CHECKPOINT_BYTES = 4 * 1024 * 1024
 
 _RunFenceReleaseKey = tuple[str, int]
 
@@ -539,57 +538,6 @@ class EnvironmentBindingFinalizeResult:
     events: list[Event]
     cancellation: asyncio.CancelledError | None = None
     cancellation_requests_consumed: int = 0
-
-
-def pending_completion_finalization_from_checkpoint(
-    checkpoint: dict[str, Any] | None,
-) -> dict[str, Any] | None:
-    """Return private finalization retry state for an invocation's terminal outcome."""
-
-    if checkpoint is None:
-        return None
-    raw = checkpoint.get(PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY)
-    if raw is None:
-        return None
-    if type(raw) is not dict:
-        raise ValueError("Pending completion finalization checkpoint must be an object.")
-    marker = copy_durable_json_object(raw, "pending completion finalization")
-    if (
-        type(marker.get("version")) is not int
-        or marker["version"] != 1
-        or marker.get("outcome") not in ("completed", "failed", "interrupted")
-    ):
-        raise ValueError("Pending completion finalization checkpoint has an unsupported format.")
-    for field_name in (
-        "environment_name",
-        "binding_generation_id",
-        "execution_profile_fingerprint",
-    ):
-        value = marker.get(field_name)
-        if type(value) is not str:
-            raise ValueError(f"Pending completion finalization {field_name} must be a string.")
-        require_clean_nonblank(value, field_name)
-    disposal_state = marker.get("disposal_state")
-    if disposal_state is not None and type(disposal_state) is not dict:
-        raise ValueError("Completion disposal state must be an object.")
-    task_id = marker.get("task_id")
-    if task_id is not None:
-        if type(task_id) is not str:
-            raise ValueError("Pending completion finalization task_id must be a string.")
-        require_clean_nonblank(task_id, "task_id")
-    if type(marker.get("binding_state")) is not dict:
-        raise ValueError("Pending completion finalization binding state must be an object.")
-    if (
-        len(
-            canonical_durable_json_bytes(
-                marker,
-                "pending completion finalization",
-            )
-        )
-        > _MAX_COMPLETION_FINALIZATION_CHECKPOINT_BYTES
-    ):
-        raise ValueError("Pending completion finalization checkpoint exceeds its byte limit.")
-    return marker
 
 
 def _same_completion_marker(left: dict[str, Any] | None, right: dict[str, Any]) -> bool:
@@ -1101,8 +1049,8 @@ class EnvironmentLifecycle:
             "execution_profile_fingerprint": execution_profile.fingerprint,
             "binding_state": record["binding_state"],
         }
-        pending_completion_finalization_from_checkpoint(
-            {PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY: marker}
+        completion_finalization.pending_completion_finalization_from_checkpoint(
+            {completion_finalization.PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY: marker}
         )
         if len(releases) == 5000:
             raise RuntimeError("Terminal binding release evidence exceeds the inspection bound.")
@@ -1151,10 +1099,12 @@ class EnvironmentLifecycle:
             ):
                 raise SessionRunFenced("Terminal binding cleanup lost its exact owner.")
             copied = copy_durable_record(checkpoint, "checkpoint")
-            existing = pending_completion_finalization_from_checkpoint(copied)
+            existing = completion_finalization.pending_completion_finalization_from_checkpoint(
+                copied
+            )
             if existing is not None and existing != marker:
                 raise RuntimeError("Terminal binding conflicts with pending finalization.")
-            copied[PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY] = marker
+            copied[completion_finalization.PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY] = marker
             return SessionOperationPublication(checkpoint=copied, operation_records={})
 
         with _invocation_lifecycle_authority_read_scope():
@@ -1258,7 +1208,9 @@ class EnvironmentLifecycle:
             raise SessionRunFenced("Completion recovery lost its private invocation authority.")
 
         def validate(current: Session, checkpoint: dict[str, Any] | None, now: datetime):
-            marker = pending_completion_finalization_from_checkpoint(checkpoint)
+            marker = completion_finalization.pending_completion_finalization_from_checkpoint(
+                checkpoint
+            )
             claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
             active = active_invocation_execution_profile_from_checkpoint(checkpoint)
             environment = invocation_context.registered_environment
@@ -1955,7 +1907,10 @@ class EnvironmentLifecycle:
             return False
         name = registered_environment.spec.name
         checkpoint = await self._session_store.load_checkpoint(session.id)
-        if pending_completion_finalization_from_checkpoint(checkpoint) is not None:
+        if (
+            completion_finalization.pending_completion_finalization_from_checkpoint(checkpoint)
+            is not None
+        ):
             return False
         reconnect, owner = _factory_reconnect_state_from_checkpoint(
             checkpoint, environment_name=name
@@ -3829,7 +3784,8 @@ class EnvironmentLifecycle:
                 is not None
                 or (current or {}).get(_PENDING_ALLOCATION_DISPOSAL_KEY, {}).get(environment_name)
                 is not None
-                or pending_completion_finalization_from_checkpoint(current) is not None
+                or completion_finalization.pending_completion_finalization_from_checkpoint(current)
+                is not None
             ):
                 raise RuntimeError("Terminal allocation has unsettled lifecycle authority.")
             receipt = self._allocation_coordinator.receipt_from_checkpoint(
@@ -3979,7 +3935,9 @@ class EnvironmentLifecycle:
         async def checkpoint_disposal(state: dict[str, Any]) -> None:
             nonlocal pending_disposal, disposal_context
             checkpoint = await self._session_store.load_checkpoint(session_id)
-            expected = pending_completion_finalization_from_checkpoint(checkpoint)
+            expected = completion_finalization.pending_completion_finalization_from_checkpoint(
+                checkpoint
+            )
             if expected is None and outcome == "completed":
                 raise RuntimeError("Completion disposal lost its durable marker.")
             if (
@@ -4002,7 +3960,11 @@ class EnvironmentLifecycle:
             def advance(current: dict[str, Any] | None) -> dict[str, Any]:
                 updated = copy_durable_record(current or {}, "checkpoint")
                 if expected is not None:
-                    marker = pending_completion_finalization_from_checkpoint(current)
+                    marker = (
+                        completion_finalization.pending_completion_finalization_from_checkpoint(
+                            current
+                        )
+                    )
                     if not _same_completion_marker(marker, expected):
                         raise RuntimeError("Disposal checkpoint lost its finalization authority.")
                     assert marker is not None
@@ -4010,8 +3972,10 @@ class EnvironmentLifecycle:
                     if existing is not None and existing != state:
                         raise RuntimeError("Completion disposal authority changed.")
                     marker["disposal_state"] = state
-                    updated[PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY] = marker
-                    pending_completion_finalization_from_checkpoint(updated)
+                    updated[
+                        completion_finalization.PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY
+                    ] = marker
+                    completion_finalization.pending_completion_finalization_from_checkpoint(updated)
                 return updated
 
             if expected is None or expected["outcome"] != "completed":
@@ -4148,7 +4112,10 @@ class EnvironmentLifecycle:
             checkpoint = await self._session_store.load_checkpoint(session.id)
             if (
                 self._active_environment_setups.get(session.id) is not None
-                or pending_completion_finalization_from_checkpoint(checkpoint) is not None
+                or completion_finalization.pending_completion_finalization_from_checkpoint(
+                    checkpoint
+                )
+                is not None
             ):
                 raise RuntimeError("Retained completion cleanup has not fully settled.")
             return True
@@ -4160,7 +4127,10 @@ class EnvironmentLifecycle:
         if factory is None:
             raise RuntimeError("Completion disposal recovery requires its factory.")
         checkpoint = await self._session_store.load_checkpoint(session.id)
-        if pending_completion_finalization_from_checkpoint(checkpoint) != marker:
+        if (
+            completion_finalization.pending_completion_finalization_from_checkpoint(checkpoint)
+            != marker
+        ):
             raise RuntimeError("Completion disposal recovery lost its exact marker.")
         reconnect_metadata, allocation_owner = _factory_reconnect_state_from_checkpoint(
             checkpoint,
@@ -4277,7 +4247,9 @@ class EnvironmentLifecycle:
                     "Session changed before completion finalization was checkpointed."
                 )
             copied = {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
-            existing = pending_completion_finalization_from_checkpoint(copied)
+            existing = completion_finalization.pending_completion_finalization_from_checkpoint(
+                copied
+            )
             if existing is not None:
                 for field_name in (
                     "version",
@@ -4293,9 +4265,11 @@ class EnvironmentLifecycle:
                 marker["disposal_state"] = copy_json_value(
                     existing["disposal_state"], "completion disposal state"
                 )
-            copied[PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY] = copy_json_value(
-                marker,
-                "pending completion finalization",
+            copied[completion_finalization.PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY] = (
+                copy_json_value(
+                    marker,
+                    "pending completion finalization",
+                )
             )
             return copied
 
@@ -4319,7 +4293,7 @@ class EnvironmentLifecycle:
         mutation = RuntimePublicationMutation(
             operations=(
                 RuntimePublicationCheckpointOperation(
-                    key=PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
+                    key=completion_finalization.PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
                     expected_value_digest=None,
                     action="set",
                     value=marker,
@@ -4369,8 +4343,8 @@ class EnvironmentLifecycle:
                 "completion finalization binding state",
             ),
         }
-        pending_completion_finalization_from_checkpoint(
-            {PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY: marker}
+        completion_finalization.pending_completion_finalization_from_checkpoint(
+            {completion_finalization.PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY: marker}
         )
         return marker
 
@@ -4382,8 +4356,10 @@ class EnvironmentLifecycle:
     ) -> None:
         """Clear the exact marker only after its source synchronization succeeds."""
 
-        expected = pending_completion_finalization_from_checkpoint(
-            {PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY: expected_marker}
+        expected = completion_finalization.pending_completion_finalization_from_checkpoint(
+            {
+                completion_finalization.PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY: expected_marker
+            }
         )
         if expected is None:  # pragma: no cover - constructed immediately above
             raise AssertionError("Completion finalization marker is unavailable.")
@@ -4392,13 +4368,15 @@ class EnvironmentLifecycle:
             _session: Session,
             checkpoint: dict[str, Any] | None,
         ) -> dict[str, Any] | None:
-            current = pending_completion_finalization_from_checkpoint(checkpoint)
+            current = completion_finalization.pending_completion_finalization_from_checkpoint(
+                checkpoint
+            )
             if current is None:
                 return checkpoint
             if not _same_completion_marker(current, expected):
                 raise RuntimeError("Completion finalization marker changed before cleanup.")
             copied = copy_durable_record(checkpoint, "checkpoint")
-            copied.pop(PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY)
+            copied.pop(completion_finalization.PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY)
             return copied or None
 
         await self._session_store.transform_checkpoint(session_id, clear_marker)
@@ -4411,8 +4389,10 @@ class EnvironmentLifecycle:
     ) -> Session:
         """Atomically publish success only after the exact workspace commit succeeds."""
 
-        expected = pending_completion_finalization_from_checkpoint(
-            {PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY: expected_marker}
+        expected = completion_finalization.pending_completion_finalization_from_checkpoint(
+            {
+                completion_finalization.PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY: expected_marker
+            }
         )
         if expected is None:  # pragma: no cover - constructed immediately above
             raise AssertionError("Completion finalization marker is unavailable.")
@@ -4426,11 +4406,13 @@ class EnvironmentLifecycle:
                 or current_session.run_epoch != session.run_epoch
             ):
                 raise SessionRunFenced("Completion finalization lost its exact session authority.")
-            current = pending_completion_finalization_from_checkpoint(checkpoint)
+            current = completion_finalization.pending_completion_finalization_from_checkpoint(
+                checkpoint
+            )
             if not _same_completion_marker(current, expected):
                 raise RuntimeError("Completion finalization marker changed before commit.")
             copied = copy_durable_record(checkpoint, "checkpoint")
-            copied.pop(PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY)
+            copied.pop(completion_finalization.PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY)
             return copied or None
 
         return await self._session_store.transition_status_and_checkpoint(
@@ -4455,7 +4437,7 @@ class EnvironmentLifecycle:
             ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
             ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY,
             ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY,
-            PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
+            completion_finalization.PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
         )
 
         def transform(session: Session, current: dict[str, Any] | None) -> dict[str, Any]:
@@ -6376,8 +6358,10 @@ class EnvironmentLifecycle:
                 and execution_profile is not None
                 and binding._completion_requires_successful_finalization(bound_workspace)
             ):
-                existing_marker = pending_completion_finalization_from_checkpoint(
-                    await self._session_store.load_checkpoint(session.id)
+                existing_marker = (
+                    completion_finalization.pending_completion_finalization_from_checkpoint(
+                        await self._session_store.load_checkpoint(session.id)
+                    )
                 )
                 if existing_marker is None:
                     # Failed/interrupted copy-back owns output just as completed
@@ -7137,7 +7121,11 @@ class EnvironmentLifecycle:
                 try:
                     if setup_owner.cleanup_requires_finalize_retry:
                         checkpoint = await self._session_store.load_checkpoint(session_id)
-                        marker = pending_completion_finalization_from_checkpoint(checkpoint)
+                        marker = (
+                            completion_finalization.pending_completion_finalization_from_checkpoint(
+                                checkpoint
+                            )
+                        )
                         await environment_operation_boundary.await_environment_operation(
                             lambda: self._finalize_binding_with_disposal_checkpoint(
                                 registered_environment,

@@ -28,9 +28,6 @@ from cayu.runtime._environment_allocation import (
     EnvironmentAllocationRecord,
     checkpoint_object_map,
 )
-from cayu.runtime._environment_lifecycle import (
-    pending_completion_finalization_from_checkpoint,
-)
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._model_step_executor import model_completion_recovery_context_from_stage
 from cayu.runtime._provider_cleanup_evidence import local_http_cleanup_event_id
@@ -47,6 +44,7 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileMismatchError,
 )
 from cayu.runtime.provider_operations import RecoverableProviderOperation
+from cayu.sessions import _completion_finalization as completion_finalization
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._durable_operation_ownership import (
     DurableOperationOwnership,
@@ -1573,7 +1571,9 @@ class RecoveryPlanCoordinator:
             if type(payload) is not dict:
                 raise ValueError("Environment allocation intent is invalid.")
             allocation_states.append(EnvironmentAllocationRecord.from_payload(payload).state)
-        finalization = pending_completion_finalization_from_checkpoint(dict(checkpoint))
+        finalization = completion_finalization.pending_completion_finalization_from_checkpoint(
+            dict(checkpoint)
+        )
         return RecoveryEnvironmentEvidence(
             allocation_states=tuple(sorted(allocation_states, key=lambda state: state.value)),
             completion_finalization_pending=finalization is not None,
