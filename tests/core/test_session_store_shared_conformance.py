@@ -29976,3 +29976,97 @@ def test_session_store_conformance_rejects_mcp_baselines_without_matching_accept
             await _close_store(store)
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("signal_order", ["status-first", "cancel-first", "caller-cancel"])
+def test_session_store_conformance_interrupt_does_not_cancel_consumer(
+    session_store_case,
+    monkeypatch,
+    signal_order,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(ScriptedModelProvider([]), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        session_id = "interrupt-consumer-order"
+        control = app._session_control
+        boundary = asyncio.Event()
+        signal_sent = asyncio.Event()
+        original_check = control.raise_if_interrupted
+        original_cancel = control.cancel_active_runs
+        original_handle = app._session_engine._handle_session_interrupted
+        observed = []
+        consumer = None
+
+        async def hold_status_check(sid):
+            boundary.set()
+            await signal_sent.wait()
+            await original_check(sid)
+
+        def signal(sid):
+            assert control._interrupt_targets(sid)
+            if signal_order == "cancel-first":
+                original_cancel(sid)
+            signal_sent.set()
+            return True
+
+        async def publish(**kwargs):
+            assert consumer is not None
+            if signal_order != "cancel-first":
+                assert control.is_emitting_interrupted(session_id, task=consumer)
+                assert consumer.cancelling() == 0
+                assert original_cancel(session_id)
+                if signal_order == "caller-cancel":
+                    consumer.cancel("caller cancellation")
+            async for event in original_handle(**kwargs):
+                yield event
+
+        monkeypatch.setattr(control, "raise_if_interrupted", hold_status_check)
+        monkeypatch.setattr(control, "cancel_active_runs", signal)
+        monkeypatch.setattr(app._session_engine, "_handle_session_interrupted", publish)
+
+        async def collect():
+            async for event in app.run(
+                RunRequest(
+                    session_id=session_id,
+                    agent_name="assistant",
+                    messages=[Message.text("user", "hello")],
+                )
+            ):
+                observed.append(event)
+
+        consumer = asyncio.create_task(collect())
+        try:
+            await asyncio.wait_for(boundary.wait(), 10)
+            interrupt_events = await asyncio.wait_for(
+                _collect_events(
+                    app.interrupt_session(
+                        InterruptSessionRequest(session_id=session_id, reason="pause")
+                    )
+                ),
+                10,
+            )
+            if signal_order == "caller-cancel":
+                with pytest.raises(asyncio.CancelledError, match="caller cancellation"):
+                    await consumer
+                assert consumer.cancelling() == 1
+            else:
+                await consumer
+                assert consumer.cancelling() == 0
+            interrupted = [e for e in observed if e.type == EventType.SESSION_INTERRUPTED]
+            assert len(interrupted) == 1
+            assert [e.id for e in interrupt_events if e.type == EventType.SESSION_INTERRUPTED] == [
+                interrupted[0].id
+            ]
+            assert (await store.load(session_id)).status is SessionStatus.INTERRUPTED
+            assert not any(e.type == EventType.SESSION_FAILED for e in observed)
+        finally:
+            signal_sent.set()
+            if not consumer.done():
+                consumer.cancel()
+            await asyncio.gather(consumer, return_exceptions=True)
+            await app.aclose()
+            await _close_store(store)
+
+    asyncio.run(run())

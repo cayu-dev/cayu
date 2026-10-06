@@ -44134,5 +44134,14 @@
     "tests/core/test_application_accounting.py::test_reporting_imports_without_application_or_execution_controllers": 1.3176609580114018,
     "tests/core/test_application_accounting.py::test_reports_compose_without_application_and_keep_native_reads[memory]": 0.04303724999772385,
     "tests/core/test_application_accounting.py::test_reports_compose_without_application_and_keep_native_reads[postgres]": 0.5902694160031388,
-    "tests/core/test_application_accounting.py::test_reports_compose_without_application_and_keep_native_reads[sqlite]": 0.2772559160075616
+    "tests/core/test_application_accounting.py::test_reports_compose_without_application_and_keep_native_reads[sqlite]": 0.2772559160075616,
+    "tests/core/test_session_store_shared_conformance.py::test_session_store_conformance_interrupt_does_not_cancel_consumer[memory-caller-cancel]": 0.20912395796040073,
+    "tests/core/test_session_store_shared_conformance.py::test_session_store_conformance_interrupt_does_not_cancel_consumer[memory-cancel-first]": 0.22809195797890425,
+    "tests/core/test_session_store_shared_conformance.py::test_session_store_conformance_interrupt_does_not_cancel_consumer[memory-status-first]": 0.3256492919754237,
+    "tests/core/test_session_store_shared_conformance.py::test_session_store_conformance_interrupt_does_not_cancel_consumer[postgres-caller-cancel]": 0.651940417039441,
+    "tests/core/test_session_store_shared_conformance.py::test_session_store_conformance_interrupt_does_not_cancel_consumer[postgres-cancel-first]": 0.5995373330370057,
+    "tests/core/test_session_store_shared_conformance.py::test_session_store_conformance_interrupt_does_not_cancel_consumer[postgres-status-first]": 3.2624802489881404,
+    "tests/core/test_session_store_shared_conformance.py::test_session_store_conformance_interrupt_does_not_cancel_consumer[sqlite-caller-cancel]": 0.4112004169728607,
+    "tests/core/test_session_store_shared_conformance.py::test_session_store_conformance_interrupt_does_not_cancel_consumer[sqlite-cancel-first]": 0.4295792090415489,
+    "tests/core/test_session_store_shared_conformance.py::test_session_store_conformance_interrupt_does_not_cancel_consumer[sqlite-status-first]": 0.42567074997350574
 }

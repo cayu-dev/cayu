@@ -481,9 +481,10 @@ class SessionControl(Generic[UsageTrackerT]):
     def cancel_active_runs(self, session_id: str) -> bool:
         signalled = False
         for task in self._interrupt_targets(session_id):
-            # An existing cancellation owns cleanup; another signal must not
-            # interrupt its durable terminal publication.
-            if not task.cancelling():
+            # Cancellation or cooperative status observation may already own
+            # interruption publication. Keep that run as a finalization target,
+            # but do not cancel it again while its shielded child publishes.
+            if not task.cancelling() and not self.is_emitting_interrupted(session_id, task=task):
                 task.cancel()
             signalled = True
         return signalled
