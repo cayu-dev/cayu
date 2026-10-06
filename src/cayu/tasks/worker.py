@@ -89,7 +89,11 @@ from cayu.runtime._task_store_operation_boundary import (
     task_store_interrupted_handoff_capability_is_complete,
     task_store_mutation_is_cancellation_quiescent,
 )
-from cayu.runtime.application_lifecycle import ApplicationAdmissionsSealed
+from cayu.runtime.application_lifecycle import (
+    ApplicationAdmission,
+    ApplicationAdmissionsSealed,
+    _current_operation_admission,
+)
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
@@ -3242,10 +3246,10 @@ async def _heartbeat_until(
                 timeout=max(0.0, current_deadline() - monotonic()),
             )
         except asyncio.CancelledError:
-            reconciliation_task.add_done_callback(_consume_task_heartbeat_outcome)
+            _retain_abandoned_task_lease_operation(reconciliation_task)
             raise
         if reconciliation_task not in completed:
-            reconciliation_task.add_done_callback(_consume_task_heartbeat_outcome)
+            _retain_abandoned_task_lease_operation(reconciliation_task)
             raise heartbeat_error
         try:
             task = reconciliation_task.result()
@@ -3306,10 +3310,10 @@ async def _renew_task_lease_before_deadline(
                 timeout=max(0.0, claim_deadline_monotonic - monotonic()),
             )
         except asyncio.CancelledError:
-            renewal_task.add_done_callback(_consume_task_heartbeat_outcome)
+            _retain_abandoned_task_lease_operation(renewal_task)
             raise
         if renewal_task not in completed:
-            renewal_task.add_done_callback(_consume_task_heartbeat_outcome)
+            _retain_abandoned_task_lease_operation(renewal_task)
             raise TaskClaimLost(
                 "Task heartbeat acknowledgement did not arrive before the last positively "
                 "known lease deadline."
@@ -3327,9 +3331,32 @@ async def _renew_task_lease_before_deadline(
         return updated, renewed_deadline
 
 
+# Lease renewals and reconciliation reads that outlived the worker waiting for
+# them, by the application whose operation started them: its shutdown waits for
+# them before releasing the task store.
+_ABANDONED_TASK_LEASE_OPERATIONS: dict[asyncio.Task[Any], ApplicationAdmission | None] = {}
+
+
+def _retain_abandoned_task_lease_operation(task: asyncio.Task[Any]) -> None:
+    _ABANDONED_TASK_LEASE_OPERATIONS[task] = _current_operation_admission()
+    task.add_done_callback(_consume_task_heartbeat_outcome)
+
+
+def abandoned_task_lease_operations(application: ApplicationAdmission) -> set[asyncio.Future[Any]]:
+    """This application's abandoned task-lease store calls still running on this loop."""
+
+    loop = asyncio.get_running_loop()
+    return {
+        task
+        for task, owner in tuple(_ABANDONED_TASK_LEASE_OPERATIONS.items())
+        if owner is application and not task.done() and task.get_loop() is loop
+    }
+
+
 def _consume_task_heartbeat_outcome(task: asyncio.Task[Any]) -> None:
     """Observe a store heartbeat that outlived this worker's local authority."""
 
+    _ABANDONED_TASK_LEASE_OPERATIONS.pop(task, None)
     with contextlib.suppress(BaseException):
         task.result()
 

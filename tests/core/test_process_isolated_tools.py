@@ -3167,6 +3167,79 @@ def test_unproven_cleanup_fences_later_isolated_dispatch_until_owner_settles(
     asyncio.run(scenario())
 
 
+@pytest.mark.process
+def test_application_shutdown_waits_for_its_unproven_isolated_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class OwnedResource:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    async def scenario() -> None:
+        release_cleanup = asyncio.Event()
+        original_settle_group = isolated_process._settle_owned_supervisor
+
+        async def blocked_settle_group(*args, **kwargs):
+            await release_cleanup.wait()
+            return await original_settle_group(*args, **kwargs)
+
+        monkeypatch.setattr(isolated_process, "_settle_owned_supervisor", blocked_settle_group)
+        monkeypatch.setattr(isolated_process, "_CLEANUP_SETTLEMENT_HEADROOM_SECONDS", 0.01)
+        started_path = tmp_path / "unsettled-child-started"
+        tool = _tool(
+            mode="conditional_gil_block",
+            deadline_seconds=8,
+            factory_config={"seconds": 30, "started_path": str(started_path)},
+            effect=ToolEffect.EXTERNAL,
+        )
+        owned = OwnedResource()
+        app = CayuApp(enable_logging=False, owned_resources=(owned,))
+
+        async def invoke():
+            arguments = {"text": "block"}
+            return await tool_execution.run_tool(
+                tool=tool,
+                effect=ToolEffect.EXTERNAL,
+                ctx=_context(arguments),
+                arguments=arguments,
+                registered_schema=_SCHEMA,
+                registered_execution_contract=isolated_tool_execution_contract(tool),
+                redactor=SecretRedactor,
+            )
+
+        try:
+            # The tool runs within one of the application's operations.
+            outcome = await app._run_worker_step(invoke)
+            assert outcome.result.structured["isolated_tool_failure_code"] == (
+                "process_cleanup_unproven"
+            )
+            retained = tuple(isolated_process._RETAINED_ISOLATED_TOOL_OWNERS)
+            assert retained
+            assert all(
+                isolated_process._RETAINED_ISOLATED_TOOL_APPLICATIONS[task] is app._admission
+                for task in retained
+            )
+            first = await app.aclose(timeout_s=0.5)
+            assert not first.settled and not owned.closed
+            release_cleanup.set()
+            assert (await app.aclose(timeout_s=10)).settled and owned.closed
+        finally:
+            release_cleanup.set()
+            pending = [
+                task
+                for task in tuple(isolated_process._RETAINED_ISOLATED_TOOL_OWNERS)
+                if not task.done()
+            ]
+            if pending:
+                await asyncio.wait(pending, timeout=3)
+
+    asyncio.run(scenario())
+
+
 def test_cleanup_fence_appearing_during_dispatch_publication_blocks_spawn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

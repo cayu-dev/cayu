@@ -27,6 +27,7 @@ from cayu._exception_groups import (
 from cayu._task_wait import (
     await_shielded_task_outcome,
     restore_task_cancellation_requests,
+    wait_until_idle,
 )
 from cayu._validation import (
     canonical_durable_json_bytes,
@@ -41,6 +42,10 @@ from cayu.runtime._isolated_tool_protocol import (
     build_isolated_tool_request,
     decode_isolated_tool_response,
     isolated_tool_terminal_frame_payload_length,
+)
+from cayu.runtime.application_lifecycle import (
+    ApplicationAdmission,
+    _current_operation_admission,
 )
 from cayu.tools.base import ToolContext, ToolResult, _runtime_tool_invocation_authority
 from cayu.tools.gateway import validate_effective_tool_arguments
@@ -89,6 +94,9 @@ _RETAINED_ISOLATED_TOOL_OWNERS: dict[
     asyncio.Task[Any],
     Callable[[], Coroutine[Any, Any, Any]] | None,
 ] = {}
+# The application whose operation dispatched each retained cleanup: its
+# shutdown waits for that cleanup, and only that application's.
+_RETAINED_ISOLATED_TOOL_APPLICATIONS: dict[asyncio.Task[Any], ApplicationAdmission | None] = {}
 
 
 class _ChildSubreaperProbeUnavailable(RuntimeError):
@@ -2381,7 +2389,17 @@ def _retain_task(
     task: asyncio.Task[Any],
     *,
     retry_factory: Callable[[], Coroutine[Any, Any, Any]] | None = None,
+    retry_of: asyncio.Task[Any] | None = None,
 ) -> None:
+    # A retry, and work a retained cleanup starts, belong to the application
+    # that dispatched the original cleanup, whoever triggered the retry.
+    origin = retry_of if retry_of is not None else asyncio.current_task()
+    application = (
+        _RETAINED_ISOLATED_TOOL_APPLICATIONS[origin]
+        if origin in _RETAINED_ISOLATED_TOOL_APPLICATIONS
+        else _current_operation_admission()
+    )
+    _RETAINED_ISOLATED_TOOL_APPLICATIONS.setdefault(task, application)
     # Task and retry ownership form one admission-fencing record.  Publishing
     # them through one mapping assignment prevents interruption from exposing
     # a retained task without the retry owner needed to settle it.
@@ -2426,10 +2444,18 @@ def _retained_task_completed_successfully(task: asyncio.Task[Any]) -> bool:
 
 def _discard_retained_task(task: asyncio.Task[Any]) -> None:
     _RETAINED_ISOLATED_TOOL_OWNERS.pop(task, None)
+    _RETAINED_ISOLATED_TOOL_APPLICATIONS.pop(task, None)
 
 
 def _retained_isolated_tool_cleanup_pending() -> bool:
     """Return positive process-local evidence of an unresolved cleanup owner."""
+
+    _retry_failed_retained_cleanups(lambda _task: True)
+    return bool(_RETAINED_ISOLATED_TOOL_OWNERS)
+
+
+def _retry_failed_retained_cleanups(selected: Callable[[asyncio.Task[Any]], bool]) -> None:
+    """Prune settled cleanups and start one retry for each selected failed one."""
 
     try:
         loop = asyncio.get_running_loop()
@@ -2446,7 +2472,7 @@ def _retained_isolated_tool_cleanup_pending() -> bool:
         if _retained_task_completed_successfully(task):
             _discard_retained_task(task)
             continue
-        if not task.done() or retry_factory is None or loop is None:
+        if not task.done() or retry_factory is None or loop is None or not selected(task):
             continue
         try:
             retry_task = loop.create_task(
@@ -2455,11 +2481,59 @@ def _retained_isolated_tool_cleanup_pending() -> bool:
             )
         except BaseException:
             continue
-        _retain_task(retry_task, retry_factory=retry_factory)
+        _retain_task(retry_task, retry_factory=retry_factory, retry_of=task)
         # Publish the replacement before retiring the completed owner so an
         # interrupt cannot temporarily remove the process-global fence.
         _discard_retained_task(task)
-    return bool(_RETAINED_ISOLATED_TOOL_OWNERS)
+
+
+def _application_cleanups(application: ApplicationAdmission) -> list[asyncio.Task[Any]]:
+    return [
+        task
+        for task in _RETAINED_ISOLATED_TOOL_OWNERS
+        if _RETAINED_ISOLATED_TOOL_APPLICATIONS.get(task) is application
+    ]
+
+
+def retained_isolated_tool_cleanups_unresolved(application: ApplicationAdmission) -> bool:
+    """Whether a cleanup this application dispatched has not settled, without retrying."""
+
+    for task, retry_factory in tuple(_RETAINED_ISOLATED_TOOL_OWNERS.items()):
+        late_spawn_owner = _late_spawn_retry_owner(retry_factory)
+        if (
+            late_spawn_owner is not None and late_spawn_owner.settled
+        ) or _retained_task_completed_successfully(task):
+            _discard_retained_task(task)
+    return bool(_application_cleanups(application))
+
+
+def retry_retained_isolated_tool_cleanups(application: ApplicationAdmission) -> None:
+    """Start one retry for each failed cleanup this application dispatched."""
+
+    _retry_failed_retained_cleanups(
+        lambda task: _RETAINED_ISOLATED_TOOL_APPLICATIONS.get(task) is application
+    )
+
+
+async def wait_for_retained_isolated_tool_cleanups(
+    application: ApplicationAdmission, *, timeout_s: float
+) -> bool:
+    """Wait, without cancelling, for this application's retained cleanups.
+
+    Returns whether all settled; one still failing stays retained for a later
+    retry. A cleanup left on another event loop is never waited on here.
+    """
+
+    loop = asyncio.get_running_loop()
+    await wait_until_idle(
+        lambda: {
+            task
+            for task in _application_cleanups(application)
+            if not task.done() and task.get_loop() is loop
+        },
+        timeout_s=timeout_s,
+    )
+    return not retained_isolated_tool_cleanups_unresolved(application)
 
 
 def _restore_and_raise_cancellation(outcome: Any, *, cause: BaseException | None) -> None:
@@ -2482,5 +2556,8 @@ __all__ = [
     "IsolatedToolSettlementFailure",
     "execute_process_isolated_tool",
     "isolated_tool_execution_contract",
+    "retained_isolated_tool_cleanups_unresolved",
+    "retry_retained_isolated_tool_cleanups",
     "validate_process_isolated_tool_registration",
+    "wait_for_retained_isolated_tool_cleanups",
 ]

@@ -7,6 +7,7 @@ from typing import Any
 
 from pydantic import SecretStr
 
+from cayu._task_wait import run_thread_to_completion
 from cayu._validation import (
     copy_durable_json_object,
     copy_durable_metadata,
@@ -108,7 +109,8 @@ class SecretsManagerVault(Vault):
         metadata = self._metadata_for(logical_name, scope)
         client = await self._get_client()
         try:
-            response = await asyncio.to_thread(
+            # The SDK call runs to completion even if this lookup is cancelled.
+            response = await run_thread_to_completion(
                 client.get_secret_value,
                 SecretId=secret_id,
                 VersionStage=self._version_stage,
@@ -167,7 +169,7 @@ class SecretsManagerVault(Vault):
             return self._client
         async with self._client_lock:
             if self._client is None:
-                self._client = await asyncio.to_thread(self._create_client)
+                self._client = await run_thread_to_completion(self._create_client)
         return self._client
 
     def _create_client(self) -> Any:

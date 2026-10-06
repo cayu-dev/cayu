@@ -131,6 +131,9 @@ class SessionControl(Generic[UsageTrackerT]):
         self._sessions_requesting_interruption: set[str] = set()
         self._interrupt_signals: dict[str, asyncio.Event] = {}
         self._terminal_finalization_claim_handoffs: dict[str, TerminalFinalizationClaimHandoff] = {}
+        # Heartbeats of handoffs no task accepted, stopped but possibly still
+        # renewing: no interrupter reclaims them, so shutdown waits for them.
+        self._stopped_handoff_heartbeats: set[asyncio.Task[None]] = set()
 
     def stream_interrupt_poll(self, session_id: str) -> StreamInterruptPoll:
         return StreamInterruptPoll(self, session_id=session_id)
@@ -299,6 +302,11 @@ class SessionControl(Generic[UsageTrackerT]):
             if not already_owned:
                 self.unregister_active_control_task(session_id, task)
 
+    def stopped_handoff_heartbeats(self) -> set[asyncio.Future[Any]]:
+        """Heartbeats of unaccepted terminal-finalization handoffs still renewing."""
+
+        return set(self._stopped_handoff_heartbeats)
+
     def unregister_active_control_task(self, session_id: str, task: asyncio.Task[Any]) -> None:
         control_tasks = self._active_control_tasks.get(session_id)
         if control_tasks is None:
@@ -398,6 +406,10 @@ class SessionControl(Generic[UsageTrackerT]):
                 # renew it forever.
                 self._terminal_finalization_claim_handoffs.pop(session_id, None)
                 current.heartbeat_stop.set()
+                heartbeat = current.heartbeat_task
+                if not heartbeat.done():
+                    self._stopped_handoff_heartbeats.add(heartbeat)
+                    heartbeat.add_done_callback(self._stopped_handoff_heartbeats.discard)
 
         for target in targets:
             target.add_done_callback(stop_unaccepted_handoff)

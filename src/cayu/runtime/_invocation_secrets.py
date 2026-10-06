@@ -232,6 +232,7 @@ async def _await_resolved_secret_operation(
     operation: asyncio.Task[ResolvedSecret],
     *,
     abandon_resolution: Callable[[], bool],
+    retain_abandoned: Callable[[asyncio.Task[Any]], None],
 ) -> ResolvedSecret:
     """Return a persisted resolution or fence a cancelled remote lookup."""
 
@@ -289,6 +290,9 @@ async def _await_resolved_secret_operation(
                     _consume_resolution_task(operation)
                 else:
                     operation.add_done_callback(_consume_resolution_task)
+                    # It may still use the environment's vault or proxy, so
+                    # shutdown waits for it before closing them.
+                    retain_abandoned(operation)
                 del operation, abandon_resolution
                 raise cancellation from None
             # Resolution has already registered its redactor and entered the
@@ -344,6 +348,8 @@ def _consume_resolution_task(task: asyncio.Task[ResolvedSecret]) -> None:
 async def _dispatch_tracked_secret_resolution(
     tracker: InvocationSecretTracker,
     operation_factory: Callable[[object], Coroutine[Any, Any, ResolvedSecret]],
+    *,
+    retain_abandoned: Callable[[asyncio.Task[Any]], None],
 ) -> ResolvedSecret:
     """Checkpoint cancellation, claim ownership, and dispatch one resolver."""
 
@@ -370,6 +376,7 @@ async def _dispatch_tracked_secret_resolution(
     return await _await_resolved_secret_operation(
         operation,
         abandon_resolution=abandon,
+        retain_abandoned=retain_abandoned,
     )
 
 
@@ -381,6 +388,8 @@ class _TrackingVault(Vault):
         vault: Vault,
         tracker: InvocationSecretTracker,
         on_redactor_change: Callable[[InvocationRedactorSnapshot], Awaitable[None]] | None = None,
+        *,
+        retain_abandoned: Callable[[asyncio.Task[Any]], None],
     ) -> None:
         if not isinstance(vault, Vault):
             raise TypeError("vault must be a Vault.")
@@ -388,9 +397,12 @@ class _TrackingVault(Vault):
             raise TypeError("tracker must be an InvocationSecretTracker.")
         if on_redactor_change is not None and not callable(on_redactor_change):
             raise TypeError("on_redactor_change must be callable.")
+        if not callable(retain_abandoned):
+            raise TypeError("retain_abandoned must be callable.")
         self._vault = vault
         self._tracker = tracker
         self._on_redactor_change = on_redactor_change or _ignore_redactor_change
+        self._retain_abandoned = retain_abandoned
 
     async def get(
         self,
@@ -426,6 +438,7 @@ class _TrackingVault(Vault):
         return await _dispatch_tracked_secret_resolution(
             self._tracker,
             operation_factory,
+            retain_abandoned=self._retain_abandoned,
         )
 
     async def _resolve_and_publish(
@@ -469,6 +482,8 @@ class _TrackingCredentialProxy(CredentialProxy):
         tracker: InvocationSecretTracker,
         on_authorize: Callable[[ProxyAuthorizationRecord], None],
         on_redactor_change: Callable[[InvocationRedactorSnapshot], Awaitable[None]] | None = None,
+        *,
+        retain_abandoned: Callable[[asyncio.Task[Any]], None],
     ) -> None:
         if not isinstance(proxy, CredentialProxy):
             raise TypeError("proxy must be a CredentialProxy.")
@@ -478,10 +493,13 @@ class _TrackingCredentialProxy(CredentialProxy):
             raise TypeError("on_authorize must be callable.")
         if on_redactor_change is not None and not callable(on_redactor_change):
             raise TypeError("on_redactor_change must be callable.")
+        if not callable(retain_abandoned):
+            raise TypeError("retain_abandoned must be callable.")
         self._proxy = proxy
         self._tracker = tracker
         self._on_authorize = on_authorize
         self._on_redactor_change = on_redactor_change or _ignore_redactor_change
+        self._retain_abandoned = retain_abandoned
 
     def supports_webbridge_credential_authority(
         self,
@@ -510,6 +528,7 @@ class _TrackingCredentialProxy(CredentialProxy):
         return await _dispatch_tracked_secret_resolution(
             self._tracker,
             operation_factory,
+            retain_abandoned=self._retain_abandoned,
         )
 
     async def _resolve_and_publish(
@@ -599,13 +618,14 @@ def vault_for_environment(
     *,
     tracker: InvocationSecretTracker,
     on_redactor_change: Callable[[InvocationRedactorSnapshot], Awaitable[None]],
+    retain_abandoned: Callable[[asyncio.Task[Any]], None],
 ) -> Vault | None:
     if registered_environment is None:
         return None
     vault = registered_environment.environment.vault
     if vault is None:
         return None
-    return _TrackingVault(vault, tracker, on_redactor_change)
+    return _TrackingVault(vault, tracker, on_redactor_change, retain_abandoned=retain_abandoned)
 
 
 def proxy_for_environment(
@@ -614,13 +634,16 @@ def proxy_for_environment(
     tracker: InvocationSecretTracker,
     on_authorize: Callable[[ProxyAuthorizationRecord], None],
     on_redactor_change: Callable[[InvocationRedactorSnapshot], Awaitable[None]],
+    retain_abandoned: Callable[[asyncio.Task[Any]], None],
 ) -> CredentialProxy | None:
     if registered_environment is None:
         return None
     proxy = registered_environment.environment.proxy
     if proxy is None:
         return None
-    return _TrackingCredentialProxy(proxy, tracker, on_authorize, on_redactor_change)
+    return _TrackingCredentialProxy(
+        proxy, tracker, on_authorize, on_redactor_change, retain_abandoned=retain_abandoned
+    )
 
 
 @dataclass(frozen=True, slots=True)

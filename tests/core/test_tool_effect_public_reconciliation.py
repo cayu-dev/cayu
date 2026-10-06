@@ -107,6 +107,7 @@ def test_public_reconciliation_consumes_verified_outcome_without_external_replay
             "repeated-cancel",
             "deadline",
             "cancel-cleanup-read",
+            "shutdown",
         }
         lifecycle = fault_phase in {"lifecycle", "factory-failure", "preflight"}
         hook_observations = []
@@ -1034,6 +1035,18 @@ def test_public_reconciliation_consumes_verified_outcome_without_external_replay
                 retained_operations = tuple(owner._operations._operations)
                 assert len(retained_operations) == 1
                 assert not callback_settled.is_set()
+                if fault_phase == "shutdown":
+                    # The abandoned lookup may still use application resources:
+                    # shutdown waits for it instead of reporting settled.
+                    first = await app.aclose(timeout_s=0.3)
+                    step = first.step("recovery_cleanups")
+                    assert not first.settled
+                    assert step is not None and step.status == "incomplete"
+                    callback_release.set()
+                    await asyncio.wait_for(callback_settled.wait(), 10)
+                    assert (await app.aclose(timeout_s=10)).settled
+                    assert owner.pending_operations == 0
+                    return
                 assert (await store.load("receipt-public")).status.value == "interrupted"
                 admitted = await assert_admitted(record)
                 before_release = await store.load_events("receipt-public")
@@ -1859,6 +1872,23 @@ def test_public_reconciliation_retains_late_callback_without_settlement(
         backend,
         "lookup",
         approval_gate,
+        tmp_path,
+        monkeypatch,
+        caplog,
+        capsys,
+    )
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_shutdown_waits_for_a_reconciliation_lookup_its_caller_abandoned(
+    backend, tmp_path, monkeypatch, caplog, capsys
+):
+    test_public_reconciliation_consumes_verified_outcome_without_external_replay(
+        "completed",
+        "shutdown",
+        backend,
+        "lookup",
+        False,
         tmp_path,
         monkeypatch,
         caplog,

@@ -3472,7 +3472,9 @@ def test_late_vault_resolution_error_traceback_does_not_retain_secret() -> None:
         vault = DelayedVault()
         vault.started = asyncio.Event()
         vault.release = asyncio.Event()
-        tracking_vault = invocation_secrets_module._TrackingVault(vault, tracker)
+        tracking_vault = invocation_secrets_module._TrackingVault(
+            vault, tracker, retain_abandoned=lambda _task: None
+        )
         resolution = asyncio.create_task(tracking_vault.resolve(SecretRef(name="api_key")))
         await vault.started.wait()
         publication = tracker.seal_for_publication()
@@ -3509,6 +3511,7 @@ def test_cancellation_during_secret_projection_preserves_cancellation_and_clean_
             StaticVault({"api_key": secret_value}),
             tracker,
             persist_projection,
+            retain_abandoned=lambda _task: None,
         )
         resolution = asyncio.create_task(tracking_vault.resolve(SecretRef(name="api_key")))
         await projection_started.wait()
@@ -3581,6 +3584,7 @@ def test_pending_cancellation_before_secret_resolution_prevents_dispatch(surface
                 vault,
                 tracker,
                 persist_projection,
+                retain_abandoned=lambda _task: None,
             )
             if surface == "vault"
             else invocation_secrets_module._TrackingCredentialProxy(
@@ -3588,6 +3592,7 @@ def test_pending_cancellation_before_secret_resolution_prevents_dispatch(surface
                 tracker,
                 lambda _record: None,
                 persist_projection,
+                retain_abandoned=lambda _task: None,
             )
         )
 
@@ -3687,6 +3692,7 @@ def test_cancellation_fences_a_nonresponsive_secret_resolver(surface: str) -> No
                 vault,
                 tracker,
                 persist_projection,
+                retain_abandoned=lambda _task: None,
             )
             if surface == "vault"
             else invocation_secrets_module._TrackingCredentialProxy(
@@ -3694,6 +3700,7 @@ def test_cancellation_fences_a_nonresponsive_secret_resolver(surface: str) -> No
                 tracker,
                 lambda _record: None,
                 persist_projection,
+                retain_abandoned=lambda _task: None,
             )
         )
         resolution = asyncio.create_task(resolver.resolve(SecretRef(name="api_key")))

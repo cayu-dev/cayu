@@ -85,6 +85,7 @@ from cayu.approvals.user_input import (
     copy_user_input_response,
 )
 from cayu.artifacts._images import ImageDecodePolicy
+from cayu.artifacts._settlement import late_artifact_writes
 from cayu.artifacts.attachments import (
     FileAttachment,
     FileAttachmentKind,
@@ -422,6 +423,12 @@ from cayu.runtime._interruption_coordinator import (
 from cayu.runtime._invocation_lifecycle import (
     InvocationContext,
 )
+from cayu.runtime._isolated_tool_process import (
+    retained_isolated_tool_cleanups_unresolved,
+    retry_retained_isolated_tool_cleanups,
+    wait_for_retained_isolated_tool_cleanups,
+)
+from cayu.runtime._local_execution_attempt_owner import retained_local_execution_tasks
 from cayu.runtime._model_execution_selection import ModelExecutionSelection
 from cayu.runtime._model_policy import ModelPolicy
 from cayu.runtime._model_step_executor import (
@@ -728,6 +735,7 @@ from cayu.tasks.scheduling import (
     TaskScheduleEvent,
     TaskScheduleReceipt,
 )
+from cayu.tasks.worker import abandoned_task_lease_operations
 from cayu.tools.base import (
     Tool,
     ToolContext,
@@ -779,6 +787,7 @@ from cayu.verification.completion_verifiers import (
     CompletionVerifierExecutionRequest,
     DeterministicCompletionVerifier,
 )
+from cayu.workspaces.observation_recovery import abandoned_workspace_observation_reads
 
 logger = logging.getLogger(__name__)
 
@@ -2851,8 +2860,12 @@ class CayuApp:
         """Wait for session store writes that outlived the call that started them.
 
         A store write that exceeds its bounded wait is cancelled and kept until
-        it settles, and a provider-operation reconciliation runs past the model
-        step that started it. This waits for that work without cancelling it,
+        it settles, a provider-operation reconciliation runs past the model step
+        that started it, a terminal-finalization claim heartbeat no task
+        accepted may still be renewing after it was stopped, a task worker
+        cancelled mid-renewal leaves its lease write running, and a local
+        execution attempt's supervisor wait or settlement write can outlive its
+        caller. This waits for that work without cancelling it,
         and returns False if any is still running. A cancelled write is not
         reported: its caller already received a timeout and either reconciles it
         from durable state or treats it as best-effort. A reconciliation or final
@@ -2869,6 +2882,7 @@ class CayuApp:
             engine.wait_for_session_operations(timeout_s=float(timeout_s)),
             executor.drain_detached_writes(timeout_s=float(timeout_s)),
             executor.wait_for_provider_reconciliations(timeout_s=float(timeout_s)),
+            wait_until_idle(self._detached_session_store_work, timeout_s=float(timeout_s)),
             return_exceptions=True,
         )
         # Failures are collected only after every wait, with no await in between,
@@ -4989,6 +5003,7 @@ class CayuApp:
             waits = await asyncio.gather(
                 engine.wait_for_session_operations(timeout_s=budget),
                 self._model_step_executor.drain_detached_writes(timeout_s=budget),
+                wait_until_idle(self._detached_session_store_work, timeout_s=budget),
                 return_exceptions=True,
             )
             # No await from here, so an interrupted wait consumes no failure.
@@ -5094,9 +5109,7 @@ class CayuApp:
         if (
             self.recovery_cleanup_status().active_tasks
             or self._session_control.execution_presence.releasing
-            or any(
-                not task.done() for task in self._recovery_coordinator.detached_recovery_writes()
-            )
+            or any(not task.done() for task in self._detached_recovery_work())
         ):
             late["recovery_cleanups"] = "late_work"
         if self._knowledge_publication_scope.pending:
@@ -5116,11 +5129,14 @@ class CayuApp:
         if (
             self._session_engine.session_operations_pending
             or self._model_step_executor.detached_writes_pending
+            or any(not task.done() for task in self._detached_session_store_work())
         ):
             late["session_operations"] = "late_work"
         if self._model_step_executor.provider_cancellation_claims_pending:
             late["provider_operation_cancellations"] = "late_work"
-        if any(not task.done() for task in self._tool_round_executor.detached_projections()):
+        if any(
+            not task.done() for task in self._detached_environment_work()
+        ) or retained_isolated_tool_cleanups_unresolved(self._admission):
             late["environment_cleanups"] = "late_work"
         provider = self.provider_operation_cancellation_status()
         # A rejection after sealing is a provider operation left without a
@@ -5216,8 +5232,9 @@ class CayuApp:
         return self._tool_round_executor.terminal_publication_metrics()
 
     async def drain_recovery_cleanups(self, *, timeout_s: float = 10.0) -> bool:
-        """Wait boundedly for recovery cleanup, stopped execution-presence writes and
-        recovery claim renewals that outlived their heartbeat."""
+        """Wait boundedly for recovery cleanup, stopped execution-presence writes,
+        recovery claim renewals that outlived their heartbeat, and artifact reads
+        and tool-effect reconciliation lookups whose caller stopped waiting."""
 
         if type(timeout_s) not in {int, float} or not isfinite(timeout_s) or timeout_s <= 0:
             raise ValueError("timeout_s must be a finite positive number.")
@@ -5229,17 +5246,20 @@ class CayuApp:
         presence_released = await self._session_control.execution_presence.drain(
             timeout_s=remaining,
         )
-        writes_settled = await wait_until_idle(
-            self._recovery_coordinator.detached_recovery_writes,
+        detached_settled = await wait_until_idle(
+            self._detached_recovery_work,
             timeout_s=max(0.0, deadline - asyncio.get_running_loop().time()),
         )
-        return recovered and presence_released and writes_settled
+        return recovered and presence_released and detached_settled
 
     async def drain_environment_cleanups(self, *, timeout_s: float = 10.0) -> bool:
         """Settle this process's retained cleanup without cancelling live mutations.
 
-        Also waits for tool-result projections that outlived their timeout, which
-        may still write into an environment's artifact store.
+        Also waits for tool-result projections that outlived their timeout and
+        artifact writes whose caller stopped waiting, which may still write into
+        an environment's artifact store, for abandoned
+        secret resolutions, which may still use its vault or credential proxy,
+        and for isolated tool process cleanups, retrying failed ones once.
 
         This is not a durable allocation census. After restart, use
         ``recover_incomplete_session`` (including for terminal sessions) to
@@ -5252,6 +5272,9 @@ class CayuApp:
         deadline = loop.time() + float(timeout_s)
 
         async def environment_cleanups() -> bool:
+            # Retry failed isolated tool cleanups first, so a slow cleanup below
+            # cannot use up the budget before this attempt retried them.
+            retry_retained_isolated_tool_cleanups(self._admission)
             handler = self._egress_authority_adoption_handler
             parked_drained = True
             if handler is not None:
@@ -5268,15 +5291,18 @@ class CayuApp:
             idle_released = await self._release_idle_environment_resources(
                 close=False, deadline=deadline
             )
-            return retained_drained and parked_drained and idle_released
+            # Isolated tool processes whose cleanup outlived their call. An
+            # exhausted budget still reports settled when none is pending.
+            isolated_drained = await wait_for_retained_isolated_tool_cleanups(
+                self._admission, timeout_s=max(0.0, deadline - loop.time())
+            )
+            return retained_drained and parked_drained and idle_released and isolated_drained
 
-        # A hung projection must not skip environment cleanup; it only has to
+        # Hung detached work must not skip environment cleanup; it only has to
         # settle before owned resources close, which this result also gates.
         # Cleanup runs in this task so a caller's cancellation reaches it as is.
-        projections = asyncio.create_task(
-            wait_until_idle(
-                self._tool_round_executor.detached_projections, timeout_s=float(timeout_s)
-            )
+        detached_work = asyncio.create_task(
+            wait_until_idle(self._detached_environment_work, timeout_s=float(timeout_s))
         )
         try:
             cleanup: bool | BaseException
@@ -5284,11 +5310,36 @@ class CayuApp:
                 cleanup = await environment_cleanups()
             except Exception as error:
                 cleanup = error
-            await asyncio.wait((projections,))
+            await asyncio.wait((detached_work,))
         finally:
-            # The projection waiter only observes; stopping it cancels no work.
-            projections.cancel()
-        return combine_drain_results((cleanup, projections.result()))
+            # The waiter only observes; stopping it cancels no work.
+            detached_work.cancel()
+        return combine_drain_results((cleanup, detached_work.result()))
+
+    def _detached_session_store_work(self) -> set[asyncio.Future[Any]]:
+        """Claim and lease writes that outlived the work that started them."""
+
+        return {
+            *self._session_control.stopped_handoff_heartbeats(),
+            *abandoned_task_lease_operations(self._admission),
+            *retained_local_execution_tasks(self._admission),
+        }
+
+    def _detached_recovery_work(self) -> set[asyncio.Future[Any]]:
+        """Recovery work that outlived its caller, including observation reads."""
+
+        return {
+            *self._recovery_coordinator.detached_recovery_work(),
+            *abandoned_workspace_observation_reads(self._admission),
+        }
+
+    def _detached_environment_work(self) -> set[asyncio.Future[Any]]:
+        """Work using an environment's resources that outlived its caller."""
+
+        return {
+            *self._tool_round_executor.detached_environment_work(),
+            *late_artifact_writes(self._admission),
+        }
 
     async def _release_idle_environment_resources(self, *, close: bool, deadline: float) -> bool:
         """Trim (or close) factories' idle resources, such as warm spares, by ``deadline``.
@@ -5300,11 +5351,15 @@ class CayuApp:
         """
 
         loop = asyncio.get_running_loop()
+        registrations = tuple(self._environment_registry.registrations.items())
+        if not any(registration.factory is not None for _, registration in registrations):
+            # Nothing holds idle resources, so nothing is left to release.
+            return True
         if deadline - loop.time() <= 0:
             return False
         owned: list[tuple[str, asyncio.Task[None]]] = []
         released = True
-        for name, registration in tuple(self._environment_registry.registrations.items()):
+        for name, registration in registrations:
             factory = registration.factory
             if factory is None:
                 continue

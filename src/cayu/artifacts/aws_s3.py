@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from cayu._exception_groups import exception_cause, exception_context, set_exception_context
 from cayu._resource_store_surface import model_store_surface
+from cayu._task_wait import run_thread_to_completion
 from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_metadata,
@@ -363,8 +364,9 @@ class S3ArtifactStore(ArtifactStore):
             },
             "S3 artifact owner",
         )
-        response = await _run_s3_sync_call(None, client.get_object, Bucket=self.bucket, Key=key)
-        value = await _run_s3_sync_call(None, _response_body_bytes, response, len(expected) + 1)
+        _, value = await _run_s3_sync_call(
+            None, _get_object_content, client, len(expected) + 1, Bucket=self.bucket, Key=key
+        )
         if value != expected:
             raise ValueError("S3 artifact closure ownership conflicts.")
 
@@ -653,8 +655,9 @@ class S3ArtifactStore(ArtifactStore):
         if limit is not None and limit < metadata.size_bytes:
             get_options["Range"] = f"bytes=0-{limit - 1}"
         try:
-            response = await asyncio.to_thread(client.get_object, **get_options)
-            content = await asyncio.to_thread(_response_body_bytes, response)
+            _, content = await run_thread_to_completion(
+                _get_object_content, client, None, **get_options
+            )
         except Exception as exc:
             if _aws_error_code(exc) in _NOT_FOUND_CODES:
                 raise FileNotFoundError(f"Artifact not found: {artifact_id}") from exc
@@ -695,13 +698,14 @@ class S3ArtifactStore(ArtifactStore):
         content = b""
         try:
             if length:
-                response = await asyncio.to_thread(
-                    client.get_object,
+                response, content = await run_thread_to_completion(
+                    _get_object_content,
+                    client,
+                    length,
                     Bucket=self.bucket,
                     Key=content_key,
                     Range=f"bytes={offset}-{offset + length - 1}",
                 )
-                content = await asyncio.to_thread(_response_body_bytes, response, length)
                 if (
                     response.get("ContentLength") != length
                     or response.get("ContentRange")
@@ -710,7 +714,7 @@ class S3ArtifactStore(ArtifactStore):
                 ):
                     raise ValueError("S3 range length did not match committed metadata.")
             else:
-                response = await asyncio.to_thread(
+                response = await run_thread_to_completion(
                     client.head_object,
                     Bucket=self.bucket,
                     Key=content_key,
@@ -999,13 +1003,14 @@ class S3ArtifactStore(ArtifactStore):
         """Read the committed metadata and the generation that holds its content."""
 
         try:
-            response = await _run_s3_sync_call(
+            _, payload = await _run_s3_sync_call(
                 reporter,
-                client.get_object,
+                _get_object_content,
+                client,
+                None,
                 Bucket=self.bucket,
                 Key=self._artifact_key(artifact_id, "metadata.json"),
             )
-            payload = await _run_s3_sync_call(reporter, _response_body_bytes, response)
         except Exception as exc:
             if _aws_error_code(exc) in _NOT_FOUND_CODES:
                 raise FileNotFoundError(f"Artifact not found: {artifact_id}") from exc
@@ -1025,13 +1030,10 @@ class S3ArtifactStore(ArtifactStore):
         *,
         reporter: _ArtifactWritePhaseReporter | None = None,
     ) -> bytes:
-        response = await _run_s3_sync_call(
-            reporter,
-            client.get_object,
-            Bucket=self.bucket,
-            Key=key,
+        _, content = await _run_s3_sync_call(
+            reporter, _get_object_content, client, None, Bucket=self.bucket, Key=key
         )
-        return await _run_s3_sync_call(reporter, _response_body_bytes, response)
+        return content
 
     async def _read_complete_artifact(
         self,
@@ -1251,8 +1253,20 @@ async def _run_s3_sync_call(
     **kwargs: Any,
 ) -> Any:
     if reporter is None:
-        return await asyncio.to_thread(callback, *args, **kwargs)
+        # An unreported sync call runs to completion even if its caller is
+        # cancelled, so whoever waits for the caller also waits for the call.
+        return await run_thread_to_completion(callback, *args, **kwargs)
     return await _await_owned_sync_call(reporter, callback, *args, **kwargs)
+
+
+def _get_object_content(client: Any, max_bytes: int | None, /, **options: Any) -> tuple[Any, bytes]:
+    """Fetch an object and read its body in one call, closing the body either way.
+
+    One call so a caller cancelled in between cannot leave an open body behind.
+    """
+
+    response = client.get_object(**options)
+    return response, _response_body_bytes(response, max_bytes)
 
 
 def _response_body_bytes(response: Any, max_bytes: int | None = None) -> bytes:

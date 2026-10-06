@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar, cast
 
 _ResultT = TypeVar("_ResultT")
 
@@ -280,6 +280,30 @@ def _consume_detached_task_outcome(task: asyncio.Task[Any]) -> None:
 
     with contextlib.suppress(asyncio.CancelledError):
         task.exception()
+
+
+async def run_thread_to_completion(
+    func: Callable[..., _ResultT], /, *args: Any, **kwargs: Any
+) -> _ResultT:
+    """Run ``func`` in a thread; if cancelled, wait for the thread before re-raising.
+
+    A thread cannot be stopped, so the awaiting task stays alive until the work
+    it dispatched has finished: owners that wait for that task, such as
+    application shutdown, then also wait for the thread. The result of a
+    cancelled call is discarded and the caller's cancellation is re-raised.
+    """
+
+    thread_task = asyncio.ensure_future(asyncio.to_thread(func, *args, **kwargs))
+    outcome = await await_shielded_task_outcome(thread_task)
+    if outcome.cancellation is not None:
+        restore_task_cancellation_requests(
+            outcome.cancellation_requests_consumed,
+            cancellation=outcome.cancellation,
+        )
+        raise outcome.cancellation
+    if outcome.error is not None:
+        raise outcome.error
+    return cast("_ResultT", outcome.result)
 
 
 async def wait_until_idle(

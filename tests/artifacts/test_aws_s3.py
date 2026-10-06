@@ -804,3 +804,71 @@ def test_s3_artifact_store_rejects_scope_and_client_configuration_errors() -> No
         asyncio.run(store.put_bytes(b"x", filename="x.txt", scope=ArtifactScope.ENVIRONMENT))
     with pytest.raises(ValueError, match="injected client"):
         S3ArtifactStore("bucket", client=client, profile_name="prod")
+
+
+class _CountingBody(io.BytesIO):
+    def __init__(self, value: bytes, closes: list[str], key: str) -> None:
+        super().__init__(value)
+        self._closes = closes
+        self._key = key
+
+    def close(self) -> None:
+        self._closes.append(self._key)
+        super().close()
+
+
+class _BlockingGetS3Client(_S3Client):
+    """Blocks one get_object in its thread so its caller can be cancelled meanwhile."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.block_suffix: str | None = None
+        self.started = ThreadEvent()
+        self.release = ThreadEvent()
+        self.closes: list[str] = []
+
+    def get_object(self, **kwargs: Any) -> dict[str, Any]:
+        response = super().get_object(**kwargs)
+        body = response["Body"].getvalue()
+        response["Body"] = _CountingBody(body, self.closes, kwargs["Key"])
+        if self.block_suffix is not None and kwargs["Key"].endswith(self.block_suffix):
+            self.block_suffix = None
+            self.started.set()
+            self.release.wait(30)
+        return response
+
+
+@pytest.mark.parametrize(
+    ("read", "blocked"),
+    [
+        ("read_bytes", "/metadata.json"),
+        ("read_bytes", "/content"),
+        ("read_range", "/content"),
+    ],
+)
+def test_s3_read_cancelled_while_fetching_closes_the_body_before_cancellation(
+    read: str, blocked: str
+) -> None:
+    async def scenario() -> None:
+        client = _BlockingGetS3Client()
+        store = S3ArtifactStore("bucket", client=client)
+        artifact = await store.put_bytes(b"abcdef", filename="letters.txt", session_id="sess_1")
+        client.closes.clear()
+        client.block_suffix = blocked
+        reading = asyncio.create_task(
+            store.read_bytes(artifact.id)
+            if read == "read_bytes"
+            else store.read_range(artifact.id, offset=1, max_bytes=3)
+        )
+        await asyncio.to_thread(client.started.wait, 10)
+        reading.cancel()
+        await asyncio.sleep(0.05)
+        assert not reading.done()  # it waits for the fetch in its thread
+        client.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await reading
+        # The blocked response's body was closed exactly once before the
+        # cancellation reached the caller.
+        assert sum(key.endswith(blocked) for key in client.closes) == 1
+
+    asyncio.run(scenario())

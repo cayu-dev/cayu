@@ -2968,8 +2968,12 @@ class TaskStoreDispatcher(Dispatcher):
                 self._terminal_receipt_reconciliation_task_generation = None
 
         reconciliation_generation = self._terminal_receipt_reconciliation_generation
+        # A worker step of its own: the sweep can outlive a cancelled caller,
+        # and the runtime's shutdown must still wait for its store writes.
         reconciliation = asyncio.create_task(
-            self._reconcile_terminal_acknowledgements_owned(runtime)
+            runtime._run_worker_step(
+                lambda: self._reconcile_terminal_acknowledgements_owned(runtime)
+            )
         )
         self._terminal_receipt_reconciliation_task = reconciliation
         self._terminal_receipt_reconciliation_task_generation = reconciliation_generation

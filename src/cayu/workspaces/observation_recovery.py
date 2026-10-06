@@ -20,6 +20,7 @@ from cayu._exception_groups import (
     iter_exception_tree,
 )
 from cayu._exception_state import exception_state, set_exception_state
+from cayu._operation_context import current_operation_owner
 from cayu._task_wait import (
     CapturedAwaitableOutcome,
     ShieldedTaskOutcome,
@@ -66,7 +67,9 @@ WORKSPACE_OBSERVATION_SCHEMA_VERSION = 1
 WORKSPACE_OBSERVATION_MAX_ACTIVE = 256
 WORKSPACE_OBSERVATION_ARTIFACT_MAX_BYTES = 16 * 1024 * 1024
 _WORKSPACE_OBSERVATION_MAX_ABANDONED_READS = 256
-_WORKSPACE_OBSERVATION_ABANDONED_READS: set[asyncio.Task[Any]] = set()
+# Reads whose caller stopped waiting, by the application whose operation
+# started them: its shutdown waits for them before releasing the store.
+_WORKSPACE_OBSERVATION_ABANDONED_READS: dict[asyncio.Task[Any], object | None] = {}
 _ReadT = TypeVar("_ReadT")
 _MutationT = TypeVar("_MutationT")
 WorkspaceObservationEvidenceKind = Literal[
@@ -1435,12 +1438,23 @@ async def await_workspace_observation_store_mutation(
 
 
 def _retain_workspace_observation_read(task: asyncio.Task[Any]) -> None:
-    _WORKSPACE_OBSERVATION_ABANDONED_READS.add(task)
+    _WORKSPACE_OBSERVATION_ABANDONED_READS[task] = current_operation_owner()
     task.add_done_callback(_consume_workspace_observation_read)
 
 
+def abandoned_workspace_observation_reads(application: object) -> set[asyncio.Future[Any]]:
+    """This application's abandoned observation store reads still running on this loop."""
+
+    loop = asyncio.get_running_loop()
+    return {
+        task
+        for task, owner in tuple(_WORKSPACE_OBSERVATION_ABANDONED_READS.items())
+        if owner is application and not task.done() and task.get_loop() is loop
+    }
+
+
 def _consume_workspace_observation_read(task: asyncio.Task[Any]) -> None:
-    _WORKSPACE_OBSERVATION_ABANDONED_READS.discard(task)
+    _WORKSPACE_OBSERVATION_ABANDONED_READS.pop(task, None)
     with contextlib.suppress(BaseException):
         task.exception()
 

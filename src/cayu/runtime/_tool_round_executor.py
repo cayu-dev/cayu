@@ -744,9 +744,11 @@ class ToolRoundExecutor:
     ) -> None:
         self._session_store = session_store
         self._event_writer = event_writer
-        # Projections that outlived their timeout may still write artifacts:
-        # waited for before environment cleanup, never cancelled again.
+        # Projections that outlived their timeout may still write artifacts,
+        # and abandoned secret resolutions may still use a vault or proxy:
+        # waited for by environment cleanup, never cancelled again.
         self._detached_projections: set[asyncio.Task[Any]] = set()
+        self._detached_secret_resolutions: set[asyncio.Task[Any]] = set()
         self._auxiliary_inference = auxiliary_inference
         self._session_control = session_control
         self._hook_runtime = hook_runtime
@@ -3809,12 +3811,14 @@ class ToolRoundExecutor:
                 registered_environment,
                 tracker=invocation_secret_scope,
                 on_redactor_change=persist_resolved_secret_projection,
+                retain_abandoned=self._retain_detached_secret_resolution,
             ),
             proxy=invocation_secrets.proxy_for_environment(
                 registered_environment,
                 tracker=invocation_secret_scope,
                 on_authorize=proxy_authorizations.append,
                 on_redactor_change=persist_resolved_secret_projection,
+                retain_abandoned=self._retain_detached_secret_resolution,
             ),
             knowledge_store=_knowledge_store(registered_environment),
             knowledge_access_scope=_knowledge_access_scope(registered_environment),
@@ -6863,10 +6867,15 @@ class ToolRoundExecutor:
 
         task.add_done_callback(settled)
 
-    def detached_projections(self) -> set[asyncio.Future[Any]]:
-        """Timed-out tool-result projections that are still running."""
+    def _retain_detached_secret_resolution(self, task: asyncio.Task[Any]) -> None:
+        # The resolver consumes its own outcome; this only keeps it owned.
+        self._detached_secret_resolutions.add(task)
+        task.add_done_callback(self._detached_secret_resolutions.discard)
 
-        return set(self._detached_projections)
+    def detached_environment_work(self) -> set[asyncio.Future[Any]]:
+        """Timed-out projections and abandoned secret resolutions still running."""
+
+        return {*self._detached_projections, *self._detached_secret_resolutions}
 
     async def _project_terminal_tool_result(
         self,

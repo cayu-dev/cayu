@@ -38,6 +38,10 @@ from cayu.artifacts.settlement import (
     _log_late_artifact_write_settlement,
     _store_identity_sha256,
 )
+from cayu.runtime.application_lifecycle import (
+    ApplicationAdmission,
+    _current_operation_admission,
+)
 
 _DEFAULT_SETTLEMENT_TIMEOUT_SECONDS = 5.0
 _DEFAULT_MAX_RETAINED_WRITES = 64
@@ -140,6 +144,23 @@ async def _await_owned_sync_call(
                 raise
             reporter.record_child_cancellation(cancellation)
             consume_pending_task_cancellation(cancellation)
+
+
+# Writes whose caller stopped waiting, by the application whose operation
+# started them: its shutdown waits for them before releasing what they use.
+# Artifact stores can be shared, so an application waits only for its own.
+_LATE_ARTIFACT_WRITES: dict[asyncio.Task[object], ApplicationAdmission | None] = {}
+
+
+def late_artifact_writes(application: ApplicationAdmission) -> set[asyncio.Future[Any]]:
+    """This application's abandoned artifact writes still running on this loop."""
+
+    loop = asyncio.get_running_loop()
+    return {
+        task
+        for task, owner in tuple(_LATE_ARTIFACT_WRITES.items())
+        if owner is application and not task.done() and task.get_loop() is loop
+    }
 
 
 class _ArtifactWriteRegistry:
@@ -654,7 +675,9 @@ def _retain_late_artifact_write(
             # values must not escape through this final ownership callback.
         finally:
             registry.release(cast("asyncio.Task[object]", completed))
+            _LATE_ARTIFACT_WRITES.pop(completed, None)
 
+    _LATE_ARTIFACT_WRITES[task] = _current_operation_admission()
     task.add_done_callback(observe_late)
 
 

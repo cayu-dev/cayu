@@ -205,6 +205,11 @@ class ToolEffectReconciliationOwner:
     def pending_operations(self) -> int:
         return len(self._operations)
 
+    def running(self) -> set[asyncio.Future[Any]]:
+        """Lookups still running, including ones whose caller stopped waiting."""
+
+        return self._operations.running()
+
     async def aclose(self, *, timeout_seconds: float = 1.0) -> bool:
         return await self._operations.aclose(timeout_s=timeout_seconds)
 

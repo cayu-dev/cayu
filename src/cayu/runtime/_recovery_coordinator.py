@@ -551,6 +551,7 @@ _INCOMPLETE_RECOVERY_CLAIM_LEASE = timedelta(minutes=5)
 _INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS = 30.0
 _INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_RETRY_SECONDS = 5.0
 _MANUAL_RECOVERY_INTERRUPT_POLL_INTERVAL_SECONDS = 0.25
+_WORKSPACE_ARTIFACT_RECOVERY_READ_TIMEOUT_SECONDS = 30.0
 _COMPLETION_FINALIZATION_TASK_EVENT_NAMESPACE = UUID("ae86f400-31e6-4cd2-95f3-7d6f115c21a1")
 _PROVIDER_OPERATION_UNAVAILABLE_INTERRUPT_NAMESPACE = UUID("c7b311fa-d36b-4ecb-a93a-c96e4c047f01")
 _INCOMPLETE_RECOVERY_CURSOR_VERSION = 1
@@ -19476,10 +19477,19 @@ class RecoveryCoordinator:
 
         task.add_done_callback(settled)
 
-    def detached_recovery_writes(self) -> set[asyncio.Future[Any]]:
-        """Recovery claim renewal writes still running after their heartbeat."""
+    def detached_recovery_work(self) -> set[asyncio.Future[Any]]:
+        """Recovery work still running after its caller stopped waiting.
 
-        return set(self._detached_recovery_writes)
+        Claim renewal writes that outlived their heartbeat, and workspace
+        artifact reads and tool-effect reconciliation lookups whose caller was
+        cancelled or timed out. All may still use stores or application code.
+        """
+
+        return {
+            *self._detached_recovery_writes,
+            *self._workspace_artifact_recovery_operations.running(),
+            *self._effect_reconciliation_owner.running(),
+        }
 
     async def _heartbeat_incomplete_recovery_claim(
         self,
@@ -20772,7 +20782,7 @@ class RecoveryCoordinator:
                     self._workspace_artifact_recovery_operations.track(read_task)
                     outcome = await await_shielded_task_outcome(
                         read_task,
-                        timeout_s=30.0,
+                        timeout_s=_WORKSPACE_ARTIFACT_RECOVERY_READ_TIMEOUT_SECONDS,
                         timeout_after_cancellation_s=0.0,
                     )
                     if read_task.done():

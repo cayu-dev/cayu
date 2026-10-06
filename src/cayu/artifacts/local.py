@@ -25,7 +25,11 @@ from cayu._exception_groups import exception_cause, exception_context, set_excep
 from cayu._filesystem_lock import cooperative_path_lock
 from cayu._resource_access_errors import ResourceAccessDenied
 from cayu._resource_store_surface import model_store_surface
-from cayu._task_wait import await_shielded_task_outcome, restore_task_cancellation_requests
+from cayu._task_wait import (
+    await_shielded_task_outcome,
+    restore_task_cancellation_requests,
+    run_thread_to_completion,
+)
 from cayu._validation import (
     copy_durable_metadata,
     require_clean_nonblank,
@@ -240,7 +244,8 @@ class LocalArtifactStore(ArtifactStore):
     ) -> ArtifactReadResult:
         limit = _validate_limit(max_bytes, "max_bytes")
         try:
-            return await asyncio.to_thread(
+            # The file read runs to completion even if this read is cancelled.
+            return await run_thread_to_completion(
                 _read_artifact,
                 self.root,
                 self._root_identity,
@@ -271,7 +276,7 @@ class LocalArtifactStore(ArtifactStore):
         if limit is None:
             raise ValueError("max_bytes is required for range reads.")
         try:
-            return await asyncio.to_thread(
+            return await run_thread_to_completion(
                 _read_artifact, self.root, self._root_identity, artifact_id, limit, offset
             )
         except OSError as exc:

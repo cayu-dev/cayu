@@ -6,6 +6,7 @@ import asyncio
 import base64
 import contextlib
 import hashlib
+import inspect
 import json
 import logging
 import threading
@@ -1490,9 +1491,28 @@ def _start_detached_event_stream_response(
                     deferred_cancellation = exc
 
         async def finish_acceptance_bookkeeping(bookkeeping: Awaitable[None]) -> None:
-            """Finish acceptance bookkeeping without swallowing an interrupt."""
+            """Finish acceptance bookkeeping without swallowing an interrupt.
+
+            It can run after the stream's own operation ended, so it holds a
+            lease of its own: application shutdown waits for its store writes,
+            and a closed application refuses them.
+            """
             nonlocal deferred_cancellation
-            callback_task = asyncio.ensure_future(bookkeeping)
+            admission = cayu_app._admission
+            try:
+                lease = admission.track()
+            except BaseException:
+                if inspect.iscoroutine(bookkeeping):
+                    bookkeeping.close()
+                raise
+            try:
+                callback_task = asyncio.ensure_future(bookkeeping)
+            except BaseException:
+                admission.release(lease)
+                if inspect.iscoroutine(bookkeeping):
+                    bookkeeping.close()
+                raise
+            callback_task.add_done_callback(lambda _task: admission.release(lease))
             while True:
                 try:
                     await asyncio.shield(callback_task)

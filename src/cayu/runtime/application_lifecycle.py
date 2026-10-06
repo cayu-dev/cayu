@@ -22,6 +22,7 @@ from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator
 
+from cayu._operation_context import current_operation_owner, operation_stack
 from cayu._task_wait import capture_awaitable_outcome
 
 DEFAULT_APPLICATION_SHUTDOWN_TIMEOUT_SECONDS = 30.0
@@ -163,11 +164,8 @@ class _AdmissionLease:
         self.active = True
 
 
-# Operations running in this context, admitted or tracked, innermost last. A
-# stack, because one application's operation can call into another's.
-_operation: ContextVar[tuple[_AdmissionLease, ...]] = ContextVar(
-    "cayu_application_operation", default=()
-)
+# Operations running in this context, admitted or tracked, innermost last.
+_operation = operation_stack
 # Admitted operations in this context: what lets work they start pass the seal.
 _admitted: ContextVar[tuple[_AdmissionLease, ...]] = ContextVar(
     "cayu_application_admission", default=()
@@ -281,6 +279,17 @@ class ApplicationAdmission:
         except TimeoutError:
             return self._in_flight == 0
         return True
+
+
+def _current_operation_admission() -> ApplicationAdmission | None:
+    """The admission of the application operation this code runs in, if any.
+
+    Identifies which application owns work started here, including from a
+    background task the operation spawned.
+    """
+
+    owner = current_operation_owner()
+    return owner if isinstance(owner, ApplicationAdmission) else None
 
 
 def _admission_of(owner: object) -> ApplicationAdmission:

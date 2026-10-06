@@ -21,6 +21,7 @@ from cayu._task_wait import (
     restore_task_cancellation_requests,
 )
 from cayu._validation import canonical_durable_json_bytes
+from cayu.runtime.application_lifecycle import ApplicationAdmission
 from cayu.runtime.local_execution_attempts import (
     MAX_LOCAL_EXECUTION_ENVIRONMENT_BYTES,
     MAX_LOCAL_EXECUTION_RECEIPT_BYTES,
@@ -60,7 +61,10 @@ _REQUIRED_SEALS = 0x0001 | 0x0002 | 0x0004 | 0x0008
 _MAX_CONTROL_BYTES = 65_536
 _MAX_PREPARATION_CLAIM_REFRESHES = 8
 _MAX_LOCAL_EXECUTION_RECOVERY_SCAN_RECORDS = MAX_LOCAL_EXECUTION_RECOVERY_BATCH
-_RETAINED_LOCAL_EXECUTION_TASKS: set[asyncio.Task[Any]] = set()
+# Supervisor waits, pipe readers and settlement writes that outlived their
+# caller, by the application whose operation started them: its shutdown waits
+# for them before releasing the task store.
+_RETAINED_LOCAL_EXECUTION_TASKS: dict[asyncio.Task[Any], ApplicationAdmission | None] = {}
 
 
 class _LocalExecutionRecoveryDeadlineElapsed(Exception):
@@ -78,12 +82,13 @@ class _LocalExecutionRecoveryScan:
 def _retain_local_execution_task(
     task: asyncio.Task[Any],
     *,
+    application: ApplicationAdmission,
     remove_path_on_success: Path | None = None,
 ) -> None:
-    _RETAINED_LOCAL_EXECUTION_TASKS.add(task)
+    _RETAINED_LOCAL_EXECUTION_TASKS.setdefault(task, application)
 
     def settled(done: asyncio.Task[Any]) -> None:
-        _RETAINED_LOCAL_EXECUTION_TASKS.discard(done)
+        _RETAINED_LOCAL_EXECUTION_TASKS.pop(done, None)
         try:
             done.result()
         except BaseException:
@@ -93,6 +98,17 @@ def _retain_local_execution_task(
                 remove_path_on_success.unlink()
 
     task.add_done_callback(settled)
+
+
+def retained_local_execution_tasks(application: ApplicationAdmission) -> set[asyncio.Future[Any]]:
+    """This application's retained local execution tasks still running on this loop."""
+
+    loop = asyncio.get_running_loop()
+    return {
+        task
+        for task, owner in tuple(_RETAINED_LOCAL_EXECUTION_TASKS.items())
+        if owner is application and not task.done() and task.get_loop() is loop
+    }
 
 
 def _create_local_execution_task(
@@ -942,9 +958,9 @@ async def run_owned_local_execution_attempt(
                 process_wait_task = _fallback_process_wait_task(process)
             except BaseException as wait_ownership_failure:
                 if stdout_task is not None:
-                    _retain_local_execution_task(stdout_task)
+                    _retain_local_execution_task(stdout_task, application=app._admission)
                 if stderr_task is not None:
-                    _retain_local_execution_task(stderr_task)
+                    _retain_local_execution_task(stderr_task, application=app._admission)
                 raise cancellation from wait_ownership_failure
         settlement_outcome = await await_shielded_task_outcome(
             process_wait_task,
@@ -952,11 +968,11 @@ async def run_owned_local_execution_attempt(
             timeout_s=(request.limits.term_grace_seconds + request.limits.kill_grace_seconds + 2.0),
         )
         if settlement_outcome.timed_out:
-            _retain_local_execution_task(process_wait_task)
+            _retain_local_execution_task(process_wait_task, application=app._admission)
             if stdout_task is not None:
-                _retain_local_execution_task(stdout_task)
+                _retain_local_execution_task(stdout_task, application=app._admission)
             if stderr_task is not None:
-                _retain_local_execution_task(stderr_task)
+                _retain_local_execution_task(stderr_task, application=app._admission)
             restore_task_cancellation_requests(
                 settlement_outcome.cancellation_requests_consumed,
                 cancellation=cancellation,
@@ -994,6 +1010,7 @@ async def run_owned_local_execution_attempt(
                     _retain_local_execution_task(
                         settlement_task,
                         remove_path_on_success=receipt_path,
+                        application=app._admission,
                     )
                     cleanup_failure = LocalExecutionAttemptUnsettled(
                         "Local execution settlement remains in flight and retry stays fenced."
@@ -1004,9 +1021,9 @@ async def run_owned_local_execution_attempt(
                         with suppress(OSError):
                             receipt_path.unlink()
         if stdout_task is not None:
-            _retain_local_execution_task(stdout_task)
+            _retain_local_execution_task(stdout_task, application=app._admission)
         if stderr_task is not None:
-            _retain_local_execution_task(stderr_task)
+            _retain_local_execution_task(stderr_task, application=app._admission)
         restore_task_cancellation_requests(
             cancellation_requests_consumed,
             cancellation=cancellation,
@@ -1060,7 +1077,7 @@ async def run_owned_local_execution_attempt(
                 )
             )
             assert process_wait_task is not None
-            _retain_local_execution_task(process_wait_task)
+            _retain_local_execution_task(process_wait_task, application=app._admission)
         elif cleanup_outcome.error is not None:
             cleanup_failures.append(cleanup_outcome.error)
         if receipt_path.exists():
@@ -1093,6 +1110,7 @@ async def run_owned_local_execution_attempt(
                     _retain_local_execution_task(
                         settlement_task,
                         remove_path_on_success=receipt_path,
+                        application=app._admission,
                     )
                     cleanup_failures.append(
                         LocalExecutionAttemptUnsettled(
@@ -1107,9 +1125,9 @@ async def run_owned_local_execution_attempt(
             except BaseException as settlement_failure:
                 cleanup_failures.append(settlement_failure)
         if stdout_task is not None:
-            _retain_local_execution_task(stdout_task)
+            _retain_local_execution_task(stdout_task, application=app._admission)
         if stderr_task is not None:
-            _retain_local_execution_task(stderr_task)
+            _retain_local_execution_task(stderr_task, application=app._admission)
     finally:
         if owner_write_fd >= 0:
             with suppress(OSError):
@@ -1187,11 +1205,12 @@ async def run_owned_local_execution_attempt(
         _retain_local_execution_task(
             settlement_task,
             remove_path_on_success=receipt_path,
+            application=app._admission,
         )
         if stdout_task is not None:
-            _retain_local_execution_task(stdout_task)
+            _retain_local_execution_task(stdout_task, application=app._admission)
         if stderr_task is not None:
-            _retain_local_execution_task(stderr_task)
+            _retain_local_execution_task(stderr_task, application=app._admission)
         if final_cancellation is not None:
             restore_task_cancellation_requests(
                 settlement_outcome.cancellation_requests_consumed,
@@ -1205,9 +1224,9 @@ async def run_owned_local_execution_attempt(
         )
     if settlement_outcome.error is not None:
         if stdout_task is not None:
-            _retain_local_execution_task(stdout_task)
+            _retain_local_execution_task(stdout_task, application=app._admission)
         if stderr_task is not None:
-            _retain_local_execution_task(stderr_task)
+            _retain_local_execution_task(stderr_task, application=app._admission)
         if final_cancellation is not None:
             restore_task_cancellation_requests(
                 settlement_outcome.cancellation_requests_consumed,
@@ -1227,9 +1246,9 @@ async def run_owned_local_execution_attempt(
         receipt_path.unlink()
     if final_cancellation is not None:
         if stdout_task is not None:
-            _retain_local_execution_task(stdout_task)
+            _retain_local_execution_task(stdout_task, application=app._admission)
         if stderr_task is not None:
-            _retain_local_execution_task(stderr_task)
+            _retain_local_execution_task(stderr_task, application=app._admission)
         restore_task_cancellation_requests(
             settlement_outcome.cancellation_requests_consumed,
             cancellation=final_cancellation,
@@ -1237,9 +1256,9 @@ async def run_owned_local_execution_attempt(
         raise final_cancellation
     if settled.quiescence is LocalExecutionAttemptQuiescence.TERMINAL_NOT_QUIESCENT:
         if stdout_task is not None:
-            _retain_local_execution_task(stdout_task)
+            _retain_local_execution_task(stdout_task, application=app._admission)
         if stderr_task is not None:
-            _retain_local_execution_task(stderr_task)
+            _retain_local_execution_task(stderr_task, application=app._admission)
         return LocalExecutionAttemptResult(
             attempt=settled,
             stdout="",

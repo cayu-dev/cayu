@@ -211,6 +211,11 @@ class BoundedInvocationOperationRegistry:
 
         self._operations.discard(operation)
 
+    def running(self) -> set[asyncio.Future[Any]]:
+        """Retained operations, for waiting on them without sealing or cancelling."""
+
+        return set(self._operations)
+
     async def aclose(self, *, timeout_s: float) -> bool:
         """Seal and drain retained operations once under a non-negative deadline."""
 

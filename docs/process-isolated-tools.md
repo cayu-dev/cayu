@@ -215,6 +215,11 @@ requests restored, after that settlement.
 While any retained isolated-process cleanup owner remains unresolved, the
 process rejects later isolated child dispatches before spawn. Settled cleanup
 removes that fence; ordinary in-process tools are unaffected.
+`CayuApp.aclose()` retries each failed cleanup its own operations dispatched
+once per attempt and waits for running ones without cancelling them. An
+unresolved one keeps that application's shutdown incomplete and its owned
+resources open until a later attempt settles it. Another application's cleanups
+do not hold up its shutdown, though they still fence dispatch process-wide.
 
 Execution-boundary controls in transcript and provider projections retain their
 runtime-authored values even when those values collide with a registered secret.

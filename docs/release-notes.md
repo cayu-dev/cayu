@@ -48,6 +48,20 @@
   whose claim is no longer needed, because it failed or no admitted or tracked
   operation is running at shutdown, now stops renewing and lets the claim's
   lease expire.
+- `CayuApp.aclose()` also waits for work that could still use a resource it
+  was about to release: secret resolutions abandoned when their tool timed out,
+  tool-effect reconciliation lookups and workspace artifact reads whose caller
+  was cancelled or timed out, artifact writes its operations started whose
+  caller stopped waiting, cleanups of isolated tool processes its own tool
+  calls started (a failed one is retried once per shutdown attempt and keeps
+  shutdown incomplete until it succeeds), a served run's acceptance
+  bookkeeping that finishes after the run ended, a task dispatcher's
+  terminal-receipt sweep or a task worker's lease renewal left running when
+  the worker was cancelled, a terminal-finalization claim heartbeat no task
+  accepted, workspace observation reads abandoned by recovery, and local
+  execution attempt tasks that outlived their caller. Before, shutdown could
+  report settled and close an owned vault, credential proxy or store while such
+  work was still running.
 
 ## v0.8.1
 
