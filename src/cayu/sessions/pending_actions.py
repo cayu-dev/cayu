@@ -8,6 +8,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from cayu._event_schema import private_event_linkage_value
 from cayu._validation import (
     EXECUTION_UNIT_ID_MAX_CHARS,
     JsonUtf8SizeCounter,
@@ -27,7 +28,6 @@ from cayu.approvals.user_input import (
     user_input_lifecycle_authority_from_checkpoint,
 )
 from cayu.events import Event, EventType
-from cayu.runtime._event_projection import private_event_linkage_value
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds

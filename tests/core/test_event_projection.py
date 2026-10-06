@@ -14,7 +14,11 @@ from pydantic import SecretStr
 from tests._session_provenance import fixture_session_invocation
 
 import cayu.events as events_module
-import cayu.runtime._event_projection as event_projection_module
+from cayu import _event_schema as event_schema
+from cayu._event_schema import (
+    EVENT_PAYLOAD_POLICIES,
+    private_event_linkage_value,
+)
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.applications import CayuApp
 from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
@@ -54,11 +58,9 @@ from cayu.events import (
 )
 from cayu.observability.events import EventSink
 from cayu.runtime._event_projection import (
-    EVENT_PAYLOAD_POLICIES,
     PRIVATE_EVENT_AUTHORITY,
     REDACTED_CUSTOM_EVENT_TYPE,
     prepare_new_runtime_event,
-    private_event_linkage_value,
     project_persisted_runtime_event,
     public_event_id,
     public_event_linkage_id,
@@ -848,11 +850,11 @@ def test_pause_projection_schemas_track_the_typed_checkpoint_models() -> None:
             "command_denial_code",
         }
         | {"arguments_state"}
-        == event_projection_module._PENDING_TOOL_CALL_FIELD_NAMES
+        == event_schema._PENDING_TOOL_CALL_FIELD_NAMES
     )
     assert (frozenset(PendingToolApproval.model_fields) - {"run_limit_accounting"}) | {
         "arguments_state"
-    } == event_projection_module._PENDING_APPROVAL_FIELD_NAMES
+    } == event_schema._PENDING_APPROVAL_FIELD_NAMES
     assert (
         frozenset(PendingUserInput.model_fields)
         - {
@@ -865,7 +867,7 @@ def test_pause_projection_schemas_track_the_typed_checkpoint_models() -> None:
             "staged_terminals",
             "tool_exposure",
         }
-    ) | {"arguments_state"} == event_projection_module._PENDING_USER_INPUT_FIELD_NAMES
+    ) | {"arguments_state"} == event_schema._PENDING_USER_INPUT_FIELD_NAMES
 
 
 @pytest.mark.parametrize(
@@ -2030,12 +2032,12 @@ def test_typed_pause_payload_keys_survive_exact_short_secret_collisions() -> Non
         (
             "approval",
             approval_event,
-            event_projection_module._PENDING_APPROVAL_FIELD_NAMES,
+            event_schema._PENDING_APPROVAL_FIELD_NAMES,
         ),
         (
             "user_input",
             input_event,
-            event_projection_module._PENDING_USER_INPUT_FIELD_NAMES,
+            event_schema._PENDING_USER_INPUT_FIELD_NAMES,
         ),
     ):
         private_field_names = {
@@ -2056,7 +2058,7 @@ def test_typed_pause_payload_keys_survive_exact_short_secret_collisions() -> Non
                 assert prepared.payload[container_name]["arguments_state"] == "quarantined"
             else:
                 assert field_name in prepared.payload[container_name]
-        for field_name in event_projection_module._PENDING_TOOL_CALL_FIELD_NAMES:
+        for field_name in event_schema._PENDING_TOOL_CALL_FIELD_NAMES:
             prepared = prepare_new_runtime_event(
                 event,
                 redactor=SecretRedactor(field_name),

@@ -57,6 +57,7 @@ from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions.base import InMemorySessionStore, RunRequest, Session, SessionStatus
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
+from cayu.tools import _web_access_result_schema as web_access_result_schema
 from cayu.tools import _web_access_results as web_access_results
 from cayu.tools._runner import sanitize_runner_failure_group
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
@@ -763,7 +764,7 @@ def test_staged_web_access_authority_survives_only_owned_durable_reconstruction(
         result,
         tool=WebFetchTool(),
     )
-    marker = terminal.payload[web_access_results.WEB_ACCESS_RESULT_AUTHORITY_FIELD]
+    marker = terminal.payload[web_access_result_schema.WEB_ACCESS_RESULT_AUTHORITY_FIELD]
     persisted = Event.model_validate(terminal.model_dump(mode="json"))
     redactor = SecretRedactor("bot_challenge")
 
@@ -774,10 +775,10 @@ def test_staged_web_access_authority_survives_only_owned_durable_reconstruction(
     )
     projected_access = projected.payload["result"]["structured"]["access"]
     assert projected_access["outcome"] == "bot_challenge"
-    assert projected.payload[web_access_results.WEB_ACCESS_RESULT_AUTHORITY_FIELD] == marker
+    assert projected.payload[web_access_result_schema.WEB_ACCESS_RESULT_AUTHORITY_FIELD] == marker
 
     untrusted = _project_staged_terminal_event(persisted, redactor=redactor)
-    assert web_access_results.WEB_ACCESS_RESULT_AUTHORITY_FIELD not in untrusted.payload
+    assert web_access_result_schema.WEB_ACCESS_RESULT_AUTHORITY_FIELD not in untrusted.payload
     assert untrusted.payload["result"]["structured"]["access"]["outcome"] == ("[REDACTED_SECRET]")
 
     coordinator = _ToolRoundPublicationCoordinator(
@@ -792,7 +793,7 @@ def test_staged_web_access_authority_survives_only_owned_durable_reconstruction(
     restored = coordinator.restore_staged_event_authority(persisted)
     assert event_payload_authority_is_runtime_generated(
         restored,
-        field_name=web_access_results.WEB_ACCESS_RESULT_AUTHORITY_FIELD,
+        field_name=web_access_result_schema.WEB_ACCESS_RESULT_AUTHORITY_FIELD,
         value=marker,
     )
 

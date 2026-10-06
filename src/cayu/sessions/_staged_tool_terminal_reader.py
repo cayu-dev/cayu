@@ -15,9 +15,9 @@ from cayu.sessions._assistant_tool_round_publication import (
     StagedToolCallTerminal,
     validate_staged_tool_exposure_terminal,
 )
-from cayu.tools import _shared_artifact_results as shared_artifact_results
+from cayu.tools import _shared_artifact_result_schema as shared_artifact_result_schema
 from cayu.tools import _terminal_controls as tool_terminal_controls
-from cayu.tools import _web_access_results as web_access_results
+from cayu.tools import _web_access_result_schema as web_access_result_schema
 from cayu.tools.base import ToolResult
 
 _NONEXECUTED_TERMINAL_EVENT_TYPES = frozenset(
@@ -156,8 +156,8 @@ def _recovery_safe_staged_terminals(
         payload = copy_durable_json_value(item.event.payload, "staged_terminal.payload")
         if type(payload) is not dict:
             raise AssertionError("Staged terminal payload copied as a non-object.")
-        payload.pop(web_access_results.WEB_ACCESS_RESULT_AUTHORITY_FIELD, None)
-        payload.pop(shared_artifact_results.SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD, None)
+        payload.pop(web_access_result_schema.WEB_ACCESS_RESULT_AUTHORITY_FIELD, None)
+        payload.pop(shared_artifact_result_schema.SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD, None)
         payload["result"] = fixed_result.model_dump(mode="json")
         payload["recovered"] = True
         payload["secret_scope_incomplete"] = True

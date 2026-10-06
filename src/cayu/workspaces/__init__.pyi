@@ -1,5 +1,9 @@
 """Static declarations for the lazy public API."""
 
+from cayu.workspaces._revision_records import WorkspacePathRevision as WorkspacePathRevision
+from cayu.workspaces._revision_records import (
+    WorkspacePathRevisionDelta as WorkspacePathRevisionDelta,
+)
 from cayu.workspaces.base import BoundedTarReader as BoundedTarReader
 from cayu.workspaces.base import BoundedTarStreamReader as BoundedTarStreamReader
 from cayu.workspaces.base import RunnerBoundWorkspace as RunnerBoundWorkspace
@@ -142,8 +146,6 @@ from cayu.workspaces.revisions import WorkspaceMutationAttribution as WorkspaceM
 from cayu.workspaces.revisions import (
     WorkspaceMutationAttributionConfidence as WorkspaceMutationAttributionConfidence,
 )
-from cayu.workspaces.revisions import WorkspacePathRevision as WorkspacePathRevision
-from cayu.workspaces.revisions import WorkspacePathRevisionDelta as WorkspacePathRevisionDelta
 from cayu.workspaces.revisions import WorkspaceRevisionDelta as WorkspaceRevisionDelta
 from cayu.workspaces.revisions import WorkspaceRevisionDeltaStatus as WorkspaceRevisionDeltaStatus
 from cayu.workspaces.revisions import WorkspaceRevisionObservation as WorkspaceRevisionObservation

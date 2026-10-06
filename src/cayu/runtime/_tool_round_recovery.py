@@ -47,8 +47,8 @@ from cayu.sessions._execution_profile_checkpoint import (
 )
 from cayu.sessions.base import Session, SessionStatus, SessionStore
 from cayu.sessions.checkpoints import WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY
-from cayu.tools import _shared_artifact_results as shared_artifact_results
-from cayu.tools import _web_access_results as web_access_results
+from cayu.tools import _shared_artifact_result_schema as shared_artifact_result_schema
+from cayu.tools import _web_access_result_schema as web_access_result_schema
 from cayu.tools.base import ToolEffect, ToolResult
 from cayu.tools.exposure import (
     ResolvedToolExposureAuthority,
@@ -1039,8 +1039,8 @@ def hook_scope_unavailable_recovery_event(event: Event) -> Event:
         is_error=True,
     )
     payload = copy_durable_json_value(event.payload, "recovered_terminal.payload")
-    payload.pop(web_access_results.WEB_ACCESS_RESULT_AUTHORITY_FIELD, None)
-    payload.pop(shared_artifact_results.SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD, None)
+    payload.pop(web_access_result_schema.WEB_ACCESS_RESULT_AUTHORITY_FIELD, None)
+    payload.pop(shared_artifact_result_schema.SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD, None)
     payload["result"] = result.model_dump(mode="json")
     payload["recovered"] = True
     return copy_event(

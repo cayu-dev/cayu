@@ -426,6 +426,16 @@ single composition root.
 
 ### Session checkpoint evidence
 
+`_event_schema.py` owns event payload policies, the shared schema registry and
+private linkage reads. It can inspect event identity without importing execution
+or store owners. Pending-action evidence and runtime projection share its registry.
+Retry-decision data lives in `providers/_retry_decision.py`; workspace path records
+and their schema fields live in `workspaces/_revision_records.py`. Supported public
+imports resolve to those same classes. Tool-result schema metadata lives beside
+its attestation code in `tools/_shared_artifact_result_schema.py` and
+`tools/_web_access_result_schema.py`. Runtime retains event redaction, publication,
+delivery and retry execution; tool-result attestation retains its authority checks.
+
 `sessions/_completion_finalization.py` owns the saved cleanup marker key, reader
 and validation, including detached results and the encoded byte limit. Session
 queue publication and runtime recovery share this component without importing

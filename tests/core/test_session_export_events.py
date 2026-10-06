@@ -6,6 +6,7 @@ import asyncio
 
 import pytest
 
+from cayu._event_schema import EVENT_PAYLOAD_POLICIES
 from cayu.budgets.base import InMemoryBudgetStore
 from cayu.events import (
     SESSION_EXPORT_EVENT_FIELDS,
@@ -18,7 +19,6 @@ from cayu.events import (
     validate_session_export_event,
 )
 from cayu.runtime._event_projection import (
-    EVENT_PAYLOAD_POLICIES,
     PRIVATE_EVENT_AUTHORITY,
     prepare_new_runtime_event,
     project_persisted_runtime_event,

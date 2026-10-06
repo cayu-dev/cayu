@@ -11,48 +11,13 @@ from cayu.events import (
     event_payload_authority_is_runtime_generated,
     event_with_runtime_payload_authority,
 )
+from cayu.tools import _web_access_result_schema as web_access_result_schema
 from cayu.tools.base import ToolResult
 
-WEB_ACCESS_RESULT_AUTHORITY_FIELD = "web_access_result_authority"
 _AUTHORITY_PREFIX = "cayu.web-access-result.v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _ResultKind = Literal["browser_session", "routing", "web_fetch"]
 
-_EVIDENCE_KEYS = frozenset(
-    {
-        "schema_version",
-        "outcome",
-        "source",
-        "signal",
-        "destination_fingerprint",
-        "status_code",
-        "retry_after_seconds",
-        "retry_after_unrepresentable",
-    }
-)
-_ROUTE_IDENTITY_KEYS = frozenset({"route_id", "kind", "profile_fingerprint"})
-_ROUTE_KEYS = frozenset(
-    {
-        "schema_version",
-        "policy",
-        "selected_route",
-        "execution_profile_fingerprint",
-        "terminal_disposition",
-        "history",
-        "original_access",
-        "next_eligible_at",
-    }
-)
-_HISTORY_KEYS = frozenset(
-    {"route", "invoked", "access", "action", "disposition", "next_eligible_at"}
-)
-WEB_ACCESS_MESSAGE_STRUCTURE_KEYS = (
-    frozenset({"access", "access_state", "webbridge_route"})
-    | _EVIDENCE_KEYS
-    | _ROUTE_IDENTITY_KEYS
-    | _ROUTE_KEYS
-    | _HISTORY_KEYS
-)
 
 _OUTCOMES = frozenset(
     {
@@ -99,29 +64,6 @@ _ROUTE_DISPOSITIONS = frozenset(
 _ACCESS_STATES = frozenset({"available", "blocked", "unknown"})
 
 
-def _event_path(*segments: str) -> tuple[str, ...]:
-    return ("result", "structured", *segments)
-
-
-WEB_ACCESS_RESULT_EVENT_SCHEMA_PATHS = frozenset(
-    {
-        _event_path("access_state"),
-        _event_path("access"),
-        *(_event_path("access", key) for key in _EVIDENCE_KEYS),
-        _event_path("webbridge_route"),
-        *(_event_path("webbridge_route", key) for key in _ROUTE_KEYS),
-        *(_event_path("webbridge_route", "selected_route", key) for key in _ROUTE_IDENTITY_KEYS),
-        *(_event_path("webbridge_route", "original_access", key) for key in _EVIDENCE_KEYS),
-        *(_event_path("webbridge_route", "history", "*", key) for key in _HISTORY_KEYS),
-        *(
-            _event_path("webbridge_route", "history", "*", "route", key)
-            for key in _ROUTE_IDENTITY_KEYS
-        ),
-        *(_event_path("webbridge_route", "history", "*", "access", key) for key in _EVIDENCE_KEYS),
-    }
-)
-
-
 def attest_runtime_web_access_result(
     event: Event,
     result: ToolResult,
@@ -136,10 +78,10 @@ def attest_runtime_web_access_result(
         return event
     marker = _marker(kind, controls)
     payload = dict(event.payload)
-    payload[WEB_ACCESS_RESULT_AUTHORITY_FIELD] = marker
+    payload[web_access_result_schema.WEB_ACCESS_RESULT_AUTHORITY_FIELD] = marker
     return event_with_runtime_payload_authority(
         event.model_copy(update={"payload": payload}),
-        WEB_ACCESS_RESULT_AUTHORITY_FIELD,
+        web_access_result_schema.WEB_ACCESS_RESULT_AUTHORITY_FIELD,
     )
 
 
@@ -194,7 +136,7 @@ def preserve_attested_controls_across_hook(
 def restore_persisted_web_access_result_authority(event: Event) -> Event:
     """Restore private authority after a coordinator-owned stage is loaded."""
 
-    if WEB_ACCESS_RESULT_AUTHORITY_FIELD not in event.payload:
+    if web_access_result_schema.WEB_ACCESS_RESULT_AUTHORITY_FIELD not in event.payload:
         return event
     result = event.payload.get("result")
     controls = (
@@ -210,7 +152,7 @@ def restore_persisted_web_access_result_authority(event: Event) -> Event:
         raise ValueError("Persisted web-access result authority is malformed.")
     return event_with_runtime_payload_authority(
         event,
-        WEB_ACCESS_RESULT_AUTHORITY_FIELD,
+        web_access_result_schema.WEB_ACCESS_RESULT_AUTHORITY_FIELD,
     )
 
 
@@ -221,7 +163,7 @@ def restore_attested_event_result(
     trust_persisted: bool,
     reject_malformed: bool,
 ) -> None:
-    if WEB_ACCESS_RESULT_AUTHORITY_FIELD not in event.payload:
+    if web_access_result_schema.WEB_ACCESS_RESULT_AUTHORITY_FIELD not in event.payload:
         return
     source_result = event.payload.get("result")
     target_result = redacted_payload.get("result")
@@ -276,7 +218,7 @@ def persisted_web_access_control_paths(
         return frozenset()
     return frozenset(
         {
-            ("payload", WEB_ACCESS_RESULT_AUTHORITY_FIELD),
+            ("payload", web_access_result_schema.WEB_ACCESS_RESULT_AUTHORITY_FIELD),
             *(
                 ("payload", "result", "structured", *path)
                 for path in _string_control_paths(controls)
@@ -335,7 +277,7 @@ def _evidence(value: object, *, finite: bool) -> dict[str, Any] | None:
     if source is None or source.get("schema_version") != 1:
         return None
     if not finite:
-        return _pick(source, _EVIDENCE_KEYS)
+        return _pick(source, web_access_result_schema._EVIDENCE_KEYS)
     outcome, evidence_source, signal = (
         source.get("outcome"),
         source.get("source"),
@@ -355,7 +297,11 @@ def _route_identity(value: object, *, finite: bool) -> dict[str, Any] | None:
     source = _json_object(value)
     if source is None or source.get("kind") not in _ROUTE_KINDS:
         return None
-    return {"kind": source["kind"]} if finite else _pick(source, _ROUTE_IDENTITY_KEYS)
+    return (
+        {"kind": source["kind"]}
+        if finite
+        else _pick(source, web_access_result_schema._ROUTE_IDENTITY_KEYS)
+    )
 
 
 def _route(value: object, *, finite: bool) -> dict[str, Any] | None:
@@ -434,7 +380,7 @@ def _attested_controls(
     *,
     trust_persisted: bool,
 ) -> dict[str, Any] | None:
-    marker = event.payload.get(WEB_ACCESS_RESULT_AUTHORITY_FIELD)
+    marker = event.payload.get(web_access_result_schema.WEB_ACCESS_RESULT_AUTHORITY_FIELD)
     if type(marker) is not str:
         return None
     parts = marker.split(":")
@@ -448,7 +394,7 @@ def _attested_controls(
     kind = cast("_ResultKind", parts[1])
     if not trust_persisted and not event_payload_authority_is_runtime_generated(
         event,
-        field_name=WEB_ACCESS_RESULT_AUTHORITY_FIELD,
+        field_name=web_access_result_schema.WEB_ACCESS_RESULT_AUTHORITY_FIELD,
         value=marker,
     ):
         return None
@@ -488,10 +434,10 @@ def _string_control_paths(
 
 
 def _without_authority(event: Event) -> Event:
-    if WEB_ACCESS_RESULT_AUTHORITY_FIELD not in event.payload:
+    if web_access_result_schema.WEB_ACCESS_RESULT_AUTHORITY_FIELD not in event.payload:
         return event
     payload = dict(event.payload)
-    payload.pop(WEB_ACCESS_RESULT_AUTHORITY_FIELD, None)
+    payload.pop(web_access_result_schema.WEB_ACCESS_RESULT_AUTHORITY_FIELD, None)
     return event.model_copy(update={"payload": payload})
 
 

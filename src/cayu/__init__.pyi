@@ -3361,6 +3361,10 @@ from cayu.observability.watchers import EventWatcherRunResult as EventWatcherRun
 from cayu.observability.watchers import EventWatcherState as EventWatcherState
 from cayu.observability.watchers import EventWatcherStore as EventWatcherStore
 from cayu.observability.watchers import InMemoryEventWatcherStore as InMemoryEventWatcherStore
+from cayu.providers._retry_decision import RetryDecision as RetryDecision
+from cayu.providers._retry_decision import RetryDisposition as RetryDisposition
+from cayu.providers._retry_decision import RetryReason as RetryReason
+from cayu.providers._retry_decision import RetrySuppression as RetrySuppression
 from cayu.providers.anthropic import AnthropicProvider as AnthropicProvider
 from cayu.providers.base import InputTokenCountConfidence as InputTokenCountConfidence
 from cayu.providers.base import InputTokenCountMethod as InputTokenCountMethod
@@ -3815,11 +3819,7 @@ from cayu.runtime.recall_sources import (
 from cayu.runtime.recall_sources import (
     AutomaticRecallSourceRegistration as AutomaticRecallSourceRegistration,
 )
-from cayu.runtime.retry_policy import RetryDecision as RetryDecision
-from cayu.runtime.retry_policy import RetryDisposition as RetryDisposition
 from cayu.runtime.retry_policy import RetryPolicy as RetryPolicy
-from cayu.runtime.retry_policy import RetryReason as RetryReason
-from cayu.runtime.retry_policy import RetrySuppression as RetrySuppression
 from cayu.runtime.retry_policy import classify_retryable_error as classify_retryable_error
 from cayu.runtime.retry_policy import copy_retry_policy as copy_retry_policy
 from cayu.runtime.retry_policy import retry_decision as retry_decision
@@ -5339,6 +5339,10 @@ from cayu.workflows.workflow import gated_loop as gated_loop
 from cayu.workflows.workflow import parallel as parallel
 from cayu.workflows.workflow import pipeline as pipeline
 from cayu.workflows.workflow import step as step
+from cayu.workspaces._revision_records import WorkspacePathRevision as WorkspacePathRevision
+from cayu.workspaces._revision_records import (
+    WorkspacePathRevisionDelta as WorkspacePathRevisionDelta,
+)
 from cayu.workspaces.base import BoundedTarReader as BoundedTarReader
 from cayu.workspaces.base import BoundedTarStreamReader as BoundedTarStreamReader
 from cayu.workspaces.base import RunnerBoundWorkspace as RunnerBoundWorkspace
@@ -5482,8 +5486,6 @@ from cayu.workspaces.revisions import WorkspaceMutationAttribution as WorkspaceM
 from cayu.workspaces.revisions import (
     WorkspaceMutationAttributionConfidence as WorkspaceMutationAttributionConfidence,
 )
-from cayu.workspaces.revisions import WorkspacePathRevision as WorkspacePathRevision
-from cayu.workspaces.revisions import WorkspacePathRevisionDelta as WorkspacePathRevisionDelta
 from cayu.workspaces.revisions import WorkspaceRevisionDelta as WorkspaceRevisionDelta
 from cayu.workspaces.revisions import WorkspaceRevisionDeltaStatus as WorkspaceRevisionDeltaStatus
 from cayu.workspaces.revisions import WorkspaceRevisionObservation as WorkspaceRevisionObservation

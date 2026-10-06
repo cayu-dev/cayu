@@ -12,6 +12,7 @@ from cayu.events import (
     event_payload_authority_is_runtime_generated,
     event_with_runtime_payload_authority,
 )
+from cayu.tools import _shared_artifact_result_schema as shared_artifact_result_schema
 from cayu.tools.base import ToolResult
 from cayu.tools.shared_artifacts import (
     MATERIALIZE_SHARED_ARTIFACT_TOOL_NAME,
@@ -23,77 +24,8 @@ from cayu.tools.shared_artifacts import (
     SharedArtifactRef,
 )
 
-SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD = "shared_artifact_result_authority"
 _AUTHORITY_PREFIX = "cayu.shared-artifact-result.v1"
 _ResultKind = Literal["publication", "materialization"]
-_REFERENCE_KEYS = frozenset(
-    {
-        "schema_version",
-        "artifact_store_id",
-        "artifact_id",
-        "content_digest",
-        "size_bytes",
-        "source_session_id",
-        "access_grant_id",
-    }
-)
-_PUBLICATION_RECEIPT_KEYS = frozenset(
-    {
-        "record_type",
-        "schema_version",
-        "operation_id",
-        "reference",
-        "source_workspace_id",
-        "source_path_sha256",
-        "content_type",
-        "policy_fingerprint",
-        "retention_class",
-        "terminal_disposition",
-        "published_at",
-    }
-)
-_MATERIALIZATION_RECEIPT_KEYS = frozenset(
-    {
-        "record_type",
-        "schema_version",
-        "operation_id",
-        "reference",
-        "source_workspace_id",
-        "destination_session_id",
-        "destination_workspace_id",
-        "destination_path_sha256",
-        "policy_fingerprint",
-        "bytes_written",
-        "terminal_disposition",
-        "materialized_at",
-    }
-)
-
-
-def _event_path(*segments: str) -> tuple[str, ...]:
-    return ("result", "structured", *segments)
-
-
-SHARED_ARTIFACT_RESULT_EVENT_SCHEMA_PATHS = frozenset(
-    {
-        *(
-            _event_path(key)
-            for key in {
-                "shared_artifact_kind",
-                "opaque_ref",
-                "shared_artifact_ref",
-                "publication_receipt",
-                "materialization_receipt",
-                "recovered_from_durable_receipt",
-            }
-        ),
-        *(_event_path("shared_artifact_ref", key) for key in _REFERENCE_KEYS),
-        *(_event_path("publication_receipt", key) for key in _PUBLICATION_RECEIPT_KEYS),
-        *(_event_path("publication_receipt", "reference", key) for key in _REFERENCE_KEYS),
-        *(_event_path("materialization_receipt", key) for key in _MATERIALIZATION_RECEIPT_KEYS),
-        *(_event_path("materialization_receipt", "reference", key) for key in _REFERENCE_KEYS),
-    }
-)
 
 
 def attest_runtime_shared_artifact_result(
@@ -112,10 +44,10 @@ def attest_runtime_shared_artifact_result(
         return event
     marker = _marker(kind, controls)
     payload = dict(event.payload)
-    payload[SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD] = marker
+    payload[shared_artifact_result_schema.SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD] = marker
     return event_with_runtime_payload_authority(
         event.model_copy(update={"payload": payload}),
-        SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD,
+        shared_artifact_result_schema.SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD,
     )
 
 
@@ -144,7 +76,7 @@ def preserve_attested_controls_across_hook(
 def restore_persisted_shared_artifact_result_authority(event: Event) -> Event:
     """Restore private marker provenance after a staged terminal is loaded."""
 
-    if SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD not in event.payload:
+    if shared_artifact_result_schema.SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD not in event.payload:
         return event
     raw_result = event.payload.get("result")
     controls = (
@@ -160,7 +92,7 @@ def restore_persisted_shared_artifact_result_authority(event: Event) -> Event:
         raise ValueError("Persisted shared-artifact result authority is malformed.")
     return event_with_runtime_payload_authority(
         event,
-        SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD,
+        shared_artifact_result_schema.SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD,
     )
 
 
@@ -171,7 +103,7 @@ def restore_attested_event_result(
     trust_persisted: bool,
     reject_malformed: bool,
 ) -> None:
-    if SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD not in event.payload:
+    if shared_artifact_result_schema.SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD not in event.payload:
         return
     source_result = event.payload.get("result")
     target_result = redacted_payload.get("result")
@@ -210,7 +142,7 @@ def persisted_shared_artifact_control_paths(
         return frozenset()
     return frozenset(
         {
-            ("payload", SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD),
+            ("payload", shared_artifact_result_schema.SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD),
             *(
                 ("payload", "result", "structured", *path)
                 for path in _string_control_paths(controls)
@@ -267,7 +199,7 @@ def _attested_controls(
     *,
     trust_persisted: bool,
 ) -> dict[str, Any] | None:
-    marker = event.payload.get(SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD)
+    marker = event.payload.get(shared_artifact_result_schema.SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD)
     if type(marker) is not str:
         return None
     parts = marker.split(":")
@@ -282,7 +214,7 @@ def _attested_controls(
     kind = cast("_ResultKind", parts[1])
     if not trust_persisted and not event_payload_authority_is_runtime_generated(
         event,
-        field_name=SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD,
+        field_name=shared_artifact_result_schema.SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD,
         value=marker,
     ):
         return None
@@ -315,10 +247,10 @@ def _json_object(value: object) -> dict[str, Any] | None:
 
 
 def _without_authority(event: Event) -> Event:
-    if SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD not in event.payload:
+    if shared_artifact_result_schema.SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD not in event.payload:
         return event
     payload = dict(event.payload)
-    payload.pop(SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD, None)
+    payload.pop(shared_artifact_result_schema.SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD, None)
     return event.model_copy(update={"payload": payload})
 
 
@@ -356,8 +288,6 @@ def _string_control_paths(
 
 
 __all__ = [
-    "SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD",
-    "SHARED_ARTIFACT_RESULT_EVENT_SCHEMA_PATHS",
     "attest_runtime_shared_artifact_result",
     "persisted_shared_artifact_control_paths",
     "preserve_attested_controls_across_hook",

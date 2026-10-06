@@ -167,8 +167,11 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "WorkspaceMutationAttributionConfidence",
     ),
     "WorkspaceMutationResult": ("cayu.workspaces.base", "WorkspaceMutationResult"),
-    "WorkspacePathRevision": ("cayu.workspaces.revisions", "WorkspacePathRevision"),
-    "WorkspacePathRevisionDelta": ("cayu.workspaces.revisions", "WorkspacePathRevisionDelta"),
+    "WorkspacePathRevision": ("cayu.workspaces._revision_records", "WorkspacePathRevision"),
+    "WorkspacePathRevisionDelta": (
+        "cayu.workspaces._revision_records",
+        "WorkspacePathRevisionDelta",
+    ),
     "WorkspacePreconditionUnsupportedError": (
         "cayu.workspaces.base",
         "WorkspacePreconditionUnsupportedError",

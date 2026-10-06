@@ -41,6 +41,7 @@ from cayu.sessions.base import (
 )
 from cayu.sessions.invocation import SessionExecutionSource
 from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.tools import _shared_artifact_result_schema as shared_artifact_result_schema
 from cayu.tools import _shared_artifact_results as shared_artifact_results
 from cayu.tools import shared_artifacts as shared_artifact_tools
 from cayu.tools._redaction import InvocationRedactorSnapshot
@@ -536,10 +537,10 @@ def test_shared_artifact_result_authority_survives_only_owned_reconstruction() -
         result,
         tool=PublishWorkspaceArtifactTool(_policy()),
     )
-    marker = terminal.payload[shared_artifact_results.SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD]
+    marker = terminal.payload[shared_artifact_result_schema.SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD]
     assert event_payload_authority_is_runtime_generated(
         terminal,
-        field_name=shared_artifact_results.SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD,
+        field_name=shared_artifact_result_schema.SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD,
         value=marker,
     )
 
@@ -560,7 +561,10 @@ def test_shared_artifact_result_authority_survives_only_owned_reconstruction() -
         untrusted.payload["result"]["structured"]["shared_artifact_ref"]["source_session_id"]
         == "[REDACTED_SECRET]"
     )
-    assert shared_artifact_results.SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD not in untrusted.payload
+    assert (
+        shared_artifact_result_schema.SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD
+        not in untrusted.payload
+    )
 
     tampered_payload = json.loads(json.dumps(persisted.payload))
     tampered_payload["result"]["structured"]["shared_artifact_ref"]["source_session_id"] = (

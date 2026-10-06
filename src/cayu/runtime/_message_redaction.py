@@ -6,6 +6,7 @@ from cayu.artifacts.attachments import FILE_ATTACHMENT_TYPE
 from cayu.messages import Message
 from cayu.runtime import _tool_results as tool_results
 from cayu.tools import _terminal_controls as tool_terminal_controls
+from cayu.tools import _web_access_result_schema as web_access_result_schema
 from cayu.tools import _web_access_results as web_access_results
 from cayu.tools.result_projection import (
     _BUILTIN_TOOL_RESULT_ARTIFACT_REFERENCE_FIELDS,
@@ -542,7 +543,7 @@ def _require_secret_free_tool_result_structure(
         redactor.require_no_secret_keys(
             structured,
             field_name=field_name,
-            preserve_keys=web_access_results.WEB_ACCESS_MESSAGE_STRUCTURE_KEYS,
+            preserve_keys=web_access_result_schema.WEB_ACCESS_MESSAGE_STRUCTURE_KEYS,
             match_short_substrings=True,
         )
         return

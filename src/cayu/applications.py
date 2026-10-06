@@ -54,6 +54,7 @@ from cayu._application_registration import (
     _validate_registered_tool as _validate_registered_tool,
 )
 from cayu._application_registration import _validate_runtime_hooks as _validate_runtime_hooks
+from cayu._event_schema import private_event_linkage_value
 from cayu._task_wait import collect_failures, combine_drain_results, wait_until_idle
 from cayu._validation import (
     canonical_bounded_durable_json_bytes,
@@ -398,7 +399,6 @@ from cayu.runtime._durable_subagents import (
 from cayu.runtime._environment_lifecycle import EnvironmentLifecycle, render_initial_system_prompt
 from cayu.runtime._event_projection import (
     PUBLIC_EVENT_ID_PREFIX,
-    private_event_linkage_value,
     project_persisted_runtime_event,
     project_runtime_event,
     public_event_envelope_alias,

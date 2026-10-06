@@ -355,6 +355,10 @@ from cayu.tools.terminal_publication import (
     ToolTerminalPublicationMetricsSnapshot,
 )
 from cayu.vaults.redaction import SecretRedactor
+from cayu.workspaces._revision_records import (
+    _WORKSPACE_PATH_REVISION_AUTHORITY_FIELDS,
+    _WORKSPACE_PATH_REVISION_DELTA_AUTHORITY_FIELDS,
+)
 from cayu.workspaces.checkpoint_lifecycle import (
     begin_workspace_checkpoint_mutation,
     complete_workspace_checkpoint_mutation,
@@ -391,8 +395,6 @@ from cayu.workspaces.observation_recovery import (
     workspace_observations_from_checkpoint,
 )
 from cayu.workspaces.revisions import (
-    _WORKSPACE_PATH_REVISION_AUTHORITY_FIELDS,
-    _WORKSPACE_PATH_REVISION_DELTA_AUTHORITY_FIELDS,
     WorkspaceDirectMutationReconciliation,
     WorkspaceIdentity,
     WorkspaceMutationAttribution,
