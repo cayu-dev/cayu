@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from cayu.sessions.base import RunRequest, SessionIdentity
+from cayu.storage import _sqlite_catalog as sqlite_catalog
 from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_support as sqlite_support
@@ -828,7 +829,7 @@ def test_revision_37_commit_and_rollback_failure_fences_connection_and_retries(
     try:
         assert check.execute("PRAGMA user_version").fetchone()[0] == 36
         assert (
-            sqlite_support._sqlite_table_columns(check, "cayu_knowledge_chunks")
+            sqlite_catalog._sqlite_table_columns(check, "cayu_knowledge_chunks")
             == sqlite_support._KNOWLEDGE_CHUNK_LEGACY_COLUMNS
         )
         assert (

@@ -62,6 +62,80 @@ assert "cayu.storage.postgres" not in sys.modules
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("missing_index", [False, True])
+def test_sqlite_knowledge_schema_validates_without_migration_or_store_imports(
+    tmp_path, sqlite_resources, missing_index
+):
+    from cayu.storage import _sqlite_connection, _sqlite_support
+
+    async def prepare():
+        async with sqlite_resources as resources:
+            path = tmp_path / "knowledge.sqlite"
+            connection = resources.own(_sqlite_connection.connect(path), kind="connection")
+            _sqlite_support.initialize_schema(connection)
+            if missing_index:
+                connection.execute("DROP INDEX idx_cayu_knowledge_revisions_status")
+                connection.commit()
+            return path
+
+    path = asyncio.run(prepare())
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sqlite3
+import sys
+from contextlib import closing
+from pathlib import Path
+
+from cayu.storage import _sqlite_knowledge_schema as knowledge_schema
+
+with closing(sqlite3.connect(Path(sys.argv[1]).as_uri() + "?mode=ro", uri=True)) as connection:
+    try:
+        knowledge_schema._validate_revision_42_knowledge_schema(
+            connection, require_payload_bytes=True
+        )
+        knowledge_schema._validate_revision_43_knowledge_schema(connection, relation_aware=True)
+        knowledge_schema._validate_revision_44_knowledge_schema(connection)
+        knowledge_schema._validate_revision_60_knowledge_schema(connection)
+        knowledge_schema._validate_revision_63_knowledge_schema(connection)
+        knowledge_schema._validate_revision_67_knowledge_schema(connection)
+        knowledge_schema._validate_revision_75_knowledge_activation_schema(connection)
+        knowledge_schema._validate_revision_77_knowledge_maintenance_governance_schema(connection)
+        knowledge_schema._validate_revision_78_knowledge_semantic_watch_schema(connection)
+        knowledge_schema._validate_knowledge_publication_access_snapshot_column(connection)
+    except RuntimeError as error:
+        assert sys.argv[2] == "True", str(error)
+        assert "idx_cayu_knowledge_revisions_status" in str(error), str(error)
+    else:
+        assert sys.argv[2] == "False", "missing index was accepted"
+    assert not connection.in_transaction
+
+for name in (
+    "cayu.storage._sqlite_support",
+    "cayu.storage._sqlite_connection",
+    "cayu.storage.migrations",
+    "cayu.sessions.base",
+    "cayu.tasks.base",
+    "cayu.storage.knowledge_sqlite",
+    "cayu.storage.sqlite",
+    "cayu.storage.tasks_sqlite",
+    "cayu.storage.postgres",
+):
+    assert name not in sys.modules, name
+""",
+            str(path),
+            str(missing_index),
+        ],
+        env={**os.environ, "PYTHONPATH": str(Path(cayu.__file__).resolve().parent.parent)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_sqlite_task_store_preserves_public_and_legacy_identity():
     from cayu.storage import sqlite, tasks_sqlite
 

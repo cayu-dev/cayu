@@ -44802,5 +44802,7 @@
     "tests/core/test_release_workflow.py::test_recording_encoder_rewrites_cloud_mirrors_in_all_ubuntu_source_formats": 0.00862037597107701,
     "tests/qualification/test_repository_maintenance_delivery_probe.py::test_destination_probes_reopen_independently_without_weakening_conflicts": 0.32106262500747107,
     "tests/qualification/test_repository_maintenance_reconciliation.py::test_operator_projects_recorded_generation_without_claiming_quiescence[aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb]": 1.4141256669827271,
-    "tests/qualification/test_repository_maintenance_reconciliation.py::test_operator_projects_recorded_generation_without_claiming_quiescence[aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:unknown]": 1.2826035420002881
+    "tests/qualification/test_repository_maintenance_reconciliation.py::test_operator_projects_recorded_generation_without_claiming_quiescence[aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:unknown]": 1.2826035420002881,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_knowledge_schema_validates_without_migration_or_store_imports[False]": 0.96964083299099,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_knowledge_schema_validates_without_migration_or_store_imports[True]": 0.1810708740085829
 }

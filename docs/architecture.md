@@ -629,6 +629,13 @@ Process commands should use argv form. Shell execution should be an explicit mod
 
 ## Storage and Memory
 
+SQLite knowledge-schema checks live in `storage/_sqlite_knowledge_schema.py`.
+They inspect existing tables, indexes, views and constraints using the shared
+readers in `storage/_sqlite_catalog.py`. Schema reconciliation retains revision
+gates and validation order in `storage/_sqlite_support.py`, alongside migration
+history and execution. The knowledge checks can run on a read-only connection
+without importing migration history or store adapters.
+
 Files are good source-of-truth for prompts, instructions, workflows, manuals, skills, and human-reviewed memories.
 
 Databases/indexes are better for sessions, event logs, high-volume memories, permissions, embeddings, search, and hosted multi-user state.
