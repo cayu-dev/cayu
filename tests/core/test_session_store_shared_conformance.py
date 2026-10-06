@@ -30070,3 +30070,337 @@ def test_session_store_conformance_interrupt_does_not_cancel_consumer(
             await _close_store(store)
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "signal_order",
+    [
+        "before-refusal",
+        "after-refusal",
+        "during-probe-load",
+        "during-probe-checkpoint",
+        "during-cleanup",
+    ],
+)
+@pytest.mark.parametrize("with_recall", [False, True])
+def test_session_store_conformance_interrupt_wins_model_preparation(
+    session_store_case,
+    monkeypatch,
+    signal_order,
+    with_recall,
+) -> None:
+    import cayu.runtime._model_step_executor as model_step_module
+
+    if signal_order == "during-cleanup" and not with_recall:
+        pytest.skip("Context-exposure cleanup requires automatic recall")
+
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            request_footprint=RequestFootprintConfig(
+                fingerprint_key_id="automatic-recall-recovery",
+                fingerprint_key="automatic-recall-recovery-key-material",
+            ),
+        )
+        provider = ScriptedModelProvider([])
+        app.register_provider(provider, default=True)
+        if with_recall:
+            knowledge = _AutomaticRecallRecoveryKnowledgeStore()
+            await knowledge.create_entry(
+                KnowledgeEntry(
+                    id="automatic-recall-recovery",
+                    text="Atlas recovery evidence says Friday.",
+                )
+            )
+            app.register_environment(
+                Environment(
+                    _approval_recovery_environment_spec(),
+                    knowledge_store=knowledge,
+                ),
+                default=True,
+            )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=_automatic_recall_recovery_policy() if with_recall else None,
+        )
+        session_id = "interrupt-model-preparation"
+        ready = asyncio.Event()
+        signal_sent = asyncio.Event()
+        original_prepare = store.prepare_model_completion_stage
+        original_cancel = app._session_control.cancel_active_runs
+        original_load_exposure = store.load_context_exposure
+        runtime_store = app._model_step_executor._session_store
+        original_load = runtime_store.load
+        original_checkpoint = runtime_store.load_checkpoint
+        original_handle = app._session_engine._handle_session_interrupted
+        refused = False
+        cancellation_injected = False
+        probe_task = None
+        original_probe = model_step_module._model_preparation_lost_to_interrupt
+
+        async def probe(*args, **kwargs):
+            nonlocal probe_task
+            probe_task = asyncio.current_task()
+            try:
+                return await original_probe(*args, **kwargs)
+            finally:
+                probe_task = None
+
+        async def prepare(*args, **kwargs):
+            nonlocal refused
+            ready.set()
+            await signal_sent.wait()
+            assert (await store.load(session_id)).status is SessionStatus.INTERRUPTING
+            try:
+                return await original_prepare(*args, **kwargs)
+            except (SessionStatusConflict, SessionRunFenced):
+                refused = True
+                raise
+
+        def signal(sid):
+            if signal_order == "before-refusal":
+                original_cancel(sid)
+            signal_sent.set()
+            return True
+
+        async def load(*args, **kwargs):
+            nonlocal cancellation_injected
+            if (
+                asyncio.current_task() is probe_task
+                and signal_order == "during-probe-load"
+                and not cancellation_injected
+            ):
+                cancellation_injected = True
+                assert original_cancel(session_id)
+                await asyncio.sleep(0)
+            return await original_load(*args, **kwargs)
+
+        async def load_checkpoint(*args, **kwargs):
+            nonlocal cancellation_injected
+            if (
+                asyncio.current_task() is probe_task
+                and signal_order == "during-probe-checkpoint"
+                and not cancellation_injected
+            ):
+                cancellation_injected = True
+                assert original_cancel(session_id)
+                await asyncio.sleep(0)
+            return await original_checkpoint(*args, **kwargs)
+
+        async def load_exposure(*args, **kwargs):
+            nonlocal cancellation_injected
+            if refused and signal_order == "during-cleanup" and not cancellation_injected:
+                cancellation_injected = True
+                assert original_cancel(session_id)
+                await asyncio.sleep(0)
+            return await original_load_exposure(*args, **kwargs)
+
+        async def publish(**kwargs):
+            if signal_order == "after-refusal":
+                assert refused
+                assert original_cancel(session_id)
+            async for event in original_handle(**kwargs):
+                yield event
+
+        monkeypatch.setattr(model_step_module, "_model_preparation_lost_to_interrupt", probe)
+        monkeypatch.setattr(store, "prepare_model_completion_stage", prepare)
+        monkeypatch.setattr(store, "load_context_exposure", load_exposure)
+        monkeypatch.setattr(runtime_store, "load", load)
+        monkeypatch.setattr(runtime_store, "load_checkpoint", load_checkpoint)
+        monkeypatch.setattr(app._session_control, "cancel_active_runs", signal)
+        monkeypatch.setattr(app._session_engine, "_handle_session_interrupted", publish)
+        consumer = asyncio.create_task(
+            _collect_events(
+                app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "When is Atlas released?")],
+                    )
+                )
+            )
+        )
+        interrupter = None
+        try:
+            try:
+                await asyncio.wait_for(ready.wait(), 10)
+            except TimeoutError:
+                if consumer.done():
+                    await consumer
+                raise
+            interrupter = asyncio.create_task(
+                _collect_events(
+                    app.interrupt_session(
+                        InterruptSessionRequest(session_id=session_id, reason="pause")
+                    )
+                )
+            )
+            observed = await asyncio.wait_for(asyncio.shield(consumer), 10)
+            interrupted_events = await asyncio.wait_for(interrupter, 10)
+            terminal = [e for e in observed if e.type == EventType.SESSION_INTERRUPTED]
+            assert len(terminal) == 1
+            assert [
+                e.id for e in interrupted_events if e.type == EventType.SESSION_INTERRUPTED
+            ] == [terminal[0].id]
+            assert (await store.load(session_id)).status is SessionStatus.INTERRUPTED
+            assert consumer.cancelling() == 0
+            assert not provider.requests
+            records = await store.query_events(EventQuery(session_id=session_id))
+            assert not any(
+                r.event.type in {EventType.SESSION_FAILED, EventType.INTERACTION_FAILED}
+                for r in records
+            )
+            if signal_order.startswith("during-"):
+                assert cancellation_injected
+            if with_recall:
+                exposures = (
+                    await store.list_context_exposures(RecallEvidenceQuery(session_id=session_id))
+                ).items
+                assert len(exposures) == 1
+                assert exposures[0].state is ContextExposureState.CANCELLED
+        finally:
+            signal_sent.set()
+            tasks = [consumer] + ([] if interrupter is None else [interrupter])
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await app.aclose()
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("termination_fails", [False, True])
+def test_session_store_conformance_cancel_during_post_preparation_cleanup(
+    session_store_case,
+    monkeypatch,
+    termination_fails,
+) -> None:
+    import cayu.runtime._model_step_executor as model_step_module
+    from cayu.runtime._run_limits import (
+        BudgetReservationLeaseLost,
+        BudgetReservationLeaseLostBeforeModelDispatch,
+    )
+
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            request_footprint=RequestFootprintConfig(
+                fingerprint_key_id="automatic-recall-recovery",
+                fingerprint_key="automatic-recall-recovery-key-material",
+            ),
+        )
+        provider = ScriptedModelProvider([])
+        app.register_provider(provider, default=True)
+        knowledge = _AutomaticRecallRecoveryKnowledgeStore()
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="automatic-recall-recovery",
+                text="Atlas recovery evidence says Friday.",
+            )
+        )
+        app.register_environment(
+            Environment(
+                _approval_recovery_environment_spec(),
+                knowledge_store=knowledge,
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=_automatic_recall_recovery_policy(),
+        )
+        session_id = "cancel-post-preparation-cleanup"
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        original_load_exposure = store.load_context_exposure
+        original_finish = model_step_module._raise_after_model_pre_dispatch_cleanup
+        original_failure = BudgetReservationLeaseLost("lease lost before dispatch")
+        prepared_stage = None
+        cleanup_observed = False
+        snapshots = []
+
+        async def fail_dispatch(_session_id, *, stage, **kwargs):
+            nonlocal prepared_stage
+            prepared_stage = stage
+            raise original_failure
+
+        async def load_exposure(*args, **kwargs):
+            nonlocal cleanup_observed
+            if prepared_stage is not None and not cleanup_observed:
+                cleanup_observed = True
+                cleanup_started.set()
+                await release_cleanup.wait()
+                if termination_fails:
+                    raise RuntimeError("exposure store unavailable")
+            return await original_load_exposure(*args, **kwargs)
+
+        async def observe_finish(cleanup, **kwargs):
+            try:
+                await original_finish(cleanup, **kwargs)
+            except asyncio.CancelledError as cancellation:
+                # Observe the outcome before the session finalizer can repair
+                # the retained stage, using real durable storage reads.
+                exposures = (
+                    await store.list_context_exposures(RecallEvidenceQuery(session_id=session_id))
+                ).items
+                stage = await store.load_model_completion_stage(
+                    session_id,
+                    prepared_stage.stage_id,
+                )
+                snapshots.append((cancellation, exposures, stage))
+                raise
+
+        monkeypatch.setattr(store, "mark_model_completion_stage_dispatched", fail_dispatch)
+        monkeypatch.setattr(store, "load_context_exposure", load_exposure)
+        monkeypatch.setattr(
+            model_step_module, "_raise_after_model_pre_dispatch_cleanup", observe_finish
+        )
+        consumer = asyncio.create_task(
+            _collect_events(
+                app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "When is Atlas released?")],
+                    )
+                )
+            )
+        )
+        try:
+            await asyncio.wait_for(cleanup_started.wait(), 10)
+            consumer.cancel("caller cancellation during exposure termination")
+            await asyncio.sleep(0)
+            assert not consumer.done()
+            release_cleanup.set()
+            await asyncio.wait_for(asyncio.gather(consumer, return_exceptions=True), 10)
+            assert len(snapshots) == 1
+            cancellation, exposures, stage = snapshots[0]
+            assert cancellation.args == ("caller cancellation during exposure termination",)
+            assert isinstance(cancellation.__cause__, BudgetReservationLeaseLostBeforeModelDispatch)
+            assert cancellation.__cause__.__cause__ is original_failure
+            assert len(exposures) == 1
+            assert not provider.requests
+            if termination_fails:
+                assert exposures[0].state is ContextExposureState.DISPATCH_STARTED
+                assert stage is not None
+                assert any(
+                    "termination is not durable" in note for note in original_failure.__notes__
+                )
+            else:
+                assert exposures[0].state is ContextExposureState.FAILED
+                assert stage is None
+        finally:
+            release_cleanup.set()
+            if not consumer.done():
+                consumer.cancel()
+            await asyncio.gather(consumer, return_exceptions=True)
+            await app.aclose()
+            await _close_store(store)
+
+    asyncio.run(run())

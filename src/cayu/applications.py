@@ -1483,6 +1483,7 @@ class CayuApp:
         self._provider_operation_cancellation_lifecycle = ProviderOperationCancellationLifecycle()
         self._model_step_executor = ModelStepExecutor(
             session_store=self._runtime_session_store,
+            recovery_cleanup_supervisor=self._recovery_cleanup_supervisor,
             event_writer=self._event_writer,
             session_control=self._session_control,
             run_limit_controller=self._run_limit_controller,

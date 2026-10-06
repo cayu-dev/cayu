@@ -4057,6 +4057,28 @@ the durable status or receives the runtime's cancellation signal first. A separa
 caller cancellation during interruption publication still propagates after owned
 terminal publication finishes.
 
+If an interrupt wins the durable model-preparation fence, the refused preparation
+joins that interrupt's terminal publication. It does not publish a competing
+failure or dispatch the provider. The interruption probe and pre-dispatch
+context-exposure termination run as one supervised cleanup step. The shared
+`RecoveryCleanupPolicy` bounds it from entry by the smaller of its step and
+overall deadlines (30 seconds by default); repeated caller cancellation does
+not restart that deadline. Within this bound, cleanup finishes before caller
+cancellation propagates, including for exposures without a prepared model stage.
+Post-preparation cleanup uses the same bound for exposure and stage settlement,
+retention diagnostics, and budget-error classification. Cancellation retains
+the classified failure as its cause. If the deadline expires first, or the
+supervisor is at `max_supervised_tasks` and cannot start cleanup, the run still
+raises the failure being settled, as far as it was classified at that point: an
+interrupt winner found before the deadline stays `SessionInterruptedByRequest`,
+and a lost budget lease stays `BudgetReservationLeaseLostBeforeModelDispatch`.
+That failure carries `RecoveryCleanupDeadlineExceeded` or
+`RecoveryCleanupCapacityExceeded` as its cause, and caller cancellation carries
+the failure as its cause as before. The supervisor cancels and retains the exact
+unfinished cleanup task, exposes its outcome as unknown, and includes it in
+bounded application shutdown/drain. A timeout or capacity refusal does not
+establish durable exposure termination or stage abandonment.
+
 Recovery cleanup is bounded by one shared app policy rather than by each call
 site. `RecoveryCleanupPolicy` defaults each step to 30 seconds, each complete
 ordered cleanup sequence to 120 seconds, and process-local supervision to 256

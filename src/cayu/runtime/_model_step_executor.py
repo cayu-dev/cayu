@@ -27,6 +27,7 @@ from cayu._exception_groups import (
     add_exception_note_safely,
     exception_cause,
     exception_context,
+    exception_suppresses_context,
     exception_tree_contains,
     iter_exception_tree,
     set_exception_cause,
@@ -462,6 +463,13 @@ from cayu.runtime.retry_policy import (
 )
 from cayu.sessions import _model_completion_publication as model_completion_publication
 from cayu.sessions import _pending_tool_round as pending_rounds
+from cayu.sessions._execution_profile_checkpoint import (
+    active_invocation_execution_profile_from_checkpoint,
+)
+from cayu.sessions._invocation_terminal_decision import (
+    InvocationTerminalOutcome,
+    invocation_terminal_decision_from_checkpoint,
+)
 from cayu.sessions._model_failover import (
     MODEL_FAILOVER_CHECKPOINT_KEY,
     ModelFailoverProgress,
@@ -470,6 +478,8 @@ from cayu.sessions._model_failover import (
 from cayu.sessions._provider_operation_cancellation_claim import (
     ProviderOperationCancellationClaim,
 )
+from cayu.sessions._terminal_evidence import interruption_request_id_from_payload
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.base import (
     CheckpointTransform,
     EventOrder,
@@ -480,10 +490,12 @@ from cayu.sessions.base import (
     RuntimePublicationRequest,
     Session,
     SessionStatus,
+    SessionStatusConflict,
     SessionStore,
     _current_session_interaction_id,
     runtime_publication_checkpoint_mutation,
 )
+from cayu.sessions.cleanup import RecoveryCleanupSupervisor
 from cayu.tools.catalogue import (
     CALL_TOOL_NAME,
     SEARCH_TOOLS_NAME,
@@ -711,7 +723,147 @@ async def _terminate_pre_dispatch_context_exposure(
             "Context-exposure pre-dispatch termination also failed: "
             f"{type(evidence_failure).__name__}.",
         )
+        if not isinstance(evidence_failure, Exception):
+            # A later cancellation or process-control failure is not diagnostic
+            # evidence: deliver it to the runtime's control-flow handler.
+            raise
         return False
+
+
+def _classify_pre_dispatch_failure(failure: BaseException) -> BaseException:
+    """Return the typed failure a pre-dispatch settlement reports to the runtime."""
+
+    if not isinstance(failure, BudgetReservationLeaseLost):
+        return failure
+    classified = BudgetReservationLeaseLostBeforeModelDispatch(
+        "Budget reservation lease was lost before model dispatch."
+    )
+    set_exception_cause(classified, failure)
+    return classified
+
+
+def _attach_unsettled_pre_dispatch_cleanup(
+    failure: BaseException,
+    supervision_failures: list[BaseException],
+) -> None:
+    """Record why settlement is unknown without discarding the failure's own cause."""
+
+    existing = exception_cause(failure)
+    if existing is None and not exception_suppresses_context(failure):
+        existing = exception_context(failure)
+    causes = list(supervision_failures)
+    if existing is not None and not any(existing is cause for cause in causes):
+        causes.append(existing)
+    set_exception_cause(
+        failure,
+        (
+            causes[0]
+            if len(causes) == 1
+            else BaseExceptionGroup("Pre-dispatch cleanup outcome is unknown.", causes)
+        ),
+    )
+    add_exception_note_safely(
+        failure,
+        "Pre-dispatch cleanup did not settle: "
+        + ", ".join(type(error).__name__ for error in supervision_failures)
+        + ".",
+    )
+
+
+async def _raise_after_model_pre_dispatch_cleanup(
+    cleanup: Callable[[], Awaitable[Never]],
+    *,
+    unsettled_failure: Callable[[], BaseException],
+    supervisor: RecoveryCleanupSupervisor,
+) -> Never:
+    """Settle within shared cleanup bounds, retaining any outcome-unknown owner.
+
+    ``unsettled_failure`` returns the failure as classified so far. It is raised
+    when the supervisor stops waiting or cannot start cleanup, so a deadline or
+    capacity refusal never replaces the outcome the runtime must handle.
+    """
+
+    delivered: list[BaseException] = []
+
+    async def delivering_cleanup() -> Never:
+        try:
+            await cleanup()
+        except BaseException as outcome:
+            delivered.append(outcome)
+            raise
+
+    task = asyncio.create_task(
+        supervisor.run_steps(
+            steps=(("model pre-dispatch cleanup", delivering_cleanup),),
+            shield_caller_cancellation=True,
+        ),
+        name="cayu-model-pre-dispatch-cleanup",
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as signal:
+            if cancellation is None:
+                cancellation = signal
+            # Keep the caller's request count intact. Its enclosing runtime
+            # handler owns interruption classification; do not uncancel and
+            # reissue a signal that could interrupt that handler again.
+    errors = [error for _, error in task.result()]
+    if not errors:
+        raise RuntimeError("Pre-dispatch cleanup did not return its authoritative failure.")
+    settled = [error for error in errors if any(error is outcome for outcome in delivered)]
+    supervision_failures = [error for error in errors if not any(error is s for s in settled)]
+    # Without the cleanup's own outcome, the supervisor timed out or refused to
+    # start it. Fall back to the classification reached before that happened.
+    failure = settled[0] if settled else unsettled_failure()
+    if supervision_failures:
+        _attach_unsettled_pre_dispatch_cleanup(failure, supervision_failures)
+    if cancellation is not None and not isinstance(failure, asyncio.CancelledError):
+        # Preserve transformed errors and retention diagnostics as the cause,
+        # including BudgetReservationLeaseLostBeforeModelDispatch.
+        raise cancellation from failure
+    raise failure
+
+
+async def _model_preparation_lost_to_interrupt(store: SessionStore, session: Session) -> bool:
+    """Recognize an interrupt winner only for this exact session invocation."""
+
+    current = await store.load(session.id)
+    if (
+        current is None
+        or current.instance_id != session.instance_id
+        or current.run_epoch != session.run_epoch
+        or current.status is not SessionStatus.INTERRUPTING
+    ):
+        return False
+    checkpoint = await store.load_checkpoint(session.id)
+    decision = invocation_terminal_decision_from_checkpoint(checkpoint)
+    marker = None if checkpoint is None else checkpoint.get("pending_session_interrupt")
+    if marker is not None and not isinstance(marker, dict):
+        return False
+    request_id = None if marker is None else interruption_request_id_from_payload(marker)
+    if decision is not None:
+        return (
+            decision.session_id == session.id
+            and decision.session_instance_id == session.instance_id
+            and decision.run_epoch == session.run_epoch
+            and decision.outcome is InvocationTerminalOutcome.INTERRUPTED
+            and (
+                marker is None
+                or (request_id is not None and decision.interruption_request_id == request_id)
+            )
+        )
+    # Pending markers carry a request ID but no run epoch. Authenticate their
+    # fallback through the active invocation in the same checkpoint instead of
+    # accepting an arbitrary dictionary left by an older run.
+    active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+    return (
+        request_id is not None
+        and active_profile is not None
+        and active_profile.session_id == session.id
+        and active_profile.run_epoch == session.run_epoch
+    )
 
 
 def _combine_context_build_failure_with_secondary(
@@ -1132,6 +1284,7 @@ class ModelStepExecutor:
         self,
         *,
         session_store: SessionStore,
+        recovery_cleanup_supervisor: RecoveryCleanupSupervisor,
         event_writer: RuntimeEventWriter,
         session_control: SessionControl[SessionUsageTracker],
         run_limit_controller: RunLimitController,
@@ -1154,6 +1307,7 @@ class ModelStepExecutor:
         | None = None,
     ) -> None:
         self._session_store = session_store
+        self._recovery_cleanup_supervisor = recovery_cleanup_supervisor
         self._event_writer = event_writer
         self._session_control = session_control
         self._run_limit_controller = run_limit_controller
@@ -4435,27 +4589,64 @@ class ModelStepRun:
                         expected_transcript_cursor=source_transcript_cursor,
                     )
                 except BaseException as preparation_failure:
-                    if context_exposure is not None:
-                        await _terminate_pre_dispatch_context_exposure(
-                            store=self._executor._session_store,
-                            exposure=context_exposure,
-                            failure=preparation_failure,
-                            evidence_ref=f"model-stage:{stage_id}",
-                        )
-                    raise
+                    classified_preparation_failure = preparation_failure
+
+                    async def settle_preparation_failure() -> Never:
+                        # Probe and terminate in the same owner: a refusal has
+                        # no stage from which recovery could find this exposure.
+                        # Publish each classification as soon as it is known so
+                        # a cleanup deadline still reports the interrupt winner.
+                        nonlocal classified_preparation_failure
+                        failure = classified_preparation_failure
+                        try:
+                            if isinstance(
+                                failure, (SessionStatusConflict, SessionRunFenced)
+                            ) and await _model_preparation_lost_to_interrupt(
+                                self._executor._session_store, self._session
+                            ):
+                                failure = SessionInterruptedByRequest(self._session.id)
+                        except BaseException as probe_failure:
+                            set_exception_cause(probe_failure, failure)
+                            failure = probe_failure
+                        classified_preparation_failure = failure
+                        if context_exposure is not None:
+                            try:
+                                await _terminate_pre_dispatch_context_exposure(
+                                    store=self._executor._session_store,
+                                    exposure=context_exposure,
+                                    failure=failure,
+                                    evidence_ref=f"model-stage:{stage_id}",
+                                )
+                            except BaseException as cleanup_failure:
+                                raise cleanup_failure from failure
+                        raise failure
+
+                    await _raise_after_model_pre_dispatch_cleanup(
+                        settle_preparation_failure,
+                        unsettled_failure=lambda: classified_preparation_failure,
+                        supervisor=self._executor._recovery_cleanup_supervisor,
+                    )
                 if not prepared.dispatch_authorized:
                     authorization_failure = ModelCompletionDispatchNotAuthorized(
                         stage=prepared.stage,
                         request_fingerprint=request_fingerprint,
                     )
-                    if context_exposure is not None:
-                        await _terminate_pre_dispatch_context_exposure(
-                            store=self._executor._session_store,
-                            exposure=context_exposure,
-                            failure=authorization_failure,
-                            evidence_ref=f"model-stage:{stage_id}",
-                        )
-                    raise authorization_failure
+
+                    async def settle_authorization_failure() -> Never:
+                        if context_exposure is not None:
+                            await _terminate_pre_dispatch_context_exposure(
+                                store=self._executor._session_store,
+                                exposure=context_exposure,
+                                failure=authorization_failure,
+                                evidence_ref=f"model-stage:{stage_id}",
+                            )
+                        raise authorization_failure
+
+                    await _raise_after_model_pre_dispatch_cleanup(
+                        settle_authorization_failure,
+                        unsettled_failure=lambda: authorization_failure,
+                        supervisor=self._executor._recovery_cleanup_supervisor,
+                    )
                 dispatch_fence_attempted = False
                 dispatch_fence_committed = False
                 try:
@@ -4497,38 +4688,48 @@ class ModelStepRun:
                     if deferred_dispatch_failure is not None:
                         raise deferred_dispatch_failure
                 except BaseException as authoritative_exc:
-                    exposure_terminal = context_exposure is None or context_exposure.state.terminal
-                    if not exposure_terminal and context_exposure is not None:
-                        exposure_terminal = await _terminate_pre_dispatch_context_exposure(
-                            store=self._executor._session_store,
-                            exposure=context_exposure,
-                            failure=authoritative_exc,
-                            evidence_ref=f"model-stage:{stage_id}",
+
+                    async def settle_dispatch_failure(
+                        authoritative_exc: BaseException = authoritative_exc,
+                    ) -> Never:
+                        exposure_terminal = (
+                            context_exposure is None or context_exposure.state.terminal
                         )
-                    if exposure_terminal and (
-                        not dispatch_fence_attempted or dispatch_fence_committed
-                    ):
-                        await self._abandon_pre_dispatch_model_stage(
-                            prepared.stage,
-                            authoritative_failure=authoritative_exc,
-                        )
-                    elif not exposure_terminal:
-                        add_exception_note_safely(
-                            authoritative_exc,
-                            "The prepared model-completion stage was retained because linked "
-                            "context-exposure termination is not durable.",
-                        )
-                    else:
-                        add_exception_note_safely(
-                            authoritative_exc,
-                            "The prepared model-completion stage was retained because the "
-                            "budget dispatch fence could not be reconstructed exactly.",
-                        )
-                    if isinstance(authoritative_exc, BudgetReservationLeaseLost):
-                        raise BudgetReservationLeaseLostBeforeModelDispatch(
-                            "Budget reservation lease was lost before model dispatch."
-                        ) from authoritative_exc
-                    raise
+                        if not exposure_terminal and context_exposure is not None:
+                            exposure_terminal = await _terminate_pre_dispatch_context_exposure(
+                                store=self._executor._session_store,
+                                exposure=context_exposure,
+                                failure=authoritative_exc,
+                                evidence_ref=f"model-stage:{stage_id}",
+                            )
+                        if exposure_terminal and (
+                            not dispatch_fence_attempted or dispatch_fence_committed
+                        ):
+                            await self._abandon_pre_dispatch_model_stage(
+                                prepared.stage,
+                                authoritative_failure=authoritative_exc,
+                            )
+                        elif not exposure_terminal:
+                            add_exception_note_safely(
+                                authoritative_exc,
+                                "The prepared model-completion stage was retained because linked "
+                                "context-exposure termination is not durable.",
+                            )
+                        else:
+                            add_exception_note_safely(
+                                authoritative_exc,
+                                "The prepared model-completion stage was retained because the "
+                                "budget dispatch fence could not be reconstructed exactly.",
+                            )
+                        raise _classify_pre_dispatch_failure(authoritative_exc)
+
+                    await _raise_after_model_pre_dispatch_cleanup(
+                        settle_dispatch_failure,
+                        unsettled_failure=partial(
+                            _classify_pre_dispatch_failure, authoritative_exc
+                        ),
+                        supervisor=self._executor._recovery_cleanup_supervisor,
+                    )
                 next_dispatch_ordinal = dispatch_ordinal + 1
                 return dispatch
 
