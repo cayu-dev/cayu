@@ -4177,15 +4177,34 @@ async def test_caller_cancellation_does_not_acknowledge_a_running_thread(store):
                 await asyncio.wait_for(worker, 8)
 
 
-async def test_terminal_task_does_not_release_a_handler_still_finalizing(store):
+@pytest.mark.parametrize("blocked_acknowledgement", [False, True])
+async def test_terminal_task_does_not_release_a_handler_still_finalizing(
+    store, monkeypatch, blocked_acknowledgement
+):
+    from cayu import TaskExecutionSettlementPending
     from cayu.tasks.worker import fail_managed_task, run_task_worker
 
     app = CayuApp(task_store=store, enable_logging=False)
     await app.create_task_group(request(timeout=10))
     published = asyncio.Event()
     finish = asyncio.Event()
+    acknowledge = asyncio.Event()
+    if not blocked_acknowledgement:
+        acknowledge.set()
+    settle = type(store)._settle_task_group_execution
+    handler_calls = settlement_calls = 0
+
+    async def settle_after_release(instance, authority):
+        nonlocal settlement_calls
+        settlement_calls += 1
+        await acknowledge.wait()
+        await settle(instance, authority)
+
+    monkeypatch.setattr(type(store), "_settle_task_group_execution", settle_after_release)
 
     async def handler(_app, task, worker_id):
+        nonlocal handler_calls
+        handler_calls += 1
         await fail_managed_task(store, task, worker_id, {"code": "expected_failure"})
         published.set()
         await finish.wait()
@@ -4210,13 +4229,34 @@ async def test_terminal_task_does_not_release_a_handler_still_finalizing(store):
         assert snapshot.quiescence.unsettled_task_ids == ("b",)
         assert await store.claim_task("finalizer", TaskQuery(type="finalize")) is None
         finish.set()
-        await asyncio.wait_for(worker, 8)
+        observed_pending = False
+        async with asyncio.timeout(8):
+            try:
+                await worker
+            except TaskExecutionSettlementPending as pending:
+                observed_pending = True
+                if blocked_acknowledgement:
+                    assert settlement_calls == 1
+                    assert await store.claim_task("finalizer", TaskQuery(type="finalize")) is None
+                acknowledge.set()
+                # Join the retained acknowledgement; never dispatch the handler again.
+                while True:
+                    try:
+                        await pending.settlement.retry()
+                    except TaskExecutionSettlementPending as still_pending:
+                        assert still_pending.settlement is pending.settlement
+                    else:
+                        break
+        if blocked_acknowledgement:
+            assert observed_pending
+        assert handler_calls == settlement_calls == 1
         assert (
             await app.load_task_group("race")
         ).quiescence.status is TaskGroupQuiescenceStatus.QUIESCENT
         assert await store.claim_task("finalizer", TaskQuery(type="finalize")) is not None
     finally:
         finish.set()
+        acknowledge.set()
         if not worker.done():
             await asyncio.wait_for(worker, 8)
 

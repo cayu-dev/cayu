@@ -39047,9 +39047,11 @@ def test_automatic_compaction_cancellation_during_publication_reconciliation_pro
             )
         monkeypatch.setattr(app._event_writer, "is_persisted", block_target_reconciliation)
         if not release_reconciliation:
+            # Bound the blocked read after cancellation without shortening
+            # ordinary publication or reconciliation during setup.
             monkeypatch.setattr(
                 model_step_executor_module,
-                "_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S",
+                "_CONTEXT_EVENT_STORE_WAIT_AFTER_CANCELLATION_TIMEOUT_S",
                 0.01,
             )
         task = asyncio.create_task(
@@ -39071,11 +39073,16 @@ def test_automatic_compaction_cancellation_during_publication_reconciliation_pro
         assert task.cancelling() == 1
         if release_reconciliation:
             allow_reconciliation.set()
+        # Observe completion without injecting a second cancellation during
+        # termination telemetry. The short reconciliation deadline above is
+        # the behavior under test; this guard allows loaded-runner cleanup.
+        done, _pending = await asyncio.wait({task}, timeout=30)
+        assert task in done
         with pytest.raises(
             asyncio.CancelledError,
             match="cancel during compaction publication reconciliation",
         ):
-            await asyncio.wait_for(task, timeout=1)
+            await task
 
         assert task.cancelled()
         assert compaction_provider.calls == expected_compactor_calls

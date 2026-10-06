@@ -505,6 +505,7 @@ from cayu.runtime._task_store_operation_boundary import (
     task_store_work_attempt_admission_capability_is_complete,
 )
 from cayu.runtime._tool_completion import (
+    _CheckpointState,
     load_recorded_tool_completion_policy,
     recorded_tool_completion_result,
     require_registered_completion_tools,
@@ -23992,6 +23993,7 @@ class SessionEngine:
         )
         stream = self._run_recovered_session(
             session=request.session,
+            admitted_checkpoint=checkpoint,
             participant_context=request.participant_context,
             invocation_context=invocation_context,
             messages=request.messages,
@@ -24034,6 +24036,7 @@ class SessionEngine:
         *,
         session: Session,
         invocation_context: InvocationContext,
+        admitted_checkpoint: dict[str, Any] | None | _CheckpointState = _CheckpointState.NOT_LOADED,
         messages: list[Message],
         messages_to_append: list[Message],
         max_steps: int,
@@ -24069,7 +24072,12 @@ class SessionEngine:
 
         if type(invocation_context) is not InvocationContext:
             raise TypeError("invocation_context must be an authenticated InvocationContext.")
-        checkpoint = await self.session_store.load_checkpoint(session.id)
+        # Recovery already authenticated this snapshot, with no intervening
+        # async work. Only an omitted snapshot triggers a fresh load; an
+        # explicitly absent checkpoint cannot acquire later evidence.
+        checkpoint = admitted_checkpoint
+        if checkpoint is _CheckpointState.NOT_LOADED:
+            checkpoint = await self.session_store.load_checkpoint(session.id)
         # Approval/input resolution reconstructs native execution without the
         # application's external-wait adapter. Its durable ticket still needs
         # the completed turn's controls for later authenticated event servicing.
@@ -24081,6 +24089,7 @@ class SessionEngine:
             tool_completion = await load_recorded_tool_completion_policy(
                 self.session_store,
                 session,
+                checkpoint,
                 execution_profile=invocation_context.profile,
                 max_steps=max_steps,
                 limits=limits,

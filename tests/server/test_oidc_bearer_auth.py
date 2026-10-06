@@ -233,11 +233,11 @@ def test_valid_es256_token_and_audience_list(ec_key: ec.EllipticCurvePrivateKey)
         ({"iss": None}, "required claim"),
         ({"aud": "api://other"}, "audience"),
         ({"aud": None}, "required claim"),
-        ({"exp": int(time.time()) - 600}, "expired"),
+        ({"exp": -600}, "expired"),
         ({"exp": None}, "required claim"),
         ({"exp": "9999999999"}, "not a number"),
-        ({"nbf": int(time.time()) + 600}, "not yet valid"),
-        ({"iat": int(time.time()) + 600}, "not yet valid"),
+        ({"nbf": 600}, "not yet valid"),
+        ({"iat": 600}, "not yet valid"),
         ({"sub": None}, "subject"),
         ({"sub": ""}, "subject"),
         ({"sub": 42}, "invalid"),
@@ -249,6 +249,13 @@ def test_claim_validation_rejects_bad_tokens(
     issuer = FakeIssuer()
     issuer.add_rsa("key-1", rsa_key)
 
+    # Relative claim times must be resolved at execution, after a long shard's
+    # collection-to-test delay, so future claims cannot age into validity.
+    now = int(time.time())
+    claims = {
+        name: now + value if name in {"exp", "nbf", "iat"} and type(value) is int else value
+        for name, value in claims.items()
+    }
     error = _rejection(_auth(issuer), _token(rsa_key, claims))
 
     assert error.status_code == 401

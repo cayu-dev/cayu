@@ -3323,8 +3323,9 @@ def test_interrupted_handoff_exhaustion_recovers_and_resumes_original_task(
 
     session_path = tmp_path / "sessions-recovery.sqlite"
     task_path = tmp_path / "tasks-recovery.sqlite"
+    ownership_now = [datetime.now(UTC)]
     session_store = SQLiteSessionStore(session_path)
-    failing_store = UnavailableHandoffStore(task_path)
+    failing_store = UnavailableHandoffStore(task_path, ownership_clock=lambda: ownership_now[0])
     first_app = CayuApp(
         session_store=session_store,
         task_store=failing_store,
@@ -3380,7 +3381,6 @@ def test_interrupted_handoff_exhaustion_recovers_and_resumes_original_task(
                 handoff_handler,
                 worker_id="worker-a",
                 query=TaskQuery(type="job"),
-                lease_seconds=1,
                 max_tasks=1,
                 poll_interval_s=0.01,
                 reclaim=False,
@@ -3415,12 +3415,11 @@ def test_interrupted_handoff_exhaustion_recovers_and_resumes_original_task(
         SessionStatus,
         list[str],
     ]:
-        remaining = max(
-            (stranded.lease_expires_at - datetime.now(UTC)).total_seconds(),
-            0,
-        )
-        await asyncio.sleep(remaining + 0.05)
-        recovered_store = SQLiteTaskStore(task_path)
+        # Expire the retained owner deliberately. The first worker uses the
+        # default lease, so CI scheduling cannot replace the handoff failure
+        # under test with an unrelated one-second lease expiry.
+        ownership_now[0] = stranded.lease_expires_at + timedelta(seconds=1)
+        recovered_store = SQLiteTaskStore(task_path, ownership_clock=lambda: ownership_now[0])
         recovered_sessions = SQLiteSessionStore(session_path)
         recovered_app = CayuApp(
             session_store=recovered_sessions,
@@ -3442,8 +3441,15 @@ def test_interrupted_handoff_exhaustion_recovers_and_resumes_original_task(
         stop = asyncio.Event()
 
         async def stop_after_recovery() -> None:
-            await asyncio.sleep(0.05)
-            stop.set()
+            try:
+                async with asyncio.timeout(30):
+                    while True:
+                        task = await recovered_store.load_task("task-recovery-handoff")
+                        if task is not None and task.worker_id is None:
+                            return
+                        await asyncio.sleep(0.01)
+            finally:
+                stop.set()
 
         async def unexpected_handler(
             _app: CayuApp,

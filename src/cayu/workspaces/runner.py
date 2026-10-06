@@ -18,7 +18,6 @@ from cayu.runners.base import (
     ExecCommand,
     RemoteWorkspaceBranchCapability,
     Runner,
-    RunnerBinaryStreamCapability,
 )
 from cayu.runners.local import LocalRunner
 from cayu.workspaces._guest_guard import (
@@ -1478,10 +1477,10 @@ class RunnerWorkspace(
         )
 
     def bounded_tar_stream_reader(self) -> BoundedTarStreamReader | None:
-        return self if isinstance(self._runner, RunnerBinaryStreamCapability) else None
+        return self if self._runner.binary_stream_capability() is not None else None
 
     def tar_stream_writer(self) -> TarStreamWriter | None:
-        return self if isinstance(self._runner, RunnerBinaryStreamCapability) else None
+        return self if self._runner.binary_stream_capability() is not None else None
 
     async def read_tar_stream(
         self,
@@ -1494,8 +1493,8 @@ class RunnerWorkspace(
     ) -> TarStreamReadResult:
         """Stream one preflight-bounded uncompressed tar into a private sink."""
 
-        runner = self._runner
-        if not isinstance(runner, RunnerBinaryStreamCapability):
+        runner = self._runner.binary_stream_capability()
+        if runner is None:
             raise RuntimeError("RunnerWorkspace runner does not support binary streams.")
         if isinstance(destination, (str, bytes, bytearray, memoryview)) or not callable(
             getattr(destination, "write", None)
@@ -1632,8 +1631,8 @@ class RunnerWorkspace(
     async def write_tar_stream(self, source: BinaryIO, *, archive_bytes: int) -> None:
         """Stream a tar through runner stdin and spool it privately in the guest."""
 
-        runner = self._runner
-        if not isinstance(runner, RunnerBinaryStreamCapability):
+        runner = self._runner.binary_stream_capability()
+        if runner is None:
             raise RuntimeError("RunnerWorkspace runner does not support binary streams.")
         if isinstance(source, (str, bytes, bytearray, memoryview)) or not callable(
             getattr(source, "read", None)

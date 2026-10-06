@@ -392,6 +392,14 @@ class _DeferredAdmissionObserver(RunnerExecutionAdmissionObserver):
         return await runner._collect_admission(self.requirements)
 
 
+class _DeferredBinaryStreamCapability(RunnerBinaryStreamCapability):
+    def __init__(self, runner: DeferredRunner) -> None:
+        self._runner = runner
+
+    async def exec_stream(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
+        return await self._runner.exec_stream(command, **kwargs)
+
+
 class DeferredRunner(Runner):
     """A runner that materializes on first command execution.
 
@@ -471,6 +479,12 @@ class DeferredRunner(Runner):
         target = await self._target()
         return await target.exec_system(command, **kwargs)
 
+    def binary_stream_capability(self) -> RunnerBinaryStreamCapability | None:
+        live = self._live()
+        if live is None or live.binary_stream_capability() is None:
+            return None
+        return _DeferredBinaryStreamCapability(self)
+
     async def exec_stream(
         self,
         command: ExecCommand,
@@ -485,9 +499,10 @@ class DeferredRunner(Runner):
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ) -> ExecResult:
         target = await self._target()
-        if not isinstance(target, RunnerBinaryStreamCapability):
+        capability = target.binary_stream_capability()
+        if capability is None:
             raise RuntimeError("The materialized runner does not support binary streams.")
-        return await target.exec_stream(
+        return await capability.exec_stream(
             command,
             cwd=cwd,
             env=env,

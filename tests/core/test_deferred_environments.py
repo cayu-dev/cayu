@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -45,10 +47,12 @@ from cayu import (
     run_to_completion,
 )
 from cayu.environments.admission import ExecutionRequirements
+from cayu.environments.bindings import SyncBindingStagingCapacity, _copy_paths
 from cayu.environments.deferred import (
     DeferredMaterialization,
     EnvironmentMaterializationError,
 )
+from cayu.runners.base import Runner, RunnerBinaryStreamCapability
 from cayu.workspaces.revisions import (
     WorkspaceRevisionObservationLimits,
     observe_deterministic_workspace,
@@ -323,6 +327,138 @@ def test_parallel_first_uses_share_one_materialization(tmp_path: Path) -> None:
     runners = asyncio.run(run())
     assert created == 1
     assert len({id(runner) for runner in runners}) == 1
+
+
+def test_deferred_workspace_discovers_and_transfers_binary_streams(tmp_path: Path) -> None:
+    created = 0
+    content = b"binary\x00payload\xff\n"
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as output:
+        member = tarfile.TarInfo("payload.bin")
+        member.size = len(content)
+        output.addfile(member, io.BytesIO(content))
+    archive.seek(0)
+
+    async def materialize(mode):
+        nonlocal created
+        created += 1
+        return LocalRunner(tmp_path), None
+
+    async def scenario():
+        state = DeferredMaterialization(materialize, default_cwd=str(tmp_path))
+        workspace = _placeholder(state.runner)
+        assert state.runner.binary_stream_capability() is None
+        assert workspace.bounded_tar_stream_reader() is None
+        assert workspace.tar_stream_writer() is None
+        assert created == 0
+        await state.materialize()
+        reader = workspace.bounded_tar_stream_reader()
+        writer = workspace.tar_stream_writer()
+        capability = state.runner.binary_stream_capability()
+        assert isinstance(capability, RunnerBinaryStreamCapability)
+        assert capability is not state.materialized_runner
+        assert reader is workspace and writer is workspace
+        assert created == 1
+        destination = io.BytesIO()
+        try:
+            await writer.write_tar_stream(archive, archive_bytes=len(archive.getbuffer()))
+            assert (tmp_path / "payload.bin").read_bytes() == content
+            await reader.read_tar_stream(
+                ["payload.bin"],
+                destination,
+                max_file_bytes=1024,
+                max_total_bytes=1024,
+                max_archive_bytes=20 * 1024,
+            )
+            assert created == 1
+            assert not archive.closed and not destination.closed
+            destination.seek(0)
+            with tarfile.open(fileobj=destination, mode="r:") as received:
+                member = received.extractfile("payload.bin")
+                assert member is not None and member.read() == content
+            state.runner._close_exec("test execution fence")
+            with pytest.raises(RuntimeError, match="test execution fence"):
+                await capability.exec_stream(ExecCommand.process("unused"))
+        finally:
+            await state.runner.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("supports_streaming", [False, True], ids=["text", "stream"])
+@pytest.mark.parametrize("materialized", [False, True], ids=["deferred", "materialized"])
+@pytest.mark.parametrize("direction", ["copy-in", "copy-back"])
+def test_deferred_workspace_copy_preserves_available_transport(
+    tmp_path: Path, supports_streaming, materialized, direction
+) -> None:
+    direct_root, target_root = tmp_path / "direct", tmp_path / "target"
+    direct_root.mkdir()
+    target_root.mkdir()
+    content = b"binary\x00payload\xff\n"
+    source_root, destination_root = (
+        (direct_root, target_root) if direction == "copy-in" else (target_root, direct_root)
+    )
+    (source_root / "payload.bin").write_bytes(content)
+    created = 0
+
+    class ObservedLocalRunner(LocalRunner):
+        stream_calls = 0
+
+        async def exec_stream(self, command, **kwargs):
+            self.stream_calls += 1
+            return await super().exec_stream(command, **kwargs)
+
+    concrete = ObservedLocalRunner(target_root)
+
+    class TextOnlyRunner(Runner):
+        default_cwd = str(target_root)
+
+        async def exec(self, command, **kwargs):
+            return await concrete.exec(command, **kwargs)
+
+        async def close(self):
+            await concrete.close()
+            await super().close()
+
+    async def materialize(mode):
+        nonlocal created
+        created += 1
+        return concrete if supports_streaming else TextOnlyRunner(), None
+
+    async def scenario():
+        state = DeferredMaterialization(materialize, default_cwd=str(target_root))
+        deferred = _placeholder(state.runner)
+        direct = LocalWorkspace(direct_root, workspace_id="direct")
+        source, target = (direct, deferred) if direction == "copy-in" else (deferred, direct)
+        try:
+            assert deferred.bounded_tar_stream_reader() is None
+            assert deferred.tar_stream_writer() is None
+            assert created == 0
+            if materialized:
+                await state.materialize()
+            copied = await _copy_paths(
+                source=source,
+                target=target,
+                paths=("payload.bin",),
+                max_file_bytes=1024,
+                max_total_bytes=1024,
+                max_archive_bytes=32 * 1024,
+                staging_capacity=SyncBindingStagingCapacity(
+                    max_concurrency=1, max_staged_bytes=1024 * 1024
+                ),
+                source_observation=None,
+                archive_policy=None,
+            )
+            assert copied == len(content)
+            assert (destination_root / "payload.bin").read_bytes() == content
+            assert created == 1
+            assert concrete.stream_calls == int(supports_streaming and materialized)
+            assert (deferred.bounded_tar_stream_reader() is not None) is supports_streaming
+            assert (deferred.tar_stream_writer() is not None) is supports_streaming
+        finally:
+            await state.runner.close()
+
+    asyncio.run(scenario())
 
 
 def test_materialization_failure_fails_the_call_and_the_session_stays_usable(dirs) -> None:

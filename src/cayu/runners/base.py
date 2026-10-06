@@ -1315,6 +1315,17 @@ class Runner(ABC):
             )
         return None
 
+    def binary_stream_capability(self) -> RunnerBinaryStreamCapability | None:
+        """Return bounded binary execution when its support is already known.
+
+        Discovery must not provision a runner or execute commands. Wrappers
+        with an unknown target return None until support is established, so
+        workspace transfers can retain their text transport fallback. Returned
+        capabilities must preserve the owning runner's execution fences.
+        """
+
+        return self if isinstance(self, RunnerBinaryStreamCapability) else None
+
     def reopen_exec(self) -> None:
         """Clear an intentional execution fence on an otherwise-open runner.
 

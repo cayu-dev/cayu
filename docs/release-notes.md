@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+## v0.9.0
+
+Cayu adds durable external-event waits, deferred execution environments, and
+production authentication and deployment checks for generated applications.
+
+- Add durable external-event registration, delivery, timeout, cancellation, and
+  restartable session continuation. Applications own caller authentication and
+  external-job submission; native receipts retain event election and continuation
+  ownership. Session waits park only after a complete model turn and tool round.
+  See [external-event waits](https://github.com/cayu-dev/cayu/blob/v0.9.0/docs/external-event-waits.md).
+- Add deferred environment materialization and optional warm Docker spares.
+  Sessions create runners when needed, subject to execution-admission requirements;
+  recovery retains exact allocation identity and unpublished output. Idle spares
+  remain bounded and participate in application shutdown.
+- Make generated applications ready for authenticated serving: include server
+  dependencies and configure the `agent` and `coding` presets to use
+  `cayu.server.environment_auth:OPERATOR_BASIC_AUTH`. It reads
+  `CAYU_OPERATOR_USERNAME` and `CAYU_OPERATOR_PASSWORD`; `cayu serve` refuses
+  to start when either variable is unset or empty. `cayu serve --dev` is
+  unchanged. `BasicAuth.from_environment(...)` supports custom variable names,
+  and `AuthConfigurationError` reports missing or invalid configuration.
+  `cayu cloud init` safely adds missing setup, preserves custom authentication,
+  and creates a compatible project auth module when an older runtime is pinned.
 - `cayu cloud deploy` now accepts a `[storage]` table in `cayu-cloud.toml`, so a
   project can acknowledge a rebuildable cache or index under `/data` with
   `local_files = [{ path = "...", reason = "..." }]` as Cayu Cloud's source
@@ -13,41 +36,28 @@
   `cayu-cloud.toml`; custom manifest paths fail locally before upload because Cloud
   would not read their acknowledgements. See
   [Cayu Cloud CLI](cayu-cloud.md#local-file-acknowledgements).
-- Add `OidcBearerAuth` and `OidcSigningKeys` to `cayu.server`, in the new
-  `cayu[oidc]` extra. They verify JWT bearer tokens from an OpenID Connect
-  provider (Cognito, Auth0, Okta, Entra ID, Google, Workday) against its
-  discovered JWKS, as a `[tool.cayu.serve].auth` target, an
-  `AuthenticatedAccess` dependency, or, through `product_dependency()`, an
-  `AuthenticatedProductAccess` dependency that takes the tenant from a verified
-  claim. `OidcBearerAuth.from_environment()` reads `CAYU_OIDC_ISSUER` and
-  `CAYU_OIDC_AUDIENCE`, and like `BasicAuth.from_environment()` raises
-  `AuthConfigurationError` when they are missing or unusable. Browser sign-in
-  flows are not included.
-- Projects from `cayu new` can now be deployed with `cayu cloud init` and
-  `cayu cloud deploy` and start. Every preset depends on `cayu[postgres,server]`,
-  and the `agent` and `coding` presets set `[tool.cayu.serve].auth` to the new
-  ready-made target `cayu.server.environment_auth:OPERATOR_BASIC_AUTH`. It reads
-  HTTP Basic credentials from `CAYU_OPERATOR_USERNAME` and `CAYU_OPERATOR_PASSWORD`
-  when `cayu serve` starts and refuses to start if either is unset or empty;
-  `cayu serve --dev` is unchanged. `BasicAuth.from_environment(...)` builds the
-  same dependency from any two variables, and `AuthConfigurationError` reports
-  missing or invalid ones. `cayu cloud init` adds the `server` extra and an auth
-  target to an existing project that lacks them, never replaces a configured
-  auth target, and refuses with the exact edit when it cannot edit
-  `pyproject.toml` safely. It names the ready-made target only when the `cayu`
-  requirement excludes 0.8.1 and older, which lack it; otherwise it creates a
-  `server_auth.py` that builds `BasicAuth` from the same variables and works on
-  every release, and never overwrites an existing one. Existing projects keep
-  working; run `cayu cloud init` or add the two settings by hand before deploying.
-- `CayuApp.aclose()` now waits, without cancelling them, for store writes that
-  outlived their owner's bounded wait, so they no longer land on a store that
-  shutdown already closed. These are claim renewals from interruption cascades,
-  provider-operation cancellations and incomplete-session recovery, cascades and
-  workers cancelled by an earlier drain timeout, and tool-result projections
-  that timed out while writing an artifact. A provider-operation cancellation
-  whose claim is no longer needed, because it failed or no admitted or tracked
-  operation is running at shutdown, now stops renewing and lets the claim's
-  lease expire.
+- Add `cayu cloud service credentials` to retrieve an application's operator
+  login without writing it to local evidence. Deployment checks reject unsafe
+  public-service access, missing server dependencies, invalid authentication
+  targets, and unsupported serve arguments before upload. Deployment waiting
+  follows release promotion through concurrent-publication conflicts.
+- Add `OidcBearerAuth` and `OidcSigningKeys` through `cayu[oidc]` for operator
+  and product authentication. Verify issuer, audience, signature, expiry, claims,
+  and scopes using bounded discovery and signing-key retrieval; refreshed key
+  sets honor key withdrawal. `OidcBearerAuth.from_environment()` reads
+  `CAYU_OIDC_ISSUER` and `CAYU_OIDC_AUDIENCE` and raises
+  `AuthConfigurationError` when either is missing or unusable. Browser sign-in
+  flows remain application-owned.
+- Expand configurable runtime limits and bounded resource accounting, including
+  shared virtual-egress buffer reservations. Improve scaffold generation and
+  source checks, provider compatibility, and redacted runner, isolated-tool, and
+  Docker diagnostics. Preserve MCP registrations made during discovery.
+- Accept OpenRouter finish chunks that repeat terminal metadata to attach usage,
+  without treating an empty assistant delta as new output after completion.
+- Keep store writes owned after their caller times out or is cancelled, and wait
+  for them during `CayuApp.aclose()` before closing the stores they still use.
+  Stop unnecessary provider-cancellation claim heartbeats after tracked work ends.
+
 - `CayuApp.aclose()` also waits for work that could still use a resource it
   was about to release: secret resolutions abandoned when their tool timed out,
   tool-effect reconciliation lookups and workspace artifact reads whose caller
@@ -62,6 +72,30 @@
   execution attempt tasks that outlived their caller. Before, shutdown could
   report settled and close an owned vault, credential proxy or store while such
   work was still running.
+
+### Upgrade from v0.8.1
+
+Storage revision is **115** (previously **114**), with a minimum supported
+revision of **115**. This is a breaking writer boundary. Stop existing writers,
+retain a restorable backup, inspect the store with `cayu storage status`, and
+run the explicit storage migration with `--acknowledge-breaking 115` before
+starting upgraded writers. Do not run 0.8.x writers against the upgraded
+store; rolling back the application alone is insufficient. Migration upgrades
+continuation indexes from their exact durable receiving records and rolls back
+if required evidence is missing or conflicting. Follow the
+[storage migration guidance](https://github.com/cayu-dev/cayu/blob/v0.9.0/docs/session-store-targets.md).
+Server contract is **48** (previously **47**). Regenerate clients and upgrade
+the dashboard with the server: the contract adds deferred-environment events
+and raises message, instruction, SSE error-text, and retry-policy limits.
+Clients for contract 47 must not treat a 0.9.0 server as schema-compatible.
+Manifest/generator schema **17** is unchanged.
+
+Refresh application lockfiles. For OIDC, install `cayu[oidc]` and configure an
+issuer, audience, and the application's access policies. Existing custom serve
+authentication is preserved. Existing generated projects can run
+`cayu cloud init` (or `--force` to refresh an existing deployment descriptor)
+and follow its reported edits and `uv lock` instructions before deploying.
+Review the [server setup guidance](https://github.com/cayu-dev/cayu/blob/v0.9.0/docs/project-server.md).
 
 ## v0.8.1
 
