@@ -73,13 +73,16 @@ from cayu.providers.operations import (
     ProviderOperationStatus,
 )
 from cayu.providers.retry_policy import RetryPolicy
-from cayu.runtime import _model_step_executor as model_step_executor
 from cayu.runtime import _provider_operation_cancellation_owner as cancellation_owner
 from cayu.runtime import _recovery_coordinator as recovery_coordinator_module
 from cayu.runtime import _session_engine as session_engine_module
 from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
+from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._model_completion_contracts import ModelCompletionRecoveryContext
 from cayu.runtime._model_errors import _BillingIdentityResolutionCancelled
-from cayu.runtime._model_step_executor import ModelCompletionRecoveryContext
+from cayu.runtime._provider_operation_recovery_owner import (
+    _ProviderRecoveryRequiredPublicationFailureEvidence,
+)
 from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import (
@@ -2602,10 +2605,10 @@ def test_malformed_start_recovery_publication_preserves_cleanup_evidence(
 
         provider.adapter.recover_start = recover_start  # type: ignore[method-assign]
         publication_failure = RuntimeError("provider recovery event publication failed")
-        original_emit = model_step_executor.RuntimeEventWriter.emit
+        original_emit = RuntimeEventWriter.emit
 
         async def fail_recovery_required_publication(
-            writer: model_step_executor.RuntimeEventWriter,
+            writer: RuntimeEventWriter,
             event: Event,
         ) -> Event:
             if event.type is EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED:
@@ -2613,7 +2616,7 @@ def test_malformed_start_recovery_publication_preserves_cleanup_evidence(
             return await original_emit(writer, event)
 
         monkeypatch.setattr(
-            model_step_executor.RuntimeEventWriter,
+            RuntimeEventWriter,
             "emit",
             fail_recovery_required_publication,
         )
@@ -2626,7 +2629,7 @@ def test_malformed_start_recovery_publication_preserves_cleanup_evidence(
             )
 
         assert raised.value is publication_failure
-        evidence_type = model_step_executor._ProviderRecoveryRequiredPublicationFailureEvidence
+        evidence_type = _ProviderRecoveryRequiredPublicationFailureEvidence
         assert isinstance(publication_failure.__cause__, BaseExceptionGroup)
         assert any(
             isinstance(failure, TypeError) for failure in publication_failure.__cause__.exceptions
@@ -2847,10 +2850,10 @@ def test_recovery_required_publication_preserves_sanitized_cleanup_evidence(
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
         publication_failure = RuntimeError("provider recovery event publication failed")
-        original_emit = model_step_executor.RuntimeEventWriter.emit
+        original_emit = RuntimeEventWriter.emit
 
         async def fail_recovery_required_publication(
-            writer: model_step_executor.RuntimeEventWriter,
+            writer: RuntimeEventWriter,
             event: Event,
         ) -> Event:
             if event.type is EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED:
@@ -2860,7 +2863,7 @@ def test_recovery_required_publication_preserves_sanitized_cleanup_evidence(
             return await original_emit(writer, event)
 
         monkeypatch.setattr(
-            model_step_executor.RuntimeEventWriter,
+            RuntimeEventWriter,
             "emit",
             fail_recovery_required_publication,
         )
@@ -2873,7 +2876,7 @@ def test_recovery_required_publication_preserves_sanitized_cleanup_evidence(
             )
 
         assert raised.value is publication_failure
-        evidence_type = model_step_executor._ProviderRecoveryRequiredPublicationFailureEvidence
+        evidence_type = _ProviderRecoveryRequiredPublicationFailureEvidence
         assert isinstance(publication_failure.__cause__, evidence_type)
         evidence = publication_failure.__cause__
         assert evidence.recovery_reason is expected_reason
@@ -3159,7 +3162,7 @@ def test_exact_start_recovery_preserves_publication_and_cleanup_failures(
                 events=close_events,
             )
 
-        original_persist = model_step_executor.RuntimeEventWriter.persist_exact_replay
+        original_persist = RuntimeEventWriter.persist_exact_replay
 
         async def fail_started_publication(writer, event: Event) -> Event:
             if event.type is EventType.PROVIDER_OPERATION_STARTED:
@@ -3168,7 +3171,7 @@ def test_exact_start_recovery_preserves_publication_and_cleanup_failures(
 
         provider.adapter.recover_start = recover_start  # type: ignore[method-assign]
         monkeypatch.setattr(
-            model_step_executor.RuntimeEventWriter,
+            RuntimeEventWriter,
             "persist_exact_replay",
             fail_started_publication,
         )
@@ -3234,7 +3237,7 @@ def test_exact_start_recovery_preserves_cleanup_failure_under_caller_cancellatio
                 events=close_events,
             )
 
-        original_persist = model_step_executor.RuntimeEventWriter.persist_exact_replay
+        original_persist = RuntimeEventWriter.persist_exact_replay
 
         async def fail_started_publication(writer, event: Event) -> Event:
             if event.type is EventType.PROVIDER_OPERATION_STARTED:
@@ -3243,7 +3246,7 @@ def test_exact_start_recovery_preserves_cleanup_failure_under_caller_cancellatio
 
         provider.adapter.recover_start = recover_start  # type: ignore[method-assign]
         monkeypatch.setattr(
-            model_step_executor.RuntimeEventWriter,
+            RuntimeEventWriter,
             "persist_exact_replay",
             fail_started_publication,
         )

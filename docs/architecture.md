@@ -302,10 +302,10 @@ saved stream-progress reconciliation and recovered completion publication. Live
 execution shares its progress publication boundary and the same cancellation
 owner. Completion contracts, completion delivery, stream validation/event
 projection and hosted tool-discovery preparation live in independent runtime
-modules used by both execution and recovery. Their former executor imports
-resolve to the same definitions, preserving exact type checks and legacy pickle
-paths. The executor wires the recovery owner's store, event writer, run-limit
-controller, redactor, clock and cancellation owner. Live retry decisions and
+modules used by both execution and recovery. Consumers import these parts from
+their owning modules; the executor composes the operations and retains the
+imports it uses. The executor wires the recovery owner's store, event writer,
+run-limit controller, redactor, clock and cancellation owner. Live retry decisions and
 automatic compaction remain with the executor.
 
 `ProviderOperationStartOwner` owns background-provider dispatch, exact start

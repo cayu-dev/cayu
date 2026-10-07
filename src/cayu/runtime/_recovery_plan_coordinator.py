@@ -29,7 +29,7 @@ from cayu.runtime._environment_allocation import (
     checkpoint_object_map,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime._model_step_executor import model_completion_recovery_context_from_stage
+from cayu.runtime._model_completion_contracts import model_completion_recovery_context_from_stage
 from cayu.runtime._provider_cleanup_evidence import local_http_cleanup_event_id
 from cayu.runtime._recovery_coordinator import (
     ModelCompletionManualRecoveryRequired,

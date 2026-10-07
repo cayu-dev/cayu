@@ -1,4 +1,4 @@
-"""Live-attempt composition preserves imports and closes the provider at caller exits."""
+"""Live-attempt composition stays independent and closes providers at caller exits."""
 
 from __future__ import annotations
 
@@ -51,24 +51,6 @@ assert not blocked.intersection(sys.modules)
         timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-
-
-def test_existing_attempt_imports_keep_exact_identity() -> None:
-    from cayu.runtime import _live_model_attempt as owner
-    from cayu.runtime import _model_step_executor as legacy
-
-    for name in (
-        "_provider_failure_proves_no_model_effect",
-        "_assistant_step_result_with_published_targeted_authority",
-        "_model_request_fingerprint",
-        "_deadline_with_runtime_recovery_authority",
-        "_model_context_overflow_error_event",
-        "ModelCompletionPublicationRequest",
-        "_model_stream_event_to_runtime_event",
-        "_admitted_model_provider_events",
-        "_owned_model_provider_events",
-    ):
-        assert getattr(legacy, name) is getattr(owner, name), name
 
 
 class _ClosingProvider(ModelProvider):

@@ -62,7 +62,7 @@ from cayu.runtime._invocation_lifecycle import (
     SettleInvocationCommand,
     invocation_checkpoint_state_sha256,
 )
-from cayu.runtime._model_step_executor import model_completion_recovery_context_from_stage
+from cayu.runtime._model_completion_contracts import model_completion_recovery_context_from_stage
 from cayu.runtime._recovery_coordinator import RecoverySessionRunRequest
 from cayu.runtime.build_provenance import RuntimeBuildProvenance
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity

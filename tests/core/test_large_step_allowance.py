@@ -11,7 +11,7 @@ from cayu.evals.testing import ScriptedModelProvider
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
-from cayu.runtime._model_step_executor import ModelCompletionRecoveryContext
+from cayu.runtime._model_completion_contracts import ModelCompletionRecoveryContext
 from cayu.runtime.work_attempt_semantics import WorkAttemptRunSemantics
 from cayu.sessions.base import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore

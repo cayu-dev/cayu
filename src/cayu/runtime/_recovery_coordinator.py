@@ -272,16 +272,16 @@ from cayu.runtime._memory_evidence import (
     recover_context_exposure,
 )
 from cayu.runtime._message_redaction import redact_runtime_message_for_boundary
+from cayu.runtime._model_completion_contracts import (
+    ModelCompletionRecoveryContext,
+    model_completion_recovery_context_from_stage,
+)
 from cayu.runtime._model_errors import (
     _FallbackBillingCancellationStateCheckFailed,
     detach_billing_identity_cancellation_group,
 )
 from cayu.runtime._model_execution_selection import ModelExecutionSelection
 from cayu.runtime._model_failover_stage import model_failover_target_for_stored_stage
-from cayu.runtime._model_step_executor import (
-    ModelCompletionRecoveryContext,
-    model_completion_recovery_context_from_stage,
-)
 from cayu.runtime._recovery_claims import (
     _IncompleteRecoveryClaim,
     _IncompleteRecoveryClaimAuthority,

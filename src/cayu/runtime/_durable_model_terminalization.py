@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from cayu._validation import canonical_durable_json_bytes
 from cayu.events import Event, EventType, event_with_runtime_envelope_authority
-from cayu.runtime._model_step_executor import model_completion_recovery_context_from_stage
+from cayu.runtime._model_completion_contracts import model_completion_recovery_context_from_stage
 from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
 from cayu.sessions._durable_operation_ownership import DurableOperationOwnership
 from cayu.sessions._execution_profile_checkpoint import (

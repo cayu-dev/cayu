@@ -47,10 +47,8 @@ from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY, public_event_id
 from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime._model_step_executor import (
-    ModelCompletionRecoveryContext,
-    reconstruct_assistant_step_result,
-)
+from cayu.runtime._model_completion_contracts import ModelCompletionRecoveryContext
+from cayu.runtime._model_step_executor import reconstruct_assistant_step_result
 from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
 from cayu.runtime.build_provenance import current_runtime_build_provenance
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity

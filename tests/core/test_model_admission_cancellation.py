@@ -9,7 +9,7 @@ from cayu.deadlines import ExecutionDeadline, ExecutionDeadlineExceeded, bind_ex
 from cayu.failure_evidence import exception_evidence
 from cayu.providers._credential_boundary import provider_cancellation_failures
 from cayu.providers.deadlines import ProviderStreamDeadlineAdmission, ProviderStreamDeadlines
-from cayu.runtime._model_step_executor import (
+from cayu.runtime._provider_stream import (
     _admitted_model_provider_events,
     _owned_model_provider_events,
 )

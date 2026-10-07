@@ -403,17 +403,19 @@ from cayu.runtime._isolated_tool_process import (
     wait_for_retained_isolated_tool_cleanups,
 )
 from cayu.runtime._local_execution_attempt_owner import retained_local_execution_tasks
-from cayu.runtime._model_execution_selection import ModelExecutionSelection
-from cayu.runtime._model_policy import ModelPolicy
-from cayu.runtime._model_step_executor import (
+from cayu.runtime._model_completion_contracts import (
     ModelCompletionPublicationRequest,
     ModelCompletionPublicationResult,
     ModelCompletionRecoveryContext,
+    model_completion_recovery_context_from_stage,
+)
+from cayu.runtime._model_execution_selection import ModelExecutionSelection
+from cayu.runtime._model_policy import ModelPolicy
+from cayu.runtime._model_step_executor import (
     ModelStepBudgetEvaluationRequest,
     ModelStepBudgetReservationFailureRequest,
     ModelStepExecutor,
     ModelStepLimitEvaluationRequest,
-    model_completion_recovery_context_from_stage,
 )
 from cayu.runtime._producer_execution import _ProducerExecution
 from cayu.runtime._public_task_scheduling import (

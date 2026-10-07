@@ -19,13 +19,13 @@ from cayu.messages import Message
 from cayu.providers._credential_boundary import provider_cancellation_failures
 from cayu.providers.base import ModelProvider, ModelProviderError, ModelRequest, ModelStreamEvent
 from cayu.providers.retry_policy import RetryPolicy
-from cayu.runtime._model_step_executor import (
+from cayu.runtime._model_completion_contracts import (
     ModelCompletionDispatchNotAuthorized,
     ModelCompletionPublicationRequest,
     ModelCompletionPublicationResult,
     ModelCompletionRecoveryContext,
-    ModelStepRun,
 )
+from cayu.runtime._model_step_executor import ModelStepRun
 from cayu.runtime._run_limits import RunLimitGate
 from cayu.sessions._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,

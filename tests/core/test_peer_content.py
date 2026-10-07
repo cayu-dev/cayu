@@ -660,7 +660,7 @@ def test_public_participant_peer_delivery_uses_registered_policy(
                 from cayu.providers.openai import build_openai_payload
 
                 if any(p.type == "peer_content" for m in request.messages for p in m.content):
-                    from cayu.runtime._model_step_executor import _model_request_fingerprint
+                    from cayu.runtime._live_model_attempt import _model_request_fingerprint
 
                     assert secret not in request.model_dump_json()
                     active = await session_store.load_active_model_completion_stage(

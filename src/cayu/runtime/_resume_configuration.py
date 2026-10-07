@@ -9,7 +9,7 @@ from cayu.execution_profiles import (
 )
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._execution_profile_admission import model_finalization_material
-from cayu.runtime._model_step_executor import model_completion_recovery_context_from_stage
+from cayu.runtime._model_completion_contracts import model_completion_recovery_context_from_stage
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_matches_session_epoch,

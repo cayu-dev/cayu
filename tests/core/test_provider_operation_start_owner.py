@@ -55,20 +55,6 @@ assert not blocked.intersection(sys.modules)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_legacy_ambiguous_start_helpers_keep_exact_identity() -> None:
-    from cayu.runtime import _model_step_executor as legacy
-    from cayu.runtime import _provider_operation_start_owner as canonical
-
-    assert (
-        legacy._ambiguous_provider_operation_start_error
-        is canonical._ambiguous_provider_operation_start_error
-    )
-    assert (
-        legacy.is_ambiguous_provider_operation_start_error
-        is canonical.is_ambiguous_provider_operation_start_error
-    )
-
-
 @pytest.mark.parametrize(
     "boundary",
     [EventType.PROVIDER_OPERATION_STARTING, EventType.PROVIDER_OPERATION_STARTED],

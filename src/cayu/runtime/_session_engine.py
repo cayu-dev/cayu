@@ -416,6 +416,7 @@ from cayu.runtime._invocation_lifecycle import (
     _authenticated_invocation_context,
     invocation_checkpoint_state_sha256,
 )
+from cayu.runtime._live_model_attempt import _provider_failure_proves_no_model_effect
 from cayu.runtime._loop_policy_continuations import (
     before_stop_continuation_checkpoint_transform,
     before_stop_continuation_indices,
@@ -426,40 +427,41 @@ from cayu.runtime._memory_evidence import (
     close_unrecoverable_context_exposure,
 )
 from cayu.runtime._message_redaction import redact_runtime_message_for_boundary
+from cayu.runtime._model_completion_contracts import (
+    ModelCompletionPublicationRequest,
+    ModelCompletionPublicationResult,
+    ModelCompletionRecoveryContext,
+    model_completion_recovery_context_from_stage,
+)
 from cayu.runtime._model_errors import (
     _FallbackBillingCancellationStateCheckFailed,
     billing_identity_cancellation_failures,
     detach_billing_identity_cancellation,
     detach_billing_identity_cancellation_group,
 )
+from cayu.runtime._model_event_authority import _event_with_model_identity_authority
 from cayu.runtime._model_execution_selection import (
     ModelExecutionSelection,
     model_failover_progress_for_session,
 )
 from cayu.runtime._model_step_executor import (
-    ModelCompletionPublicationRequest,
-    ModelCompletionPublicationResult,
-    ModelCompletionRecoveryContext,
     ModelStepBudgetEvaluationRequest,
     ModelStepBudgetReservationFailureRequest,
     ModelStepExecutor,
     ModelStepFlowOutcome,
     ModelStepLimitEvaluationRequest,
     _detach_model_request,
-    _event_with_model_identity_authority,
     _model_request_messages,
     _model_request_tools,
-    _provider_failure_proves_no_model_effect,
     _require_frozen_tool_exposure,
     _session_agent_spec,
     _tool_capability_ceiling_exposure,
-    is_ambiguous_provider_operation_start_error,
-    model_completion_recovery_context_from_stage,
     preflight_model_thinking,
     preflight_portable_model_material,
     reconstruct_assistant_step_result,
 )
 from cayu.runtime._producer_execution import _ProducerExecution
+from cayu.runtime._provider_operation_start_owner import is_ambiguous_provider_operation_start_error
 from cayu.runtime._recovery_coordinator import (
     _INCOMPLETE_RECOVERY_CLAIM_LEASE,
     ModelCompletionManualRecoveryRequired,

@@ -17,7 +17,7 @@ from cayu.messages import MessageRole, ToolCallPart, ToolResultPart
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._execution_profile_admission import model_finalization_material
-from cayu.runtime._model_step_executor import (
+from cayu.runtime._model_completion_contracts import (
     ModelCompletionRecoveryContext,
     model_completion_recovery_context_from_stage,
 )
