@@ -20,7 +20,7 @@ from cayu.providers.openai import (
     OpenAIProvider,
     _OpenAIBackgroundOperationAdapter,
 )
-from cayu.runtime.retry_policy import RetryPolicy
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.sessions.base import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 

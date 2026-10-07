@@ -28,7 +28,7 @@ from cayu.providers import (
     ModelRequest,
     ModelStreamEvent,
 )
-from cayu.runtime.retry_policy import RetryPolicy
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.sessions.base import (
     EventOrder,
     EventQuery,

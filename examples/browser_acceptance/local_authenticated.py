@@ -321,9 +321,9 @@ async def _setup(startup_cleanups):
         live_authenticated_browser_acceptance_manifest,
     )
     from cayu.providers._http import aclose_transport
+    from cayu.providers.retry_policy import RetryPolicy
     from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD
     from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-    from cayu.runtime.retry_policy import RetryPolicy
     from cayu.server import BasicAuth, BrowserControlServerConfig, ServerConfig, create_server
     from cayu.tools.browser_control import (
         BrowserControlPolicy,

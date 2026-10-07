@@ -43,6 +43,7 @@ from cayu.providers.base import (
     ModelRequest,
     ModelStreamEvent,
 )
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime._invocation_lifecycle import (
     ReleaseInvocationCommand,
@@ -59,7 +60,6 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
 )
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions.base import (
     EventQuery,
     ForkExecutionProfileSelection,

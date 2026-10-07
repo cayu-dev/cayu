@@ -223,6 +223,7 @@ from cayu.providers.operations import (
     ProviderOperationStartRequest,
     ProviderOperationState,
 )
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.proxies.base import CredentialProxy, ProxyAuthorizationResult
 from cayu.proxies.passthrough import PassthroughProxy
 from cayu.runners.base import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, ExecResult, Runner
@@ -261,7 +262,6 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyResult,
 )
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader

@@ -92,6 +92,7 @@ from cayu.providers.base import (
     copy_model_completion,
     copy_usage_dialect,
 )
+from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime._completion_projection import portable_model_completion_projection
 from cayu.runtime._model_errors import (
     ProviderExceptionControl,
@@ -107,9 +108,7 @@ from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.retry_policy import (
     RetryDecision,
     RetryDisposition,
-    RetryPolicy,
     RetrySuppression,
-    copy_retry_policy,
     retry_decision,
     retry_diagnostic_payload,
 )

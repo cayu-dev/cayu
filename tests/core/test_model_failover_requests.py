@@ -19,8 +19,8 @@ from cayu import (
 )
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.providers.base import ModelProviderError, ModelStreamEvent
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._session_request_boundary import prepare_resume_request, prepare_run_request
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.work_attempt_semantics import (
     WorkAttemptRunSemantics,
     copy_work_attempt_run_semantics,

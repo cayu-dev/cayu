@@ -20,6 +20,7 @@ from cayu import (
     RunRequest,
 )
 from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime.execution_profiles import (
     ExecutionProfileAdoptionIntent,
     ExecutionProfileAuthorityDecision,
@@ -27,7 +28,6 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyResult,
     execution_profile_from_session_metadata,
 )
-from cayu.runtime.retry_policy import RetryPolicy
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])

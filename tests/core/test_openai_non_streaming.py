@@ -17,7 +17,7 @@ from cayu.providers.base import ModelRequest, ModelStreamDeadlineError
 from cayu.providers.deadlines import ProviderStreamDeadlines
 from cayu.providers.hosted import OpenAIWebSearch
 from cayu.providers.openai import HttpxOpenAITransport, OpenAIProvider
-from cayu.runtime.retry_policy import RetryPolicy
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.sessions.base import InMemorySessionStore, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolResult, ToolSpec

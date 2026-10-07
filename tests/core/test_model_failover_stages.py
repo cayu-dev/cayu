@@ -19,6 +19,7 @@ from cayu import AgentSpec, CayuApp, Event, EventType, Message
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.execution_units import new_model_step_identity
 from cayu.providers.base import ModelProviderError
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._execution_profile_admission import bind_model_failover_execution_profile
 from cayu.runtime._invocation_lifecycle import (
     AdmittedInvocationBinding,
@@ -27,7 +28,7 @@ from cayu.runtime._invocation_lifecycle import (
 from cayu.runtime._model_failover import FailoverObservation
 from cayu.runtime._model_failover_stage import ModelFailoverStageAdmission
 from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
-from cayu.runtime.retry_policy import RetryPolicy, retry_decision
+from cayu.runtime.retry_policy import retry_decision
 from cayu.sessions._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     ModelStepPublicationCheckpoint,

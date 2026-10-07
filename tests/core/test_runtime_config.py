@@ -23,8 +23,8 @@ from cayu.configuration import (
 from cayu.context.thinking import ThinkingConfig
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.messages import Message
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime.config_inspection import EffectiveRunConfiguration
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions.base import RunRequest, copy_run_request
 
 
@@ -173,6 +173,7 @@ def test_app_manifest_exposes_effective_config_ownership_and_source() -> None:
     assert provenance["run.max_steps"].source == "application"
     assert provenance["run.max_steps"].owner == "cayu.configuration.RunDefaults"
     assert provenance["run.limits"].source == "framework"
+    assert provenance["run.retry_policy"].owner == "cayu.providers.retry_policy.RetryPolicy"
 
 
 def test_effective_run_configuration_inspection_is_typed_read_only_and_compatible() -> None:

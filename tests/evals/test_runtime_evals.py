@@ -134,8 +134,8 @@ from cayu.providers.operations import (
     ProviderOperationStartRequest,
     ProviderOperationStatus,
 )
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._memory_evidence import memory_evidence_key
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions.base import (
     InMemorySessionStore,
     RunRequest,

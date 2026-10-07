@@ -101,6 +101,7 @@ from cayu.providers.cache import CacheBreakpoint, CachePolicy
 from cayu.providers.chat_completions import ChatCompletionsProvider
 from cayu.providers.deadlines import ProviderStreamDeadlines
 from cayu.providers.openai import OpenAIProvider
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runners.base import ExecCommand, ExecResult, Runner
 from cayu.runners.docker import DockerRunner
 from cayu.runners.local import LocalRunner
@@ -141,7 +142,6 @@ from cayu.runtime.execution_profiles import (
     execution_profile_session_metadata,
 )
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions.base import (
     ForkExecutionProfileSelection,
     ForkSessionRequest,

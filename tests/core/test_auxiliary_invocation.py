@@ -25,6 +25,7 @@ from cayu.providers import (
 from cayu.providers.base import TargetedToolProjectionRequest, ToolDiscoveryProjectionRequest
 from cayu.providers.deadlines import ProviderStreamDeadlines
 from cayu.providers.response import ModelResponse
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime import _tool_execution
 from cayu.runtime._auxiliary_invocation import AuxiliaryInferenceScope, AuxiliaryInvocationPolicy
 from cayu.runtime._tool_round_executor import ToolRoundExecutor
@@ -33,7 +34,6 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileComponentClass,
     ExecutionProfileMismatchError,
 )
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.stop_policy import auxiliary_token_admission
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec

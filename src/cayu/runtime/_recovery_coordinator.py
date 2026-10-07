@@ -187,6 +187,7 @@ from cayu.providers.operations import (
     ProviderOperationSnapshot,
     ProviderOperationStatus,
 )
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.resource_access import ResourceAccessPolicy, resource_recovery
 from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
@@ -375,7 +376,6 @@ from cayu.runtime.provider_operations import (
     resolve_provider_operation_stage,
     validate_provider_operation_resolution_outcome_event,
 )
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.stop_policy import StopDecision, StopLimit
 from cayu.runtime.tool_completion import ToolCompletionPolicy, ToolCompletionResult
 from cayu.runtime.tool_effects import (

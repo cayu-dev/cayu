@@ -30,7 +30,7 @@ from cayu.providers._thinking import copy_preflight_thinking
 from cayu.providers.base import ModelProvider, ModelProviderError, ModelStreamEvent
 from cayu.providers.bedrock import BedrockProvider
 from cayu.providers.openai_subscription import OpenAISubscriptionProvider
-from cayu.runtime.retry_policy import RetryPolicy
+from cayu.providers.retry_policy import RetryPolicy
 
 
 class _NoAccess:

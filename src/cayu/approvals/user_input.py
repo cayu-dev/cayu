@@ -41,8 +41,8 @@ from cayu.events import (
 )
 from cayu.execution_units import ToolRoundIdentity
 from cayu.messages import Message, detach_message
+from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
-from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.sessions._assistant_tool_round_publication import (
     AssistantToolRoundPublication,
     StagedToolCallTerminal,

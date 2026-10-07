@@ -20,7 +20,7 @@ from cayu.artifacts.attachments import (
 )
 from cayu.budgets.run_limits import RunLimits
 from cayu.context.thinking import ThinkingConfig
-from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
+from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.sessions.cleanup import (
     RecoveryCleanupPolicy,
     copy_recovery_cleanup_policy,

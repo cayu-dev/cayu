@@ -48,7 +48,7 @@ from cayu.providers.base import (
     _preflight_provider_portable_messages,
 )
 from cayu.providers.deadlines import ProviderStreamDeadlines
-from cayu.runtime.retry_policy import RetryPolicy
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.sessions.base import SessionStore
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy

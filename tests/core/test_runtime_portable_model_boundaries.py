@@ -41,8 +41,8 @@ from cayu.providers import (
     ModelStreamEventType,
     UsageDialect,
 )
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._event_projection import public_event_sequence
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions.base import EventQuery, InMemorySessionStore, RunRequest
 
 

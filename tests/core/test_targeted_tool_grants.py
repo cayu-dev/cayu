@@ -41,9 +41,9 @@ from cayu.providers.operations import (
     ProviderOperationState,
     ProviderOperationStatus,
 )
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions.base import (
     ForkSessionRequest,
     InMemorySessionStore,

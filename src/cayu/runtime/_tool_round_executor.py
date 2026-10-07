@@ -128,6 +128,7 @@ from cayu.observability.hooks import (
 from cayu.observability.hooks import (
     _runtime_hook_event as _build_runtime_hook_event,
 )
+from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runners._cleanup import (
     attach_runner_cancellation_failure,
     pop_runner_cancellation_failure,
@@ -214,7 +215,6 @@ from cayu.runtime.mcp_manifest_policy import (
     mcp_manifest_policy_payload,
 )
 from cayu.runtime.public_authority import parse_public_authority_alias
-from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader

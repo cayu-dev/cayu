@@ -208,6 +208,7 @@ from cayu.providers.operations import (
     ProviderOperationSnapshot,
     ProviderOperationStartIdempotencySupport,
 )
+from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._child_session_notifications import (
@@ -454,9 +455,7 @@ from cayu.runtime.provider_operations import (
 )
 from cayu.runtime.retry_policy import (
     RetryDecision,
-    RetryPolicy,
     RetrySuppression,
-    copy_retry_policy,
     retry_decision,
     retry_diagnostic_payload,
     retry_event_payload,

@@ -55,6 +55,7 @@ from cayu.providers.operations import (
     ProviderOperationState,
     ProviderOperationStatus,
 )
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._invocation_lifecycle import (
     AdmitInvocationCommand,
     InvocationContext,
@@ -89,7 +90,6 @@ from cayu.runtime.execution_profiles import (
     execution_profile_from_session_metadata,
 )
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import (

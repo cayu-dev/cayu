@@ -57,10 +57,10 @@ from cayu.events import Event
 from cayu.messages import Message
 from cayu.observability.events import InMemoryEventSink
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._workflow_structured_output_handoff import (
     WorkflowStructuredOutputHandoff,
 )
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions.base import (
     EventQuery,
     IncompleteSessionsRecoveryRequest,

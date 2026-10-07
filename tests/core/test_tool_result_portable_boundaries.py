@@ -45,9 +45,9 @@ from cayu.providers.base import (
     ModelStreamEventType,
     UsageDialect,
 )
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.proxies.base import CredentialProxy, ProxyAuthorizationResult
 from cayu.proxies.passthrough import PassthroughProxy
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions.base import (
     InMemorySessionStore,
     InterruptSessionRequest,

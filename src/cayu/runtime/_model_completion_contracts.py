@@ -44,6 +44,7 @@ from cayu.providers.base import (
     ModelRequest,
     copy_model_completion,
 )
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._child_session_notifications import (
     ChildSessionNotificationStageBinding,
@@ -57,7 +58,6 @@ from cayu.runtime._memory_evidence import (
 from cayu.runtime._model_execution_selection import ModelFailoverAttempt
 from cayu.runtime._run_limits import BudgetStepReservation
 from cayu.runtime.model_steps import AssistantStepResult
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.tool_completion import ToolCompletionPolicy
 from cayu.sessions.base import (
     MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES,

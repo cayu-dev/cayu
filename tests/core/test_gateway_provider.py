@@ -17,7 +17,7 @@ from cayu import (
 )
 from cayu.context.structured_output import StructuredOutputSpec
 from cayu.providers.base import ModelProviderError, ModelRequest, ModelStreamEventType
-from cayu.runtime.retry_policy import RetryPolicy
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolEffect, ToolResult, ToolSpec
 

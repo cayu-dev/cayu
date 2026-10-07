@@ -29,7 +29,7 @@ from cayu import (
     TextPart,
 )
 from cayu.providers.base import ModelProviderError, ModelStreamEvent
-from cayu.runtime.retry_policy import RetryPolicy
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 
 

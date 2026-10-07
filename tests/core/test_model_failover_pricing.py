@@ -23,7 +23,7 @@ from cayu import (
     PriceBook,
     RunRequest,
 )
-from cayu.runtime.retry_policy import RetryPolicy
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 
 

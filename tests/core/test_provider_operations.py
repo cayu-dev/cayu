@@ -38,6 +38,7 @@ from cayu.providers.operations import (
     ProviderOperationState,
     ProviderOperationStatus,
 )
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._model_step_executor import (
     _MODEL_COMPLETION_RECOVERY_V1_DEFAULT_MAX_STEPS,
     MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS,
@@ -55,7 +56,6 @@ from cayu.runtime.provider_operations import (
     ProviderOperationInspectionStatus,
     inspect_provider_operation,
 )
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions.base import (
     EventQuery,
     EventRecord,

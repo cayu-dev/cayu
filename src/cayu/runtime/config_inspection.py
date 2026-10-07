@@ -11,7 +11,7 @@ from cayu.context.thinking import ThinkingConfig
 from cayu.execution_profiles import (
     ExecutionProfileIdentity,
 )
-from cayu.runtime.retry_policy import RetryPolicy
+from cayu.providers.retry_policy import RetryPolicy
 
 _ValueT = TypeVar("_ValueT")
 

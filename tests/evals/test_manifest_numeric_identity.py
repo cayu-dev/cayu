@@ -18,8 +18,8 @@ from cayu.evals.execution_reporting import (
     corpus_execution_result_from_json,
     corpus_execution_result_to_json,
 )
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime.manifest import _app_manifest_fingerprint
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.storage.evals_sqlite import SQLiteEvalStore
 from cayu.storage.migrations import SchemaMode
 from cayu.vaults.redaction import SecretRedactor

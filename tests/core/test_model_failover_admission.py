@@ -44,12 +44,12 @@ from cayu.providers.base import (
     _preflight_provider_portable_messages,
 )
 from cayu.providers.operations import ProviderOperationMode
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime import provider_operations
 from cayu.runtime.provider_operations import (
     ProviderOperationResolutionConflict,
     inspect_provider_operation,
 )
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions.base import SessionStore
 from cayu.vaults.redaction import SecretRedactor
 

@@ -8,13 +8,14 @@ import pytest
 
 from cayu import ModelFailoverPolicy, ModelTarget
 from cayu.providers.base import ModelProviderError
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._model_failover import (
     FailoverDisposition,
     FailoverObservation,
     FailoverSuppression,
     decide_model_failover,
 )
-from cayu.runtime.retry_policy import RetryPolicy, RetrySuppression, retry_decision
+from cayu.runtime.retry_policy import RetrySuppression, retry_decision
 from cayu.sessions.base import copy_model_failover_policy
 
 

@@ -58,6 +58,7 @@ from cayu.providers._credential_boundary import (
 from cayu.providers.base import _copy_auxiliary_request
 from cayu.providers.deadlines import ProviderStreamDeadlineAdmission
 from cayu.providers.response import ModelResponse
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._auxiliary_inference_contract import (
     AUXILIARY_ATTRIBUTION_AUTHORITY_PATHS,
     AuxiliaryInferenceAttribution,
@@ -93,7 +94,7 @@ from cayu.runtime._runtime_records import RegisteredTool
 from cayu.runtime.execution_profiles import (
     ExecutionProfileMismatchError,
 )
-from cayu.runtime.retry_policy import RetryDecision, RetryPolicy, retry_decision
+from cayu.runtime.retry_policy import RetryDecision, retry_decision
 from cayu.sessions.base import (
     ModelCompletionStage,
     ModelCompletionStageRequest,

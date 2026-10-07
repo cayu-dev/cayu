@@ -128,6 +128,7 @@ from cayu.knowledge.records import (
 from cayu.knowledge.search import KnowledgeListItem
 from cayu.messages import Message, MessageRole
 from cayu.project_control_plane import ResolvedProjectControlPlaneContext
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._binding_cleanup import is_containable_cleanup_error
 from cayu.runtime._event_projection import (
     PUBLIC_EVENT_ID_PREFIX,
@@ -159,7 +160,6 @@ from cayu.runtime.request_costs import (
     RequestCostSummary,
     disabled_request_cost_summary,
 )
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.session_message_lifecycle import (
     SessionMessageAccessContext,
     SessionMessageAccessDenied,

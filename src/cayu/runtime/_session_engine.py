@@ -317,6 +317,7 @@ from cayu.providers.base import (
 from cayu.providers.cache import CacheBreakpoint, CachePolicy
 from cayu.providers.hosted import HostedToolCapabilityError
 from cayu.providers.operations import ProviderOperationMode
+from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
@@ -585,10 +586,6 @@ from cayu.runtime.provider_operations import (
     pending_provider_operation_disposition_from_checkpoint,
     provider_operation_resolution_outcome_event_id,
     validate_provider_operation_resolution_outcome_event,
-)
-from cayu.runtime.retry_policy import (
-    RetryPolicy,
-    copy_retry_policy,
 )
 from cayu.runtime.stop_policy import StopDecision, StopLimit
 from cayu.runtime.tool_completion import (

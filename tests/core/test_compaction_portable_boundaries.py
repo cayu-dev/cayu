@@ -48,7 +48,7 @@ from cayu.providers import (
     ModelStreamEvent,
     UsageDialect,
 )
-from cayu.runtime.retry_policy import RetryPolicy
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.sessions.base import RunRequest, Session
 
 

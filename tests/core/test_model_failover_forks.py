@@ -30,13 +30,13 @@ from cayu import (
     ToolCapabilityCeiling,
 )
 from cayu.providers.base import ModelStreamEvent
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime.execution_profiles import (
     ExecutionProfileComponentClass,
     direct_tool_capability_ceiling_component,
     execution_profile_from_session_metadata,
 )
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions._model_failover import ModelFailoverSelection
 from cayu.sessions.base import session_fork_profile_relationship
 

@@ -52,6 +52,7 @@ from cayu.providers.base import (
     UsageDialect,
 )
 from cayu.providers.bedrock import bedrock_billing_identity, completed_bedrock_billing_identity
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._event_projection import (
     PRIVATE_EVENT_AUTHORITY,
     public_event_id,
@@ -63,7 +64,6 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileComponentClass,
     ExecutionProfileMismatchError,
 )
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions.base import (
     CompactSessionRequest,

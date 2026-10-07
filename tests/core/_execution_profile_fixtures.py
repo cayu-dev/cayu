@@ -19,6 +19,7 @@ from cayu.events import Event, EventType, event_with_runtime_envelope_authority
 from cayu.messages import Message
 from cayu.observability.hooks import RuntimeHook
 from cayu.providers import ModelProvider
+from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
 from cayu.runtime import _session_engine as session_engine_module
 from cayu.runtime import _session_request_boundary as session_request_boundary
@@ -50,7 +51,6 @@ from cayu.runtime.execution_profiles import (
     execution_profile_from_session_metadata,
 )
 from cayu.runtime.loop_policies import LoopPolicy
-from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.sessions.base import (
     RunRequest,
     Session,

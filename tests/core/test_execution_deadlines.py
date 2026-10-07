@@ -714,7 +714,7 @@ def test_isolated_context_projection_carries_only_portable_deadline():
 
 
 def test_model_retry_uses_live_original_deadline(clock):
-    from cayu.runtime.retry_policy import RetryPolicy
+    from cayu.providers.retry_policy import RetryPolicy
 
     seen = []
 

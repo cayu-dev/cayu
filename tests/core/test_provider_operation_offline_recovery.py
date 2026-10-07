@@ -72,6 +72,7 @@ from cayu.providers.operations import (
     ProviderOperationState,
     ProviderOperationStatus,
 )
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime import _model_step_executor as model_step_executor
 from cayu.runtime import _provider_operation_cancellation_owner as cancellation_owner
 from cayu.runtime import _recovery_coordinator as recovery_coordinator_module
@@ -111,7 +112,6 @@ from cayu.runtime.provider_operations import (
     provider_operation_resolution_storage_key,
     resolve_provider_operation_stage,
 )
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions._invocation_terminal_decision import (
     settled_invocation_terminal_decision_from_checkpoint,
 )

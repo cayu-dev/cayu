@@ -25,6 +25,7 @@ from cayu.providers.base import (
     ModelStreamEventType,
 )
 from cayu.providers.deadlines import ProviderStreamDeadlines
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.providers.vertex import (
     VERTEX_OAUTH_SCOPE,
     HttpxVertexTransport,
@@ -36,7 +37,6 @@ from cayu.providers.vertex import (
     _resolve_credentials,
     _safe_gcp_error,
 )
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions.base import RunRequest
 
 

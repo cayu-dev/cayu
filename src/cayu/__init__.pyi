@@ -3429,6 +3429,8 @@ from cayu.providers.operations import ProviderOperationStartRequest as ProviderO
 from cayu.providers.operations import ProviderOperationState as ProviderOperationState
 from cayu.providers.operations import ProviderOperationStatus as ProviderOperationStatus
 from cayu.providers.response import ModelResponse as ModelResponse
+from cayu.providers.retry_policy import RetryPolicy as RetryPolicy
+from cayu.providers.retry_policy import copy_retry_policy as copy_retry_policy
 from cayu.providers.vertex import VertexProvider as VertexProvider
 from cayu.proxies.base import CredentialProxy as CredentialProxy
 from cayu.proxies.base import ProxyAuthorizationResult as ProxyAuthorizationResult
@@ -3819,9 +3821,7 @@ from cayu.runtime.recall_sources import (
 from cayu.runtime.recall_sources import (
     AutomaticRecallSourceRegistration as AutomaticRecallSourceRegistration,
 )
-from cayu.runtime.retry_policy import RetryPolicy as RetryPolicy
 from cayu.runtime.retry_policy import classify_retryable_error as classify_retryable_error
-from cayu.runtime.retry_policy import copy_retry_policy as copy_retry_policy
 from cayu.runtime.retry_policy import retry_decision as retry_decision
 from cayu.runtime.service_manifest import PublicServiceManifest as PublicServiceManifest
 from cayu.runtime.service_manifest import RuntimeStoreDurability as RuntimeStoreDurability

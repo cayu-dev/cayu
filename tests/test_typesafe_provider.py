@@ -119,8 +119,9 @@ def test_error_does_not_expose_credentials_or_body():
     ],
 )
 def test_sanitized_failures_preserve_retry_classification(failure, reason):
+    from cayu.providers.retry_policy import RetryPolicy
     from cayu.runtime._model_errors import model_provider_error_from_payload
-    from cayu.runtime.retry_policy import RetryPolicy, classify_retryable_error
+    from cayu.runtime.retry_policy import classify_retryable_error
 
     def handler(request):
         if isinstance(failure, int):

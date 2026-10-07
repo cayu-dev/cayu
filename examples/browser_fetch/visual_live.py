@@ -32,8 +32,8 @@ from cayu import (
 from cayu.egress import HttpxUpstream
 from cayu.egress.docker_adapter import DockerEgressAdapter
 from cayu.evals.browser_acceptance_fixture import _fixture_address
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runners import PINNED_BROWSER_SESSION_WORKLOAD
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.storage.sqlite import SQLiteSessionStore
 
 ROOT = Path(__file__).resolve().parents[2]

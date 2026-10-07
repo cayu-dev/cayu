@@ -51,6 +51,7 @@ from cayu.execution_profiles import (
     copy_execution_profile_adoption_intent,
 )
 from cayu.messages import Message, detach_message
+from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.runtime._diagnostics import ExceptionDiagnostic
 from cayu.runtime._durable_subagents import (
@@ -85,7 +86,6 @@ from cayu.runtime.execution_profiles import (
     _ExecutionProfileAdmissionRequestRejected,
 )
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
-from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.sessions._model_failover import ModelFailoverPolicy, copy_optional_model_failover_policy
 from cayu.sessions._terminal_evidence import (
     queued_dispatch_terminal_event_id as _queued_dispatch_terminal_event_id,

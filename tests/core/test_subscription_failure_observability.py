@@ -19,7 +19,7 @@ from cayu.providers.openai_subscription import (
     OpenAISubscriptionProvider,
     _safe_subscription_error_event,
 )
-from cayu.runtime.retry_policy import RetryPolicy
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.sessions.base import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 

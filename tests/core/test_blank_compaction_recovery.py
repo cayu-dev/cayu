@@ -12,7 +12,7 @@ from cayu.budgets.pricing import ModelPrice, PriceBook
 from cayu.context.base import CheckpointCompactionContextPolicy, CompactionRequest, ModelCompactor
 from cayu.messages import Message
 from cayu.providers.base import ModelCompletion, ModelProvider, ModelProviderError, ModelStreamEvent
-from cayu.runtime.retry_policy import RetryPolicy
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest, SessionIdentity
 from cayu.storage.sqlite import SQLiteSessionStore
 

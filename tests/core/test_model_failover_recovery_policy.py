@@ -25,7 +25,7 @@ from cayu import (
     ToolSpec,
 )
 from cayu.providers.base import ModelStreamEvent
-from cayu.runtime.retry_policy import RetryPolicy
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.sessions.base import InMemorySessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.policy import AllowAllToolPolicy

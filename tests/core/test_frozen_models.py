@@ -27,7 +27,8 @@ from cayu.messages import (
     copy_message_part,
     detach_message,
 )
-from cayu.runtime.retry_policy import RetryDecision, RetryPolicy, copy_retry_policy
+from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
+from cayu.runtime.retry_policy import RetryDecision
 from cayu.tools.base import ToolContext, ToolResult
 
 

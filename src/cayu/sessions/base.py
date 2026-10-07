@@ -311,6 +311,7 @@ from cayu.messages import (
     copy_message,
     detach_message,
 )
+from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime._child_session_notifications import (
     CHILD_SESSION_ADMISSION_OCCURRENCE_TYPE,
     CHILD_SESSION_NOTIFICATION_OPERATION_KEY_PREFIX,
@@ -341,7 +342,6 @@ from cayu.runtime.public_authority import (
     PublicAuthorityAliasKeyring,
     parse_public_authority_alias,
 )
-from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.service_manifest import RuntimeStoreDurability
 from cayu.runtime.session_message_lifecycle import (
     SessionMessageActionRequest,

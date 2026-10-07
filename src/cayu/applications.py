@@ -371,6 +371,7 @@ from cayu.observability.watchers import (
 from cayu.providers.base import ModelProvider, ModelRequest
 from cayu.providers.hosted import OpenAIWebSearch
 from cayu.providers.operations import ProviderOperationSnapshot
+from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.resource_access import ResourceAccessPolicy, runtime_stream_entrance
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
@@ -555,10 +556,6 @@ from cayu.runtime.public_authority import (
     PublicAuthorityAliasKeyring,
     parse_public_authority_alias,
     public_authority_alias_is_reserved,
-)
-from cayu.runtime.retry_policy import (
-    RetryPolicy,
-    copy_retry_policy,
 )
 from cayu.runtime.session_closure import (
     BudgetSessionClosureStore,
@@ -963,7 +960,7 @@ _CAYU_CONFIG_FIELD_OWNERS = {
     "evals.max_concurrency": "cayu.configuration.EvalConfig",
     "run.max_steps": "cayu.configuration.RunDefaults",
     "run.limits": "cayu.runtime.stop_policy.RunLimits",
-    "run.retry_policy": "cayu.runtime.retry_policy.RetryPolicy",
+    "run.retry_policy": "cayu.providers.retry_policy.RetryPolicy",
     "run.thinking": "cayu.context.thinking.ThinkingConfig",
     "tool_execution.max_file_attachment_bytes": "cayu.configuration.ToolExecutionConfig",
     "tool_execution.max_total_file_attachment_bytes": ("cayu.configuration.ToolExecutionConfig"),

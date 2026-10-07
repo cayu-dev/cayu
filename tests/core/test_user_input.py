@@ -39,6 +39,7 @@ from cayu.execution_units import ToolRoundIdentity
 from cayu.messages import Message, ToolResultPart
 from cayu.observability.hooks import RuntimeHook, ToolCallHookContext
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY, public_event_sequence
 from cayu.runtime.execution_profiles import (
@@ -46,7 +47,6 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileMismatchError,
     active_invocation_execution_profile_from_checkpoint,
 )
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions.base import (
     EventQuery,
     ForkSessionRequest,

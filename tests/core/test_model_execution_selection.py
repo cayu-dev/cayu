@@ -43,6 +43,7 @@ from cayu.providers.base import (
     ModelProviderError,
     ModelStreamEvent,
 )
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._execution_profile_admission import ModelFailoverProfileResolution
 from cayu.runtime._model_execution_selection import (
     ModelExecutionSelection,
@@ -60,7 +61,7 @@ from cayu.runtime._model_step_executor import (
 from cayu.runtime._run_limits import RunLimitGate
 from cayu.runtime._runtime_records import RegisteredProvider
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
-from cayu.runtime.retry_policy import RetryPolicy, retry_decision
+from cayu.runtime.retry_policy import retry_decision
 
 
 async def _selection():

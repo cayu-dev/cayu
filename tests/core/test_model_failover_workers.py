@@ -24,7 +24,7 @@ from tests.core.verified_worker_fixtures import (
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.events import EventType
-from cayu.runtime.retry_policy import RetryPolicy
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime.verified_task_worker import VerifiedTaskWorker
 from cayu.sessions.base import EventQuery, ModelFailoverPolicy, ModelTarget
 from cayu.tasks.base import TaskCreate, TaskStatus

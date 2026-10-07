@@ -34,6 +34,7 @@ from cayu.providers.operations import (
     ProviderOperationMode,
     ProviderOperationStatus,
 )
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime.execution_profiles import (
     ExecutionProfileAdoptionIntent,
     ExecutionProfileAuthorityDecision,
@@ -41,7 +42,6 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyAction,
     ExecutionProfilePolicyResult,
 )
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions.base import InMemorySessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 

@@ -13,13 +13,14 @@ from cayu.applications import CayuApp
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelProvider, ModelProviderError, ModelStreamEvent
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._model_errors import copy_provider_exception_control
 from cayu.runtime._model_step_executor import (
     ModelAttemptFailed,
     _attempt_retry_suppression,
     _typed_retry_fields,
 )
-from cayu.runtime.retry_policy import RetryPolicy, RetrySuppression, retry_decision
+from cayu.runtime.retry_policy import RetrySuppression, retry_decision
 from cayu.sessions.base import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 

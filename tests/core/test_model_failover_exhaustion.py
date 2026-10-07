@@ -23,8 +23,8 @@ from cayu import (
 )
 from cayu.providers.base import ModelProviderError, ModelStreamEvent
 from cayu.providers.deadlines import ProviderStreamDeadlines
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime import _model_step_executor as model_executor
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions import EventQuery
 
 

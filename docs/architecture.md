@@ -426,6 +426,12 @@ single composition root.
 
 ### Session checkpoint evidence
 
+`providers/retry_policy.py` owns immutable retry configuration, its default status
+codes and the policy validation helper. Saved tool rounds, approvals and runtime
+share the same policy class. Supported root and runtime imports resolve to that
+class; retry classification, suppression, backoff and execution remain with their
+existing runtime owners.
+
 `execution_units.py` owns shared model-step, model-attempt, tool-round and
 budget-limit identities, including ID generation, validation, copying and removal
 of caller-supplied authority fields. Checkpoint readers, approvals, budgets, native

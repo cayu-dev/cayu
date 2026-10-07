@@ -22,6 +22,7 @@ from cayu.context.thinking import ThinkingConfig
 from cayu.events import Event, EventType
 from cayu.execution_units import ToolRoundIdentity
 from cayu.messages import Message
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime import _recovery_coordinator as recovery_coordinator
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._recovery_coordinator import (
@@ -42,7 +43,6 @@ from cayu.runtime.build_provenance import (
     RuntimeBuildProvenance,
     RuntimeBuildProvenanceOrigin,
 )
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions.base import (
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     CheckpointTransform,

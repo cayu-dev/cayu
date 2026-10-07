@@ -15,7 +15,7 @@ from cayu import (
     ScriptedModelProvider,
 )
 from cayu.providers.base import ModelProviderError, ModelRequest, ModelStreamEvent
-from cayu.runtime.retry_policy import RetryPolicy
+from cayu.providers.retry_policy import RetryPolicy
 
 
 async def main() -> None:

@@ -35,7 +35,7 @@ from cayu.providers.base import (
     ModelStreamEvent,
 )
 from cayu.providers.openai import OpenAITransport
-from cayu.runtime.retry_policy import RetryPolicy
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.tools.exposure import StaticToolExposurePolicy
 from cayu.tools.targeted_projection import targeted_tool_projection_marker_id
 

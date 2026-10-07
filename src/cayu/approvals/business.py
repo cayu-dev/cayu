@@ -58,9 +58,9 @@ from cayu.budgets.run_limits import RunLimits
 from cayu.context.structured_output import StructuredOutputSpec
 from cayu.events import Event, EventType
 from cayu.execution_units import ToolRoundIdentity
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime.loop_policies import LoopPolicy
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.tools.policy import (
     ToolPolicy,
     ToolPolicyDecision,

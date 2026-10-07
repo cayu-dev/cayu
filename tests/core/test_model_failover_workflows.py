@@ -9,7 +9,7 @@ from tests.core.test_model_failover_recovery import _RecoveryProvider
 from tests.core.test_model_failover_stages import _StageMemoryStore, _StageSQLiteStore
 
 from cayu import AgentSpec, CayuApp, EventType, ModelFailoverPolicy, ModelTarget, WorkflowSpec
-from cayu.runtime.retry_policy import RetryPolicy
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.workflows import StepRunOptions, WorkflowBase, step
 
 

@@ -21,8 +21,8 @@ from cayu.budgets.run_limits import RunLimits, copy_run_limits
 from cayu.configuration import MAX_STEPS
 from cayu.context.structured_output import StructuredOutputSpec, copy_structured_output_spec
 from cayu.context.thinking import ThinkingConfig
+from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
-from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 
 
 class ToolRoundRecoveryRequest(BaseModel):

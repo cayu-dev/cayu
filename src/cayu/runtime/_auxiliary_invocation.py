@@ -21,7 +21,7 @@ from cayu.budgets.run_limits import RunLimits, copy_run_limits
 from cayu.providers import ModelRequest
 from cayu.providers.base import _copy_auxiliary_request
 from cayu.providers.response import ModelResponse
-from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
+from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.tools.inference import InferenceLimits, copy_inference_limits
 
 

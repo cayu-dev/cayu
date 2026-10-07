@@ -9,7 +9,7 @@ from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME, Structur
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.providers import ModelProvider, ModelProviderError, ModelRequest, ModelStreamEvent
-from cayu.runtime.retry_policy import RetryPolicy
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.sessions.base import RunRequest
 
 

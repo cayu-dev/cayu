@@ -30,6 +30,7 @@ from cayu.execution_units import ToolRoundIdentity
 from cayu.messages import Message
 from cayu.observability.hooks import AfterToolCallDecision, RuntimeHook, ToolCallHookContext
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.providers.retry_policy import RetryPolicy
 from cayu.runners.base import RunnerExecutionError, attach_cancellation_artifacts
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
@@ -54,7 +55,6 @@ from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
     build_execution_profile_identity,
 )
-from cayu.runtime.retry_policy import RetryPolicy
 from cayu.sessions.base import InMemorySessionStore, RunRequest, Session, SessionStatus
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 from cayu.tools import _web_access_result_schema as web_access_result_schema
