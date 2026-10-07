@@ -118,6 +118,36 @@ from cayu.tasks.base import (
 from cayu.tasks.base import task_create_with_execution_source as task_create_with_execution_source
 from cayu.tasks.base import task_invocation_for_create as task_invocation_for_create
 from cayu.tasks.base import terminalize_task_with_retry as terminalize_task_with_retry
+from cayu.tasks.completion_verifier_dispatches import (
+    CompletionVerifierDecodeStatus as CompletionVerifierDecodeStatus,
+)
+from cayu.tasks.completion_verifier_dispatches import (
+    CompletionVerifierDispatch as CompletionVerifierDispatch,
+)
+from cayu.tasks.completion_verifier_dispatches import (
+    CompletionVerifierDispatchBudget as CompletionVerifierDispatchBudget,
+)
+from cayu.tasks.completion_verifier_dispatches import (
+    CompletionVerifierDispatchBudgetExhausted as CompletionVerifierDispatchBudgetExhausted,
+)
+from cayu.tasks.completion_verifier_dispatches import (
+    CompletionVerifierDispatchFailure as CompletionVerifierDispatchFailure,
+)
+from cayu.tasks.completion_verifier_dispatches import (
+    CompletionVerifierDispatchOutcome as CompletionVerifierDispatchOutcome,
+)
+from cayu.tasks.completion_verifier_dispatches import (
+    CompletionVerifierDispatchRequest as CompletionVerifierDispatchRequest,
+)
+from cayu.tasks.completion_verifier_dispatches import (
+    CompletionVerifierDispatchSettlement as CompletionVerifierDispatchSettlement,
+)
+from cayu.tasks.completion_verifier_dispatches import (
+    CompletionVerifierDispatchSettlementRequest as CompletionVerifierDispatchSettlementRequest,
+)
+from cayu.tasks.completion_verifier_dispatches import (
+    CompletionVerifierUsageStatus as CompletionVerifierUsageStatus,
+)
 from cayu.tasks.contracts import CompletionConstraintOutcome as CompletionConstraintOutcome
 from cayu.tasks.contracts import CompletionContinuationPolicy as CompletionContinuationPolicy
 from cayu.tasks.contracts import CompletionCriterionOutcome as CompletionCriterionOutcome

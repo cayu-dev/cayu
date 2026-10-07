@@ -75,6 +75,20 @@ from cayu.tasks.base import (
     _task_session_instance_for_attachment,
     _work_attempt_discovery_query,
 )
+from cayu.tasks.completion_verifier_dispatches import (
+    CompletionVerifierDispatch,
+    CompletionVerifierDispatchRequest,
+    CompletionVerifierDispatchSettlementRequest,
+    completion_verifier_dispatch_document,
+    completion_verifier_dispatch_from_document,
+    completion_verifier_dispatch_from_request,
+    copy_completion_verifier_dispatch,
+    copy_completion_verifier_dispatch_request,
+    copy_completion_verifier_dispatch_settlement_request,
+    replay_completion_verifier_dispatch,
+    require_completion_verifier_dispatch_admission,
+    settle_completion_verifier_dispatch_record,
+)
 from cayu.tasks.completion_verifier_profiles import (
     CompletionVerifierProfilePreparationRequest,
     CompletionVerifierProfileRecord,
@@ -3339,6 +3353,182 @@ class PostgresVerifiedWorkMixin:
         async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
             decision = await self._load_decision_for_proposal(cur, proposal_id)
             return None if decision is None else decision.model_copy(deep=True)
+
+    @staticmethod
+    def _verifier_dispatch_from_row(row: Any) -> CompletionVerifierDispatch:
+        dispatch = completion_verifier_dispatch_from_document(_json_document(row[6]))
+        if (
+            dispatch.dispatch_id != row[0]
+            or dispatch.proposal_id != row[1]
+            or dispatch.task_id != row[2]
+            or dispatch.ordinal != row[3]
+            or dispatch.request_sha256 != row[4]
+            or (dispatch.settlement is not None) != bool(row[5])
+        ):
+            raise WorkCompletionConflict(
+                "Stored completion-verifier dispatch indexes conflict with canonical content."
+            )
+        return dispatch
+
+    async def _load_verifier_dispatch_row(
+        self,
+        cur: Any,
+        dispatch_id: str,
+        *,
+        for_update: bool = False,
+    ) -> CompletionVerifierDispatch | None:
+        await cur.execute(
+            "SELECT dispatch_id, proposal_id, task_id, ordinal, request_sha256, settled, "
+            "record_json FROM cayu_completion_verifier_dispatches WHERE dispatch_id = %s"
+            + (" FOR UPDATE" if for_update else ""),
+            (dispatch_id,),
+        )
+        row = await cur.fetchone()
+        return None if row is None else self._verifier_dispatch_from_row(row)
+
+    async def _list_verifier_dispatch_rows(
+        self,
+        cur: Any,
+        proposal_id: str,
+        *,
+        for_update: bool = False,
+    ) -> tuple[CompletionVerifierDispatch, ...]:
+        await cur.execute(
+            "SELECT dispatch_id, proposal_id, task_id, ordinal, request_sha256, settled, "
+            "record_json FROM cayu_completion_verifier_dispatches WHERE proposal_id = %s "
+            "ORDER BY ordinal" + (" FOR UPDATE" if for_update else ""),
+            (proposal_id,),
+        )
+        dispatches = tuple(self._verifier_dispatch_from_row(row) for row in await cur.fetchall())
+        if tuple(item.ordinal for item in dispatches) != tuple(range(1, len(dispatches) + 1)):
+            raise WorkCompletionConflict("Stored completion-verifier dispatch order has gaps.")
+        return dispatches
+
+    async def record_completion_verifier_dispatch(
+        self,
+        request: CompletionVerifierDispatchRequest,
+    ) -> CompletionVerifierDispatch:
+        request = copy_completion_verifier_dispatch_request(request)
+        await self._ensure_ready()
+
+        async def operation(conn: Any, cur: Any) -> CompletionVerifierDispatch:
+            del conn
+            await self._lock_verified_work_identity(cur, "dispatch", request.dispatch_id)
+            existing = await self._load_verifier_dispatch_row(
+                cur, request.dispatch_id, for_update=True
+            )
+            if existing is not None:
+                return replay_completion_verifier_dispatch(existing, request)
+            proposal_snapshot = await self._load_proposal_row(cur, request.proposal_id)
+            if proposal_snapshot is None:
+                raise KeyError(f"Completion proposal not found: {request.proposal_id}")
+            await self._lock_verified_work_task(cur, proposal_snapshot.task_id)
+            proposal = await self._load_proposal_row(cur, request.proposal_id, for_update=True)
+            if proposal is None:
+                raise KeyError(f"Completion proposal not found: {request.proposal_id}")
+            attempt = await self._load_attempt_row(cur, proposal.attempt_id, for_update=True)
+            if attempt is None:
+                raise WorkCompletionConflict("Completion proposal has no durable work attempt.")
+            task = await self._load_task_locked(cur, proposal.task_id)
+            contract = verified_work_support.require_proposal_chain(
+                proposal,
+                attempt,
+                task,
+                latest_attempt_id=await self._latest_attempt_id(cur, task.id),
+                contract=await self._load_work_contract_row(
+                    cur, proposal.contract, for_update=True
+                ),
+            )
+            claim = await self._load_current_claim(cur, proposal.proposal_id, for_update=True)
+            profile = await self._load_verifier_profile_row(
+                cur, proposal.proposal_id, for_update=True
+            )
+            decided = (
+                await self._load_decision_for_proposal(cur, proposal.proposal_id, for_update=True)
+                is not None
+            )
+            prior = await self._list_verifier_dispatch_rows(
+                cur, proposal.proposal_id, for_update=True
+            )
+            require_completion_verifier_dispatch_admission(
+                request,
+                proposal=proposal,
+                contract_verifier=contract.verifier,
+                claim=claim,
+                profile_fingerprint=None if profile is None else profile.profile.fingerprint,
+                decided=decided,
+                existing=prior,
+                lease_now=await self._verified_lease_now(cur),
+            )
+            record = completion_verifier_dispatch_from_request(
+                request,
+                proposal=proposal,
+                ordinal=len(prior) + 1,
+                dispatched_at=await self._verified_evidence_now(cur),
+            )
+            await cur.execute(
+                "INSERT INTO cayu_completion_verifier_dispatches "
+                "(dispatch_id, proposal_id, task_id, ordinal, request_sha256, settled, "
+                "record_json) VALUES (%s, %s, %s, %s, %s, FALSE, %s)",
+                (
+                    record.dispatch_id,
+                    record.proposal_id,
+                    record.task_id,
+                    record.ordinal,
+                    record.request_sha256,
+                    json.dumps(completion_verifier_dispatch_document(record)),
+                ),
+            )
+            return copy_completion_verifier_dispatch(record)
+
+        return await self._run_verified_work_mutation(operation)
+
+    async def settle_completion_verifier_dispatch(
+        self,
+        request: CompletionVerifierDispatchSettlementRequest,
+    ) -> CompletionVerifierDispatch:
+        request = copy_completion_verifier_dispatch_settlement_request(request)
+        await self._ensure_ready()
+
+        async def operation(conn: Any, cur: Any) -> CompletionVerifierDispatch:
+            del conn
+            await self._lock_verified_work_identity(cur, "dispatch", request.dispatch_id)
+            existing = await self._load_verifier_dispatch_row(
+                cur, request.dispatch_id, for_update=True
+            )
+            if existing is None:
+                raise KeyError(f"Completion verifier dispatch not found: {request.dispatch_id}")
+            updated, changed = settle_completion_verifier_dispatch_record(
+                existing,
+                request,
+                settled_at=await self._verified_evidence_now(cur),
+            )
+            if changed:
+                await cur.execute(
+                    "UPDATE cayu_completion_verifier_dispatches "
+                    "SET settled = TRUE, record_json = %s "
+                    "WHERE dispatch_id = %s AND NOT settled",
+                    (
+                        json.dumps(completion_verifier_dispatch_document(updated)),
+                        updated.dispatch_id,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise WorkCompletionConflict(
+                        "Completion verifier dispatch settlement lost its record."
+                    )
+            return copy_completion_verifier_dispatch(updated)
+
+        return await self._run_verified_work_mutation(operation)
+
+    async def list_completion_verifier_dispatches(
+        self,
+        proposal_id: str,
+    ) -> tuple[CompletionVerifierDispatch, ...]:
+        proposal_id = require_clean_nonblank(proposal_id, "proposal_id")
+        await self._ensure_ready()
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+            return await self._list_verifier_dispatch_rows(cur, proposal_id)
 
     async def apply_completion_decision(
         self,

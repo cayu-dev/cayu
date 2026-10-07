@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from time import monotonic
@@ -39,11 +39,13 @@ from cayu.runtime._diagnostics import (
 from cayu.runtime._execution_profile_identity_validation import (
     copy_secret_free_execution_profile_behavior_identity,
 )
+from cayu.runtime._runtime_records import RegisteredProvider
 from cayu.runtime._task_store_operation_boundary import (
     TaskStoreOperationOutcome,
     capture_sensitive_validation,
     capture_task_store_operation,
     raise_task_store_operation_failure,
+    task_store_completion_verifier_dispatch_capability_is_complete,
 )
 from cayu.tasks._verified_work_authority import (
     completion_decision_claim_authority_matches,
@@ -100,6 +102,14 @@ from cayu.verification._leased_adapter_runner import (
     LeasedAdapterRunner,
     LeasedAdapterSettlement,
 )
+from cayu.verification._provider_completion_verifier_profile import (
+    RUNTIME_COMPONENT_PREFIX,
+    provider_verifier_runtime_components,
+)
+from cayu.verification._provider_completion_verifier_runtime import (
+    ProviderCompletionVerifierRuntime,
+    ProviderVerifierExecutionAuthority,
+)
 from cayu.verification.completion_verifiers import (
     CompletionVerifierExecutionError,
     CompletionVerifierExecutionRequest,
@@ -108,11 +118,27 @@ from cayu.verification.completion_verifiers import (
     DeterministicCompletionVerifier,
     copy_completion_verifier_execution_request,
 )
+from cayu.verification.provider_completion_verifiers import (
+    ProviderCompletionVerifier,
+    ProviderCompletionVerifierBudgetExhausted,
+    ProviderCompletionVerifierDecodingError,
+    ProviderCompletionVerifierDispatchError,
+    ProviderCompletionVerifierTarget,
+    copy_provider_completion_verifier_target,
+)
 from cayu.workspaces.observation_recovery import (
     retain_workspace_observation_pending_cancellation_requests,
     workspace_observation_pending_cancellation_requests,
 )
 
+_RUNTIME_AUTHORED_VERIFIER_FAILURES = frozenset(
+    {
+        CompletionVerifierUnavailable,
+        ProviderCompletionVerifierBudgetExhausted,
+        ProviderCompletionVerifierDecodingError,
+        ProviderCompletionVerifierDispatchError,
+    }
+)
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 _ExecutionKey = str
 _MAX_ACTIVE_COMPLETION_VERIFIERS = 64
@@ -163,8 +189,9 @@ class _VerifierAuthority:
 
 @dataclass(frozen=True, slots=True)
 class _RegisteredVerifier:
-    adapter: DeterministicCompletionVerifier = field(repr=False)
+    adapter: DeterministicCompletionVerifier | ProviderCompletionVerifier = field(repr=False)
     profile: CompletionVerifierExecutionProfile
+    target: ProviderCompletionVerifierTarget | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -435,6 +462,14 @@ def _detached_verifier_failure(
             redactor=redactor,
             fallback_message="Completion verifier cancellation diagnostic was redacted.",
         )
+    if type(error) in _RUNTIME_AUTHORED_VERIFIER_FAILURES:
+        # Provider-verifier failures carry runtime-authored messages only.
+        return credential_safe_runtime_exception(
+            type(error),
+            message,
+            redactor=redactor,
+            fallback_message="Completion verifier failure diagnostic was redacted.",
+        )
     return credential_safe_runtime_exception(
         CompletionVerifierExecutionError,
         redactor.redact_text_bounded(
@@ -461,7 +496,7 @@ def _generic_verifier_failure(
         safe_type = SystemExit
     elif isinstance(error, asyncio.CancelledError):
         safe_type = asyncio.CancelledError
-    elif type(error) in {
+    elif type(error) in _RUNTIME_AUTHORED_VERIFIER_FAILURES or type(error) in {
         CompletionVerifierExecutionError,
         CompletionVerifierUnavailable,
         TaskClaimLost,
@@ -734,6 +769,8 @@ class CompletionVerifierCoordinator:
         task_store: TaskStore | None,
         secret_redactor: SecretRedactor,
         profile_policy: CompletionVerifierProfilePolicy | None = None,
+        provider_registrations: Callable[[], Mapping[str, RegisteredProvider]] | None = None,
+        execution_profile_process_identity: str | None = None,
     ) -> None:
         if task_store is not None and not isinstance(task_store, TaskStore):
             raise TypeError("Completion verifier coordinator requires a TaskStore.")
@@ -767,6 +804,35 @@ class CompletionVerifierCoordinator:
         self._execution_owner_id = f"cver_{uuid4().hex}"
         self._verifiers: dict[tuple[str, str, str, str], _RegisteredVerifier] = {}
         self._adapter_runner = LeasedAdapterRunner[_DrainingAdapter]()
+        self._provider_registrations = provider_registrations
+        self._process_identity = execution_profile_process_identity or uuid4().hex
+        self._provider_runtime = ProviderCompletionVerifierRuntime(
+            resolve_provider=self._resolve_provider,
+            secret_redactor=secret_redactor,
+        )
+
+    def _resolve_provider(self, provider_name: str) -> RegisteredProvider:
+        registrations = (
+            None if self._provider_registrations is None else self._provider_registrations()
+        )
+        registered = None if registrations is None else registrations.get(provider_name)
+        if registered is None:
+            raise CompletionVerifierUnavailable(
+                "The provider required by the provider-backed completion verifier is not "
+                "registered."
+            ) from None
+        return registered
+
+    def _provider_runtime_components(
+        self,
+        target: ProviderCompletionVerifierTarget,
+    ) -> tuple[CompletionVerifierProfileComponentDeclaration, ...]:
+        return provider_verifier_runtime_components(
+            target=target,
+            registered_provider=self._resolve_provider(target.provider_name),
+            process_identity=self._process_identity,
+            redactor=self._secret_redactor,
+        )
 
     @property
     def pending(self) -> bool:
@@ -823,16 +889,17 @@ class CompletionVerifierCoordinator:
     def register(
         self,
         reference: CompletionVerifierRef,
-        verifier: DeterministicCompletionVerifier,
+        verifier: DeterministicCompletionVerifier | ProviderCompletionVerifier,
     ) -> CompletionVerifierRef:
         self._ensure_process_local_generation()
         if type(reference) is not CompletionVerifierRef:
             del reference, verifier
             raise TypeError("Completion verifier registration requires a CompletionVerifierRef.")
-        if not isinstance(verifier, DeterministicCompletionVerifier):
+        if not isinstance(verifier, (DeterministicCompletionVerifier, ProviderCompletionVerifier)):
             del reference, verifier
             raise TypeError(
-                "Completion verifier registration requires a DeterministicCompletionVerifier."
+                "Completion verifier registration requires a DeterministicCompletionVerifier "
+                "or a ProviderCompletionVerifier."
             )
         verifier_value = verifier
         del verifier
@@ -856,9 +923,18 @@ class CompletionVerifierCoordinator:
         if copied is None:
             del verifier_value
             raise ValueError("Completion verifier reference is invalid.") from None
-        if copied.kind is not CompletionVerifierKind.DETERMINISTIC:
+        expected_kind = (
+            CompletionVerifierKind.PROVIDER
+            if isinstance(verifier_value, ProviderCompletionVerifier)
+            else CompletionVerifierKind.DETERMINISTIC
+        )
+        if copied.kind is not expected_kind:
             del copied, verifier_value
-            raise ValueError("Only deterministic completion verifiers can be registered.")
+            raise ValueError(
+                "Completion verifier reference kind does not match the registered verifier: "
+                "provider references require a ProviderCompletionVerifier and deterministic "
+                "references a DeterministicCompletionVerifier."
+            )
         if _contains_workload_secret(
             (
                 copied.verifier_id,
@@ -917,12 +993,41 @@ class CompletionVerifierCoordinator:
         if components is None:
             del copied, key, verifier_value, adapter_identity
             raise ValueError("Completion verifier component identities are invalid.") from None
+        target: ProviderCompletionVerifierTarget | None = None
+        if isinstance(verifier_value, ProviderCompletionVerifier):
+            if any(item.component_id.startswith(RUNTIME_COMPONENT_PREFIX) for item in components):
+                del copied, key, verifier_value, adapter_identity, components
+                raise ValueError(
+                    "Provider verifier component IDs starting with 'runtime.' are reserved."
+                ) from None
+            target_validation = capture_sensitive_validation(
+                lambda value=verifier_value: copy_provider_completion_verifier_target(value.target),
+                operation_name="Provider completion verifier target validation",
+                redactor=self._secret_redactor,
+            )
+            if target_validation.failure is not None:
+                failure = target_validation.failure
+                del copied, key, verifier_value, adapter_identity, components, target_validation
+                raise_task_store_operation_failure(failure)
+            target = target_validation.result
+            del target_validation
+            if target is None:
+                del copied, key, verifier_value, adapter_identity, components
+                raise ValueError("Provider completion verifier target is invalid.") from None
+            components = tuple(
+                sorted(
+                    (*components, *self._provider_runtime_components(target)),
+                    key=lambda item: item.component_id,
+                )
+            )
         profile = build_completion_verifier_execution_profile(
             verifier=copied,
             adapter_identity=adapter_identity,
             component_declarations=components,
         )
-        self._verifiers[key] = _RegisteredVerifier(adapter=verifier_value, profile=profile)
+        self._verifiers[key] = _RegisteredVerifier(
+            adapter=verifier_value, profile=profile, target=target
+        )
         del verifier_value
         return copied
 
@@ -989,10 +1094,29 @@ class CompletionVerifierCoordinator:
             raise CompletionVerifierUnavailable(
                 "Completion verifier execution-profile identity is unavailable."
             ) from None
+        components = live_profile[1]
+        if registered.target is not None:
+            target_validation = capture_sensitive_validation(
+                lambda adapter=registered.adapter: copy_provider_completion_verifier_target(
+                    cast("ProviderCompletionVerifier", adapter).target
+                ),
+                operation_name="Provider completion verifier live-target validation",
+                redactor=self._secret_redactor,
+            )
+            if target_validation.result != registered.target:
+                raise CompletionVerifierUnavailable(
+                    "Provider completion verifier target changed after registration."
+                ) from None
+            components = tuple(
+                sorted(
+                    (*components, *self._provider_runtime_components(registered.target)),
+                    key=lambda item: item.component_id,
+                )
+            )
         candidate = build_completion_verifier_execution_profile(
             verifier=registered.profile.verifier,
             adapter_identity=live_profile[0],
-            component_declarations=live_profile[1],
+            component_declarations=components,
         )
         if candidate != registered.profile:
             raise CompletionVerifierUnavailable(
@@ -1197,10 +1321,14 @@ class CompletionVerifierCoordinator:
                 raise_task_store_operation_failure(failure)
 
         deadline.require_admission("completion_verifier")
-        if authority.contract.verifier.kind is not CompletionVerifierKind.DETERMINISTIC:
+        provider_backed = authority.contract.verifier.kind is CompletionVerifierKind.PROVIDER
+        if provider_backed and not task_store_completion_verifier_dispatch_capability_is_complete(
+            store_owner.store
+        ):
             raise credential_safe_runtime_exception(
                 CompletionVerifierUnavailable,
-                "Provider-backed completion verifiers are not supported by this runtime slice.",
+                "Provider-backed completion verifiers require a task store with durable "
+                "provider-verifier dispatch support.",
                 redactor=self._secret_redactor,
                 fallback_message="The required completion verifier is unavailable.",
             ) from None
@@ -1208,8 +1336,7 @@ class CompletionVerifierCoordinator:
         if verifier_key not in self._verifiers:
             raise credential_safe_runtime_exception(
                 CompletionVerifierUnavailable,
-                "The exact deterministic completion verifier required by the work contract "
-                "is not registered.",
+                "The exact completion verifier required by the work contract is not registered.",
                 redactor=self._secret_redactor,
                 fallback_message="The required completion verifier is unavailable.",
             ) from None
@@ -1314,8 +1441,26 @@ class CompletionVerifierCoordinator:
 
             self._require_live_registered_profile(registered)
 
+            if registered.target is None:
+                deterministic = cast("DeterministicCompletionVerifier", verifier)
+                invoke = deterministic.verify
+            else:
+                invoke = self._provider_invocation(
+                    store_owner.store,
+                    cast("ProviderCompletionVerifier", verifier),
+                    registered.target,
+                    ProviderVerifierExecutionAuthority(
+                        proposal_id=claim.proposal_id,
+                        claim_id=claim.claim_id,
+                        worker_id=claim.worker_id,
+                        execution_owner_id=self._execution_owner_id,
+                        claim_attempt_number=claim.attempt_number,
+                        verifier=claim.verifier,
+                        verifier_profile_fingerprint=claim.verifier_profile_fingerprint,
+                    ),
+                )
             outcome = await self._invoke_adapter(
-                verifier,
+                invoke,
                 authority.adapter_request,
                 operation_key=operation_key,
                 timeout_seconds=request.execution_timeout_seconds,
@@ -2643,9 +2788,29 @@ class CompletionVerifierCoordinator:
             return failure
         return None
 
+    def _provider_invocation(
+        self,
+        store: TaskStore,
+        verifier: ProviderCompletionVerifier,
+        target: ProviderCompletionVerifierTarget,
+        authority: ProviderVerifierExecutionAuthority,
+    ) -> Callable[[CompletionVerifierRequest], Awaitable[CompletionVerifierDecision]]:
+        runtime = self._provider_runtime
+
+        async def invoke(request: CompletionVerifierRequest) -> CompletionVerifierDecision:
+            return await runtime.evaluate(
+                store=store,
+                verifier=verifier,
+                target=target,
+                request=request,
+                authority=authority,
+            )
+
+        return invoke
+
     async def _invoke_adapter(
         self,
-        verifier: DeterministicCompletionVerifier,
+        verifier: Callable[[CompletionVerifierRequest], Awaitable[CompletionVerifierDecision]],
         request: CompletionVerifierRequest,
         *,
         operation_key: _ExecutionKey,
@@ -2661,7 +2826,7 @@ class CompletionVerifierCoordinator:
         try:
             invocation = await self._adapter_runner.run(
                 operation_key,
-                lambda adapter=verifier, value=request: adapter.verify(value),
+                lambda adapter=verifier, value=request: adapter(value),
                 name="cayu-completion-verifier",
                 timeout_seconds=timeout_seconds,
                 lease=LeasedAdapterLease(

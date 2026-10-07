@@ -515,6 +515,9 @@ REVISIONS: tuple[Revision, ...] = (
     # External waits retain session continuation responsibilities. All writers
     # must preserve the receiving records and their deletion fences.
     Revision(revision=115, kind=RevisionKind.BREAKING, compatible_from=115),
+    # Provider-backed completion verifiers record each provider attempt in a
+    # new table that older binaries never read or write.
+    Revision(revision=116, kind=RevisionKind.ADDITIVE, compatible_from=115),
 )
 
 #: The revision an empty database is initialized to.

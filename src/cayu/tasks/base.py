@@ -167,6 +167,18 @@ from cayu.tasks.admission import (
     work_attempt_admission_prepare_sha256,
     work_attempt_execution_claim_request_sha256,
 )
+from cayu.tasks.completion_verifier_dispatches import (
+    CompletionVerifierDispatch,
+    CompletionVerifierDispatchRequest,
+    CompletionVerifierDispatchSettlementRequest,
+    completion_verifier_dispatch_from_request,
+    copy_completion_verifier_dispatch,
+    copy_completion_verifier_dispatch_request,
+    copy_completion_verifier_dispatch_settlement_request,
+    replay_completion_verifier_dispatch,
+    require_completion_verifier_dispatch_admission,
+    settle_completion_verifier_dispatch_record,
+)
 from cayu.tasks.completion_verifier_profiles import (
     CompletionVerifierProfilePreparationRequest,
     CompletionVerifierProfileRecord,
@@ -2635,6 +2647,7 @@ class TaskStore(ABC):
     supports_task_cancellation_reconciliation: ClassVar[bool] = False
     supports_task_retry_series: ClassVar[bool] = False
     supports_verified_work_contracts: ClassVar[bool] = False
+    supports_completion_verifier_dispatches: ClassVar[bool] = False
     supports_work_attempt_admission: ClassVar[bool] = False
     supports_verified_task_worker: ClassVar[bool] = False
     supports_local_execution_attempts: ClassVar[bool] = False
@@ -3108,6 +3121,33 @@ class TaskStore(ABC):
     ) -> CompletionDecisionApplicationReceipt | None:
         """Load exact durable evidence for decision application reconciliation."""
         raise NotImplementedError("This TaskStore does not support verified work contracts.")
+
+    async def record_completion_verifier_dispatch(
+        self,
+        request: CompletionVerifierDispatchRequest,
+    ) -> CompletionVerifierDispatch:
+        """Persist one provider-verifier attempt intent before the provider is entered.
+
+        Implementations must atomically read the current verification claim,
+        prepared verifier profile, decision index and prior dispatches for the
+        proposal, call ``require_completion_verifier_dispatch_admission`` and
+        insert the record, or exactly replay an identical intent.
+        """
+        raise NotImplementedError("This TaskStore does not support provider verifier dispatches.")
+
+    async def settle_completion_verifier_dispatch(
+        self,
+        request: CompletionVerifierDispatchSettlementRequest,
+    ) -> CompletionVerifierDispatch:
+        """Write the one terminal settlement for a recorded provider attempt."""
+        raise NotImplementedError("This TaskStore does not support provider verifier dispatches.")
+
+    async def list_completion_verifier_dispatches(
+        self,
+        proposal_id: str,
+    ) -> tuple[CompletionVerifierDispatch, ...]:
+        """List one proposal's provider attempts in their durable order."""
+        raise NotImplementedError("This TaskStore does not support provider verifier dispatches.")
 
     @abstractmethod
     async def create_task(self, request: TaskCreate) -> Task:
@@ -3809,6 +3849,7 @@ class InMemoryTaskStore(TaskStore):
     supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
+    supports_completion_verifier_dispatches: ClassVar[bool] = True
     supports_work_attempt_admission: ClassVar[bool] = True
     supports_verified_task_worker: ClassVar[bool] = True
     supports_local_execution_attempts: ClassVar[bool] = True
@@ -3873,6 +3914,8 @@ class InMemoryTaskStore(TaskStore):
         self._completion_proposals: dict[str, CompletionProposal] = {}
         self._proposal_id_by_attempt: dict[str, str] = {}
         self._completion_verifier_profiles: dict[str, CompletionVerifierProfileRecord] = {}
+        self._completion_verifier_dispatches: dict[str, list[CompletionVerifierDispatch]] = {}
+        self._completion_verifier_dispatch_proposals: dict[str, str] = {}
         self._completion_verification_claims: dict[str, CompletionVerificationClaim] = {}
         self._verification_claims_by_id: dict[str, CompletionVerificationClaim] = {}
         self._completion_decisions: dict[str, CompletionDecision] = {}
@@ -5322,6 +5365,82 @@ class InMemoryTaskStore(TaskStore):
             decision = None if decision_id is None else self._completion_decisions.get(decision_id)
             return None if decision is None else decision.model_copy(deep=True)
 
+    async def record_completion_verifier_dispatch(
+        self,
+        request: CompletionVerifierDispatchRequest,
+    ) -> CompletionVerifierDispatch:
+        request = copy_completion_verifier_dispatch_request(request)
+        async with self._lock:
+            existing_proposal_id = self._completion_verifier_dispatch_proposals.get(
+                request.dispatch_id
+            )
+            if existing_proposal_id is not None:
+                existing = next(
+                    item
+                    for item in self._completion_verifier_dispatches[existing_proposal_id]
+                    if item.dispatch_id == request.dispatch_id
+                )
+                return replay_completion_verifier_dispatch(existing, request)
+            proposal = self._require_completion_proposal(request.proposal_id)
+            contract = self._require_work_contract(proposal.contract)
+            profile = self._completion_verifier_profiles.get(proposal.proposal_id)
+            prior = tuple(self._completion_verifier_dispatches.get(proposal.proposal_id, ()))
+            require_completion_verifier_dispatch_admission(
+                request,
+                proposal=proposal,
+                contract_verifier=contract.verifier,
+                claim=self._completion_verification_claims.get(proposal.proposal_id),
+                profile_fingerprint=None if profile is None else profile.profile.fingerprint,
+                decided=proposal.proposal_id in self._decision_id_by_proposal,
+                existing=prior,
+                lease_now=self._ownership_clock(),
+            )
+            self._ensure_completion_proposal_is_current(proposal)
+            record = completion_verifier_dispatch_from_request(
+                request,
+                proposal=proposal,
+                ordinal=len(prior) + 1,
+                dispatched_at=self._clock(),
+            )
+            self._completion_verifier_dispatches.setdefault(proposal.proposal_id, []).append(record)
+            self._completion_verifier_dispatch_proposals[record.dispatch_id] = proposal.proposal_id
+            return copy_completion_verifier_dispatch(record)
+
+    async def settle_completion_verifier_dispatch(
+        self,
+        request: CompletionVerifierDispatchSettlementRequest,
+    ) -> CompletionVerifierDispatch:
+        request = copy_completion_verifier_dispatch_settlement_request(request)
+        async with self._lock:
+            proposal_id = self._completion_verifier_dispatch_proposals.get(request.dispatch_id)
+            if proposal_id is None:
+                raise KeyError(f"Completion verifier dispatch not found: {request.dispatch_id}")
+            dispatches = self._completion_verifier_dispatches[proposal_id]
+            index = next(
+                position
+                for position, item in enumerate(dispatches)
+                if item.dispatch_id == request.dispatch_id
+            )
+            updated, changed = settle_completion_verifier_dispatch_record(
+                dispatches[index],
+                request,
+                settled_at=self._clock(),
+            )
+            if changed:
+                dispatches[index] = updated
+            return copy_completion_verifier_dispatch(updated)
+
+    async def list_completion_verifier_dispatches(
+        self,
+        proposal_id: str,
+    ) -> tuple[CompletionVerifierDispatch, ...]:
+        proposal_id = require_clean_nonblank(proposal_id, "proposal_id")
+        async with self._lock:
+            return tuple(
+                copy_completion_verifier_dispatch(item)
+                for item in self._completion_verifier_dispatches.get(proposal_id, ())
+            )
+
     async def apply_completion_decision(
         self,
         request: CompletionDecisionApplicationRequest,
@@ -5844,6 +5963,15 @@ class InMemoryTaskStore(TaskStore):
                 (self._admission_id_by_attempt, attempt_ids),
                 (self._proposal_id_by_attempt, attempt_ids),
                 (self._completion_verifier_profiles, proposal_ids),
+                (self._completion_verifier_dispatches, proposal_ids),
+                (
+                    self._completion_verifier_dispatch_proposals,
+                    {
+                        key
+                        for key, value in self._completion_verifier_dispatch_proposals.items()
+                        if value in proposal_ids
+                    },
+                ),
                 (self._completion_verification_claims, proposal_ids),
                 (self._decision_id_by_proposal, proposal_ids),
                 (self._decision_application_key_by_decision, decision_ids),

@@ -44,6 +44,26 @@
   and stage are shown as Cloud sent them, or `unknown` when missing, not a lowercase
   identifier, or unsafe to print. `smoke_test` is a known stage for release smoke-test
   failures. See [the Cayu Cloud CLI guide](cayu-cloud.md).
+- Provider-backed (model-judge) completion verifiers. Register a
+  `ProviderCompletionVerifier` with `CayuApp.register_completion_verifier(...)`
+  for a work contract whose verifier reference has kind `provider`. The runtime
+  calls the model through the registered provider with no tools, records every
+  provider attempt in a new verifier dispatch ledger before entering the
+  provider, settles its outcome, usage and latency afterwards, enforces a
+  per-proposal attempt and token budget across retries and recoveries, and
+  strictly decodes the response into a contract-complete decision. Provider,
+  transport, timeout and decoding failures raise typed verifier-execution errors
+  and never become a rejected candidate. A decoded provider outcome that already
+  committed is reused after a crash instead of judging again.
+  `CayuApp.list_completion_verifier_dispatches(...)` and
+  `summarize_completion_verifier_dispatches(...)` report verifier usage and cost
+  separately from the worker session. See
+  [provider-backed completion verifiers](runtime-contracts.md#provider-backed-completion-verifiers).
+
+Storage revision is **116** (previously **115**). The revision is additive: it
+adds the `cayu_completion_verifier_dispatches` table. Task stores now require
+revision 116, so migrate storage before starting this version; older binaries
+keep working against a migrated database.
 
 ### Cloud-hosted Agents upgrading from v0.8.x
 

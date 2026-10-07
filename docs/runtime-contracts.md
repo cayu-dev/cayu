@@ -6246,8 +6246,11 @@ is rejected rather than replacing live application policy. Publishing a work
 contract does not require its adapter to be present, so queue producers and
 workers may run in separate processes; every worker that may begin unfinished
 verification must reconstruct the exact registration during application
-startup. Provider-backed verifier references remain reserved and fail closed in
-this slice.
+startup. A reference with kind `deterministic` takes a
+`DeterministicCompletionVerifier`; a reference with kind `provider` takes a
+`ProviderCompletionVerifier` (see
+[provider-backed completion verifiers](#provider-backed-completion-verifiers)).
+A mismatched kind fails registration.
 
 Each deterministic registration must also declare a stable, application-versioned
 `execution_profile_identity`. Decision-bearing dependencies that are not part of
@@ -6365,9 +6368,9 @@ Reconciliation never converts cancellation or process control into success, and
 a reconciliation failure is preserved after the original publication failure.
 A different claim tuple or decision publication remains a conflict. This method
 ends at durable decision publication: it deliberately does not call
-`apply_completion_decision(...)`, transition the task or session, create a
-hidden continuation loop, or add provider-verifier usage. Those are separate
-verified-work lifecycle boundaries. Only `TaskStore` implementations that opt
+`apply_completion_decision(...)`, transition the task or session, or create a
+hidden continuation loop. Those are separate verified-work lifecycle
+boundaries. Only `TaskStore` implementations that opt
 into the verified-work capability can use this API. All three built-in task
 stores implement the complete lifecycle: `InMemoryTaskStore` is the
 process-local reference, while `SQLiteTaskStore` and `PostgresTaskStore`
@@ -7366,6 +7369,112 @@ assignment policy, priorities, dependency graphs, domain retry classification,
 human workflows, and worker deployment. `examples/task_worker_loop.py` shows the
 ordinary queue-worker pattern with claim, heartbeat, run, failure, and reclaim
 paths.
+
+### Provider-backed completion verifiers
+
+A work contract whose `CompletionVerifierRef.kind` is `provider` is verified by a
+model acting as judge. The application registers a `ProviderCompletionVerifier`
+that declares a `ProviderCompletionVerifierTarget` (registered provider name,
+model, per-attempt input/output token envelope, attempt timeout, request and
+response byte bounds, provider `retry_policy`, and a durable
+`CompletionVerifierDispatchBudget`) and an async `build_messages(request)` that
+returns text-only `system`, `user` or `assistant` messages for one
+`CompletionVerifierRequest`. `build_messages` must be read-only and deterministic,
+like a deterministic verifier: the runtime may call it again after a crash. The
+target provider must already be registered with the application, must support
+bounded auxiliary requests (`prepare_auxiliary_request`), and must have a stable
+execution-profile identity (bundled providers, or a custom provider declaring
+`execution_profile_identity`). Registration fails closed otherwise.
+
+The provider verifier runs in the same coordinator slot as a deterministic
+adapter, so claim fencing, heartbeat renewal, the execution timeout, caller
+cancellation, cancellation-resistant draining, single-flight per proposal and
+claim-fenced decision publication are unchanged. Set
+`CompletionVerifierExecutionRequest.execution_timeout_seconds` (and the lease)
+long enough to cover the provider attempts and retries. The immutable verifier
+profile binds two runtime-derived components in addition to the application's
+own: `runtime.provider-adapter` (the provider adapter identity) and
+`runtime.provider-target` (the complete target, including retry policy, budget
+and decision-contract version). Component IDs starting with `runtime.` are
+reserved. Replacing the provider or changing the target after registration fails
+before a claim, and changing them between task attempts is a profile change that
+needs explicit adoption.
+
+The runtime appends its own decision contract to the application's messages:
+the objective, criteria, constraints, evidence requirements, the candidate
+result reference and the proposal's evidence references, each with a citation
+token. Worker output and cited evidence are presented as claims to evaluate. The
+request is prepared with the provider's auxiliary hook, carries no tools, hosted
+tools, projections or raw options, and is fingerprinted.
+
+Every provider attempt follows one durable lifecycle in the task store:
+
+1. `record_completion_verifier_dispatch(...)` persists the attempt intent
+   (runtime-derived dispatch ID, exact claim tuple including the execution-owner
+   generation and claim attempt number, verifier profile fingerprint, provider,
+   pricing provider and model, request fingerprint, token envelope, timeout and
+   budget) before the provider is entered. The store checks, atomically with the
+   insert, that the claim is current and live, the profile matches, the proposal
+   is undecided and current, attempts are recorded in order within one verifier
+   execution with the previous one settled, all attempts for the proposal share
+   one profile and budget, and the budget admits the attempt. An exact replay
+   returns the recorded intent; a conflicting one fails.
+2. The provider is called once through the runtime provider stream boundary with
+   the attempt timeout.
+3. `settle_completion_verifier_dispatch(...)` writes the attempt's one terminal
+   settlement: `completed`, `failed`, `cancelled`, `timed_out` or
+   `outcome_unknown`; provider-observed usage with its status (`observed`,
+   `missing`, `malformed`); latency; a content-free failure classification; and,
+   for a completed attempt, the response digest, the decode status and the
+   decoded decision. Settlement is accounting, not decision authority, so it does
+   not need a live claim: usage observed by an owner that lost its claim is still
+   recorded. Settlement runs in its own task and completes even when the caller
+   cancels; the caller's cancellation is then re-raised.
+
+The budget counts every attempt for the proposal: provider retries inside one
+verifier execution (bounded by `retry_policy.max_attempts`, at most 16) and
+attempts made by later executions after failures, timeouts, lease expiry or
+process loss (bounded by `budget.max_attempts`, at most 64). Token ceilings count
+observed usage for settled attempts and the declared envelope for attempts whose
+usage is unknown, including attempts a crashed owner never settled, so a lost
+attempt cannot free budget. An exhausted budget raises
+`ProviderCompletionVerifierBudgetExhausted` before the provider is entered.
+
+The response must be exactly one JSON object (optionally inside a single fenced
+`json` block) with `verdict`, `criteria` and `constraints`, covering every
+criterion and constraint once in contract order, with a valid status and reason
+code, a gap code for exactly the unresolved outcomes, and citations only of the
+proposal's evidence. Cayu builds the `CompletionVerifierDecision` from it:
+evidence references are copied from the proposal, a satisfied outcome citing
+available evidence uses the `evidence` basis and otherwise `verifier_assertion`,
+and each gap lists the subject's required evidence that was not cited as
+available. The decision is then checked against the frozen contract like any
+other. A response that fails any of this raises
+`ProviderCompletionVerifierDecodingError` and is recorded as a completed attempt
+with decode status `invalid`; its text never appears in diagnostics. Provider
+errors, transport failures, timeouts and ambiguous stream endings raise
+`ProviderCompletionVerifierDispatchError`. None of these failures becomes a
+rejected candidate decision or an accepted empty result.
+
+Once an attempt for this proposal and profile settled with a decoded decision,
+later executions, including a new claim after a crash between settlement and
+decision publication, publish that decision without calling the provider again.
+
+Verifier usage stays out of worker sessions. `CayuApp.list_completion_verifier_dispatches(proposal_id)`
+returns the attempts in order, and `summarize_completion_verifier_dispatches(...)`
+totals attempts, outcomes and observed tokens, and, given a `PriceBook`, prices
+each observed attempt on its dispatch date. The decision's
+`verifier.kind` distinguishes provider verification from deterministic
+verification, and the dispatch records identify the verifier's provider and model
+separately from the source worker call.
+
+`InMemoryTaskStore`, `SQLiteTaskStore` and `PostgresTaskStore` implement the
+dispatch ledger (storage revision 116). A custom store opts in with
+`supports_completion_verifier_dispatches = True`, implements the three methods
+with the shared `require_completion_verifier_dispatch_admission` and
+`settle_completion_verifier_dispatch_record` helpers inside its atomic boundary,
+and declares the mutations cancellation-quiescent. Without that capability a
+provider verifier fails closed before claiming.
 
 ## EventSink
 

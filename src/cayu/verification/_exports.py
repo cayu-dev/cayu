@@ -67,6 +67,34 @@ EXPORTS = {
         "cayu.verification.verified_task_worker",
         "VerifiedTaskWorkerDraining",
     ),
+    "CompletionVerifierUsageSummary": (
+        "cayu.verification.provider_completion_verifiers",
+        "CompletionVerifierUsageSummary",
+    ),
+    "ProviderCompletionVerifier": (
+        "cayu.verification.provider_completion_verifiers",
+        "ProviderCompletionVerifier",
+    ),
+    "ProviderCompletionVerifierBudgetExhausted": (
+        "cayu.verification.provider_completion_verifiers",
+        "ProviderCompletionVerifierBudgetExhausted",
+    ),
+    "ProviderCompletionVerifierDecodingError": (
+        "cayu.verification.provider_completion_verifiers",
+        "ProviderCompletionVerifierDecodingError",
+    ),
+    "ProviderCompletionVerifierDispatchError": (
+        "cayu.verification.provider_completion_verifiers",
+        "ProviderCompletionVerifierDispatchError",
+    ),
+    "ProviderCompletionVerifierTarget": (
+        "cayu.verification.provider_completion_verifiers",
+        "ProviderCompletionVerifierTarget",
+    ),
+    "summarize_completion_verifier_dispatches": (
+        "cayu.verification.provider_completion_verifiers",
+        "summarize_completion_verifier_dispatches",
+    ),
 }
 
 PUBLIC_NAMES = [
@@ -88,4 +116,11 @@ PUBLIC_NAMES = [
     "VerifiedTaskProposalContext",
     "VerifiedTaskWorker",
     "VerifiedTaskWorkerDraining",
+    "CompletionVerifierUsageSummary",
+    "ProviderCompletionVerifier",
+    "ProviderCompletionVerifierBudgetExhausted",
+    "ProviderCompletionVerifierDecodingError",
+    "ProviderCompletionVerifierDispatchError",
+    "ProviderCompletionVerifierTarget",
+    "summarize_completion_verifier_dispatches",
 ]

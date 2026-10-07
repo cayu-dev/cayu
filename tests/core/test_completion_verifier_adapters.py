@@ -1059,7 +1059,7 @@ def test_registration_uses_complete_reference_and_missing_registration_does_not_
         different = _verifier_reference(fingerprint="different-configuration")
         app.register_completion_verifier(different, RecordingVerifier(_accepted_decision()))
 
-        with pytest.raises(CompletionVerifierUnavailable, match="exact deterministic"):
+        with pytest.raises(CompletionVerifierUnavailable, match="exact completion verifier"):
             await app.verify_completion_proposal(_execution_request(proposal_id))
         assert await store.load_completion_verification_claim(proposal_id) is None
 
@@ -1074,19 +1074,19 @@ def test_registration_uses_complete_reference_and_missing_registration_does_not_
     asyncio.run(scenario())
 
 
-def test_provider_kind_fails_before_claim_or_adapter_execution() -> None:
+def test_provider_kind_requires_a_provider_verifier_before_claim() -> None:
     async def scenario() -> None:
         store = InMemoryTaskStore()
         contract = _contract(verifier=_verifier_reference(kind=CompletionVerifierKind.PROVIDER))
         proposal_id = await _proposal(store, contract)
         app = CayuApp(task_store=store, enable_logging=False)
 
-        with pytest.raises(ValueError, match="Only deterministic"):
+        with pytest.raises(ValueError, match="kind does not match"):
             app.register_completion_verifier(
                 contract.verifier,
                 RecordingVerifier(_accepted_decision()),
             )
-        with pytest.raises(CompletionVerifierUnavailable, match="Provider-backed"):
+        with pytest.raises(CompletionVerifierUnavailable, match="not registered"):
             await app.verify_completion_proposal(_execution_request(proposal_id))
         assert await store.load_completion_verification_claim(proposal_id) is None
 
@@ -4097,12 +4097,11 @@ def test_duplicate_registration_final_composition_is_split_secret_safe(
     [
         (
             CompletionVerifierKind.DETERMINISTIC,
-            "The exact deterministic completion verifier required by the work contract "
-            "is not registered.",
+            "The exact completion verifier required by the work contract is not registered.",
         ),
         (
             CompletionVerifierKind.PROVIDER,
-            "Provider-backed completion verifiers are not supported by this runtime slice.",
+            "The exact completion verifier required by the work contract is not registered.",
         ),
     ],
 )

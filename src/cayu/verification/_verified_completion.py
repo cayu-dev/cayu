@@ -8,7 +8,7 @@ process-local completion authority is introduced here.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import Protocol, TypeVar
@@ -18,6 +18,7 @@ from cayu.deadlines import ExecutionDeadlineExceeded
 from cayu.messages import Message
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._invocation_lifecycle import retire_released_invocation_context
+from cayu.runtime._runtime_records import RegisteredProvider
 from cayu.runtime._task_store_operation_boundary import (
     capture_sensitive_result_validation,
     capture_task_store_operation,
@@ -168,6 +169,8 @@ class VerifiedCompletionCoordinator:
         profile_policy: CompletionVerifierProfilePolicy | None,
         release: Callable[[WorkAttemptAdmission], Awaitable[InvocationReleaseEvidence]],
         admit: VerifiedTaskAdmissionCallback,
+        provider_registrations: Callable[[], Mapping[str, RegisteredProvider]] | None = None,
+        execution_profile_process_identity: str | None = None,
     ) -> None:
         self._task_store = task_store
         self._redactor = secret_redactor
@@ -177,6 +180,8 @@ class VerifiedCompletionCoordinator:
             task_store=task_store,
             secret_redactor=secret_redactor,
             profile_policy=profile_policy,
+            provider_registrations=provider_registrations,
+            execution_profile_process_identity=execution_profile_process_identity,
         )
         self.application = CompletionDecisionApplicationCoordinator(
             task_store=task_store,

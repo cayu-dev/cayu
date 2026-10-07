@@ -1979,6 +1979,74 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "validate_application_tool_name": ("cayu.tools.catalogue", "validate_application_tool_name"),
     "work_contract_fingerprint": ("cayu.tasks.contracts", "work_contract_fingerprint"),
     "work_contract_from_draft": ("cayu.tasks.contracts", "work_contract_from_draft"),
+    "CompletionVerifierUsageSummary": (
+        "cayu.verification.provider_completion_verifiers",
+        "CompletionVerifierUsageSummary",
+    ),
+    "ProviderCompletionVerifier": (
+        "cayu.verification.provider_completion_verifiers",
+        "ProviderCompletionVerifier",
+    ),
+    "ProviderCompletionVerifierBudgetExhausted": (
+        "cayu.verification.provider_completion_verifiers",
+        "ProviderCompletionVerifierBudgetExhausted",
+    ),
+    "ProviderCompletionVerifierDecodingError": (
+        "cayu.verification.provider_completion_verifiers",
+        "ProviderCompletionVerifierDecodingError",
+    ),
+    "ProviderCompletionVerifierDispatchError": (
+        "cayu.verification.provider_completion_verifiers",
+        "ProviderCompletionVerifierDispatchError",
+    ),
+    "ProviderCompletionVerifierTarget": (
+        "cayu.verification.provider_completion_verifiers",
+        "ProviderCompletionVerifierTarget",
+    ),
+    "summarize_completion_verifier_dispatches": (
+        "cayu.verification.provider_completion_verifiers",
+        "summarize_completion_verifier_dispatches",
+    ),
+    "CompletionVerifierDecodeStatus": (
+        "cayu.tasks.completion_verifier_dispatches",
+        "CompletionVerifierDecodeStatus",
+    ),
+    "CompletionVerifierDispatch": (
+        "cayu.tasks.completion_verifier_dispatches",
+        "CompletionVerifierDispatch",
+    ),
+    "CompletionVerifierDispatchBudget": (
+        "cayu.tasks.completion_verifier_dispatches",
+        "CompletionVerifierDispatchBudget",
+    ),
+    "CompletionVerifierDispatchBudgetExhausted": (
+        "cayu.tasks.completion_verifier_dispatches",
+        "CompletionVerifierDispatchBudgetExhausted",
+    ),
+    "CompletionVerifierDispatchFailure": (
+        "cayu.tasks.completion_verifier_dispatches",
+        "CompletionVerifierDispatchFailure",
+    ),
+    "CompletionVerifierDispatchOutcome": (
+        "cayu.tasks.completion_verifier_dispatches",
+        "CompletionVerifierDispatchOutcome",
+    ),
+    "CompletionVerifierDispatchRequest": (
+        "cayu.tasks.completion_verifier_dispatches",
+        "CompletionVerifierDispatchRequest",
+    ),
+    "CompletionVerifierDispatchSettlement": (
+        "cayu.tasks.completion_verifier_dispatches",
+        "CompletionVerifierDispatchSettlement",
+    ),
+    "CompletionVerifierDispatchSettlementRequest": (
+        "cayu.tasks.completion_verifier_dispatches",
+        "CompletionVerifierDispatchSettlementRequest",
+    ),
+    "CompletionVerifierUsageStatus": (
+        "cayu.tasks.completion_verifier_dispatches",
+        "CompletionVerifierUsageStatus",
+    ),
 }
 
 PUBLIC_NAMES = [
@@ -3071,4 +3139,21 @@ PUBLIC_NAMES = [
     "validate_application_tool_name",
     "work_contract_fingerprint",
     "work_contract_from_draft",
+    "CompletionVerifierUsageSummary",
+    "ProviderCompletionVerifier",
+    "ProviderCompletionVerifierBudgetExhausted",
+    "ProviderCompletionVerifierDecodingError",
+    "ProviderCompletionVerifierDispatchError",
+    "ProviderCompletionVerifierTarget",
+    "summarize_completion_verifier_dispatches",
+    "CompletionVerifierDecodeStatus",
+    "CompletionVerifierDispatch",
+    "CompletionVerifierDispatchBudget",
+    "CompletionVerifierDispatchBudgetExhausted",
+    "CompletionVerifierDispatchFailure",
+    "CompletionVerifierDispatchOutcome",
+    "CompletionVerifierDispatchRequest",
+    "CompletionVerifierDispatchSettlement",
+    "CompletionVerifierDispatchSettlementRequest",
+    "CompletionVerifierUsageStatus",
 ]

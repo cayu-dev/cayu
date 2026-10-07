@@ -36,6 +36,27 @@ from cayu.verification.completion_verifiers import (
 from cayu.verification.completion_verifiers import (
     DeterministicCompletionVerifier as DeterministicCompletionVerifier,
 )
+from cayu.verification.provider_completion_verifiers import (
+    CompletionVerifierUsageSummary as CompletionVerifierUsageSummary,
+)
+from cayu.verification.provider_completion_verifiers import (
+    ProviderCompletionVerifier as ProviderCompletionVerifier,
+)
+from cayu.verification.provider_completion_verifiers import (
+    ProviderCompletionVerifierBudgetExhausted as ProviderCompletionVerifierBudgetExhausted,
+)
+from cayu.verification.provider_completion_verifiers import (
+    ProviderCompletionVerifierDecodingError as ProviderCompletionVerifierDecodingError,
+)
+from cayu.verification.provider_completion_verifiers import (
+    ProviderCompletionVerifierDispatchError as ProviderCompletionVerifierDispatchError,
+)
+from cayu.verification.provider_completion_verifiers import (
+    ProviderCompletionVerifierTarget as ProviderCompletionVerifierTarget,
+)
+from cayu.verification.provider_completion_verifiers import (
+    summarize_completion_verifier_dispatches as summarize_completion_verifier_dispatches,
+)
 from cayu.verification.verified_task_worker import VerifiedTaskHandler as VerifiedTaskHandler
 from cayu.verification.verified_task_worker import (
     VerifiedTaskHandlerReport as VerifiedTaskHandlerReport,

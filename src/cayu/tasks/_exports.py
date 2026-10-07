@@ -252,6 +252,46 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "terminalize_task_with_retry": ("cayu.tasks.base", "terminalize_task_with_retry"),
     "work_contract_fingerprint": ("cayu.tasks.contracts", "work_contract_fingerprint"),
     "work_contract_from_draft": ("cayu.tasks.contracts", "work_contract_from_draft"),
+    "CompletionVerifierDecodeStatus": (
+        "cayu.tasks.completion_verifier_dispatches",
+        "CompletionVerifierDecodeStatus",
+    ),
+    "CompletionVerifierDispatch": (
+        "cayu.tasks.completion_verifier_dispatches",
+        "CompletionVerifierDispatch",
+    ),
+    "CompletionVerifierDispatchBudget": (
+        "cayu.tasks.completion_verifier_dispatches",
+        "CompletionVerifierDispatchBudget",
+    ),
+    "CompletionVerifierDispatchBudgetExhausted": (
+        "cayu.tasks.completion_verifier_dispatches",
+        "CompletionVerifierDispatchBudgetExhausted",
+    ),
+    "CompletionVerifierDispatchFailure": (
+        "cayu.tasks.completion_verifier_dispatches",
+        "CompletionVerifierDispatchFailure",
+    ),
+    "CompletionVerifierDispatchOutcome": (
+        "cayu.tasks.completion_verifier_dispatches",
+        "CompletionVerifierDispatchOutcome",
+    ),
+    "CompletionVerifierDispatchRequest": (
+        "cayu.tasks.completion_verifier_dispatches",
+        "CompletionVerifierDispatchRequest",
+    ),
+    "CompletionVerifierDispatchSettlement": (
+        "cayu.tasks.completion_verifier_dispatches",
+        "CompletionVerifierDispatchSettlement",
+    ),
+    "CompletionVerifierDispatchSettlementRequest": (
+        "cayu.tasks.completion_verifier_dispatches",
+        "CompletionVerifierDispatchSettlementRequest",
+    ),
+    "CompletionVerifierUsageStatus": (
+        "cayu.tasks.completion_verifier_dispatches",
+        "CompletionVerifierUsageStatus",
+    ),
 }
 
 PUBLIC_NAMES = [
@@ -425,4 +465,14 @@ PUBLIC_NAMES = [
     "terminalize_task_with_retry",
     "work_contract_fingerprint",
     "work_contract_from_draft",
+    "CompletionVerifierDecodeStatus",
+    "CompletionVerifierDispatch",
+    "CompletionVerifierDispatchBudget",
+    "CompletionVerifierDispatchBudgetExhausted",
+    "CompletionVerifierDispatchFailure",
+    "CompletionVerifierDispatchOutcome",
+    "CompletionVerifierDispatchRequest",
+    "CompletionVerifierDispatchSettlement",
+    "CompletionVerifierDispatchSettlementRequest",
+    "CompletionVerifierUsageStatus",
 ]

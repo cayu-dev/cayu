@@ -71,6 +71,9 @@ from cayu.sessions.base import (
     _validate_session_closure_detach_replay,
 )
 from cayu.storage import _creation_fence
+from cayu.storage._completion_verifier_dispatch_schema import (
+    POSTGRES_COMPLETION_VERIFIER_DISPATCH_DDL,
+)
 from cayu.storage._context_selection_fence import PostgresContextSelectionFenceMixin
 from cayu.storage._creation_fence import PostgresCreationFenceMixin
 from cayu.storage._external_wait_postgres import PostgresExternalWaitMixin
@@ -1178,7 +1181,7 @@ _MAINTENANCE_REJECTED_REPLACEMENT_RETIREMENT_TRANSITIONS = frozenset(
 )
 _POSTGRES_MIN_REQUIRED_REVISION = 18
 _POSTGRES_SESSION_MIN_REQUIRED_REVISION = 113
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 96
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 116
 _INTERRUPTED_HANDOFF_MIGRATION_BATCH_SIZE = 256
 
 
@@ -1580,6 +1583,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     113: POSTGRES_EXECUTION_DDL,
     114: POSTGRES_MODEL_POLICY_DDL,
     115: POSTGRES_EXTERNAL_WAIT_DDL,
+    116: POSTGRES_COMPLETION_VERIFIER_DISPATCH_DDL,
     106: (),  # Contract-only writer fence; existing typed request records own storage.
     105: POSTGRES_COLLABORATION_CLARIFICATION_DDL,
     104: (
@@ -42813,6 +42817,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
     supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
+    supports_completion_verifier_dispatches: ClassVar[bool] = True
     supports_work_attempt_admission: ClassVar[bool] = True
     supports_verified_task_worker: ClassVar[bool] = True
     supports_local_execution_attempts: ClassVar[bool] = True

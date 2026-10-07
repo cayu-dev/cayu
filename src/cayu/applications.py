@@ -462,6 +462,7 @@ from cayu.runtime._session_request_boundary import _validate_resume_request, _va
 from cayu.runtime._structured_output_tool_round import _has_structured_output_tool_call
 from cayu.runtime._task_store_operation_boundary import (
     raise_task_store_operation_failure,
+    task_store_completion_verifier_dispatch_capability_is_complete,
 )
 from cayu.runtime._tool_round_executor import (
     InterruptedToolRoundRequest,
@@ -667,6 +668,7 @@ from cayu.tasks.base import (
     TaskCreate,
     TaskStore,
 )
+from cayu.tasks.completion_verifier_dispatches import CompletionVerifierDispatch
 from cayu.tasks.completion_verifier_profiles import CompletionVerifierProfilePolicy
 from cayu.tasks.contracts import (
     CompletionDecision,
@@ -756,6 +758,7 @@ from cayu.verification.completion_verifiers import (
     CompletionVerifierExecutionRequest,
     DeterministicCompletionVerifier,
 )
+from cayu.verification.provider_completion_verifiers import ProviderCompletionVerifier
 from cayu.workspaces.observation_recovery import abandoned_workspace_observation_reads
 
 logger = logging.getLogger(__name__)
@@ -1410,6 +1413,8 @@ class CayuApp:
             admit=lambda request, *, execution: self.admit_work_attempt(
                 request, execution=execution
             ),
+            provider_registrations=lambda: self._provider_registry.registrations,
+            execution_profile_process_identity=self._execution_profile_process_identity,
         )
         self._environment_lifecycle = EnvironmentLifecycle(
             session_store=self._runtime_session_store,
@@ -5673,9 +5678,14 @@ class CayuApp:
     def register_completion_verifier(
         self,
         reference: CompletionVerifierRef,
-        verifier: DeterministicCompletionVerifier,
+        verifier: DeterministicCompletionVerifier | ProviderCompletionVerifier,
     ) -> CompletionVerifierRef:
-        """Register one deterministic verifier under its complete durable identity."""
+        """Register one verifier under its complete durable identity.
+
+        Deterministic references take a ``DeterministicCompletionVerifier``.
+        Provider references take a ``ProviderCompletionVerifier`` whose target
+        provider must already be registered with this application.
+        """
 
         try:
             registered = self._verified_completion.verifier.register(reference, verifier)
@@ -7668,6 +7678,27 @@ class CayuApp:
         operation = self._verified_completion.verifier.verify(request)
         del request
         return await operation
+
+    @_tracked_entrance
+    async def list_completion_verifier_dispatches(
+        self,
+        proposal_id: str,
+    ) -> tuple[CompletionVerifierDispatch, ...]:
+        """List the provider-verifier attempts recorded for one proposal.
+
+        These records are the verifier's own accounting: provider, model,
+        usage, latency and outcome per attempt, kept apart from the worker
+        session that produced the proposal.
+        """
+
+        store = self.task_store
+        if store is None or not task_store_completion_verifier_dispatch_capability_is_complete(
+            store
+        ):
+            raise NotImplementedError(
+                "The task store does not support provider-verifier dispatch records."
+            )
+        return await store.list_completion_verifier_dispatches(proposal_id)
 
     @_tracked_entrance
     async def apply_completion_decision(
