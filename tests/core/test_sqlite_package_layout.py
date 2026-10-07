@@ -63,6 +63,125 @@ assert "cayu.storage.postgres" not in sys.modules
 
 
 @pytest.mark.parametrize(
+    ("damage", "expected_error"),
+    [
+        (None, None),
+        (
+            "DROP TABLE cayu_task_terminalization_receipts",
+            "terminalization receipt table",
+        ),
+        (
+            "ALTER TABLE cayu_tasks RENAME COLUMN invocation_json TO old_invocation_json",
+            "invocation-provenance contract",
+        ),
+        ("DROP TABLE cayu_task_retry_settlements", "retry-series schema"),
+        (
+            "DROP TABLE cayu_task_retry_reconciliation_rejections",
+            "retry-reconciliation schema",
+        ),
+        (
+            "DROP TABLE cayu_task_interrupted_handoff_receipts",
+            "interrupted-task handoff storage",
+        ),
+        (
+            "DROP INDEX idx_cayu_tasks_interrupted_handoff_recovery",
+            "interrupted-task handoff storage",
+        ),
+        (
+            "DROP INDEX idx_cayu_tasks_interrupted_handoff_generation",
+            "task handoff generation or bounded continuation index",
+        ),
+        (
+            "DROP TABLE cayu_task_interrupted_continuation_claims",
+            "task handoff generation or bounded continuation index",
+        ),
+        (
+            "DROP INDEX idx_cayu_tasks_interrupted_handoff_continuation; "
+            "CREATE INDEX idx_cayu_tasks_interrupted_handoff_continuation "
+            "ON cayu_tasks(status, created_at, id) WHERE worker_id IS NULL",
+            "task handoff generation or bounded continuation index",
+        ),
+    ],
+    ids=[
+        "current",
+        "missing-terminal-receipts",
+        "missing-invocation-column",
+        "missing-retry-settlements",
+        "missing-retry-rejections",
+        "missing-handoff-receipts",
+        "missing-handoff-recovery-index",
+        "missing-handoff-generation-index",
+        "missing-continuation-claims",
+        "weak-continuation-predicate",
+    ],
+)
+def test_sqlite_task_schema_validates_without_migration_or_store_imports(
+    tmp_path, sqlite_resources, damage, expected_error
+):
+    from cayu.storage import _sqlite_connection, _sqlite_support
+
+    async def prepare():
+        async with sqlite_resources as resources:
+            path = tmp_path / "task-schema.sqlite"
+            connection = resources.own(_sqlite_connection.connect(path), kind="connection")
+            _sqlite_support.initialize_schema(connection)
+            if damage is not None:
+                connection.executescript(damage)
+                connection.commit()
+            return path
+
+    path = asyncio.run(prepare())
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sqlite3
+import sys
+from contextlib import closing
+from pathlib import Path
+
+from cayu.storage import _sqlite_task_schema as task_schema
+
+with closing(sqlite3.connect(Path(sys.argv[1]).as_uri() + "?mode=ro", uri=True)) as connection:
+    try:
+        task_schema._validate_task_terminalization_receipt_table(connection)
+        task_schema._validate_task_invocation_column(connection)
+        task_schema._validate_task_retry_series_schema(connection)
+        task_schema._validate_task_retry_reconciliation_schema(connection)
+        task_schema._validate_interrupted_task_handoff_schema(connection)
+        task_schema._validate_interrupted_handoff_generation_column(connection)
+    except RuntimeError as error:
+        assert sys.argv[2] and sys.argv[2] in str(error), str(error)
+    else:
+        assert not sys.argv[2], "incompatible schema was accepted"
+    assert not connection.in_transaction
+
+for name in (
+    "cayu.storage._sqlite_support",
+    "cayu.storage._sqlite_connection",
+    "cayu.storage.migrations",
+    "cayu.sessions.base",
+    "cayu.tasks.base",
+    "cayu.storage.sqlite",
+    "cayu.storage.tasks_sqlite",
+    "cayu.storage.postgres",
+    "cayu.runtime.task_worker",
+):
+    assert name not in sys.modules, name
+""",
+            str(path),
+            expected_error or "",
+        ],
+        env={**os.environ, "PYTHONPATH": str(Path(cayu.__file__).resolve().parent.parent)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
     ("revision", "require_profiles", "damage", "expected_error"),
     [
         (49, False, None, None),

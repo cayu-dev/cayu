@@ -44898,5 +44898,15 @@
     "tests/core/test_sqlite_package_layout.py::test_sqlite_verified_work_schema_validates_without_migration_or_store_imports[missing-preparation-holds]": 0.227,
     "tests/core/test_sqlite_package_layout.py::test_sqlite_verified_work_schema_validates_without_migration_or_store_imports[missing-profiles]": 0.185,
     "tests/core/test_sqlite_package_layout.py::test_sqlite_verified_work_schema_validates_without_migration_or_store_imports[revision-49-requires-profiles]": 0.091,
-    "tests/core/test_sqlite_package_layout.py::test_sqlite_verified_work_schema_validates_without_migration_or_store_imports[revision-49]": 0.932
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_verified_work_schema_validates_without_migration_or_store_imports[revision-49]": 0.932,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_task_schema_validates_without_migration_or_store_imports[current]": 1.814,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_task_schema_validates_without_migration_or_store_imports[missing-continuation-claims]": 0.283,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_task_schema_validates_without_migration_or_store_imports[missing-handoff-generation-index]": 0.226,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_task_schema_validates_without_migration_or_store_imports[missing-handoff-receipts]": 0.205,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_task_schema_validates_without_migration_or_store_imports[missing-handoff-recovery-index]": 0.196,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_task_schema_validates_without_migration_or_store_imports[missing-invocation-column]": 0.242,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_task_schema_validates_without_migration_or_store_imports[missing-retry-rejections]": 0.206,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_task_schema_validates_without_migration_or_store_imports[missing-retry-settlements]": 0.202,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_task_schema_validates_without_migration_or_store_imports[missing-terminal-receipts]": 0.272,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_task_schema_validates_without_migration_or_store_imports[weak-continuation-predicate]": 0.22
 }

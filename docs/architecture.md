@@ -664,6 +664,8 @@ readers in `storage/_sqlite_catalog.py`. Evaluation result, case, scenario,
 authored-suite, calibration and run checks live in `storage/_sqlite_eval_schema.py`.
 Verified-work contracts, completion verification, attempt admission and lifecycle
 receipt checks live together in `storage/_sqlite_verified_work_schema.py`.
+Task invocation metadata, terminal receipts, retries and interrupted handoffs
+are checked by `storage/_sqlite_task_schema.py`.
 These owners inspect existing tables, indexes, views and constraints.
 Schema reconciliation retains revision
 gates and validation order in `storage/_sqlite_support.py`, alongside migration
