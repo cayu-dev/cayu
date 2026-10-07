@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- After recovery closes a tool call that started but never finished, the model now
+  sees that call's redacted arguments when the round resolved no invocation secrets
+  (no vault or credential proxy) and the tool permits argument publication. The
+  recovered result for an `IDEMPOTENT` tool explains that a safe retry must preserve
+  the same downstream idempotency identity; repeating arguments with a new runtime
+  idempotency key may duplicate the effect. Before, recovery
+  always showed the call with empty, unavailable arguments, so models reworded the
+  retry and applications that guard a write by its exact request body refused it.
+  Rounds that could resolve secrets and tools with private arguments keep their
+  arguments hidden.
 - Continuation now recovers a session whose process died during a model call.
   When `run`, `resume` or another continuation takes over an abandoned execution
   and finds an ordinary dispatched assistant model call with no durable response,

@@ -962,6 +962,7 @@ def unknown_recovered_tool_result(
     pending_round: pending_rounds.PendingToolRound,
     started: bool,
     effect: ToolEffect | None = None,
+    arguments_shown: bool = False,
 ) -> ToolResult:
     if not started:
         return ToolResult(
@@ -983,7 +984,21 @@ def unknown_recovered_tool_result(
             is_error=True,
         )
 
-    if effect in (ToolEffect.NONE, ToolEffect.IDEMPOTENT):
+    if effect is ToolEffect.IDEMPOTENT:
+        # A new model-authored call has a new runtime idempotency key. The effect
+        # declaration only makes replay safe under the same downstream identity.
+        guidance = (
+            f"Its outcome is unknown. {pending_tool_call.tool_name} declares idempotent effects, "
+            "but retry is safe only when the same downstream idempotency identity is preserved. "
+            "A new tool call receives a different ToolContext.idempotency_key; identical "
+            "arguments alone do not guarantee deduplication."
+        )
+    elif effect is ToolEffect.NONE and arguments_shown:
+        guidance = (
+            f"Its outcome is unknown. {pending_tool_call.tool_name} declares "
+            f"{effect.value} effects, so calling it again with the same arguments is safe."
+        )
+    elif effect is ToolEffect.NONE:
         # Recovery cannot republish the original arguments (their redaction scope
         # is gone), but the declared effect makes another call for the same
         # operation safe; "inspect external state" assumes a tool apps rarely have.

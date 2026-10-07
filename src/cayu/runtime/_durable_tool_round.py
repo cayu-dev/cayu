@@ -1190,6 +1190,12 @@ class DurableToolRound:
                     pending_round=pending_round,
                     started=pending_tool_call.tool_call_id in effective_started_ids,
                     effect=None if registered_tool is None else registered_tool.effect,
+                    arguments_shown=(
+                        pending_round.assistant_publication is not None
+                        and pending_round.assistant_publication.secret_resolution_scope == "static"
+                        and registered_tool is not None
+                        and registered_tool.publish_arguments
+                    ),
                 )
             if confirmed_effect_record is not None:
                 confirmed_native_effect_records[pending_tool_call.tool_call_id] = (
@@ -1401,17 +1407,18 @@ class DurableToolRound:
 
         emitted_events: list[Event] = []
         tool_round_identity = pending_rounds.pending_tool_round_identity(pending_round)
+        recovery_argument_redactor = _redactor_for_tool_calls(
+            redactor,
+            registered_agent=registered_agent,
+            tool_calls=[item.call for item in planned_outcomes],
+        )
         recovery_publication_coordinator = _ToolRoundPublicationCoordinator(
             session_id=session.id,
             session_instance_id=session.instance_id,
             run_epoch=session.run_epoch,
             tool_round_identity=tool_round_identity,
             session_store=self._session_store,
-            redactor=_redactor_for_tool_calls(
-                redactor,
-                registered_agent=registered_agent,
-                tool_calls=[item.call for item in planned_outcomes],
-            ),
+            redactor=recovery_argument_redactor,
             execution_profile=execution_profile,
             tool_exposure=pending_round.tool_exposure,
             publication_governor=publication_governor,
@@ -1489,6 +1496,7 @@ class DurableToolRound:
                 )
             argument_projection = tool_argument_publication.unavailable_argument_projection()
             hook_argument_projection = argument_projection
+            registered_tool = registered_agent.executable_tool(expected_outcome.call.name)
             if expected_outcome.call.id in staged_events_by_id and publication_scope == "static":
                 # Only a static scope survives restart with argument authority.
                 # Dynamic scopes remain unavailable after their redactor is lost.
@@ -1497,6 +1505,20 @@ class DurableToolRound:
                 argument_projection, hook_argument_projection = (
                     _staged_terminal_argument_projections(terminal_event)
                 )
+            elif (
+                publication_scope == "static"
+                and expected_outcome.call.arguments_state != "unavailable"
+                and registered_tool is not None
+                and registered_tool.publish_arguments
+            ):
+                # A static scope resolves no invocation secrets, so the round's base
+                # redactor is the sealed one. Preserve the live path's per-tool
+                # publication restriction even when that secret scope is complete.
+                argument_projection = tool_argument_publication.finalized_argument_projection(
+                    expected_outcome.call.arguments,
+                    redactor=recovery_argument_redactor,
+                )
+                hook_argument_projection = argument_projection
             expected_public_outcome = runtime_records.ToolCallOutcome(
                 call=runtime_records.copy_tool_call_request(
                     expected_outcome.call,

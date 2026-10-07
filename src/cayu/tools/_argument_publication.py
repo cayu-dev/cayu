@@ -3,8 +3,9 @@
 Raw arguments are executable private state.  A start event is emitted before an
 invocation can discover every workload secret, so it may carry only a
 quarantine marker.  Arguments become publishable only after the invocation's
-secret tracker has been sealed; abnormal recovery without that tracker remains
-explicitly unavailable instead of guessing from the application redactor.
+secret tracker has been sealed. Recovery without that tracker requires positive
+static-scope evidence and the tool's publication permission; otherwise arguments
+remain explicitly unavailable.
 """
 
 from __future__ import annotations

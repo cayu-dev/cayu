@@ -38,13 +38,15 @@ from cayu import (
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.storage.migrations import SchemaMode
 
+_PROPOSAL_ARGUMENTS = {"body": "Replacement proposal with private customer details"}
+
 
 class _Proposal(Tool):
-    def __init__(self, effect, receipt, *, mode="return"):
+    def __init__(self, effect, receipt, *, mode="return", publish_arguments=True, keyed=False):
         self.spec = ToolSpec(
             name="propose",
             description="Record the proposal exactly once.",
-            input_schema={"type": "object", "properties": {}},
+            input_schema={"type": "object", "properties": {"body": {"type": "string"}}},
             effect=effect,
             execution_profile_identity=ExecutionProfileBehaviorIdentity(
                 name="tests:abandoned-proposal", behavior_version="1", implementation_version="1"
@@ -52,10 +54,19 @@ class _Proposal(Tool):
         )
         self.receipt = Path(receipt)
         self.mode = mode
+        self.publish_arguments = publish_arguments
+        self.keyed = keyed
 
-    async def run(self, arguments, context):
-        with self.receipt.open("a") as receipt:
-            receipt.write("committed\n")
+    @property
+    def _publish_arguments(self):
+        return self.publish_arguments
+
+    async def run(self, context, arguments):
+        key = context.idempotency_key if self.keyed else "committed"
+        prior = self.receipt.read_text().splitlines() if self.receipt.exists() else []
+        if not self.keyed or key not in prior:
+            with self.receipt.open("a") as receipt:
+                receipt.write(key + "\n")
         if self.mode == "crash":
             os._exit(137)
         if self.mode == "block":
@@ -101,10 +112,14 @@ def _run_child():
             ToolEffect(os.environ["CAYU_CRASH_TEST_EFFECT"]),
             os.environ["CAYU_CRASH_TEST_RECEIPT"],
             mode=os.environ["CAYU_CRASH_TEST_MODE"],
+            publish_arguments=os.environ["CAYU_CRASH_TEST_PUBLISH_ARGUMENTS"] == "1",
+            keyed=os.environ["CAYU_CRASH_TEST_KEYED"] == "1",
         )
         gate = os.environ["CAYU_CRASH_TEST_GATE"]
         model_events = [
-            ModelStreamEvent.tool_call(id="proposal", name="propose", arguments={}),
+            ModelStreamEvent.tool_call(
+                id="proposal", name="propose", arguments=_PROPOSAL_ARGUMENTS
+            ),
             ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
         ]
         if gate == "input":
@@ -157,7 +172,19 @@ def _run_child():
     asyncio.run(scenario())
 
 
-def _child(store, backend, request, receipt, sid, effect, mode, *, gate="none"):
+def _child(
+    store,
+    backend,
+    request,
+    receipt,
+    sid,
+    effect,
+    mode,
+    *,
+    gate="none",
+    publish_arguments=True,
+    keyed=False,
+):
     return subprocess.Popen(
         [
             sys.executable,
@@ -175,6 +202,8 @@ def _child(store, backend, request, receipt, sid, effect, mode, *, gate="none"):
             "CAYU_CRASH_TEST_SESSION": sid,
             "CAYU_CRASH_TEST_MODE": mode,
             "CAYU_CRASH_TEST_GATE": gate,
+            "CAYU_CRASH_TEST_PUBLISH_ARGUMENTS": "1" if publish_arguments else "0",
+            "CAYU_CRASH_TEST_KEYED": "1" if keyed else "0",
         },
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -184,14 +213,24 @@ def _child(store, backend, request, receipt, sid, effect, mode, *, gate="none"):
 
 @pytest.mark.parametrize("backend", ["sqlite", "postgres"])
 @pytest.mark.parametrize("effect", [ToolEffect.NONE, ToolEffect.IDEMPOTENT, ToolEffect.EXTERNAL])
+@pytest.mark.parametrize("publish_arguments", [True, False])
 def test_resume_recovers_process_death_without_repeating_tool(
-    backend, effect, request, sqlite_resources, tmp_path
+    backend, effect, publish_arguments, request, sqlite_resources, tmp_path
 ):
     async def scenario():
         async with _stores(backend, request, sqlite_resources) as (store, reopen):
             receipt = tmp_path / "proposal-receipt"
             sid = "crashed-" + uuid4().hex
-            child = _child(store, backend, request, receipt, sid, effect, "crash")
+            child = _child(
+                store,
+                backend,
+                request,
+                receipt,
+                sid,
+                effect,
+                "crash",
+                publish_arguments=publish_arguments,
+            )
             try:
                 stdout, stderr = await asyncio.wait_for(asyncio.to_thread(child.communicate), 30)
                 assert child.returncode == 137, (stdout, stderr)
@@ -202,15 +241,16 @@ def test_resume_recovers_process_death_without_repeating_tool(
             observer_store = reopen()
             original = await observer_store.load(sid)
             assert original.status is SessionStatus.RUNNING
+            provider = VersionedFakeProvider(
+                [
+                    ModelStreamEvent.text_delta("Your proposal is recorded."),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ]
+            )
             app = _app(
                 observer_store,
-                VersionedFakeProvider(
-                    [
-                        ModelStreamEvent.text_delta("Your proposal is recorded."),
-                        ModelStreamEvent.completed({"finish_reason": "stop"}),
-                    ]
-                ),
-                tools=[_Proposal(effect, receipt)],
+                provider,
+                tools=[_Proposal(effect, receipt, publish_arguments=publish_arguments)],
             )
             execution = await app.inspect_session_execution(sid)
             assert execution.state == "owner_lost"
@@ -235,9 +275,136 @@ def test_resume_recovers_process_death_without_repeating_tool(
                 assert current.status is SessionStatus.COMPLETED
                 assert any(event.type is EventType.SESSION_COMPLETED for event in events)
                 interrupted = next(e for e in events if e.type is EventType.TOOL_CALL_FAILED)
+                # Static scope does not override a tool's private-argument contract.
+                [call] = [
+                    part
+                    for message in provider.requests[0].messages
+                    for part in message.content
+                    if getattr(part, "tool_call_id", None) == "proposal"
+                    and getattr(part, "arguments_state", None) is not None
+                ]
+                assert call.arguments_state == ("finalized" if publish_arguments else "unavailable")
+                assert call.arguments == (_PROPOSAL_ARGUMENTS if publish_arguments else {})
+                assert interrupted.payload["arguments_state"] == call.arguments_state
+                if not publish_arguments:
+                    assert _PROPOSAL_ARGUMENTS["body"] not in json.dumps(
+                        [event.model_dump(mode="json") for event in events]
+                    )
+                    assert _PROPOSAL_ARGUMENTS["body"] not in json.dumps(
+                        [
+                            message.model_dump(mode="json")
+                            for message in provider.requests[0].messages
+                        ]
+                    )
                 guidance = interrupted.payload["result"]["content"]
-                assert "calling it again for the same operation is safe" in guidance
+                if effect is ToolEffect.IDEMPOTENT:
+                    assert "same downstream idempotency identity is preserved" in guidance
+                    assert "identical arguments alone do not guarantee deduplication" in guidance
+                elif publish_arguments:
+                    assert "calling it again with the same arguments is safe" in guidance
+                else:
+                    assert "original arguments are not shown" in guidance
                 assert "inspect external state" not in guidance
+
+    asyncio.run(scenario())
+
+
+def test_recovered_idempotent_guidance_accounts_for_new_call_identity(
+    request, sqlite_resources, tmp_path
+):
+    async def scenario():
+        async with _stores("sqlite", request, sqlite_resources) as (store, reopen):
+            receipt = tmp_path / "keyed-proposal-receipt"
+            sid = "keyed-" + uuid4().hex
+            child = _child(
+                store, "sqlite", request, receipt, sid, ToolEffect.IDEMPOTENT, "crash", keyed=True
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(asyncio.to_thread(child.communicate), 30)
+                assert child.returncode == 137, (stdout, stderr)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    await asyncio.to_thread(child.wait)
+            [original_key] = receipt.read_text().splitlines()
+            provider = VersionedFakeProvider(
+                [
+                    [
+                        ModelStreamEvent.tool_call(
+                            id="retry", name="propose", arguments=_PROPOSAL_ARGUMENTS
+                        ),
+                        ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                    ],
+                    [
+                        ModelStreamEvent.text_delta("Done."),
+                        ModelStreamEvent.completed({"finish_reason": "stop"}),
+                    ],
+                ]
+            )
+            app = _app(
+                reopen(), provider, tools=[_Proposal(ToolEffect.IDEMPOTENT, receipt, keyed=True)]
+            )
+            events = await _consume(
+                app.resume(ResumeRequest(session_id=sid, messages=[Message.text("user", "Retry")]))
+            )
+            # Identical arguments do not preserve a ToolContext-based downstream key.
+            keys = receipt.read_text().splitlines()
+            assert keys[0] == original_key and len(keys) == len(set(keys)) == 2
+            recovered = next(event for event in events if event.type is EventType.TOOL_CALL_FAILED)
+            guidance = recovered.payload["result"]["content"]
+            assert "same downstream idempotency identity is preserved" in guidance
+            assert "A new tool call receives a different ToolContext.idempotency_key" in guidance
+            assert "calling it again with the same arguments is safe" not in guidance
+
+    asyncio.run(scenario())
+
+
+def test_recovered_arguments_stay_hidden_after_dynamic_secret_scope(
+    request, sqlite_resources, tmp_path
+):
+    async def scenario():
+        async with _stores("sqlite", request, sqlite_resources) as (store, reopen):
+            receipt = tmp_path / "proposal-receipt"
+            sid = "dynamic-" + uuid4().hex
+            child = _child(store, "sqlite", request, receipt, sid, ToolEffect.IDEMPOTENT, "crash")
+            try:
+                stdout, stderr = await asyncio.wait_for(asyncio.to_thread(child.communicate), 30)
+                assert child.returncode == 137, (stdout, stderr)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    await asyncio.to_thread(child.wait)
+            observer_store = reopen()
+
+            # A round whose model completion could resolve invocation secrets has no
+            # sealed redactor after the crash, so its arguments must not be published.
+            def dynamic(_session, checkpoint):
+                checkpoint = json.loads(json.dumps(checkpoint))
+                checkpoint["pending_tool_round"]["assistant_publication"][
+                    "secret_resolution_scope"
+                ] = "dynamic"
+                return checkpoint
+
+            await observer_store.transform_checkpoint(sid, dynamic)
+            provider = VersionedFakeProvider(
+                [
+                    ModelStreamEvent.text_delta("Your proposal is recorded."),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ]
+            )
+            app = _app(observer_store, provider, tools=[_Proposal(ToolEffect.IDEMPOTENT, receipt)])
+            await _consume(
+                app.resume(
+                    ResumeRequest(session_id=sid, messages=[Message.text("user", "Any update?")])
+                )
+            )
+            assert (await observer_store.load(sid)).status is SessionStatus.COMPLETED
+            assert not any(
+                getattr(part, "tool_call_id", None) == "proposal"
+                and getattr(part, "arguments_state", None) == "finalized"
+                for message in provider.requests[0].messages
+                for part in message.content
+            )
 
     asyncio.run(scenario())
 
