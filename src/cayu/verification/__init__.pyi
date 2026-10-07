@@ -1,5 +1,21 @@
 """Static declarations for the lazy verification API."""
 
+from cayu.verification.completion_evaluators import (
+    CompletionEvaluationExecutionError as CompletionEvaluationExecutionError,
+)
+from cayu.verification.completion_evaluators import (
+    CompletionEvaluationRequest as CompletionEvaluationRequest,
+)
+from cayu.verification.completion_evaluators import (
+    CompletionEvaluationResult as CompletionEvaluationResult,
+)
+from cayu.verification.completion_evaluators import CompletionEvaluator as CompletionEvaluator
+from cayu.verification.completion_evaluators import (
+    CompletionEvaluatorBudgetExhausted as CompletionEvaluatorBudgetExhausted,
+)
+from cayu.verification.completion_evaluators import (
+    CompletionEvaluatorUnavailable as CompletionEvaluatorUnavailable,
+)
 from cayu.verification.completion_result_resolvers import (
     COMPLETION_RESULT_RESOLUTION_MAX_SECONDS as COMPLETION_RESULT_RESOLUTION_MAX_SECONDS,
 )

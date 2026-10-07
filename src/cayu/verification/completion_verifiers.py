@@ -13,6 +13,7 @@ from cayu.execution_profiles import (
     copy_execution_profile_adoption_intent,
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.tasks.completion_evaluations import CompletionEvaluationReceipt
 from cayu.tasks.completion_verifier_profiles import (
     CompletionVerifierProfileComponentDeclaration,
 )
@@ -48,11 +49,26 @@ def _bounded_execution_identifier(value: str, field_name: str) -> str:
 
 
 class CompletionVerifierRequest(FrozenWorkContractModel):
-    """Immutable bounded evidence presented to one deterministic verifier."""
+    """Immutable bounded evidence presented to one verifier.
+
+    ``evaluation`` is the runtime-recorded receipt of the contract's
+    independent evaluation, when the contract declares one. Verifiers may treat
+    it as trusted evidence; the proposal and its evidence remain worker claims.
+    """
 
     contract: WorkContract
     attempt: WorkAttempt
     proposal: CompletionProposal
+    evaluation: CompletionEvaluationReceipt | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+    @field_validator("evaluation", mode="before")
+    @classmethod
+    def copy_evaluation(cls, value: object) -> object:
+        if value is None:
+            return None
+        return revalidate_model_input(value, CompletionEvaluationReceipt)
 
     @field_validator("contract", mode="before")
     @classmethod
@@ -78,6 +94,15 @@ class CompletionVerifierRequest(FrozenWorkContractModel):
             raise ValueError("Verifier proposal belongs to another work attempt.")
         if self.proposal.task_id != self.attempt.task_id:
             raise ValueError("Verifier proposal belongs to another task.")
+        evaluation = self.evaluation
+        if evaluation is not None and (
+            self.contract.evaluation is None
+            or evaluation.evaluator != self.contract.evaluation.evaluator
+            or evaluation.proposal_id != self.proposal.proposal_id
+            or evaluation.attempt_id != self.attempt.attempt_id
+            or evaluation.contract != reference
+        ):
+            raise ValueError("Verifier evaluation receipt conflicts with its proposal chain.")
         return self
 
 

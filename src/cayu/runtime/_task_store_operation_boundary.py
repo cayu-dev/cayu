@@ -25,6 +25,7 @@ from cayu.tasks.admission import (
     _GroupExecutionEntryRefused,
 )
 from cayu.tasks.base import TaskClaimLost, TaskStore
+from cayu.tasks.completion_evaluations import CompletionEvaluationBudgetExhausted
 from cayu.tasks.completion_verifier_dispatches import CompletionVerifierDispatchBudgetExhausted
 from cayu.tasks.contracts import (
     CompletionVerificationClaimLost,
@@ -99,6 +100,11 @@ _COMPLETION_VERIFIER_DISPATCH_MUTATIONS = (
     "settle_completion_verifier_dispatch",
 )
 _COMPLETION_VERIFIER_DISPATCH_READS = ("list_completion_verifier_dispatches",)
+_COMPLETION_EVALUATION_MUTATIONS = (
+    "record_completion_evaluation_run",
+    "settle_completion_evaluation_run",
+)
+_COMPLETION_EVALUATION_READS = ("list_completion_evaluation_runs",)
 _INTERRUPTED_TASK_HANDOFF_MUTATIONS = (
     "release_interrupted_task_worker",
     "recover_interrupted_task_worker",
@@ -300,6 +306,26 @@ def task_store_completion_verifier_dispatch_capability_is_complete(
     return all(
         task_store_mutation_is_cancellation_quiescent(task_store, method_name)
         for method_name in _COMPLETION_VERIFIER_DISPATCH_MUTATIONS
+    )
+
+
+def task_store_completion_evaluation_capability_is_complete(task_store: TaskStore) -> bool:
+    """Return positive proof for durable completion-evaluation support."""
+
+    try:
+        supported = object.__getattribute__(task_store, "supports_completion_evaluations")
+    except BaseException:
+        return False
+    if supported is not True:
+        return False
+    if not all(
+        _task_store_method_has_stable_concrete_implementation(task_store, method_name)
+        for method_name in (*_COMPLETION_EVALUATION_MUTATIONS, *_COMPLETION_EVALUATION_READS)
+    ):
+        return False
+    return all(
+        task_store_mutation_is_cancellation_quiescent(task_store, method_name)
+        for method_name in _COMPLETION_EVALUATION_MUTATIONS
     )
 
 
@@ -549,6 +575,7 @@ def _detached_task_store_failure(
         _GroupExecutionEntryRefused,
         WorkAttemptRecoveryRequired,
         CompletionVerificationClaimLost,
+        CompletionEvaluationBudgetExhausted,
         CompletionVerifierDispatchBudgetExhausted,
         TaskCompletionDecisionRequired,
         WorkContractConflict,
@@ -719,6 +746,7 @@ def _generic_task_store_failure(
         _GroupExecutionEntryRefused,
         WorkAttemptRecoveryRequired,
         CompletionVerificationClaimLost,
+        CompletionEvaluationBudgetExhausted,
         CompletionVerifierDispatchBudgetExhausted,
         TaskCompletionDecisionRequired,
         WorkContractConflict,
@@ -1201,6 +1229,7 @@ __all__ = [
     "capture_task_store_operation",
     "raise_task_store_operation_failure",
     "task_store_cancellation_reconciliation_capability_is_complete",
+    "task_store_completion_evaluation_capability_is_complete",
     "task_store_completion_verifier_dispatch_capability_is_complete",
     "task_store_mutation_is_cancellation_quiescent",
     "task_store_verified_task_worker_capability_is_complete",

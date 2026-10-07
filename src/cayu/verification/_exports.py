@@ -95,6 +95,27 @@ EXPORTS = {
         "cayu.verification.provider_completion_verifiers",
         "summarize_completion_verifier_dispatches",
     ),
+    "CompletionEvaluationExecutionError": (
+        "cayu.verification.completion_evaluators",
+        "CompletionEvaluationExecutionError",
+    ),
+    "CompletionEvaluationRequest": (
+        "cayu.verification.completion_evaluators",
+        "CompletionEvaluationRequest",
+    ),
+    "CompletionEvaluationResult": (
+        "cayu.verification.completion_evaluators",
+        "CompletionEvaluationResult",
+    ),
+    "CompletionEvaluator": ("cayu.verification.completion_evaluators", "CompletionEvaluator"),
+    "CompletionEvaluatorBudgetExhausted": (
+        "cayu.verification.completion_evaluators",
+        "CompletionEvaluatorBudgetExhausted",
+    ),
+    "CompletionEvaluatorUnavailable": (
+        "cayu.verification.completion_evaluators",
+        "CompletionEvaluatorUnavailable",
+    ),
 }
 
 PUBLIC_NAMES = [
@@ -123,4 +144,10 @@ PUBLIC_NAMES = [
     "ProviderCompletionVerifierDispatchError",
     "ProviderCompletionVerifierTarget",
     "summarize_completion_verifier_dispatches",
+    "CompletionEvaluationExecutionError",
+    "CompletionEvaluationRequest",
+    "CompletionEvaluationResult",
+    "CompletionEvaluator",
+    "CompletionEvaluatorBudgetExhausted",
+    "CompletionEvaluatorUnavailable",
 ]

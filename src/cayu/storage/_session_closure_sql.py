@@ -43,6 +43,7 @@ TASK_CLOSURE_DEPENDENCIES = frozenset(
         ("cayu_completion_decision_application_receipts", "task_id"),
         ("cayu_completion_verifier_profiles", "task_id"),
         ("cayu_completion_verifier_dispatches", "task_id"),
+        ("cayu_completion_evaluation_runs", "task_id"),
         ("cayu_work_attempt_admissions", "task_id"),
         ("cayu_local_execution_attempts", "task_id"),
         ("cayu_work_attempt_preparation_holds", "task_id"),

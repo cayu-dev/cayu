@@ -292,6 +292,37 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.tasks.completion_verifier_dispatches",
         "CompletionVerifierUsageStatus",
     ),
+    "CompletionEvaluationPolicy": ("cayu.tasks.contracts", "CompletionEvaluationPolicy"),
+    "CompletionEvaluatorRef": ("cayu.tasks.contracts", "CompletionEvaluatorRef"),
+    "CompletionEvaluationBudgetExhausted": (
+        "cayu.tasks.completion_evaluations",
+        "CompletionEvaluationBudgetExhausted",
+    ),
+    "CompletionEvaluationFailure": (
+        "cayu.tasks.completion_evaluations",
+        "CompletionEvaluationFailure",
+    ),
+    "CompletionEvaluationOutcome": (
+        "cayu.tasks.completion_evaluations",
+        "CompletionEvaluationOutcome",
+    ),
+    "CompletionEvaluationReceipt": (
+        "cayu.tasks.completion_evaluations",
+        "CompletionEvaluationReceipt",
+    ),
+    "CompletionEvaluationRun": ("cayu.tasks.completion_evaluations", "CompletionEvaluationRun"),
+    "CompletionEvaluationRunRequest": (
+        "cayu.tasks.completion_evaluations",
+        "CompletionEvaluationRunRequest",
+    ),
+    "CompletionEvaluationSettlement": (
+        "cayu.tasks.completion_evaluations",
+        "CompletionEvaluationSettlement",
+    ),
+    "CompletionEvaluationSettlementRequest": (
+        "cayu.tasks.completion_evaluations",
+        "CompletionEvaluationSettlementRequest",
+    ),
 }
 
 PUBLIC_NAMES = [
@@ -475,4 +506,14 @@ PUBLIC_NAMES = [
     "CompletionVerifierDispatchSettlement",
     "CompletionVerifierDispatchSettlementRequest",
     "CompletionVerifierUsageStatus",
+    "CompletionEvaluationPolicy",
+    "CompletionEvaluatorRef",
+    "CompletionEvaluationBudgetExhausted",
+    "CompletionEvaluationFailure",
+    "CompletionEvaluationOutcome",
+    "CompletionEvaluationReceipt",
+    "CompletionEvaluationRun",
+    "CompletionEvaluationRunRequest",
+    "CompletionEvaluationSettlement",
+    "CompletionEvaluationSettlementRequest",
 ]

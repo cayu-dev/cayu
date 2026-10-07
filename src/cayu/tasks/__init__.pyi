@@ -118,6 +118,28 @@ from cayu.tasks.base import (
 from cayu.tasks.base import task_create_with_execution_source as task_create_with_execution_source
 from cayu.tasks.base import task_invocation_for_create as task_invocation_for_create
 from cayu.tasks.base import terminalize_task_with_retry as terminalize_task_with_retry
+from cayu.tasks.completion_evaluations import (
+    CompletionEvaluationBudgetExhausted as CompletionEvaluationBudgetExhausted,
+)
+from cayu.tasks.completion_evaluations import (
+    CompletionEvaluationFailure as CompletionEvaluationFailure,
+)
+from cayu.tasks.completion_evaluations import (
+    CompletionEvaluationOutcome as CompletionEvaluationOutcome,
+)
+from cayu.tasks.completion_evaluations import (
+    CompletionEvaluationReceipt as CompletionEvaluationReceipt,
+)
+from cayu.tasks.completion_evaluations import CompletionEvaluationRun as CompletionEvaluationRun
+from cayu.tasks.completion_evaluations import (
+    CompletionEvaluationRunRequest as CompletionEvaluationRunRequest,
+)
+from cayu.tasks.completion_evaluations import (
+    CompletionEvaluationSettlement as CompletionEvaluationSettlement,
+)
+from cayu.tasks.completion_evaluations import (
+    CompletionEvaluationSettlementRequest as CompletionEvaluationSettlementRequest,
+)
 from cayu.tasks.completion_verifier_dispatches import (
     CompletionVerifierDecodeStatus as CompletionVerifierDecodeStatus,
 )
@@ -156,6 +178,8 @@ from cayu.tasks.contracts import (
     CompletionDecisionApplicationRequest as CompletionDecisionApplicationRequest,
 )
 from cayu.tasks.contracts import CompletionDecisionCreate as CompletionDecisionCreate
+from cayu.tasks.contracts import CompletionEvaluationPolicy as CompletionEvaluationPolicy
+from cayu.tasks.contracts import CompletionEvaluatorRef as CompletionEvaluatorRef
 from cayu.tasks.contracts import CompletionGap as CompletionGap
 from cayu.tasks.contracts import CompletionProposal as CompletionProposal
 from cayu.tasks.contracts import CompletionProposalCreate as CompletionProposalCreate

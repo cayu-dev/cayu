@@ -7476,6 +7476,98 @@ with the shared `require_completion_verifier_dispatch_admission` and
 and declares the mutations cancellation-quiescent. Without that capability a
 provider verifier fails closed before claiming.
 
+### Independent completion evaluations
+
+Some acceptance depends on an evaluation that is expensive, effectful and
+non-deterministic, and that must stay independent of the agent being judged: a
+benchmark run, a test suite, a canary probe or an external grader. A
+deterministic verifier must stay side-effect-free and a provider verifier has no
+tools, and running the evaluation in the worker's own session would let the
+agent trigger its own score. A work contract can therefore declare an
+`evaluation: CompletionEvaluationPolicy` naming an application-registered
+`CompletionEvaluatorRef` (evaluator ID, version and configuration fingerprint),
+`max_runs` (evaluator runs per proposal, at most 16) and `timeout_seconds` (per
+run, at most seven days). The policy is part of the contract fingerprint;
+contracts without one keep their existing canonical definition and fingerprint.
+
+Applications register the evaluator with
+`CayuApp.register_completion_evaluator(reference, evaluator)`. Registration is
+keyed by the complete reference; a duplicate registration fails rather than
+replacing the evaluator, and the evaluator must declare a stable
+`execution_profile_identity`. A missing evaluator, a changed live identity or a
+task store without the evaluation capability fails before the verification claim.
+
+The evaluation runs inside `verify_completion_proposal(...)`, after the
+verification claim is taken and before the verifier is called, in the same
+coordinator slot. The claim heartbeat keeps the claim live for the whole
+evaluation, so set the lease as usual; the evaluation has its own timeout
+instead of `execution_timeout_seconds`. Caller cancellation, ownership loss and
+cancellation-resistant draining apply as they do to verifiers. The run lifecycle
+is:
+
+1. If a run for this proposal already completed, its receipt is used and the
+   evaluator is not called. Exact replay, a lost decision write and a new claim
+   after process loss all reuse it.
+2. If the latest run has a durable intent but no settlement (process loss or a
+   lost acknowledgement), Cayu calls `evaluator.reconcile(request)` with that
+   run's `effect_id`. A returned result settles the run as completed and
+   `reconciled`; `None` (the default) settles it as `outcome_unknown`.
+   Before receipt reuse or reconciliation, the registered evaluator profile must
+   match the run's persisted profile. A reconciliation exception, timeout, invalid
+   result or cancellation leaves the original run unsettled and propagates the
+   failure; a later retry reconciles the same effect instead of starting a new one.
+3. Otherwise, if the run budget allows, Cayu persists the next run's intent with
+   `record_completion_evaluation_run(...)` under the live claim, then calls
+   `evaluator.evaluate(request)` once. The store checks atomically that the
+   claim is current and live, the proposal is undecided and current, the policy
+   matches the frozen contract, runs are in order with the previous one settled,
+   no receipt exists yet, all runs use one evaluator profile, and the budget
+   admits the run. An exact replay returns the recorded intent.
+4. `settle_completion_evaluation_run(...)` writes the run's one settlement:
+   `completed` (with the evidence object, its digest, an optional summary and
+   evaluator-reported usage), `failed`, `cancelled`, `timed_out` or
+   `outcome_unknown`, with latency. Settlement does not need a live claim and
+   runs in its own task, so cancellation cannot skip it.
+
+The `effect_id` is derived from the proposal, the evaluator reference and the run
+ordinal, so it is the same across processes and claims. Use it as the idempotency
+key of the external effect: `reconcile` can then find a run an earlier owner
+started, and a retried effect cannot be double-counted. After lease expiry an
+owner that lost its claim may still be running; its late settlement is rejected
+and the run's recorded outcome stands.
+
+The evaluator receives a `CompletionEvaluationRequest` with detached copies of
+the contract, attempt and proposal plus its `effect_id` and `run_ordinal`, and
+returns a `CompletionEvaluationResult`: a bounded JSON `evidence` object (at most
+256 KiB), an optional summary and optional `reported_usage` (at most 16 KiB).
+It cannot change the contract, the candidate, the verifier or the task result.
+Evaluator exceptions, invalid results and timeouts raise
+`CompletionEvaluationExecutionError` with a runtime-authored message (evaluator
+diagnostics are not retained); an exhausted run budget raises
+`CompletionEvaluatorBudgetExhausted`; neither publishes a decision or becomes a
+rejected candidate.
+
+The completed run becomes an immutable `CompletionEvaluationReceipt` bound to the
+proposal, task, attempt, contract, evaluator reference and evaluator profile. The
+verifier receives it as `CompletionVerifierRequest.evaluation`. Verifiers treat
+it as trusted evidence, while the worker's proposal and evidence remain claims.
+A deterministic verifier stays deterministic over (proposal, receipt). A
+provider-backed verifier sees the receipt's evidence in the runtime decision
+contract, marked as independently recorded.
+
+Evaluator runs per proposal (`max_runs`) and work attempts (the continuation
+policy) are budgeted separately: each new work attempt's proposal gets its own
+evaluation budget. Evaluation accounting stays apart from worker sessions and
+provider-verifier attempts: `CayuApp.list_completion_evaluation_runs(proposal_id)`
+returns each run's outcome, latency, evidence digest and reported usage.
+
+`InMemoryTaskStore`, `SQLiteTaskStore` and `PostgresTaskStore` implement the
+evaluation ledger (storage revision 117). A custom store opts in with
+`supports_completion_evaluations = True`, implements the three methods with the
+shared `require_completion_evaluation_admission` and
+`settle_completion_evaluation_run_record` helpers inside its atomic boundary,
+and declares the mutations cancellation-quiescent.
+
 ## EventSink
 
 Receives events and forwards them somewhere:

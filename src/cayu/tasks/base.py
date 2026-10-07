@@ -167,6 +167,18 @@ from cayu.tasks.admission import (
     work_attempt_admission_prepare_sha256,
     work_attempt_execution_claim_request_sha256,
 )
+from cayu.tasks.completion_evaluations import (
+    CompletionEvaluationRun,
+    CompletionEvaluationRunRequest,
+    CompletionEvaluationSettlementRequest,
+    completion_evaluation_run_from_request,
+    copy_completion_evaluation_run,
+    copy_completion_evaluation_run_request,
+    copy_completion_evaluation_settlement_request,
+    replay_completion_evaluation_run,
+    require_completion_evaluation_admission,
+    settle_completion_evaluation_run_record,
+)
 from cayu.tasks.completion_verifier_dispatches import (
     CompletionVerifierDispatch,
     CompletionVerifierDispatchRequest,
@@ -2648,6 +2660,7 @@ class TaskStore(ABC):
     supports_task_retry_series: ClassVar[bool] = False
     supports_verified_work_contracts: ClassVar[bool] = False
     supports_completion_verifier_dispatches: ClassVar[bool] = False
+    supports_completion_evaluations: ClassVar[bool] = False
     supports_work_attempt_admission: ClassVar[bool] = False
     supports_verified_task_worker: ClassVar[bool] = False
     supports_local_execution_attempts: ClassVar[bool] = False
@@ -3148,6 +3161,33 @@ class TaskStore(ABC):
     ) -> tuple[CompletionVerifierDispatch, ...]:
         """List one proposal's provider attempts in their durable order."""
         raise NotImplementedError("This TaskStore does not support provider verifier dispatches.")
+
+    async def record_completion_evaluation_run(
+        self,
+        request: CompletionEvaluationRunRequest,
+    ) -> CompletionEvaluationRun:
+        """Persist one evaluator-run intent before its external effect.
+
+        Implementations must atomically read the current verification claim,
+        contract evaluation policy, decision index and prior runs for the
+        proposal, call ``require_completion_evaluation_admission`` and insert the
+        record, or exactly replay an identical intent.
+        """
+        raise NotImplementedError("This TaskStore does not support completion evaluations.")
+
+    async def settle_completion_evaluation_run(
+        self,
+        request: CompletionEvaluationSettlementRequest,
+    ) -> CompletionEvaluationRun:
+        """Write the one terminal settlement for a recorded evaluator run."""
+        raise NotImplementedError("This TaskStore does not support completion evaluations.")
+
+    async def list_completion_evaluation_runs(
+        self,
+        proposal_id: str,
+    ) -> tuple[CompletionEvaluationRun, ...]:
+        """List one proposal's evaluator runs in their durable order."""
+        raise NotImplementedError("This TaskStore does not support completion evaluations.")
 
     @abstractmethod
     async def create_task(self, request: TaskCreate) -> Task:
@@ -3850,6 +3890,7 @@ class InMemoryTaskStore(TaskStore):
     supports_task_retry_series: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
     supports_completion_verifier_dispatches: ClassVar[bool] = True
+    supports_completion_evaluations: ClassVar[bool] = True
     supports_work_attempt_admission: ClassVar[bool] = True
     supports_verified_task_worker: ClassVar[bool] = True
     supports_local_execution_attempts: ClassVar[bool] = True
@@ -3916,6 +3957,8 @@ class InMemoryTaskStore(TaskStore):
         self._completion_verifier_profiles: dict[str, CompletionVerifierProfileRecord] = {}
         self._completion_verifier_dispatches: dict[str, list[CompletionVerifierDispatch]] = {}
         self._completion_verifier_dispatch_proposals: dict[str, str] = {}
+        self._completion_evaluation_runs: dict[str, list[CompletionEvaluationRun]] = {}
+        self._completion_evaluation_run_proposals: dict[str, str] = {}
         self._completion_verification_claims: dict[str, CompletionVerificationClaim] = {}
         self._verification_claims_by_id: dict[str, CompletionVerificationClaim] = {}
         self._completion_decisions: dict[str, CompletionDecision] = {}
@@ -5441,6 +5484,73 @@ class InMemoryTaskStore(TaskStore):
                 for item in self._completion_verifier_dispatches.get(proposal_id, ())
             )
 
+    async def record_completion_evaluation_run(
+        self,
+        request: CompletionEvaluationRunRequest,
+    ) -> CompletionEvaluationRun:
+        request = copy_completion_evaluation_run_request(request)
+        async with self._lock:
+            existing_proposal_id = self._completion_evaluation_run_proposals.get(request.effect_id)
+            if existing_proposal_id is not None:
+                existing = next(
+                    item
+                    for item in self._completion_evaluation_runs[existing_proposal_id]
+                    if item.effect_id == request.effect_id
+                )
+                return replay_completion_evaluation_run(existing, request)
+            proposal = self._require_completion_proposal(request.proposal_id)
+            contract = self._require_work_contract(proposal.contract)
+            prior = tuple(self._completion_evaluation_runs.get(proposal.proposal_id, ()))
+            require_completion_evaluation_admission(
+                request,
+                proposal=proposal,
+                contract_evaluation=contract.evaluation,
+                claim=self._completion_verification_claims.get(proposal.proposal_id),
+                decided=proposal.proposal_id in self._decision_id_by_proposal,
+                existing=prior,
+                lease_now=self._ownership_clock(),
+            )
+            self._ensure_completion_proposal_is_current(proposal)
+            record = completion_evaluation_run_from_request(
+                request, proposal=proposal, started_at=self._clock()
+            )
+            self._completion_evaluation_runs.setdefault(proposal.proposal_id, []).append(record)
+            self._completion_evaluation_run_proposals[record.effect_id] = proposal.proposal_id
+            return copy_completion_evaluation_run(record)
+
+    async def settle_completion_evaluation_run(
+        self,
+        request: CompletionEvaluationSettlementRequest,
+    ) -> CompletionEvaluationRun:
+        request = copy_completion_evaluation_settlement_request(request)
+        async with self._lock:
+            proposal_id = self._completion_evaluation_run_proposals.get(request.effect_id)
+            if proposal_id is None:
+                raise KeyError(f"Completion evaluation run not found: {request.effect_id}")
+            runs = self._completion_evaluation_runs[proposal_id]
+            index = next(
+                position
+                for position, item in enumerate(runs)
+                if item.effect_id == request.effect_id
+            )
+            updated, changed = settle_completion_evaluation_run_record(
+                runs[index], request, settled_at=self._clock()
+            )
+            if changed:
+                runs[index] = updated
+            return copy_completion_evaluation_run(updated)
+
+    async def list_completion_evaluation_runs(
+        self,
+        proposal_id: str,
+    ) -> tuple[CompletionEvaluationRun, ...]:
+        proposal_id = require_clean_nonblank(proposal_id, "proposal_id")
+        async with self._lock:
+            return tuple(
+                copy_completion_evaluation_run(item)
+                for item in self._completion_evaluation_runs.get(proposal_id, ())
+            )
+
     async def apply_completion_decision(
         self,
         request: CompletionDecisionApplicationRequest,
@@ -5964,6 +6074,15 @@ class InMemoryTaskStore(TaskStore):
                 (self._proposal_id_by_attempt, attempt_ids),
                 (self._completion_verifier_profiles, proposal_ids),
                 (self._completion_verifier_dispatches, proposal_ids),
+                (self._completion_evaluation_runs, proposal_ids),
+                (
+                    self._completion_evaluation_run_proposals,
+                    {
+                        key
+                        for key, value in self._completion_evaluation_run_proposals.items()
+                        if value in proposal_ids
+                    },
+                ),
                 (
                     self._completion_verifier_dispatch_proposals,
                     {

@@ -518,6 +518,9 @@ REVISIONS: tuple[Revision, ...] = (
     # Provider-backed completion verifiers record each provider attempt in a
     # new table that older binaries never read or write.
     Revision(revision=116, kind=RevisionKind.ADDITIVE, compatible_from=115),
+    # Independent completion evaluations record each evaluator run and its
+    # receipt in a new table that older binaries never read or write.
+    Revision(revision=117, kind=RevisionKind.ADDITIVE, compatible_from=115),
 )
 
 #: The revision an empty database is initialized to.

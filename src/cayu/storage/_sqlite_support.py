@@ -42,6 +42,7 @@ from cayu.storage._collaboration_wait_schema import (
     SQLITE_COLLABORATION_WAIT_DDL,
     validate_sqlite_wait_discovery,
 )
+from cayu.storage._completion_evaluation_schema import SQLITE_COMPLETION_EVALUATION_DDL
 from cayu.storage._completion_verifier_dispatch_schema import (
     SQLITE_COMPLETION_VERIFIER_DISPATCH_DDL,
 )
@@ -761,6 +762,7 @@ _MIGRATION_STEPS: dict[int, str] = {
     114: SQLITE_MODEL_POLICY_DDL,
     115: SQLITE_EXTERNAL_WAIT_DDL,
     116: SQLITE_COMPLETION_VERIFIER_DISPATCH_DDL,
+    117: SQLITE_COMPLETION_EVALUATION_DDL,
     110: """
         CREATE TABLE IF NOT EXISTS cayu_producer_cleanup_receipts (
             operation_key TEXT PRIMARY KEY NOT NULL,

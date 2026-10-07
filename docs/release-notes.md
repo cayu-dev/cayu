@@ -60,10 +60,24 @@
   separately from the worker session. See
   [provider-backed completion verifiers](runtime-contracts.md#provider-backed-completion-verifiers).
 
-Storage revision is **116** (previously **115**). The revision is additive: it
-adds the `cayu_completion_verifier_dispatches` table. Task stores now require
-revision 116, so migrate storage before starting this version; older binaries
-keep working against a migrated database.
+- Independent completion evaluations. A work contract can declare an
+  `evaluation` policy naming an evaluator registered with
+  `CayuApp.register_completion_evaluator(...)`, such as a benchmark run or test
+  suite that must not be triggered by the agent being judged. Cayu runs it once
+  per durable effect identity under the verification claim, persists the run
+  intent before the effect, reconciles an earlier owner's unfinished run through
+  `CompletionEvaluator.reconcile(...)`, bounds runs per proposal, and gives the
+  verifier an immutable `CompletionEvaluationReceipt` as trusted evidence.
+  Evaluator failures and timeouts are typed execution failures, never rejected
+  candidates. `CayuApp.list_completion_evaluation_runs(...)` reports runs and
+  evaluator-reported usage separately. See
+  [independent completion evaluations](runtime-contracts.md#independent-completion-evaluations).
+
+Storage revision is **117** (previously **115**). Revisions 116 and 117 are
+additive: they add the `cayu_completion_verifier_dispatches` and
+`cayu_completion_evaluation_runs` tables. Task stores now require revision 117,
+so migrate storage before starting this version; older binaries keep working
+against a migrated database.
 
 ### Cloud-hosted Agents upgrading from v0.8.x
 

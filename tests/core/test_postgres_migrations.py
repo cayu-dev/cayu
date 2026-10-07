@@ -315,6 +315,7 @@ def test_revision_forty_nine_migrates_existing_ordinary_tasks(postgres_dsn: str)
                     "cayu_completion_decisions",
                     "cayu_completion_verification_claims",
                     "cayu_completion_verifier_profiles",
+                    "cayu_completion_evaluation_runs",
                     "cayu_completion_verifier_dispatches",
                     "cayu_completion_proposals",
                     "cayu_work_attempts",

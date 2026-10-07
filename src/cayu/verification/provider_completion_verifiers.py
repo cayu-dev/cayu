@@ -222,7 +222,7 @@ def render_provider_completion_verifier_contract(request: CompletionVerifierRequ
 
     contract = request.contract
     proposal = request.proposal
-    document = {
+    document: dict[str, object] = {
         "decision_contract_version": PROVIDER_COMPLETION_VERIFIER_DECISION_CONTRACT_VERSION,
         "objective": contract.objective,
         "criteria": [
@@ -266,6 +266,15 @@ def render_provider_completion_verifier_contract(request: CompletionVerifierRequ
             ],
         },
     }
+    evaluation = request.evaluation
+    if evaluation is not None:
+        # Recorded by the runtime from an independent evaluator: trusted evidence.
+        document["independent_evaluation"] = {
+            "evaluator": evaluation.evaluator.evaluator_id,
+            "evaluator_version": evaluation.evaluator.version,
+            "summary": evaluation.summary,
+            "evidence": evaluation.evidence,
+        }
     rendered = canonical_durable_json_bytes(document, "provider_verifier_contract").decode()
     if len(rendered.encode("utf-8")) > _MAX_RENDERED_CONTRACT_BYTES:
         raise ValueError("The rendered decision contract exceeds its bound.")
@@ -287,7 +296,13 @@ def render_provider_completion_verifier_contract(request: CompletionVerifierRequ
         "outcome is satisfied; otherwise use another verdict. A satisfied outcome "
         "whose contract entry lists required evidence must cite available evidence "
         "for each listed requirement.\n\n"
-        f"Work contract:\n{rendered}"
+        + (
+            ""
+            if evaluation is None
+            else "The contract's independent_evaluation was run and recorded by the "
+            "runtime independently of the worker; treat it as trusted evidence.\n\n"
+        )
+        + f"Work contract:\n{rendered}"
     )
 
 

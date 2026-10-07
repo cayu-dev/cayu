@@ -226,6 +226,20 @@ from cayu.tasks.base import (
     prepare_task_terminalization_receipt_lookup,
     task_query_from_aggregate_filter,
 )
+from cayu.tasks.completion_evaluations import (
+    CompletionEvaluationRun,
+    CompletionEvaluationRunRequest,
+    CompletionEvaluationSettlementRequest,
+    completion_evaluation_run_document,
+    completion_evaluation_run_from_document,
+    completion_evaluation_run_from_request,
+    copy_completion_evaluation_run,
+    copy_completion_evaluation_run_request,
+    copy_completion_evaluation_settlement_request,
+    replay_completion_evaluation_run,
+    require_completion_evaluation_admission,
+    settle_completion_evaluation_run_record,
+)
 from cayu.tasks.completion_verifier_dispatches import (
     CompletionVerifierDispatch,
     CompletionVerifierDispatchRequest,
@@ -320,7 +334,7 @@ from cayu.tasks.topology import (
 _T = TypeVar("_T")
 
 
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 116
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 117
 
 
 @model_store_surface("tasks")
@@ -436,6 +450,7 @@ class SQLiteTaskStore(TaskStore):
     supports_task_retry_series: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
     supports_completion_verifier_dispatches: ClassVar[bool] = True
+    supports_completion_evaluations: ClassVar[bool] = True
     supports_work_attempt_admission: ClassVar[bool] = True
     supports_verified_task_worker: ClassVar[bool] = True
     supports_local_execution_attempts: ClassVar[bool] = True
@@ -3265,6 +3280,140 @@ class SQLiteTaskStore(TaskStore):
         proposal_id = require_clean_nonblank(proposal_id, "proposal_id")
         async with self._lock:
             return self._list_completion_verifier_dispatches_unlocked(proposal_id)
+
+    @staticmethod
+    def _completion_evaluation_run_from_row(row: sqlite3.Row) -> CompletionEvaluationRun:
+        run = completion_evaluation_run_from_document(json.loads(row["record_json"]))
+        if (
+            run.effect_id != row["effect_id"]
+            or run.proposal_id != row["proposal_id"]
+            or run.task_id != row["task_id"]
+            or run.run_ordinal != row["run_ordinal"]
+            or run.request_sha256 != row["request_sha256"]
+            or (run.settlement is not None) != bool(row["settled"])
+        ):
+            raise WorkCompletionConflict(
+                "Stored completion-evaluation indexes conflict with canonical content."
+            )
+        return run
+
+    def _load_completion_evaluation_run_unlocked(
+        self,
+        effect_id: str,
+    ) -> CompletionEvaluationRun | None:
+        row = self._connection.execute(
+            "SELECT effect_id, proposal_id, task_id, run_ordinal, request_sha256, settled, "
+            "record_json FROM cayu_completion_evaluation_runs WHERE effect_id = ?",
+            (effect_id,),
+        ).fetchone()
+        return None if row is None else self._completion_evaluation_run_from_row(row)
+
+    def _list_completion_evaluation_runs_unlocked(
+        self,
+        proposal_id: str,
+    ) -> tuple[CompletionEvaluationRun, ...]:
+        rows = self._connection.execute(
+            "SELECT effect_id, proposal_id, task_id, run_ordinal, request_sha256, settled, "
+            "record_json FROM cayu_completion_evaluation_runs WHERE proposal_id = ? "
+            "ORDER BY run_ordinal",
+            (proposal_id,),
+        ).fetchall()
+        runs = tuple(self._completion_evaluation_run_from_row(row) for row in rows)
+        if tuple(item.run_ordinal for item in runs) != tuple(range(1, len(runs) + 1)):
+            raise WorkCompletionConflict("Stored completion-evaluation run order has gaps.")
+        return runs
+
+    async def record_completion_evaluation_run(
+        self,
+        request: CompletionEvaluationRunRequest,
+    ) -> CompletionEvaluationRun:
+        request = copy_completion_evaluation_run_request(request)
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                existing = self._load_completion_evaluation_run_unlocked(request.effect_id)
+                if existing is not None:
+                    return replay_completion_evaluation_run(existing, request)
+                proposal = self._load_completion_proposal_unlocked(request.proposal_id)
+                if proposal is None:
+                    raise KeyError(f"Completion proposal not found: {request.proposal_id}")
+                attempt = self._load_work_attempt_unlocked(proposal.attempt_id)
+                if attempt is None:
+                    raise WorkCompletionConflict("Completion proposal has no durable work attempt.")
+                task = self._require_task_unlocked(proposal.task_id)
+                contract = verified_work_support.require_proposal_chain(
+                    proposal,
+                    attempt,
+                    task,
+                    latest_attempt_id=self._latest_work_attempt_id_unlocked(task.id),
+                    contract=self._load_work_contract_unlocked(proposal.contract),
+                )
+                prior = self._list_completion_evaluation_runs_unlocked(proposal.proposal_id)
+                require_completion_evaluation_admission(
+                    request,
+                    proposal=proposal,
+                    contract_evaluation=contract.evaluation,
+                    claim=self._load_completion_claim_unlocked(proposal.proposal_id),
+                    decided=self._load_completion_decision_for_proposal_unlocked(
+                        proposal.proposal_id
+                    )
+                    is not None,
+                    existing=prior,
+                    lease_now=self._ownership_clock(),
+                )
+                record = completion_evaluation_run_from_request(
+                    request, proposal=proposal, started_at=self._clock()
+                )
+                self._connection.execute(
+                    "INSERT INTO cayu_completion_evaluation_runs "
+                    "(effect_id, proposal_id, task_id, run_ordinal, request_sha256, settled, "
+                    "record_json) VALUES (?, ?, ?, ?, ?, 0, ?)",
+                    (
+                        record.effect_id,
+                        record.proposal_id,
+                        record.task_id,
+                        record.run_ordinal,
+                        record.request_sha256,
+                        sqlite_records.json_dumps(completion_evaluation_run_document(record)),
+                    ),
+                )
+                return copy_completion_evaluation_run(record)
+
+    async def settle_completion_evaluation_run(
+        self,
+        request: CompletionEvaluationSettlementRequest,
+    ) -> CompletionEvaluationRun:
+        request = copy_completion_evaluation_settlement_request(request)
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                existing = self._load_completion_evaluation_run_unlocked(request.effect_id)
+                if existing is None:
+                    raise KeyError(f"Completion evaluation run not found: {request.effect_id}")
+                updated, changed = settle_completion_evaluation_run_record(
+                    existing, request, settled_at=self._clock()
+                )
+                if changed:
+                    cursor = self._connection.execute(
+                        "UPDATE cayu_completion_evaluation_runs "
+                        "SET settled = 1, record_json = ? "
+                        "WHERE effect_id = ? AND settled = 0",
+                        (
+                            sqlite_records.json_dumps(completion_evaluation_run_document(updated)),
+                            updated.effect_id,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise WorkCompletionConflict(
+                            "Completion evaluation settlement lost its record."
+                        )
+                return copy_completion_evaluation_run(updated)
+
+    async def list_completion_evaluation_runs(
+        self,
+        proposal_id: str,
+    ) -> tuple[CompletionEvaluationRun, ...]:
+        proposal_id = require_clean_nonblank(proposal_id, "proposal_id")
+        async with self._lock:
+            return self._list_completion_evaluation_runs_unlocked(proposal_id)
 
     async def apply_completion_decision(
         self,

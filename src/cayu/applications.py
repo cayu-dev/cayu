@@ -462,6 +462,7 @@ from cayu.runtime._session_request_boundary import _validate_resume_request, _va
 from cayu.runtime._structured_output_tool_round import _has_structured_output_tool_call
 from cayu.runtime._task_store_operation_boundary import (
     raise_task_store_operation_failure,
+    task_store_completion_evaluation_capability_is_complete,
     task_store_completion_verifier_dispatch_capability_is_complete,
 )
 from cayu.runtime._tool_round_executor import (
@@ -668,11 +669,13 @@ from cayu.tasks.base import (
     TaskCreate,
     TaskStore,
 )
+from cayu.tasks.completion_evaluations import CompletionEvaluationRun
 from cayu.tasks.completion_verifier_dispatches import CompletionVerifierDispatch
 from cayu.tasks.completion_verifier_profiles import CompletionVerifierProfilePolicy
 from cayu.tasks.contracts import (
     CompletionDecision,
     CompletionDecisionApplicationRequest,
+    CompletionEvaluatorRef,
     CompletionProposal,
     CompletionResultResolverRef,
     CompletionVerifierRef,
@@ -750,6 +753,7 @@ from cayu.tools.targeted_projection import (
 from cayu.tools.terminal_publication import ToolTerminalPublicationMetricsSnapshot
 from cayu.vaults.redaction import SecretRedactionStream, SecretRedactor
 from cayu.verification._verified_completion import VerifiedCompletionCoordinator
+from cayu.verification.completion_evaluators import CompletionEvaluator
 from cayu.verification.completion_result_resolvers import (
     CompletionResultResolutionRequest,
     CompletionResultResolver,
@@ -5695,6 +5699,19 @@ class CayuApp:
         del reference, verifier
         return registered
 
+    def register_completion_evaluator(
+        self,
+        reference: CompletionEvaluatorRef,
+        evaluator: CompletionEvaluator,
+    ) -> CompletionEvaluatorRef:
+        """Register one independent evaluator under its complete durable identity.
+
+        Work contracts name the evaluator in their ``evaluation`` policy. Every
+        worker that may verify such a contract must register it at startup.
+        """
+
+        return self._verified_completion.verifier.register_evaluator(reference, evaluator)
+
     def register_completion_result_resolver(
         self,
         reference: CompletionResultResolverRef,
@@ -7699,6 +7716,25 @@ class CayuApp:
                 "The task store does not support provider-verifier dispatch records."
             )
         return await store.list_completion_verifier_dispatches(proposal_id)
+
+    @_tracked_entrance
+    async def list_completion_evaluation_runs(
+        self,
+        proposal_id: str,
+    ) -> tuple[CompletionEvaluationRun, ...]:
+        """List the independent evaluator runs recorded for one proposal.
+
+        A completed run is the proposal's evaluation receipt. Run outcome,
+        latency and evaluator-reported usage are kept apart from the worker
+        session and from provider-verifier attempts.
+        """
+
+        store = self.task_store
+        if store is None or not task_store_completion_evaluation_capability_is_complete(store):
+            raise NotImplementedError(
+                "The task store does not support completion evaluation records."
+            )
+        return await store.list_completion_evaluation_runs(proposal_id)
 
     @_tracked_entrance
     async def apply_completion_decision(

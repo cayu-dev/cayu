@@ -72,6 +72,8 @@ WORK_COMPLETION_LINKED_ID_MAX_BYTES = 2048
 WORK_EVIDENCE_REFERENCE_ID_MAX_BYTES = 2048
 WORK_COMPLETION_IDEMPOTENCY_KEY_MAX_BYTES = 256
 WORK_VERIFICATION_LEASE_MAX_SECONDS = 3600
+WORK_EVALUATION_MAX_RUNS = 16
+WORK_EVALUATION_MAX_SECONDS = 7 * 24 * 3600
 
 _LOWER_HEX_SHA256 = re.compile(r"[0-9a-f]{64}\Z", flags=re.ASCII)
 _CANONICAL_CODE = re.compile(r"[a-z0-9][a-z0-9._:-]{0,127}\Z", flags=re.ASCII)
@@ -384,6 +386,49 @@ class CompletionResultResolverRef(FrozenWorkContractModel):
         return _sha256_digest(value, "configuration_fingerprint")
 
 
+class CompletionEvaluatorRef(FrozenWorkContractModel):
+    """Exact application-owned authority for one independent external evaluator."""
+
+    evaluator_id: str
+    version: str
+    configuration_fingerprint: str
+
+    @field_validator("evaluator_id", "version")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_identifier(value, info.field_name)
+
+    @field_validator("configuration_fingerprint")
+    @classmethod
+    def validate_configuration_fingerprint(cls, value: str) -> str:
+        return _sha256_digest(value, "configuration_fingerprint")
+
+
+class CompletionEvaluationPolicy(FrozenWorkContractModel):
+    """Independent evaluation that must run once before a proposal is verified.
+
+    ``max_runs`` bounds evaluator runs for one proposal (evaluator retries);
+    work-attempt retries remain bounded by the continuation policy and each
+    new attempt's proposal gets its own evaluation budget.
+    """
+
+    evaluator: CompletionEvaluatorRef
+    max_runs: StrictInt = Field(default=2, ge=1, le=WORK_EVALUATION_MAX_RUNS)
+    timeout_seconds: StrictFloat = Field(gt=0, le=WORK_EVALUATION_MAX_SECONDS)
+
+    @field_validator("evaluator", mode="before")
+    @classmethod
+    def copy_evaluator(cls, value: object) -> object:
+        return revalidate_model_input(value, CompletionEvaluatorRef)
+
+    @field_validator("timeout_seconds", mode="before")
+    @classmethod
+    def validate_timeout(cls, value: object) -> object:
+        if type(value) is int:
+            return float(value)
+        return value
+
+
 class CompletionContinuationPolicy(FrozenWorkContractModel):
     rejection_action: CompletionRejectionAction = CompletionRejectionAction.INTERRUPT
     max_attempts: StrictInt = Field(default=3, ge=1, le=100)
@@ -490,6 +535,16 @@ class WorkContractDraft(FrozenWorkContractModel):
     continuation_policy: CompletionContinuationPolicy = Field(
         default_factory=CompletionContinuationPolicy
     )
+    evaluation: CompletionEvaluationPolicy | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+    @field_validator("evaluation", mode="before")
+    @classmethod
+    def copy_evaluation(cls, value: object) -> object:
+        if value is None:
+            return None
+        return revalidate_model_input(value, CompletionEvaluationPolicy)
 
     @field_validator("contract_id")
     @classmethod
@@ -633,7 +688,7 @@ class WorkContract(WorkContractDraft):
 
 
 def _work_contract_definition_document(contract: WorkContractDraft) -> dict[str, object]:
-    return {
+    document: dict[str, object] = {
         "schema_version": 2,
         "contract_id": contract.contract_id,
         "version": contract.version,
@@ -654,6 +709,10 @@ def _work_contract_definition_document(contract: WorkContractDraft) -> dict[str,
         "result_resolver": contract.result_resolver.model_dump(mode="json", warnings=False),
         "continuation_policy": contract.continuation_policy.model_dump(mode="json", warnings=False),
     }
+    # Contracts without an evaluation keep their original canonical definition.
+    if contract.evaluation is not None:
+        document["evaluation"] = contract.evaluation.model_dump(mode="json", warnings=False)
+    return document
 
 
 def _work_contract_definition_bytes(contract: WorkContractDraft) -> bytes:
@@ -733,6 +792,7 @@ def _copy_work_contract_definition(value: WorkContractDraft) -> dict[str, object
             CompletionContinuationPolicy,
             3,
         ),
+        "evaluation": _copy_bounded_model_input(value.evaluation, CompletionEvaluationPolicy, 3),
     }
 
 

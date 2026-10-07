@@ -398,6 +398,7 @@ _POSTGRES_TABLES = (
     "cayu_completion_decision_application_receipts",
     "cayu_completion_decisions",
     "cayu_completion_verification_claims",
+    "cayu_completion_evaluation_runs",
     "cayu_completion_verifier_dispatches",
     "cayu_completion_verifier_profiles",
     "cayu_completion_proposals",

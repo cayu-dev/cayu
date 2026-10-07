@@ -6,8 +6,9 @@ import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
+from hashlib import sha256
 from time import monotonic
-from typing import ClassVar, NoReturn, TypeVar, cast
+from typing import Any, ClassVar, NoReturn, TypeVar, cast
 from uuid import uuid4
 
 from pydantic import BaseModel
@@ -19,7 +20,11 @@ from cayu._task_wait import (
     capture_awaitable_outcome,
     restore_task_cancellation_requests,
 )
-from cayu._validation import require_durable_clean_nonblank, revalidate_model_input
+from cayu._validation import (
+    canonical_durable_json_bytes,
+    require_durable_clean_nonblank,
+    revalidate_model_input,
+)
 from cayu.approvals.tools import ResolutionActor
 from cayu.deadlines import ExecutionDeadline, effective_deadline
 from cayu.execution_profiles import (
@@ -45,8 +50,10 @@ from cayu.runtime._task_store_operation_boundary import (
     capture_sensitive_validation,
     capture_task_store_operation,
     raise_task_store_operation_failure,
+    task_store_completion_evaluation_capability_is_complete,
     task_store_completion_verifier_dispatch_capability_is_complete,
 )
+from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.tasks._verified_work_authority import (
     completion_decision_claim_authority_matches,
     completion_decision_request_from_record,
@@ -55,6 +62,9 @@ from cayu.tasks._verified_work_authority import (
     require_completion_verifier_profile_integrity,
 )
 from cayu.tasks.base import TaskClaimLost, TaskStore
+from cayu.tasks.completion_evaluations import (
+    CompletionEvaluationReceipt,
+)
 from cayu.tasks.completion_verifier_profiles import (
     CompletionVerifierExecutionProfile,
     CompletionVerifierProfileAdoptionDecision,
@@ -72,6 +82,8 @@ from cayu.tasks.completion_verifier_profiles import (
 from cayu.tasks.contracts import (
     CompletionDecision,
     CompletionDecisionCreate,
+    CompletionEvaluationPolicy,
+    CompletionEvaluatorRef,
     CompletionProposal,
     CompletionVerificationClaim,
     CompletionVerificationClaimLost,
@@ -96,6 +108,10 @@ from cayu.tasks.contracts import (
     validate_completion_decision_contract,
 )
 from cayu.vaults.redaction import SecretRedactor
+from cayu.verification._completion_evaluation_runtime import (
+    CompletionEvaluationRuntime,
+    EvaluationExecutionAuthority,
+)
 from cayu.verification._leased_adapter_heartbeat import run_leased_adapter_heartbeat
 from cayu.verification._leased_adapter_runner import (
     LeasedAdapterLease,
@@ -109,6 +125,12 @@ from cayu.verification._provider_completion_verifier_profile import (
 from cayu.verification._provider_completion_verifier_runtime import (
     ProviderCompletionVerifierRuntime,
     ProviderVerifierExecutionAuthority,
+)
+from cayu.verification.completion_evaluators import (
+    CompletionEvaluationExecutionError,
+    CompletionEvaluator,
+    CompletionEvaluatorBudgetExhausted,
+    CompletionEvaluatorUnavailable,
 )
 from cayu.verification.completion_verifiers import (
     CompletionVerifierExecutionError,
@@ -133,6 +155,9 @@ from cayu.workspaces.observation_recovery import (
 
 _RUNTIME_AUTHORED_VERIFIER_FAILURES = frozenset(
     {
+        CompletionEvaluationExecutionError,
+        CompletionEvaluatorBudgetExhausted,
+        CompletionEvaluatorUnavailable,
         CompletionVerifierUnavailable,
         ProviderCompletionVerifierBudgetExhausted,
         ProviderCompletionVerifierDecodingError,
@@ -192,6 +217,39 @@ class _RegisteredVerifier:
     adapter: DeterministicCompletionVerifier | ProviderCompletionVerifier = field(repr=False)
     profile: CompletionVerifierExecutionProfile
     target: ProviderCompletionVerifierTarget | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RegisteredEvaluator:
+    adapter: CompletionEvaluator = field(repr=False)
+    fingerprint: str
+
+
+def _evaluator_key(reference: CompletionEvaluatorRef) -> tuple[str, str, str]:
+    return (reference.evaluator_id, reference.version, reference.configuration_fingerprint)
+
+
+def _evaluator_fingerprint(
+    reference: CompletionEvaluatorRef,
+    identity: ExecutionProfileBehaviorIdentity,
+) -> str:
+    return sha256(
+        canonical_durable_json_bytes(
+            {
+                "evaluator": reference.model_dump(mode="json", warnings=False),
+                "identity": identity.model_dump(mode="json", warnings=False),
+            },
+            "completion_evaluator_profile",
+        )
+    ).hexdigest()
+
+
+def _copy_evaluation_receipt(value: object) -> CompletionEvaluationReceipt:
+    if type(value) is not CompletionEvaluationReceipt:
+        raise TypeError("Completion evaluation returned no receipt.")
+    return CompletionEvaluationReceipt.model_validate(
+        value.model_dump(mode="python", warnings=False)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -805,11 +863,99 @@ class CompletionVerifierCoordinator:
         self._verifiers: dict[tuple[str, str, str, str], _RegisteredVerifier] = {}
         self._adapter_runner = LeasedAdapterRunner[_DrainingAdapter]()
         self._provider_registrations = provider_registrations
+        self._evaluators: dict[tuple[str, str, str], _RegisteredEvaluator] = {}
+        self._evaluation_runtime = CompletionEvaluationRuntime(secret_redactor=secret_redactor)
         self._process_identity = execution_profile_process_identity or uuid4().hex
         self._provider_runtime = ProviderCompletionVerifierRuntime(
             resolve_provider=self._resolve_provider,
             secret_redactor=secret_redactor,
         )
+
+    def register_evaluator(
+        self,
+        reference: CompletionEvaluatorRef,
+        evaluator: CompletionEvaluator,
+    ) -> CompletionEvaluatorRef:
+        """Register one evaluator under its complete immutable identity."""
+
+        self._ensure_process_local_generation()
+        if type(reference) is not CompletionEvaluatorRef:
+            raise TypeError("Completion evaluator registration requires a CompletionEvaluatorRef.")
+        if not isinstance(evaluator, CompletionEvaluator):
+            raise TypeError("Completion evaluator registration requires a CompletionEvaluator.")
+        copied = cast(
+            "CompletionEvaluatorRef", revalidate_model_input(reference, CompletionEvaluatorRef)
+        )
+        if _contains_workload_secret(
+            (copied.evaluator_id, copied.version), redactor=self._secret_redactor
+        ):
+            raise ValueError(
+                "Completion evaluator identity contains a workload secret and cannot be "
+                "registered as durable authority."
+            ) from None
+        key = _evaluator_key(copied)
+        if key in self._evaluators:
+            raise ValueError("Completion evaluator identity is already registered.") from None
+        identity = self._live_evaluator_identity(evaluator)
+        if identity is None:
+            raise ValueError(
+                "Completion evaluator registration requires stable execution-profile identity."
+            ) from None
+        self._evaluators[key] = _RegisteredEvaluator(
+            adapter=evaluator, fingerprint=_evaluator_fingerprint(copied, identity)
+        )
+        return copied
+
+    def _live_evaluator_identity(
+        self, evaluator: CompletionEvaluator
+    ) -> ExecutionProfileBehaviorIdentity | None:
+        validation = capture_sensitive_validation(
+            lambda value=evaluator: copy_secret_free_execution_profile_behavior_identity(
+                value.execution_profile_identity,
+                redactor=self._secret_redactor,
+                field_name="completion_evaluator.execution_profile_identity",
+            ),
+            operation_name="Completion evaluator execution-profile identity validation",
+            redactor=self._secret_redactor,
+        )
+        if validation.failure is not None:
+            return None
+        return validation.result
+
+    def _require_live_evaluator(self, reference: CompletionEvaluatorRef) -> _RegisteredEvaluator:
+        registered = self._evaluators.get(_evaluator_key(reference))
+        if registered is None:
+            raise CompletionEvaluatorUnavailable(
+                "The exact completion evaluator required by the work contract is not registered."
+            ) from None
+        identity = self._live_evaluator_identity(registered.adapter)
+        if identity is None or _evaluator_fingerprint(reference, identity) != (
+            registered.fingerprint
+        ):
+            raise CompletionEvaluatorUnavailable(
+                "Completion evaluator execution-profile identity changed after registration."
+            ) from None
+        return registered
+
+    def _evaluation_invocation(
+        self,
+        store: TaskStore,
+        policy: CompletionEvaluationPolicy,
+        authority: EvaluationExecutionAuthority,
+    ) -> Callable[[CompletionVerifierRequest], Awaitable[CompletionEvaluationReceipt]]:
+        runtime = self._evaluation_runtime
+        registered = self._require_live_evaluator(policy.evaluator)
+
+        async def invoke(request: CompletionVerifierRequest) -> CompletionEvaluationReceipt:
+            return await runtime.obtain_receipt(
+                store=store,
+                evaluator=registered.adapter,
+                policy=policy,
+                request=request,
+                authority=authority,
+            )
+
+        return invoke
 
     def _resolve_provider(self, provider_name: str) -> RegisteredProvider:
         registrations = (
@@ -1332,6 +1478,17 @@ class CompletionVerifierCoordinator:
                 redactor=self._secret_redactor,
                 fallback_message="The required completion verifier is unavailable.",
             ) from None
+        evaluation_policy = authority.contract.evaluation
+        if evaluation_policy is not None:
+            if not task_store_completion_evaluation_capability_is_complete(store_owner.store):
+                raise credential_safe_runtime_exception(
+                    CompletionEvaluatorUnavailable,
+                    "Contracts with an independent evaluation require a task store with "
+                    "durable completion-evaluation support.",
+                    redactor=self._secret_redactor,
+                    fallback_message="The required completion evaluator is unavailable.",
+                ) from None
+            self._require_live_evaluator(evaluation_policy.evaluator)
         verifier_key = _verifier_key(authority.contract.verifier)
         if verifier_key not in self._verifiers:
             raise credential_safe_runtime_exception(
@@ -1382,6 +1539,9 @@ class CompletionVerifierCoordinator:
         verifier = registered.adapter
         capacity_reservation = self._reserve_adapter_capacity()
         heartbeat: _ClaimHeartbeat | None = None
+        # Bound evidence is released with the other authority locals on failure.
+        adapter_request: CompletionVerifierRequest | None = None
+        receipt: CompletionEvaluationReceipt | None = None
         try:
             claim_request = CompletionVerificationClaimRequest(
                 claim_id=request.claim_id,
@@ -1441,6 +1601,43 @@ class CompletionVerifierCoordinator:
 
             self._require_live_registered_profile(registered)
 
+            adapter_request = authority.adapter_request
+            evaluation_policy = authority.contract.evaluation
+            if evaluation_policy is not None:
+                receipt = await self._invoke_adapter(
+                    self._evaluation_invocation(
+                        store_owner.store,
+                        evaluation_policy,
+                        EvaluationExecutionAuthority(
+                            proposal_id=claim.proposal_id,
+                            claim_id=claim.claim_id,
+                            worker_id=claim.worker_id,
+                            execution_owner_id=self._execution_owner_id,
+                            claim_attempt_number=claim.attempt_number,
+                            evaluator_profile_fingerprint=self._require_live_evaluator(
+                                evaluation_policy.evaluator
+                            ).fingerprint,
+                        ),
+                    ),
+                    adapter_request,
+                    operation_key=operation_key,
+                    # Reconciling an earlier run and one new run each have the
+                    # policy timeout; the slack lets the run's own timeout fire
+                    # first so its settlement records a timeout, not a cancel.
+                    timeout_seconds=evaluation_policy.timeout_seconds * 2 + 30.0,
+                    heartbeat=heartbeat,
+                    deadline=deadline,
+                    retained_drain=retained_drain,
+                    validate_result=_copy_evaluation_receipt,
+                )
+                adapter_request = CompletionVerifierRequest(
+                    contract=adapter_request.contract,
+                    attempt=adapter_request.attempt,
+                    proposal=adapter_request.proposal,
+                    evaluation=receipt,
+                )
+                self._require_live_registered_profile(registered)
+
             if registered.target is None:
                 deterministic = cast("DeterministicCompletionVerifier", verifier)
                 invoke = deterministic.verify
@@ -1461,7 +1658,7 @@ class CompletionVerifierCoordinator:
                 )
             outcome = await self._invoke_adapter(
                 invoke,
-                authority.adapter_request,
+                adapter_request,
                 operation_key=operation_key,
                 timeout_seconds=request.execution_timeout_seconds,
                 heartbeat=heartbeat,
@@ -1481,13 +1678,14 @@ class CompletionVerifierCoordinator:
                 del settlement
             else:
                 propagated = failure
-            del verifier, registered, profile, authority, store_owner
+            del verifier, registered, profile, authority, store_owner, adapter_request, receipt
             if propagated is None:  # pragma: no cover - primary failure is authoritative
                 raise AssertionError("Completion verifier failure was lost.") from None
             raise_task_store_operation_failure(propagated)
         finally:
             if heartbeat is None:
                 self._release_adapter_capacity_reservation(capacity_reservation)
+        del adapter_request, receipt
         try:
             decision = await self._publish_adapter_outcome(
                 store_owner=store_owner,
@@ -2810,7 +3008,7 @@ class CompletionVerifierCoordinator:
 
     async def _invoke_adapter(
         self,
-        verifier: Callable[[CompletionVerifierRequest], Awaitable[CompletionVerifierDecision]],
+        verifier: Callable[[CompletionVerifierRequest], Awaitable[Any]],
         request: CompletionVerifierRequest,
         *,
         operation_key: _ExecutionKey,
@@ -2818,7 +3016,8 @@ class CompletionVerifierCoordinator:
         heartbeat: _ClaimHeartbeat,
         deadline: ExecutionDeadline,
         retained_drain: asyncio.Future[_DrainingAdapter | None] | None = None,
-    ) -> CompletionVerifierDecision:
+        validate_result: Callable[[object], object] | None = None,
+    ) -> Any:
         deadline.require_admission("completion_verifier")
         remaining = deadline.remaining_seconds()
         if remaining is not None:
@@ -2969,8 +3168,10 @@ class CompletionVerifierCoordinator:
             ) from None
         del captured_was_missing
         validation = capture_sensitive_validation(
-            lambda value=captured_result: copy_completion_verifier_decision(
-                cast("CompletionVerifierDecision", value)
+            lambda value=captured_result: (
+                copy_completion_verifier_decision(cast("CompletionVerifierDecision", value))
+                if validate_result is None
+                else validate_result(value)
             ),
             operation_name="Completion verifier decision validation",
             redactor=self._secret_redactor,
