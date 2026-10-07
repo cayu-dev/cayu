@@ -83,12 +83,14 @@ class _ExecutionToWait:
 
     async def parked_replay(self, *, permit_operation: str, permit_commitment: str) -> bool:
         """Recognize the exact released invocation, not a terminal status guess."""
+        from cayu.sessions._checkpoint_preservation import (
+            _invocation_lifecycle_authority_read_scope,
+        )
         from cayu.sessions._session_continuation import (
             ContinuationConflict,
             ContinuationUnavailable,
         )
         from cayu.sessions._session_continuation_store import require_released_wait_invocation
-        from cayu.sessions.base import _invocation_lifecycle_authority_read_scope
 
         record = await self.owner.store.load_continuation_ticket(
             self.session_id,

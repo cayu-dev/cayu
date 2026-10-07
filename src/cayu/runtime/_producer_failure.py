@@ -8,16 +8,12 @@ from cayu.events import EventType
 from cayu.execution_profiles import (
     ExecutionProfileIdentity,
 )
+from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
 from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
     active_invocation_execution_profile_from_checkpoint,
 )
-from cayu.sessions.base import (
-    EventOrder,
-    EventQuery,
-    SessionStatus,
-    _invocation_lifecycle_authority_read_scope,
-)
+from cayu.sessions.base import EventOrder, EventQuery, SessionStatus
 
 
 async def read_native_failure(store, attachment, index):
@@ -182,11 +178,11 @@ async def _stopped_invocation_evidence(store, attachment, index, event):
     from cayu.collaboration._preparation import contract_bytes
     from cayu.runtime._session_steering import steering_operation_key
     from cayu.runtime.session_steering import SessionSteeringReceipt
+    from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
     from cayu.sessions._invocation_terminal_decision import (
         InvocationTerminalOutcome,
         settled_invocation_terminal_decision_from_checkpoint,
     )
-    from cayu.sessions.base import _invocation_lifecycle_authority_read_scope
     from cayu.vaults.redaction import SecretRedactor
 
     invocation = index.invocation

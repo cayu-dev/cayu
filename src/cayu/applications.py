@@ -1005,7 +1005,9 @@ class _ParticipantExecutionSettlementReader(PermitSettlementReader):
         session = await self.app.session_store.load(target.object_id)
         if session is None or session.instance_id != target.incarnation:
             return ExactUnavailable()
-        from cayu.sessions.base import _invocation_lifecycle_authority_read_scope
+        from cayu.sessions._checkpoint_preservation import (
+            _invocation_lifecycle_authority_read_scope,
+        )
 
         with _invocation_lifecycle_authority_read_scope():
             checkpoint = await self.app.session_store.load_checkpoint(session.id)

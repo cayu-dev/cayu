@@ -46,6 +46,7 @@ from cayu.runtime.execution_profiles import (
 from cayu.runtime.provider_operations import RecoverableProviderOperation
 from cayu.sessions import _completion_finalization as completion_finalization
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
+from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
 from cayu.sessions._durable_operation_ownership import (
     DurableOperationOwnership,
     DurableOperationOwnershipAction,
@@ -81,7 +82,6 @@ from cayu.sessions.base import (
     SessionStatus,
     SessionStore,
     _incomplete_recovery_claim_from_checkpoint,
-    _invocation_lifecycle_authority_read_scope,
     _session_run_operation_from_checkpoint,
 )
 from cayu.sessions.pending_actions import (

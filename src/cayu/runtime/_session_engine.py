@@ -597,6 +597,10 @@ from cayu.runtime.work_attempt_semantics import WorkAttemptRunSemantics
 from cayu.runtime.work_attempt_source import WorkAttemptSourceRequest, work_attempt_source_digest
 from cayu.sessions import _model_completion_publication as model_completion_publication
 from cayu.sessions import _tool_call_evidence as tool_call_evidence
+from cayu.sessions._checkpoint_preservation import (
+    _invocation_lifecycle_authority_mutation_scope,
+    _invocation_lifecycle_authority_read_scope,
+)
 from cayu.sessions._execution_profile_checkpoint import (
     EXECUTION_PROFILE_METADATA_KEY,
     ActiveInvocationExecutionProfile,
@@ -737,8 +741,6 @@ from cayu.sessions.base import (
     _fork_source_session_instance_fingerprint,
     _incomplete_recovery_claim_from_checkpoint,
     _initial_transcript_pending_interaction_id,
-    _invocation_lifecycle_authority_mutation_scope,
-    _invocation_lifecycle_authority_read_scope,
     _latest_session_invocation_interaction_is_settled,
     _mark_session_interaction_settled,
     _mark_session_invocation_terminal_event,

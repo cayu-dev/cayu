@@ -23,6 +23,7 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._work_attempt_invocation import WorkAttemptInvocationAuthority
 from cayu.runtime.invocation_release import InvocationReleaseEvidence
 from cayu.runtime.loop_policies import LoopPolicy
+from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_mutation_scope
 from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
     active_invocation_execution_profile_from_checkpoint,
@@ -199,7 +200,6 @@ from cayu.sessions.base import (
     _current_session_run_epoch,
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
-    _invocation_lifecycle_authority_mutation_scope,
     copy_session,
     runtime_publication_checkpoint_mutation,
 )

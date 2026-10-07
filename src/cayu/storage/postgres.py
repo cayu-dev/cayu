@@ -507,6 +507,11 @@ from cayu.runtime.local_execution_attempts import (
 )
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, parse_public_authority_alias
 from cayu.runtime.service_manifest import RuntimeStoreDurability
+from cayu.sessions._checkpoint_preservation import (
+    _checkpoint_transform_result_preserving_completion_result_event_publications,
+    _copy_checkpoint_for_transform,
+    _replace_checkpoint_preserving_completion_result_event_publications,
+)
 from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
 )
@@ -649,7 +654,6 @@ from cayu.sessions.base import (
     _checkpoint_after_exact_invocation_terminal_decision,
     _checkpoint_after_initial_transcript_publication,
     _checkpoint_after_queued_interaction_profile_handoff,
-    _checkpoint_transform_result_preserving_completion_result_event_publications,
     _child_session_lifecycle_entry,
     _child_session_lifecycle_entry_sort_key,
     _child_session_lifecycle_occurrence,
@@ -657,7 +661,6 @@ from cayu.sessions.base import (
     _child_session_notification_consumption_replays,
     _classify_terminal_session_evidence_records,
     _completion_result_event_publication_delete_block_reason,
-    _copy_checkpoint_for_transform,
     _copy_failed_first_delivery_retirement,
     _copy_historical_queued_interaction_profile_handoff,
     _copy_mcp_manifest_publication,
@@ -738,7 +741,6 @@ from cayu.sessions.base import (
     _reconstruct_runtime_publication_receipt,
     _reject_reserved_runtime_publication_key,
     _reject_settled_model_completion_stage,
-    _replace_checkpoint_preserving_completion_result_event_publications,
     _replay_model_completion_stage_abandonment,
     _replay_promoted_model_completion_stage,
     _require_invocation_release_recovery_claim,

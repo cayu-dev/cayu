@@ -33,7 +33,6 @@ from tests.core.test_verified_work_contracts import (
 )
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
-import cayu.sessions.base as sessions_module
 from cayu._validation import canonical_durable_json_bytes
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
@@ -55,6 +54,7 @@ from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
 )
 from cayu.runtime.loop_policies import LoopPolicy
+from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,
     settled_invocation_terminal_decision_from_checkpoint,
@@ -4188,7 +4188,7 @@ def test_public_work_attempt_recovery_rejects_deleted_v4_lifecycle_authority_bef
             updated.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY, None)
             return updated
 
-        with sessions_module._invocation_lifecycle_authority_mutation_scope():
+        with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
             await sessions.transform_checkpoint(
                 admitted.session_id,
                 delete_v4_lifecycle_roots,

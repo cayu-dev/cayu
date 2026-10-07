@@ -16,13 +16,13 @@ from cayu.collaboration.prepared_admission import FreshRecipientAdmissionTarget,
 from cayu.collaboration.requests import RequestControlReceipt
 from cayu.runtime._session_steering import accept_session_steering
 from cayu.runtime.session_steering import StopAfterCurrentToolRoundRequest
+from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
 from cayu.sessions._producer_checkpoint import (
     ROOT_KEY,
     NativeProducerAttachment,
     NativeProducerIndex,
     attachment_operation_key,
 )
-from cayu.sessions.base import _invocation_lifecycle_authority_read_scope
 from cayu.vaults.redaction import SecretRedactor
 
 _SEAL = object()

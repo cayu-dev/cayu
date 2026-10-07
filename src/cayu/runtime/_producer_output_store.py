@@ -541,10 +541,8 @@ async def retain_native_output(store, session_id, *, invocation, stage_id):
     This record contains only exact references/commitments, never private parts.
     """
     from cayu.collaboration._native_output import read_native_output
-    from cayu.sessions.base import (
-        SessionOperationPublication,
-        _invocation_lifecycle_authority_read_scope,
-    )
+    from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
+    from cayu.sessions.base import SessionOperationPublication
 
     with _invocation_lifecycle_authority_read_scope():
         checkpoint = await store.load_checkpoint(session_id)
@@ -728,7 +726,7 @@ async def read_retained_native_output(store, command):
     Missing output remains unresolved production, not permission to rerun it.
     """
     from cayu.collaboration._native_output import read_native_output
-    from cayu.sessions.base import _invocation_lifecycle_authority_read_scope
+    from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
 
     if not store._supports_producer_attachment_protocol():
         raise NotImplementedError("Native producer output readback is not qualified.")

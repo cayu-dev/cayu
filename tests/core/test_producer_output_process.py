@@ -155,7 +155,8 @@ async def test_sigkill_after_native_production_recovers_exact_output(
     from cayu.budgets.base import BudgetReservationRecord
     from cayu.collaboration.prepared_admission import prepared_budget
     from cayu.runtime._producer_output_store import ROOT_KEY, NativeProducerIndex
-    from cayu.sessions.base import SessionRunFenced, _invocation_lifecycle_authority_read_scope
+    from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
+    from cayu.sessions.base import SessionRunFenced
     from cayu.storage.budget_ledger import SQLiteBudgetLedger
     from cayu.storage.migrations import SchemaMode
     from cayu.storage.postgres import PostgresBudgetLedger, PostgresSessionStore

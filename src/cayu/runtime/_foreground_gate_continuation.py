@@ -17,6 +17,7 @@ from cayu.approvals.user_input import (
 )
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
+from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
@@ -27,13 +28,7 @@ from cayu.sessions._foreground_child_checkpoint import (
     ForegroundParentContinuation,
     foreground_child_state_from_checkpoint,
 )
-from cayu.sessions.base import (
-    Session,
-    SessionOperationPublication,
-    SessionRunFenced,
-    SessionStore,
-    _invocation_lifecycle_authority_read_scope,
-)
+from cayu.sessions.base import Session, SessionOperationPublication, SessionRunFenced, SessionStore
 
 
 def _key(kind: str, action_id: str, resolution_digest: str) -> str:

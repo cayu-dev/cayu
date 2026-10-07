@@ -20,15 +20,11 @@ from cayu.sessions._browser_control_checkpoint import (
     browser_control_receipt,
     browser_control_receipt_key,
 )
+from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
-from cayu.sessions.base import (
-    Session,
-    SessionOperationPublication,
-    SessionStatus,
-    _invocation_lifecycle_authority_read_scope,
-)
+from cayu.sessions.base import Session, SessionOperationPublication, SessionStatus
 from cayu.sessions.checkpoints import (
     BROWSER_CONTROLS_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,

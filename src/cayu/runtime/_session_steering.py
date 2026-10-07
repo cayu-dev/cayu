@@ -17,6 +17,7 @@ from cayu.runtime.session_steering import (
     StopAfterCurrentToolRoundRequest,
     copy_stop_after_current_tool_round_request,
 )
+from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
@@ -27,7 +28,6 @@ from cayu.sessions.base import (
     SessionRunFenced,
     SessionStatus,
     SessionStore,
-    _invocation_lifecycle_authority_read_scope,
 )
 from cayu.vaults.redaction import SecretRedactor
 

@@ -355,10 +355,10 @@ async def terminalize_dispatched_model(
         if confirmed != active:
             raise SessionRunFenced("Active model stage changed during terminalization claim.")
         assert decision is not None
-        from cayu.sessions.base import (
-            _incomplete_recovery_claim_from_checkpoint,
+        from cayu.sessions._checkpoint_preservation import (
             _invocation_lifecycle_authority_mutation_scope,
         )
+        from cayu.sessions.base import _incomplete_recovery_claim_from_checkpoint
 
         def elect(
             current_session: Session, current_checkpoint: dict[str, Any] | None, now: datetime

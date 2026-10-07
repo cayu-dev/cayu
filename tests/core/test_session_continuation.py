@@ -1846,8 +1846,10 @@ async def _test_continuation_admission_uses_typed_lifecycle_boundary(
                 )
                 assert pending is not None and pending.consumption is not None
                 assert pending.consumption.receipt_stage == "prepared"
+                from cayu.sessions._checkpoint_preservation import (
+                    _invocation_lifecycle_authority_read_scope,
+                )
                 from cayu.sessions._session_continuation_store import ROOT_KEY
-                from cayu.sessions.base import _invocation_lifecycle_authority_read_scope
 
                 def generic_read(_session, current):
                     assert current is not None and ROOT_KEY not in current

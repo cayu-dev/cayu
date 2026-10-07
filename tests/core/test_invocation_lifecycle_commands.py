@@ -72,6 +72,7 @@ from cayu.runtime.execution_profiles import (
     checkpoint_with_active_invocation_execution_profile,
 )
 from cayu.runtime.loop_policies import LoopPolicy
+from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _invocation_lifecycle as invocation_contracts_module
 from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
 from cayu.sessions.base import (
@@ -1207,7 +1208,7 @@ async def _assert_invocation_command_conformance(store, suffix: str) -> None:
         updated.pop(ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY)
         return updated
 
-    with sessions_module._invocation_lifecycle_authority_mutation_scope():
+    with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
         await store.transform_checkpoint(missing_profile_session_id, remove_active_profile)
     corrupted_checkpoint = await store.load_checkpoint(missing_profile_session_id)
     assert corrupted_checkpoint is not None
@@ -1499,7 +1500,7 @@ class _MissingProfileAfterRecoveryClaimStore(InMemorySessionStore):
             return updated
 
         self.corrupted_after_claim_renewal = True
-        with sessions_module._invocation_lifecycle_authority_mutation_scope():
+        with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
             await InMemorySessionStore.transform_checkpoint(
                 self,
                 session_id,
@@ -1684,7 +1685,7 @@ async def _assert_generic_checkpoint_replacements_preserve_authority(
     def install_future_checkpoint(_session, _current):
         return future_checkpoint
 
-    with sessions_module._invocation_lifecycle_authority_mutation_scope():
+    with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
         await raw_store.transform_checkpoint(session_id, install_future_checkpoint)
 
     for callback_result in (None, {"ordinary": "replacement"}):
@@ -1902,7 +1903,7 @@ def test_lifecycle_receipt_replay_rejects_digest_valid_forged_result() -> None:
                 )
                 return updated
 
-            with sessions_module._invocation_lifecycle_authority_mutation_scope():
+            with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
                 await store.transform_checkpoint(
                     command.session_id,
                     install_forged_receipt,
@@ -2324,7 +2325,7 @@ async def _assert_v4_active_profile_migration_fails_closed(raw_store, suffix: st
     # Version 4 exposed this root to generic writers. Seed that historical
     # representation directly and prove that migration does not reinterpret it
     # as positive release authority.
-    with sessions_module._invocation_lifecycle_authority_mutation_scope():
+    with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
         await raw_store.transform_checkpoint(session_id, replace_with_ambiguous_v4)
 
     migrated = await store.load_checkpoint(session_id)
@@ -2344,7 +2345,7 @@ async def _assert_v4_active_profile_migration_fails_closed(raw_store, suffix: st
         updated.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY, None)
         return updated
 
-    with sessions_module._invocation_lifecycle_authority_mutation_scope():
+    with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
         await raw_store.transform_checkpoint(session_id, delete_v4_lifecycle_roots)
     migrated = await store.load_checkpoint(session_id)
     assert migrated is not None
@@ -2521,7 +2522,7 @@ def test_public_resume_rejects_ambiguous_v4_release_state(
                 updated.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY, None)
                 return updated
 
-            with sessions_module._invocation_lifecycle_authority_mutation_scope():
+            with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
                 await raw_store.transform_checkpoint(session_id, replace_with_v4)
             versioned_store = runtime_checkpoint_session_store(raw_store)
             migrated = await versioned_store.load_checkpoint(session_id)
@@ -2731,7 +2732,7 @@ def test_runtime_checkpoint_adapter_owns_command_codec_and_rejects_v4_collision(
             }
             return updated
 
-        with sessions_module._invocation_lifecycle_authority_mutation_scope():
+        with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
             await raw_store.transform_checkpoint(
                 collision.session_id,
                 replace_with_v4_collision,
@@ -2813,7 +2814,7 @@ def test_runtime_checkpoint_adapter_wraps_store_time_event_publication() -> None
 
         future = dict(migrated)
         future[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION + 1
-        with sessions_module._invocation_lifecycle_authority_mutation_scope():
+        with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
             await raw_store.checkpoint(session_id, future)
         callback_called = False
 
@@ -2910,7 +2911,7 @@ def test_runtime_atomic_snapshot_persists_only_an_actual_schema_migration() -> N
                     "ordinary": "preserved",
                 }
 
-            with sessions_module._invocation_lifecycle_authority_mutation_scope():
+            with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
                 await raw_store.transform_checkpoint(
                     command.session_id,
                     install_v4_checkpoint,

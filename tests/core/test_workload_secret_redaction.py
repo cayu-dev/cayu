@@ -48,6 +48,7 @@ from cayu.runners.base import (
 from cayu.runners.local import LocalRunner
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
+from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
@@ -3724,7 +3725,7 @@ def test_fork_profile_resolution_does_not_retain_rejected_checkpoint() -> None:
         # Simulate a malformed value returned by a defective/custom store.
         # Generic checkpoint writers intentionally cannot mutate this private
         # authority root.
-        with sessions_module._invocation_lifecycle_authority_mutation_scope():
+        with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
             await store.checkpoint(
                 source_id,
                 {
@@ -3763,7 +3764,7 @@ def test_atomic_fork_profile_recheck_does_not_retain_changed_checkpoint(
             # Inject corruption after the runtime preflight while preserving
             # the production rule that generic checkpoint writers cannot
             # mutate lifecycle authority.
-            with sessions_module._invocation_lifecycle_authority_mutation_scope():
+            with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
                 await self.checkpoint(
                     source_id,
                     {

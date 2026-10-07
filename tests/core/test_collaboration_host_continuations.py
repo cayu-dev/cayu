@@ -323,10 +323,12 @@ async def test_host_discovers_and_recovers_public_park_after_reopen(
                 assert exact.ticket.state == "CONSUMED"
                 if advance_before_reconcile:
                     from cayu.sessions import _invocation_lifecycle
+                    from cayu.sessions._checkpoint_preservation import (
+                        _invocation_lifecycle_authority_read_scope,
+                    )
                     from cayu.sessions._invocation_lifecycle import (
                         _invocation_lifecycle_receipt_ledger_from_checkpoint,
                     )
-                    from cayu.sessions.base import _invocation_lifecycle_authority_read_scope
 
                     # Two original receipts plus the next admission/release
                     # exactly fill this window. The second successor forces

@@ -46,6 +46,7 @@ from cayu.runtime._durable_subagents import (
     require_durable_subagent_rejection_receipt_matches_seed,
 )
 from cayu.runtime.build_provenance import RuntimeBuildProvenance
+from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
     execution_profile_from_session_metadata,
@@ -59,7 +60,6 @@ from cayu.sessions.base import (
     SessionRunFenced,
     SessionStatus,
     SessionStore,
-    _invocation_lifecycle_authority_read_scope,
     _queued_dispatch_session_instance_fingerprint,
     _session_run_operation_from_checkpoint,
     copy_run_request,

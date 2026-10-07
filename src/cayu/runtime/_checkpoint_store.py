@@ -27,6 +27,11 @@ from cayu._validation import copy_durable_json_object
 from cayu.execution_profiles import (
     ExecutionProfileIdentity,
 )
+from cayu.sessions._checkpoint_preservation import (
+    _copy_checkpoint_for_transform,
+    _invocation_lifecycle_authority_read_scope,
+    _replace_checkpoint_preserving_completion_result_event_publications,
+)
 from cayu.sessions.base import (
     CheckpointRootFieldGuard,
     CheckpointTransform,
@@ -42,9 +47,6 @@ from cayu.sessions.base import (
     SessionStore,
     StoreTimeCheckpointTransform,
     _apply_runtime_publication_checkpoint_mutation,
-    _copy_checkpoint_for_transform,
-    _invocation_lifecycle_authority_read_scope,
-    _replace_checkpoint_preserving_completion_result_event_publications,
     _runtime_publication_checkpoint_codec_scope,
     _session_continuation_methods_owned,
     _session_export_methods_owned,

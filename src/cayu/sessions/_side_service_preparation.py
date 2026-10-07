@@ -62,14 +62,16 @@ def plan_preparation(
     snapshots: dict[str, SidePreparationSnapshot],
     now: datetime,
 ) -> dict[str, SessionOperationPublication]:
+    from cayu.sessions._checkpoint_preservation import (
+        _checkpoint_transform_result_preserving_completion_result_event_publications,
+        _copy_checkpoint_for_transform,
+        _invocation_lifecycle_authority_read_scope,
+    )
     from cayu.sessions._session_continuation_store import ROOT_KEY
     from cayu.sessions._temporary_continuation_store import publish_service_record
     from cayu.sessions._temporary_service_target import publish_target_record
     from cayu.sessions.base import (
         SessionOperationPublication,
-        _checkpoint_transform_result_preserving_completion_result_event_publications,
-        _copy_checkpoint_for_transform,
-        _invocation_lifecycle_authority_read_scope,
         _validate_session_operation_record_keys,
     )
 

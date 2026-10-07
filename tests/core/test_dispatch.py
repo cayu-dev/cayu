@@ -64,6 +64,7 @@ from cayu.runtime.public_authority import (
     PublicAuthorityAliasKeyring,
 )
 from cayu.sessions import _pending_tool_round as pending_rounds
+from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_mutation_scope
 from cayu.sessions.base import (
     EventQuery,
     ForkSessionRequest,
@@ -82,7 +83,6 @@ from cayu.sessions.base import (
     SessionStatusConflict,
     _checkpoint_with_session_run_operation,
     _fork_initial_invocation_request_sha256,
-    _invocation_lifecycle_authority_mutation_scope,
     fork_source_state_sha256,
     fork_source_transcript_sha256,
     session_fork_profile_relationship,

@@ -11,13 +11,13 @@ from cayu.collaboration._producer_registration import producer_launch_guard
 from cayu.collaboration._request_coordinator import _safe_request_failure
 from cayu.collaboration.mandates import MandateAccessContext
 from cayu.collaboration.prepared_admission import FreshRecipientAdmissionTarget
+from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
 from cayu.sessions._producer_checkpoint import (
     ROOT_KEY,
     NativeProducerAttachment,
     NativeProducerIndex,
     attachment_index,
 )
-from cayu.sessions.base import _invocation_lifecycle_authority_read_scope
 from cayu.sessions.checkpoints import decode_runtime_checkpoint
 
 if TYPE_CHECKING:

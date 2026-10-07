@@ -20,8 +20,8 @@ from unittest.mock import patch
 import pytest
 from pydantic import SecretStr, ValidationError
 
-import cayu.sessions.base as sessions_module
 from cayu.configuration import MAX_STEPS
+from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 
 fastapi = pytest.importorskip("fastapi")
 pytest.importorskip("sse_starlette")
@@ -5760,7 +5760,7 @@ def test_server_pending_actions_reports_future_checkpoint_without_exposing_conte
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
         await app.session_store.update_status(session_id, SessionStatus.INTERRUPTED)
-        with sessions_module._invocation_lifecycle_authority_mutation_scope():
+        with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
             await app.session_store.checkpoint(
                 session_id,
                 {

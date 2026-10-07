@@ -426,6 +426,15 @@ single composition root.
 
 ### Session checkpoint evidence
 
+`sessions/_checkpoint_preservation.py` owns callback-visible checkpoint copies,
+protected-root preservation and the shared lifecycle/workspace authority scopes.
+The runtime adapter and native stores use this same owner, which composes the
+existing browser, producer, continuation and collaboration-export rules and the
+schema decoder in `sessions/checkpoints.py`. Callback state stays detached and
+restored private roots count toward the full document limit. Runtime admission
+checks and native memory locks, SQLite writer transactions and PostgreSQL
+transactions remain with their existing owners.
+
 `providers/retry_policy.py` owns immutable retry configuration, its default status
 codes and the policy validation helper. Saved tool rounds, approvals and runtime
 share the same policy class. Supported root and runtime imports resolve to that

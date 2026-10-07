@@ -199,6 +199,7 @@ from cayu.runtime._invocation_lifecycle import (
 from cayu.runtime._tool_execution_requirements import effective_execution_requirements
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
 from cayu.sessions import _completion_finalization as completion_finalization
+from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
@@ -232,7 +233,6 @@ from cayu.sessions.base import (
     _deactivate_session_run_fence,
     _incomplete_recovery_claim_from_checkpoint,
     _initial_transcript_pending_interaction_id,
-    _invocation_lifecycle_authority_read_scope,
     _session_run_operation_from_checkpoint,
     session_user_metadata,
 )

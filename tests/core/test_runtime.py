@@ -262,6 +262,7 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyResult,
 )
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
+from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
@@ -34430,7 +34431,7 @@ def test_terminal_recovery_rejects_receipt_history_without_active_profile() -> N
         assert INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY in checkpoint
         corrupted = dict(checkpoint)
         corrupted.pop(execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY)
-        with sessions_module._invocation_lifecycle_authority_mutation_scope():
+        with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
             await store.checkpoint(session_id, corrupted)
         before = await store.load_events(session_id)
 

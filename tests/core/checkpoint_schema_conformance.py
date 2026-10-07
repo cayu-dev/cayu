@@ -5,7 +5,6 @@ from collections.abc import AsyncIterator
 import pytest
 from tests.core._execution_profile_fixtures import create_admitted_session
 
-import cayu.sessions.base as sessions_module
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.approvals.user_input import AmbiguousUserInputPauseAuthorityError, UserInputResponse
@@ -19,6 +18,7 @@ from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
 )
+from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import (
     IncompleteSessionRecoveryAction,
@@ -191,7 +191,7 @@ async def assert_reserved_checkpoint_key_migration_conformance(
     # Model durable legacy state directly. The public generic checkpoint
     # entrance is intentionally unable to downgrade or replace current private
     # lifecycle authority.
-    with sessions_module._invocation_lifecycle_authority_mutation_scope():
+    with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
         await store.checkpoint(session_id, legacy)
 
     migrated = await runtime_checkpoint_session_store(store).load_checkpoint(session_id)
@@ -363,7 +363,7 @@ async def assert_versionless_pending_continuation_fails_closed_conformance(
     versionless["future_additive_field"] = {"kept": True}
     # Model a pre-upgrade durable checkpoint rather than a generic mutation:
     # current generic writes preserve both lifecycle roots and their schema.
-    with sessions_module._invocation_lifecycle_authority_mutation_scope():
+    with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
         await store.checkpoint(session_id, versionless)
     pending = await _app(
         store,
@@ -485,7 +485,7 @@ async def assert_future_checkpoint_rejection_conformance(
     future[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION + 1
     # Model durable state written by a future runtime. Generic checkpoint
     # replacement cannot overwrite current lifecycle schema provenance.
-    with sessions_module._invocation_lifecycle_authority_mutation_scope():
+    with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
         await store.checkpoint(session_id, future)
 
     provider = _CompleteProvider()

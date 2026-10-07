@@ -223,6 +223,7 @@ from cayu.runtime.provider_operations import (
 )
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.runtime.session_message_lifecycle import SessionMessageQueueStatus
+from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
@@ -23442,7 +23443,7 @@ def test_session_store_conformance_rejects_future_checkpoint_before_operation_lo
                 operation_transform=transform,
                 events=[],
             )
-            with sessions_module._invocation_lifecycle_authority_mutation_scope():
+            with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
                 await store.checkpoint(
                     created.id,
                     {
@@ -24840,7 +24841,7 @@ def test_session_store_conformance_rejects_future_checkpoint_before_marker_proje
                 ),
                 identity=_identity(),
             )
-            with sessions_module._invocation_lifecycle_authority_mutation_scope():
+            with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
                 await store.checkpoint(
                     session_id,
                     {
@@ -25530,7 +25531,7 @@ def test_session_store_conformance_rejects_future_checkpoint_before_initial_tran
             assert checkpoint is not None
             checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION + 1
             checkpoint["private_checkpoint_detail"] = "must-not-be-reported"
-            with sessions_module._invocation_lifecycle_authority_mutation_scope():
+            with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
                 await store.checkpoint(session.id, checkpoint)
 
             runtime_store = CayuApp(
@@ -25868,7 +25869,7 @@ def test_session_store_conformance_terminal_decision_publishes_exact_event_pair_
                 interruption_request_id=interruption_request_id,
             )
 
-            with sessions_module._invocation_lifecycle_authority_mutation_scope():
+            with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
                 await store.publish_checkpoint_and_events(
                     session_id,
                     checkpoint_transform=lambda _session, checkpoint: (
@@ -26195,7 +26196,7 @@ def test_session_store_conformance_terminal_decision_rejects_profile_drift(
                 interruption_request_id=interruption_request_id,
             )
 
-            with sessions_module._invocation_lifecycle_authority_mutation_scope():
+            with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
                 await store.publish_checkpoint_and_events(
                     session_id,
                     checkpoint_transform=lambda _session, checkpoint: (

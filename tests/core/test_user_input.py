@@ -16,7 +16,6 @@ from tests.core._execution_profile_fixtures import (
     rebind_test_invocation,
 )
 
-import cayu.sessions.base as sessions_module
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.approvals.tools import ToolApprovalRecoveryOutcome
@@ -47,6 +46,7 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileMismatchError,
     active_invocation_execution_profile_from_checkpoint,
 )
+from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions.base import (
     EventQuery,
     ForkSessionRequest,
@@ -708,7 +708,7 @@ def test_resolve_user_input_rejects_versionless_root_with_reserved_authority() -
         assert versionless is not None
         versionless.pop(CHECKPOINT_SCHEMA_VERSION_KEY, None)
         versionless["future_additive_field"] = {"kept": True}
-        with sessions_module._invocation_lifecycle_authority_mutation_scope():
+        with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
             await store.checkpoint(session_id, versionless)
 
         with pytest.raises(AmbiguousUserInputPauseAuthorityError):
@@ -764,7 +764,7 @@ def test_future_root_checkpoint_blocks_user_input_resume_before_governed_work() 
         future_checkpoint = await store.load_checkpoint(session_id)
         assert future_checkpoint is not None
         future_checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION + 1
-        with sessions_module._invocation_lifecycle_authority_mutation_scope():
+        with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
             await store.checkpoint(session_id, future_checkpoint)
 
         with pytest.raises(CheckpointCompatibilityError) as caught:

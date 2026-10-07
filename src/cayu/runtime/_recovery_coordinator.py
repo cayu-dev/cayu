@@ -385,6 +385,10 @@ from cayu.runtime.tool_effects import (
 )
 from cayu.sessions import _model_completion_publication as model_completion_publication
 from cayu.sessions import _tool_call_evidence as tool_call_evidence
+from cayu.sessions._checkpoint_preservation import (
+    _invocation_lifecycle_authority_read_scope,
+    _workspace_observation_authority_mutation_scope,
+)
 from cayu.sessions._durable_operation_ownership import DurableOperationOwnership
 from cayu.sessions._execution_profile_checkpoint import (
     EXECUTION_PROFILE_METADATA_KEY,
@@ -456,12 +460,10 @@ from cayu.sessions.base import (
     _event_with_session_run_operation,
     _incomplete_recovery_claim_from_checkpoint,
     _initial_transcript_pending_interaction_id,
-    _invocation_lifecycle_authority_read_scope,
     _model_completion_stage_promotion_statuses,
     _queued_dispatch_session_instance_fingerprint,
     _session_run_operation_from_checkpoint,
     _SessionRunOperation,
-    _workspace_observation_authority_mutation_scope,
     copy_interaction_transition_spec,
     runtime_publication_checkpoint_value_digest,
 )

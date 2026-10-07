@@ -280,7 +280,9 @@ def test_terminalization_preserves_ordinary_resume_admission(store):
 def test_pending_evidence_never_uses_profile_independent_terminalization(store, key):
     async def exercise():
         await _orphan(store)
-        from cayu.sessions.base import _workspace_observation_authority_mutation_scope
+        from cayu.sessions._checkpoint_preservation import (
+            _workspace_observation_authority_mutation_scope,
+        )
 
         with _workspace_observation_authority_mutation_scope():
             await runtime_checkpoint_session_store(store).transform_checkpoint(

@@ -6,7 +6,6 @@ import json
 
 import pytest
 
-import cayu.sessions.base as sessions_module
 import cayu.storage.jsonl_export as jsonl_export_module
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
@@ -15,6 +14,7 @@ from cayu._validation import (
 )
 from cayu.events import Event, EventType
 from cayu.messages import Message
+from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
@@ -455,7 +455,7 @@ def test_session_export_and_import_reject_future_root_checkpoint_versions() -> N
             ),
             identity=_identity(),
         )
-        with sessions_module._invocation_lifecycle_authority_mutation_scope():
+        with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
             await store.checkpoint(
                 "sess_future_export",
                 {

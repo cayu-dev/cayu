@@ -92,6 +92,7 @@ from cayu.runtime.execution_profiles import (
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
+from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_mutation_scope
 from cayu.sessions.base import (
     EventQuery,
     ForkExecutionProfileSelection,
@@ -111,7 +112,6 @@ from cayu.sessions.base import (
     SessionStatus,
     SessionStatusConflict,
     SessionStore,
-    _invocation_lifecycle_authority_mutation_scope,
     session_fork_profile_relationship,
     session_prompt_anatomy_transition,
 )

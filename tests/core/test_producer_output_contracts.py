@@ -384,10 +384,8 @@ async def test_output_contract_from_real_admission_is_bounded_and_non_dispatchin
         NativeProducerAttachment,
         attachment_index,
     )
-    from cayu.sessions.base import (
-        SessionOperationPublication,
-        _invocation_lifecycle_authority_read_scope,
-    )
+    from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
+    from cayu.sessions.base import SessionOperationPublication
 
     native = NativeProducerAttachment.from_registration(record)
     index = attachment_index(native)
@@ -680,7 +678,7 @@ async def test_registered_producer_enters_native_participant_runtime(
     from cayu.collaboration._contracts import ExactUnavailable
     from cayu.events import EventType
     from cayu.runtime._producer_output_store import ROOT_KEY, NativeProducerIndex
-    from cayu.sessions.base import _invocation_lifecycle_authority_read_scope
+    from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
 
     events = []
     execution_reader = None
