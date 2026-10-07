@@ -89,7 +89,7 @@ def test_new_safe_server_wording_and_code_survive_json_output(
         ("attempt", True),
         ("diagnostic_ref", "https://provider.invalid/private"),
         ("code", "provider/code"),
-        ("phase", []),
+        ("diagnostic_ref", "smoke_tested:attempt-2"),
     ],
 )
 def test_malformed_or_unsafe_contract_has_safe_actionable_fallback(
@@ -247,3 +247,190 @@ def test_cloud_database_publication_failures_parse_as_versioned_diagnostics(
     }
     assert parse_build_failure(payload) == payload
     assert wait_error(Client(payload)).failure == payload
+
+
+def smoke_failure(stage: object) -> dict[str, Any]:
+    """Cloud's release smoke-test failure, as Cloud's timeline reports it."""
+
+    return {
+        "schema_version": 1,
+        "code": "release_smoke_failed",
+        "phase": "smoke_tested",
+        "message": "The release smoke test failed.",
+        "detail": "Cloud's credential-free check failed inside the release sandbox.",
+        "hint": "Inspect the deployment diagnostics. Provider checks are Cloud-owned; do not "
+        "add unrelated provider credentials to the Agent.",
+        "automatic_retryable": True,
+        "attempt": None,
+        "diagnostic_ref": None,
+        "diagnostic": {
+            "status": "unavailable",
+            "stage": stage,
+            "exit_code": None,
+            "reason": "not_applicable",
+            "excerpt": "",
+            "truncated": False,
+        },
+    }
+
+
+def test_smoke_stage_failure_keeps_message_hint_and_stage(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    payload = smoke_failure("smoke_test")
+    assert parse_build_failure(payload) == payload
+    error = wait_error(Client(payload))
+    assert cloud._cloud_failure(error) == 2
+    result = json.loads(capsys.readouterr().out)["error"]
+    assert result["category"] == "release_smoke_failed"
+    assert result["message"] == "The release smoke test failed."
+    assert result["failure"] == payload
+    assert result["failure"]["diagnostic"]["stage"] == "smoke_test"
+    assert "diagnostic_status" not in result
+    assert set(result["commands"]) == {"logs", "timeline", "retry"}
+
+
+@pytest.mark.parametrize(
+    "stage,shown",
+    [
+        ("release_verification", "release_verification"),
+        ("Smoke Test", "unknown"),
+        ("https://provider.invalid/stage", "unknown"),
+        (None, "unknown"),
+        ([], "unknown"),
+    ],
+)
+def test_unknown_stage_keeps_the_failure(stage: object, shown: str) -> None:
+    payload = smoke_failure(stage)
+    expected = copy.deepcopy(payload)
+    expected["diagnostic"]["stage"] = shown
+    assert parse_build_failure(payload) == expected
+    assert wait_error(Client(payload)).failure == expected
+    result = cloud._validated_deployment_diagnostics(
+        {"diagnostics": [payload], "next_diagnostic_offset": None}
+    )
+    assert result == {"diagnostics": [expected], "next_diagnostic_offset": None}
+
+
+def test_missing_stage_is_reported_as_unknown() -> None:
+    payload = smoke_failure("smoke_test")
+    del payload["diagnostic"]["stage"]
+    parsed = parse_build_failure(payload)
+    assert parsed is not None
+    assert parsed["diagnostic"]["stage"] == "unknown"
+    assert parsed["hint"] == payload["hint"]
+
+
+@pytest.mark.parametrize("field", ["phase", "stage"])
+@pytest.mark.parametrize(
+    "private_value",
+    [
+        "ghp_credentialcanary123456",
+        "github_pat_credentialcanary123456",
+        "sk_credentialcanary123456",
+        "cloudwatch",
+        "a" * 64,
+    ],
+)
+def test_private_identifiers_are_not_published(
+    field: str, private_value: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    payload = failure()
+    expected = copy.deepcopy(payload)
+    if field == "phase":
+        payload.update(phase=private_value, diagnostic_ref=f"{private_value}:attempt-2")
+        expected.update(phase="unknown", diagnostic_ref=None)
+    else:
+        payload["diagnostic"]["stage"] = private_value
+        expected["diagnostic"]["stage"] = "unknown"
+
+    error = wait_error(Client(payload))
+    assert cloud._cloud_failure(error) == 2
+    rendered = capsys.readouterr().out
+    result = json.loads(rendered)["error"]
+    assert result["failure"] == expected
+    assert result["category"] == expected["code"]
+    assert result["message"] == expected["message"]
+    assert private_value not in rendered
+
+    diagnostics = cloud._validated_deployment_diagnostics(
+        {"failure": payload, "diagnostics": [payload], "next_diagnostic_offset": None}
+    )
+    assert diagnostics == {
+        "failure": expected,
+        "diagnostics": [expected],
+        "next_diagnostic_offset": None,
+    }
+    assert private_value not in json.dumps(diagnostics)
+
+
+@pytest.mark.parametrize(
+    "stage", ["source_validation", "docker_build", "image_build", "database_migration"]
+)
+def test_existing_stages_are_unchanged(stage: str) -> None:
+    payload = failure()
+    payload["diagnostic"]["stage"] = stage
+    assert parse_build_failure(payload) == payload
+
+
+@pytest.mark.parametrize(
+    "phase,shown",
+    [
+        ("release_verified", "release_verified"),
+        ("Image Built", "unknown"),
+        ("https://provider.invalid/phase", "unknown"),
+        (None, "unknown"),
+        ([], "unknown"),
+    ],
+)
+def test_unknown_phase_keeps_the_failure(
+    phase: object, shown: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    payload = failure()
+    payload["phase"] = phase
+    payload["diagnostic_ref"] = f"{phase}:attempt-2" if shown == phase else None
+    expected = copy.deepcopy(payload)
+    expected["phase"] = shown
+    assert parse_build_failure(payload) == expected
+    error = wait_error(Client(payload))
+    assert cloud._cloud_failure(error) == 2
+    rendered = capsys.readouterr().out
+    result = json.loads(rendered)["error"]
+    assert result["category"] == "new_build_error"
+    assert result["message"] == payload["message"]
+    assert result["failure"] == expected
+    assert "diagnostic_status" not in result
+    assert "provider.invalid" not in rendered
+
+
+def test_missing_phase_is_unknown_and_drops_its_unverifiable_reference() -> None:
+    payload = failure()
+    del payload["phase"]
+    parsed = parse_build_failure(payload)
+    assert parsed is not None
+    assert parsed["phase"] == "unknown"
+    assert parsed["diagnostic_ref"] is None
+    assert (parsed["code"], parsed["message"], parsed["hint"]) == (
+        payload["code"],
+        payload["message"],
+        payload["hint"],
+    )
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "source_resolved",
+        "image_built",
+        "image_scanned",
+        "sandbox_template_ready",
+        "policy_compiled",
+        "smoke_tested",
+        "database_provisioned",
+        "database_migrated",
+    ],
+)
+def test_existing_phases_are_unchanged(phase: str) -> None:
+    payload = failure()
+    payload.update(phase=phase, diagnostic_ref=f"{phase}:attempt-2")
+    assert parse_build_failure(payload) == payload

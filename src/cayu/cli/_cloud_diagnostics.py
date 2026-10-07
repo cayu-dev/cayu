@@ -20,17 +20,6 @@ class CloudDeploymentFailure(TypedDict):
     diagnostic: NotRequired[dict[str, object]]
 
 
-_PHASES = {
-    "source_resolved",
-    "image_built",
-    "image_scanned",
-    "sandbox_template_ready",
-    "policy_compiled",
-    "smoke_tested",
-    # Cloud's service-publication phases for Agents that declare a database.
-    "database_provisioned",
-    "database_migrated",
-}
 _PRIVATE = re.compile(
     r"(?:[a-z][a-z0-9+.-]*://|arn:|\b[A-Za-z_][A-Za-z0-9_]*\s*=|"
     r"\b(?:sk|ghp|gho|github_pat|AKIA|ASIA)[_-]?[A-Za-z0-9_-]{8,}|"
@@ -39,6 +28,26 @@ _PRIVATE = re.compile(
     r"\b(?:CodeBuild|CloudWatch)\b|[A-Za-z0-9_+/-]{64,})",
     re.I,
 )
+_IDENTIFIER = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+def _identifier_or_unknown(value: object) -> str:
+    """Cloud's failure phase or diagnostic stage, kept even when this CLI doesn't know it.
+
+    Known phases are Cloud's release phases (`source_resolved`, `image_built`,
+    `image_scanned`, `sandbox_template_ready`, `policy_compiled`, `smoke_tested`,
+    `database_provisioned`, `database_migrated`). Known stages are
+    `source_validation`, `docker_build`, `image_build`, `database_migration` and
+    `smoke_test` (the deployment timeline's key for the release smoke test). Cloud adds
+    both over time, and an unfamiliar value must never hide the failure, its message or
+    its hint, so an identifier that passes the private-text filter is kept as given
+    and anything else is `unknown`.
+    """
+
+    identifier = safe_text(value, 64)
+    if identifier is not None and _IDENTIFIER.fullmatch(identifier) is not None:
+        return identifier
+    return "unknown"
 
 
 def safe_text(
@@ -68,7 +77,8 @@ def parse_build_failure(value: object) -> CloudDeploymentFailure | None:
     if type(version) is not int or version != 1:
         return None
     code = safe_text(candidate.get("code"), 64)
-    phase = candidate.get("phase")
+    raw_phase = candidate.get("phase")
+    phase = _identifier_or_unknown(raw_phase)
     detail = safe_text(candidate.get("detail"), 4096, multiline=True)
     hint = safe_text(candidate.get("hint"), 1024)
     message = safe_text(candidate.get("message"), 512)
@@ -76,8 +86,6 @@ def parse_build_failure(value: object) -> CloudDeploymentFailure | None:
     if (
         code is None
         or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code) is None
-        or not isinstance(phase, str)
-        or phase not in _PHASES
         or detail is None
         or hint is None
         or message is None
@@ -88,6 +96,9 @@ def parse_build_failure(value: object) -> CloudDeploymentFailure | None:
     reference = candidate.get("diagnostic_ref")
     if attempt is not None and (type(attempt) is not int or not 1 <= attempt <= 1_000_000):
         return None
+    if phase != raw_phase:
+        # The reference names the phase; without a usable phase it can't be checked.
+        reference = None
     if reference is not None and (
         not isinstance(reference, str)
         or attempt is None
@@ -98,15 +109,14 @@ def parse_build_failure(value: object) -> CloudDeploymentFailure | None:
     if not isinstance(diagnostic, dict):
         return None
     raw = cast("dict[str, object]", diagnostic)
-    status, stage, reason = raw.get("status"), raw.get("stage"), raw.get("reason")
+    status, reason = raw.get("status"), raw.get("reason")
+    stage = _identifier_or_unknown(raw.get("stage"))
     excerpt = safe_text(raw.get("excerpt"), 4096, multiline=True, empty=True)
     exit_code = raw.get("exit_code")
     truncated = raw.get("truncated")
     if (
         not isinstance(status, str)
         or status not in {"available", "unavailable", "withheld"}
-        or not isinstance(stage, str)
-        or stage not in {"source_validation", "docker_build", "image_build", "database_migration"}
         or (
             reason is not None
             and (not isinstance(reason, str) or re.fullmatch(r"[a-z_]{1,64}", reason) is None)

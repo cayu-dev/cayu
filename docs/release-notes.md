@@ -19,6 +19,12 @@
   exact `--acknowledge-breaking` retry. `deployment wait` no longer reports a
   release whose publication failed as ready. `cayu cloud rollback --wait` waits for
   the service and reports a refused rollback across a storage boundary.
+- `cayu cloud deploy`, `deployment wait` and `deployment logs` keep a Cloud failure
+  whose phase or diagnostic stage this CLI doesn't know, with its code, message and
+  hint, instead of falling back to the generic `deployment_failed` result. The phase
+  and stage are shown as Cloud sent them, or `unknown` when missing, not a lowercase
+  identifier, or unsafe to print. `smoke_test` is a known stage for release smoke-test
+  failures. See [the Cayu Cloud CLI guide](cayu-cloud.md).
 
 ### Cloud-hosted Agents upgrading from v0.8.x
 

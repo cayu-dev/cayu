@@ -205,10 +205,22 @@ Supported schema-version-1 failures preserve safe structured details without req
 specific English wording: code, phase, summary, repair hint, retry classification, attempt,
 and diagnostic reference. Structured failures also include the application/deployment
 identifiers and a logs command, including when evidence is unavailable or truncated.
-`failure.diagnostic` includes evidence status/reason, build stage,
+`failure.diagnostic` includes evidence status/reason, pipeline stage,
 exit code, a bounded redacted excerpt, and a truncation flag. Invalid, unsupported, oversized,
 or unsafe payloads are withheld rather than printed. Older unversioned safe failures remain
 supported through the existing compatibility projection.
+
+`failure.diagnostic.stage` names where the release failed: `source_validation`,
+`docker_build`, `image_build`, `database_migration`, or `smoke_test` for the release smoke
+test (the same name as the `smoke_test` step in `deployment timeline`). A smoke-test failure
+has no build output, so its evidence status is `unavailable` with reason `not_applicable`;
+read `failure.detail` for the check that failed and `deployment timeline` for the steps.
+Cloud may add phases and stages later. The CLI keeps a failure with an unfamiliar
+`failure.phase` or `failure.diagnostic.stage`, including its code, message and hint, and
+shows the value as Cloud sent it, or `unknown` when it is missing, isn't a lowercase
+identifier, or fails the private-text filter. When the CLI normalizes a phase to `unknown`,
+it drops `diagnostic_ref`, because the reference names the phase. Earlier CLIs dropped
+such a failure and reported only the generic `deployment_failed` result.
 
 Read explicit evidence noninteractively:
 
