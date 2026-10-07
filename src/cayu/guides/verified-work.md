@@ -208,10 +208,17 @@ For durable stores, give `SQLiteSessionStore` a stable
 verify workspace aliases written before it. The worker never closes stores. Use
 it as an async context manager; if closing reports `VerifiedTaskWorkerDraining`,
 alone or inside an exception group, keep the worker and its stores and retry
-`aclose()` until it returns. A cancellation is reported as a cancellation, so
-treat a cancelled worker's stores the same way the application treats any
-cancelled operation that may still have work in flight. Close the worker before
-`app.aclose()`, which waits for an attempt still executing before its stores can
+`aclose()` until it returns. A cancellation is reported as a cancellation; when
+the worker still owns work at that point, `VerifiedTaskWorkerDraining` is in the
+cancellation's cause chain: directly, inside an exception group, or under a
+nested cancellation when `async with` combines the body's cancellation with the
+close's. Search group members and cancellation causes before closing the stores,
+as `_still_draining` in `examples/durable_file_workflow/verified.py` does. Retry
+from a task that is not being cancelled: while the work is still owned, a retry
+inside the cancelled task is cancelled again and reports draining again. The
+example's `DemoOwner` keeps such a worker with its stores, finishes the drain in
+a task of its own, shuts its apps down, and only then closes the stores. Close
+the worker before `app.aclose()`, which waits for an attempt still executing before its stores can
 close. A worker left running stops claiming once the app closes, and an attempt
 cut off by shutdown records no terminal outcome, so recovery resumes it.
 

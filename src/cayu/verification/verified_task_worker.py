@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, TypeVar
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from cayu._exception_groups import exception_cause
+from cayu._exception_groups import exception_cause, iter_exception_tree
 from cayu._task_wait import (
     CapturedAwaitableOutcome,
     await_shielded_task_outcome,
@@ -180,6 +180,32 @@ class VerifiedTaskHandler(ABC):
 
 class VerifiedTaskWorkerDraining(RuntimeError):
     """Owned work is still settling; retain the worker and retry aclose()."""
+
+
+_OWNED_WORK_DRAINING = (
+    "Owned verified task work is still draining; keep stores open and retry aclose()."
+)
+
+
+def _carries_draining_report(error: BaseException) -> bool:
+    """Whether a caller's documented check already finds a draining report.
+
+    Follows exception-group members and cancellation causes, where the guide
+    tells callers to look; an ordinary error's cause is not part of that check.
+    """
+    pending, seen = [error], set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, VerifiedTaskWorkerDraining):
+            return True
+        pending.extend(item for item in iter_exception_tree(current) if item is not current)
+        cause = exception_cause(current)
+        if isinstance(current, asyncio.CancelledError) and cause is not None:
+            pending.append(cause)
+    return False
 
 
 class _LeaseOwner:
@@ -788,8 +814,12 @@ class VerifiedTaskWorker:
         failure = None
         try:
             await self._close_running(self.callback_timeout_seconds)
-        except (asyncio.CancelledError, VerifiedTaskWorkerDraining):
+        except VerifiedTaskWorkerDraining:
             raise
+        except asyncio.CancelledError as cancellation:
+            # Cancellation stops close without awaiting the remaining steps.
+            failure = self._report_retained_ownership(cancellation)
+            raise failure from exception_cause(failure)
         except BaseException as error:
             failure = error
         try:
@@ -811,7 +841,31 @@ class VerifiedTaskWorker:
         except BaseException as error:
             failure = merge_owned_failures(failure, error)
         if failure is not None:
+            failure = self._report_retained_ownership(failure)
             raise failure from exception_cause(failure)
+
+    def _report_retained_ownership(self, failure: BaseException) -> BaseException:
+        """Keep a cancellation outermost while reporting work close still owns.
+
+        Decided without awaiting, so reporting cannot delay or absorb the
+        cancellation; a later aclose() settles the retained work.
+        """
+        if not isinstance(failure, asyncio.CancelledError) or _carries_draining_report(failure):
+            return failure
+        running = self._running
+        if (
+            (running is None or running.done())
+            and self._verification is None
+            and self._preparation_settlement is None
+            and self._pre_entry_settlement is None
+        ):
+            return failure
+        merged = merge_owned_failures(
+            failure,
+            VerifiedTaskWorkerDraining(_OWNED_WORK_DRAINING),
+        )
+        assert merged is not None
+        return merged
 
     async def _close_running(self, timeout_s: float) -> None:
         running = self._running
@@ -835,9 +889,7 @@ class VerifiedTaskWorker:
             assert failure is not None
             raise failure from exception_cause(failure)
         if outcome.timed_out:
-            raise VerifiedTaskWorkerDraining(
-                "Owned verified task work is still draining; keep stores open and retry aclose()."
-            )
+            raise VerifiedTaskWorkerDraining(_OWNED_WORK_DRAINING)
         if failure is not None:
             raise failure
 

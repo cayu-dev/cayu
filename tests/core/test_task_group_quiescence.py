@@ -919,7 +919,12 @@ async def test_drained_preparation_retains_settlement_before_election(store, mon
 async def test_successful_preparation_retains_proof_before_admission(
     store, monkeypatch, failure, commit_ack
 ):
-    from tests.core.test_verified_task_worker import _contract, _RecordingProvider, _StaticHandler
+    from tests.core.test_verified_task_worker import (
+        _contract,
+        _draining_reports,
+        _RecordingProvider,
+        _StaticHandler,
+    )
 
     from cayu import AgentSpec
     from cayu.runtime.verified_task_worker import VerifiedTaskWorker, VerifiedTaskWorkerDraining
@@ -1029,6 +1034,14 @@ async def test_successful_preparation_retains_proof_before_admission(
             assert running.cancelling() == (2 if failure == "repeated_cancel" else 1)
             if admission_boundary:
                 assert retained.admission is not None
+                closing = asyncio.create_task(owner.aclose())
+                await asyncio.sleep(0)
+                closing.cancel("stop close")
+                with pytest.raises(asyncio.CancelledError) as caught:
+                    await closing
+                assert caught.value.args == ("stop close",)
+                assert closing.cancelled() and closing.cancelling() == 1
+                assert len(_draining_reports(caught.value)) == 1
                 with pytest.raises(VerifiedTaskWorkerDraining):
                     await owner.aclose()
                 assert not retained.admission.operation.done()
@@ -3293,7 +3306,12 @@ async def test_pre_entry_cleanup_waits_for_competing_terminal_sink(
 ):
     from datetime import UTC, datetime
 
-    from tests.core.test_verified_task_worker import _contract, _RecordingProvider, _StaticHandler
+    from tests.core.test_verified_task_worker import (
+        _contract,
+        _draining_reports,
+        _RecordingProvider,
+        _StaticHandler,
+    )
 
     from cayu import AgentSpec, Message, RunRequest
     from cayu.events import EventType
@@ -3383,6 +3401,15 @@ async def test_pre_entry_cleanup_waits_for_competing_terminal_sink(
                     await running
                 assert running.cancelled() and running.cancelling() == 1
                 assert owner._pre_entry_publication is not None
+                assert not owner._pre_entry_publication.done()
+                closing = asyncio.create_task(owner.aclose())
+                await asyncio.sleep(0)
+                closing.cancel("stop close")
+                with pytest.raises(asyncio.CancelledError) as caught:
+                    await closing
+                assert caught.value.args == ("stop close",)
+                assert closing.cancelled() and closing.cancelling() == 1
+                assert len(_draining_reports(caught.value)) == 1
                 assert not owner._pre_entry_publication.done()
             with pytest.raises(
                 WorkAttemptRecoveryRequired, match="terminal handoff is not settled"

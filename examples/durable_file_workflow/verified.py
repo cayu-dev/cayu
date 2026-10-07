@@ -13,12 +13,13 @@ import base64
 import hashlib
 import json
 import secrets
+import shutil
 import sys
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import mkdtemp
 from typing import Any
 
 from examples.durable_file_workflow.file_worker import (
@@ -768,10 +769,17 @@ async def _close_stores(
     sessions: InMemorySessionStore | SQLiteSessionStore,
     tasks: InMemoryTaskStore | SQLiteTaskStore,
 ) -> None:
-    if isinstance(tasks, SQLiteTaskStore):
-        await tasks.close()
-    if isinstance(sessions, SQLiteSessionStore):
-        await sessions.close()
+    failures: list[Exception] = []
+    for store in (tasks, sessions):
+        if isinstance(store, (SQLiteTaskStore, SQLiteSessionStore)):
+            try:
+                await store.close()
+            except Exception as error:
+                failures.append(error)
+    if len(failures) == 1:
+        raise failures[0]
+    if failures:
+        raise ExceptionGroup("Closing the demo's stores failed", failures)
 
 
 CLOSE_ATTEMPTS = 3
@@ -803,7 +811,8 @@ async def _finish_draining(worker: VerifiedTaskWorker) -> None:
 
     The worker contract says to keep a draining worker and its stores and retry.
     If it never finishes, the last draining report propagates and the caller must
-    not close the stores.
+    not close the stores. If the retrying task is cancelled, the cancellation
+    propagates, carrying a draining report while the work is still owned.
     """
 
     for attempt in range(1, CLOSE_ATTEMPTS + 1):
@@ -811,11 +820,18 @@ async def _finish_draining(worker: VerifiedTaskWorker) -> None:
             await worker.aclose()
             return
         except BaseException as error:
-            if attempt == CLOSE_ATTEMPTS or not _still_draining(error):
+            # A retry inside a cancelled task would be cancelled again.
+            if (
+                attempt == CLOSE_ATTEMPTS
+                or isinstance(error, asyncio.CancelledError)
+                or not _still_draining(error)
+            ):
                 raise
 
 
-async def _run_worker(app: CayuApp, handler: FileArtifactHandler, worker_id: str) -> None:
+async def _run_worker(
+    app: CayuApp, handler: FileArtifactHandler, worker_id: str, owner: DemoOwner
+) -> None:
     worker = VerifiedTaskWorker(app, handler, worker_id=worker_id, poll_interval_s=0.01)
     try:
         async with worker:
@@ -823,31 +839,68 @@ async def _run_worker(app: CayuApp, handler: FileArtifactHandler, worker_id: str
     except BaseException as error:
         if not _still_draining(error):
             raise
+        if isinstance(error, asyncio.CancelledError):
+            # A retry inside this cancelled task would be cancelled again, so the
+            # owner finishes the drain from its own task.
+            owner.retain(worker)
+            raise
         try:
             await _finish_draining(worker)
         except BaseException as close_error:
-            # Keep a cancellation outermost, carrying the unfinished drain as its
-            # cause so callers still see that work remains in flight.
-            if isinstance(error, asyncio.CancelledError):
-                raise error from close_error
+            if _still_draining(close_error):
+                # Once the owner finishes the drain it reports the run's own failure.
+                owner.retain(worker, run_failure=_run_failure(error))
             raise
-        # The worker has now closed. A cancellation still propagates, without the
-        # drain it carried, since that work has settled; otherwise report only what
-        # the run itself raised.
-        if isinstance(error, asyncio.CancelledError):
-            cause = error.__cause__
-            if isinstance(cause, BaseExceptionGroup):
-                _, cause = cause.split(VerifiedTaskWorkerDraining)
-            elif isinstance(cause, VerifiedTaskWorkerDraining):
-                cause = None
-            raise error from cause
-        if isinstance(error, BaseExceptionGroup):
-            _, remaining = error.split(VerifiedTaskWorkerDraining)
-            if remaining is not None:
-                # Re-raise unchanged, keeping each failure's own cause.
-                if len(remaining.exceptions) == 1:
-                    raise remaining.exceptions[0]  # noqa: B904
-                raise remaining  # noqa: B904
+        # The worker has now closed; report only what the run itself raised,
+        # unchanged, keeping each failure's own cause.
+        failure = _run_failure(error)
+        if failure is not None:
+            # Its implicit context is the handled error, which already holds this
+            # failure; hide it so the failure is printed once.
+            failure.__suppress_context__ = True
+            raise failure  # noqa: B904
+
+
+def _run_failure(error: BaseException) -> BaseException | None:
+    """What the run itself raised, without the worker's draining reports."""
+
+    if isinstance(error, VerifiedTaskWorkerDraining):
+        return None
+    if isinstance(error, BaseExceptionGroup):
+        _, remaining = error.split(VerifiedTaskWorkerDraining)
+        if remaining is None:
+            return None
+        return remaining.exceptions[0] if len(remaining.exceptions) == 1 else remaining
+    return error
+
+
+def _reachable(root: BaseException, target: BaseException) -> bool:
+    """Whether `target` is `root`, a member of its groups, or in its cause chain."""
+
+    pending, seen = [root], set()
+    while pending:
+        current = pending.pop()
+        if current is target:
+            return True
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+    return False
+
+
+def _attach_failure(cancellation: asyncio.CancelledError, failure: BaseException) -> None:
+    """Keep a settlement failure on a cancellation without hiding its cause."""
+
+    cause = cancellation.__cause__
+    cancellation.__cause__ = (
+        failure
+        if cause is None
+        else BaseExceptionGroup("The demo's cancellation causes", [cause, failure])
+    )
 
 
 async def _attempt_history(tasks: InMemoryTaskStore | SQLiteTaskStore) -> tuple[AttemptRecord, ...]:
@@ -899,6 +952,201 @@ async def _attempt_history(tasks: InMemoryTaskStore | SQLiteTaskStore) -> tuple[
     return tuple(reversed(records))
 
 
+class DemoNotSettled(RuntimeError):
+    """The demo's owner has not settled; keep its stores until `owner.settle()` succeeds.
+
+    It carries the owner, so a caller that did not create it can settle later.
+    A settlement failure, if one stopped it, is its cause.
+    """
+
+    def __init__(self, owner: DemoOwner, reason: str) -> None:
+        super().__init__(f"The demo has not settled: {reason}.")
+        self.owner = owner
+
+
+class DemoOwner:
+    """Owns the demo's stores, apps and any worker left draining until they settle.
+
+    A worker that still owns in-flight work must keep its stores open and be
+    closed again later. The owner keeps that worker and settles in order: it
+    finishes the worker's drain, shuts each app down, and only then closes the
+    stores. On exit it settles in a task of its own, because a retry inside a
+    cancelled task would be cancelled again. A cancellation stays authoritative,
+    including one received while settling, which then carries the run's outcome
+    as its cause; otherwise the run's own failure is
+    reported, and once a retained worker has finished draining it replaces the
+    stale draining report. If settling has not finished, a `DemoNotSettled`
+    carrying the owner travels with the outcome, with any settlement failure as
+    its cause, so even a caller that did not create the owner can settle later.
+    Until `settle()` returns True, `settled` stays False: the stores are not
+    closed (unless closing them is what failed) and the demo's files must be kept.
+    """
+
+    def __init__(self, base_root: Path, *, store: str = "memory") -> None:
+        self.base_root = base_root
+        self.store = store
+        self.alias_codec = demo_alias_codec()
+        self.sessions, self.tasks = _open_stores(store, base_root / "state", self.alias_codec)
+        self.settled = False
+        # Why the last settle() returned False or failed, for the caller to report.
+        self.unsettled: str | None = None
+        self._apps: list[CayuApp] = []
+        self._draining: VerifiedTaskWorker | None = None
+        self._retained = False
+        self._run_failure: BaseException | None = None
+
+    def adopt(self, app: CayuApp) -> CayuApp:
+        self._apps.append(app)
+        return app
+
+    def retain(
+        self, worker: VerifiedTaskWorker, *, run_failure: BaseException | None = None
+    ) -> None:
+        self._draining = worker
+        self._retained = True
+        self._run_failure = run_failure
+
+    async def reopen_stores(self) -> None:
+        """Simulate a restart: freshly opened stores over the same durable state."""
+
+        if not await self._close_apps():
+            raise RuntimeError("The app did not shut down before the restart.")
+        await _close_stores(self.sessions, self.tasks)
+        self.sessions, self.tasks = _open_stores(
+            self.store, self.base_root / "state", self.alias_codec
+        )
+
+    async def settle(self) -> bool:
+        """Finish the drain, shut the apps down, then close the stores; repeatable."""
+
+        if self.settled:
+            return True
+        worker = self._draining
+        if worker is not None:
+            try:
+                await _finish_draining(worker)
+            except asyncio.CancelledError:
+                self.unsettled = "settling was cancelled"
+                raise
+            except BaseException as error:
+                if not _still_draining(error):
+                    self.unsettled = "closing the worker failed"
+                    raise
+                self.unsettled = "the worker still owns in-flight work"
+                return False
+            self._draining = None
+        try:
+            apps_settled = await self._close_apps()
+        except BaseException:
+            self.unsettled = "shutting an app down failed"
+            raise
+        if not apps_settled:
+            self.unsettled = "an app has not finished shutting down"
+            return False
+        try:
+            await _close_stores(self.sessions, self.tasks)
+        except BaseException:
+            self.unsettled = "closing the stores failed"
+            raise
+        self.settled = True
+        self.unsettled = None
+        return True
+
+    async def _close_apps(self) -> bool:
+        while self._apps:
+            if not (await self._apps[-1].aclose()).settled:
+                return False
+            self._apps.pop()
+        return True
+
+    async def __aenter__(self) -> DemoOwner:
+        return self
+
+    async def __aexit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object
+    ) -> None:
+        settlement = asyncio.create_task(self.settle())
+        interrupted: asyncio.CancelledError | None = None
+        while not settlement.done():
+            try:
+                await asyncio.wait({settlement})
+            except asyncio.CancelledError as cancellation:
+                # Settlement is bounded (the worker's close attempts, then each
+                # app's shutdown timeout), so keep waiting rather than abandon the
+                # stores; the cancellation is raised afterwards.
+                interrupted = interrupted or cancellation
+        if settlement.cancelled():
+            # Only the settlement's own work cancelled it, not the caller.
+            failure: BaseException | None = RuntimeError("Settling the demo was cancelled.")
+        else:
+            failure = settlement.exception()
+        # An owner that has not settled is always handed over, so the caller can
+        # settle it later; a settlement failure is the handoff's cause.
+        problem: BaseException | None = None
+        if not self.settled:
+            problem = DemoNotSettled(self, self.unsettled or "settling did not finish")
+            problem.__cause__ = failure
+        reported = exc
+        if (
+            exc is not None
+            and not isinstance(exc, asyncio.CancelledError)
+            and self._retained
+            and self._draining is None
+            and _still_draining(exc)
+        ):
+            # The drain it reported has finished: report what the run itself raised.
+            reported = self._run_failure or RuntimeError(
+                "The demo stopped while its worker was draining; the worker has since settled."
+            )
+        cancellation = exc if isinstance(exc, asyncio.CancelledError) else interrupted
+        if cancellation is not None:
+            # A cancellation carries the run's outcome beside any settlement problem:
+            # the outcome it interrupted while settling, or a run failure retained
+            # when it interrupted the run's own close retry. A printed traceback
+            # shows an explicit cause but hides the implicit context.
+            outcome = self._run_failure if cancellation is exc else reported
+            carried = [
+                item
+                for item in (outcome, problem)
+                if item is not None and not _reachable(cancellation, item)
+            ]
+            if carried:
+                _attach_failure(
+                    cancellation,
+                    carried[0]
+                    if len(carried) == 1
+                    else BaseExceptionGroup("The demo's outcome when cancelled", carried),
+                )
+            if cancellation is not exc:
+                raise cancellation
+            return
+        if problem is not None:
+            if reported is None:
+                raise problem
+            raise BaseExceptionGroup("The demo failed and did not settle", [reported, problem])
+        if reported is not None and reported is not exc:
+            if reported is self._run_failure:
+                # Its implicit context, the stale draining report, already holds it.
+                reported.__suppress_context__ = True
+            raise reported
+
+    async def run(
+        self,
+        *,
+        lose_acknowledgement: bool = True,
+        provider: GapAwareProvider | None = None,
+        limits: RunLimits | None = None,
+    ) -> VerifiedDemoResult:
+        workspaces = SessionWorkspaces(self.base_root / "workspaces")
+        parts = Components(
+            workspaces=workspaces,
+            provider=provider or GapAwareProvider(),
+            handler=FileArtifactHandler(workspaces, limits),
+            resolver=ArtifactResultResolver(workspaces),
+        )
+        return await _run_demo(self, parts, lose_acknowledgement=lose_acknowledgement)
+
+
 async def run_demo(
     base_root: Path,
     *,
@@ -907,103 +1155,96 @@ async def run_demo(
     provider: GapAwareProvider | None = None,
     limits: RunLimits | None = None,
 ) -> VerifiedDemoResult:
-    alias_codec = demo_alias_codec()
-    sessions, tasks = _open_stores(store, base_root / "state", alias_codec)
-    workspaces = SessionWorkspaces(base_root / "workspaces")
-    parts = Components(
-        workspaces=workspaces,
-        provider=provider or GapAwareProvider(),
-        handler=FileArtifactHandler(workspaces, limits),
-        resolver=ArtifactResultResolver(workspaces),
+    """Run the demo once; its owner settles before returning, or reports why not."""
+
+    async with DemoOwner(base_root, store=store) as owner:
+        return await owner.run(
+            lose_acknowledgement=lose_acknowledgement, provider=provider, limits=limits
+        )
+
+
+async def _run_demo(
+    owner: DemoOwner, parts: Components, *, lose_acknowledgement: bool
+) -> VerifiedDemoResult:
+    sessions, tasks = owner.sessions, owner.tasks
+    app = owner.adopt(build_app(sessions, tasks, parts))
+    if lose_acknowledgement:
+        lose_proposal_acknowledgement(app, on_proposal=2)
+    contract = await app.create_work_contract(build_contract_draft())
+    await app.create_task(
+        TaskCreate(
+            task_id=TASK_ID,
+            type="transform_file",
+            input={"source_text": SOURCE_TEXT},
+            work_contract=contract.reference(),
+        )
     )
-    keep_stores_open = False
+    interrupted_by: str | None = None
     try:
-        app = build_app(sessions, tasks, parts)
-        if lose_acknowledgement:
-            lose_proposal_acknowledgement(app, on_proposal=2)
-        contract = await app.create_work_contract(build_contract_draft())
-        await app.create_task(
-            TaskCreate(
+        await _run_worker(app, parts.handler, "worker-before-restart", owner)
+    except ConnectionError as error:
+        interrupted_by = str(error)
+    admission = await tasks.load_latest_work_attempt_admission(TASK_ID)
+    if admission is None:
+        raise RuntimeError("The worker never admitted an attempt.")
+    session_id = admission.session_id
+    attempts_before_restart = await _attempt_history(tasks)
+    provider_calls_before_restart = len(parts.provider.requests)
+    effects_before_restart = await parts.workspaces.effect_count(session_id)
+
+    if interrupted_by is not None:
+        # Simulate a restart: a fresh app, and for SQLite freshly opened stores,
+        # recovering the same task from durable evidence alone.
+        if owner.store != "memory":
+            await owner.reopen_stores()
+            sessions, tasks = owner.sessions, owner.tasks
+        app = owner.adopt(build_app(sessions, tasks, parts))
+        await _run_worker(app, parts.handler, "worker-after-restart", owner)
+
+    task = await tasks.load_task(TASK_ID)
+    latest = await tasks.load_latest_work_attempt_admission(TASK_ID)
+    if task is None or latest is None:
+        raise RuntimeError("Demo task disappeared.")
+    attempts = await _attempt_history(tasks)
+    accepted = attempts[-1].application if attempts[-1].verdict == "accepted" else None
+    # Asking again with the same idempotency key replays the stored outcome; it
+    # neither calls the resolver nor applies a second decision.
+    replayed_task = (
+        await app.resolve_completion_result(
+            CompletionResultResolutionRequest(
                 task_id=TASK_ID,
-                type="transform_file",
-                input={"source_text": SOURCE_TEXT},
-                work_contract=contract.reference(),
+                decision_id=accepted.decision_id,
+                idempotency_key=accepted.idempotency_key,
             )
         )
-        interrupted_by: str | None = None
-        try:
-            await _run_worker(app, parts.handler, "worker-before-restart")
-        except ConnectionError as error:
-            interrupted_by = str(error)
-        admission = await tasks.load_latest_work_attempt_admission(TASK_ID)
-        if admission is None:
-            raise RuntimeError("The worker never admitted an attempt.")
-        session_id = admission.session_id
-        attempts_before_restart = await _attempt_history(tasks)
-        provider_calls_before_restart = len(parts.provider.requests)
-        effects_before_restart = await parts.workspaces.effect_count(session_id)
-
-        if interrupted_by is not None:
-            # Simulate a restart: a fresh app, and for SQLite freshly opened stores,
-            # recovering the same task from durable evidence alone.
-            if store != "memory":
-                await _close_stores(sessions, tasks)
-                sessions, tasks = _open_stores(store, base_root / "state", alias_codec)
-            app = build_app(sessions, tasks, parts)
-            await _run_worker(app, parts.handler, "worker-after-restart")
-
-        task = await tasks.load_task(TASK_ID)
-        latest = await tasks.load_latest_work_attempt_admission(TASK_ID)
-        if task is None or latest is None:
-            raise RuntimeError("Demo task disappeared.")
-        attempts = await _attempt_history(tasks)
-        accepted = attempts[-1].application if attempts[-1].verdict == "accepted" else None
-        # Asking again with the same idempotency key replays the stored outcome; it
-        # neither calls the resolver nor applies a second decision.
-        replayed_task = (
-            await app.resolve_completion_result(
-                CompletionResultResolutionRequest(
-                    task_id=TASK_ID,
-                    decision_id=accepted.decision_id,
-                    idempotency_key=accepted.idempotency_key,
-                )
-            )
-            if accepted is not None
-            else None
-        )
-        receipt = await tasks.load_work_attempt_lifecycle_receipt(latest.admission_id)
-        resolved = await sessions.query_events(
-            EventQuery(session_id=session_id, event_type=EventType.TASK_COMPLETION_RESULT_RESOLVED)
-        )
-        return VerifiedDemoResult(
-            task=task,
-            attempts=attempts,
-            attempts_before_restart=attempts_before_restart,
-            replayed_task=replayed_task,
-            interrupted_by=interrupted_by,
-            session_id=session_id,
-            binding_retired=receipt is not None and receipt.retired_contract_binding,
-            active_contract_task=await tasks.load_active_work_contract_task_for_session(session_id),
-            unsettled_admissions=len(await tasks.list_unsettled_work_attempt_admissions()),
-            resolved_events=len(resolved),
-            received_continuations=tuple(parts.provider.received_continuations),
-            provider_calls_before_restart=provider_calls_before_restart,
-            provider_calls=len(parts.provider.requests),
-            effects_before_restart=effects_before_restart,
-            effects=await parts.workspaces.effect_count(session_id),
-            verifier_calls=sum(verifier.calls for verifier in parts.verifiers),
-            resolver_calls=parts.resolver.calls,
-            preparations=parts.handler.preparations,
-            proposals=parts.handler.proposals,
-        )
-    except BaseException as error:
-        # A worker that never finished draining still owns in-flight work, so its
-        # stores must stay open; closing them could strand that work.
-        keep_stores_open = _still_draining(error)
-        raise
-    finally:
-        if not keep_stores_open:
-            await _close_stores(sessions, tasks)
+        if accepted is not None
+        else None
+    )
+    receipt = await tasks.load_work_attempt_lifecycle_receipt(latest.admission_id)
+    resolved = await sessions.query_events(
+        EventQuery(session_id=session_id, event_type=EventType.TASK_COMPLETION_RESULT_RESOLVED)
+    )
+    return VerifiedDemoResult(
+        task=task,
+        attempts=attempts,
+        attempts_before_restart=attempts_before_restart,
+        replayed_task=replayed_task,
+        interrupted_by=interrupted_by,
+        session_id=session_id,
+        binding_retired=receipt is not None and receipt.retired_contract_binding,
+        active_contract_task=await tasks.load_active_work_contract_task_for_session(session_id),
+        unsettled_admissions=len(await tasks.list_unsettled_work_attempt_admissions()),
+        resolved_events=len(resolved),
+        received_continuations=tuple(parts.provider.received_continuations),
+        provider_calls_before_restart=provider_calls_before_restart,
+        provider_calls=len(parts.provider.requests),
+        effects_before_restart=effects_before_restart,
+        effects=await parts.workspaces.effect_count(session_id),
+        verifier_calls=sum(verifier.calls for verifier in parts.verifiers),
+        resolver_calls=parts.resolver.calls,
+        preparations=parts.handler.preparations,
+        proposals=parts.handler.proposals,
+    )
 
 
 def durable_evidence_preserved(
@@ -1065,8 +1306,19 @@ async def main() -> None:
     parser = argparse.ArgumentParser(description="Run the contract-verified file workflow.")
     parser.add_argument("--store", choices=("memory", "sqlite"), default="memory")
     args = parser.parse_args()
-    with TemporaryDirectory(prefix="cayu-verified-file-") as temp:
-        print_timeline(await run_demo(Path(temp), store=args.store))
+    root = Path(mkdtemp(prefix="cayu-verified-file-"))
+    owner = DemoOwner(root, store=args.store)
+    try:
+        async with owner:
+            print_timeline(await owner.run())
+    finally:
+        # Remove the demo's files only once the worker, the apps and the stores
+        # have all settled, so nothing can still be using them.
+        if owner.settled:
+            shutil.rmtree(root)
+        else:
+            reason = owner.unsettled or "settling did not finish"
+            print(f"Keeping {root}: {reason}.", file=sys.stderr)
 
 
 if __name__ == "__main__":

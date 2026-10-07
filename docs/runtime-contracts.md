@@ -5995,7 +5995,16 @@ does not gain this continuation authority.
 Cancellation can return while owned cleanup drains. If `aclose()` raises
 `VerifiedTaskWorkerDraining`, retain the worker and its stores, then retry close
 after that work settles; do not close stores or treat the attempt as retryable
-merely because the caller stopped waiting. The worker does not own store closure.
+merely because the caller stopped waiting. A cancelled `aclose()` stays a
+`CancelledError`; when the worker still owns a running attempt, a retained
+verifier, or a retained preparation or pre-entry settlement, a
+`VerifiedTaskWorkerDraining` is reachable from that cancellation through
+exception-group members and cancellation causes (it can sit under the body's
+cancellation when `async with` exits, or beside an earlier failure in a group),
+with the same retention rule. A cancellation with no owned work left carries no
+draining report. While that work is still owned, a close retried inside the
+cancelled task is cancelled again and reports draining again, so retry from a
+task that is not being cancelled. The worker does not own store closure.
 
 ### Governed work-attempt admission
 

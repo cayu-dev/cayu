@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import stat
+import sys
+import tempfile
 import threading
+from types import SimpleNamespace
 
 import examples.durable_file_workflow.verified as verified
 import pytest
@@ -33,12 +36,14 @@ from examples.durable_file_workflow.verified import (
 )
 
 from cayu import (
+    CayuApp,
     CompletionResultReference,
     CompletionVerdict,
     CriterionOutcomeStatus,
     ExecutionProfileBehaviorIdentity,
     InMemoryTaskStore,
     RunLimits,
+    SQLiteSessionStore,
     SQLiteTaskStore,
     TaskStatus,
     VerifiedTaskWorker,
@@ -206,14 +211,7 @@ def test_stores_stay_open_until_a_draining_worker_closes(
 ) -> None:
     # Characterizes the example's handling of the shapes Cayu reports when closing
     # fails: a run error plus draining, or a cancellation carrying draining.
-    closed_stores: list[object] = []
-    real_close = SQLiteTaskStore.close
-
-    async def record_close(self) -> None:
-        closed_stores.append(self)
-        await real_close(self)
-
-    monkeypatch.setattr(SQLiteTaskStore, "close", record_close)
+    closed_stores = _record_store_closes(monkeypatch)
     close_attempts: list[int] = []
 
     class DrainingWorker(VerifiedTaskWorker):
@@ -229,15 +227,36 @@ def test_stores_stay_open_until_a_draining_worker_closes(
     monkeypatch.setattr(verified, "VerifiedTaskWorker", DrainingWorker)
 
     cancelled = run_failure is asyncio.CancelledError
-    if drains_forever:
-        # The stores are left open because the worker still owns in-flight work.
-        # A cancellation stays outermost and carries the unfinished drain.
-        expected = asyncio.CancelledError if cancelled else VerifiedTaskWorkerDraining
-        with pytest.raises(expected) as raised:
+    if cancelled:
+        # A retry inside the cancelled task would be cancelled again, so the owner
+        # finishes the drain from its own task; the cancellation still propagates,
+        # carrying the drain it reported.
+        with pytest.raises(asyncio.CancelledError) as raised:
             asyncio.run(run_demo(tmp_path, store="sqlite", lose_acknowledgement=False))
         assert verified._still_draining(raised.value)
-        # One close from `async with`, then the retries.
-        assert len(close_attempts) == 1 + verified.CLOSE_ATTEMPTS
+        if drains_forever:
+            # One close from `async with`, then the owner's retries; the worker
+            # still owns in-flight work, so the stores stay open.
+            assert len(close_attempts) == 1 + verified.CLOSE_ATTEMPTS
+            assert closed_stores == []
+        else:
+            # The owner's first retry settles, then the stores close.
+            assert len(close_attempts) == 2
+            assert sorted(closed_stores) == ["sessions", "tasks"]
+    elif drains_forever:
+        # The stores are left open because the worker still owns in-flight work,
+        # and the outcome says so beside the draining report.
+        with pytest.raises(BaseExceptionGroup) as raised:
+            asyncio.run(run_demo(tmp_path, store="sqlite", lose_acknowledgement=False))
+        assert verified._still_draining(raised.value)
+        assert raised.value.subgroup(
+            lambda error: (
+                isinstance(error, RuntimeError)
+                and "the worker still owns in-flight work" in str(error)
+            )
+        )
+        # One close from `async with`, the run's retries, then the owner's.
+        assert len(close_attempts) == 1 + 2 * verified.CLOSE_ATTEMPTS
         assert closed_stores == []
     else:
         # The retried close succeeds, so the run's own failure surfaces and the
@@ -245,7 +264,7 @@ def test_stores_stay_open_until_a_draining_worker_closes(
         with pytest.raises(run_failure):
             asyncio.run(run_demo(tmp_path, store="sqlite", lose_acknowledgement=False))
         assert len(close_attempts) == 2
-        assert len(closed_stores) == 1
+        assert sorted(closed_stores) == ["sessions", "tasks"]
 
 
 def _validate_against_contract(decision) -> None:
@@ -405,11 +424,324 @@ def test_cancelling_the_run_propagates_and_closes_the_stores(tmp_path, monkeypat
     task = asyncio.run(scenario())
 
     # Delivered through Task.cancel(): the run reports cancellation, not a
-    # converted error, and the stores close. This run has no owned work left in
-    # flight; if a verifier ignored cancellation, Cayu's aclose() would currently
-    # report only the cancellation, so the stores would close while it ran.
+    # converted error, and the stores close because no owned work is left in
+    # flight. A verifier still running is covered by the next test.
     assert task.cancelled()
     assert len(closed_stores) == 1
+
+
+def test_cancelling_a_close_retry_stops_retrying(monkeypatch) -> None:
+    close_attempts: list[int] = []
+
+    class DrainingWorker:
+        async def aclose(self) -> None:
+            # Like the real worker: a cancelled close still owning work raises
+            # the cancellation carrying a draining report.
+            close_attempts.append(1)
+            if len(close_attempts) == 1:
+                raise VerifiedTaskWorkerDraining("in-flight work is still settling")
+            try:
+                if len(close_attempts) == 2:
+                    await asyncio.Event().wait()
+                raise asyncio.CancelledError
+            except asyncio.CancelledError as cancellation:
+                raise cancellation from VerifiedTaskWorkerDraining("still settling")
+
+    async def scenario() -> None:
+        retrying = asyncio.create_task(verified._finish_draining(DrainingWorker()))
+        while len(close_attempts) < 2 and not retrying.done():
+            await asyncio.sleep(0)
+        # The plain draining report was retried, and that retry is still waiting.
+        assert not retrying.done()
+        retrying.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await retrying
+
+    asyncio.run(scenario())
+    # The cancelled retry is not retried again inside the cancelled task.
+    assert len(close_attempts) == 2
+
+
+def test_owner_settles_then_raises_a_cancellation_received_while_settling(tmp_path) -> None:
+    release = asyncio.Event()
+    close_attempts: list[int] = []
+
+    class DrainingWorker:
+        async def aclose(self) -> None:
+            close_attempts.append(1)
+            await release.wait()
+
+    async def scenario() -> verified.DemoOwner:
+        owner = verified.DemoOwner(tmp_path)
+        owner.retain(DrainingWorker())
+
+        async def leave() -> None:
+            async with owner:
+                pass
+
+        leaving = asyncio.create_task(leave())
+        while not close_attempts:
+            await asyncio.sleep(0)
+        leaving.cancel("stop while settling")
+        await asyncio.sleep(0)
+        # The owner keeps waiting for its bounded settlement, then reports the
+        # cancellation instead of dropping it.
+        assert not leaving.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await leaving
+        assert raised.value.args == ("stop while settling",)
+        assert leaving.cancelled()
+        return owner
+
+    owner = asyncio.run(scenario())
+    assert owner.settled
+    assert len(close_attempts) == 1
+
+
+def test_cancelled_cli_run_settles_before_removing_its_files(tmp_path, monkeypatch) -> None:
+    # Through the real entrance: only the verifier's behavior and the temporary
+    # directory's location are replaced, never a handle to the worker or stores.
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["verified.py", "--store", "sqlite"])
+    closed_stores = _record_store_closes(monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    real_verify = ExactArtifactVerifier.verify
+
+    async def resistant_verify(self, request):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.to_thread(release.wait)
+            return await real_verify(self, request)
+
+    monkeypatch.setattr(ExactArtifactVerifier, "verify", resistant_verify)
+
+    async def scenario() -> None:
+        run = asyncio.create_task(verified.main())
+        try:
+            await asyncio.to_thread(entered.wait, 120)
+            (root,) = tmp_path.glob("cayu-verified-file-*")
+            run.cancel()
+            # The verifier still owns in-flight work: its files and stores stay.
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+            assert not run.done()
+            assert (root / "state" / "tasks.sqlite").exists()
+            assert closed_stores == []
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await run
+        assert run.cancelled()
+        # Once the work settles, the owner closes each store once, then the files go.
+        assert sorted(closed_stores) == ["sessions", "tasks"]
+        assert not root.exists()
+
+    asyncio.run(scenario())
+
+
+def _record_store_closes(monkeypatch, events: list[str] | None = None) -> list[str]:
+    closed = [] if events is None else events
+    for store_type, name in ((SQLiteTaskStore, "tasks"), (SQLiteSessionStore, "sessions")):
+        real = store_type.close
+
+        async def record_close(self, real=real, name=name) -> None:
+            closed.append(name)
+            await real(self)
+
+        monkeypatch.setattr(store_type, "close", record_close)
+    return closed
+
+
+class _SettlingWorker:
+    """A worker whose close reports draining until `settles` is set."""
+
+    def __init__(self) -> None:
+        self.settles = False
+        self.closes = 0
+
+    async def aclose(self) -> None:
+        self.closes += 1
+        if not self.settles:
+            raise VerifiedTaskWorkerDraining("in-flight work is still settling")
+
+
+def test_a_run_failure_is_reported_once_the_owner_finishes_the_drain(tmp_path, monkeypatch) -> None:
+    closed_stores = _record_store_closes(monkeypatch)
+    close_attempts: list[int] = []
+
+    class DrainingWorker(VerifiedTaskWorker):
+        async def run(self, stop=None, max_tasks=None) -> int:
+            raise TimeoutError("the run timed out")
+
+        async def aclose(self) -> None:
+            close_attempts.append(1)
+            # Outlasts the run's own retries; the owner's first retry settles.
+            if len(close_attempts) <= 1 + verified.CLOSE_ATTEMPTS:
+                raise VerifiedTaskWorkerDraining("in-flight work is still settling")
+            await super().aclose()
+
+    monkeypatch.setattr(verified, "VerifiedTaskWorker", DrainingWorker)
+
+    with pytest.raises(TimeoutError, match="the run timed out") as raised:
+        asyncio.run(run_demo(tmp_path, store="sqlite", lose_acknowledgement=False))
+    assert _printed_once(raised.value, "TimeoutError: the run timed out")
+    assert len(close_attempts) == 2 + verified.CLOSE_ATTEMPTS
+    assert sorted(closed_stores) == ["sessions", "tasks"]
+
+
+def test_owner_shuts_each_app_down_before_closing_its_stores(tmp_path, monkeypatch) -> None:
+    events: list[str] = []
+    _record_store_closes(monkeypatch, events)
+    real_aclose = CayuApp.aclose
+
+    async def record_aclose(self, **kwargs):
+        outcome = await real_aclose(self, **kwargs)
+        events.append("app" if outcome.settled else "unsettled app")
+        return outcome
+
+    monkeypatch.setattr(CayuApp, "aclose", record_aclose)
+
+    asyncio.run(run_demo(tmp_path, store="sqlite"))
+
+    # The restart closes the first app before its stores, and the owner the second.
+    assert events == ["app", "tasks", "sessions", "app", "tasks", "sessions"]
+
+
+def test_owner_keeps_the_stores_while_an_app_has_not_shut_down(tmp_path, monkeypatch) -> None:
+    closed_stores = _record_store_closes(monkeypatch)
+    real_aclose = CayuApp.aclose
+    shutdown = {"settles": False}
+
+    async def unsettled_aclose(self, **kwargs):
+        outcome = await real_aclose(self, **kwargs)
+        return outcome if shutdown["settles"] else SimpleNamespace(settled=False)
+
+    monkeypatch.setattr(CayuApp, "aclose", unsettled_aclose)
+
+    async def scenario() -> None:
+        owner = verified.DemoOwner(tmp_path, store="sqlite")
+        with pytest.raises(RuntimeError, match="an app has not finished shutting down"):
+            async with owner:
+                await owner.run(lose_acknowledgement=False)
+        assert not owner.settled
+        assert closed_stores == []
+        # Settling is repeatable: once the app shuts down, the stores close.
+        shutdown["settles"] = True
+        assert await owner.settle()
+        assert sorted(closed_stores) == ["sessions", "tasks"]
+
+    asyncio.run(scenario())
+
+
+def test_owner_settle_can_be_retried_after_its_bounded_attempts(tmp_path, monkeypatch) -> None:
+    closed_stores = _record_store_closes(monkeypatch)
+
+    async def scenario() -> None:
+        owner = verified.DemoOwner(tmp_path, store="sqlite")
+        worker = _SettlingWorker()
+        owner.retain(worker)
+        with pytest.raises(RuntimeError, match="the worker still owns in-flight work"):
+            async with owner:
+                pass
+        assert not owner.settled
+        assert worker.closes == verified.CLOSE_ATTEMPTS
+        assert closed_stores == []
+        worker.settles = True
+        assert await owner.settle()
+        assert owner.settled and owner.unsettled is None
+        assert sorted(closed_stores) == ["sessions", "tasks"]
+        assert await owner.settle()
+        assert len(closed_stores) == 2
+
+    asyncio.run(scenario())
+
+
+def test_cli_keeps_its_files_when_the_drain_does_not_settle(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["verified.py", "--store", "sqlite"])
+    closed_stores = _record_store_closes(monkeypatch)
+
+    class DrainingWorker(VerifiedTaskWorker):
+        async def run(self, stop=None, max_tasks=None) -> int:
+            raise TimeoutError("the run timed out")
+
+        async def aclose(self) -> None:
+            raise VerifiedTaskWorkerDraining("in-flight work is still settling")
+
+    monkeypatch.setattr(verified, "VerifiedTaskWorker", DrainingWorker)
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        asyncio.run(verified.main())
+    assert verified._still_draining(raised.value)
+    (root,) = tmp_path.glob("cayu-verified-file-*")
+    assert (root / "state" / "tasks.sqlite").exists()
+    assert closed_stores == []
+    assert f"Keeping {root}: the worker still owns in-flight work." in capsys.readouterr().err
+
+
+def test_a_cancellation_keeps_a_settlement_failure_as_its_cause(tmp_path, monkeypatch) -> None:
+    close_failure = RuntimeError("closing the task store failed")
+
+    async def failing_close(self) -> None:
+        raise close_failure
+
+    monkeypatch.setattr(SQLiteTaskStore, "close", failing_close)
+    closed_sessions: list[object] = []
+    real_session_close = SQLiteSessionStore.close
+
+    async def record_session_close(self) -> None:
+        closed_sessions.append(self)
+        await real_session_close(self)
+
+    monkeypatch.setattr(SQLiteSessionStore, "close", record_session_close)
+
+    async def scenario() -> verified.DemoOwner:
+        owner = verified.DemoOwner(tmp_path, store="sqlite")
+
+        async def inside() -> None:
+            async with owner:
+                await asyncio.Event().wait()
+
+        running = asyncio.create_task(inside())
+        await asyncio.sleep(0)
+        running.cancel("stop the demo")
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await running
+        assert raised.value.args == ("stop the demo",)
+        handoff = raised.value.__cause__
+        assert isinstance(handoff, verified.DemoNotSettled) and handoff.owner is owner
+        assert handoff.__cause__ is close_failure
+        return owner
+
+    owner = asyncio.run(scenario())
+    assert not owner.settled
+    assert owner.unsettled == "closing the stores failed"
+    # The session store still closes although the task store failed to.
+    assert len(closed_sessions) == 1
+
+
+def test_a_run_failure_stays_beside_a_settlement_failure(tmp_path, monkeypatch) -> None:
+    close_failure = RuntimeError("closing the task store failed")
+
+    async def failing_close(self) -> None:
+        raise close_failure
+
+    monkeypatch.setattr(SQLiteTaskStore, "close", failing_close)
+    run_failure = ValueError("the run failed")
+
+    async def scenario() -> None:
+        with pytest.raises(BaseExceptionGroup) as raised:
+            async with verified.DemoOwner(tmp_path, store="sqlite"):
+                raise run_failure
+        reported, handoff = raised.value.exceptions
+        assert reported is run_failure
+        assert isinstance(handoff, verified.DemoNotSettled)
+        assert handoff.__cause__ is close_failure
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(
@@ -481,3 +813,278 @@ def test_a_proposal_claiming_a_different_result_is_rejected(tmp_path, monkeypatc
     assert set(result.attempts[0].gap_codes) == {RESULT_MISMATCH}
     assert result.resolver_calls == 0
     assert result.unsettled_admissions == 0
+
+
+def _failing_task_store_close(monkeypatch, failure: BaseException) -> None:
+    async def failing_close(self) -> None:
+        raise failure
+
+    monkeypatch.setattr(SQLiteTaskStore, "close", failing_close)
+
+
+def test_a_finished_drain_reports_the_run_failure_beside_a_settlement_failure(
+    tmp_path, monkeypatch
+) -> None:
+    close_failure = RuntimeError("closing the task store failed")
+    _failing_task_store_close(monkeypatch, close_failure)
+    run_failure = TimeoutError("the run timed out")
+
+    async def scenario() -> None:
+        owner = verified.DemoOwner(tmp_path, store="sqlite")
+        worker = _SettlingWorker()
+        worker.settles = True
+        owner.retain(worker, run_failure=run_failure)
+        with pytest.raises(BaseExceptionGroup) as raised:
+            async with owner:
+                raise VerifiedTaskWorkerDraining("reported before the drain finished")
+        # The drain finished, so the stale draining report gives way to the
+        # run's own failure, even though the stores did not close.
+        reported, handoff = raised.value.exceptions
+        assert reported is run_failure
+        assert isinstance(handoff, verified.DemoNotSettled)
+        assert handoff.__cause__ is close_failure
+
+    asyncio.run(scenario())
+
+
+def test_an_unsettled_owner_reports_beside_a_run_failure(tmp_path) -> None:
+    run_failure = ValueError("the run failed")
+
+    async def scenario() -> None:
+        owner = verified.DemoOwner(tmp_path, store="sqlite")
+        owner.retain(_SettlingWorker())
+        with pytest.raises(BaseExceptionGroup) as raised:
+            async with owner:
+                raise run_failure
+        first, unsettled = raised.value.exceptions
+        assert first is run_failure
+        assert isinstance(unsettled, RuntimeError)
+        assert "the worker still owns in-flight work" in str(unsettled)
+        owner._draining.settles = True
+        assert await owner.settle()
+
+    asyncio.run(scenario())
+
+
+def test_an_unsettled_owner_reports_on_a_cancellation(tmp_path) -> None:
+    async def scenario() -> None:
+        owner = verified.DemoOwner(tmp_path, store="sqlite")
+        worker = _SettlingWorker()
+        owner.retain(worker)
+
+        async def inside() -> None:
+            async with owner:
+                await asyncio.Event().wait()
+
+        running = asyncio.create_task(inside())
+        await asyncio.sleep(0)
+        running.cancel("stop the demo")
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await running
+        assert raised.value.args == ("stop the demo",)
+        assert isinstance(raised.value.__cause__, RuntimeError)
+        assert "the worker still owns in-flight work" in str(raised.value.__cause__)
+        worker.settles = True
+        assert await owner.settle()
+
+    asyncio.run(scenario())
+
+
+def test_a_failed_worker_close_is_named_as_the_reason(tmp_path) -> None:
+    close_failure = ValueError("the worker's close failed")
+
+    class FailingWorker:
+        async def aclose(self) -> None:
+            raise close_failure
+
+    async def scenario() -> verified.DemoOwner:
+        owner = verified.DemoOwner(tmp_path, store="sqlite")
+        owner.retain(FailingWorker())
+        with pytest.raises(verified.DemoNotSettled) as raised:
+            async with owner:
+                pass
+        assert raised.value.__cause__ is close_failure
+        return owner
+
+    owner = asyncio.run(scenario())
+    assert owner.unsettled == "closing the worker failed"
+    owner._draining = None
+    assert asyncio.run(owner.settle())
+
+
+def test_a_cancelled_settlement_does_not_replace_the_callers_cancellation(tmp_path) -> None:
+    class CancellingWorker:
+        async def aclose(self) -> None:
+            raise asyncio.CancelledError("raised by the worker's own close")
+
+    async def scenario() -> verified.DemoOwner:
+        owner = verified.DemoOwner(tmp_path, store="sqlite")
+        owner.retain(CancellingWorker())
+
+        async def inside() -> None:
+            async with owner:
+                await asyncio.Event().wait()
+
+        running = asyncio.create_task(inside())
+        await asyncio.sleep(0)
+        running.cancel("stop the demo")
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await running
+        # The caller's cancellation stays authoritative and names the failure.
+        assert raised.value.args == ("stop the demo",)
+        handoff = raised.value.__cause__
+        assert isinstance(handoff, verified.DemoNotSettled)
+        assert str(handoff.__cause__) == "Settling the demo was cancelled."
+        return owner
+
+    owner = asyncio.run(scenario())
+    assert owner.unsettled == "settling was cancelled"
+    owner._draining = None
+    assert asyncio.run(owner.settle())
+
+
+def test_a_cancellation_while_settling_keeps_the_run_failure_in_the_traceback(
+    tmp_path,
+) -> None:
+    import traceback
+
+    async def scenario() -> asyncio.CancelledError:
+        owner = verified.DemoOwner(tmp_path, store="sqlite")
+        worker = _SettlingWorker()
+        owner.retain(worker)
+        closing = asyncio.Event()
+        real_aclose = worker.aclose
+
+        async def slow_aclose() -> None:
+            closing.set()
+            await asyncio.sleep(0.05)
+            await real_aclose()
+
+        worker.aclose = slow_aclose
+
+        async def inside() -> None:
+            async with owner:
+                raise ValueError("the run failed")
+
+        running = asyncio.create_task(inside())
+        await closing.wait()
+        running.cancel("stop while settling")
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await running
+        worker.settles = True
+        assert await owner.settle()
+        return raised.value
+
+    cancellation = asyncio.run(scenario())
+    run_failure, unsettled = cancellation.__cause__.exceptions
+    assert str(run_failure) == "the run failed"
+    assert "the worker still owns in-flight work" in str(unsettled)
+    printed = "".join(traceback.format_exception(cancellation))
+    assert printed.count("ValueError: the run failed") == 1
+
+
+def test_run_demo_hands_an_unsettled_owner_to_its_caller(tmp_path, monkeypatch) -> None:
+    closed_stores = _record_store_closes(monkeypatch)
+    work = {"settles": False}
+
+    class DrainingWorker(VerifiedTaskWorker):
+        async def run(self, stop=None, max_tasks=None) -> int:
+            raise TimeoutError("the run timed out")
+
+        async def aclose(self) -> None:
+            if not work["settles"]:
+                raise VerifiedTaskWorkerDraining("in-flight work is still settling")
+            await super().aclose()
+
+    monkeypatch.setattr(verified, "VerifiedTaskWorker", DrainingWorker)
+
+    async def scenario() -> None:
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await run_demo(tmp_path, store="sqlite", lose_acknowledgement=False)
+        # The owner's bounded attempts ran out: the error hands the owner over.
+        handoffs = raised.value.subgroup(lambda error: isinstance(error, verified.DemoNotSettled))
+        assert handoffs is not None
+        (handoff,) = handoffs.exceptions
+        assert closed_stores == []
+        # The work finishes later; the caller settles it through the handed-over owner.
+        work["settles"] = True
+        assert await handoff.owner.settle()
+        assert sorted(closed_stores) == ["sessions", "tasks"]
+
+    asyncio.run(scenario())
+
+
+def test_a_cancellation_during_the_close_retry_keeps_the_run_failure(tmp_path, monkeypatch) -> None:
+    import traceback
+
+    close_attempts: list[int] = []
+
+    class DrainingWorker(VerifiedTaskWorker):
+        async def run(self, stop=None, max_tasks=None) -> int:
+            raise TimeoutError("the run timed out")
+
+        async def aclose(self) -> None:
+            close_attempts.append(1)
+            if len(close_attempts) == 1:
+                raise VerifiedTaskWorkerDraining("in-flight work is still settling")
+            if len(close_attempts) == 2:
+                # The run's own close retry, which the caller cancels. Like the
+                # real worker, the cancellation carries the draining report.
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError as cancellation:
+                    raise cancellation from VerifiedTaskWorkerDraining("still settling")
+            await super().aclose()
+
+    monkeypatch.setattr(verified, "VerifiedTaskWorker", DrainingWorker)
+
+    async def scenario() -> asyncio.CancelledError:
+        running = asyncio.create_task(
+            run_demo(tmp_path, store="sqlite", lose_acknowledgement=False)
+        )
+        while len(close_attempts) < 2 and not running.done():
+            await asyncio.sleep(0)
+        assert not running.done()
+        running.cancel("stop the demo")
+        try:
+            await running
+        except asyncio.CancelledError as error:
+            caught = error
+        else:
+            pytest.fail("An ordinary CancelledError handler must catch the cancellation.")
+        assert caught.args == ("stop the demo",)
+        assert running.cancelled()
+        return caught
+
+    cancellation = asyncio.run(scenario())
+    # The owner's retry settled the worker, and the run's failure stays visible once.
+    assert len(close_attempts) == 3
+    printed = "".join(traceback.format_exception(cancellation))
+    assert printed.count("TimeoutError: the run timed out") == 1
+
+
+def _printed_once(error: BaseException, line: str) -> bool:
+    import traceback
+
+    return "".join(traceback.format_exception(error)).count(line) == 1
+
+
+def test_a_run_failure_after_a_settled_close_retry_is_printed_once(tmp_path, monkeypatch) -> None:
+    close_attempts: list[int] = []
+
+    class DrainingWorker(VerifiedTaskWorker):
+        async def run(self, stop=None, max_tasks=None) -> int:
+            raise TimeoutError("the run timed out")
+
+        async def aclose(self) -> None:
+            close_attempts.append(1)
+            if len(close_attempts) == 1:
+                raise VerifiedTaskWorkerDraining("in-flight work is still settling")
+            await super().aclose()
+
+    monkeypatch.setattr(verified, "VerifiedTaskWorker", DrainingWorker)
+
+    with pytest.raises(TimeoutError, match="the run timed out") as raised:
+        asyncio.run(run_demo(tmp_path, store="sqlite", lose_acknowledgement=False))
+    assert len(close_attempts) == 2
+    assert _printed_once(raised.value, "TimeoutError: the run timed out")

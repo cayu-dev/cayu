@@ -5171,6 +5171,408 @@ def test_worker_close_cancellation_preserves_settled_callback_failure(
     asyncio.run(scenario())
 
 
+def _draining_reports(error):
+    """Draining reports a caller finds by the documented check.
+
+    That check follows exception-group members and cancellation causes only.
+    """
+    reports, pending, seen = [], [error], set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, VerifiedTaskWorkerDraining):
+            reports.append(current)
+        pending.extend(item for item in iter_exception_tree(current) if item is not current)
+        if isinstance(current, asyncio.CancelledError) and current.__cause__ is not None:
+            pending.append(current.__cause__)
+    return reports
+
+
+def _leaf_failures(error, failure_type):
+    """Every instance of a failure type in an error's group tree and full cause chain."""
+    found, pending, seen = [], [error], set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, failure_type):
+            found.append(current)
+        pending.extend(item for item in iter_exception_tree(current) if item is not current)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+    return found
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+@pytest.mark.parametrize("entrance", ["close", "context_exit"])
+def test_cancelled_close_reports_retained_verifier_as_draining(
+    backend, entrance, verified_worker_store_factory
+):
+    async def scenario():
+        sessions, tasks = verified_worker_store_factory()
+        entered, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        class ResistantVerifier(RecordingVerifier):
+            async def verify(self, request):
+                self.requests.append(request)
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    await release.wait()
+                    return _accepted_decision()
+
+        app = CayuApp(session_store=sessions, task_store=tasks, enable_logging=False)
+        provider = _RecordingProvider()
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="worker", model="verified-work-test-model"))
+        contract = _contract()
+        verifier = ResistantVerifier(_accepted_decision())
+        app.register_completion_verifier(contract.verifier, verifier)
+        app.register_completion_result_resolver(contract.result_resolver, _Resolver(_task_result()))
+        await tasks.publish_work_contract(contract)
+        await tasks.create_task(TaskCreate(type="verified", work_contract=contract.reference()))
+        worker = VerifiedTaskWorker(
+            app, _StaticHandler(), worker_id="cancelled-close", callback_timeout_seconds=0.2
+        )
+
+        async def invoke():
+            async with worker:
+                return await worker.run(max_tasks=1)
+
+        run = asyncio.create_task(
+            invoke() if entrance == "context_exit" else worker.run(max_tasks=1)
+        )
+        close = None
+        try:
+            await asyncio.wait_for(entered.wait(), 10)
+            if entrance == "context_exit":
+                cancelled_task = run
+            else:
+                run.cancel("stop verified worker")
+                await asyncio.gather(run, return_exceptions=True)
+                await asyncio.wait_for(cancelled.wait(), 5)
+                assert worker._verification is not None
+                close = cancelled_task = asyncio.create_task(worker.aclose())
+                await asyncio.sleep(0)
+            cancelled_task.cancel("stop close")
+            try:
+                await cancelled_task
+            except asyncio.CancelledError as error:
+                caught = error
+            else:
+                pytest.fail("An ordinary CancelledError handler must catch the cancellation.")
+            assert caught.args == ("stop close",)
+            assert cancelled_task.cancelling() == 1 and cancelled_task.cancelled()
+            assert worker._verification is not None
+            assert len(_draining_reports(caught)) == 1
+            assert len(provider.requests) == len(verifier.requests) == 1
+
+            # The report is retryable: once the verifier settles, close returns
+            # without replaying the earlier draining report.
+            release.set()
+            await worker.aclose()
+            assert worker._verification is None
+            await worker.aclose()
+        finally:
+            release.set()
+            for pending in (run, close):
+                if pending is not None and not pending.done():
+                    pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)
+            await worker.aclose()
+            if backend != "memory":
+                await tasks.close()
+                await sessions.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+def test_cancelled_close_reports_running_callback_as_draining(
+    backend, verified_worker_store_factory
+):
+    async def scenario():
+        sessions, tasks = verified_worker_store_factory()
+        entered, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        class Handler(_StaticHandler):
+            async def prepare(self, context):
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    await release.wait()
+                    raise
+
+        contract = _contract()
+        await tasks.publish_work_contract(contract)
+        task = await tasks.create_task(
+            TaskCreate(type="verified", work_contract=contract.reference())
+        )
+        worker = VerifiedTaskWorker(
+            CayuApp(task_store=tasks, session_store=sessions, enable_logging=False),
+            Handler(),
+            worker_id="cancelled-running-close",
+            lease_seconds=3,
+            callback_timeout_seconds=0.2,
+        )
+        run = asyncio.create_task(worker.run(max_tasks=1))
+        close = None
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            close = asyncio.create_task(worker.aclose())
+            await asyncio.wait_for(cancelled.wait(), 5)
+            close.cancel("stop close")
+            try:
+                await close
+            except asyncio.CancelledError as error:
+                caught = error
+            else:
+                pytest.fail("An ordinary CancelledError handler must catch the cancellation.")
+            assert caught.args == ("stop close",)
+            assert close.cancelling() == 1 and close.cancelled()
+            assert worker._running is not None and not worker._running.done()
+            assert len(_draining_reports(caught)) == 1
+            assert (await tasks.load_task(task.id)).status is TaskStatus.CLAIMED
+
+            release.set()
+            await worker.aclose()
+            assert worker._running is None
+            await worker.aclose()
+        finally:
+            release.set()
+            for pending in (run, close):
+                if pending is not None and not pending.done():
+                    pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)
+            await worker.aclose()
+            if backend != "memory":
+                await tasks.close()
+                await sessions.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+def test_cancelled_context_exit_keeps_run_failure_and_draining_once(
+    backend, verified_worker_store_factory, monkeypatch
+):
+    from cayu.verification import verified_task_worker as worker_module
+
+    monkeypatch.setattr(worker_module, "_VERIFIER_TIMEOUT_SECONDS", 0.05)
+
+    async def scenario():
+        sessions, tasks = verified_worker_store_factory()
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        class ResistantVerifier(RecordingVerifier):
+            async def verify(self, request):
+                self.requests.append(request)
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await release.wait()
+                    return _accepted_decision()
+
+        app = CayuApp(session_store=sessions, task_store=tasks, enable_logging=False)
+        app.register_provider(_RecordingProvider(), default=True)
+        app.register_agent(AgentSpec(name="worker", model="verified-work-test-model"))
+        contract = _contract()
+        app.register_completion_verifier(contract.verifier, ResistantVerifier(_accepted_decision()))
+        app.register_completion_result_resolver(contract.result_resolver, _Resolver(_task_result()))
+        await tasks.publish_work_contract(contract)
+        await tasks.create_task(TaskCreate(type="verified", work_contract=contract.reference()))
+        worker = VerifiedTaskWorker(
+            app, _StaticHandler(), worker_id="failed-run-close", callback_timeout_seconds=5
+        )
+
+        async def invoke():
+            async with worker:
+                return await worker.run(max_tasks=1)
+
+        run = asyncio.create_task(invoke())
+        try:
+            await asyncio.wait_for(entered.wait(), 10)
+            # The bounded verifier fails the run; leaving the context then waits
+            # for the retained verifier, and that close is cancelled.
+            async with asyncio.timeout(10):
+                while worker._verification is None or worker._verification.observation is None:
+                    await asyncio.sleep(0.01)
+            run.cancel("stop close")
+            try:
+                await run
+            except asyncio.CancelledError as error:
+                caught = error
+            else:
+                pytest.fail("An ordinary CancelledError handler must catch the cancellation.")
+            assert caught.args == ("stop close",)
+            assert run.cancelling() == 1 and run.cancelled()
+            assert len(_leaf_failures(caught, CompletionVerifierExecutionError)) == 1
+            assert len(_draining_reports(caught)) == 1
+            assert worker._verification is not None
+
+            release.set()
+            await worker.aclose()
+            assert worker._verification is None
+        finally:
+            release.set()
+            if not run.done():
+                run.cancel()
+                await asyncio.gather(run, return_exceptions=True)
+            await worker.aclose()
+            if backend != "memory":
+                await tasks.close()
+                await sessions.close()
+
+    asyncio.run(scenario())
+
+
+def test_close_retried_inside_the_cancelled_task_reports_draining_again():
+    async def scenario():
+        sessions, tasks = InMemorySessionStore(), InMemoryTaskStore()
+        entered, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        class ResistantVerifier(RecordingVerifier):
+            async def verify(self, request):
+                self.requests.append(request)
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    await release.wait()
+                    return _accepted_decision()
+
+        app = CayuApp(session_store=sessions, task_store=tasks, enable_logging=False)
+        app.register_provider(_RecordingProvider(), default=True)
+        app.register_agent(AgentSpec(name="worker", model="verified-work-test-model"))
+        contract = _contract()
+        app.register_completion_verifier(contract.verifier, ResistantVerifier(_accepted_decision()))
+        app.register_completion_result_resolver(contract.result_resolver, _Resolver(_task_result()))
+        await tasks.publish_work_contract(contract)
+        await tasks.create_task(TaskCreate(type="verified", work_contract=contract.reference()))
+        worker = VerifiedTaskWorker(
+            app, _StaticHandler(), worker_id="same-task-retry", callback_timeout_seconds=0.2
+        )
+        run = asyncio.create_task(worker.run(max_tasks=1))
+        retries = []
+
+        async def close_and_retry():
+            try:
+                await worker.aclose()
+            except asyncio.CancelledError:
+                try:
+                    await worker.aclose()
+                except asyncio.CancelledError as retried:
+                    retries.append(retried)
+                raise
+
+        close = None
+        try:
+            await asyncio.wait_for(entered.wait(), 10)
+            run.cancel()
+            await asyncio.gather(run, return_exceptions=True)
+            await asyncio.wait_for(cancelled.wait(), 5)
+            close = asyncio.create_task(close_and_retry())
+            await asyncio.sleep(0)
+            close.cancel("stop close")
+            with pytest.raises(asyncio.CancelledError):
+                await close
+            assert close.cancelling() == 1 and close.cancelled()
+            (retried,) = retries
+            assert len(_draining_reports(retried)) == 1
+            assert worker._verification is not None
+
+            release.set()
+            await worker.aclose()
+            assert worker._verification is None
+        finally:
+            release.set()
+            for pending in (run, close):
+                if pending is not None and not pending.done():
+                    pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)
+            await worker.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "retained", ["none", "finished_run", "running", "verifier", "preparation", "pre_entry"]
+)
+def test_cancellation_reports_each_retained_handle(retained):
+    # Real entrances usually reach these handles through consumers that already
+    # report draining; the narrow routes where only this check reports are
+    # timing-dependent, so each condition is pinned here.
+    async def scenario():
+        worker = VerifiedTaskWorker(
+            CayuApp(
+                task_store=InMemoryTaskStore(),
+                session_store=InMemorySessionStore(),
+                enable_logging=False,
+            ),
+            _StaticHandler(),
+            worker_id="retained-handles",
+        )
+        held = asyncio.Event()
+        task = None
+        if retained in {"finished_run", "running"}:
+            task = asyncio.create_task(held.wait())
+            if retained == "finished_run":
+                held.set()
+                await task
+            worker._running = task
+        elif retained == "verifier":
+            worker._verification = object()
+        elif retained == "preparation":
+            worker._preparation_settlement = object()
+        elif retained == "pre_entry":
+            worker._pre_entry_settlement = object()
+        try:
+            reported = worker._report_retained_ownership(asyncio.CancelledError("stop"))
+            assert isinstance(reported, asyncio.CancelledError)
+            assert reported.args == ("stop",)
+            expected = 0 if retained in {"none", "finished_run"} else 1
+            assert len(_draining_reports(reported)) == expected
+            failure = ValueError("not a cancellation")
+            assert worker._report_retained_ownership(failure) is failure
+        finally:
+            held.set()
+            if task is not None:
+                await task
+
+    asyncio.run(scenario())
+
+
+def test_draining_report_check_follows_only_where_callers_look():
+    from cayu.verification.verified_task_worker import _carries_draining_report
+
+    def cancellation(cause):
+        error = asyncio.CancelledError("stop")
+        error.__cause__ = cause
+        return error
+
+    draining = VerifiedTaskWorkerDraining("draining")
+    hidden = ValueError("callback failed")
+    hidden.__cause__ = draining
+    assert _carries_draining_report(cancellation(draining))
+    assert _carries_draining_report(cancellation(cancellation(draining)))
+    assert _carries_draining_report(
+        cancellation(BaseExceptionGroup("owned", [ValueError("x"), draining]))
+    )
+    # A report under an ordinary error's cause is invisible to the documented
+    # check, so it must not stop close from attaching a visible one.
+    assert not _carries_draining_report(cancellation(hidden))
+    assert not _draining_reports(cancellation(hidden))
+
+
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
 @pytest.mark.parametrize("signal", ["timeout", "cancel"])
 def test_worker_retains_heartbeat_and_drain_handle_for_late_preparation(
