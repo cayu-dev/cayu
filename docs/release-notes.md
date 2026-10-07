@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- `cayu cloud deploy --acknowledge-breaking REVISION` (repeatable) acknowledges a
+  breaking Cayu storage revision for Cayu Cloud's database migration, and
+  `cayu cloud deployment retry RELEASE --application AGENT --acknowledge-breaking
+  REVISION` adds the acknowledgement to an existing release. Values must be whole
+  numbers from 1 to 1,000,000 (at most 32) and fail locally with `invalid_input`
+  otherwise. Without the flag, deploy requests and their idempotency keys are
+  unchanged. Rerunning `deploy` with the flag for unchanged source adds the
+  acknowledgement to the release Cloud refused. See
+  [breaking storage revisions](cayu-cloud.md#breaking-storage-revisions).
+- `cayu cloud deploy` and `deployment wait` report Cloud's breaking-migration
+  publication failures (`storage_breaking_acknowledgement_required`,
+  `storage_newer_than_release`, `storage_writers_not_stopped` and
+  `storage_migration_state_unknown`) as `error.code` with Cloud's message, detail
+  and hint, plus ready-to-run commands; the acknowledgement refusal includes the
+  exact `--acknowledge-breaking` retry. `deployment wait` no longer reports a
+  release whose publication failed as ready. `cayu cloud rollback --wait` waits for
+  the service and reports a refused rollback across a storage boundary.
+
+### Cloud-hosted Agents upgrading from v0.8.x
+
+The v0.9.0 storage migration from revision 114 to 115 is breaking. For an Agent on
+Cayu Cloud with an existing database, Cloud runs that migration when it publishes
+the first 0.9.x release, and refuses the publication until it is acknowledged. Deploy
+with `cayu cloud deploy --acknowledge-breaking 115`. Cloud stops the previous release
+during the migration, and 0.8.x releases can't be rolled back to afterwards. A new
+Agent with an empty database needs no acknowledgement.
+
 ## v0.9.1
 
 Cayu improves release validation and separates internal storage and event-schema

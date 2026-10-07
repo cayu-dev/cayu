@@ -58,6 +58,21 @@ _SERVICE_POLL_TRANSIENT_LIMIT = 5
 _TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
 _CLOUD_DEPLOYMENT_ID = re.compile(r"dep_[a-z0-9]{1,64}")
 _PRODUCTION_API_URL = "https://cloud.cayu.dev"
+# Cloud's bounds on the breaking Cayu storage revisions one Release acknowledges.
+_MAX_STORAGE_REVISION = 1_000_000
+_MAX_STORAGE_ACKNOWLEDGEMENTS = 32
+_STORAGE_ACKNOWLEDGEMENT_REQUIRED = "storage_breaking_acknowledgement_required"
+# Publication failures that a retry of the same Release can get past.
+_RETRYABLE_STORAGE_PUBLICATION_FAILURES = frozenset(
+    {"storage_migration_state_unknown", "storage_writers_not_stopped"}
+)
+# Cloud's documented breaking-storage publication failures, reported as `error.code`.
+_STORAGE_PUBLICATION_FAILURES = _RETRYABLE_STORAGE_PUBLICATION_FAILURES | {
+    _STORAGE_ACKNOWLEDGEMENT_REQUIRED,
+    "storage_newer_than_release",
+}
+_ACKNOWLEDGE_BREAKING_LIST = re.compile(r'"acknowledge_breaking":\s*\[([0-9, ]{1,400})\]')
+_ACKNOWLEDGE_BREAKING_FLAG = re.compile(r"--acknowledge-breaking ([0-9]{1,7})\b")
 _LEGACY_RETRY_REJECTION = "Only paused or failed deployments can be retried."
 
 
@@ -94,14 +109,63 @@ class _CloudServiceHealthError(CloudApiError):
 class _CloudServicePublicationError(CloudApiError):
     """Cayu Cloud promoted the release but could not publish it to the service."""
 
-    def __init__(self, publication_error: dict[str, str]) -> None:
+    def __init__(
+        self,
+        publication_error: dict[str, str],
+        *,
+        application_id: str | None = None,
+        deployment_id: str | None = None,
+        recovery_arguments: Sequence[str] = (),
+    ) -> None:
+        app = None if application_id is None else _cloud_application_id(application_id)
+        deployment = None if deployment_id is None else _cloud_deployment_id(deployment_id)
+        self.details: dict[str, object] = {}
+        if app is not None:
+            self.details["application"] = app
+        if deployment is not None:
+            self.details["deployment_id"] = deployment
+        parts = [
+            publication_error[key] for key in ("message", "detail") if key in publication_error
+        ]
+        code = publication_error.get("code")
+        revisions = (
+            _requested_storage_acknowledgement(publication_error)
+            if code == _STORAGE_ACKNOWLEDGEMENT_REQUIRED
+            else ()
+        )
+        flags = [
+            item for revision in revisions for item in ("--acknowledge-breaking", str(revision))
+        ]
+        retry_command = None
+        if app is not None and deployment is not None:
+            command = ["cayu", "cloud", *recovery_arguments, "deployment"]
+            suffix = [deployment, "--application", app]
+            commands = {
+                action: shlex.join([*command, action, *suffix]) for action in ("status", "timeline")
+            }
+            if revisions:
+                retry_command = shlex.join([*command, "retry", *suffix, *flags])
+            elif code in _RETRYABLE_STORAGE_PUBLICATION_FAILURES:
+                retry_command = shlex.join([*command, "retry", *suffix])
+            if retry_command is not None:
+                commands["retry"] = retry_command
+            self.details["commands"] = commands
+        if revisions:
+            # Cloud's hint names its operator tooling; give the customer CLI's own steps.
+            self.details["acknowledge_breaking"] = list(revisions)
+            parts.append(
+                "A breaking migration stops the previous release while the database migrates, "
+                "until this release starts, and releases built with the older Cayu can't be "
+                "rolled back to afterwards. To proceed, "
+                + (f"run `{retry_command}`, or " if retry_command is not None else "")
+                + f"run `cayu cloud deploy` again with `{' '.join(flags)}`."
+            )
+        elif "hint" in publication_error:
+            parts.append(publication_error["hint"])
         super().__init__(
             "service_publication_failed",
-            " ".join(
-                publication_error[key]
-                for key in ("message", "detail", "hint")
-                if key in publication_error
-            ),
+            " ".join(parts),
+            code=code if code in _STORAGE_PUBLICATION_FAILURES else None,
         )
         self.publication_error = publication_error.copy()
 
@@ -406,6 +470,7 @@ def _cloud_failure(exc: Exception) -> int:
     if isinstance(exc, _CloudServiceHealthError):
         error["issues"] = exc.issues
     if isinstance(exc, _CloudServicePublicationError):
+        error.update(exc.details)
         error["publication_error"] = exc.publication_error
     print(
         json.dumps(
@@ -570,6 +635,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
             "public service starting on Cayu Cloud."
         ),
     )
+    _add_acknowledge_breaking_argument(deploy)
     deploy.add_argument("--poll-seconds", type=_positive_finite_seconds, default=5.0)
     deploy.add_argument("--wait-seconds", type=_positive_finite_seconds, default=1800.0)
     deploy.set_defaults(_cloud_preflight=_preflight_deploy_wait)
@@ -597,6 +663,8 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         operation.add_argument("--application", required=True)
         if action == "retry":
             operation.add_argument("--idempotency-key")
+            _add_acknowledge_breaking_argument(operation)
+            operation.set_defaults(_cloud_preflight=_preflight_acknowledgements)
         if action == "logs":
             operation.add_argument("--diagnostic-offset", type=_diagnostic_offset, default=None)
             operation.add_argument("--diagnostic-limit", type=_diagnostic_limit, default=None)
@@ -612,6 +680,17 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     )
     rollback.add_argument("deployment_id")
     rollback.add_argument("--application", required=True)
+    rollback.add_argument(
+        "--wait",
+        action="store_true",
+        help=(
+            "Wait until the Agent service runs the selected release, and report Cloud's "
+            "publication failure if it refuses it."
+        ),
+    )
+    rollback.add_argument("--poll-seconds", type=_positive_finite_seconds, default=5.0)
+    rollback.add_argument("--wait-seconds", type=_positive_finite_seconds, default=1800.0)
+    rollback.set_defaults(_cloud_preflight=_preflight_rollback_wait)
 
     runtimes = commands.add_parser(
         "runtimes",
@@ -709,6 +788,65 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         "verify",
         description="Verify the integrity of every local evidence record.",
     )
+
+
+def _add_acknowledge_breaking_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--acknowledge-breaking",
+        action="append",
+        type=_storage_revision,
+        metavar="REVISION",
+        help=(
+            "Acknowledge a breaking Cayu storage revision the release migrates the Agent "
+            "database across (repeatable). Cloud stops the previous release for the "
+            "migration, and releases built with the older Cayu can't be rolled back to."
+        ),
+    )
+
+
+def _storage_revision(value: str) -> int:
+    if re.fullmatch(r"[1-9][0-9]{0,6}", value) is None or int(value) > _MAX_STORAGE_REVISION:
+        raise argparse.ArgumentTypeError(
+            f"must be a whole storage revision between 1 and {_MAX_STORAGE_REVISION}"
+        )
+    return int(value)
+
+
+def _acknowledged_revisions(arguments: argparse.Namespace) -> tuple[int, ...]:
+    """The breaking storage revisions acknowledged on the command line, as Cloud stores them."""
+
+    revisions = tuple(sorted(set(getattr(arguments, "acknowledge_breaking", None) or ())))
+    if len(revisions) > _MAX_STORAGE_ACKNOWLEDGEMENTS:
+        raise CloudCommandError(
+            "invalid_input",
+            f"At most {_MAX_STORAGE_ACKNOWLEDGEMENTS} distinct --acknowledge-breaking "
+            "revisions can be given.",
+        )
+    return revisions
+
+
+def _acknowledgement_payload(revisions: Sequence[int]) -> dict[str, Any] | None:
+    # Omitted when empty, so requests and their idempotency stay as before.
+    return {"acknowledge_breaking": list(revisions)} if revisions else None
+
+
+def _requested_storage_acknowledgement(publication_error: dict[str, str]) -> tuple[int, ...]:
+    """The breaking revisions Cloud's refusal asks the owner to acknowledge."""
+
+    hint = publication_error.get("hint", "")
+    listed = _ACKNOWLEDGE_BREAKING_LIST.search(hint)
+    if listed is not None:
+        values = [item.strip() for item in listed.group(1).split(",")]
+    else:
+        values = _ACKNOWLEDGE_BREAKING_FLAG.findall(hint)
+    revisions: set[int] = set()
+    for value in values:
+        if re.fullmatch(r"[1-9][0-9]{0,6}", value) is None or int(value) > _MAX_STORAGE_REVISION:
+            return ()
+        revisions.add(int(value))
+    if len(revisions) > _MAX_STORAGE_ACKNOWLEDGEMENTS:
+        return ()
+    return tuple(sorted(revisions))
 
 
 def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
@@ -1006,24 +1144,55 @@ def _deploy(
         )
         client.upload_bytes(upload_url, project.bundle)
     correlation_id = _correlation_id("deploy")
+    acknowledged = _acknowledged_revisions(arguments)
+    acknowledgement = _acknowledgement_payload(acknowledged)
+    unacknowledged_payload = project.manifest.deployment_payload(
+        repository=repository,
+        revision=revision,
+    )
     source_key = _deployment_idempotency_key(
         application_id=str(application["id"]),
         version=project.manifest.version,
         revision=revision,
-    )
-    deployment = client.request(
-        "POST",
-        f"/v1/applications/{application['id']}/deployments",
-        payload=project.manifest.deployment_payload(
-            repository=repository,
-            revision=revision,
-        ),
-        idempotency_key=source_key,
+        acknowledge_breaking=acknowledged,
     )
     retry = None
+    acknowledge_existing = False
+    try:
+        deployment = client.request(
+            "POST",
+            f"/v1/applications/{application['id']}/deployments",
+            payload={**unacknowledged_payload, **(acknowledgement or {})},
+            idempotency_key=source_key,
+        )
+    except CloudApiError as exc:
+        if acknowledgement is None or exc.status_code != 409:
+            raise
+        # The earlier submission may have acknowledged a different set of revisions.
+        # Its current acknowledgement can also have grown through publication retries,
+        # so it cannot reconstruct the original submission key. Match immutable inputs.
+        existing = _existing_source_deployment(
+            client,
+            application_id=str(application["id"]),
+            payload=unacknowledged_payload,
+        )
+        if existing is None:
+            raise
+        deployment = existing
+        acknowledge_existing = True
     original = deployment
     if _deployment_status(deployment) in _DEPLOYMENT_FAILURES:
         deployment = _latest_source_retry(client, str(application["id"]), original)
+    if acknowledge_existing:
+        # Publication may have failed on a retry of the original build. Acknowledge
+        # that selected Release, while retaining the root for failed-build retries.
+        deployment, retry = _acknowledge_existing_release(
+            client,
+            application_id=str(application["id"]),
+            deployment=deployment,
+            acknowledged=acknowledged,
+            source_key=source_key,
+        )
     if _deployment_status(deployment) in _DEPLOYMENT_FAILURES:
         old_id = str(deployment["id"])
         old_status = str(deployment["status"])
@@ -1048,6 +1217,9 @@ def _deploy(
                     "POST",
                     f"/v1/applications/{application['id']}/deployments/{original['id']}/retry",
                     idempotency_key=retry_key,
+                    # Cloud carries a Release's acknowledgement to its retries; this
+                    # adds one given only now.
+                    **({} if acknowledgement is None else {"payload": acknowledgement}),
                 )
             except CloudApiError as exc:
                 if exc.status_code == 409:
@@ -1180,14 +1352,113 @@ def _deploy(
     return response
 
 
+def _existing_source_deployment(
+    client: CloudApiClient,
+    *,
+    application_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Find the original Release only when every immutable submission input matches."""
+
+    # Cloud's canonical manifest omits an absent runtime, and includes a web process's
+    # unset idle timeout as null. Other optional defaults are already omitted by the
+    # project serializer, just as Cloud omits them to preserve existing digests.
+    manifest = dict(payload["manifest"])
+    runtime = manifest.get("runtime")
+    if runtime is None:
+        manifest.pop("runtime", None)
+    elif runtime.get("web") is not None:
+        manifest["runtime"] = {
+            **runtime,
+            "web": {"idle_timeout_seconds": None, **runtime["web"]},
+        }
+    digest = hashlib.sha256(
+        json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
+    cursor = None
+    seen = set()
+    for _page in range(100):
+        query = {"limit": "100"}
+        if cursor is not None:
+            query["cursor"] = cursor
+        page = client.request("GET", f"/v1/applications/{application_id}/deployments", query=query)
+        items = page.get("items")
+        if not isinstance(items, list):
+            raise CloudApiError(
+                "api_response_invalid", "Cayu Cloud returned an invalid deployment list."
+            )
+        for item in items:
+            if (
+                isinstance(item, dict)
+                and item.get("version") == payload["version"]
+                and item.get("manifest_digest") == digest
+                and item.get("policy_version") == payload["policy_version"]
+            ):
+                return item
+        cursor = page.get("next_cursor")
+        if cursor is None:
+            return None
+        if not isinstance(cursor, str) or cursor in seen:
+            break
+        seen.add(cursor)
+    raise CloudApiError(
+        "api_response_invalid", "Cayu Cloud deployment history pagination did not converge."
+    )
+
+
+def _acknowledge_existing_release(
+    client: CloudApiClient,
+    *,
+    application_id: str,
+    deployment: dict[str, Any],
+    acknowledged: Sequence[int],
+    source_key: str,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Add the acknowledgement to an earlier submission of the same source.
+
+    Cloud adds it when the Release's publication failed and awaits a retry, and then
+    publishes the same Release again. A failed build is retried by the caller with the
+    acknowledgement; a Release still in progress is followed as it is.
+    """
+
+    existing = deployment.get("acknowledge_breaking")
+    if isinstance(existing, list) and set(acknowledged) <= set(existing):
+        return deployment, None
+    if _deployment_status(deployment) in _DEPLOYMENT_FAILURES:
+        return deployment, None
+    deployment_id = str(deployment["id"])
+    path = f"/v1/applications/{application_id}/deployments/{deployment_id}"
+    publication_error = _deployment_publication_error(client.request("GET", path))
+    if publication_error is None:
+        return deployment, None
+    retried = client.request(
+        "POST",
+        f"{path}/retry",
+        idempotency_key="deploy-acknowledge:"
+        + hashlib.sha256(f"{source_key}:{deployment_id}".encode()).hexdigest(),
+        payload={"acknowledge_breaking": list(acknowledged)},
+    )
+    return retried, {
+        "acknowledge_breaking": list(acknowledged),
+        "deployment_id": str(retried["id"]),
+        "failure_code": publication_error["code"],
+        "previous_deployment_id": deployment_id,
+        "reason": publication_error["message"],
+    }
+
+
 def _deployment_idempotency_key(
     *,
     application_id: str,
     version: str,
     revision: str,
+    acknowledge_breaking: Sequence[int] = (),
 ) -> str:
+    # Cloud refuses a key reused with another acknowledgement, so a nonempty one is part
+    # of the key. Without it the key is unchanged from earlier CLI releases.
     identity = json.dumps(
-        [application_id, version, revision],
+        [application_id, version, revision]
+        + ([sorted(set(acknowledge_breaking))] if acknowledge_breaking else []),
         ensure_ascii=True,
         separators=(",", ":"),
     ).encode()
@@ -1389,11 +1660,13 @@ def _deployment(
         result = _validated_deployment_diagnostics(result)
 
     elif arguments.deployment_command == "retry":
+        payload = _acknowledgement_payload(_acknowledged_revisions(arguments))
         try:
             result = client.request(
                 "POST",
                 base + "/retry",
                 idempotency_key=arguments.idempotency_key or _correlation_id("deployment-retry"),
+                **({} if payload is None else {"payload": payload}),
             )
         except CloudApiError as exc:
             if exc.status_code != 409 or exc.detail is None:
@@ -1416,6 +1689,16 @@ def _deployment(
             sleep=sleep,
             monotonic=monotonic,
         )
+        # A ready Release whose service publication failed (for example a refused
+        # breaking storage migration) waits for a retry, not for more time.
+        publication_error = _deployment_publication_error(result)
+        if publication_error is not None:
+            raise _CloudServicePublicationError(
+                publication_error,
+                application_id=application_id,
+                deployment_id=arguments.deployment_id,
+                recovery_arguments=_cloud_recovery_arguments(arguments),
+            )
     else:
         application = client.request("GET", f"/v1/applications/{application_id}")
         result = client.request(
@@ -1433,6 +1716,8 @@ def _rollback(
     arguments: argparse.Namespace,
     *,
     client: CloudApiClient,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     application_id = _application_id(client, arguments.application)
     application = client.request("GET", f"/v1/applications/{application_id}")
@@ -1445,6 +1730,20 @@ def _rollback(
         "PUT",
         f"/v1/applications/{application_id}/service",
     )
+    if getattr(arguments, "wait", False):
+        # Cloud publishes the selected release asynchronously and may refuse it, for
+        # example when the database was migrated past what its Cayu supports.
+        service = _wait_for_service(
+            client,
+            application_id=application_id,
+            initial=None,
+            expected_deployment_id=arguments.deployment_id,
+            poll_seconds=arguments.poll_seconds,
+            recovery_arguments=_cloud_recovery_arguments(arguments),
+            wait_seconds=arguments.wait_seconds,
+            sleep=sleep,
+            monotonic=monotonic,
+        )
     return {
         "operation": "rollback",
         "result": {"application": selected, "service": service},
@@ -1983,6 +2282,10 @@ def _publication_error(
     deployment = client.request(
         "GET", f"/v1/applications/{application_id}/deployments/{deployment_id}"
     )
+    return _deployment_publication_error(deployment)
+
+
+def _deployment_publication_error(deployment: dict[str, Any]) -> dict[str, str] | None:
     candidate = deployment.get("publication_error")
     if not isinstance(candidate, dict):
         return None
@@ -2048,7 +2351,12 @@ def _wait_for_service(
                     raise
                 publication_error = None
             if publication_error is not None:
-                raise _CloudServicePublicationError(publication_error)
+                raise _CloudServicePublicationError(
+                    publication_error,
+                    application_id=application_id,
+                    deployment_id=expected_deployment_id,
+                    recovery_arguments=recovery_arguments,
+                )
         elif service is not None:
             last_issue = _web_not_ready_message(service) or last_issue
         if status in _SERVICE_READY:
@@ -2404,7 +2712,17 @@ def _preflight_wait(arguments: argparse.Namespace) -> None:
 
 
 def _preflight_deploy_wait(arguments: argparse.Namespace) -> None:
+    _acknowledged_revisions(arguments)
     if not arguments.no_wait:
+        _validate_wait(arguments.poll_seconds, arguments.wait_seconds)
+
+
+def _preflight_acknowledgements(arguments: argparse.Namespace) -> None:
+    _acknowledged_revisions(arguments)
+
+
+def _preflight_rollback_wait(arguments: argparse.Namespace) -> None:
+    if arguments.wait:
         _validate_wait(arguments.poll_seconds, arguments.wait_seconds)
 
 

@@ -23,7 +23,7 @@ cayu cloud service status --application my-agent
 - `applications list|archive|archive-status` for Agent discovery and archive;
 - `context use|show|clear` and `doctor` for connection selection and diagnosis;
 - `init` and `deploy` for local project setup and publication;
-- `deployment logs|status|timeline|wait|promote` and `rollback` for immutable releases;
+- `deployment logs|status|timeline|wait|promote|retry` and `rollback` for immutable releases;
 - `runtimes list|status` for retained runtime artifacts;
 - `service credentials|destroy|logs|restart|sleep|status|wake` for Agent infrastructure;
 - `env list|set|unset` for Agent-owned configuration; and
@@ -154,7 +154,11 @@ release: if Cloud reports a `publication_error` (for example a failed database
 migration), it exits `2` with category `service_publication_failed`, Cloud's message and
 hint, and the structured `error.publication_error`. With `--no-wait`,
 `result.service_publication_pending=true` identifies an absent service or one still
-serving an older release. `rollback` still asks Cloud to publish the selected release.
+serving an older release. `rollback` still asks Cloud to publish the selected release and
+returns once Cloud accepts it; `rollback --wait` (with `--poll-seconds` and
+`--wait-seconds`) also waits for the service to run that release and reports a
+`publication_error` the same way. `deployment wait` reports a ready release's
+`publication_error` the same way instead of returning it as ready.
 
 Cloud's deployment worker promotes a smoke-tested release on its own, so `deploy`'s
 promote request can race it. The request carries the Agent revision read before the
@@ -232,7 +236,9 @@ attempt without retrying it. Non-retryable source failures include the retained 
 instructions to change the source and deploy again. Terminal errors carry `deployment_id`,
 `status`, and exact logs, timeline, and retry commands when the identifiers are safe.
 
-Submit a retry directly, retaining the same key when retrying an uncertain HTTP outcome:
+Submit a retry directly, retaining the same key when retrying an uncertain HTTP outcome.
+`--acknowledge-breaking REVISION` adds a breaking storage revision acknowledgement to the
+retry (see [Breaking storage revisions](#breaking-storage-revisions)):
 
 ```bash
 cayu cloud deployment retry DEPLOYMENT_ID --application AGENT_SLUG \
@@ -315,6 +321,74 @@ operational handoffs, and automation:
 cayu cloud context use /private/path/cloud-context.json
 CAYU_CLOUD_API_KEY_FILE=/private/path/key cayu cloud doctor
 ```
+
+## Breaking storage revisions
+
+Some Cayu releases move the Agent database across a breaking storage revision. Cayu
+0.9.0 and later move it from revision 114 to 115. Cloud migrates the database when it
+publishes a release, and for a breaking revision it needs the owner's acknowledgement,
+because the migration changes how the Agent runs:
+
+- Cloud stops the previous release (web, worker and schedules) while the database
+  migrates, and the Agent address shows its starting page until the new release starts.
+  If the migration doesn't complete and Cloud can confirm the database is unchanged, it
+  starts the previous release again.
+- Releases built with the older Cayu can't open the migrated database, so you can't roll
+  back or promote them afterwards.
+
+An empty database, such as a new Agent's, needs no acknowledgement. Acknowledge the
+revision when you deploy:
+
+```bash
+cayu cloud deploy . --acknowledge-breaking 115
+```
+
+`--acknowledge-breaking REVISION` can be repeated. Each value must be a whole number from
+1 to 1,000,000, and at most 32 distinct revisions can be given; anything else fails with
+`invalid_input` before the CLI signs in or uploads. The CLI sends the revisions, sorted and
+without duplicates, as the release's `acknowledge_breaking` field. Without the flag the
+field is omitted and the deploy's idempotency key is the same as in earlier CLI releases;
+with it the key also covers the revisions. The automatic retry of a replayed failed attempt
+sends the acknowledgement too, and Cloud keeps a release's acknowledgement on its retries.
+Cloud only acknowledges breaking revisions on the actual migration path, so acknowledging
+one the database has already passed does nothing.
+
+Without the acknowledgement, Cloud refuses the publication before it stops anything: the
+previous release keeps serving. `deploy` and `deployment wait` exit `2` with category
+`service_publication_failed` and `error.code`
+`storage_breaking_acknowledgement_required`. The message names the revisions, says what the
+migration stops and that rollback can't cross it afterwards, and gives the exact command to
+proceed. `error.acknowledge_breaking` lists the revisions and `error.commands.retry` adds
+them to the same release:
+
+```bash
+cayu cloud deployment retry DEPLOYMENT_ID --application AGENT_SLUG --acknowledge-breaking 115
+```
+
+Running `cayu cloud deploy --acknowledge-breaking 115` again with unchanged source and
+version also works: the CLI finds the release with the same source and deployment
+settings, follows any build retries, and adds the acknowledgement to the release whose
+publication failed (`result.retry` records it). This also works when the earlier submission
+acknowledged different revisions; Cloud retains those acknowledgements and adds the new
+ones. Different source or deployment settings are refused with Cloud's HTTP 409 reason;
+give the changed deployment a new version.
+
+Cloud reports three other breaking-migration failures the same way, each with its
+`error.code`, Cloud's message, detail and hint, `error.publication_error`, and `status` and
+`timeline` commands:
+
+- `storage_writers_not_stopped`: the previous release did not stop in time, so the
+  migration did not start and Cloud restarted the previous release. `error.commands.retry`
+  retries the release after you fix the process that ignores shutdown.
+- `storage_migration_state_unknown`: the migration failed and Cloud can't confirm the
+  database is unchanged, so it left the services stopped. `error.commands.retry` resumes the
+  migration of the same release.
+- `storage_newer_than_release`: a rollback, promotion or deploy selected a release whose
+  Cayu predates the database. The running service is not changed. There is no retry
+  command; select or deploy a release whose Cayu supports the current revision. Use
+  `rollback --wait` to see this refusal from the rollback itself.
+
+`deployment timeline` also carries these failures, with phase `database_migrated`.
 
 ## Agent operator credentials
 

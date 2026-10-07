@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +12,13 @@ import pytest
 from cayu.cli import cloud
 from cayu.cli._cloud_api import CloudApiError, _plain_api_error_detail
 from cayu.cli._cloud_evidence import EvidenceRecorder
-from cayu.cli._cloud_project import CloudProjectManifest, ResolvedCloudProject
+from cayu.cli._cloud_project import (
+    CloudProcess,
+    CloudProjectManifest,
+    CloudSchedule,
+    CloudWebProcess,
+    ResolvedCloudProject,
+)
 
 
 def _failure(*, retryable=True):
@@ -466,3 +473,401 @@ def test_generic_failure_contract_does_not_depend_on_server_wording(tmp_path):
         _deploy(client, project, tmp_path)
     assert raised.value.failure["code"] == "source_build_inputs_invalid"
     assert raised.value.failure["message"] == failure["message"]
+
+
+def _legacy_source_key(project):
+    # The key earlier CLI releases sent; deploying without an acknowledgement keeps it.
+    identity = json.dumps(
+        ["retry-agent", project.manifest.version, project.revision],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode()
+    return "deploy:" + hashlib.sha256(identity).hexdigest()
+
+
+def _acknowledged_deploy(client, project, tmp_path, revisions):
+    return cloud._deploy(
+        SimpleNamespace(
+            acknowledge_breaking=revisions,
+            application=None,
+            no_wait=True,
+            no_promote=True,
+            retry_failed=True,
+        ),
+        client=client,
+        project=project,
+        recorder=EvidenceRecorder(tmp_path / "evidence"),
+    )
+
+
+def _requests(client, suffix):
+    return [
+        kwargs
+        for method, path, kwargs in client.requests
+        if method == "POST" and path.endswith(suffix)
+    ]
+
+
+def test_deploy_without_acknowledgement_keeps_payload_and_submission_key(tmp_path):
+    project = _project(tmp_path)
+    client = Client(project, status="accepted")
+    _acknowledged_deploy(client, project, tmp_path, None)
+    _acknowledged_deploy(client, project, tmp_path, [])
+    creates = _requests(client, "/deployments")
+    assert creates[0] == creates[1]
+    assert "acknowledge_breaking" not in creates[0]["payload"]
+    assert creates[0]["idempotency_key"] == _legacy_source_key(project)
+
+
+def test_deploy_sends_sorted_unique_acknowledgement_under_its_own_key(tmp_path):
+    project = _project(tmp_path)
+    client = Client(project, status="accepted")
+    _acknowledged_deploy(client, project, tmp_path, [115, 114, 115])
+    _acknowledged_deploy(client, project, tmp_path, [114, 115])
+    creates = _requests(client, "/deployments")
+    assert creates[0]["payload"]["acknowledge_breaking"] == [114, 115]
+    assert creates[0]["idempotency_key"] == creates[1]["idempotency_key"]
+    assert creates[0]["idempotency_key"] != _legacy_source_key(project)
+    unacknowledged = {
+        key: value for key, value in creates[0]["payload"].items() if key != "acknowledge_breaking"
+    }
+    assert unacknowledged == project.manifest.deployment_payload(
+        repository=project.repository, revision=project.revision
+    )
+
+
+def test_automatic_retry_of_a_replayed_failure_keeps_the_acknowledgement(tmp_path):
+    project = _project(tmp_path)
+    client = Client(project, status="failed")
+    result = _acknowledged_deploy(client, project, tmp_path, [115])
+    assert result["result"]["retry"]["deployment_id"] == "dep_new"
+    assert _requests(client, "/retry")[0]["payload"] == {"acknowledge_breaking": [115]}
+
+    plain = Client(project, status="failed")
+    _acknowledged_deploy(plain, project, tmp_path, None)
+    assert "payload" not in _requests(plain, "/retry")[0]
+
+
+_REFUSAL = {
+    "code": "storage_breaking_acknowledgement_required",
+    "detail": (
+        "Publishing this release migrates the Agent database from Cayu storage revision 114 "
+        "to 115 across breaking revision 115, and the release does not acknowledge 115. "
+        "Nothing was stopped or migrated; the previous release keeps serving."
+    ),
+    "hint": (
+        "A breaking migration stops the previous release until this one starts, and releases "
+        "built with the older Cayu can't be rolled back to afterwards. To proceed, retry "
+        'release dep_old with {"acknowledge_breaking": [115]} (`cayu-cloud-operator '
+        "deployment retry dep_old --application retry-agent --acknowledge-breaking 115`), or "
+        "deploy again with that field. The database keeps a point-in-time backup."
+    ),
+    "message": (
+        "The release crosses a breaking Cayu storage revision that it does not acknowledge."
+    ),
+}
+
+
+class RefusedReleaseClient(Client):
+    """The same source was deployed without the acknowledgement and Cloud refused it."""
+
+    def __init__(self, project, *, unacknowledged_replay=True):
+        super().__init__(project, status="promoted")
+        self.unacknowledged_replay = unacknowledged_replay
+        payload = project.manifest.deployment_payload(
+            repository=project.repository, revision=project.revision
+        )
+        # Cloud omits the absent runtime from its canonical manifest digest.
+        manifest = {key: value for key, value in payload["manifest"].items() if key != "runtime"}
+        self.release = {
+            "id": "dep_old",
+            "version": payload["version"],
+            "manifest_digest": hashlib.sha256(
+                json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode()
+            ).hexdigest(),
+            "policy_version": payload["policy_version"],
+            "created_at": "2026-10-07T00:00:00Z",
+            "status": "promoted",
+            "acknowledge_breaking": [],
+        }
+
+    def request(self, method, path, **kwargs):
+        if method == "POST" and path.endswith("/deployments"):
+            self.requests.append((method, path, kwargs))
+            if "acknowledge_breaking" in kwargs["payload"] or not self.unacknowledged_replay:
+                raise CloudApiError(
+                    "api_request_rejected",
+                    "Cayu Cloud API returned HTTP 409.",
+                    status_code=409,
+                    detail="Application already has a deployment with this version.",
+                )
+            return self.release.copy()
+        if method == "GET" and path.endswith("/deployments"):
+            self.requests.append((method, path, kwargs))
+            return {
+                "items": [self.release.copy()] if self.unacknowledged_replay else [],
+                "next_cursor": None,
+            }
+        if method == "GET" and path.endswith("/deployments/dep_old"):
+            self.requests.append((method, path, kwargs))
+            return {"id": "dep_old", "status": "promoted", "publication_error": _REFUSAL}
+        if method == "GET" and path.endswith("/service"):
+            self.requests.append((method, path, kwargs))
+            return {"deployment_id": "dep_old", "status": "running", "issues": []}
+        if method == "POST" and path.endswith("/dep_old/retry"):
+            self.requests.append((method, path, kwargs))
+            return {"id": "dep_old", "status": "promoted", "acknowledge_breaking": [115]}
+        return super().request(method, path, **kwargs)
+
+
+def test_acknowledged_rerun_adds_the_acknowledgement_to_the_refused_release(tmp_path):
+    project = _project(tmp_path)
+    client = RefusedReleaseClient(project)
+    result = _acknowledged_deploy(client, project, tmp_path, [115])
+    assert result["result"]["deployment"]["id"] == "dep_old"
+    assert result["result"]["retry"] == {
+        "acknowledge_breaking": [115],
+        "deployment_id": "dep_old",
+        "failure_code": "storage_breaking_acknowledgement_required",
+        "previous_deployment_id": "dep_old",
+        "reason": _REFUSAL["message"],
+    }
+    creates = _requests(client, "/deployments")
+    assert len(creates) == 1
+    retry = _requests(client, "/retry")
+    assert len(retry) == 1
+    assert retry[0]["payload"] == {"acknowledge_breaking": [115]}
+
+
+def test_acknowledged_rerun_reports_the_conflict_when_no_earlier_submission_matches(tmp_path):
+    project = _project(tmp_path)
+    client = RefusedReleaseClient(project, unacknowledged_replay=False)
+    with pytest.raises(CloudApiError) as raised:
+        _acknowledged_deploy(client, project, tmp_path, [115])
+    assert raised.value.status_code == 409
+    assert raised.value.detail == "Application already has a deployment with this version."
+    assert not _requests(client, "/retry")
+
+
+def test_acknowledged_rerun_updates_the_refused_retry_instead_of_its_failed_original(tmp_path):
+    project = _project(tmp_path)
+
+    class RetriedPublicationClient(RefusedReleaseClient):
+        def __init__(self):
+            super().__init__(project)
+            self.release["status"] = "failed"
+            self.child = {
+                **self.release,
+                "id": "dep_child",
+                "version": self.release["version"] + "-retry-1",
+                "created_at": "2026-10-07T01:00:00Z",
+                "status": "promoted",
+            }
+
+        def request(self, method, path, **kwargs):
+            if method == "GET" and path.endswith("/deployments"):
+                self.requests.append((method, path, kwargs))
+                return {"items": [self.child, self.release], "next_cursor": None}
+            if method == "GET" and path.endswith("/deployments/dep_child"):
+                self.requests.append((method, path, kwargs))
+                return {**self.child, "publication_error": _REFUSAL}
+            if method == "POST" and path.endswith("/deployments/dep_child/retry"):
+                self.requests.append((method, path, kwargs))
+                return {**self.child, "acknowledge_breaking": [115]}
+            return super().request(method, path, **kwargs)
+
+    client = RetriedPublicationClient()
+    result = _acknowledged_deploy(client, project, tmp_path, [115])
+    assert result["result"]["deployment"]["acknowledge_breaking"] == [115]
+    assert result["result"]["retry"]["previous_deployment_id"] == "dep_child"
+    retries = [
+        (path, kwargs)
+        for method, path, kwargs in client.requests
+        if method == "POST" and path.endswith("/retry")
+    ]
+    assert len(retries) == 1
+    assert retries[0][0].endswith("/dep_child/retry")
+    assert retries[0][1]["payload"] == {"acknowledge_breaking": [115]}
+
+
+@pytest.mark.parametrize("previous_acknowledgements", [[114], [114, 116]])
+def test_acknowledged_rerun_corrects_an_earlier_acknowledgement(
+    tmp_path, previous_acknowledgements
+):
+    project = _project(tmp_path)
+
+    class PreviouslyAcknowledgedClient(RefusedReleaseClient):
+        def __init__(self):
+            super().__init__(project)
+            self.release["acknowledge_breaking"] = previous_acknowledgements
+
+        def request(self, method, path, **kwargs):
+            if method == "POST" and path.endswith("/deployments"):
+                self.requests.append((method, path, kwargs))
+                # Neither the corrected key nor the unacknowledged key created this version.
+                raise CloudApiError(
+                    "api_request_rejected",
+                    "Cayu Cloud API returned HTTP 409.",
+                    status_code=409,
+                    detail="Application already has a deployment with this version.",
+                )
+            if method == "POST" and path.endswith("/dep_old/retry"):
+                self.requests.append((method, path, kwargs))
+                return {
+                    **self.release,
+                    "acknowledge_breaking": sorted({*previous_acknowledgements, 115}),
+                }
+            return super().request(method, path, **kwargs)
+
+    client = PreviouslyAcknowledgedClient()
+    result = _acknowledged_deploy(client, project, tmp_path, [115])
+    assert result["result"]["deployment"]["acknowledge_breaking"] == sorted(
+        {*previous_acknowledgements, 115}
+    )
+    assert _requests(client, "/retry")[0]["payload"] == {"acknowledge_breaking": [115]}
+
+
+@pytest.mark.parametrize(
+    "changes,digest",
+    [
+        (
+            {"web": CloudWebProcess(command="python -m agent", port=8000)},
+            "14d283d24742c4b3ec8e26ecc48aa057bfdda1dd474ad49646f079ba59ff22c3",
+        ),
+        (
+            {
+                "web": CloudWebProcess(
+                    command="python -m agent",
+                    port=8000,
+                    idle_timeout_seconds=600,
+                    ready_path="/health",
+                    ready_timeout_seconds=3,
+                    ready_start_period_seconds=60,
+                    cpu_millis=1000,
+                    memory_mb=2048,
+                ),
+                "runtime_environment": {"MODE": "worker"},
+                "worker": CloudProcess(command="python -m agent.worker"),
+                "schedules": (
+                    CloudSchedule(
+                        name="daily", command="python -m agent.daily", expression="rate(1 day)"
+                    ),
+                ),
+            },
+            "13ca696824528f9331fd0fd6a0a759001b5f5bc1ea4fc82093f4fae73540ee21",
+        ),
+        (
+            {"worker": CloudProcess(command="python -m agent.worker")},
+            "cd7ebd4790f33482001dcfd8f754e4d76ef026cc4adaf33b726ba015604eaf02",
+        ),
+        (
+            {
+                "schedules": (
+                    CloudSchedule(
+                        name="daily",
+                        command="python -m agent.daily",
+                        expression="rate(1 day)",
+                        cpu_millis=1000,
+                        memory_mb=2048,
+                    ),
+                )
+            },
+            "18208187f9585a89ca56fde6024020a121eca26f3d2b497e442c44a9a2f99757",
+        ),
+    ],
+    ids=["web-defaults", "web-custom", "worker", "schedule"],
+)
+def test_acknowledgement_recovery_matches_cloud_runtime_manifest_digests(tmp_path, changes, digest):
+    project = _project(tmp_path)
+    project = replace(project, manifest=replace(project.manifest, **changes))
+    client = RefusedReleaseClient(project)
+    # Recorded from Cloud's DeploymentManifestPayload.to_domain() and manifest_digest(),
+    # including the server's treatment of default and per-process runtime settings.
+    client.release["manifest_digest"] = digest
+    result = _acknowledged_deploy(client, project, tmp_path, [115])
+    assert result["result"]["deployment"]["acknowledge_breaking"] == [115]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("version", "different-version"), ("manifest_digest", "0" * 64), ("policy_version", "v2")],
+)
+def test_acknowledgement_recovery_refuses_different_submission_inputs(tmp_path, field, value):
+    project = _project(tmp_path)
+    client = RefusedReleaseClient(project)
+    client.release[field] = value
+    with pytest.raises(CloudApiError) as raised:
+        _acknowledged_deploy(client, project, tmp_path, [115])
+    assert raised.value.status_code == 409
+    assert not _requests(client, "/retry")
+
+
+def test_acknowledgement_recovery_finds_the_original_on_a_later_page(tmp_path):
+    project = _project(tmp_path)
+
+    class PagedClient(RefusedReleaseClient):
+        def request(self, method, path, **kwargs):
+            if (
+                method == "GET"
+                and path.endswith("/deployments")
+                and "cursor" not in kwargs["query"]
+            ):
+                self.requests.append((method, path, kwargs))
+                return {
+                    "items": [{**self.release, "version": "another-version"}],
+                    "next_cursor": "older-releases",
+                }
+            return super().request(method, path, **kwargs)
+
+    client = PagedClient(project)
+    result = _acknowledged_deploy(client, project, tmp_path, [115])
+    assert result["result"]["deployment"]["acknowledge_breaking"] == [115]
+    pages = [
+        kwargs["query"]
+        for method, path, kwargs in client.requests
+        if method == "GET" and path.endswith("/deployments")
+    ]
+    assert pages == [{"limit": "100"}, {"limit": "100", "cursor": "older-releases"}]
+
+
+@pytest.mark.parametrize("page", [{"items": None}, {"items": [], "next_cursor": "same"}])
+def test_acknowledgement_recovery_refuses_invalid_or_cyclic_history(tmp_path, page):
+    project = _project(tmp_path)
+
+    class InvalidHistoryClient(RefusedReleaseClient):
+        def request(self, method, path, **kwargs):
+            if method == "GET" and path.endswith("/deployments"):
+                self.requests.append((method, path, kwargs))
+                return page
+            return super().request(method, path, **kwargs)
+
+    client = InvalidHistoryClient(project)
+    with pytest.raises(CloudApiError) as raised:
+        _acknowledged_deploy(client, project, tmp_path, [115])
+    assert raised.value.category == "api_response_invalid"
+    assert not _requests(client, "/retry")
+    assert len(client.requests) <= 5
+
+
+def test_public_retry_command_sends_the_acknowledgement(tmp_path: Path):
+    project = _project(tmp_path)
+    client = Client(project)
+    arguments = cloud._build_parser().parse_args(
+        [
+            "deployment",
+            "retry",
+            "dep_old",
+            "--application",
+            "retry-agent",
+            "--idempotency-key",
+            "one-submission",
+            "--acknowledge-breaking",
+            "115",
+        ]
+    )
+    cloud._deployment(arguments, client=client)
+    assert client.requests[-1] == (
+        "POST",
+        "/v1/applications/retry-agent/deployments/dep_old/retry",
+        {"idempotency_key": "one-submission", "payload": {"acknowledge_breaking": [115]}},
+    )

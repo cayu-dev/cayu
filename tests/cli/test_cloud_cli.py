@@ -4090,3 +4090,300 @@ def test_deployment_logs_page_through_query_parameters() -> None:
         "/v1/applications/research-agent/deployments/dep_one/logs",
         {"query": {"diagnostic_offset": "40", "diagnostic_limit": "20"}},
     )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["deploy", "."],
+        ["deployment", "retry", "dep_one", "--application", "research-agent"],
+    ],
+)
+@pytest.mark.parametrize("value", ["0", "-1", "abc", "1.5", "+5", "0115", "1000001", ""])
+def test_cloud_acknowledge_breaking_rejects_invalid_revisions_before_authentication(
+    command: list[str],
+    value: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def unexpected_client(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("an invalid acknowledgement reached Cloud authentication")
+
+    monkeypatch.setattr(cloud_cli, "_cloud_client", unexpected_client)
+
+    assert main(["cloud", *command, f"--acknowledge-breaking={value}"]) == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error["category"] == "invalid_input"
+    assert "--acknowledge-breaking" in error["message"]
+
+
+def test_cloud_acknowledge_breaking_accepts_cloud_bounds_and_limits_the_count(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parsed = cloud_cli._build_parser().parse_args(
+        [
+            "deploy",
+            ".",
+            *("--acknowledge-breaking", "1000000", "--acknowledge-breaking", "1"),
+            *("--acknowledge-breaking", "115", "--acknowledge-breaking", "115"),
+        ]
+    )
+    assert cloud_cli._acknowledged_revisions(parsed) == (1, 115, 1_000_000)
+    assert cloud_cli._acknowledged_revisions(cloud_cli._build_parser().parse_args(["deploy"])) == ()
+
+    def unexpected_client(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("an invalid acknowledgement reached Cloud authentication")
+
+    monkeypatch.setattr(cloud_cli, "_cloud_client", unexpected_client)
+    flags = [
+        item for revision in range(1, 34) for item in ("--acknowledge-breaking", str(revision))
+    ]
+    assert main(["cloud", "deploy", ".", *flags]) == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error == {
+        "category": "invalid_input",
+        "message": "At most 32 distinct --acknowledge-breaking revisions can be given.",
+    }
+
+
+_DEPLOYMENT = "dep_0123456789abcdef0123456789abcdef"
+
+_STORAGE_PUBLICATION_ERRORS = {
+    "storage_breaking_acknowledgement_required": {
+        "code": "storage_breaking_acknowledgement_required",
+        "detail": (
+            "Publishing this release migrates the Agent database from Cayu storage revision "
+            "114 to 115 across breaking revision 115, and the release does not acknowledge "
+            "115. Nothing was stopped or migrated; the previous release keeps serving."
+        ),
+        "hint": (
+            "A breaking migration stops the previous release until this one starts, and "
+            "releases built with the older Cayu can't be rolled back to afterwards. To "
+            f'proceed, retry release {_DEPLOYMENT} with {{"acknowledge_breaking": [115]}} '
+            f"(`cayu-cloud-operator deployment retry {_DEPLOYMENT} --application ready-agent "
+            "--acknowledge-breaking 115`), or deploy again with that field. The database "
+            "keeps a point-in-time backup."
+        ),
+        "message": (
+            "The release crosses a breaking Cayu storage revision that it does not acknowledge."
+        ),
+    },
+    "storage_newer_than_release": {
+        "code": "storage_newer_than_release",
+        "detail": (
+            "The Agent database is at Cayu storage revision 115, past revision 114, the newest "
+            "this release's Cayu supports, so this release can't open it. A release can't be "
+            "rolled back to across a storage migration boundary."
+        ),
+        "hint": (
+            "Deploy or roll back to a release built with a Cayu that supports the current "
+            "storage revision. The running service was not changed."
+        ),
+        "message": "The release's Cayu can't open the Agent's current database.",
+    },
+    "storage_writers_not_stopped": {
+        "code": "storage_writers_not_stopped",
+        "detail": (
+            "The running release did not stop within 300 seconds, so the breaking storage "
+            "migration did not start. The previous release was restarted."
+        ),
+        "hint": (
+            "Check the Agent's web, worker and scheduled task logs for a process that ignores "
+            "SIGTERM, then retry the deployment. The database was not changed."
+        ),
+        "message": "The previous release did not stop for the breaking storage migration.",
+    },
+    "storage_migration_state_unknown": {
+        "code": "storage_migration_state_unknown",
+        "detail": (
+            "`cayu storage migrate` exited with code 1. The database was at revision 114 "
+            "before the migration and its status now could not be read, so Cloud can't "
+            "confirm it is unchanged and left the previous release stopped rather than start "
+            "it against it."
+        ),
+        "hint": (
+            "Retry this release: its migration resumes with the same backup reference and "
+            "acknowledgement and starts the release when it completes. Inspect the store with "
+            "`cayu storage status` first if the failure repeats; do not start the previous "
+            "release against it. The database's point-in-time backup is retained."
+        ),
+        "message": ("The breaking storage migration failed and the database state is unconfirmed."),
+    },
+}
+
+
+class _PublicationClient:
+    """An Agent still serving its old release while `_DEPLOYMENT` reports a publication error."""
+
+    def __init__(self, publication_error: dict[str, str]) -> None:
+        self.publication_error = publication_error
+        self.requests: list[tuple[str, str, dict[str, object]]] = []
+
+    def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+        self.requests.append((method, path, kwargs))
+        if path == "/v1/applications":
+            return {"items": [{"id": "ready-agent", "name": "Ready Agent", "revision": 3}]}
+        if path == "/v1/applications/ready-agent":
+            return {"id": "ready-agent", "revision": 3}
+        if path.endswith("/rollback"):
+            return {"id": "ready-agent", "current_deployment_id": _DEPLOYMENT}
+        if path.endswith("/service"):
+            return {"deployment_id": "dep_newer", "status": "running", "issues": []}
+        assert (method, path) == ("GET", f"/v1/applications/ready-agent/deployments/{_DEPLOYMENT}")
+        return {
+            "id": _DEPLOYMENT,
+            "status": "promoted",
+            "publication_error": self.publication_error,
+        }
+
+
+def _publication_failure_envelope(
+    raised: pytest.ExceptionInfo[CloudApiError], capsys: pytest.CaptureFixture[str]
+) -> dict[str, object]:
+    assert cloud_cli._cloud_failure(raised.value) == 2
+    return json.loads(capsys.readouterr().out)["error"]
+
+
+@pytest.mark.parametrize("code", sorted(_STORAGE_PUBLICATION_ERRORS))
+def test_cloud_deploy_wait_renders_breaking_storage_publication_failures(
+    code: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    publication_error = _STORAGE_PUBLICATION_ERRORS[code]
+    with pytest.raises(CloudApiError) as raised:
+        cloud_cli._wait_for_service(
+            _PublicationClient(publication_error),
+            application_id="ready-agent",
+            initial=None,
+            expected_deployment_id=_DEPLOYMENT,
+            poll_seconds=0.01,
+            recovery_arguments=("--context", "/private/cloud.json"),
+            wait_seconds=600,
+            sleep=lambda _: None,
+            monotonic=lambda: 0,
+        )
+
+    error = _publication_failure_envelope(raised, capsys)
+    assert error["category"] == "service_publication_failed"
+    assert error["code"] == code
+    assert error["publication_error"] == publication_error
+    assert error["application"] == "ready-agent"
+    assert error["deployment_id"] == _DEPLOYMENT
+    message = str(error["message"])
+    assert message.startswith(f"{publication_error['message']} {publication_error['detail']} ")
+    base = f"cayu cloud --context /private/cloud.json deployment %s {_DEPLOYMENT} --application ready-agent"
+    commands = error["commands"]
+    assert isinstance(commands, dict)
+    assert commands["status"] == base % "status"
+    assert commands["timeline"] == base % "timeline"
+    if code == "storage_breaking_acknowledgement_required":
+        retry = base % "retry" + " --acknowledge-breaking 115"
+        assert commands["retry"] == retry
+        assert error["acknowledge_breaking"] == [115]
+        assert "cayu-cloud-operator" not in message
+        assert "stops the previous release" in message
+        assert "can't be rolled back to afterwards" in message
+        assert f"run `{retry}`" in message
+        assert "run `cayu cloud deploy` again with `--acknowledge-breaking 115`" in message
+    else:
+        assert message.endswith(publication_error["hint"])
+        assert "acknowledge_breaking" not in error
+        if code == "storage_newer_than_release":
+            assert "retry" not in commands
+        else:
+            assert commands["retry"] == base % "retry"
+
+
+def test_cloud_acknowledgement_refusal_without_parseable_revisions_keeps_cloud_hint(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    publication_error = {
+        **_STORAGE_PUBLICATION_ERRORS["storage_breaking_acknowledgement_required"],
+        "hint": "Acknowledge the breaking revisions and retry the release.",
+    }
+    with pytest.raises(CloudApiError) as raised:
+        cloud_cli._wait_for_service(
+            _PublicationClient(publication_error),
+            application_id="ready-agent",
+            initial=None,
+            expected_deployment_id=_DEPLOYMENT,
+            poll_seconds=0.01,
+            wait_seconds=600,
+            sleep=lambda _: None,
+            monotonic=lambda: 0,
+        )
+
+    error = _publication_failure_envelope(raised, capsys)
+    assert error["code"] == "storage_breaking_acknowledgement_required"
+    assert str(error["message"]).endswith(publication_error["hint"])
+    assert "retry" not in error["commands"]
+
+
+def test_cloud_deployment_wait_reports_a_refused_publication(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = _PublicationClient(
+        _STORAGE_PUBLICATION_ERRORS["storage_breaking_acknowledgement_required"]
+    )
+    arguments = cloud_cli._build_parser().parse_args(
+        ["deployment", "wait", _DEPLOYMENT, "--application", "ready-agent"]
+    )
+    with pytest.raises(CloudApiError) as raised:
+        cloud_cli._deployment(arguments, client=client)
+
+    error = _publication_failure_envelope(raised, capsys)
+    assert error["code"] == "storage_breaking_acknowledgement_required"
+    assert error["commands"]["retry"] == (
+        f"cayu cloud deployment retry {_DEPLOYMENT} --application ready-agent "
+        "--acknowledge-breaking 115"
+    )
+
+
+def test_cloud_rollback_wait_reports_a_release_older_than_the_database(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = _PublicationClient(_STORAGE_PUBLICATION_ERRORS["storage_newer_than_release"])
+    arguments = cloud_cli._build_parser().parse_args(
+        ["rollback", _DEPLOYMENT, "--application", "ready-agent", "--wait"]
+    )
+    with pytest.raises(CloudApiError) as raised:
+        cloud_cli._rollback(arguments, client=client)
+
+    error = _publication_failure_envelope(raised, capsys)
+    assert error["code"] == "storage_newer_than_release"
+    assert "retry" not in error["commands"]
+    assert ("PUT", "/v1/applications/ready-agent/service", {}) in client.requests
+
+    # Without --wait, rollback returns once Cloud accepts the selection, as before.
+    quiet = _PublicationClient(_STORAGE_PUBLICATION_ERRORS["storage_newer_than_release"])
+    result = cloud_cli._rollback(
+        cloud_cli._build_parser().parse_args(
+            ["rollback", _DEPLOYMENT, "--application", "ready-agent"]
+        ),
+        client=quiet,
+    )
+    assert result["operation"] == "rollback"
+    assert not any(path.endswith(_DEPLOYMENT) for _, path, _ in quiet.requests)
+
+
+@pytest.mark.parametrize("code", sorted(_STORAGE_PUBLICATION_ERRORS))
+def test_cloud_timeline_keeps_breaking_storage_failures(code: str) -> None:
+    publication_error = _STORAGE_PUBLICATION_ERRORS[code]
+    failure = {
+        "schema_version": 1,
+        **publication_error,
+        "phase": "database_migrated",
+        "automatic_retryable": False,
+        "attempt": 1,
+        "diagnostic_ref": "database_migrated:attempt-1",
+        "diagnostic": {
+            "status": "unavailable",
+            "stage": "database_migration",
+            "reason": "not_applicable",
+            "exit_code": None,
+            "excerpt": "",
+            "truncated": False,
+        },
+    }
+    result = cloud_cli._validated_deployment_diagnostics({"failure": failure, "items": []})
+    assert result["failure"] == failure
