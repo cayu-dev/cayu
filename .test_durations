@@ -44856,5 +44856,13 @@
     "tests/core/test_sqlite_package_layout.py::test_sqlite_eval_schema_validates_without_migration_or_store_imports[cayu_eval_scenarios]": 0.19,
     "tests/core/test_sqlite_package_layout.py::test_sqlite_eval_schema_validates_without_migration_or_store_imports[cayu_eval_authored_suites]": 0.186,
     "tests/core/test_sqlite_package_layout.py::test_sqlite_eval_schema_validates_without_migration_or_store_imports[cayu_eval_judge_calibrations]": 0.184,
-    "tests/core/test_sqlite_package_layout.py::test_sqlite_eval_schema_validates_without_migration_or_store_imports[cayu_eval_run_trial_checkpoints]": 0.185
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_eval_schema_validates_without_migration_or_store_imports[cayu_eval_run_trial_checkpoints]": 0.185,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_verified_work_schema_validates_without_migration_or_store_imports[current]": 0.28,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_verified_work_schema_validates_without_migration_or_store_imports[missing-claim-index]": 0.191,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_verified_work_schema_validates_without_migration_or_store_imports[missing-contracts]": 0.185,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_verified_work_schema_validates_without_migration_or_store_imports[missing-lifecycle-receipts]": 0.19,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_verified_work_schema_validates_without_migration_or_store_imports[missing-preparation-holds]": 0.227,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_verified_work_schema_validates_without_migration_or_store_imports[missing-profiles]": 0.185,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_verified_work_schema_validates_without_migration_or_store_imports[revision-49-requires-profiles]": 0.091,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_verified_work_schema_validates_without_migration_or_store_imports[revision-49]": 0.932
 }

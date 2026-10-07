@@ -62,6 +62,131 @@ assert "cayu.storage.postgres" not in sys.modules
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize(
+    ("revision", "require_profiles", "damage", "expected_error"),
+    [
+        (49, False, None, None),
+        (49, True, None, "revision-58 verified-work contract"),
+        (None, True, None, None),
+        (
+            None,
+            True,
+            "DROP TABLE cayu_work_contracts",
+            "cayu_work_contracts",
+        ),
+        (
+            None,
+            True,
+            "DROP TABLE cayu_completion_verifier_profiles",
+            "cayu_completion_verifier_profiles",
+        ),
+        (
+            None,
+            True,
+            "DROP INDEX idx_cayu_work_attempt_claim_current",
+            "work-attempt admission schema",
+        ),
+        (
+            None,
+            True,
+            "DROP TABLE cayu_work_attempt_preparation_holds",
+            "work-attempt preparation hold schema",
+        ),
+        (
+            None,
+            True,
+            "DROP TABLE cayu_work_attempt_lifecycle_receipts",
+            "work-attempt lifecycle schema",
+        ),
+    ],
+    ids=[
+        "revision-49",
+        "revision-49-requires-profiles",
+        "current",
+        "missing-contracts",
+        "missing-profiles",
+        "missing-claim-index",
+        "missing-preparation-holds",
+        "missing-lifecycle-receipts",
+    ],
+)
+def test_sqlite_verified_work_schema_validates_without_migration_or_store_imports(
+    tmp_path, sqlite_resources, revision, require_profiles, damage, expected_error
+):
+    from cayu.storage import _sqlite_connection, _sqlite_support, migrations
+
+    async def prepare():
+        async with sqlite_resources as resources:
+            path = tmp_path / "verified-work.sqlite"
+            connection = resources.own(_sqlite_connection.connect(path), kind="connection")
+            if revision is None:
+                _sqlite_support.initialize_schema(connection)
+            else:
+                connection.execute(_sqlite_support._MIGRATIONS_TABLE_DDL)
+                _sqlite_support._apply_baseline(connection)
+                for pending in migrations.pending(migrations.BASELINE_REVISION):
+                    if pending.revision > revision:
+                        break
+                    _sqlite_support._apply_revision(connection, pending)
+            if damage is not None:
+                connection.execute(damage)
+                connection.commit()
+            return path
+
+    path = asyncio.run(prepare())
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sqlite3
+import sys
+from contextlib import closing
+from pathlib import Path
+
+from cayu.storage import _sqlite_verified_work_schema as verified_work_schema
+
+with closing(sqlite3.connect(Path(sys.argv[1]).as_uri() + "?mode=ro", uri=True)) as connection:
+    revision = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    try:
+        verified_work_schema._validate_verified_work_schema(
+            connection, require_verifier_profiles=sys.argv[2] == "True"
+        )
+        if revision >= 61:
+            verified_work_schema._validate_work_attempt_admission_schema(connection)
+        if revision >= 84:
+            verified_work_schema._validate_work_attempt_lifecycle_schema(connection)
+    except RuntimeError as error:
+        assert sys.argv[3] and sys.argv[3] in str(error), str(error)
+    else:
+        assert not sys.argv[3], "incompatible schema was accepted"
+    assert not connection.in_transaction
+
+for name in (
+    "cayu.storage._sqlite_support",
+    "cayu.storage._sqlite_connection",
+    "cayu.storage.migrations",
+    "cayu.sessions.base",
+    "cayu.tasks.base",
+    "cayu.storage.sqlite",
+    "cayu.storage.tasks_sqlite",
+    "cayu.storage.postgres",
+    "cayu.verification.verified_task_worker",
+):
+    assert name not in sys.modules, name
+""",
+            str(path),
+            str(require_profiles),
+            expected_error or "",
+        ],
+        env={**os.environ, "PYTHONPATH": str(Path(cayu.__file__).resolve().parent.parent)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize("missing_index", [False, True])
 def test_sqlite_knowledge_schema_validates_without_migration_or_store_imports(
     tmp_path, sqlite_resources, missing_index

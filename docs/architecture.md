@@ -656,6 +656,8 @@ Work-context, recall-delivery and recall-subscription checks live together in
 `storage/_sqlite_work_context_schema.py`. Both owners use the shared catalog
 readers in `storage/_sqlite_catalog.py`. Evaluation result, case, scenario,
 authored-suite, calibration and run checks live in `storage/_sqlite_eval_schema.py`.
+Verified-work contracts, completion verification, attempt admission and lifecycle
+receipt checks live together in `storage/_sqlite_verified_work_schema.py`.
 These owners inspect existing tables, indexes, views and constraints.
 Schema reconciliation retains revision
 gates and validation order in `storage/_sqlite_support.py`, alongside migration
