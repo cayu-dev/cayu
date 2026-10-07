@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Continuation now recovers a session whose process died during a model call.
+  When `run`, `resume` or another continuation takes over an abandoned execution
+  and finds an ordinary dispatched assistant model call with no durable response,
+  it records the call's outcome as unknown, charges its budget reservations in
+  full, interrupts that interaction and continues the conversation. Before, this
+  raised `ModelCompletionManualRecoveryRequired` until the application called
+  `recover_model_completion_stage(...)`. Resumable provider operations, context
+  compaction, auxiliary inference and contracted tasks keep their existing
+  recovery paths.
 - `cayu cloud deploy --acknowledge-breaking REVISION` (repeatable) acknowledges a
   breaking Cayu storage revision for Cayu Cloud's database migration, and
   `cayu cloud deployment retry RELEASE --application AGENT --acknowledge-breaking

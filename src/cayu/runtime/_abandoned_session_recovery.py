@@ -69,6 +69,7 @@ async def recover_abandoned_execution(
     recover: Callable[
         [IncompleteSessionRecoveryRequest], Awaitable[IncompleteSessionRecoveryResult]
     ],
+    settle_model_dispatch: Callable[[Session], Awaitable[tuple[Event, ...]]] | None = None,
 ) -> tuple[Event, ...]:
     if session.status not in {SessionStatus.RUNNING, SessionStatus.INTERRUPTING}:
         return ()
@@ -78,6 +79,10 @@ async def recover_abandoned_execution(
     if execution.state != "owner_lost" or execution.run_epoch != session.run_epoch:
         raise SessionExecutionInProgress(session.id, session.status)
     with _abandoned_execution(session):
+        # The lost owner may have died with a provider call in flight. Its outcome is
+        # unknown, so settle it as interrupted (charging its budget reservations in full)
+        # before ordinary recovery fences the run.
+        settled = () if settle_model_dispatch is None else await settle_model_dispatch(session)
         result = await recover(
             IncompleteSessionRecoveryRequest(
                 session_id=session.id,
@@ -88,4 +93,4 @@ async def recover_abandoned_execution(
         )
     if result.status in {SessionStatus.RUNNING, SessionStatus.INTERRUPTING}:
         raise SessionExecutionInProgress(session.id, result.status)
-    return result.events
+    return (*settled, *result.events)

@@ -6907,7 +6907,63 @@ class SessionEngine:
             recover=lambda request: self.recover_incomplete_session(
                 request, participant_context=participant_context
             ),
+            settle_model_dispatch=self._settle_abandoned_model_dispatch,
         )
+
+    async def _settle_abandoned_model_dispatch(self, session: Session) -> tuple[Event, ...]:
+        """Interrupt an assistant model call whose owning process is gone.
+
+        Only an ordinary dispatched call qualifies: no terminal response, no provider
+        operation that can be resumed or inspected, and no task contract that needs an
+        explicit completion decision. Everything else stays on the operator path.
+        """
+
+        from cayu.runtime.provider_operations import load_recoverable_provider_operation_start
+
+        active = await self.session_store.load_active_model_completion_stage(session.id)
+        if active is None:
+            return ()
+        stage = active.stage
+        context = model_completion_recovery_context_from_stage(stage)
+        if (
+            stage.state != "in_flight"
+            or stage.purpose != "assistant-turn"
+            or stage.intent.get("provider_operation_start") is not None
+            or context is None
+            or context.task_id is not None
+        ):
+            return ()
+        if (
+            await self.session_store.load_model_completion_stage_dispatch(
+                session.id, stage.stage_id
+            )
+            is None
+            or await self.session_store.load_model_completion_stage_settlement(
+                session.id, stage.stage_id
+            )
+            is not None
+        ):
+            return ()
+        try:
+            if (
+                await load_recoverable_provider_operation(self.session_store, stage) is not None
+                or await load_recoverable_provider_operation_start(self.session_store, stage)
+                is not None
+            ):
+                return ()
+        except ProviderOperationEvidenceError:
+            return ()
+        result = await self._recover_model_completion_stage(
+            ModelCompletionManualRecoveryRequest(
+                session_id=session.id,
+                stage_id=stage.stage_id,
+                expected_run_epoch=session.run_epoch,
+                expected_session_instance_id=session.instance_id,
+                terminal_status=SessionStatus.INTERRUPTED,
+                inactive_for_seconds=0,
+            )
+        )
+        return result.budget_events
 
     async def recover_incomplete_session(
         self,
