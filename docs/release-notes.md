@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+## v0.9.1
+
+Cayu improves release validation and separates internal storage and event-schema
+ownership while preserving the public contracts introduced in v0.9.0.
+
+- Register all maintenance qualification cases and check registry coverage in
+  ordinary pull-request CI. Consolidate the five fixture journeys into one
+  qualification scenario and update concurrent gateway test assertions to avoid
+  depending on execution order.
+- Fix FFmpeg installation in Cayu’s own CI through the shared apt action, using
+  the HTTPS archive for Ubuntu Azure and GCE mirror sources.
+- Separate SQLite transaction ownership from schema support and shared event
+  schemas from runtime projection, preserving supported imports and serialized
+  model identities.
+
+The storage revision remains 115 and the server contract remains 48. When
+upgrading from a version older than v0.9.0, follow the full
+[v0.9.0 upgrade guidance](https://github.com/cayu-dev/cayu/blob/v0.9.1/docs/release-notes.md#upgrade-from-v081):
+migrate storage to revision 115, regenerate clients for server contract 48
+(previously 47), upgrade the dashboard with the server, refresh application
+lockfiles, and follow the `cayu cloud init` refresh instructions. For installs
+older than v0.8.1, also review the
+[v0.8.0 and earlier upgrade guidance](https://github.com/cayu-dev/cayu/blob/v0.9.1/docs/release-notes.md#v080).
+
 ## v0.9.0
 
 Cayu adds durable external-event waits, deferred execution environments, and
