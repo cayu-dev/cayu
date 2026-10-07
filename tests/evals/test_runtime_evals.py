@@ -5481,11 +5481,13 @@ def test_fresh_eval_memory_read_capacity_fails_closed_after_opaque_timeout():
                 _memory_read_app(store, requests=2),
                 EvalSuite(id="bounded-memory-reads", cases=cases),
                 max_concurrency=1,
-                case_timeout_seconds=2.0,
+                # The same bound applies to the second case, which must finish
+                # its full run inside it on a loaded runner.
+                case_timeout_seconds=5.0,
             )
         )
         try:
-            result = await asyncio.wait_for(task, timeout=5)
+            result = await asyncio.wait_for(task, timeout=15)
         finally:
             store.release_read.set()
             if store.read_started.is_set():

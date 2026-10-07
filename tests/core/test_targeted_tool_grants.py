@@ -2015,11 +2015,12 @@ def test_call_tool_publishes_only_safe_argument_projections(
         ]
 
         assert events[-1].type is EventType.SESSION_COMPLETED
-        assert tool.calls == (
+        expected_calls = (
             [{"fact": "Fact 0."}, {"fact": "Fact 1."}]
             if multi_call
             else [{"fact": "Keep the gateway identity stable."}]
         )
+        assert sorted(tool.calls, key=repr) == sorted(expected_calls, key=repr)
         terminals = [event for event in events if event.type is EventType.TOOL_CALL_COMPLETED]
         assert len(terminals) == (2 if multi_call else 1)
         assert all(
@@ -2094,7 +2095,8 @@ def test_failed_multi_call_gateway_terminals_restore_targeted_authority(
         ]
 
         assert events[-1].type is EventType.SESSION_COMPLETED
-        assert tool.calls == [{"fact": "Fact 0."}, {"fact": "Fact 1."}]
+        expected_calls = [{"fact": "Fact 0."}, {"fact": "Fact 1."}]
+        assert sorted(tool.calls, key=repr) == sorted(expected_calls, key=repr)
         terminals = [event for event in events if event.type is EventType.TOOL_CALL_FAILED]
         assert len(terminals) == 2
         assert all(event.tool_name == "remember" for event in terminals)

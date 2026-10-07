@@ -1,0 +1,42 @@
+name: Install system packages
+description: Point apt at Ubuntu's primary archive and install packages whose commands are missing.
+
+inputs:
+  packages:
+    description: Space-separated apt packages to install.
+    required: true
+  commands:
+    description: Space-separated commands the packages provide. Installation is skipped when all exist.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Use Ubuntu's primary archive
+      shell: bash
+      run: |
+        # Regional GCE and Azure mirrors can stall downloads for half an hour.
+        # Later apt users in the job, such as Playwright's system dependencies,
+        # also read these sources, so rewrite them even when nothing is missing.
+        for source in \
+          /etc/apt/sources.list \
+          /etc/apt/sources.list.d/ubuntu.sources \
+          /etc/apt/apt-mirrors.txt \
+          /etc/apt/apt-security-mirrors.txt; do
+          if test -f "$source"; then
+            sudo sed -i -E 's@https?://([a-z0-9-]+\.)*(azure|gce)\.archive\.ubuntu\.com/ubuntu@https://archive.ubuntu.com/ubuntu@g' "$source"
+          fi
+        done
+    - name: Install missing packages
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+        COMMANDS: ${{ inputs.commands }}
+      run: |
+        for command in $COMMANDS; do
+          if ! command -v "$command" >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends $PACKAGES
+            exit 0
+          fi
+        done

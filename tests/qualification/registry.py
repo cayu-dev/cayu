@@ -17,6 +17,7 @@ def core(file, *names):
 
 
 _MAINTENANCE_APPLICATION = "tests/qualification/test_repository_maintenance_application.py"
+_MAINTENANCE_FIXTURE = "tests/qualification/test_repository_maintenance_fixture.py"
 
 
 def _maintenance_module(name, invariant, boundary):
@@ -29,8 +30,9 @@ def _maintenance_module(name, invariant, boundary):
 
 
 # Each scenario keeps the runner's existing 300-second default ownership bound.
-# Full journeys are independently selected: the combined application suite takes
-# more than that limit even when every individual test passes.
+# Application journeys are independently selected: together they take more than
+# that limit even when every individual test passes. The fixture journeys fit
+# in one scenario.
 MAINTENANCE_SCENARIOS = (
     Scenario(
         "repository-maintenance-corpus",
@@ -91,6 +93,27 @@ MAINTENANCE_SCENARIOS = (
             ),
         )
     ),
+    Scenario(
+        "repository-maintenance-fixture-contract",
+        "Captured source remains unchanged and generated checks retain the fixed acceptance case",
+        "base-bound source capture, validation and generated toolchain configuration",
+        tuple(
+            f"{_MAINTENANCE_FIXTURE}::{name}"
+            for name in (
+                "test_capture_refuses_before_generation_and_without_git_mutation",
+                "test_generator_revalidates_mutated_capture",
+                "test_capture_is_read_only_and_generated_binding_is_complete",
+                "test_capture_rejects_unsupported_committed_tree",
+                "test_bound_check_commands_use_fixed_case_without_target_configuration",
+            )
+        ),
+    ),
+    Scenario(
+        "repository-maintenance-fixture-journeys",
+        "Only a current captured repository can enter the bounded public journey",
+        "captured fixture through generated workflow admission and delivery",
+        (f"{_MAINTENANCE_FIXTURE}::test_bound_repository_public_journey",),
+    ),
     *(
         _maintenance_module(*row)
         for row in (
@@ -135,6 +158,16 @@ MAINTENANCE_SCENARIOS = (
                 "native worker to emitted coding handler",
             ),
             (
+                "worker_case",
+                "Publication observation preserves the worker owner and original deadline",
+                "publication barrier, worker exit and observer cancellation",
+            ),
+            (
+                "reconciliation",
+                "Operator settlement requires exact receipts without claiming unproven quiescence",
+                "cancellation evidence, retained acknowledgements and recorded generations",
+            ),
+            (
                 "http",
                 "Product access cannot bypass tenant authority",
                 "HTTP intake and resource lookup",
@@ -153,6 +186,11 @@ MAINTENANCE_SCENARIOS = (
                 "delivery_view",
                 "Native effects and task outcomes remain distinct",
                 "Git/GitHub historical projection",
+            ),
+            (
+                "delivery_probe",
+                "Independent destination probes retain conflict checks after reconstruction",
+                "shared-store delivery identities and conflicting request replay",
             ),
             (
                 "cost",

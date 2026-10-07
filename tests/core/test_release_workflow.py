@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 _REPOSITORY_ROOT = Path(__file__).parents[2]
@@ -8,6 +9,9 @@ _CI_WORKFLOW = _REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
 _CI_RUNNER = _REPOSITORY_ROOT / "scripts" / "run_ci.py"
 _PACKAGE_MANIFEST = _REPOSITORY_ROOT / "scripts" / "package_ci_steps.yml"
 _TAG_VERIFIER = _REPOSITORY_ROOT / ".github" / "actions" / "verify-release-tag" / "action.yml"
+_SYSTEM_PACKAGES = (
+    _REPOSITORY_ROOT / ".github" / "actions" / "install-system-packages" / "action.yml"
+)
 _RELEASE_RUNBOOK = _REPOSITORY_ROOT / "docs" / "releasing.md"
 _SIDECAR_VERIFIER = _REPOSITORY_ROOT / "scripts" / "verify_release_sidecar_artifacts.sh"
 _COMMIT_PIN = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
@@ -110,19 +114,16 @@ def test_core_ci_uses_balanced_required_shards_without_coverage() -> None:
         assert "actions/upload-artifact@" not in job
         assert "continue-on-error" not in job
 
-    for job in (shards, specialists, qualification):
-        assert "command -v rg" in job
-        assert "sudo apt-get install --yes ripgrep" in job
-        assert job.index("sudo apt-get install --yes ripgrep") < job.index("scripts/run_ci.py")
+    for job, packages in (
+        (shards, "packages: ripgrep ffmpeg\n          commands: rg ffmpeg"),
+        (specialists, "packages: ripgrep\n          commands: rg"),
+        (qualification, "packages: ripgrep\n          commands: rg"),
+    ):
+        assert packages in job
+        assert job.index(packages) < job.index("scripts/run_ci.py")
 
     assert "github.event_name == 'pull_request'" not in shards
     assert "timeout-minutes: 45" in shards
-    assert "sudo apt-get install --yes --no-install-recommends ffmpeg" in shards
-    encoder = shards.split("- name: Install recording encoder", 1)[1].split(
-        "- name: Test duration-balanced shard", 1
-    )[0]
-    assert "timeout-minutes: 5" in encoder
-    assert "https://archive.ubuntu.com/ubuntu" in encoder
     assert (
         "shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]"
         in shards
@@ -149,6 +150,64 @@ def test_core_ci_uses_balanced_required_shards_without_coverage() -> None:
         assert f"- host-journey-{group}\n" in specialists
     assert "--cov" not in specialists
     assert "COVERAGE_FILE" not in specialists
+
+
+def test_every_apt_install_uses_the_bounded_shared_mirror_step() -> None:
+    step = "        timeout-minutes: 5\n        uses: ./.github/actions/install-system-packages\n"
+    ci = _CI_WORKFLOW.read_text()
+    qualification = (_REPOSITORY_ROOT / ".github/workflows/qualification.yml").read_text()
+    for workflow, job in (
+        (ci, "test_shards"),
+        (ci, "test_specialists"),
+        (ci, "package-build"),
+        (ci, "package"),
+        (qualification, "qualification"),
+    ):
+        assert step in _job_block(workflow, job), job
+    for path in (_REPOSITORY_ROOT / ".github/workflows").glob("*.yml"):
+        assert "apt-get" not in path.read_text(), path.name
+
+
+def test_shared_apt_step_rewrites_cloud_mirrors_in_all_ubuntu_source_formats() -> None:
+    action = _SYSTEM_PACKAGES.read_text()
+    [loop] = re.findall(r"for source in \\\n(.*?); do", action, flags=re.DOTALL)
+    assert loop.split() == [
+        "/etc/apt/sources.list",
+        "\\",
+        "/etc/apt/sources.list.d/ubuntu.sources",
+        "\\",
+        "/etc/apt/apt-mirrors.txt",
+        "\\",
+        "/etc/apt/apt-security-mirrors.txt",
+    ]
+    [rewrite] = re.findall(r"sudo sed -i -E '([^']+)' \"\$source\"", action)
+    sources = (
+        "deb http://us-west2.gce.archive.ubuntu.com/ubuntu noble main\n"
+        "URIs: https://europe-west1.gce.archive.ubuntu.com/ubuntu\n"
+        "URIs: http://azure.archive.ubuntu.com/ubuntu\n"
+        "URIs: http://eastus2.azure.archive.ubuntu.com/ubuntu\n"
+        "http://azure.archive.ubuntu.com/ubuntu\tpriority:1\n"
+        "https://westeurope.azure.archive.ubuntu.com/ubuntu\tpriority:2\n"
+        "URIs: http://azure.ports.ubuntu.com/ubuntu-ports\n"
+        "URIs: https://packages.microsoft.com/ubuntu/24.04/prod\n"
+    )
+    rewritten = subprocess.run(
+        ["sed", "-E", rewrite],
+        input=sources,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert rewritten.stdout == (
+        "deb https://archive.ubuntu.com/ubuntu noble main\n"
+        "URIs: https://archive.ubuntu.com/ubuntu\n"
+        "URIs: https://archive.ubuntu.com/ubuntu\n"
+        "URIs: https://archive.ubuntu.com/ubuntu\n"
+        "https://archive.ubuntu.com/ubuntu\tpriority:1\n"
+        "https://archive.ubuntu.com/ubuntu\tpriority:2\n"
+        "URIs: http://azure.ports.ubuntu.com/ubuntu-ports\n"
+        "URIs: https://packages.microsoft.com/ubuntu/24.04/prod\n"
+    )
 
 
 def test_privileged_jobs_share_release_tag_verifier() -> None:

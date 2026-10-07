@@ -133,6 +133,9 @@ def test_dependency_or_scope_changes_fail_open() -> None:
     )
     assert select_pull_request_jobs(["pyproject.toml"]) == all_jobs
     assert select_pull_request_jobs([".github/workflows/ci.yml"]) == all_jobs
+    assert (
+        select_pull_request_jobs([".github/actions/install-system-packages/action.yml"]) == all_jobs
+    )
     assert select_pull_request_jobs(["scripts/package_ci_steps.yml"]) == all_jobs
     assert select_pull_request_jobs(["scripts/run_ci.py"]) == all_jobs
     assert select_pull_request_jobs(["scripts/select_ci_jobs.py"]) == all_jobs

@@ -32205,11 +32205,20 @@ def test_cayu_app_recover_tool_round_cancellation_after_claim_commit_preserves_c
         round_id = checkpoint["pending_tool_round"]["tool_round_id"]
         releases_before_recovery = store.release_calls
         if expire_acknowledgement:
-            monkeypatch.setattr(
-                recovery_coordinator_module,
-                "_INCOMPLETE_RECOVERY_CLAIM_LEASE",
-                timedelta(seconds=1),
-            )
+            # Expire the local lease only after the claim commits. A short real
+            # lease can run out before the commit on a loaded runner.
+            from cayu.runtime import _recovery_claims
+
+            real_monotonic = recovery_coordinator_module.time.monotonic
+            monotonic_offset = 0.0
+
+            class RecoveryMonotonicClock:
+                @staticmethod
+                def monotonic() -> float:
+                    return real_monotonic() + monotonic_offset
+
+            monkeypatch.setattr(recovery_coordinator_module, "time", RecoveryMonotonicClock)
+            monkeypatch.setattr(_recovery_claims, "time", RecoveryMonotonicClock)
             cleanup_failure = RuntimeError("expired recovery claim cleanup failed")
             original_release = app._recovery_coordinator._release_incomplete_recovery_claim
 
@@ -32241,7 +32250,9 @@ def test_cayu_app_recover_tool_round_cancellation_after_claim_commit_preserves_c
         recovery_task.cancel("cancel committed manual recovery claim")
         assert recovery_task.cancelling() == 1
         if expire_acknowledgement:
-            await asyncio.sleep(1.05)
+            monotonic_offset = (
+                recovery_coordinator_module._INCOMPLETE_RECOVERY_CLAIM_LEASE.total_seconds() + 1
+            )
         store.allow_recovery_transition_return.set()
         with pytest.raises(asyncio.CancelledError) as cancellation:
             await recovery_task

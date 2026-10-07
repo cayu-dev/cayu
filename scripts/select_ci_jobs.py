@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 _SCOPE_DEFINITION_PATHS = {
+    ".github/actions/install-system-packages/action.yml",
     ".github/workflows/ci.yml",
     ".github/workflows/qualification.yml",
     "scripts/package_ci_steps.yml",

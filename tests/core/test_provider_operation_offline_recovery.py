@@ -5066,6 +5066,9 @@ def test_successful_provider_resolution_redacts_audit_fields_before_persistence_
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
+            # Earlier tests in the same worker can leave resources that the
+            # garbage collector finalizes here. They are not resolution output.
+            warnings.simplefilter("ignore", ResourceWarning)
             emitted = [event async for event in app.resolve_provider_operation(request)]
         assert caught == []
         stored_resolution = await load_provider_operation_resolution(

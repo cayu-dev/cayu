@@ -91,27 +91,12 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
-      - name: Install test search dependency
-        run: |
-          if ! command -v rg >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install --yes ripgrep
-          fi
-      - name: Install recording encoder
+      - name: Install test system dependencies
         timeout-minutes: 5
-        run: |
-          if ! command -v ffmpeg >/dev/null; then
-            # Some GCE runners' regional HTTP mirror takes half an hour for
-            # ffmpeg's dependencies. Use Ubuntu's HTTPS archive and bound setup
-            # separately so it cannot consume the test execution budget.
-            for source in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
-              if test -f "$source"; then
-                sudo sed -i -E 's@https?://[a-z0-9.-]+\.gce\.archive\.ubuntu\.com/ubuntu@https://archive.ubuntu.com/ubuntu@g' "$source"
-              fi
-            done
-            sudo apt-get update
-            sudo apt-get install --yes --no-install-recommends ffmpeg
-          fi
+        uses: ./.github/actions/install-system-packages
+        with:
+          packages: ripgrep ffmpeg
+          commands: rg ffmpeg
       - name: Test duration-balanced shard
         run: python3 scripts/run_ci.py --lane general --shard "${{ matrix.shard }}"
 
@@ -153,11 +138,11 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - name: Install test search dependency
-        run: |
-          if ! command -v rg >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install --yes ripgrep
-          fi
+        timeout-minutes: 5
+        uses: ./.github/actions/install-system-packages
+        with:
+          packages: ripgrep
+          commands: rg
       - name: Test specialist lane
         run: >-
           python3 scripts/run_ci.py --lane specialist
@@ -200,9 +185,11 @@ jobs:
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
       - name: Install package prerequisites
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes ripgrep
+        timeout-minutes: 5
+        uses: ./.github/actions/install-system-packages
+        with:
+          packages: ripgrep
+          commands: rg
       - name: Build and verify reproducible release archives
         id: release-package
         run: |
@@ -243,17 +230,14 @@ jobs:
           node-version: 22.18.0
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
+      # Later browser setup reads the same apt sources, so this also keeps
+      # Playwright's system dependencies off the slow regional mirror.
       - name: Install coding-composition system dependencies
-        run: |
-          # Later browser setup uses these sources too. Avoid the slow regional
-          # HTTP mirror before downloading Playwright's system dependencies.
-          for source in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
-            if test -f "$source"; then
-              sudo sed -i -E 's@https?://[a-z0-9.-]+\.gce\.archive\.ubuntu\.com/ubuntu@https://archive.ubuntu.com/ubuntu@g' "$source"
-            fi
-          done
-          sudo apt-get update
-          sudo apt-get install --yes ripgrep
+        timeout-minutes: 5
+        uses: ./.github/actions/install-system-packages
+        with:
+          packages: ripgrep
+          commands: rg
       # Core verifies the ARM64 sidecar on a native ARM runner.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:

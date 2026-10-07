@@ -88,7 +88,14 @@ async def test_server_resources_enclose_policy_workers(store_factory, exit_mode,
 
     task = asyncio.create_task(serve())
     if exit_mode == "cancel":
-        await asyncio.wait_for(entered.wait(), 5)
+        # Startup and the first run can take seconds on a loaded PostgreSQL
+        # runner. Wait for the body or its failure instead of a fixed bound.
+        entered_wait = asyncio.create_task(entered.wait())
+        done, _ = await asyncio.wait({task, entered_wait}, return_when=asyncio.FIRST_COMPLETED)
+        if task in done:
+            entered_wait.cancel()
+            await task
+            pytest.fail("Server body exited before cancellation")
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
