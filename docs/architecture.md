@@ -644,9 +644,11 @@ Process commands should use argv form. Shell execution should be an explicit mod
 
 SQLite knowledge-schema checks live in `storage/_sqlite_knowledge_schema.py`.
 Work-context, recall-delivery and recall-subscription checks live together in
-`storage/_sqlite_work_context_schema.py`. Both owners inspect existing tables,
-indexes, views and constraints using the shared readers in
-`storage/_sqlite_catalog.py`. Schema reconciliation retains revision
+`storage/_sqlite_work_context_schema.py`. Both owners use the shared catalog
+readers in `storage/_sqlite_catalog.py`. Evaluation result, case, scenario,
+authored-suite, calibration and run checks live in `storage/_sqlite_eval_schema.py`.
+These owners inspect existing tables, indexes, views and constraints.
+Schema reconciliation retains revision
 gates and validation order in `storage/_sqlite_support.py`, alongside migration
 history and execution. These domain checks can run on a read-only connection
 without importing migration history or store adapters.

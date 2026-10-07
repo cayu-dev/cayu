@@ -44837,5 +44837,13 @@
     "tests/core/test_sqlite_package_layout.py::test_sqlite_work_context_schema_validates_without_migration_or_store_imports[None]": 0.9341377070231829,
     "tests/core/test_sqlite_package_layout.py::test_sqlite_work_context_schema_validates_without_migration_or_store_imports[cayu_agent_recall_delivery_claims]": 0.16744124901015311,
     "tests/core/test_sqlite_package_layout.py::test_sqlite_work_context_schema_validates_without_migration_or_store_imports[cayu_agent_recall_subscription_claims]": 0.16440050103119574,
-    "tests/core/test_sqlite_package_layout.py::test_sqlite_work_context_schema_validates_without_migration_or_store_imports[cayu_agent_work_context_publications]": 0.16885591697064228
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_work_context_schema_validates_without_migration_or_store_imports[cayu_agent_work_context_publications]": 0.16885591697064228,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_eval_schema_validates_without_migration_or_store_imports[None]": 0.182,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_eval_schema_validates_without_migration_or_store_imports[cayu_eval_baselines]": 0.185,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_eval_schema_validates_without_migration_or_store_imports[cayu_eval_cases]": 0.186,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_eval_schema_validates_without_migration_or_store_imports[cayu_eval_runs]": 0.185,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_eval_schema_validates_without_migration_or_store_imports[cayu_eval_scenarios]": 0.19,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_eval_schema_validates_without_migration_or_store_imports[cayu_eval_authored_suites]": 0.186,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_eval_schema_validates_without_migration_or_store_imports[cayu_eval_judge_calibrations]": 0.184,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_eval_schema_validates_without_migration_or_store_imports[cayu_eval_run_trial_checkpoints]": 0.185
 }

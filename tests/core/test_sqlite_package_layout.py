@@ -209,6 +209,88 @@ for name in (
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize(
+    "missing_table",
+    [
+        None,
+        "cayu_eval_baselines",
+        "cayu_eval_cases",
+        "cayu_eval_runs",
+        "cayu_eval_scenarios",
+        "cayu_eval_authored_suites",
+        "cayu_eval_judge_calibrations",
+        "cayu_eval_run_trial_checkpoints",
+    ],
+)
+def test_sqlite_eval_schema_validates_without_migration_or_store_imports(
+    tmp_path, sqlite_resources, missing_table
+):
+    from cayu.storage import _sqlite_connection, _sqlite_support
+
+    async def prepare():
+        async with sqlite_resources as resources:
+            path = tmp_path / "eval-schema.sqlite"
+            connection = resources.own(_sqlite_connection.connect(path), kind="connection")
+            _sqlite_support.initialize_schema(connection)
+            if missing_table is not None:
+                connection.execute(f"DROP TABLE {missing_table}")
+                connection.commit()
+            return path
+
+    path = asyncio.run(prepare())
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sqlite3
+import sys
+from contextlib import closing
+from pathlib import Path
+
+from cayu.storage import _sqlite_eval_schema as eval_schema
+
+with closing(sqlite3.connect(Path(sys.argv[1]).as_uri() + "?mode=ro", uri=True)) as connection:
+    try:
+        eval_schema._validate_eval_result_baseline_schema(connection)
+        eval_schema._validate_captured_eval_case_schema(connection)
+        eval_schema._validate_eval_run_invocation_column(connection)
+        eval_schema._validate_eval_scenario_schema(connection)
+        eval_schema._validate_eval_run_scenario_progress_column(connection)
+        eval_schema._validate_eval_authored_suite_schema(connection)
+        eval_schema._validate_eval_judge_calibration_schema(connection)
+        eval_schema._validate_eval_run_max_concurrency_schema(connection)
+        eval_schema._validate_eval_run_trial_checkpoint_schema(connection)
+    except RuntimeError as error:
+        assert sys.argv[2] and sys.argv[2] in str(error), str(error)
+    else:
+        assert not sys.argv[2], "missing table was accepted"
+    assert not connection.in_transaction
+
+for name in (
+    "cayu.storage._sqlite_support",
+    "cayu.storage._sqlite_connection",
+    "cayu.storage.migrations",
+    "cayu.evals.store",
+    "cayu.evals.execution",
+    "cayu.storage.evals_sqlite",
+    "cayu.storage.sqlite",
+    "cayu.storage.tasks_sqlite",
+    "cayu.storage.postgres",
+):
+    assert name not in sys.modules, name
+""",
+            str(path),
+            missing_table or "",
+        ],
+        env={**os.environ, "PYTHONPATH": str(Path(cayu.__file__).resolve().parent.parent)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_sqlite_task_store_preserves_public_and_legacy_identity():
     from cayu.storage import sqlite, tasks_sqlite
 
