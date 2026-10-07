@@ -67,6 +67,146 @@ assert "cayu.storage.postgres" not in sys.modules
     [
         (None, None),
         (
+            "DROP TABLE cayu_sessions",
+            "session-instance authority columns are missing",
+        ),
+        (
+            "PRAGMA foreign_keys=OFF; DROP TABLE cayu_sessions; "
+            "CREATE TABLE cayu_sessions(instance_id TEXT); "
+            "INSERT INTO cayu_sessions(instance_id) VALUES(NULL)",
+            "session-instance authority is incomplete",
+        ),
+        (
+            "ALTER TABLE cayu_sessions RENAME COLUMN invocation_json TO old_invocation_json",
+            "invocation-provenance contract",
+        ),
+        ("DROP TABLE cayu_targeted_tool_grants", "targeted-grant durability contract"),
+        (
+            "DROP INDEX idx_cayu_targeted_tool_grant_uses_grant",
+            "targeted-grant contention contract",
+        ),
+        ("DROP TABLE cayu_deferred_interaction_inputs", "deferred interaction input schema"),
+        (
+            "ALTER TABLE cayu_session_message_queue RENAME COLUMN message_json TO old_message_json",
+            "typed queued-message contract",
+        ),
+        (
+            "ALTER TABLE cayu_session_message_queue RENAME COLUMN terminal_json TO old_terminal_json",
+            "session-message lifecycle columns",
+        ),
+        (
+            "DROP INDEX idx_cayu_events_queue_acceptance; "
+            "CREATE INDEX idx_cayu_events_queue_acceptance "
+            "ON cayu_events(session_id, json_extract(payload_json, '$.queue_id')) "
+            "WHERE event_type='session.message.started'",
+            "queue acceptance lookup index",
+        ),
+        (
+            "DROP TABLE cayu_child_session_lifecycle_candidates",
+            "bounded child-lifecycle projection",
+        ),
+        (
+            "DROP TRIGGER cayu_index_child_lifecycle_event_insert; "
+            "CREATE TRIGGER cayu_index_child_lifecycle_event_insert "
+            "AFTER INSERT ON cayu_events BEGIN SELECT 1; END",
+            "bounded child-lifecycle projection",
+        ),
+        (
+            "DROP INDEX idx_cayu_child_lifecycle_candidates_page; "
+            "CREATE INDEX idx_cayu_child_lifecycle_candidates_page "
+            "ON cayu_child_session_lifecycle_candidates "
+            "(parent_session_id, sort_at, priority, child_session_id)",
+            "bounded child-lifecycle projection",
+        ),
+    ],
+    ids=[
+        "current",
+        "missing-session-instance",
+        "null-session-instance",
+        "missing-invocation-column",
+        "missing-targeted-grants",
+        "missing-grant-use-index",
+        "missing-deferred-inputs",
+        "missing-queued-message-column",
+        "missing-message-lifecycle-column",
+        "wrong-queue-acceptance-predicate",
+        "missing-child-candidates",
+        "weakened-child-trigger",
+        "wrong-child-index-order",
+    ],
+)
+def test_sqlite_session_schema_validates_without_migration_or_store_imports(
+    tmp_path, sqlite_resources, damage, expected_error
+):
+    from cayu.storage import _sqlite_connection, _sqlite_support
+
+    async def prepare():
+        async with sqlite_resources as resources:
+            path = tmp_path / "session-schema.sqlite"
+            connection = resources.own(_sqlite_connection.connect(path), kind="connection")
+            _sqlite_support.initialize_schema(connection)
+            if damage is not None:
+                connection.executescript(damage)
+                connection.commit()
+            return path
+
+    path = asyncio.run(prepare())
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sqlite3
+import sys
+from contextlib import closing
+from pathlib import Path
+
+from cayu.storage import _sqlite_session_schema as session_schema
+
+with closing(sqlite3.connect(Path(sys.argv[1]).as_uri() + "?mode=ro", uri=True)) as connection:
+    try:
+        session_schema._validate_session_instance_schema(connection)
+        session_schema._validate_session_invocation_column(connection)
+        session_schema._validate_targeted_tool_grant_schema(connection)
+        session_schema._validate_revision_sixty_two_payload_schema(connection)
+        session_schema._validate_session_message_queue_typed_message_column(connection)
+        session_schema._validate_session_message_lifecycle_columns(connection)
+        session_schema._validate_revision_79_child_lifecycle_schema(connection)
+    except RuntimeError as error:
+        assert sys.argv[2] and sys.argv[2] in str(error), str(error)
+    else:
+        assert not sys.argv[2], "incompatible schema was accepted"
+    assert not connection.in_transaction
+
+for name in (
+    "cayu.storage._sqlite_support",
+    "cayu.storage._sqlite_connection",
+    "cayu.storage.migrations",
+    "cayu.sessions.base",
+    "cayu.tasks.base",
+    "cayu.storage.sqlite",
+    "cayu.storage.tasks_sqlite",
+    "cayu.storage.postgres",
+    "cayu.runtime.task_worker",
+):
+    assert name not in sys.modules, name
+""",
+            str(path),
+            expected_error or "",
+        ],
+        env={**os.environ, "PYTHONPATH": str(Path(cayu.__file__).resolve().parent.parent)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("damage", "expected_error"),
+    [
+        (None, None),
+        (
             "DROP TABLE cayu_task_terminalization_receipts",
             "terminalization receipt table",
         ),
