@@ -435,6 +435,12 @@ restored private roots count toward the full document limit. Runtime admission
 checks and native memory locks, SQLite writer transactions and PostgreSQL
 transactions remain with their existing owners.
 
+`sessions/_checkpoint_transforms.py` composes schema decoding, detached callback
+input, output validation, protected-root preservation and version stamping. It
+supports ordinary, store-time and operation-publication callbacks using the
+existing session contracts. `runtime/_checkpoint_store.py` applies those shared
+transforms while retaining runtime dispatch and store capability checks.
+
 `providers/retry_policy.py` owns immutable retry configuration, its default status
 codes and the policy validation helper. Saved tool rounds, approvals and runtime
 share the same policy class. Supported root and runtime imports resolve to that
