@@ -136,6 +136,79 @@ for name in (
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize(
+    "missing_table",
+    [
+        None,
+        "cayu_agent_work_context_publications",
+        "cayu_agent_recall_delivery_claims",
+        "cayu_agent_recall_subscription_claims",
+    ],
+)
+def test_sqlite_work_context_schema_validates_without_migration_or_store_imports(
+    tmp_path, sqlite_resources, missing_table
+):
+    from cayu.storage import _sqlite_connection, _sqlite_support
+
+    async def prepare():
+        async with sqlite_resources as resources:
+            path = tmp_path / "work-context.sqlite"
+            connection = resources.own(_sqlite_connection.connect(path), kind="connection")
+            _sqlite_support.initialize_schema(connection)
+            if missing_table is not None:
+                connection.execute(f"DROP TABLE {missing_table}")
+                connection.commit()
+            return path
+
+    path = asyncio.run(prepare())
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sqlite3
+import sys
+from contextlib import closing
+from pathlib import Path
+
+from cayu.storage import _sqlite_work_context_schema as work_context_schema
+
+with closing(sqlite3.connect(Path(sys.argv[1]).as_uri() + "?mode=ro", uri=True)) as connection:
+    try:
+        work_context_schema._validate_revision_69_work_context_schema(connection)
+        work_context_schema._validate_revision_71_recall_delivery_schema(
+            connection, require_processing_schema_version=True
+        )
+        work_context_schema._validate_revision_73_recall_subscription_schema(connection)
+    except RuntimeError as error:
+        assert sys.argv[2] and sys.argv[2] in str(error), str(error)
+    else:
+        assert not sys.argv[2], "missing table was accepted"
+    assert not connection.in_transaction
+
+for name in (
+    "cayu.storage._sqlite_support",
+    "cayu.storage._sqlite_connection",
+    "cayu.storage.migrations",
+    "cayu.sessions.base",
+    "cayu.tasks.base",
+    "cayu.storage.work_context_sqlite",
+    "cayu.storage.sqlite",
+    "cayu.storage.postgres",
+):
+    assert name not in sys.modules, name
+""",
+            str(path),
+            missing_table or "",
+        ],
+        env={**os.environ, "PYTHONPATH": str(Path(cayu.__file__).resolve().parent.parent)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_sqlite_task_store_preserves_public_and_legacy_identity():
     from cayu.storage import sqlite, tasks_sqlite
 

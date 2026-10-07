@@ -44821,5 +44821,9 @@
     "tests/qualification/test_repository_maintenance_reconciliation.py::test_operator_projects_recorded_generation_without_claiming_quiescence[aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb]": 1.4141256669827271,
     "tests/qualification/test_repository_maintenance_reconciliation.py::test_operator_projects_recorded_generation_without_claiming_quiescence[aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:unknown]": 1.2826035420002881,
     "tests/core/test_sqlite_package_layout.py::test_sqlite_knowledge_schema_validates_without_migration_or_store_imports[False]": 0.96964083299099,
-    "tests/core/test_sqlite_package_layout.py::test_sqlite_knowledge_schema_validates_without_migration_or_store_imports[True]": 0.1810708740085829
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_knowledge_schema_validates_without_migration_or_store_imports[True]": 0.1810708740085829,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_work_context_schema_validates_without_migration_or_store_imports[None]": 0.9341377070231829,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_work_context_schema_validates_without_migration_or_store_imports[cayu_agent_recall_delivery_claims]": 0.16744124901015311,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_work_context_schema_validates_without_migration_or_store_imports[cayu_agent_recall_subscription_claims]": 0.16440050103119574,
+    "tests/core/test_sqlite_package_layout.py::test_sqlite_work_context_schema_validates_without_migration_or_store_imports[cayu_agent_work_context_publications]": 0.16885591697064228
 }
