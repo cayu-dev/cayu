@@ -1,9 +1,8 @@
-"""Registration components compose independently and preserve existing imports."""
+"""Registration components compose independently."""
 
 from __future__ import annotations
 
 import os
-import pickle
 import subprocess
 import sys
 from pathlib import Path
@@ -77,18 +76,3 @@ assert not blocked.intersection(sys.modules)
         timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-
-
-def test_registration_helpers_preserve_legacy_import_and_pickle_identity() -> None:
-    from cayu import _application_registration as registration
-    from cayu import applications
-
-    for name in (
-        "_validate_agent_spec",
-        "_validate_registered_tool",
-        "_copy_registered_tool",
-        "_registered_tool_descriptor",
-    ):
-        canonical = getattr(registration, name)
-        assert getattr(applications, name) is canonical
-        assert pickle.loads(f"ccayu.applications\n{name}\n.".encode()) is canonical

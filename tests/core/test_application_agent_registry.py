@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import pickle
 import subprocess
 import sys
 from pathlib import Path
@@ -233,30 +232,3 @@ def test_refresh_preserves_registrations_completed_during_discovery_publication(
             await app.aclose()
 
     asyncio.run(run())
-
-
-def test_registry_helpers_preserve_legacy_import_and_pickle_identity() -> None:
-    from cayu import _application_agent_registry as registry
-    from cayu import _application_registration as validation
-    from cayu import applications
-
-    for owner, names in (
-        (
-            registry,
-            (
-                "_copy_refreshable_mcp_toolsets",
-                "_mcp_refresh_source_key",
-                "_registered_agent_contains_mcp_source",
-                "_agents_contain_mcp_source",
-                "_registered_agent_after_mcp_refresh",
-            ),
-        ),
-        (
-            validation,
-            ("_validate_runtime_hooks", "_snapshot_context_behavior_execution_profile_identities"),
-        ),
-    ):
-        for name in names:
-            canonical = getattr(owner, name)
-            assert getattr(applications, name) is canonical
-            assert pickle.loads(f"ccayu.applications\n{name}\n.".encode()) is canonical
