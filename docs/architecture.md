@@ -441,6 +441,12 @@ supports ordinary, store-time and operation-publication callbacks using the
 existing session contracts. `runtime/_checkpoint_store.py` applies those shared
 transforms while retaining runtime dispatch and store capability checks.
 
+`sessions/_checkpoint_publication.py` owns publication request stamping and
+checkpoint decode, encode and writer-schema mutation projection. It reuses the
+canonical publication records and decoder; the runtime adapter selects this
+composition through the existing task-local codec scope. Native stores retain
+the atomic publication, validation and persistence boundary.
+
 `providers/retry_policy.py` owns immutable retry configuration, its default status
 codes and the policy validation helper. Saved tool rounds, approvals and runtime
 share the same policy class. Supported root and runtime imports resolve to that
