@@ -676,6 +676,8 @@ Session identity, grants, deferred inputs, queued messages and child-lifecycle
 checks live in `storage/_sqlite_session_schema.py`.
 Recall and model-context evidence checks live in
 `storage/_sqlite_memory_evidence_schema.py`.
+Transcript-search checks live in `storage/_sqlite_transcript_schema.py`,
+with the expected tokenizer identity supplied by schema composition.
 These owners inspect existing tables, indexes, views and constraints.
 Schema reconciliation retains revision
 gates and validation order in `storage/_sqlite_support.py`, alongside migration

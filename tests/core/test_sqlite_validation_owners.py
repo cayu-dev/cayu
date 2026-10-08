@@ -28,7 +28,9 @@ def _prepare_database(tmp_path, sqlite_resources, damage):
     return asyncio.run(prepare())
 
 
-def _validate_in_fresh_process(path, owner, validator, expected_error, **arguments):
+def _validate_in_fresh_process(
+    path, owner, validator, expected_error, *, projection=None, **arguments
+):
     result = subprocess.run(
         [
             sys.executable,
@@ -43,6 +45,9 @@ from pathlib import Path
 
 owner = importlib.import_module("cayu.storage." + sys.argv[2])
 with closing(sqlite3.connect(Path(sys.argv[1]).as_uri() + "?mode=ro", uri=True)) as connection:
+    projection = json.loads(sys.argv[6])
+    if projection is not None:
+        connection.create_function("cayu_transcript_search_document", 1, lambda _: projection)
     try:
         getattr(owner, sys.argv[3])(connection, **json.loads(sys.argv[5]))
     except RuntimeError as error:
@@ -69,6 +74,7 @@ for name in (
             validator,
             expected_error or "",
             json.dumps(arguments),
+            json.dumps(projection),
         ],
         env={**os.environ, "PYTHONPATH": str(Path(cayu.__file__).resolve().parent.parent)},
         capture_output=True,
@@ -114,4 +120,88 @@ def test_memory_evidence_schema_validates_independently(tmp_path, sqlite_resourc
         "_sqlite_memory_evidence_schema",
         "_validate_memory_evidence_schema",
         "revision-51 memory evidence contract" if damage else None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("damage", "version", "projection", "expected_error"),
+    [
+        (None, None, "x76697369626c65", None),
+        ("DROP TABLE cayu_transcript_messages", None, "x76697369626c65", "document column"),
+        (
+            "DROP TABLE cayu_transcript_search_configuration",
+            None,
+            "x76697369626c65",
+            "tokenizer configuration is missing or malformed",
+        ),
+        (
+            "DELETE FROM cayu_transcript_search_configuration",
+            None,
+            "x76697369626c65",
+            "tokenizer identity conflicts",
+        ),
+        (None, "different-tokenizer", "x76697369626c65", "tokenizer identity conflicts"),
+        (
+            "UPDATE cayu_transcript_search_configuration SET tokenizer_version='different-tokenizer'",
+            "different-tokenizer",
+            "x76697369626c65",
+            None,
+        ),
+        (
+            "DROP TABLE cayu_transcript_messages_fts",
+            None,
+            "x76697369626c65",
+            "schema is incomplete",
+        ),
+        (
+            "DROP TRIGGER cayu_transcript_messages_fts_delete",
+            None,
+            "x76697369626c65",
+            "schema is incomplete",
+        ),
+        (
+            "DROP TRIGGER cayu_transcript_messages_fts_insert; "
+            "CREATE TRIGGER cayu_transcript_messages_fts_insert "
+            "AFTER INSERT ON cayu_transcript_messages BEGIN SELECT 1; END",
+            None,
+            "x76697369626c65",
+            "maintenance triggers conflict",
+        ),
+        (
+            "DROP TRIGGER cayu_transcript_messages_search_document_update; "
+            "CREATE TRIGGER cayu_transcript_messages_search_document_update "
+            "BEFORE UPDATE ON cayu_transcript_messages BEGIN SELECT 1; END",
+            None,
+            "x76697369626c65",
+            "maintenance triggers conflict",
+        ),
+        (None, None, "visible hidden", "narrative-only boundary"),
+    ],
+    ids=[
+        "current",
+        "missing-transcript",
+        "missing-configuration",
+        "missing-tokenizer-row",
+        "mismatched-expected-tokenizer",
+        "supplied-tokenizer-identity",
+        "missing-search-index",
+        "missing-delete-trigger",
+        "weakened-insert-trigger",
+        "weakened-document-guard",
+        "invalid-projection",
+    ],
+)
+def test_transcript_schema_validates_independently(
+    tmp_path, sqlite_resources, damage, version, projection, expected_error
+):
+    from cayu.sessions.base import TRANSCRIPT_SEARCH_TOKENIZER_VERSION
+
+    path = _prepare_database(tmp_path, sqlite_resources, damage)
+    _validate_in_fresh_process(
+        path,
+        "_sqlite_transcript_schema",
+        "_validate_revision_46_transcript_search_schema",
+        expected_error,
+        expected_tokenizer_version=version or TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
+        projection=projection,
     )
