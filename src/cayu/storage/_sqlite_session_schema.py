@@ -7,11 +7,183 @@ identity rows without importing migration or store implementations.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from hashlib import sha256
 from typing import NoReturn
 
 from cayu.storage import _sqlite_catalog as sqlite_catalog
+
+_REVISION_17_INDEX_NAMES = frozenset(
+    {
+        "idx_cayu_checkpoints_pending_control_action",
+        "idx_cayu_events_pending_action_barrier",
+        "idx_cayu_events_pending_action_lookup",
+    }
+)
+
+
+_PENDING_ACTION_SCOPE_INDEX_NAMES = frozenset(
+    {
+        "idx_cayu_events_pending_action_round_scope",
+        "idx_cayu_events_pending_action_attempt_scope",
+    }
+)
+
+
+_WORKFLOW_REPLAY_INDEX_NAMES = frozenset(
+    {
+        "idx_cayu_events_workflow_step_replay",
+        "idx_cayu_events_workflow_step_attempt",
+        "idx_cayu_events_workflow_attempt_marker",
+    }
+)
+
+
+def _revision_17_index_definitions(revision_sql: str) -> dict[str, str]:
+    definitions: dict[str, str] = {}
+    for statement in sqlite_catalog._iter_statements(revision_sql):
+        match = re.match(
+            r"CREATE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([^\s(]+)",
+            statement,
+            flags=re.IGNORECASE,
+        )
+        if match is not None and match.group(1) in _REVISION_17_INDEX_NAMES:
+            definitions[match.group(1)] = statement
+    if definitions.keys() != _REVISION_17_INDEX_NAMES:
+        raise RuntimeError("Cayu revision 17 index definitions are incomplete.")
+    return definitions
+
+
+def _validate_revision_17_indexes(
+    connection: sqlite3.Connection,
+    *,
+    revision_sql: str,
+    require_all: bool,
+) -> None:
+    """Reject same-name SQLite indexes whose structure is not Cayu's contract."""
+    for index_name, expected in _revision_17_index_definitions(revision_sql=revision_sql).items():
+        row = connection.execute(
+            "SELECT type, tbl_name, sql FROM sqlite_master WHERE name = ?",
+            (index_name,),
+        ).fetchone()
+        if row is None:
+            if require_all:
+                raise RuntimeError(
+                    f"Required Cayu SQLite index is missing: {index_name}. "
+                    "Run with schema_mode='migrate' to repair the schema."
+                )
+            continue
+        actual_type, _table_name, actual_definition = row
+        if (
+            actual_type != "index"
+            or actual_definition is None
+            or (
+                sqlite_catalog._normalize_sqlite_schema_definition(actual_definition)
+                != sqlite_catalog._normalize_sqlite_schema_definition(expected)
+            )
+        ):
+            raise RuntimeError(
+                f"SQLite schema object {index_name!r} conflicts with Cayu revision 17. "
+                "Rename or remove the conflicting object, then run with "
+                "schema_mode='migrate' to create the required index."
+            )
+
+
+def _workflow_replay_index_definitions(revision_sql: str) -> dict[str, str]:
+    definitions: dict[str, str] = {}
+    for statement in sqlite_catalog._iter_statements(revision_sql):
+        match = re.match(
+            r"CREATE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([^\s(]+)",
+            statement,
+            flags=re.IGNORECASE,
+        )
+        if match is not None and match.group(1) in _WORKFLOW_REPLAY_INDEX_NAMES:
+            definitions[match.group(1)] = statement
+    if definitions.keys() != _WORKFLOW_REPLAY_INDEX_NAMES:
+        raise RuntimeError("Cayu workflow replay index definitions are incomplete.")
+    return definitions
+
+
+def _validate_workflow_replay_indexes(
+    connection: sqlite3.Connection,
+    *,
+    revision_sql: str,
+    require_all: bool,
+) -> None:
+    for index_name, expected in _workflow_replay_index_definitions(
+        revision_sql=revision_sql
+    ).items():
+        row = connection.execute(
+            "SELECT type, tbl_name, sql FROM sqlite_master WHERE name = ?",
+            (index_name,),
+        ).fetchone()
+        if row is None:
+            if require_all:
+                raise RuntimeError(
+                    f"Required Cayu SQLite index is missing: {index_name}. "
+                    "Run with schema_mode='migrate' to repair the schema."
+                )
+            continue
+        actual_type, table_name, actual_definition = row
+        if (
+            actual_type != "index"
+            or table_name != "cayu_events"
+            or actual_definition is None
+            or sqlite_catalog._normalize_sqlite_schema_definition(actual_definition)
+            != sqlite_catalog._normalize_sqlite_schema_definition(expected)
+        ):
+            raise RuntimeError(
+                f"SQLite schema object {index_name!r} conflicts with Cayu's "
+                "workflow replay contract. Rename or remove the conflicting "
+                "object, then run with schema_mode='migrate'."
+            )
+
+
+def _pending_action_scope_index_definitions(revision_sql: str) -> dict[str, str]:
+    definitions: dict[str, str] = {}
+    for statement in sqlite_catalog._iter_statements(revision_sql):
+        for index_name in _PENDING_ACTION_SCOPE_INDEX_NAMES:
+            if index_name in statement:
+                definitions[index_name] = statement
+    if definitions.keys() != _PENDING_ACTION_SCOPE_INDEX_NAMES:
+        raise RuntimeError("Cayu pending-action scope index definitions are incomplete.")
+    return definitions
+
+
+def _validate_pending_action_scope_indexes(
+    connection: sqlite3.Connection,
+    *,
+    revision_sql: str,
+    require_all: bool,
+) -> None:
+    for index_name, expected in _pending_action_scope_index_definitions(
+        revision_sql=revision_sql
+    ).items():
+        row = connection.execute(
+            "SELECT type, tbl_name, sql FROM sqlite_master WHERE name = ?",
+            (index_name,),
+        ).fetchone()
+        if row is None:
+            if require_all:
+                raise RuntimeError(
+                    f"Required Cayu SQLite index is missing: {index_name}. "
+                    "Run with schema_mode='migrate' to repair the schema."
+                )
+            continue
+        actual_type, table_name, actual_definition = row
+        if (
+            actual_type != "index"
+            or table_name != "cayu_events"
+            or actual_definition is None
+            or sqlite_catalog._normalize_sqlite_schema_definition(actual_definition)
+            != sqlite_catalog._normalize_sqlite_schema_definition(expected)
+        ):
+            raise RuntimeError(
+                f"SQLite schema object {index_name!r} conflicts with Cayu's "
+                "pending-action scope contract. Rename or remove the conflicting "
+                "object, then run with schema_mode='migrate'."
+            )
 
 
 def _validate_session_instance_schema(connection: sqlite3.Connection) -> None:

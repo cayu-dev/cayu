@@ -689,10 +689,12 @@ readers in `storage/_sqlite_catalog.py`. Evaluation result, case, scenario,
 authored-suite, calibration and run checks live in `storage/_sqlite_eval_schema.py`.
 Verified-work contracts, completion verification, attempt admission and lifecycle
 receipt checks live together in `storage/_sqlite_verified_work_schema.py`.
-Task invocation metadata, terminal receipts, retries and interrupted handoffs
-are checked by `storage/_sqlite_task_schema.py`.
-Session identity, grants, deferred inputs, queued messages and child-lifecycle
-checks live in `storage/_sqlite_session_schema.py`.
+Task invocation metadata, terminal receipts, retries, interrupted handoffs and
+local execution attempts are checked by `storage/_sqlite_task_schema.py`.
+Session identity, grants, deferred inputs, queued messages, child lifecycle and
+pending-action/workflow index checks live in `storage/_sqlite_session_schema.py`.
+Budget reservation indexes and ownership checks live in `storage/_sqlite_budget_schema.py`;
+producer cleanup receipts and retirement fences are checked by `storage/_sqlite_producer_schema.py`.
 Recall and model-context evidence checks live in
 `storage/_sqlite_memory_evidence_schema.py`.
 Transcript-search checks live in `storage/_sqlite_transcript_schema.py`,
@@ -703,7 +705,9 @@ These owners inspect existing tables, indexes, views and constraints.
 Baseline SQL, revision scripts and conditional-column declarations live in
 `storage/_sqlite_schema_history.py`, reusing canonical DDL from domain schema owners.
 Schema reconciliation retains revision gates and validation order in
-`storage/_sqlite_support.py`, alongside migration execution, hooks and backfills.
+`storage/_sqlite_support.py`, alongside migration execution, index repair transactions,
+hooks and backfills. Checks that compare stored schema with revision SQL receive
+that SQL explicitly from reconciliation or migration callers.
 History declarations can be imported without loading migration execution or store
 adapters. The domain checks can run on a read-only connection without importing
 migration history or store adapters.

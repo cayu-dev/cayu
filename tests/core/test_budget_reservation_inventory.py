@@ -37,14 +37,18 @@ def test_budget_readback_does_not_inherit_qualification_over_changed_owners(meth
 
 
 def test_sqlite_reservation_inventory_uses_exact_session_index(tmp_path):
+    from cayu.storage import _sqlite_budget_schema as sqlite_budget_schema
     from cayu.storage import _sqlite_connection as sqlite_connection
+    from cayu.storage import _sqlite_schema_history as sqlite_schema_history
     from cayu.storage import _sqlite_support
 
     path = tmp_path / "index.sqlite"
     connection = sqlite_connection.connect(path)
     try:
         _sqlite_support.reconcile_schema(connection)
-        _sqlite_support._validate_reservation_inventory_index(connection)
+        sqlite_budget_schema._validate_reservation_inventory_index(
+            connection, revision_sql=sqlite_schema_history._MIGRATION_STEPS[109]
+        )
         plan = connection.execute(
             "EXPLAIN QUERY PLAN SELECT reservation_id FROM cayu_budget_reservations "
             "WHERE session_id = ? AND reservation_id > ? ORDER BY reservation_id LIMIT ?",
@@ -53,13 +57,17 @@ def test_sqlite_reservation_inventory_uses_exact_session_index(tmp_path):
         assert any("idx_cayu_budget_reservations_session_identity" in row[3] for row in plan)
         connection.execute("DROP INDEX idx_cayu_budget_reservations_session_identity")
         with pytest.raises(RuntimeError, match="inventory index"):
-            _sqlite_support._validate_reservation_inventory_index(connection)
+            sqlite_budget_schema._validate_reservation_inventory_index(
+                connection, revision_sql=sqlite_schema_history._MIGRATION_STEPS[109]
+            )
         connection.execute(
             "CREATE INDEX idx_cayu_budget_reservations_session_identity "
             "ON cayu_budget_reservations(reservation_id)"
         )
         with pytest.raises(RuntimeError, match="inventory index"):
-            _sqlite_support._validate_reservation_inventory_index(connection)
+            sqlite_budget_schema._validate_reservation_inventory_index(
+                connection, revision_sql=sqlite_schema_history._MIGRATION_STEPS[109]
+            )
     finally:
         connection.close()
 

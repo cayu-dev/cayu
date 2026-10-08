@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -19,12 +18,14 @@ from cayu.sessions.base import (
     deferred_interaction_input_from_storage_payload,
     deferred_interaction_input_storage_payload,
 )
+from cayu.storage import _sqlite_budget_schema as sqlite_budget_schema
 from cayu.storage import _sqlite_catalog as sqlite_catalog
 from cayu.storage import _sqlite_closure_schema as sqlite_closure_schema
 from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_eval_schema as sqlite_eval_schema
 from cayu.storage import _sqlite_knowledge_schema as sqlite_knowledge_schema
 from cayu.storage import _sqlite_memory_evidence_schema as sqlite_memory_evidence_schema
+from cayu.storage import _sqlite_producer_schema as sqlite_producer_schema
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_schema_history as sqlite_schema_history
 from cayu.storage import _sqlite_session_schema as sqlite_session_schema
@@ -630,16 +631,6 @@ def _prepare_revision_twenty_five(connection: sqlite3.Connection) -> None:
         )
 
 
-_KNOWLEDGE_CHUNK_LEGACY_COLUMNS = (
-    "id",
-    "entry_id",
-    "chunk_index",
-    "text",
-    "content_hash",
-    "source_uri",
-    "metadata_json",
-)
-_KNOWLEDGE_CHUNK_KEYED_COLUMNS = ("fts_rowid", *_KNOWLEDGE_CHUNK_LEGACY_COLUMNS)
 _KNOWLEDGE_CHUNK_REVISION_COLUMNS = (
     "fts_rowid",
     "id",
@@ -651,58 +642,6 @@ _KNOWLEDGE_CHUNK_REVISION_COLUMNS = (
     "source_uri",
     "metadata_json",
 )
-
-
-def _validate_revision_37_knowledge_fts_schema(connection: sqlite3.Connection) -> None:
-    columns = connection.execute("PRAGMA table_info(cayu_knowledge_chunks)").fetchall()
-    if tuple(str(row[1]) for row in columns) != _KNOWLEDGE_CHUNK_KEYED_COLUMNS:
-        raise RuntimeError(
-            "SQLite knowledge chunks do not provide the revision-37 stable FTS key. "
-            "Restore the required schema from a known-good backup."
-        )
-    fts_rowid = columns[0]
-    if str(fts_rowid[2]).upper() != "INTEGER" or int(fts_rowid[5]) != 1:
-        raise RuntimeError(
-            "SQLite knowledge chunks have an invalid revision-37 FTS key. "
-            "Restore the required schema from a known-good backup."
-        )
-    if not sqlite_catalog._sqlite_has_unique_index(connection, "cayu_knowledge_chunks", ("id",)):
-        raise RuntimeError("SQLite knowledge chunks are missing their unique public id constraint.")
-    if not sqlite_catalog._sqlite_has_unique_index(
-        connection,
-        "cayu_knowledge_chunks",
-        ("entry_id", "chunk_index"),
-    ):
-        raise RuntimeError(
-            "SQLite knowledge chunks are missing their entry/chunk identity constraint."
-        )
-    entry_index = connection.execute(
-        "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'index' "
-        "AND name = 'idx_cayu_knowledge_chunks_entry_index'"
-    ).fetchone()
-    entry_index_columns = (
-        tuple(
-            str(column[2])
-            for column in connection.execute(
-                "PRAGMA index_info(idx_cayu_knowledge_chunks_entry_index)"
-            )
-        )
-        if entry_index is not None
-        else ()
-    )
-    if (
-        entry_index is None
-        or entry_index[0] != "cayu_knowledge_chunks"
-        or entry_index_columns != ("entry_id", "chunk_index")
-    ):
-        raise RuntimeError("Required Cayu SQLite knowledge chunk index is missing.")
-    fts = connection.execute(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cayu_knowledge_chunks_fts'"
-    ).fetchone()
-    normalized_fts = " ".join(str(fts[0]).lower().split()) if fts is not None else ""
-    required_fts = "using fts5(entry_id unindexed, chunk_id unindexed, title, text)"
-    if required_fts not in normalized_fts:
-        raise RuntimeError("SQLite knowledge FTS does not match the revision-37 search contract.")
 
 
 def _validate_revision_37_knowledge_fts_data(connection: sqlite3.Connection) -> None:
@@ -747,14 +686,14 @@ def _migrate_revision_thirty_seven_knowledge_fts(connection: sqlite3.Connection)
         # revision-bound layout later in the same migration sequence; revision
         # 37 must not reject that known-newer shape first.
         return
-    if columns == _KNOWLEDGE_CHUNK_KEYED_COLUMNS:
+    if columns == sqlite_knowledge_schema._KNOWLEDGE_CHUNK_KEYED_COLUMNS:
         # Greenfield baseline databases already have the current layout. This also
         # makes an explicitly retried migration safe if the schema was prepared by
         # a compatible deployment before its ledger marker was restored.
-        _validate_revision_37_knowledge_fts_schema(connection)
+        sqlite_knowledge_schema._validate_revision_37_knowledge_fts_schema(connection)
         _validate_revision_37_knowledge_fts_data(connection)
         return
-    if columns != _KNOWLEDGE_CHUNK_LEGACY_COLUMNS:
+    if columns != sqlite_knowledge_schema._KNOWLEDGE_CHUNK_LEGACY_COLUMNS:
         raise RuntimeError(
             "SQLite knowledge chunks conflict with both the legacy and revision-37 "
             "schemas. Restore the database from a known-good backup."
@@ -823,7 +762,7 @@ def _migrate_revision_thirty_seven_knowledge_fts(connection: sqlite3.Connection)
         ORDER BY chunk.fts_rowid
         """
     )
-    _validate_revision_37_knowledge_fts_schema(connection)
+    sqlite_knowledge_schema._validate_revision_37_knowledge_fts_schema(connection)
     _validate_revision_37_knowledge_fts_data(connection)
 
 
@@ -1061,460 +1000,89 @@ _MIGRATION_HOOKS: dict[int, Callable[[sqlite3.Connection], None]] = {
     115: _upgrade_continuation_indexes,
 }
 
-_REVISION_17_INDEX_NAMES = frozenset(
-    {
-        "idx_cayu_checkpoints_pending_control_action",
-        "idx_cayu_events_pending_action_barrier",
-        "idx_cayu_events_pending_action_lookup",
-    }
-)
-_RESERVATION_EVENT_INDEX_NAME = "idx_cayu_events_budget_reservation_identity"
-_RESERVATION_IDENTITY_TABLE_NAME = "cayu_budget_reservation_identities"
-_PENDING_ACTION_SCOPE_INDEX_NAMES = frozenset(
-    {
-        "idx_cayu_events_pending_action_round_scope",
-        "idx_cayu_events_pending_action_attempt_scope",
-    }
-)
-_WORKFLOW_REPLAY_INDEX_NAMES = frozenset(
-    {
-        "idx_cayu_events_workflow_step_replay",
-        "idx_cayu_events_workflow_step_attempt",
-        "idx_cayu_events_workflow_attempt_marker",
-    }
-)
-
-
-def _revision_17_index_definitions() -> dict[str, str]:
-    definitions: dict[str, str] = {}
-    for statement in sqlite_catalog._iter_statements(sqlite_schema_history._MIGRATION_STEPS[17]):
-        match = re.match(
-            r"CREATE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([^\s(]+)",
-            statement,
-            flags=re.IGNORECASE,
-        )
-        if match is not None and match.group(1) in _REVISION_17_INDEX_NAMES:
-            definitions[match.group(1)] = statement
-    if definitions.keys() != _REVISION_17_INDEX_NAMES:
-        raise RuntimeError("Cayu revision 17 index definitions are incomplete.")
-    return definitions
-
-
-def _validate_revision_17_indexes(
-    connection: sqlite3.Connection,
-    *,
-    require_all: bool,
-) -> None:
-    """Reject same-name SQLite indexes whose structure is not Cayu's contract."""
-    for index_name, expected in _revision_17_index_definitions().items():
-        row = connection.execute(
-            "SELECT type, tbl_name, sql FROM sqlite_master WHERE name = ?",
-            (index_name,),
-        ).fetchone()
-        if row is None:
-            if require_all:
-                raise RuntimeError(
-                    f"Required Cayu SQLite index is missing: {index_name}. "
-                    "Run with schema_mode='migrate' to repair the schema."
-                )
-            continue
-        actual_type, _table_name, actual_definition = row
-        if (
-            actual_type != "index"
-            or actual_definition is None
-            or (
-                sqlite_catalog._normalize_sqlite_schema_definition(actual_definition)
-                != sqlite_catalog._normalize_sqlite_schema_definition(expected)
-            )
-        ):
-            raise RuntimeError(
-                f"SQLite schema object {index_name!r} conflicts with Cayu revision 17. "
-                "Rename or remove the conflicting object, then run with "
-                "schema_mode='migrate' to create the required index."
-            )
-
 
 def _repair_missing_revision_17_indexes(connection: sqlite3.Connection) -> None:
     """Recreate missing required indexes even when revision 17 is already recorded."""
     with sqlite_connection._transaction(connection):
-        _validate_revision_17_indexes(connection, require_all=False)
+        sqlite_session_schema._validate_revision_17_indexes(
+            connection, require_all=False, revision_sql=sqlite_schema_history._MIGRATION_STEPS[17]
+        )
         existing_names = {
             row[0]
             for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'index'"
             ).fetchall()
         }
-        for index_name, definition in _revision_17_index_definitions().items():
+        for index_name, definition in sqlite_session_schema._revision_17_index_definitions(
+            revision_sql=sqlite_schema_history._MIGRATION_STEPS[17]
+        ).items():
             if index_name not in existing_names:
                 connection.execute(definition)
-        _validate_revision_17_indexes(connection, require_all=True)
-
-
-def _workflow_replay_index_definitions() -> dict[str, str]:
-    definitions: dict[str, str] = {}
-    for statement in sqlite_catalog._iter_statements(sqlite_schema_history._MIGRATION_STEPS[29]):
-        match = re.match(
-            r"CREATE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([^\s(]+)",
-            statement,
-            flags=re.IGNORECASE,
+        sqlite_session_schema._validate_revision_17_indexes(
+            connection, require_all=True, revision_sql=sqlite_schema_history._MIGRATION_STEPS[17]
         )
-        if match is not None and match.group(1) in _WORKFLOW_REPLAY_INDEX_NAMES:
-            definitions[match.group(1)] = statement
-    if definitions.keys() != _WORKFLOW_REPLAY_INDEX_NAMES:
-        raise RuntimeError("Cayu workflow replay index definitions are incomplete.")
-    return definitions
-
-
-def _validate_workflow_replay_indexes(
-    connection: sqlite3.Connection,
-    *,
-    require_all: bool,
-) -> None:
-    for index_name, expected in _workflow_replay_index_definitions().items():
-        row = connection.execute(
-            "SELECT type, tbl_name, sql FROM sqlite_master WHERE name = ?",
-            (index_name,),
-        ).fetchone()
-        if row is None:
-            if require_all:
-                raise RuntimeError(
-                    f"Required Cayu SQLite index is missing: {index_name}. "
-                    "Run with schema_mode='migrate' to repair the schema."
-                )
-            continue
-        actual_type, table_name, actual_definition = row
-        if (
-            actual_type != "index"
-            or table_name != "cayu_events"
-            or actual_definition is None
-            or sqlite_catalog._normalize_sqlite_schema_definition(actual_definition)
-            != sqlite_catalog._normalize_sqlite_schema_definition(expected)
-        ):
-            raise RuntimeError(
-                f"SQLite schema object {index_name!r} conflicts with Cayu's "
-                "workflow replay contract. Rename or remove the conflicting "
-                "object, then run with schema_mode='migrate'."
-            )
 
 
 def _repair_missing_workflow_replay_indexes(connection: sqlite3.Connection) -> None:
     with sqlite_connection._transaction(connection):
-        _validate_workflow_replay_indexes(connection, require_all=False)
+        sqlite_session_schema._validate_workflow_replay_indexes(
+            connection, require_all=False, revision_sql=sqlite_schema_history._MIGRATION_STEPS[29]
+        )
         existing_names = {
             row[0]
             for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'index'"
             ).fetchall()
         }
-        for index_name, definition in _workflow_replay_index_definitions().items():
+        for index_name, definition in sqlite_session_schema._workflow_replay_index_definitions(
+            revision_sql=sqlite_schema_history._MIGRATION_STEPS[29]
+        ).items():
             if index_name not in existing_names:
                 connection.execute(definition)
-        _validate_workflow_replay_indexes(connection, require_all=True)
-
-
-def _reservation_event_index_definition() -> str:
-    statements = tuple(
-        statement
-        for statement in sqlite_catalog._iter_statements(sqlite_schema_history._MIGRATION_STEPS[23])
-        if _RESERVATION_EVENT_INDEX_NAME in statement
-    )
-    if len(statements) != 1:
-        raise RuntimeError("Cayu reservation event index definition is incomplete.")
-    return statements[0]
-
-
-def _validate_producer_cleanup_receipts(connection: sqlite3.Connection) -> None:
-    names = (
-        ("cayu_producer_cleanup_receipts", "table"),
-        ("idx_cayu_producer_cleanup_namespace", "index"),
-        ("cayu_producer_cleanup_retirements", "table"),
-    )
-    for (name, kind), expected in zip(
-        names,
-        sqlite_catalog._iter_statements(sqlite_schema_history._MIGRATION_STEPS[110]),
-        strict=True,
-    ):
-        row = connection.execute(
-            "SELECT type, sql FROM sqlite_master WHERE name = ?", (name,)
-        ).fetchone()
-        if (
-            row is None
-            or row[0] != kind
-            or row[1] is None
-            or sqlite_catalog._normalize_sqlite_schema_definition(row[1])
-            != sqlite_catalog._normalize_sqlite_schema_definition(expected)
-        ):
-            raise RuntimeError(
-                "Required Cayu producer cleanup receipt table or fence is missing or conflicting."
-            )
-
-
-def _validate_reservation_inventory_index(connection: sqlite3.Connection) -> None:
-    name = "idx_cayu_budget_reservations_session_identity"
-    row = connection.execute(
-        "SELECT type, tbl_name, sql FROM sqlite_master WHERE name = ?", (name,)
-    ).fetchone()
-    expected = next(sqlite_catalog._iter_statements(sqlite_schema_history._MIGRATION_STEPS[109]))
-    if (
-        row is None
-        or row[0] != "index"
-        or row[1] != "cayu_budget_reservations"
-        or row[2] is None
-        or sqlite_catalog._normalize_sqlite_schema_definition(row[2])
-        != sqlite_catalog._normalize_sqlite_schema_definition(expected)
-    ):
-        raise RuntimeError("Required Cayu reservation inventory index is missing or conflicting.")
-
-
-def _validate_reservation_event_index(
-    connection: sqlite3.Connection,
-    *,
-    require: bool,
-) -> None:
-    row = connection.execute(
-        "SELECT type, tbl_name, sql FROM sqlite_master WHERE name = ?",
-        (_RESERVATION_EVENT_INDEX_NAME,),
-    ).fetchone()
-    if row is None:
-        if require:
-            raise RuntimeError(
-                f"Required Cayu SQLite index is missing: {_RESERVATION_EVENT_INDEX_NAME}. "
-                "Run with schema_mode='migrate' to repair the schema."
-            )
-        return
-    actual_type, table_name, actual_definition = row
-    if (
-        actual_type != "index"
-        or table_name != "cayu_events"
-        or actual_definition is None
-        or (
-            sqlite_catalog._normalize_sqlite_schema_definition(actual_definition)
-            != sqlite_catalog._normalize_sqlite_schema_definition(
-                _reservation_event_index_definition()
-            )
-        )
-    ):
-        raise RuntimeError(
-            f"SQLite schema object {_RESERVATION_EVENT_INDEX_NAME!r} conflicts with "
-            "Cayu's reservation identity contract. Rename or remove the conflicting object, then run "
-            "with schema_mode='migrate' to create the required unique index."
+        sqlite_session_schema._validate_workflow_replay_indexes(
+            connection, require_all=True, revision_sql=sqlite_schema_history._MIGRATION_STEPS[29]
         )
 
 
 def _repair_missing_reservation_event_index(connection: sqlite3.Connection) -> None:
     with sqlite_connection._transaction(connection):
-        _validate_reservation_event_index(connection, require=False)
+        sqlite_budget_schema._validate_reservation_event_index(
+            connection, require=False, revision_sql=sqlite_schema_history._MIGRATION_STEPS[23]
+        )
         row = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
-            (_RESERVATION_EVENT_INDEX_NAME,),
+            (sqlite_budget_schema._RESERVATION_EVENT_INDEX_NAME,),
         ).fetchone()
         if row is None:
-            connection.execute(_reservation_event_index_definition())
-        _validate_reservation_event_index(connection, require=True)
-
-
-def _pending_action_scope_index_definitions() -> dict[str, str]:
-    definitions: dict[str, str] = {}
-    for statement in sqlite_catalog._iter_statements(sqlite_schema_history._MIGRATION_STEPS[23]):
-        for index_name in _PENDING_ACTION_SCOPE_INDEX_NAMES:
-            if index_name in statement:
-                definitions[index_name] = statement
-    if definitions.keys() != _PENDING_ACTION_SCOPE_INDEX_NAMES:
-        raise RuntimeError("Cayu pending-action scope index definitions are incomplete.")
-    return definitions
-
-
-def _validate_pending_action_scope_indexes(
-    connection: sqlite3.Connection,
-    *,
-    require_all: bool,
-) -> None:
-    for index_name, expected in _pending_action_scope_index_definitions().items():
-        row = connection.execute(
-            "SELECT type, tbl_name, sql FROM sqlite_master WHERE name = ?",
-            (index_name,),
-        ).fetchone()
-        if row is None:
-            if require_all:
-                raise RuntimeError(
-                    f"Required Cayu SQLite index is missing: {index_name}. "
-                    "Run with schema_mode='migrate' to repair the schema."
+            connection.execute(
+                sqlite_budget_schema._reservation_event_index_definition(
+                    revision_sql=sqlite_schema_history._MIGRATION_STEPS[23]
                 )
-            continue
-        actual_type, table_name, actual_definition = row
-        if (
-            actual_type != "index"
-            or table_name != "cayu_events"
-            or actual_definition is None
-            or sqlite_catalog._normalize_sqlite_schema_definition(actual_definition)
-            != sqlite_catalog._normalize_sqlite_schema_definition(expected)
-        ):
-            raise RuntimeError(
-                f"SQLite schema object {index_name!r} conflicts with Cayu's "
-                "pending-action scope contract. Rename or remove the conflicting "
-                "object, then run with schema_mode='migrate'."
             )
+        sqlite_budget_schema._validate_reservation_event_index(
+            connection, require=True, revision_sql=sqlite_schema_history._MIGRATION_STEPS[23]
+        )
 
 
 def _repair_missing_pending_action_scope_indexes(connection: sqlite3.Connection) -> None:
     with sqlite_connection._transaction(connection):
-        _validate_pending_action_scope_indexes(connection, require_all=False)
+        sqlite_session_schema._validate_pending_action_scope_indexes(
+            connection, require_all=False, revision_sql=sqlite_schema_history._MIGRATION_STEPS[23]
+        )
         existing_names = {
             row[0]
             for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'index'"
             ).fetchall()
         }
-        for index_name, definition in _pending_action_scope_index_definitions().items():
+        for index_name, definition in sqlite_session_schema._pending_action_scope_index_definitions(
+            revision_sql=sqlite_schema_history._MIGRATION_STEPS[23]
+        ).items():
             if index_name not in existing_names:
                 connection.execute(definition)
-        _validate_pending_action_scope_indexes(connection, require_all=True)
-
-
-def _validate_reservation_identity_registry(
-    connection: sqlite3.Connection,
-    *,
-    require: bool,
-    verify_event_ownership: bool = False,
-) -> None:
-    row = connection.execute(
-        "SELECT type FROM sqlite_master WHERE name = ?",
-        (_RESERVATION_IDENTITY_TABLE_NAME,),
-    ).fetchone()
-    if row is None:
-        if require:
-            raise RuntimeError(
-                f"Required Cayu SQLite table is missing: "
-                f"{_RESERVATION_IDENTITY_TABLE_NAME}. Restore the permanent "
-                "reservation ownership registry from a known-good backup."
-            )
-        return
-    columns = connection.execute(
-        f"PRAGMA table_info({_RESERVATION_IDENTITY_TABLE_NAME})"
-    ).fetchall()
-    actual = tuple(
-        (column[1], column[2].upper(), bool(column[3]), int(column[5])) for column in columns
-    )
-    expected = (
-        ("reservation_id", "TEXT", False, 1),
-        ("publication_session_id", "TEXT", True, 0),
-        ("publication_id", "TEXT", True, 0),
-        ("published", "INTEGER", True, 0),
-    )
-    foreign_keys = connection.execute(
-        f"PRAGMA foreign_key_list({_RESERVATION_IDENTITY_TABLE_NAME})"
-    ).fetchall()
-    if row[0] != "table" or actual != expected or foreign_keys:
-        raise RuntimeError(
-            f"SQLite schema object {_RESERVATION_IDENTITY_TABLE_NAME!r} conflicts "
-            "with Cayu's reservation identity contract. Restore the required "
-            "ownership registry from a known-good backup."
+        sqlite_session_schema._validate_pending_action_scope_indexes(
+            connection, require_all=True, revision_sql=sqlite_schema_history._MIGRATION_STEPS[23]
         )
-    if not verify_event_ownership:
-        return
-    unmatched_event = connection.execute(
-        """
-        SELECT 1
-        FROM cayu_events AS event
-        LEFT JOIN cayu_budget_reservation_identities AS identity
-          ON identity.reservation_id = json_extract(
-              event.payload_json,
-              '$.reservation_id'
-          )
-        WHERE event.event_type = 'budget.reserved'
-          AND json_type(event.payload_json, '$.reservation_id') = 'text'
-          AND (
-              identity.reservation_id IS NULL
-              OR identity.publication_session_id != event.session_id
-              OR identity.publication_id != event.event_id
-              OR identity.published != 1
-          )
-        LIMIT 1
-        """
-    ).fetchone()
-    if unmatched_event is not None:
-        raise RuntimeError(
-            "SQLite budget reservation events disagree with the permanent "
-            "reservation ownership registry."
-        )
-
-
-def _validate_local_execution_attempt_schema(connection: sqlite3.Connection) -> None:
-    expected_columns = (
-        ("attempt_id", "TEXT", 1),
-        ("task_id", "TEXT", 1),
-        ("retry_series_id", "TEXT", 0),
-        ("effect_lineage_id", "TEXT", 1),
-        ("request_sha256", "TEXT", 1),
-        ("phase", "TEXT", 1),
-        ("quiescence", "TEXT", 1),
-        ("retry_admissible", "INTEGER", 1),
-        ("recovery_generation", "INTEGER", 1),
-        ("recovery_owner_id", "TEXT", 0),
-        ("recovery_owner_expires_at", "TEXT", 0),
-        ("record_json", "TEXT", 1),
-        ("created_at", "TEXT", 1),
-        ("updated_at", "TEXT", 1),
-    )
-    actual_columns = tuple(
-        (str(row[1]), str(row[2]).upper(), int(row[3]))
-        for row in connection.execute("PRAGMA table_info(cayu_local_execution_attempts)")
-    )
-    if actual_columns != expected_columns:
-        raise RuntimeError("SQLite local execution-attempt storage conflicts with revision 66.")
-    table_row = connection.execute(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' "
-        "AND name = 'cayu_local_execution_attempts'"
-    ).fetchone()
-    definition = (
-        ""
-        if table_row is None or table_row[0] is None
-        else " ".join(str(table_row[0]).lower().split())
-    )
-    required_fragments = (
-        "references cayu_tasks(id) on delete restrict",
-        "json_valid(record_json)",
-        "retry_admissible in (0, 1)",
-        "unique (task_id, effect_lineage_id, attempt_id)",
-    )
-    if any(fragment not in definition for fragment in required_fragments):
-        raise RuntimeError("SQLite local execution-attempt constraints conflict with revision 66.")
-    expected_indexes = {
-        "idx_cayu_local_execution_attempts_task_fence": (
-            "task_id",
-            "retry_admissible",
-            "created_at",
-            "attempt_id",
-        ),
-        "idx_cayu_local_execution_attempts_lineage": (
-            "retry_series_id",
-            "task_id",
-            "effect_lineage_id",
-            "created_at",
-            "attempt_id",
-        ),
-        "idx_cayu_local_execution_attempts_recovery": (
-            "retry_admissible",
-            "phase",
-            "updated_at",
-            "attempt_id",
-        ),
-        "idx_cayu_local_execution_attempts_discovery": (
-            "created_at",
-            "attempt_id",
-        ),
-    }
-    for index_name, expected in expected_indexes.items():
-        row = connection.execute(
-            "SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ?",
-            (index_name,),
-        ).fetchone()
-        columns = tuple(
-            str(index_row[2])
-            for index_row in connection.execute(f"PRAGMA index_info({index_name})")
-        )
-        if row is None or row[0] != "cayu_local_execution_attempts" or columns != expected:
-            raise RuntimeError(f"SQLite schema object {index_name!r} conflicts with revision 66.")
 
 
 def reconcile_schema(
@@ -1573,26 +1141,40 @@ def reconcile_schema(
         if schema_mode is schema.SchemaMode.MIGRATE:
             _repair_missing_revision_17_indexes(connection)
         else:
-            _validate_revision_17_indexes(connection, require_all=True)
+            sqlite_session_schema._validate_revision_17_indexes(
+                connection,
+                require_all=True,
+                revision_sql=sqlite_schema_history._MIGRATION_STEPS[17],
+            )
     if current.revision >= 23:
         if schema_mode is schema.SchemaMode.MIGRATE:
             _repair_missing_reservation_event_index(connection)
             _repair_missing_pending_action_scope_indexes(connection)
         else:
-            _validate_reservation_event_index(connection, require=True)
-            _validate_pending_action_scope_indexes(connection, require_all=True)
-        _validate_reservation_identity_registry(connection, require=True)
+            sqlite_budget_schema._validate_reservation_event_index(
+                connection, require=True, revision_sql=sqlite_schema_history._MIGRATION_STEPS[23]
+            )
+            sqlite_session_schema._validate_pending_action_scope_indexes(
+                connection,
+                require_all=True,
+                revision_sql=sqlite_schema_history._MIGRATION_STEPS[23],
+            )
+        sqlite_budget_schema._validate_reservation_identity_registry(connection, require=True)
     if current.revision >= 29:
         if schema_mode is schema.SchemaMode.MIGRATE:
             _repair_missing_workflow_replay_indexes(connection)
         else:
-            _validate_workflow_replay_indexes(connection, require_all=True)
+            sqlite_session_schema._validate_workflow_replay_indexes(
+                connection,
+                require_all=True,
+                revision_sql=sqlite_schema_history._MIGRATION_STEPS[29],
+            )
     if app_min_supported >= 36:
         sqlite_session_schema._validate_session_invocation_column(connection)
     if 37 <= current.revision < 42:
         # Structural validation is intentionally constant-size. The full source/
         # FTS census belongs to the one-time revision hook, never ordinary startup.
-        _validate_revision_37_knowledge_fts_schema(connection)
+        sqlite_knowledge_schema._validate_revision_37_knowledge_fts_schema(connection)
     if current.revision >= 42:
         sqlite_knowledge_schema._validate_revision_42_knowledge_schema(
             connection,
@@ -1647,9 +1229,13 @@ def reconcile_schema(
     if current.revision >= 76:
         sqlite_task_schema._validate_interrupted_handoff_generation_column(connection)
     if current.revision >= 109:
-        _validate_reservation_inventory_index(connection)
+        sqlite_budget_schema._validate_reservation_inventory_index(
+            connection, revision_sql=sqlite_schema_history._MIGRATION_STEPS[109]
+        )
     if current.revision >= 110:
-        _validate_producer_cleanup_receipts(connection)
+        sqlite_producer_schema._validate_producer_cleanup_receipts(
+            connection, revision_sql=sqlite_schema_history._MIGRATION_STEPS[110]
+        )
     if current.revision >= 111:
         validate_sqlite_wait_discovery(connection)
     if current.revision >= 112:
@@ -1703,7 +1289,7 @@ def reconcile_schema(
     if app_min_supported >= 64:
         sqlite_eval_schema._validate_eval_authored_suite_schema(connection)
     if app_min_supported >= 66:
-        _validate_local_execution_attempt_schema(connection)
+        sqlite_task_schema._validate_local_execution_attempt_schema(connection)
     if app_min_supported >= 68:
         sqlite_eval_schema._validate_eval_judge_calibration_schema(connection)
     if app_min_supported >= 72:
@@ -1948,17 +1534,29 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
         return
     if rev.revision == 23:
         with sqlite_connection._transaction(connection):
-            _validate_reservation_event_index(connection, require=False)
-            _validate_pending_action_scope_indexes(connection, require_all=False)
+            sqlite_budget_schema._validate_reservation_event_index(
+                connection, require=False, revision_sql=sqlite_schema_history._MIGRATION_STEPS[23]
+            )
+            sqlite_session_schema._validate_pending_action_scope_indexes(
+                connection,
+                require_all=False,
+                revision_sql=sqlite_schema_history._MIGRATION_STEPS[23],
+            )
             for statement in sqlite_catalog._iter_statements(
                 sqlite_schema_history._MIGRATION_STEPS[23]
             ):
                 connection.execute(statement)
             hook = _MIGRATION_HOOKS[23]
             hook(connection)
-            _validate_reservation_event_index(connection, require=True)
-            _validate_pending_action_scope_indexes(connection, require_all=True)
-            _validate_reservation_identity_registry(
+            sqlite_budget_schema._validate_reservation_event_index(
+                connection, require=True, revision_sql=sqlite_schema_history._MIGRATION_STEPS[23]
+            )
+            sqlite_session_schema._validate_pending_action_scope_indexes(
+                connection,
+                require_all=True,
+                revision_sql=sqlite_schema_history._MIGRATION_STEPS[23],
+            )
+            sqlite_budget_schema._validate_reservation_identity_registry(
                 connection,
                 require=True,
                 verify_event_ownership=True,
@@ -1968,12 +1566,20 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
         return
     if rev.revision == 29:
         with sqlite_connection._transaction(connection):
-            _validate_workflow_replay_indexes(connection, require_all=False)
+            sqlite_session_schema._validate_workflow_replay_indexes(
+                connection,
+                require_all=False,
+                revision_sql=sqlite_schema_history._MIGRATION_STEPS[29],
+            )
             for statement in sqlite_catalog._iter_statements(
                 sqlite_schema_history._MIGRATION_STEPS[29]
             ):
                 connection.execute(statement)
-            _validate_workflow_replay_indexes(connection, require_all=True)
+            sqlite_session_schema._validate_workflow_replay_indexes(
+                connection,
+                require_all=True,
+                revision_sql=sqlite_schema_history._MIGRATION_STEPS[29],
+            )
             _record_revision(connection, rev)
             connection.execute(f"PRAGMA user_version = {rev.revision}")
         return
@@ -2104,7 +1710,7 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
                 require_payload_bytes=True,
             )
         if rev.revision == 66:
-            _validate_local_execution_attempt_schema(connection)
+            sqlite_task_schema._validate_local_execution_attempt_schema(connection)
         if rev.revision == 67:
             sqlite_knowledge_schema._validate_revision_67_knowledge_schema(connection)
         if rev.revision == 68:
@@ -2188,7 +1794,9 @@ def _apply_revision_seventeen(
     # Validate before any staged work so a conflict cannot be followed by a
     # falsely recorded successful migration.
     with sqlite_connection._transaction(connection):
-        _validate_revision_17_indexes(connection, require_all=False)
+        sqlite_session_schema._validate_revision_17_indexes(
+            connection, require_all=False, revision_sql=sqlite_schema_history._MIGRATION_STEPS[17]
+        )
         for table, column, decl in sqlite_schema_history._MIGRATION_ADD_COLUMNS[17]:
             _add_column_if_missing(connection, table, column, decl)
         for statement in sqlite_catalog._iter_statements(
@@ -2242,7 +1850,9 @@ def _apply_revision_seventeen(
         after_sequence = 0
 
     with sqlite_connection._transaction(connection):
-        _validate_revision_17_indexes(connection, require_all=True)
+        sqlite_session_schema._validate_revision_17_indexes(
+            connection, require_all=True, revision_sql=sqlite_schema_history._MIGRATION_STEPS[17]
+        )
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

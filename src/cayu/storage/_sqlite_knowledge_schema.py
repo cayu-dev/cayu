@@ -11,6 +11,71 @@ from typing import NoReturn
 
 from cayu.storage import _sqlite_catalog as sqlite_catalog
 
+_KNOWLEDGE_CHUNK_LEGACY_COLUMNS = (
+    "id",
+    "entry_id",
+    "chunk_index",
+    "text",
+    "content_hash",
+    "source_uri",
+    "metadata_json",
+)
+
+
+_KNOWLEDGE_CHUNK_KEYED_COLUMNS = ("fts_rowid", *_KNOWLEDGE_CHUNK_LEGACY_COLUMNS)
+
+
+def _validate_revision_37_knowledge_fts_schema(connection: sqlite3.Connection) -> None:
+    columns = connection.execute("PRAGMA table_info(cayu_knowledge_chunks)").fetchall()
+    if tuple(str(row[1]) for row in columns) != _KNOWLEDGE_CHUNK_KEYED_COLUMNS:
+        raise RuntimeError(
+            "SQLite knowledge chunks do not provide the revision-37 stable FTS key. "
+            "Restore the required schema from a known-good backup."
+        )
+    fts_rowid = columns[0]
+    if str(fts_rowid[2]).upper() != "INTEGER" or int(fts_rowid[5]) != 1:
+        raise RuntimeError(
+            "SQLite knowledge chunks have an invalid revision-37 FTS key. "
+            "Restore the required schema from a known-good backup."
+        )
+    if not sqlite_catalog._sqlite_has_unique_index(connection, "cayu_knowledge_chunks", ("id",)):
+        raise RuntimeError("SQLite knowledge chunks are missing their unique public id constraint.")
+    if not sqlite_catalog._sqlite_has_unique_index(
+        connection,
+        "cayu_knowledge_chunks",
+        ("entry_id", "chunk_index"),
+    ):
+        raise RuntimeError(
+            "SQLite knowledge chunks are missing their entry/chunk identity constraint."
+        )
+    entry_index = connection.execute(
+        "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'index' "
+        "AND name = 'idx_cayu_knowledge_chunks_entry_index'"
+    ).fetchone()
+    entry_index_columns = (
+        tuple(
+            str(column[2])
+            for column in connection.execute(
+                "PRAGMA index_info(idx_cayu_knowledge_chunks_entry_index)"
+            )
+        )
+        if entry_index is not None
+        else ()
+    )
+    if (
+        entry_index is None
+        or entry_index[0] != "cayu_knowledge_chunks"
+        or entry_index_columns != ("entry_id", "chunk_index")
+    ):
+        raise RuntimeError("Required Cayu SQLite knowledge chunk index is missing.")
+    fts = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cayu_knowledge_chunks_fts'"
+    ).fetchone()
+    normalized_fts = " ".join(str(fts[0]).lower().split()) if fts is not None else ""
+    required_fts = "using fts5(entry_id unindexed, chunk_id unindexed, title, text)"
+    if required_fts not in normalized_fts:
+        raise RuntimeError("SQLite knowledge FTS does not match the revision-37 search contract.")
+
 
 def _validate_revision_42_knowledge_schema(
     connection: sqlite3.Connection,
