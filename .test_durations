@@ -44975,7 +44975,6 @@
     "tests/core/test_provider_completion_verifiers.py::test_retryable_provider_failure_retries_inside_one_execution[memory]": 0.03013237501727417,
     "tests/core/test_provider_completion_verifiers.py::test_retryable_provider_failure_retries_inside_one_execution[postgres]": 0.36214258190011606,
     "tests/core/test_provider_completion_verifiers.py::test_retryable_provider_failure_retries_inside_one_execution[sqlite]": 0.1859070000355132,
-    "tests/core/test_provider_completion_verifiers.py::test_session_closure_removes_verifier_dispatch_records": 0.10021474899258465,
     "tests/core/test_provider_completion_verifiers.py::test_store_fences_dispatch_intents_and_settles_once[memory]": 0.02538612496573478,
     "tests/core/test_provider_completion_verifiers.py::test_store_fences_dispatch_intents_and_settles_once[postgres]": 5.022714624006767,
     "tests/core/test_provider_completion_verifiers.py::test_store_fences_dispatch_intents_and_settles_once[sqlite]": 0.1655957090551965,
@@ -45031,5 +45030,11 @@
     "tests/cli/test_cloud_rejected_login_token.py::test_rejected_token_forces_a_refresh_before_its_expiry": 0.02644866704940796,
     "tests/cli/test_cloud_rejected_login_token.py::test_workos_login_client_refreshes_a_token_cloud_rejects_early": 0.5268202070146799,
     "tests/cli/test_cloud_reused_release.py::test_promoted_retry_found_from_a_failed_original_is_treated_as_reused": 0.0008337069884873927,
-    "tests/cli/test_cloud_reused_release.py::test_transient_service_read_keeps_polling_instead_of_publishing": 0.0009760000393725932
+    "tests/cli/test_cloud_reused_release.py::test_transient_service_read_keeps_polling_instead_of_publishing": 0.0009760000393725932,
+    "tests/core/test_verified_work_session_closure.py::test_closure_erases_completion_evaluation_runs[memory]": 0.042369291943032295,
+    "tests/core/test_verified_work_session_closure.py::test_closure_erases_completion_evaluation_runs[postgres]": 1.1084409999311902,
+    "tests/core/test_verified_work_session_closure.py::test_closure_erases_completion_evaluation_runs[sqlite]": 0.2302135830395855,
+    "tests/core/test_verified_work_session_closure.py::test_closure_erases_provider_verifier_dispatches[memory]": 0.2593125000712462,
+    "tests/core/test_verified_work_session_closure.py::test_closure_erases_provider_verifier_dispatches[postgres]": 7.8779902489623055,
+    "tests/core/test_verified_work_session_closure.py::test_closure_erases_provider_verifier_dispatches[sqlite]": 0.2554006659775041
 }
