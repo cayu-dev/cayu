@@ -4470,6 +4470,10 @@ _REVISION_17_EVENT_BACKFILL_LARGE_REMAINING_SQL = _revision_17_event_backfill_re
 )
 
 
+# These revisions cannot run inside the schema transaction. The baseline still
+# creates the same indexes normally because its tables are empty; existing hot
+# databases use CONCURRENTLY so checkpoint and event writes remain available
+# during upgrades.
 @dataclass(frozen=True)
 class _ConcurrentIndexMigration:
     index_name: str

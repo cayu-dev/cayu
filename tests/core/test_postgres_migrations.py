@@ -23,6 +23,7 @@ from cayu.messages import Message
 from cayu.sessions.base import RunRequest, SessionIdentity
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.transcript_queries import TRANSCRIPT_SEARCH_TOKENIZER_VERSION
+from cayu.storage import _postgres_base as postgres_base
 from cayu.storage import _postgres_schema_history as postgres_schema_history
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import migrations as schema
@@ -122,12 +123,12 @@ def test_constraint_fragment_matching_is_catalog_order_independent() -> None:
         ),
     )
 
-    assert postgres_storage._constraint_fragments_match_exactly(candidates, required)
-    assert postgres_storage._constraint_fragments_match_exactly(
+    assert postgres_base._constraint_fragments_match_exactly(candidates, required)
+    assert postgres_base._constraint_fragments_match_exactly(
         tuple(reversed(candidates)),
         required,
     )
-    assert not postgres_storage._constraint_fragments_match_exactly(
+    assert not postgres_base._constraint_fragments_match_exactly(
         candidates[:1],
         required,
     )
@@ -1262,7 +1263,7 @@ def test_cli_migrate_recovers_postgres_receipt_after_delivery_failure(
         import psycopg
 
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
-            state = await postgres_storage.read_schema_state(conn.cursor())
+            state = await postgres_base.read_schema_state(conn.cursor())
             row = await (
                 await conn.execute(
                     "SELECT operation_sha256, receipt_json "
@@ -1328,7 +1329,7 @@ def test_cli_migrate_invalid_output_fails_before_postgres_schema_write(
             await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
             conn.cursor() as cur,
         ):
-            state = await postgres_storage.read_schema_state(cur)
+            state = await postgres_base.read_schema_state(cur)
             await cur.execute(
                 "SELECT to_regclass('cayu_schema_migrations'), "
                 "to_regclass('cayu_schema_migration_receipts')"
@@ -2110,7 +2111,7 @@ def test_revision_seventy_six_backfills_live_handoff_authority(
     postgres_dsn: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(postgres_storage, "_INTERRUPTED_HANDOFF_MIGRATION_BATCH_SIZE", 1)
+    monkeypatch.setattr(postgres_base, "_INTERRUPTED_HANDOFF_MIGRATION_BATCH_SIZE", 1)
 
     async def runner() -> None:
         import psycopg

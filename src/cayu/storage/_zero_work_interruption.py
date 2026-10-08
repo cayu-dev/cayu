@@ -155,7 +155,7 @@ async def sqlite_terminalize(
 async def postgres_terminalize(
     store: PostgresSessionStore, request: ZeroWorkInterruptionRequest
 ) -> ZeroWorkInterruptionPublication | None:
-    from cayu.storage.postgres import _dumps, _json_obj
+    from cayu.storage._postgres_support import _dumps, _json_obj
 
     sid = request.session.id
     await store._ensure_ready()

@@ -140,7 +140,7 @@ from cayu.evals.suite_authoring import (
     EvalSuiteDocument,
     eval_suite_document_from_json,
 )
-from cayu.storage.postgres import _PostgresStoreBase
+from cayu.storage._postgres_base import _PostgresStoreBase
 
 _POSTGRES_EVAL_MIN_REQUIRED_REVISION = 80
 

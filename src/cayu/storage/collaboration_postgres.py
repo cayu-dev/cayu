@@ -9,7 +9,7 @@ from cayu.collaboration._ownership import _MutationOwners
 from cayu.collaboration.base import CollaborationStore
 from cayu.collaboration.participants import CollaborationUnavailable
 from cayu.storage._collaboration_repository import _SQLRepository
-from cayu.storage.postgres import _PostgresStoreBase
+from cayu.storage._postgres_base import _PostgresStoreBase
 
 
 class PostgresCollaborationStore(_PostgresStoreBase, CollaborationStore):

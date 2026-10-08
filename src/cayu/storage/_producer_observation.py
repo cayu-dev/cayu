@@ -64,7 +64,7 @@ async def sqlite_observation(store, command, *, kind=None, attachment_only=False
 async def postgres_observation(store, command, *, kind=None, attachment_only=False):
     if kind == "published":
         return await published_progress(store, command)
-    from cayu.storage.postgres import _json_obj
+    from cayu.storage._postgres_support import _json_obj
 
     command, sid, key = release_read_target(command)
     await store._ensure_ready()

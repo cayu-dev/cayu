@@ -782,6 +782,10 @@ migration history or store adapters.
 PostgreSQL baseline and bookkeeping SQL, revision scripts, backfill SQL and concurrent-index
 declarations live in `storage/_postgres_schema_history.py`. It imports canonical domain
 DDL and can be used without importing PostgreSQL record codecs or store adapters.
+`storage/_postgres_base.py` owns pool lifecycle, schema locks, transition preflights,
+validation, migration execution and receipts. PostgreSQL adapters inherit that owner
+directly; CLI schema commands use its readers and preflights. JSON record helpers
+remain in `storage/_postgres_support.py`.
 
 Files are good source-of-truth for prompts, instructions, workflows, manuals, skills, and human-reviewed memories.
 

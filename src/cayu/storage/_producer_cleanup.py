@@ -138,7 +138,7 @@ async def sqlite_cleanup(store, registration, *, authority=None, commit=False):
 
 
 async def postgres_cleanup(store, registration, *, authority=None, commit=False):
-    from cayu.storage.postgres import _dumps, _json_obj
+    from cayu.storage._postgres_support import _dumps, _json_obj
 
     registration, sid, key = _request(registration, authority, commit)
     retirement = retirement_for(registration.command)

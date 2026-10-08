@@ -503,10 +503,10 @@ def _postgres_revision(dsn: str) -> int:
     async def read() -> int:
         import psycopg
 
-        from cayu.storage import postgres
+        from cayu.storage import _postgres_base as postgres_base
 
         async with await psycopg.AsyncConnection.connect(dsn) as conn, conn.cursor() as cur:
-            return (await postgres.read_schema_state(cur)).revision
+            return (await postgres_base.read_schema_state(cur)).revision
 
     return asyncio.run(read())
 

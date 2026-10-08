@@ -78,7 +78,7 @@ async def sqlite_retirement(store, retirement, *, authority, limit):
 
 
 async def postgres_retirement(store, retirement, *, authority, limit):
-    from cayu.storage.postgres import _json_obj
+    from cayu.storage._postgres_support import _json_obj
 
     retirement, key = prepare_retirement(retirement, authority, limit)
     generation = retirement.namespace.generation

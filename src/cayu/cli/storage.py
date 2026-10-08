@@ -559,13 +559,13 @@ def _status(args: argparse.Namespace) -> int:
     async def run() -> tuple[schema.SchemaState, dict[str, object]]:
         import psycopg
 
-        from cayu.storage import postgres
+        from cayu.storage import _postgres_base as postgres_base
 
         async with await psycopg.AsyncConnection.connect(args.postgres) as conn:
             await conn.set_read_only(True)
             async with conn.cursor() as cur:
-                state = await postgres.read_schema_state(cur)
-                pending = await postgres.read_pending_migration_receipt(cur)
+                state = await postgres_base.read_schema_state(cur)
+                pending = await postgres_base.read_pending_migration_receipt(cur)
                 resume_state = None if pending is None else _pending_receipt_input_state(pending[1])
                 migration = _assess_migration(
                     state,
@@ -963,24 +963,24 @@ def _migrate_postgres(args: argparse.Namespace) -> int:
     async def load_pending() -> tuple[str, dict[str, object]] | None:
         import psycopg
 
-        from cayu.storage import postgres
+        from cayu.storage import _postgres_base as postgres_base
 
         async with (
             await psycopg.AsyncConnection.connect(args.postgres) as conn,
             conn.cursor() as cur,
         ):
-            return await postgres.read_pending_migration_receipt(cur)
+            return await postgres_base.read_pending_migration_receipt(cur)
 
     async def preflight() -> tuple[schema.SchemaState, tuple[schema.Revision, ...], bool]:
         import psycopg
 
-        from cayu.storage import postgres
+        from cayu.storage import _postgres_base as postgres_base
 
         async with (
             await psycopg.AsyncConnection.connect(args.postgres) as conn,
             conn.cursor() as cur,
         ):
-            state = await postgres.read_schema_state(cur)
+            state = await postgres_base.read_schema_state(cur)
             planned = await _preflight_postgres_migration(cur, state, codec, args)
             return state, planned, await _postgres_input_empty(cur, state)
 
@@ -1080,13 +1080,13 @@ def _migrate_postgres(args: argparse.Namespace) -> int:
             await store.close()
         import psycopg
 
-        from cayu.storage import postgres
+        from cayu.storage import _postgres_base as postgres_base
 
         async with (
             await psycopg.AsyncConnection.connect(args.postgres) as conn,
             conn.cursor() as cur,
         ):
-            return await postgres.read_schema_state(cur)
+            return await postgres_base.read_schema_state(cur)
 
     state = _run_postgres(run, args)
     if state is None:
@@ -1112,13 +1112,13 @@ def _migrate_postgres(args: argparse.Namespace) -> int:
     async def discard_receipt() -> None:
         import psycopg
 
-        from cayu.storage import postgres
+        from cayu.storage import _postgres_base as postgres_base
 
         async with (
             await psycopg.AsyncConnection.connect(args.postgres) as conn,
             conn.cursor() as cur,
         ):
-            await postgres.discard_pending_migration_receipt(cur, operation_sha256)
+            await postgres_base.discard_pending_migration_receipt(cur, operation_sha256)
             await conn.commit()
 
     # A leftover receipt is safe: the next literal invocation validates it
@@ -1212,12 +1212,12 @@ async def _preflight_postgres_migration(
 ) -> tuple[schema.Revision, ...]:
     """Run every read-only migration check before the first schema write."""
 
-    from cayu.storage import postgres
+    from cayu.storage import _postgres_base as postgres_base
 
     planned = schema.validate_migration_input(state)
     _validate_breaking_acknowledgements(state, planned, args.acknowledge_breaking)
     _validate_recall_reset_input(state, planned, args.reset_empty_recall_state)
-    await postgres.preflight_migration(
+    await postgres_base.preflight_migration(
         cur,
         state,
         allow_empty_recall_reset=args.reset_empty_recall_state,

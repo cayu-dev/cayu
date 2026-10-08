@@ -1376,7 +1376,7 @@ def test_postgres_first_claim_cancellation_settles_lazy_schema_readiness(postgre
     async def run() -> None:
         import psycopg
 
-        from cayu.storage.postgres import _SCHEMA_ADVISORY_LOCK_KEY
+        from cayu.storage._postgres_base import _SCHEMA_ADVISORY_LOCK_KEY
 
         await _truncate(postgres_dsn)
         bootstrap = _new_store(postgres_dsn)

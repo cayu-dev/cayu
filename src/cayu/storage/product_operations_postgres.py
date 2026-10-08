@@ -27,8 +27,8 @@ from cayu.server import (
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _product_operations as rules
 from cayu.storage import migrations as schema
+from cayu.storage._postgres_base import _PostgresStoreBase
 from cayu.storage._product_operation_schema import PRODUCT_OPERATIONS_TABLE
-from cayu.storage.postgres import _PostgresStoreBase
 
 if TYPE_CHECKING:
     from psycopg_pool import AsyncConnectionPool

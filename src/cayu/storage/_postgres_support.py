@@ -370,3 +370,9 @@ def _loads(value: Any) -> Any:
     if isinstance(value, str):
         return json.loads(value)
     return value
+
+
+def _json_obj(value: Any) -> dict[str, Any]:
+    if isinstance(value, str):
+        return json.loads(value)
+    return value

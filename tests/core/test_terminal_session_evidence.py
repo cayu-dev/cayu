@@ -1800,17 +1800,17 @@ def test_postgres_terminal_evidence_survives_restart_with_the_exact_boundary(
                 )
             assert events.value.code is TerminalSessionEvidenceErrorCode.EVENT_LIMIT_EXCEEDED
 
-            import cayu.storage.postgres as postgres_store_module
+            from cayu.storage import _postgres_support as postgres_support
 
             hydrated_json_values = 0
-            original_json_obj = postgres_store_module._json_obj
+            original_json_obj = postgres_support._json_obj
 
             def json_obj_spy(value):
                 nonlocal hydrated_json_values
                 hydrated_json_values += 1
                 return original_json_obj(value)
 
-            monkeypatch.setattr(postgres_store_module, "_json_obj", json_obj_spy)
+            monkeypatch.setattr(postgres_support, "_json_obj", json_obj_spy)
             with pytest.raises(TerminalSessionEvidenceError) as record:
                 await reopened.load_terminal_session_evidence(
                     session_id,

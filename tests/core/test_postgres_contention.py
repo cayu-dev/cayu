@@ -33,8 +33,8 @@ from cayu.budgets.base import BudgetLimit, BudgetReservation, BudgetWindow
 from cayu.budgets.pricing import ModelPrice, PriceBook
 from cayu.providers import bedrock_billing_identity, completed_bedrock_billing_identity
 from cayu.storage import migrations as schema
+from cayu.storage._postgres_base import _SCHEMA_ADVISORY_LOCK_KEY
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import _SCHEMA_ADVISORY_LOCK_KEY
 
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 

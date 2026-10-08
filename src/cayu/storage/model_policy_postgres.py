@@ -12,7 +12,7 @@ from cayu.runtime._policy_storage import (
     transition,
 )
 from cayu.runtime._policy_wire import require
-from cayu.storage.postgres import _PostgresStoreBase
+from cayu.storage._postgres_base import _PostgresStoreBase
 
 
 class PostgresModelPolicyStore(_PostgresStoreBase, ModelPolicyStore):
