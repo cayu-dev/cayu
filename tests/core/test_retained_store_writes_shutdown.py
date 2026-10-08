@@ -273,11 +273,11 @@ def test_shutdown_waits_for_a_timed_out_tool_result_projection(
     from cayu.artifacts.local import LocalArtifactStore
     from cayu.environments.base import Environment, EnvironmentSpec
     from cayu.providers.base import ModelStreamEvent
-    from cayu.runtime import _tool_round_executor
+    from cayu.runtime._tool_invocation import terminal as invocation_terminal
     from cayu.tools.base import ToolResult
     from cayu.tools.result_projection import ArtifactExternalizingToolResultPolicy
 
-    monkeypatch.setattr(_tool_round_executor, "_TOOL_RESULT_PROJECTION_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(invocation_terminal, "_TOOL_RESULT_PROJECTION_TIMEOUT_SECONDS", 0.05)
 
     class OwnedSlowArtifactStore(LocalArtifactStore):
         """Its write ignores cancellation, outliving the projection timeout."""
@@ -494,7 +494,9 @@ def test_a_hung_projection_does_not_skip_environment_cleanup(
     async def scenario() -> None:
         app = CayuApp(enable_logging=False)
         release = asyncio.Event()
-        app._tool_round_executor._retain_detached_projection(asyncio.create_task(release.wait()))
+        app._tool_round_executor.terminals._retain_detached_projection(
+            asyncio.create_task(release.wait())
+        )
         cleaned: list[float] = []
         drain_retained = app._environment_lifecycle.drain_retained_cleanups
 

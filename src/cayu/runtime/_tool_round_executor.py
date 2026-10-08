@@ -13,7 +13,7 @@ import asyncio
 import hashlib
 import json
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
-from contextlib import aclosing, nullcontext, suppress
+from contextlib import aclosing, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -36,18 +36,14 @@ from cayu._task_wait import (
     unexpected_child_cancellation_error,
 )
 from cayu._validation import (
-    DurableValueError,
     canonical_durable_json_bytes,
     copy_durable_json_object,
     copy_durable_json_value,
     copy_durable_metadata,
     copy_durable_record,
     copy_json_value,
-    extract_durable_value_error,
     require_clean_nonblank,
-    require_durable_text,
     require_nonblank,
-    require_unicode_scalar_text,
 )
 from cayu._workspace_mutation import workspace_mutation_task_settlement_probe
 from cayu.agents import AgentSpec
@@ -70,10 +66,6 @@ from cayu.approvals.user_input import (
 )
 from cayu.artifacts._images import ImageDecodePolicy
 from cayu.artifacts.base import ArtifactScope
-from cayu.artifacts.local import LocalArtifactStore
-from cayu.artifacts.settlement import (
-    ArtifactWriteSettlementObserver,
-)
 from cayu.budgets._run_limit_accounting import (
     RunLimitAccountingContext,
     pause_run_limit_accounting_context,
@@ -94,14 +86,10 @@ from cayu.environments.deferred import materialization_trigger
 from cayu.events import (
     Event,
     EventType,
-    copy_event,
-    event_nested_payload_authority_is_runtime_generated,
-    event_retains_runtime_payload_authority,
     event_with_runtime_envelope_authority,
     event_with_runtime_generated_id,
     event_with_runtime_nested_payload_authority,
     event_with_runtime_payload_authority,
-    validate_event_envelope,
 )
 from cayu.execution_profiles import (
     EXECUTION_PROFILE_FINGERPRINT_FIELD,
@@ -117,16 +105,7 @@ from cayu.knowledge._publication import KnowledgePublicationScope
 from cayu.mcp.tools import McpToolAdapter, McpToolset
 from cayu.messages import Message
 from cayu.observability.hooks import (
-    AfterToolCallDecision,
-    BeforeToolCallDecision,
-    BeforeToolCallHookContext,
-    RuntimeHookPhase,
     RuntimeHookRuntime,
-    ToolCallHookContext,
-    _runtime_hook_supports_phase,
-)
-from cayu.observability.hooks import (
-    _runtime_hook_event as _build_runtime_hook_event,
 )
 from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runners._cleanup import (
@@ -142,7 +121,6 @@ from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_execution as tool_execution
-from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._auxiliary_inference import AuxiliaryInferenceOwner
@@ -168,7 +146,6 @@ from cayu.runtime._environment_exposure import (
     refresh_and_require_environment_exposed,
     require_environment_exposed,
 )
-from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
 from cayu.runtime._event_writer import RuntimeEventWriter, prepare_runtime_event
 from cayu.runtime._interruption_coordinator import (
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
@@ -195,17 +172,48 @@ from cayu.runtime._tool_effect_state import (
     ToolEffectStateOwner,
     ToolEffectTerminal,
 )
+from cayu.runtime._tool_invocation.cancellation import (
+    _await_post_tool_operation,
+    _contains_process_signal,
+    _iterate_post_tool_events,
+    _raise_preserved_post_tool_cancellation,
+    _raise_restored_post_tool_cancellation,
+    _receive_restored_post_tool_cancellation,
+)
+from cayu.runtime._tool_invocation.context import (
+    _artifact_store,
+    _artifact_store_id,
+    _environment_name,
+    _event_with_targeted_tool_invocation_authority,
+    _knowledge_access_scope,
+    _knowledge_store,
+    _mcp_servers,
+    _published_argument_presence,
+    _restore_targeted_tool_invocation_event_authority,
+    _runner,
+    _targeted_tool_invocation_payload,
+    _workspace,
+    _workspace_id,
+    _workspace_receipt_artifact_store,
+)
+from cayu.runtime._tool_invocation.hooks import (
+    ToolInvocationHooks,
+    _BeforeToolCallResolution,
+    _private_argument_short_circuit_result,
+    _project_tool_call_for_hook,
+    _redact_event_for_invocation,
+)
+from cayu.runtime._tool_invocation.terminal import (
+    DeferredTerminalCaptureRecorder,
+    DeferredTerminalStager,
+    ToolTerminalPublisher,
+)
 from cayu.runtime._tool_round_staging import (
     CheckpointTransform,
-    _durable_payload_utf8_size,
     _event_with_tool_round_authority,
-    _is_policy_denial_event,
     _prepare_tool_result_event,
-    _redact_tool_result_for_event,
     _redactor_for_tool_calls,
-    _terminal_publication_work_estimate,
     _tool_terminal_payload_limits,
-    _validate_and_synchronize_tool_result_event,
 )
 from cayu.runtime.mcp_manifest_policy import (
     McpManifestPolicy,
@@ -231,7 +239,6 @@ from cayu.sessions._execution_profile_checkpoint import (
 from cayu.sessions._tool_effect_intent import ToolEffectIntent
 from cayu.sessions.base import (
     _MCP_MANIFEST_BASELINE_MAX_TOOLS,
-    INHERIT_INTERACTION,
     McpManifestBaseline,
     McpManifestBaselineLoadResult,
     McpManifestHistoryConflict,
@@ -242,15 +249,11 @@ from cayu.sessions.base import (
     _mcp_authoritative_manifest_hash,
     _mcp_manifest_session_ref,
     _McpManifestBaselineEvidenceInvalid,
-    resolve_interaction_attribution,
     runtime_publication_checkpoint_value_digest,
 )
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import Session, SessionStatus
 from cayu.tools import _argument_publication as tool_argument_publication
-from cayu.tools import _shared_artifact_results as shared_artifact_results
-from cayu.tools import _terminal_controls as tool_terminal_controls
-from cayu.tools import _web_access_results as web_access_results
 from cayu.tools._operation_boundary import (
     BoundedInvocationOperationRegistry,
     await_invocation_operation,
@@ -280,7 +283,6 @@ from cayu.tools.base import (
 from cayu.tools.catalogue import (
     CALL_TOOL_NAME,
     SEARCH_TOOLS_NAME,
-    ToolExecutionContract,
 )
 from cayu.tools.commands import ExecCommandTool
 from cayu.tools.discovery import (
@@ -339,20 +341,9 @@ from cayu.tools.policy import (
     taint_labels_from_metadata,
 )
 from cayu.tools.result_projection import (
-    _TOOL_RESULT_PROJECTION_PROVENANCE_PATH,
     ToolResultProjectionPolicy,
-    ToolResultProjectionRequest,
-    _last_reconciliation_candidate,
-    projection_failure,
-    safe_projection_failure_type,
-    validate_tool_result_projection,
 )
 from cayu.tools.structured_commands import RunCommandTool
-from cayu.tools.terminal_publication import (
-    TOOL_TERMINAL_PUBLICATION_SLICE_BYTES,
-    ToolTerminalPublicationGovernor,
-    ToolTerminalPublicationMetricsSnapshot,
-)
 from cayu.vaults.redaction import SecretRedactor
 from cayu.workspaces._revision_records import (
     _WORKSPACE_PATH_REVISION_AUTHORITY_FIELDS,
@@ -363,7 +354,6 @@ from cayu.workspaces.checkpoint_lifecycle import (
     complete_workspace_checkpoint_mutation,
     ensure_workspace_checkpoint,
 )
-from cayu.workspaces.local import LocalWorkspace
 from cayu.workspaces.mutation_attribution import (
     DirectWorkspaceMutationCollector,
     WorkspaceMutationWindow,
@@ -447,7 +437,6 @@ def _event_with_workspace_observation_authority(
     return event_with_runtime_envelope_authority(event, "interaction_id")
 
 
-_TOOL_RESULT_PROJECTION_TIMEOUT_SECONDS = 30.0
 _WORKSPACE_RECEIPT_INLINE_PATH_LIMIT = 32
 _WORKSPACE_RECEIPT_INLINE_BYTES = 8 * 1024
 _WORKSPACE_OBSERVATION_RUNTIME_LIMITS = WorkspaceRevisionObservationLimits()
@@ -455,33 +444,6 @@ _WORKSPACE_OBSERVATION_MAX_TOTAL_PATHS = (1 << 63) - 1
 _WORKSPACE_OBSERVATION_TIMEOUT_SECONDS = 30.0
 _WORKSPACE_ARTIFACT_WRITE_TIMEOUT_SECONDS = 30.0
 _MAX_RETAINED_WORKSPACE_CAPTURE_OPERATIONS = 64
-
-
-def _bounded_tool_failure_event(
-    event: Event, failure: tool_execution.ToolExecutionOutcome
-) -> Event:
-    payload = dict(event.payload)
-    payload.pop("tool_result_projection", None)
-    payload["result"] = failure.result.model_dump(mode="json")
-    payload.update(failure.terminal_payload_fields())
-    failed = event.model_copy(update={"type": EventType.TOOL_CALL_FAILED, "payload": payload})
-    try:
-        copied = copy_event(failed)
-        validate_event_envelope(copied)
-        return copied
-    except Exception as exc:
-        limit_error = extract_durable_value_error(exc)
-        if limit_error is None or limit_error.dimension is None:
-            raise
-    # The effect intent retains argument authority. This terminal projection is
-    # explicitly unavailable, never a truncated or different invocation.
-    payload.pop("effective_arguments", None)
-    payload.pop(tool_argument_publication.ARGUMENTS_FIELD, None)
-    payload.update(tool_argument_publication.unavailable_argument_projection().payload_fields())
-    payload[tool_argument_publication.ARGUMENTS_EXACT_FIELD] = False
-    copied = copy_event(failed.model_copy(update={"payload": payload}))
-    validate_event_envelope(copied)
-    return copied
 
 
 @dataclass(frozen=True)
@@ -529,19 +491,6 @@ class ToolRoundLimitRequest:
 
 LimitEventStream = Callable[[ToolRoundLimitRequest], AsyncIterator[Event]]
 InterruptedRoundEventStream = Callable[[InterruptedToolRoundRequest], AsyncGenerator[Event, None]]
-DeferredTerminalStager = Callable[
-    [
-        Event,
-        runtime_records.ToolCallOutcome,
-        bool,
-        bool,
-        invocation_secrets.InvocationPublicationSnapshot,
-    ],
-    Awaitable[Event],
-]
-DeferredTerminalFinalizer = Callable[[Event], Awaitable[Event]]
-DeferredTerminalCaptureRecorder = Callable[[Event], Awaitable[Event]]
-TerminalEventEmitter = Callable[[Event], Awaitable[Event]]
 
 _AMBIGUOUS_POLICY_RECOVERY_REASON = (
     "Tool policy planning was interrupted without a durable outcome; "
@@ -551,92 +500,6 @@ _AMBIGUOUS_POLICY_RECOVERY_METADATA = {
     "recovered": True,
     "policy_evaluation": "ambiguous",
 }
-_TARGETED_TOOL_INVOCATION_PAYLOAD_FIELDS = (
-    "dispatch_kind",
-    "model_tool_name",
-    "grant_id",
-    "use_id",
-    "effective_tool_id",
-    "catalogue_revision",
-    "descriptor_version",
-    "schema_fingerprint",
-    "arguments_sha256",
-    "invocation_id",
-)
-
-
-def _targeted_tool_invocation_payload(
-    tool_call: runtime_records.ToolCallRequest,
-) -> dict[str, Any]:
-    invocation = tool_call.targeted_tool_invocation
-    if invocation is None:
-        return {}
-    payload = {
-        "dispatch_kind": invocation.dispatch_kind,
-        "model_tool_name": invocation.model_tool_name,
-        "grant_id": invocation.grant_id,
-        "use_id": invocation.use_id,
-        "effective_tool_id": invocation.tool_id,
-        "catalogue_revision": invocation.catalogue_revision,
-        "descriptor_version": invocation.descriptor_version,
-        "schema_fingerprint": invocation.schema_fingerprint,
-        "arguments_sha256": invocation.arguments_sha256,
-        "invocation_id": invocation.invocation_id,
-    }
-    if tuple(payload) != _TARGETED_TOOL_INVOCATION_PAYLOAD_FIELDS:
-        raise AssertionError("Targeted tool invocation payload fields drifted.")
-    return payload
-
-
-def _event_with_targeted_tool_invocation_authority(
-    event: Event,
-    tool_call: runtime_records.ToolCallRequest,
-) -> Event:
-    """Attest exact targeted-tool linkage copied from one resolved invocation."""
-
-    if tool_call.targeted_tool_invocation is None:
-        return event
-    return event_with_runtime_payload_authority(
-        event,
-        *_TARGETED_TOOL_INVOCATION_PAYLOAD_FIELDS,
-    )
-
-
-def _restore_targeted_tool_invocation_event_authority(
-    event: Event,
-    tool_call: runtime_records.ToolCallRequest,
-    *,
-    redactor: SecretRedactor | None = None,
-) -> Event:
-    """Rebind one terminal returned through a durable checkpoint callback."""
-
-    invocation = tool_call.targeted_tool_invocation
-    if invocation is None:
-        return event
-    if event.tool_name != tool_call.name or event.payload.get("tool_call_id") != tool_call.id:
-        raise RuntimeError("Targeted tool terminal conflicts with its resolved invocation.")
-    expected = _targeted_tool_invocation_payload(tool_call)
-    for field_name, expected_value in expected.items():
-        observed = event.payload.get(field_name)
-        retained_authority = event_retains_runtime_payload_authority(
-            event,
-            field_name=field_name,
-            value=expected_value,
-        )
-        redacted_attested_authority = retained_authority and (
-            observed == PRIVATE_EVENT_AUTHORITY
-            or (redactor is not None and observed == redactor.redact_json(expected_value))
-        )
-        if (
-            field_name in event.payload
-            and observed != expected_value
-            and not redacted_attested_authority
-        ):
-            raise RuntimeError(
-                "Targeted tool terminal conflicts with its durable invocation authority."
-            )
-    rebound = event.model_copy(update={"payload": {**event.payload, **expected}})
-    return _event_with_targeted_tool_invocation_authority(rebound, tool_call)
 
 
 def _require_matching_policy_round(
@@ -703,13 +566,6 @@ class UserInputRequired(Exception):
         self.pending = copy_pending_user_input(pending)
 
 
-def _consume_projection_task_outcome(task: asyncio.Task[Any]) -> None:
-    """Observe a timed-out policy task after requesting cooperative cancellation."""
-
-    with suppress(BaseException):
-        task.result()
-
-
 class ToolRoundExecutor:
     """Execute tool calls and complete ordinary tool rounds.
 
@@ -748,20 +604,25 @@ class ToolRoundExecutor:
         # Projections that outlived their timeout may still write artifacts,
         # and abandoned secret resolutions may still use a vault or proxy:
         # waited for by environment cleanup, never cancelled again.
-        self._detached_projections: set[asyncio.Task[Any]] = set()
         self._detached_secret_resolutions: set[asyncio.Task[Any]] = set()
         self._auxiliary_inference = auxiliary_inference
         self._session_control = session_control
-        self._hook_runtime = hook_runtime
-        self._runtime_hooks = runtime_hooks
         self._mcp_manifest_policy = mcp_manifest_policy
-        self._tool_result_projection_policy = tool_result_projection_policy
         self._secret_redactor = secret_redactor
         self._image_decode_policy = image_decode_policy
         self._tool_timeout_seconds = tool_timeout_seconds
         self._max_parallel_tool_calls = max_parallel_tool_calls
         self._clock = clock
-        self._terminal_publication_governor = ToolTerminalPublicationGovernor()
+        self.hooks = ToolInvocationHooks(
+            event_writer=event_writer, hook_runtime=hook_runtime, runtime_hooks=runtime_hooks
+        )
+        self.terminals = ToolTerminalPublisher(
+            event_writer=event_writer,
+            hooks=self.hooks,
+            secret_redactor=secret_redactor,
+            projection_policy=tool_result_projection_policy,
+            clock=clock,
+        )
         self._checkpoint_transform = checkpoint_transform
         self._apply_limit_evaluation = apply_limit_evaluation
         self._close_interrupted_round = close_interrupted_round
@@ -770,32 +631,6 @@ class ToolRoundExecutor:
         self._knowledge_publication_scope = knowledge_publication_scope
         self._workspace_capture_operations = BoundedInvocationOperationRegistry(
             max_operations=_MAX_RETAINED_WORKSPACE_CAPTURE_OPERATIONS
-        )
-
-    def terminal_publication_metrics(self) -> ToolTerminalPublicationMetricsSnapshot:
-        """Return current content-free terminal-publication backlog and latency metrics."""
-
-        return self._terminal_publication_governor.snapshot()
-
-    async def _emit_staged_terminal_fairly(self, event: Event) -> Event:
-        """Prepare staged payload CPU off-loop, then use the writer's exact prepared path."""
-
-        return await self._event_writer.emit_cooperatively(
-            event,
-            # Final preparation validates every event field. Conservatively
-            # classify staged terminals as off-loop even when their content
-            # string is small; nested arguments and metadata are not safely
-            # measurable in constant time at this scheduling boundary.
-            estimated_bytes=max(
-                _terminal_publication_work_estimate(event),
-                TOOL_TERMINAL_PUBLICATION_SLICE_BYTES + 1,
-            ),
-            scheduler=self._terminal_publication_governor.run_cpu,
-            persisted_observer=lambda persisted: self._terminal_publication_governor.published(
-                session_id=persisted.session_id,
-                event_id=persisted.id,
-                published_at=self._clock(),
-            ),
         )
 
     def create_run(
@@ -3257,7 +3092,7 @@ class ToolRoundExecutor:
                 payload["approval_id"] = approval_id
             if input_id is not None:
                 payload["input_id"] = input_id
-            async for event in self.emit_tool_call_result_with_hooks(
+            async for event in self.terminals.publish_result(
                 event=Event(
                     type=EventType.TOOL_CALL_FAILED,
                     session_id=session.id,
@@ -3332,7 +3167,7 @@ class ToolRoundExecutor:
                     payload["approval_id"] = approval_id
                 if input_id is not None:
                     payload["input_id"] = input_id
-                async for event in self.emit_tool_call_result_with_hooks(
+                async for event in self.terminals.publish_result(
                     event=Event(
                         type=EventType.TOOL_CALL_BLOCKED,
                         session_id=session.id,
@@ -3407,7 +3242,7 @@ class ToolRoundExecutor:
             policy_output_secret_resolution_scope != "static"
             or not registered_tool.publish_arguments
         )
-        async for hook_event in self._run_before_tool_call_hooks(
+        async for hook_event in self.hooks.before_call(
             session=session,
             registered_agent=registered_agent,
             registered_environment=registered_environment,
@@ -3439,7 +3274,7 @@ class ToolRoundExecutor:
                 if registered_tool.publish_arguments
                 else "Tool call blocked by a before_tool_call hook."
             )
-            async for event in self._emit_terminal_tool_result(
+            async for event in self.terminals.emit_result(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
@@ -3473,7 +3308,7 @@ class ToolRoundExecutor:
                 if registered_tool.publish_arguments
                 else _private_argument_short_circuit_result(before_resolution.short_circuit_result)
             )
-            async for event in self._emit_terminal_tool_result(
+            async for event in self.terminals.emit_result(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
@@ -3550,7 +3385,7 @@ class ToolRoundExecutor:
                         or "Modified tool arguments require approval, which before_tool_call "
                         "hook modifications do not support."
                     )
-                async for event in self._emit_terminal_tool_result(
+                async for event in self.terminals.emit_result(
                     session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
@@ -5321,7 +5156,7 @@ class ToolRoundExecutor:
                     initial_projection_cancellation,
                     initial_projection_requests,
                 ) = await _await_post_tool_operation(
-                    self._prepare_size_bounded_tool_terminal(
+                    self.terminals.prepare_bounded_result(
                         event=result_event,
                         result=result,
                         registered_tool=registered_tool,
@@ -5365,7 +5200,7 @@ class ToolRoundExecutor:
                         projection_cancellation,
                         projection_requests,
                     ) = await _await_post_tool_operation(
-                        self._project_terminal_tool_result(
+                        self.terminals.project_result(
                             event=result_event,
                             result=result,
                             session=session,
@@ -5448,7 +5283,7 @@ class ToolRoundExecutor:
                 terminal_events: list[tuple[Event, runtime_records.ToolCallOutcome | None]] = []
                 terminal_recorded = False
                 async for event in _iterate_post_tool_events(
-                    self._emit_terminal_tool_result(
+                    self.terminals.emit_result(
                         session=session,
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
@@ -5522,7 +5357,7 @@ class ToolRoundExecutor:
                     redactor=redactor,
                 )
                 async for hook_event, modified in _iterate_post_tool_events(
-                    self.run_tool_call_hooks(
+                    self.hooks.after_call(
                         session=session,
                         tool_event=published_terminal_event,
                         registered_agent=registered_agent,
@@ -5565,7 +5400,7 @@ class ToolRoundExecutor:
             terminal_recorded = False
             try:
                 async for event in _iterate_post_tool_events(
-                    self.emit_tool_call_result_with_hooks(
+                    self.terminals.publish_result(
                         event=result_event,
                         session=session,
                         registered_agent=registered_agent,
@@ -6087,787 +5922,6 @@ class ToolRoundExecutor:
                 )
             )
 
-    async def _emit_terminal_tool_result(
-        self,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        tool_call: runtime_records.ToolCallRequest,
-        event_type: EventType,
-        result: ToolResult,
-        extra_payload: dict[str, Any],
-        task_id: str | None,
-        execution_profile: ExecutionProfileIdentity | None,
-        invocation_context: InvocationContext | None,
-        tool_round_identity: ToolRoundIdentity,
-        approval_id: str | None,
-        input_id: str | None,
-        allow_modification: bool,
-        redactor: SecretRedactor | None = None,
-        output_redactor: SecretRedactor | None = None,
-        argument_projection: tool_argument_publication.ToolArgumentProjection | None = None,
-        deferred_terminal_stager: DeferredTerminalStager | None = None,
-        publication_snapshot: invocation_secrets.InvocationPublicationSnapshot | None = None,
-    ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
-        payload: dict[str, Any] = {
-            "tool_call_id": tool_call.id,
-            **extra_payload,
-            "result": result.model_dump(),
-            **copy_tool_round_identity(tool_round_identity).payload(),
-        }
-        if approval_id is not None:
-            payload["approval_id"] = approval_id
-        if input_id is not None:
-            payload["input_id"] = input_id
-        async for event in self.emit_tool_call_result_with_hooks(
-            event=Event(
-                type=event_type,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=_environment_name(registered_environment),
-                tool_name=tool_call.name,
-                payload=payload,
-            ),
-            session=session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            tool_call=tool_call,
-            result=result,
-            task_id=task_id,
-            execution_profile=execution_profile,
-            invocation_context=invocation_context,
-            redactor=redactor,
-            output_redactor=output_redactor,
-            argument_projection=argument_projection,
-            allow_modification=allow_modification,
-            deferred_terminal_stager=deferred_terminal_stager,
-            publication_snapshot=publication_snapshot,
-        ):
-            yield event
-
-    async def _run_before_tool_call_hooks(
-        self,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        tool_call: runtime_records.ToolCallRequest,
-        anchor_event: Event,
-        task_id: str | None,
-        resolution: _BeforeToolCallResolution,
-        redactor: SecretRedactor,
-        output_redactor: SecretRedactor,
-        execution_profile: ExecutionProfileIdentity | None,
-        invocation_context: InvocationContext | None = None,
-        quarantine_output: bool = False,
-    ) -> AsyncIterator[Event]:
-        if invocation_context is not None and (
-            invocation_context.binding.session_id != session.id
-            or invocation_context.registered_agent is not registered_agent
-            or invocation_context.registered_environment is not registered_environment
-            or invocation_context.profile is not execution_profile
-        ):
-            raise RuntimeError("Before-tool hooks lost frozen invocation authority.")
-        runtime_hooks = (
-            self._runtime_hooks if invocation_context is None else invocation_context.runtime_hooks
-        )
-        for hooks, scope in (
-            (runtime_hooks, "app"),
-            (registered_agent.runtime_hooks, "agent"),
-        ):
-            for registered_hook in hooks:
-                hook = registered_hook.hook
-                if not _runtime_hook_supports_phase(
-                    hook=hook,
-                    phase=RuntimeHookPhase.BEFORE_TOOL_CALL,
-                ):
-                    continue
-                hook_name = registered_hook.name
-                yield await self._event_writer.emit(
-                    _redact_event_for_invocation(
-                        _runtime_hook_event(
-                            event_type=EventType.HOOK_STARTED,
-                            hook_name=hook_name,
-                            scope=scope,
-                            phase=RuntimeHookPhase.BEFORE_TOOL_CALL,
-                            session=session,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                            terminal_event=anchor_event,
-                            execution_profile=execution_profile,
-                            payload={
-                                "tool_name": tool_call.name,
-                                "tool_call_id": tool_call.id,
-                            },
-                        ),
-                        redactor=redactor,
-                    )
-                )
-                context = BeforeToolCallHookContext(
-                    runtime=self._hook_runtime,
-                    hook_name=hook_name,
-                    phase=RuntimeHookPhase.BEFORE_TOOL_CALL,
-                    session=session,
-                    tool_name=tool_call.name,
-                    tool_call_id=tool_call.id,
-                    arguments=resolution.arguments,
-                    task_id=task_id,
-                    publication_actions_allowed=not quarantine_output,
-                    execution_profile=execution_profile,
-                )
-                hook_failure_payload: dict[str, Any] | None = None
-                try:
-                    decision = await hook.before_tool_call(context)
-                    try:
-                        stop = _resolve_before_tool_call_decision(
-                            decision,
-                            resolution,
-                            redactor=output_redactor,
-                        )
-                    finally:
-                        # Hook-owned objects can retain application secrets. Do
-                        # not carry the raw decision across durable publication.
-                        decision = None
-                except Exception as exc:
-                    hook_failure_payload = (
-                        {
-                            "error_type": "runtime_hook_failure",
-                            "actions": [],
-                            "actions_omitted": True,
-                        }
-                        if quarantine_output
-                        else {
-                            **_hook_failure_payload(
-                                exc,
-                                redactor=output_redactor,
-                            ),
-                            **_hook_actions_payload(
-                                context,
-                                redactor=output_redactor,
-                            ),
-                        }
-                    )
-                # Publish only after the raw hook exception has left the active
-                # handler so a store failure cannot inherit its traceback.
-                if hook_failure_payload is not None:
-                    yield await self._event_writer.emit(
-                        _redact_event_for_invocation(
-                            _runtime_hook_event(
-                                event_type=EventType.HOOK_FAILED,
-                                hook_name=hook_name,
-                                scope=scope,
-                                phase=RuntimeHookPhase.BEFORE_TOOL_CALL,
-                                session=session,
-                                registered_agent=registered_agent,
-                                registered_environment=registered_environment,
-                                terminal_event=anchor_event,
-                                execution_profile=execution_profile,
-                                payload={
-                                    "tool_name": tool_call.name,
-                                    "tool_call_id": tool_call.id,
-                                    **hook_failure_payload,
-                                },
-                            ),
-                            redactor=redactor,
-                        )
-                    )
-                    continue
-                yield await self._event_writer.emit(
-                    _redact_event_for_invocation(
-                        _runtime_hook_event(
-                            event_type=EventType.HOOK_COMPLETED,
-                            hook_name=hook_name,
-                            scope=scope,
-                            phase=RuntimeHookPhase.BEFORE_TOOL_CALL,
-                            session=session,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                            terminal_event=anchor_event,
-                            execution_profile=execution_profile,
-                            payload={
-                                "tool_name": tool_call.name,
-                                "tool_call_id": tool_call.id,
-                                **(
-                                    {"actions": [], "actions_omitted": True}
-                                    if quarantine_output
-                                    else _hook_actions_payload(
-                                        context,
-                                        redactor=output_redactor,
-                                    )
-                                ),
-                            },
-                        ),
-                        redactor=redactor,
-                    )
-                )
-                if stop:
-                    return
-
-    async def _prepare_size_bounded_tool_terminal(
-        self,
-        *,
-        event: Event,
-        result: ToolResult,
-        registered_tool: runtime_records.RegisteredTool,
-        session: Session,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        tool_call: runtime_records.ToolCallRequest,
-        redactor: SecretRedactor,
-    ) -> tuple[
-        Event,
-        ToolResult,
-        tool_execution.ToolExecutionOutcome | None,
-        asyncio.CancelledError | None,
-        int,
-    ]:
-        """Admit a post-effect candidate only after projection or bounded failure.
-
-        The candidate is internal and has not entered an event writer or store.
-        Neither an oversized result nor its serializer error is durable evidence.
-        """
-        try:
-            candidate = copy_event(event)
-            if self._tool_result_projection_policy is None:
-                validate_event_envelope(candidate)
-            return candidate, result, None, None, 0
-        except Exception as exc:
-            limit_error = extract_durable_value_error(exc)
-            if limit_error is None or limit_error.dimension is None:
-                raise
-        cancellation: asyncio.CancelledError | None = None
-        if self._tool_result_projection_policy is not None:
-            # Artifact projection sees only redacted output, and only the small
-            # event scaffold crosses its await. The large body remains a result,
-            # not an admitted Event payload.
-            projected_input = tool_results.redact_tool_result(result, redactor)
-            scaffold_payload = dict(event.payload)
-            scaffold_payload.pop("result", None)
-            scaffold = copy_event(event.model_copy(update={"payload": scaffold_payload}))
-            return await self._project_terminal_tool_result(
-                event=scaffold,
-                result=projected_input,
-                session=session,
-                registered_environment=registered_environment,
-                tool_call=tool_call,
-                effect=registered_tool.effect,
-                redactor=redactor,
-            )
-        assert isinstance(limit_error, DurableValueError)
-        failure = tool_execution.durable_output_limit_failure(
-            error=limit_error,
-            effect=registered_tool.effect,
-            result=result,
-            redactor=redactor,
-        )
-        failed = _bounded_tool_failure_event(event, failure)
-        return failed, failure.result, failure, cancellation, 0
-
-    async def _enforce_terminal_result_payload_limit(
-        self,
-        *,
-        event: Event,
-        result: ToolResult,
-        registered_tool: runtime_records.RegisteredTool | None,
-        redactor: SecretRedactor,
-    ) -> tuple[Event, ToolResult, bool]:
-        """Replace an oversized finalized result with bounded effect authority."""
-
-        if registered_tool is None:
-            return event, result, False
-        maximum_bytes = ToolExecutionContract.model_validate(
-            registered_tool.execution_contract
-        ).max_terminal_payload_bytes
-        if maximum_bytes is None:
-            return event, result, False
-        observed_bytes = await self._terminal_publication_governor.run_cpu(
-            _terminal_publication_work_estimate(event),
-            lambda: _durable_payload_utf8_size(result.model_dump(mode="json")),
-        )
-        if observed_bytes <= maximum_bytes:
-            return event, result, False
-
-        failure = tool_execution.terminal_payload_limit_failure(
-            effect=registered_tool.effect,
-            maximum_bytes=maximum_bytes,
-            observed_bytes=observed_bytes,
-            redactor=redactor,
-        )
-        failure_result = failure.result
-        failure_payload = dict(event.payload)
-        for field_name in tool_terminal_controls.runtime_terminal_controls(failure_payload):
-            failure_payload.pop(field_name, None)
-        failure_payload.pop("tool_result_projection", None)
-        failure_payload["result"] = failure_result.model_dump()
-        failure_payload.update(failure.terminal_payload_fields())
-        failed_event = event.model_copy(
-            update={
-                "type": EventType.TOOL_CALL_FAILED,
-                "payload": failure_payload,
-            }
-        )
-        failed_event, failure_result = _prepare_tool_result_event(
-            event=failed_event,
-            result=failure_result,
-            redactor=redactor,
-            runtime_tool=registered_tool.tool,
-        )
-        failure_bytes = _durable_payload_utf8_size(failure_result.model_dump(mode="json"))
-        if failure_bytes > maximum_bytes:
-            raise RuntimeError(
-                "Registered terminal payload limit cannot contain its bounded "
-                "contract-failure result."
-            )
-        return failed_event, failure_result, True
-
-    @timed_phase("result_processing")
-    async def emit_tool_call_result_with_hooks(
-        self,
-        *,
-        event: Event,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        tool_call: runtime_records.ToolCallRequest,
-        result: ToolResult,
-        task_id: str | None,
-        redactor: SecretRedactor | None = None,
-        output_redactor: SecretRedactor | None = None,
-        argument_projection: tool_argument_publication.ToolArgumentProjection | None = None,
-        hook_argument_projection: tool_argument_publication.ToolArgumentProjection | None = None,
-        allow_modification: bool = False,
-        publish_before_hooks: bool = False,
-        deferred_terminal_stager: DeferredTerminalStager | None = None,
-        deferred_terminal_projection_recorder: DeferredTerminalFinalizer | None = None,
-        deferred_terminal_finalizer: DeferredTerminalFinalizer | None = None,
-        terminal_event_emitter: TerminalEventEmitter | None = None,
-        hooks_already_completed: bool = False,
-        publication_snapshot: invocation_secrets.InvocationPublicationSnapshot | None = None,
-        execution_profile: ExecutionProfileIdentity | None = None,
-        invocation_context: InvocationContext | None = None,
-        executed_runtime_tool: object | None = None,
-    ) -> AsyncGenerator[tuple[Event, runtime_records.ToolCallOutcome | None], None]:
-        if invocation_context is not None and (
-            invocation_context.binding.session_id != session.id
-            or invocation_context.registered_agent is not registered_agent
-            or invocation_context.registered_environment is not registered_environment
-            or invocation_context.profile is not execution_profile
-        ):
-            raise RuntimeError("Tool-result publication lost frozen invocation authority.")
-        if publish_before_hooks and allow_modification:
-            raise ValueError("Pre-hook tool-result publication cannot allow hook modification.")
-        if hooks_already_completed and (publish_before_hooks or allow_modification):
-            raise ValueError("Completed terminal hooks cannot be scheduled again.")
-        if publish_before_hooks and "terminal_outcome" not in event.payload:
-            # A runtime-owned isolated pre-dispatch rejection has boundary
-            # controls, not a post-dispatch terminal outcome. Its evidence
-            # must also precede observational hooks without becoming mutable.
-            boundary_controls = tool_results.runtime_tool_execution_boundary_controls(event.payload)
-            if "isolated_tool_failure_code" not in boundary_controls:
-                raise ValueError("Pre-hook tool-result publication requires terminal controls.")
-        if deferred_terminal_stager is not None and publication_snapshot is None:
-            raise ValueError("Deferred terminal staging requires a publication snapshot.")
-        if deferred_terminal_projection_recorder is not None and not publish_before_hooks:
-            raise ValueError("Deferred terminal projection recording requires observational hooks.")
-
-        async def emit_terminal_event(candidate: Event) -> Event:
-            if terminal_event_emitter is not None:
-                return await terminal_event_emitter(candidate)
-            return await self._event_writer.emit(candidate)
-
-        registered_tool = registered_agent.executable_tool(tool_call.name)
-        quarantine_hook_output = (
-            registered_tool is not None and not registered_tool.publish_arguments
-        )
-        if quarantine_hook_output:
-            allow_modification = False
-        resolved_redactor = redactor if redactor is not None else self._secret_redactor
-        resolved_output_redactor = resolved_redactor if output_redactor is None else output_redactor
-        resolved_argument_projection = (
-            tool_argument_publication.unavailable_argument_projection()
-            if argument_projection is None
-            else argument_projection
-        )
-        resolved_hook_argument_projection = (
-            resolved_argument_projection
-            if hook_argument_projection is None
-            else hook_argument_projection
-        )
-        projected_tool_call = replace(
-            tool_call,
-            arguments=resolved_argument_projection.transcript_arguments(),
-            arguments_state=resolved_argument_projection.state,
-        )
-        event = _restore_targeted_tool_invocation_event_authority(
-            event,
-            tool_call,
-            redactor=resolved_redactor,
-        )
-        event_payload = dict(event.payload)
-        event_payload.update(_published_argument_presence(tool_call, registered_tool))
-        event_payload.pop(tool_argument_publication.ARGUMENTS_FIELD, None)
-        event_payload.pop(tool_argument_publication.ARGUMENTS_STATE_FIELD, None)
-        if resolved_argument_projection.state == "unavailable":
-            event_payload.pop("effective_arguments", None)
-            event_payload[tool_argument_publication.ARGUMENTS_EXACT_FIELD] = False
-        event_payload.update(resolved_argument_projection.payload_fields())
-        event = event.model_copy(update={"payload": event_payload})
-        event = _event_with_targeted_tool_invocation_authority(event, tool_call)
-        event = event_with_execution_profile_authority(event, execution_profile)
-        hook_tool_call = _project_tool_call_for_hook(
-            tool_call,
-            argument_projection=resolved_hook_argument_projection,
-            redactor=resolved_output_redactor,
-        )
-        event_identity_values = {
-            field_name: event.payload.get(field_name)
-            for field_name in ("model_step_id", "model_attempt_id", "tool_round_id")
-        }
-        if all(type(value) is str for value in event_identity_values.values()):
-            event_identity = ToolRoundIdentity.model_validate(event_identity_values)
-            event = _event_with_tool_round_authority(
-                event,
-                event_identity,
-                *(
-                    field_name
-                    for field_name in (
-                        "approval_id",
-                        "input_id",
-                        "profile_id",
-                        "exposure_fingerprint",
-                    )
-                    if field_name in event.payload
-                ),
-            )
-        boundary_controls, _boundary_references = tool_results.runtime_tool_event_boundary_controls(
-            event.payload,
-            include_terminal_controls=event.type
-            in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED},
-        )
-        projection_record = boundary_controls.get("tool_result_projection")
-        trusted_projection = (
-            type(projection_record) is dict
-            and type(projection_record.get("policy_id")) is str
-            and event_nested_payload_authority_is_runtime_generated(
-                event,
-                path=_TOOL_RESULT_PROJECTION_PROVENANCE_PATH,
-                value=projection_record["policy_id"],
-            )
-        )
-        if trusted_projection:
-            # Projection evidence and its strict artifact reference were
-            # validated as one runtime-owned unit before durable staging.
-            # Re-enter the schema-aware event boundary so a later secret scope
-            # cannot rewrite the artifact identity during terminal replay.
-            event = prepare_runtime_event(event, redactor=resolved_output_redactor)
-            stored_result = event.payload.get("result")
-            if type(stored_result) is not dict:
-                raise RuntimeError("Projected terminal lost its tool result.")
-            result = tool_results.tool_result_from_payload(stored_result)
-            if not resolved_output_redactor.has_same_registry(resolved_redactor):
-                event = prepare_runtime_event(event, redactor=resolved_redactor)
-                stored_result = event.payload.get("result")
-                if type(stored_result) is not dict:
-                    raise RuntimeError("Projected terminal lost its tool result.")
-                result = tool_results.tool_result_from_payload(stored_result)
-        else:
-            event, result = _prepare_tool_result_event(
-                event=event,
-                result=result,
-                redactor=resolved_output_redactor,
-                runtime_tool=executed_runtime_tool,
-            )
-            if not resolved_output_redactor.has_same_registry(resolved_redactor):
-                event, result = _prepare_tool_result_event(
-                    event=event,
-                    result=result,
-                    redactor=resolved_redactor,
-                )
-        event = _restore_targeted_tool_invocation_event_authority(
-            event,
-            tool_call,
-            redactor=resolved_redactor,
-        )
-        pre_staging_projection_cancellation: asyncio.CancelledError | None = None
-        pre_staging_projection_requests = 0
-        projection_policy = getattr(self, "_tool_result_projection_policy", None)
-        if (
-            deferred_terminal_stager is not None
-            and projection_policy is not None
-            and not trusted_projection
-        ):
-            runtime_hooks = (
-                self._runtime_hooks
-                if invocation_context is None
-                else invocation_context.runtime_hooks
-            )
-            has_after_tool_hooks = any(
-                _runtime_hook_supports_phase(
-                    hook=registered_hook.hook,
-                    phase=RuntimeHookPhase.AFTER_TOOL_CALL,
-                )
-                for registered_hook in (*runtime_hooks, *registered_agent.runtime_hooks)
-            )
-            # Observational hooks already run after projection. With no
-            # after-tool hooks there is likewise no modifier to preserve. In
-            # both cases externalize before the durable stage so one large
-            # completed result cannot inflate every later checkpoint copy.
-            if publish_before_hooks or not has_after_tool_hooks:
-                (
-                    event,
-                    result,
-                    projection_size_failure,
-                    pre_staging_projection_cancellation,
-                    pre_staging_projection_requests,
-                ) = await self._project_terminal_tool_result(
-                    event=event,
-                    result=result,
-                    session=session,
-                    registered_environment=registered_environment,
-                    tool_call=tool_call,
-                    effect=ToolEffect.NONE if registered_tool is None else registered_tool.effect,
-                    redactor=resolved_redactor,
-                )
-                if projection_size_failure is not None:
-                    allow_modification = False
-                    publish_before_hooks = True
-                event = _restore_targeted_tool_invocation_event_authority(
-                    event,
-                    tool_call,
-                    redactor=resolved_redactor,
-                )
-        event, result, result_limit_failed = await self._enforce_terminal_result_payload_limit(
-            event=event,
-            result=result,
-            registered_tool=registered_tool,
-            redactor=resolved_redactor,
-        )
-        if result_limit_failed:
-            allow_modification = False
-            publish_before_hooks = True
-        event = _restore_targeted_tool_invocation_event_authority(
-            event,
-            tool_call,
-            redactor=resolved_redactor,
-        )
-        if deferred_terminal_stager is not None:
-            await deferred_terminal_stager(
-                event,
-                runtime_records.ToolCallOutcome(
-                    call=projected_tool_call,
-                    result=result,
-                ),
-                allow_modification,
-                publish_before_hooks,
-                cast(
-                    "invocation_secrets.InvocationPublicationSnapshot",
-                    publication_snapshot,
-                ),
-            )
-            if pre_staging_projection_cancellation is not None:
-                _raise_restored_post_tool_cancellation(
-                    pre_staging_projection_cancellation,
-                    restore_cancellation_requests=pre_staging_projection_requests,
-                )
-            return
-        if hooks_already_completed:
-            if deferred_terminal_finalizer is not None:
-                # Recovery may conservatively suppress argument evidence even
-                # when hooks already completed. Persist that final projection
-                # before append, without invoking the hooks again.
-                event = await deferred_terminal_finalizer(event)
-                event = _restore_targeted_tool_invocation_event_authority(
-                    event, tool_call, redactor=resolved_redactor
-                )
-                stored_result = event.payload.get("result")
-                if type(stored_result) is not dict:
-                    raise RuntimeError("Finalized staged terminal lost its tool result.")
-                result = tool_results.tool_result_from_payload(stored_result)
-            tool_event = await emit_terminal_event(event)
-            yield (
-                tool_event,
-                runtime_records.ToolCallOutcome(
-                    call=projected_tool_call,
-                    result=result,
-                ),
-            )
-            return
-        if publish_before_hooks:
-            if "tool_result_projection" in event.payload:
-                projection_cancellation = None
-                projection_requests = 0
-            else:
-                (
-                    event,
-                    result,
-                    _projection_failure,
-                    projection_cancellation,
-                    projection_requests,
-                ) = await self._project_terminal_tool_result(
-                    event=event,
-                    result=result,
-                    session=session,
-                    registered_environment=registered_environment,
-                    tool_call=hook_tool_call,
-                    effect=ToolEffect.NONE if registered_tool is None else registered_tool.effect,
-                    redactor=resolved_redactor,
-                )
-            event = _restore_targeted_tool_invocation_event_authority(
-                event,
-                tool_call,
-                redactor=resolved_redactor,
-            )
-            if deferred_terminal_projection_recorder is not None:
-                event = await deferred_terminal_projection_recorder(event)
-                event = _restore_targeted_tool_invocation_event_authority(
-                    event,
-                    tool_call,
-                    redactor=resolved_redactor,
-                )
-                stored_result = event.payload.get("result")
-                if type(stored_result) is not dict:
-                    raise RuntimeError("Projected staged terminal lost its tool result.")
-                result = tool_results.tool_result_from_payload(stored_result)
-            tool_event = await emit_terminal_event(event)
-            yield (
-                tool_event,
-                runtime_records.ToolCallOutcome(
-                    call=projected_tool_call,
-                    result=result,
-                ),
-            )
-            if projection_cancellation is not None:
-                _raise_restored_post_tool_cancellation(
-                    projection_cancellation,
-                    restore_cancellation_requests=projection_requests,
-                )
-            async for hook_event, modified in self.run_tool_call_hooks(
-                session=session,
-                tool_event=tool_event,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                tool_call=hook_tool_call,
-                result=result,
-                task_id=task_id,
-                execution_profile=execution_profile,
-                invocation_context=invocation_context,
-                redactor=resolved_redactor,
-                output_redactor=resolved_output_redactor,
-                allow_modification=False,
-                quarantine_output=quarantine_hook_output,
-            ):
-                if modified is not None:
-                    raise AssertionError(
-                        "Observational after-tool hook modified terminal evidence."
-                    )
-                yield hook_event, None
-            if deferred_terminal_finalizer is not None:
-                await deferred_terminal_finalizer(event)
-            return
-        final_result = result
-        async for hook_event, modified in self.run_tool_call_hooks(
-            session=session,
-            tool_event=event,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            tool_call=hook_tool_call,
-            result=final_result,
-            task_id=task_id,
-            execution_profile=execution_profile,
-            invocation_context=invocation_context,
-            redactor=resolved_redactor,
-            output_redactor=resolved_output_redactor,
-            allow_modification=allow_modification,
-            quarantine_output=quarantine_hook_output,
-        ):
-            yield hook_event, None
-            if modified is not None:
-                final_result = modified
-        if final_result is not result:
-            payload = dict(event.payload)
-            payload["result"] = final_result.model_dump()
-            event = event.model_copy(update={"payload": payload})
-            event, final_result = _prepare_tool_result_event(
-                event=event,
-                result=final_result,
-                redactor=resolved_output_redactor,
-                restore_terminal_result_controls=False,
-            )
-            if not resolved_output_redactor.has_same_registry(resolved_redactor):
-                event, final_result = _prepare_tool_result_event(
-                    event=event,
-                    result=final_result,
-                    redactor=resolved_redactor,
-                    restore_terminal_result_controls=False,
-                )
-        if "tool_result_projection" in event.payload and final_result is result:
-            projection_cancellation = None
-            projection_requests = 0
-        else:
-            (
-                event,
-                final_result,
-                _projection_failure,
-                projection_cancellation,
-                projection_requests,
-            ) = await self._project_terminal_tool_result(
-                event=event,
-                result=final_result,
-                session=session,
-                registered_environment=registered_environment,
-                tool_call=tool_call,
-                effect=ToolEffect.NONE if registered_tool is None else registered_tool.effect,
-                redactor=resolved_redactor,
-            )
-        (
-            event,
-            final_result,
-            _result_limit_failed,
-        ) = await self._enforce_terminal_result_payload_limit(
-            event=event,
-            result=final_result,
-            registered_tool=registered_tool,
-            redactor=resolved_redactor,
-        )
-        event = _restore_targeted_tool_invocation_event_authority(
-            event,
-            tool_call,
-            redactor=resolved_redactor,
-        )
-        if deferred_terminal_finalizer is not None:
-            event = await deferred_terminal_finalizer(event)
-            event = _restore_targeted_tool_invocation_event_authority(
-                event,
-                tool_call,
-                redactor=resolved_redactor,
-            )
-            stored_result = event.payload.get("result")
-            if type(stored_result) is not dict:
-                raise RuntimeError("Finalized staged terminal lost its tool result.")
-            final_result = tool_results.tool_result_from_payload(stored_result)
-        tool_event = await emit_terminal_event(event)
-        yield (
-            tool_event,
-            runtime_records.ToolCallOutcome(
-                call=projected_tool_call,
-                result=final_result,
-            ),
-        )
-        if projection_cancellation is not None:
-            _raise_restored_post_tool_cancellation(
-                projection_cancellation,
-                restore_cancellation_requests=projection_requests,
-            )
-
-    def _retain_detached_projection(self, task: asyncio.Task[Any]) -> None:
-        self._detached_projections.add(task)
-
-        def settled(completed: asyncio.Task[Any]) -> None:
-            self._detached_projections.discard(completed)
-            _consume_projection_task_outcome(completed)
-
-        task.add_done_callback(settled)
-
     def _retain_detached_secret_resolution(self, task: asyncio.Task[Any]) -> None:
         # The resolver consumes its own outcome; this only keeps it owned.
         self._detached_secret_resolutions.add(task)
@@ -6876,410 +5930,7 @@ class ToolRoundExecutor:
     def detached_environment_work(self) -> set[asyncio.Future[Any]]:
         """Timed-out projections and abandoned secret resolutions still running."""
 
-        return {*self._detached_projections, *self._detached_secret_resolutions}
-
-    async def _project_terminal_tool_result(
-        self,
-        *,
-        event: Event,
-        result: ToolResult,
-        session: Session,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        tool_call: runtime_records.ToolCallRequest,
-        effect: ToolEffect,
-        redactor: SecretRedactor,
-    ) -> tuple[
-        Event,
-        ToolResult,
-        tool_execution.ToolExecutionOutcome | None,
-        asyncio.CancelledError | None,
-        int,
-    ]:
-        policy = self._tool_result_projection_policy
-        if policy is None:
-            try:
-                validate_event_envelope(event)
-            except Exception as exc:
-                limit_error = extract_durable_value_error(exc)
-                if limit_error is None or limit_error.dimension is None:
-                    raise
-                failure = tool_execution.durable_output_limit_failure(
-                    error=limit_error,
-                    effect=effect,
-                    result=result,
-                    redactor=redactor,
-                )
-                return _bounded_tool_failure_event(event, failure), failure.result, failure, None, 0
-            return event, result, None, None, 0
-        if event.payload.get("terminal_outcome") == "invalid_tool_output" and event.payload.get(
-            "durable_value_error_code"
-        ) in {"json_value_too_large", "too_many_json_nodes", "nesting_too_deep"}:
-            # This is the bounded runtime disposition, not another candidate
-            # for externalization. Re-running a policy here could create a
-            # second artifact after the original projection already settled.
-            return event, result, None, None, 0
-        request = ToolResultProjectionRequest(
-            result=result,
-            session_id=session.id,
-            agent_name=session.agent_name,
-            environment_name=_environment_name(registered_environment),
-            tool_call_id=tool_call.id,
-            artifact_store=_artifact_store(registered_environment),
-        )
-        settlement_observer = ArtifactWriteSettlementObserver()
-        with settlement_observer:
-            policy_task = asyncio.create_task(policy.project(request))
-        outcome = await await_shielded_task_outcome(
-            policy_task,
-            timeout_s=_TOOL_RESULT_PROJECTION_TIMEOUT_SECONDS,
-        )
-        error = outcome.error
-        if outcome.timed_out:
-            settlement_observer.record_active_candidates()
-            policy_task.cancel()
-            self._retain_detached_projection(policy_task)
-            projection = projection_failure(
-                policy=policy,
-                request=request,
-                failure_type="projection_timeout",
-                artifact_write_settlement=_last_reconciliation_candidate(
-                    settlement_observer.snapshot()
-                ),
-            )
-        elif error is not None:
-            settlement = _last_reconciliation_candidate(settlement_observer.snapshot())
-            if isinstance(error, asyncio.CancelledError):
-                error = unexpected_child_cancellation_error(
-                    error,
-                    operation="Tool-result projection policy",
-                )
-            if not isinstance(error, Exception):
-                raise error
-            projection = projection_failure(
-                policy=policy,
-                request=request,
-                failure_type=safe_projection_failure_type(
-                    error,
-                    fallback="projection_policy_failure",
-                ),
-                artifact_write_settlement=settlement,
-            )
-        elif outcome.result is None:
-            projection = projection_failure(
-                policy=policy,
-                request=request,
-                failure_type="missing_projection_result",
-                artifact_write_settlement=_last_reconciliation_candidate(
-                    settlement_observer.snapshot()
-                ),
-            )
-        else:
-            try:
-                projection = validate_tool_result_projection(
-                    outcome.result,
-                    request=request,
-                    policy=policy,
-                    observed_artifact_write_settlements=settlement_observer.snapshot(),
-                )
-            except Exception as exc:
-                projection = projection_failure(
-                    policy=policy,
-                    request=request,
-                    failure_type=safe_projection_failure_type(
-                        exc,
-                        fallback="projection_policy_failure",
-                    ),
-                    artifact_write_settlement=_last_reconciliation_candidate(
-                        settlement_observer.snapshot()
-                    ),
-                )
-        payload = dict(event.payload)
-        payload["result"] = projection.result.model_dump()
-        payload["tool_result_projection"] = projection.record.model_dump(
-            mode="json",
-            exclude_none=True,
-        )
-        projected_event = event.model_copy(update={"payload": payload})
-        # The policy receives the final redacted result. Reapplying generic
-        # redaction here would rewrite runtime-owned artifact identities when
-        # a registered secret happens to overlap an id, hash, type, or status.
-        try:
-            projected_event, projected_result = _validate_and_synchronize_tool_result_event(
-                event=projected_event,
-                result=projection.result,
-            )
-            validate_event_envelope(projected_event)
-        except Exception as exc:
-            limit_error = extract_durable_value_error(exc)
-            if limit_error is None or limit_error.dimension is None:
-                raise
-            failure = tool_execution.durable_output_limit_failure(
-                error=limit_error,
-                effect=effect,
-                result=projection.result,
-                redactor=redactor,
-                projection_evidence=projection.record.model_dump(mode="json", exclude_none=True),
-            )
-            failed_event = _bounded_tool_failure_event(event, failure)
-            return (
-                failed_event,
-                failure.result,
-                failure,
-                outcome.cancellation,
-                outcome.cancellation_requests_consumed,
-            )
-        projected_event, projected_result = web_access_results.restore_attested_tool_result(
-            projected_event,
-            original=projected_result,
-            redacted=projected_result,
-        )
-        projected_event, projected_result = shared_artifact_results.restore_attested_tool_result(
-            projected_event,
-            original=projected_result,
-            redacted=projected_result,
-        )
-        projected_event = event_with_runtime_nested_payload_authority(
-            projected_event,
-            _TOOL_RESULT_PROJECTION_PROVENANCE_PATH,
-        )
-        return (
-            projected_event,
-            projected_result,
-            None,
-            outcome.cancellation,
-            outcome.cancellation_requests_consumed,
-        )
-
-    async def run_tool_call_hooks(
-        self,
-        *,
-        session: Session,
-        tool_event: Event,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        tool_call: runtime_records.ToolCallRequest,
-        result: ToolResult,
-        task_id: str | None,
-        redactor: SecretRedactor,
-        output_redactor: SecretRedactor,
-        execution_profile: ExecutionProfileIdentity | None = None,
-        invocation_context: InvocationContext | None = None,
-        allow_modification: bool = False,
-        quarantine_output: bool = False,
-    ) -> AsyncIterator[tuple[Event, ToolResult | None]]:
-        if invocation_context is not None and (
-            invocation_context.binding.session_id != session.id
-            or invocation_context.registered_agent is not registered_agent
-            or invocation_context.registered_environment is not registered_environment
-            or invocation_context.profile is not execution_profile
-        ):
-            raise RuntimeError("After-tool hooks lost frozen invocation authority.")
-        current_result = result
-        runtime_hooks = (
-            self._runtime_hooks if invocation_context is None else invocation_context.runtime_hooks
-        )
-        for hooks, scope in (
-            (runtime_hooks, "app"),
-            (registered_agent.runtime_hooks, "agent"),
-        ):
-            async for hook_event, modified in self._run_scoped_tool_call_hooks(
-                session=session,
-                tool_event=tool_event,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                tool_call=tool_call,
-                result=current_result,
-                task_id=task_id,
-                execution_profile=execution_profile,
-                hooks=hooks,
-                scope=scope,
-                redactor=redactor,
-                output_redactor=output_redactor,
-                allow_modification=allow_modification,
-                quarantine_output=quarantine_output,
-                attested_result=result,
-            ):
-                yield hook_event, modified
-                if modified is not None:
-                    current_result = modified
-
-    async def _run_scoped_tool_call_hooks(
-        self,
-        *,
-        session: Session,
-        tool_event: Event,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        tool_call: runtime_records.ToolCallRequest,
-        result: ToolResult,
-        task_id: str | None,
-        hooks: tuple[runtime_records.RegisteredRuntimeHook, ...],
-        scope: str,
-        redactor: SecretRedactor,
-        output_redactor: SecretRedactor,
-        execution_profile: ExecutionProfileIdentity | None = None,
-        allow_modification: bool = False,
-        quarantine_output: bool = False,
-        attested_result: ToolResult | None = None,
-    ) -> AsyncIterator[tuple[Event, ToolResult | None]]:
-        current_result = result
-        for registered_hook in hooks:
-            hook = registered_hook.hook
-            if not _runtime_hook_supports_phase(
-                hook=hook,
-                phase=RuntimeHookPhase.AFTER_TOOL_CALL,
-            ):
-                continue
-            hook_name = registered_hook.name
-            yield (
-                await self._event_writer.emit(
-                    _redact_event_for_invocation(
-                        _runtime_hook_event(
-                            event_type=EventType.HOOK_STARTED,
-                            hook_name=hook_name,
-                            scope=scope,
-                            phase=RuntimeHookPhase.AFTER_TOOL_CALL,
-                            session=session,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                            terminal_event=tool_event,
-                            execution_profile=execution_profile,
-                            payload={
-                                "tool_name": tool_call.name,
-                                "tool_call_id": tool_call.id,
-                            },
-                        ),
-                        redactor=redactor,
-                    )
-                ),
-                None,
-            )
-            context = ToolCallHookContext(
-                runtime=self._hook_runtime,
-                hook_name=hook_name,
-                phase=RuntimeHookPhase.AFTER_TOOL_CALL,
-                session=session,
-                tool_event=tool_event,
-                tool_name=tool_call.name,
-                tool_call_id=tool_call.id,
-                arguments=output_redactor.redact_json(tool_call.arguments),
-                result=(
-                    current_result
-                    if _is_policy_denial_event(tool_event) and not allow_modification
-                    else _redact_tool_result_for_event(
-                        event=tool_event,
-                        result=current_result,
-                        redactor=output_redactor,
-                    )
-                ),
-                task_id=task_id,
-                publication_actions_allowed=not quarantine_output,
-                execution_profile=execution_profile,
-            )
-            hook_failure_payload: dict[str, Any] | None = None
-            try:
-                decision = await hook.after_tool_call(context)
-                try:
-                    resolved = _resolve_after_tool_call_decision(
-                        decision,
-                        redactor=output_redactor,
-                    )
-                finally:
-                    # The copied, sanitized resolution is the only hook result
-                    # permitted to cross the following durable event await.
-                    decision = None
-                modified = resolved if allow_modification else None
-            except Exception as exc:
-                hook_failure_payload = (
-                    {
-                        "error_type": "runtime_hook_failure",
-                        "actions": [],
-                        "actions_omitted": True,
-                    }
-                    if quarantine_output
-                    else {
-                        **_hook_failure_payload(
-                            exc,
-                            redactor=output_redactor,
-                        ),
-                        **_hook_actions_payload(
-                            context,
-                            redactor=output_redactor,
-                        ),
-                    }
-                )
-            # Publish only after the raw hook exception has left the active
-            # handler so a store failure cannot inherit its traceback.
-            if hook_failure_payload is not None:
-                yield (
-                    await self._event_writer.emit(
-                        _redact_event_for_invocation(
-                            _runtime_hook_event(
-                                event_type=EventType.HOOK_FAILED,
-                                hook_name=hook_name,
-                                scope=scope,
-                                phase=RuntimeHookPhase.AFTER_TOOL_CALL,
-                                session=session,
-                                registered_agent=registered_agent,
-                                registered_environment=registered_environment,
-                                terminal_event=tool_event,
-                                execution_profile=execution_profile,
-                                payload={
-                                    "tool_name": tool_call.name,
-                                    "tool_call_id": tool_call.id,
-                                    **hook_failure_payload,
-                                },
-                            ),
-                            redactor=redactor,
-                        )
-                    ),
-                    None,
-                )
-                continue
-            if modified is not None:
-                if attested_result is not None:
-                    modified = web_access_results.preserve_attested_controls_across_hook(
-                        tool_event,
-                        original=attested_result,
-                        replacement=modified,
-                    )
-                    modified = shared_artifact_results.preserve_attested_controls_across_hook(
-                        tool_event,
-                        original=attested_result,
-                        replacement=modified,
-                    )
-                current_result = modified
-            yield (
-                await self._event_writer.emit(
-                    _redact_event_for_invocation(
-                        _runtime_hook_event(
-                            event_type=EventType.HOOK_COMPLETED,
-                            hook_name=hook_name,
-                            scope=scope,
-                            phase=RuntimeHookPhase.AFTER_TOOL_CALL,
-                            session=session,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                            terminal_event=tool_event,
-                            execution_profile=execution_profile,
-                            payload={
-                                "tool_name": tool_call.name,
-                                "tool_call_id": tool_call.id,
-                                **(
-                                    {"actions": [], "actions_omitted": True}
-                                    if quarantine_output
-                                    else _hook_actions_payload(
-                                        context,
-                                        redactor=output_redactor,
-                                    )
-                                ),
-                            },
-                        ),
-                        redactor=redactor,
-                    )
-                ),
-                modified,
-            )
+        return self.terminals.detached_environment_work() | self._detached_secret_resolutions
 
 
 class ToolRoundRun:
@@ -7623,18 +6274,18 @@ class ToolRoundRun:
                 else executor._secret_redactor
             ),
             tool_exposure=tool_exposure,
-            publication_governor=executor._terminal_publication_governor,
+            publication_governor=executor.terminals.governor,
             clock=executor._clock,
-            emit_result=executor.emit_tool_call_result_with_hooks,
-            emit_terminal=executor._emit_staged_terminal_fairly,
+            emit_result=executor.terminals.publish_result,
+            emit_terminal=executor.terminals.emit_staged,
             defer_terminals=defer_round_terminals,
             terminal_payload_limits=(
                 await _tool_terminal_payload_limits(
                     self._registered_agent,
                     tool_calls,
-                    publication_governor=executor._terminal_publication_governor,
+                    publication_governor=executor.terminals.governor,
                     runtime_hooks=(
-                        executor._runtime_hooks
+                        executor.hooks.registrations
                         if self._invocation_context is None
                         else self._invocation_context.runtime_hooks
                     ),
@@ -8787,23 +7438,6 @@ def _copy_agent_spec(spec: AgentSpec) -> AgentSpec:
     )
 
 
-def _environment_name(
-    registered_environment: runtime_records.RegisteredEnvironment | None,
-) -> str | None:
-    return None if registered_environment is None else registered_environment.spec.name
-
-
-def _workspace_id(
-    registered_environment: runtime_records.RegisteredEnvironment | None,
-) -> str | None:
-    if registered_environment is None or registered_environment.environment.workspace is None:
-        return None
-    workspace_id = getattr(registered_environment.environment.workspace, "id", None)
-    if workspace_id is None:
-        return None
-    return require_clean_nonblank(workspace_id, "workspace.id")
-
-
 def _workspace_binding_generation_id(
     registered_environment: runtime_records.RegisteredEnvironment,
 ) -> str:
@@ -9025,123 +7659,6 @@ async def _observe_workspace_revision(
             detail_code="revision_observer_failed",
         )
     return validated.model_copy(update={"identity": durable_identity})
-
-
-def _contains_process_signal(error: BaseException | None) -> bool:
-    if error is None:
-        return False
-    return any(
-        isinstance(candidate, (GeneratorExit, KeyboardInterrupt, SystemExit))
-        for candidate in iter_exception_tree(error)
-    )
-
-
-_PostToolResultT = TypeVar("_PostToolResultT")
-
-
-def _raise_preserved_post_tool_cancellation(
-    cancellation: asyncio.CancelledError | None,
-    failure: BaseException,
-    *,
-    restore_cancellation_requests: int,
-) -> Never:
-    """Keep an earlier caller cancellation authoritative over terminalization failure."""
-
-    if cancellation is None or type(failure) is GeneratorExit or _contains_process_signal(failure):
-        raise failure
-    # Terminalization crosses stores, hooks, projections, and other extension
-    # seams. Preserve the fact of the secondary failure without retaining its
-    # potentially workload-derived message, traceback, or mutable state on the
-    # public cancellation object.
-    safe_failure = RuntimeError("Tool terminalization failed after caller cancellation.")
-    del failure
-    prior_cause = exception_cause(cancellation)
-    if prior_cause is None:
-        cause: BaseException = safe_failure
-    else:
-        cause = BaseExceptionGroup(
-            "Post-tool cancellation and terminalization failures.",
-            [prior_cause, safe_failure],
-        )
-    attach_runner_cancellation_failure(cancellation, cause)
-    set_exception_cause(cancellation, cause)
-    _raise_restored_post_tool_cancellation(
-        cancellation,
-        restore_cancellation_requests=restore_cancellation_requests,
-        cause=cause,
-    )
-
-
-async def _receive_restored_post_tool_cancellation() -> None:
-    """Observe restored control before publishing the durable tool outcome."""
-
-    current_task = asyncio.current_task()
-    if current_task is None or not current_task.cancelling():
-        return
-    # Observation and tool helpers restore requests before raising their owned
-    # cancellation. On Python 3.11/3.12, uncancel() cannot rescind the queued
-    # injection. Receive it before another publication await, while retaining
-    # the original exception, its evidence, and every task cancellation count.
-    with suppress(asyncio.CancelledError):
-        await asyncio.sleep(0)
-
-
-def _raise_restored_post_tool_cancellation(
-    cancellation: asyncio.CancelledError,
-    *,
-    restore_cancellation_requests: int,
-    cause: BaseException | None = None,
-) -> Never:
-    """Redeliver owned cancellation without erasing Task.cancelling() evidence."""
-
-    current_task = asyncio.current_task()
-    if current_task is not None:
-        for _request in range(restore_cancellation_requests):
-            current_task.cancel()
-    raise cancellation from cause
-
-
-async def _await_post_tool_operation(
-    operation: Awaitable[_PostToolResultT],
-    *,
-    cancellation: asyncio.CancelledError | None,
-    restore_cancellation_requests: int,
-) -> _PostToolResultT:
-    """Await terminalization without allowing it to replace owned cancellation."""
-
-    if cancellation is None:
-        return await operation
-    try:
-        return await operation
-    except BaseException as failure:
-        _raise_preserved_post_tool_cancellation(
-            cancellation,
-            failure,
-            restore_cancellation_requests=restore_cancellation_requests,
-        )
-
-
-async def _iterate_post_tool_events(
-    events: AsyncIterator[_PostToolResultT],
-    *,
-    cancellation: asyncio.CancelledError | None,
-    restore_cancellation_requests: int,
-) -> AsyncIterator[_PostToolResultT]:
-    """Iterate terminalization events under the same cancellation authority."""
-
-    if cancellation is None:
-        async for event in events:
-            yield event
-        return
-    try:
-        async for event in events:
-            yield event
-    except BaseException as failure:
-        _raise_preserved_post_tool_cancellation(
-            cancellation,
-            failure,
-            restore_cancellation_requests=restore_cancellation_requests,
-        )
 
 
 def _bounded_workspace_observation_copy(
@@ -10111,79 +8628,6 @@ async def _workspace_evidence_projection(
     )
 
 
-def _workspace(registered_environment: runtime_records.RegisteredEnvironment | None) -> Any:
-    if registered_environment is None:
-        return None
-    return registered_environment.environment.workspace
-
-
-def _artifact_store_id(
-    registered_environment: runtime_records.RegisteredEnvironment | None,
-) -> str | None:
-    if registered_environment is None or registered_environment.environment.artifact_store is None:
-        return None
-    artifact_store_id = getattr(registered_environment.environment.artifact_store, "id", None)
-    if artifact_store_id is None:
-        return None
-    artifact_store_id = require_clean_nonblank(artifact_store_id, "artifact_store.id")
-    return require_unicode_scalar_text(artifact_store_id, "artifact_store.id")
-
-
-def _artifact_store(registered_environment: runtime_records.RegisteredEnvironment | None) -> Any:
-    if registered_environment is None:
-        return None
-    return registered_environment.environment.artifact_store
-
-
-def _workspace_receipt_artifact_store(
-    registered_environment: runtime_records.RegisteredEnvironment | None,
-) -> tuple[Any, str]:
-    """Exclude local stores whose receipt writes would mutate the observed workspace."""
-
-    artifact_store = _artifact_store(registered_environment)
-    workspace = _workspace(registered_environment)
-    if registered_environment is not None and registered_environment.bound_workspace is not None:
-        workspace = registered_environment.bound_workspace.workspace
-    if isinstance(artifact_store, LocalArtifactStore) and isinstance(workspace, LocalWorkspace):
-        try:
-            artifact_store.root.relative_to(workspace.root)
-        except ValueError:
-            pass
-        else:
-            return None, "manifest_artifact_store_inside_workspace"
-    return artifact_store, "manifest_artifact_store_unavailable"
-
-
-def _runner(registered_environment: runtime_records.RegisteredEnvironment | None) -> Any:
-    if registered_environment is None:
-        return None
-    return registered_environment.environment.runner
-
-
-def _knowledge_store(
-    registered_environment: runtime_records.RegisteredEnvironment | None,
-) -> Any:
-    if registered_environment is None:
-        return None
-    return registered_environment.environment.knowledge_store
-
-
-def _knowledge_access_scope(
-    registered_environment: runtime_records.RegisteredEnvironment | None,
-) -> Any:
-    if registered_environment is None:
-        return None
-    return registered_environment.environment.knowledge_access_scope
-
-
-def _mcp_servers(
-    registered_environment: runtime_records.RegisteredEnvironment | None,
-) -> tuple[Any, ...]:
-    if registered_environment is None:
-        return ()
-    return registered_environment.environment.mcp_servers
-
-
 def _registered_mcp_tool_authority_is_unavailable(
     registered_tool: runtime_records.RegisteredTool | None,
 ) -> bool:
@@ -10763,205 +9207,6 @@ def _taint_labels_for_source_tool(
     return set(taint_policy.labels_for_source_tool(tool_name))
 
 
-@dataclass
-class _BeforeToolCallResolution:
-    arguments: dict[str, Any]
-    short_circuit_result: ToolResult | None = None
-    block_reason: str | None = None
-
-
-def _private_argument_short_circuit_result(result: ToolResult) -> ToolResult:
-    """Project one hook-controlled result without argument-derived content."""
-
-    return ToolResult(
-        content="Tool execution was short-circuited by a before_tool_call hook.",
-        structured={"outcome": "short_circuited"},
-        is_error=result.is_error,
-    )
-
-
-def _resolve_before_tool_call_decision(
-    decision: BeforeToolCallDecision | None,
-    resolution: _BeforeToolCallResolution,
-    *,
-    redactor: SecretRedactor,
-) -> bool:
-    if decision is None:
-        return False
-    if type(decision) is not BeforeToolCallDecision:
-        raise TypeError("before_tool_call must return a BeforeToolCallDecision or None.")
-    if decision.action == "proceed":
-        return False
-    if decision.action == "proceed_modified":
-        modified_arguments = decision.modified_arguments
-        if modified_arguments is None:
-            raise TypeError("A proceed_modified decision must carry modified_arguments.")
-        copied_arguments = copy_durable_json_value(
-            modified_arguments,
-            "modified_arguments",
-        )
-        if type(copied_arguments) is not dict:
-            raise TypeError("A proceed_modified decision must carry object arguments.")
-        resolution.arguments = copied_arguments
-        return False
-    if decision.action == "short_circuit":
-        synthetic = decision.synthetic_result
-        if synthetic is None:
-            raise TypeError("A short_circuit decision must carry a synthetic_result.")
-        resolution.short_circuit_result = _prepare_hook_authored_tool_result(
-            synthetic,
-            redactor=redactor,
-        )
-        return True
-    if decision.action != "block":
-        raise ValueError("Unsupported before_tool_call decision action.")
-    reason = decision.block_reason
-    if reason is None:
-        raise TypeError("A block decision must carry a block_reason.")
-    resolution.block_reason = require_durable_text(reason, "block_reason")
-    return True
-
-
-def _resolve_after_tool_call_decision(
-    decision: AfterToolCallDecision | None,
-    *,
-    redactor: SecretRedactor,
-) -> ToolResult | None:
-    if decision is None:
-        return None
-    if type(decision) is not AfterToolCallDecision:
-        raise TypeError("after_tool_call must return an AfterToolCallDecision or None.")
-    if decision.action == "modify":
-        modified = decision.modified_result
-        if modified is None:
-            raise TypeError("An after_tool_call modify decision must carry a modified_result.")
-        return _prepare_hook_authored_tool_result(modified, redactor=redactor)
-    if decision.action == "pass_through":
-        if decision.modified_result is not None:
-            raise TypeError("A pass_through decision must not carry a modified_result.")
-        return None
-    raise ValueError("Unsupported after_tool_call decision action.")
-
-
-def _prepare_hook_authored_tool_result(
-    result: ToolResult,
-    *,
-    redactor: SecretRedactor,
-) -> ToolResult:
-    """Detach untrusted hook output before the next runtime-owned await."""
-
-    validated = tool_results.normalize_tool_result(tool_results.validate_tool_result(result))
-    sanitized = ToolResult(
-        content=validated.content,
-        structured=tool_results.strip_untrusted_runtime_tool_result_control_authority(
-            validated.structured
-        ),
-        artifacts=tool_results.strip_runtime_tool_result_projection_authority(validated.artifacts),
-        is_error=validated.is_error,
-    )
-    return tool_results.redact_tool_result(sanitized, redactor)
-
-
-def _runtime_hook_event(
-    *,
-    event_type: EventType,
-    hook_name: str,
-    scope: str,
-    phase: RuntimeHookPhase,
-    session: Session,
-    registered_agent: runtime_records.RegisteredAgentState,
-    registered_environment: runtime_records.RegisteredEnvironment | None,
-    terminal_event: Event,
-    payload: dict[str, Any],
-    execution_profile: ExecutionProfileIdentity | None = None,
-) -> Event:
-    event = _build_runtime_hook_event(
-        event_type=event_type,
-        hook_name=hook_name,
-        scope=scope,
-        phase=phase,
-        session=session,
-        terminal_event=terminal_event,
-        agent_name=registered_agent.spec.name,
-        environment_name=_environment_name(registered_environment),
-        payload=payload,
-    )
-    # Tool hooks belong to their tool event's interaction. A result event can
-    # still be unpublished here, so fall back to the active tool-round owner.
-    # Keep this scoped: terminal hooks use deterministic replay identities and
-    # must preserve the terminal event's explicit attribution instead.
-    interaction_id = terminal_event.interaction_id
-    if interaction_id is None:
-        interaction_id = resolve_interaction_attribution(session.id, INHERIT_INTERACTION)
-    if interaction_id is not None:
-        event = event_with_runtime_envelope_authority(
-            event.model_copy(update={"interaction_id": interaction_id}),
-            "interaction_id",
-        )
-    return event_with_execution_profile_authority(
-        event,
-        execution_profile,
-    )
-
-
-def _redact_event_for_invocation(
-    event: Event,
-    *,
-    redactor: SecretRedactor,
-) -> Event:
-    """Scrub adapter/invocation secrets before the app-level writer sees them."""
-
-    return prepare_runtime_event(event, redactor=redactor)
-
-
-def _project_tool_call_for_hook(
-    tool_call: runtime_records.ToolCallRequest,
-    *,
-    argument_projection: tool_argument_publication.ToolArgumentProjection,
-    redactor: SecretRedactor,
-) -> runtime_records.ToolCallRequest:
-    """Expose effective arguments only after the invocation scope is complete."""
-
-    if argument_projection.state == "unavailable":
-        arguments: dict[str, Any] = {}
-    else:
-        projected = redactor.redact_json(argument_projection.transcript_arguments())
-        if type(projected) is not dict:
-            raise AssertionError("Hook argument projection returned a non-object.")
-        arguments = projected
-    return replace(tool_call, arguments=arguments)
-
-
-def _hook_failure_payload(
-    exc: Exception,
-    *,
-    redactor: SecretRedactor,
-) -> dict[str, Any]:
-    diagnostic = tool_results.exception_diagnostic(
-        exc,
-        empty_message="runtime hook failed",
-        nonportable_message="Runtime hook failed with a non-portable diagnostic.",
-        redactor=redactor,
-    )
-    return copy_durable_json_object(diagnostic.payload_fields(), "hook_failure")
-
-
-def _hook_actions_payload(
-    context: BeforeToolCallHookContext | ToolCallHookContext,
-    *,
-    redactor: SecretRedactor,
-) -> dict[str, Any]:
-    try:
-        actions = copy_durable_json_value(context.actions, "hook_actions")
-        actions = redactor.redact_json(actions)
-        actions = copy_durable_json_value(actions, "hook_actions")
-    except Exception:
-        return {"actions": [], "actions_omitted": True}
-    if type(actions) is not list:
-        return {"actions": [], "actions_omitted": True}
-    return {"actions": actions}
-
-
 def policy_denial_payload_fields(
     *,
     tool_name: str,
@@ -10988,10 +9233,3 @@ def _registered_tool_argument_error(registered_tool, arguments):
         # selector/process denial codes and their repair instructions.
         return None
     return tool_argument_validation_error(arguments, registered_tool.schema)
-
-
-def _published_argument_presence(tool_call, registered_tool):
-    return tool_argument_publication.publish_argument_presence(
-        tool_call.argument_presence,
-        None if registered_tool is None else registered_tool.schema,
-    )

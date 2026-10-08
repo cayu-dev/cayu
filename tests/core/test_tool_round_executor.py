@@ -38,12 +38,8 @@ from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
 from cayu.runtime._run_limits import RunLimitGate
 from cayu.runtime._session_control import SessionInterruptedByRequest
 from cayu.runtime._tool_effect_state import ToolEffectReconciliationRequired, ToolEffectStateOwner
-from cayu.runtime._tool_round_executor import (
-    ToolRoundExecutor,
-    ToolRoundRun,
-    _copy_agent_spec,
-    _restore_targeted_tool_invocation_event_authority,
-)
+from cayu.runtime._tool_invocation.context import _restore_targeted_tool_invocation_event_authority
+from cayu.runtime._tool_round_executor import ToolRoundRun, _copy_agent_spec
 from cayu.runtime._tool_round_recovery import checkpoint_with_pending_tool_round
 from cayu.runtime._tool_round_staging import (
     _durable_payload_utf8_size,
@@ -251,14 +247,16 @@ async def _stage_targeted_terminal_from_publication_entrance(
     terminal: Event,
     tool_call: runtime_records.ToolCallRequest,
 ) -> list[Event]:
-    executor = object.__new__(ToolRoundExecutor)
-    executor._secret_redactor = SecretRedactor()
+    from cayu.runtime._tool_invocation.terminal import ToolTerminalPublisher
+
+    terminal_publisher = object.__new__(ToolTerminalPublisher)
+    terminal_publisher._secret_redactor = SecretRedactor()
     staged: list[Event] = []
 
     async def stage(event: Event, *_args: object) -> None:
         staged.append(event)
 
-    async for _ in executor.emit_tool_call_result_with_hooks(
+    async for _ in terminal_publisher.publish_result(
         event=terminal,
         session=SimpleNamespace(id=terminal.session_id),
         registered_agent=_NoExecutableToolAgent(),

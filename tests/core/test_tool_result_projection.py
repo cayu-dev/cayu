@@ -2881,10 +2881,10 @@ def test_projection_timeout_allows_interrupt_to_finish_without_store_release(
     tmp_path,
     monkeypatch,
 ) -> None:
-    from cayu.runtime import _tool_round_executor
+    from cayu.runtime._tool_invocation import terminal as invocation_terminal
 
     monkeypatch.setattr(
-        _tool_round_executor,
+        invocation_terminal,
         "_TOOL_RESULT_PROJECTION_TIMEOUT_SECONDS",
         0.01,
     )
@@ -2964,10 +2964,10 @@ def test_projection_timeout_records_active_local_write_without_artifact_authorit
     tmp_path,
     monkeypatch,
 ) -> None:
-    from cayu.runtime import _tool_round_executor
+    from cayu.runtime._tool_invocation import terminal as invocation_terminal
 
     monkeypatch.setattr(
-        _tool_round_executor,
+        invocation_terminal,
         "_TOOL_RESULT_PROJECTION_TIMEOUT_SECONDS",
         0.01,
     )
@@ -3080,10 +3080,10 @@ def test_late_projection_completion_is_an_identifiable_publication_orphan(
     tmp_path,
     monkeypatch,
 ) -> None:
-    from cayu.runtime import _tool_round_executor
+    from cayu.runtime._tool_invocation import terminal as invocation_terminal
 
     monkeypatch.setattr(
-        _tool_round_executor,
+        invocation_terminal,
         "_TOOL_RESULT_PROJECTION_TIMEOUT_SECONDS",
         0.01,
     )

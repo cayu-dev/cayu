@@ -353,6 +353,13 @@ It does not prepare the final publication request or manage individual stage
 leases. Closing the ordinary publication stream closes its active terminal hook
 stream before returning.
 
+Tool hook phases and terminal publication are independently usable components in
+`runtime/_tool_invocation/`. `ToolInvocationHooks` owns before/after hook execution
+and safe hook evidence. `ToolTerminalPublisher` owns result limits, projection,
+deferred staging and terminal delivery, sharing one publication governor with
+the durable round. Live execution and recovered continuations use the same
+components; detached projection work remains visible to environment cleanup.
+
 `SessionEngine` also delegates ordinary round closure after a run limit to this
 owner. It retains completed effects, publishes skipped results for unstarted
 calls, and commits the round using the same publication operation. A repeated

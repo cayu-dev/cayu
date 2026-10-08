@@ -5204,7 +5204,7 @@ class CayuApp:
     def tool_terminal_publication_status(self) -> ToolTerminalPublicationMetricsSnapshot:
         """Return content-free staged-terminal backlog and fairness measurements."""
 
-        return self._tool_round_executor.terminal_publication_metrics()
+        return self._tool_round_executor.terminals.metrics()
 
     async def drain_recovery_cleanups(self, *, timeout_s: float = 10.0) -> bool:
         """Wait boundedly for recovery cleanup, stopped execution-presence writes,

@@ -20,7 +20,7 @@ from cayu.runtime._tool_effect_state import (
     ToolEffectStateOwner,
     ToolEffectTerminal,
 )
-from cayu.runtime._tool_round_executor import (
+from cayu.runtime._tool_invocation.context import (
     _event_with_targeted_tool_invocation_authority,
     _targeted_tool_invocation_payload,
 )

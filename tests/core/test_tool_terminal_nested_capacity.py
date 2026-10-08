@@ -76,7 +76,7 @@ def test_inline_child_capacity_uses_durable_family_without_releasing_parent(
         )
         app = CayuApp(session_store=store, enable_logging=False)
         governor = ToolTerminalPublicationGovernor(staged_capacity_bytes=256_000)
-        app._tool_round_executor._terminal_publication_governor = governor
+        app._tool_round_executor.terminals.governor = governor
         delegate = SubagentTool(app, agents={"child": SubagentSpec(agent_name="child")})
         if mode == "capacity-rejected" or mode.startswith("bounded-family"):
             delegate.spec = delegate.spec.model_copy(update={"max_terminal_payload_bytes": 100_000})
@@ -261,7 +261,7 @@ def test_queued_siblings_share_exclusive_aggregate_while_parent_waits(tmp_path, 
             session_store=store, task_store=tasks, dispatcher=dispatcher, enable_logging=False
         )
         governor = ToolTerminalPublicationGovernor(staged_capacity_bytes=256_000)
-        app._tool_round_executor._terminal_publication_governor = governor
+        app._tool_round_executor.terminals.governor = governor
         result = WaitingResult(store, task_store=tasks, execution_profile_identity=profile)
         result.spec = result.spec.model_copy(update={"max_terminal_payload_bytes": 100_000})
         delegate = SubagentTool(
