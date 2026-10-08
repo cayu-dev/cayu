@@ -787,7 +787,10 @@ validation, migration execution and receipts. PostgreSQL adapters inherit that o
 directly; CLI schema commands use its readers and preflights. JSON record helpers
 remain in `storage/_postgres_support.py`.
 `storage/event_watchers_postgres.py` owns watcher claims, lease renewal, settlement
-replay and dead letters. Public imports resolve to that same concrete class.
+replay and dead letters. `storage/budget_postgres.py` owns budget reservations,
+binding inventory and settlement receipts. Both adapters use the shared base without
+loading the session, task or knowledge adapters. Existing public store imports
+resolve to the same concrete classes as the canonical modules.
 
 Files are good source-of-truth for prompts, instructions, workflows, manuals, skills, and human-reviewed memories.
 

@@ -944,8 +944,8 @@ async def test_public_question_uses_real_assistant_export(
 
                     ledger = SQLiteBudgetLedger(tmp_path / "clarification-budget.sqlite")
                 else:
+                    from cayu.storage.budget_postgres import PostgresBudgetLedger
                     from cayu.storage.migrations import SchemaMode
-                    from cayu.storage.postgres import PostgresBudgetLedger
 
                     ledger = PostgresBudgetLedger(
                         request.getfixturevalue("postgres_dsn"), schema_mode=SchemaMode.CREATE

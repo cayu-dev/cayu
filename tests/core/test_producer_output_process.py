@@ -19,7 +19,8 @@ async def test_completed_producer_accounting_reopens_without_new_authority(
     from cayu.collaboration._producer_contracts import ProducerOutputRegistration
     from cayu.runtime._producer_budget import ProducerBudgetSettlement
     from cayu.storage.budget_ledger import SQLiteBudgetLedger
-    from cayu.storage.postgres import PostgresBudgetLedger, PostgresSessionStore
+    from cayu.storage.budget_postgres import PostgresBudgetLedger
+    from cayu.storage.postgres import PostgresSessionStore
     from cayu.storage.sqlite import SQLiteSessionStore
 
     address = (
@@ -158,8 +159,9 @@ async def test_sigkill_after_native_production_recovers_exact_output(
     from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
     from cayu.sessions.base import SessionRunFenced
     from cayu.storage.budget_ledger import SQLiteBudgetLedger
+    from cayu.storage.budget_postgres import PostgresBudgetLedger
     from cayu.storage.migrations import SchemaMode
-    from cayu.storage.postgres import PostgresBudgetLedger, PostgresSessionStore
+    from cayu.storage.postgres import PostgresSessionStore
     from cayu.storage.sqlite import SQLiteSessionStore
 
     if backend == "sqlite":

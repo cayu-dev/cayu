@@ -27,8 +27,9 @@ from cayu.providers.gateway import HttpxGatewayTransport
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.sessions import InMemorySessionStore
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
+from cayu.storage.budget_postgres import PostgresBudgetLedger
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresBudgetLedger, PostgresSessionStore
+from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

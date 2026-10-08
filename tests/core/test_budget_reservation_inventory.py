@@ -9,8 +9,8 @@ from tests.core.test_budget_binding import _limit
 
 from cayu.budgets.base import BudgetBindingRegistrationConflict, InMemoryBudgetLedger
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
+from cayu.storage.budget_postgres import PostgresBudgetLedger
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresBudgetLedger
 
 
 @pytest.mark.parametrize(

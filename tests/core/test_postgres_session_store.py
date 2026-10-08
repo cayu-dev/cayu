@@ -529,8 +529,8 @@ def test_postgres_terminal_session_fails_closed_with_active_provider_operation(
 
 def test_postgres_budgeted_offline_provider_operation_recovery(postgres_dsn: str) -> None:
     async def ops(store) -> None:
+        from cayu.storage.budget_postgres import PostgresBudgetLedger
         from cayu.storage.migrations import SchemaMode
-        from cayu.storage.postgres import PostgresBudgetLedger
 
         ledger = PostgresBudgetLedger(
             postgres_dsn,

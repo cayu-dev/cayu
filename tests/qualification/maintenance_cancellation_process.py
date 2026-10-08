@@ -96,7 +96,7 @@ async def run(root, action, old_pid):
             ]
         )
         if dsn:
-            from cayu.storage.postgres import PostgresBudgetLedger
+            from cayu.storage.budget_postgres import PostgresBudgetLedger
 
             ledger = PostgresBudgetLedger(dsn)
         else:

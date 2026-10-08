@@ -14,8 +14,9 @@ import pytest
 from cayu.budgets.base import BudgetLedger, InMemoryBudgetLedger
 from cayu.sessions.base import InMemorySessionStore, SessionStore
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
+from cayu.storage.budget_postgres import PostgresBudgetLedger
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresBudgetLedger, PostgresSessionStore, PostgresTaskStore
+from cayu.storage.postgres import PostgresSessionStore, PostgresTaskStore
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.store import TaskStore

@@ -221,6 +221,7 @@ from cayu.knowledge.search import KnowledgeQuery as KnowledgeQuery
 from cayu.knowledge.search import KnowledgeSearchMode as KnowledgeSearchMode
 from cayu.knowledge.search import KnowledgeSearchResult as KnowledgeSearchResult
 from cayu.storage.budget_ledger import SQLiteBudgetLedger as SQLiteBudgetLedger
+from cayu.storage.budget_postgres import PostgresBudgetLedger as PostgresBudgetLedger
 from cayu.storage.evals_postgres import PostgresEvalStore as PostgresEvalStore
 from cayu.storage.evals_sqlite import SQLiteEvalStore as SQLiteEvalStore
 from cayu.storage.evals_sqlite import (
@@ -267,7 +268,6 @@ from cayu.storage.knowledge_transition import (
     require_empty_knowledge_revision_transition as require_empty_knowledge_revision_transition,
 )
 from cayu.storage.postgres import PostgresAgentWorkContextStore as PostgresAgentWorkContextStore
-from cayu.storage.postgres import PostgresBudgetLedger as PostgresBudgetLedger
 from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore as PostgresEmbeddingKnowledgeStore
 from cayu.storage.postgres import PostgresKnowledgeStore as PostgresKnowledgeStore
 from cayu.storage.postgres import PostgresSessionStore as PostgresSessionStore

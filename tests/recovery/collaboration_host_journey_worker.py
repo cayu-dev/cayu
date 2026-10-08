@@ -40,10 +40,11 @@ from cayu.runtime._host_continuation_discovery import ContinuationRecovery
 from cayu.runtime._session_continuation_owner import SessionContinuationOwner
 from cayu.sessions import ResumeRequest, SessionStatus
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
+from cayu.storage.budget_postgres import PostgresBudgetLedger
 from cayu.storage.collaboration_postgres import PostgresCollaborationStore
 from cayu.storage.collaboration_sqlite import SQLiteCollaborationStore
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresBudgetLedger, PostgresSessionStore
+from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

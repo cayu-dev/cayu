@@ -34,8 +34,8 @@ def authorize_execution(resolver):
 async def refusal_ledger(native_stores, tmp_path):
     from cayu.budgets.base import InMemoryBudgetLedger
     from cayu.storage.budget_ledger import SQLiteBudgetLedger
+    from cayu.storage.budget_postgres import PostgresBudgetLedger
     from cayu.storage.migrations import SchemaMode
-    from cayu.storage.postgres import PostgresBudgetLedger
 
     backend, address = native_stores[3]
     if backend == "memory":

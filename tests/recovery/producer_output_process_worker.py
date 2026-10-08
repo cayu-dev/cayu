@@ -11,10 +11,11 @@ from tests.core.test_producer_output_contracts import output_scenario
 
 from cayu.providers.base import ModelStreamEvent
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
+from cayu.storage.budget_postgres import PostgresBudgetLedger
 from cayu.storage.collaboration_postgres import PostgresCollaborationStore
 from cayu.storage.collaboration_sqlite import SQLiteCollaborationStore
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresBudgetLedger, PostgresSessionStore
+from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

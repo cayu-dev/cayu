@@ -25,8 +25,9 @@ from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.sessions import RunRequest
 from cayu.sessions.outcomes import run_to_completion
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
+from cayu.storage.budget_postgres import PostgresBudgetLedger
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresBudgetLedger, PostgresSessionStore
+from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.inference import AuxiliaryInferencePolicy, InferenceLimits

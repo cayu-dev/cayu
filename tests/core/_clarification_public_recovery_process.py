@@ -82,7 +82,7 @@ async def recover(value):
                     Path(value["source_path"]).with_name("clarification-budget.sqlite")
                 )
             else:
-                from cayu.storage.postgres import PostgresBudgetLedger
+                from cayu.storage.budget_postgres import PostgresBudgetLedger
 
                 ledger = PostgresBudgetLedger(value["dsn"])
             try:

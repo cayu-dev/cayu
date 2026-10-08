@@ -45232,5 +45232,11 @@
     "tests/core/test_postgres_base_ownership.py::test_postgres_subclass_import_does_not_load_monolithic_stores[product_operations_postgres-PostgresProductOperationStore]": 3.1830034590384457,
     "tests/core/test_postgres_base_ownership.py::test_shared_postgres_base_preserves_borrowed_pool_and_lazy_schema_lock": 1.2486618749971967,
     "tests/core/test_postgres_base_ownership.py::test_postgres_subclass_import_does_not_load_monolithic_stores[event_watchers_postgres-PostgresEventWatcherStore]": 0.8222926669986919,
-    "tests/core/test_postgres_store_ownership.py::test_postgres_owner_preserves_public_imports_and_pickled_class[event_watchers_postgres-PostgresEventWatcherStore]": 0.00042687501991167665
+    "tests/core/test_postgres_store_ownership.py::test_postgres_owner_preserves_public_imports_and_pickled_class[event_watchers_postgres-PostgresEventWatcherStore]": 0.00042687501991167665,
+    "tests/core/test_postgres_base_ownership.py::test_postgres_subclass_import_does_not_load_monolithic_stores[budget_postgres-PostgresBudgetLedger]": 0.8176015830249526,
+    "tests/core/test_postgres_store_ownership.py::test_postgres_owner_preserves_optional_dependency_error[_postgres_base]": 0.8486652490100823,
+    "tests/core/test_postgres_store_ownership.py::test_postgres_owner_preserves_optional_dependency_error[budget_postgres]": 0.1162549169966951,
+    "tests/core/test_postgres_store_ownership.py::test_postgres_owner_preserves_optional_dependency_error[event_watchers_postgres]": 0.855881416995544,
+    "tests/core/test_postgres_store_ownership.py::test_postgres_owner_preserves_optional_dependency_error[postgres]": 0.7734996669751126,
+    "tests/core/test_postgres_store_ownership.py::test_postgres_owner_preserves_public_imports_and_pickled_class[budget_postgres-PostgresBudgetLedger]": 0.0003066249773837626
 }
