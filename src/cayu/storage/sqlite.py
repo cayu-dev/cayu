@@ -170,7 +170,6 @@ from cayu.sessions.base import (
     MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
     MODEL_TARGET_PROJECTION_METADATA_KEY,
     RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX,
-    SESSION_INSPECTION_LABEL_LIMIT,
     SESSION_LINEAGE_MAX_EVENT_ID_BYTES,
     SESSION_LINEAGE_MAX_IDENTIFIER_BYTES,
     SESSION_LINEAGE_MAX_ORIGIN_EVENTS,
@@ -199,7 +198,6 @@ from cayu.sessions.base import (
     ModelCompletionStageResult,
     ModelCompletionStageSettlementRequest,
     PendingActionIssue,
-    PendingActionKind,
     PendingActionListResult,
     PendingActionQuery,
     PersistedEventSideEffectClaim,
@@ -217,7 +215,6 @@ from cayu.sessions.base import (
     SessionForkActiveModelStageConflict,
     SessionForkProfileRelationship,
     SessionIdentity,
-    SessionInspectionIdentity,
     SessionInvocationSnapshot,
     SessionLineageNode,
     SessionLineageOrigin,
@@ -433,6 +430,7 @@ from cayu.sessions.base import (
     validate_persisted_event_side_effect_error,
 )
 from cayu.sessions.event_queries import EventQuery, EventQueryResultTooLarge, copy_event_query
+from cayu.sessions.inspection import SESSION_INSPECTION_LABEL_LIMIT, SessionInspectionIdentity
 from cayu.sessions.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
     INTERACTION_TERMINAL_EVENT_TYPES,
@@ -454,6 +452,7 @@ from cayu.sessions.queries import (
 from cayu.sessions.records import (
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     EventRecord,
+    PendingActionKind,
     PendingActionSession,
     RunnerObservedEventIdentity,
     Session,

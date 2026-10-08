@@ -103,7 +103,6 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.sessions.base import (
     EnqueueSessionMessageRequest,
-    PendingActionKind,
     PendingActionQuery,
     PendingActionRecord,
     ResumeRequest,
@@ -111,7 +110,7 @@ from cayu.sessions.base import (
     SessionMessageDeliveryMode,
     copy_run_request,
 )
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import PendingActionKind, SessionStatus
 
 
 class ScenarioExecutionError(RuntimeError):

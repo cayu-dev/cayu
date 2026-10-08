@@ -17,11 +17,11 @@ from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAutho
 from cayu.sessions.base import (
     InMemorySessionStore,
     InterruptSessionRequest,
-    PendingActionKind,
     PendingActionQuery,
     RunRequest,
 )
 from cayu.sessions.queries import SessionQuery
+from cayu.sessions.records import PendingActionKind
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
 from cayu.tools.subagents import SubagentSpec, SubagentTool

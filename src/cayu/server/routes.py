@@ -309,7 +309,6 @@ from cayu.sessions.base import (
     InterruptSessionRequest,
     ModelFailoverPolicy,
     ModelTarget,
-    PendingActionKind,
     PendingActionQuery,
     PendingActionRecord,
     PendingActionResultTooLarge,
@@ -353,6 +352,7 @@ from cayu.sessions.queries import (
 from cayu.sessions.records import (
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     EventRecord,
+    PendingActionKind,
     PendingActionSession,
     Session,
     SessionStatus,

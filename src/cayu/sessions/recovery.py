@@ -21,8 +21,8 @@ from cayu._validation import MAX_DURABLE_JSON_INTEGER, require_durable_clean_non
 from cayu.collaboration._contracts import ContractValue
 from cayu.collaboration.access import CollaborationAccessContext
 from cayu.environments.factory import EnvironmentAllocationState
-from cayu.sessions.base import IncompleteSessionRecoveryAction, PendingActionKind
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.base import IncompleteSessionRecoveryAction
+from cayu.sessions.records import PendingActionKind, SessionStatus
 from cayu.tasks.records import TaskStatus
 
 RECOVERY_PLAN_SCHEMA_VERSION = 1

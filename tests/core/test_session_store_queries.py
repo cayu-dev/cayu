@@ -47,7 +47,6 @@ from cayu.runtime import (
 from cayu.sessions import _tool_call_evidence as tool_call_evidence
 from cayu.sessions.base import (
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
-    PendingActionKind,
     PendingActionQuery,
     fork_session_invocation,
 )
@@ -61,7 +60,7 @@ from cayu.sessions.queries import (
     decode_session_cursor,
     encode_session_cursor,
 )
-from cayu.sessions.records import MAX_SESSION_ID_BYTES
+from cayu.sessions.records import MAX_SESSION_ID_BYTES, PendingActionKind
 from cayu.sessions.summaries import event_summary_from_records, session_outcome_from_records
 from cayu.storage import _session_store_sql as session_store_sql
 

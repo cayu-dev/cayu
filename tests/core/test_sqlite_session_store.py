@@ -29,7 +29,6 @@ from cayu.sessions.base import (
     ResumeRequest,
     RunRequest,
     SessionIdentity,
-    SessionInspectionSummary,
     SessionMessageDeliveryMode,
     fork_session_invocation,
 )
@@ -38,6 +37,7 @@ from cayu.sessions.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery
+from cayu.sessions.inspection import SessionInspectionSummary
 from cayu.sessions.queries import SessionAggregateFilter, SessionQuery
 from cayu.sessions.records import RUNTIME_BUILD_PROVENANCE_METADATA_KEY, Session, SessionStatus
 from cayu.sessions.transcript_queries import TRANSCRIPT_SEARCH_TOKENIZER_VERSION, TranscriptQuery

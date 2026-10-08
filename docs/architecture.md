@@ -499,6 +499,12 @@ aggregation. It retains candidate selection, exact re-aggregation, group remaind
 and pricing-input collection. Memory stores supply repeatable records under their
 existing read boundary; SQL stores reuse the query contract with native aggregation.
 
+`sessions/inspection.py` owns bounded inspection records, label/event retention
+limits and the shared usage fold. It composes usage rules and the pending-action
+enum in `sessions/records.py` without importing store implementations. Native
+inspection queries, pagination and pending-action evidence validation remain with
+their existing store owners.
+
 ### Session checkpoint evidence
 
 `sessions/_checkpoint_preservation.py` owns callback-visible checkpoint copies,

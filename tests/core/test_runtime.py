@@ -38141,7 +38141,8 @@ def test_tool_approval_publication_acknowledgement_loss_preserves_atomic_pair():
 def test_tool_approval_requested_audit_metadata_is_bounded_and_redacted():
     from cayu.approvals.tools import PendingToolCallApproval
     from cayu.runtime import _approval_support as approval_support
-    from cayu.sessions.base import PendingActionKind, PendingActionQuery
+    from cayu.sessions.base import PendingActionQuery
+    from cayu.sessions.records import PendingActionKind
     from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
     secret = "approval-audit-secret"

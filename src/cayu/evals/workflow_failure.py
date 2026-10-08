@@ -28,8 +28,8 @@ from cayu.evals.trajectory import (
     _strict_child_nodes,
 )
 from cayu.events import Event, EventType, event_payload_authority_is_runtime_generated
-from cayu.sessions.base import SessionInspectionIdentity
 from cayu.sessions.event_queries import EventQueryResultTooLarge
+from cayu.sessions.inspection import SessionInspectionIdentity
 from cayu.sessions.records import EventRecord
 from cayu.sessions.terminal_evidence import TerminalSessionEvidenceErrorCode
 from cayu.workflows.journal import WORKFLOW_ATTEMPT_EVENT_TYPE, WORKFLOW_JOURNAL_PROVIDER

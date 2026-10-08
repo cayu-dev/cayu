@@ -30,6 +30,7 @@ from uuid import uuid4
 from weakref import ReferenceType, ref
 
 from cayu._resource_store_surface import model_store_surface
+from cayu.budgets.base import SessionBudgetInspection as SessionBudgetInspection
 from cayu.collaboration.peer_content import (
     PeerAppendKey,
     PeerContentAppendRequest,
@@ -56,6 +57,7 @@ from cayu.sessions import _completion_finalization as completion_finalization
 from cayu.sessions import _terminal_evidence as terminal_event_evidence
 from cayu.sessions import creation_fence
 from cayu.sessions import event_queries as event_query_rules
+from cayu.sessions import inspection as session_inspection_rules
 from cayu.sessions import queries as session_query_rules
 from cayu.sessions import records as session_record_rules
 from cayu.sessions import summaries as session_summary_rules
@@ -72,6 +74,13 @@ from cayu.sessions.event_queries import EventQuery as EventQuery
 from cayu.sessions.event_queries import EventQueryResultTooLarge as EventQueryResultTooLarge
 from cayu.sessions.event_queries import copy_event_query as copy_event_query
 from cayu.sessions.execution import SessionExecutionState
+from cayu.sessions.inspection import (
+    SESSION_INSPECTION_LABEL_LIMIT as SESSION_INSPECTION_LABEL_LIMIT,
+)
+from cayu.sessions.inspection import SerializedRecordSummary as SerializedRecordSummary
+from cayu.sessions.inspection import SessionInspectionIdentity as SessionInspectionIdentity
+from cayu.sessions.inspection import SessionInspectionSummary as SessionInspectionSummary
+from cayu.sessions.inspection import SessionInspectionUsageSummary as SessionInspectionUsageSummary
 from cayu.sessions.queries import MAX_AGGREGATE_LABEL_FILTERS as MAX_AGGREGATE_LABEL_FILTERS
 from cayu.sessions.queries import (
     MAX_AGGREGATE_LABEL_SELECTOR_VALUES as MAX_AGGREGATE_LABEL_SELECTOR_VALUES,
@@ -104,6 +113,7 @@ from cayu.sessions.records import (
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY as RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
 )
 from cayu.sessions.records import EventRecord as EventRecord
+from cayu.sessions.records import PendingActionKind as PendingActionKind
 from cayu.sessions.records import PendingActionSession as PendingActionSession
 from cayu.sessions.records import RunnerObservedEventIdentity as RunnerObservedEventIdentity
 from cayu.sessions.records import Session as Session
@@ -371,16 +381,13 @@ from cayu.artifacts.attachments import MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOA
 from cayu.budgets.aggregates import (
     _IN_MEMORY_AGGREGATE_CANCELLATION_INTERVAL,
     EXACT_AGGREGATE,
-    AggregateUsageMetrics,
     UsageRollupStoreResult,
     _cooperate_with_in_memory_aggregate_cancellation,
-    build_aggregate_usage_metrics,
     project_aggregate_usage_inspection_event,
 )
 from cayu.budgets.base import (
     BudgetLimit,
     BudgetReservationIdentityConflict,
-    SessionBudgetInspection,
     copy_request_budget_limits,
     is_budget_inspection_event,
     is_budget_model_attempt_terminal_event,
@@ -391,7 +398,6 @@ from cayu.budgets.base import (
 )
 from cayu.budgets.pricing import PriceBook
 from cayu.budgets.run_limits import RunLimits, copy_run_limits
-from cayu.budgets.usage import UsageMetrics
 from cayu.configuration import DEFAULT_MAX_STEPS, MAX_STEPS
 from cayu.context.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
@@ -6762,13 +6768,6 @@ class McpManifestPublicationResult(BaseModel):
         return self
 
 
-class PendingActionKind(StrEnum):
-    TOOL_APPROVAL = "tool_approval"
-    USER_INPUT = "user_input"
-    MANUAL_RECOVERY = "manual_recovery"
-    DELEGATED_ACTION = "delegated_action"
-
-
 class PendingActionIssueCode(StrEnum):
     """Why one pending-action candidate could not be projected safely."""
 
@@ -7310,125 +7309,6 @@ def enforce_pending_action_result_size(
     if not json_utf8_size_within_limit(result, max_bytes):
         raise PendingActionResultTooLarge(max_bytes)
     return result
-
-
-class SerializedRecordSummary(BaseModel):
-    """Exact serialized-size totals for one kind of durable session record."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    record_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    total_bytes: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    largest_record_bytes: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-
-
-class SessionInspectionIdentity(BaseModel):
-    """Bounded, metadata-free identity used by operator inspection."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    agent_name: str
-    provider_name: str
-    model: str
-    parent_session_id: str | None
-    causal_budget_id: str
-    runtime_name: str
-    runtime_version: str | None
-    runtime_build_provenance: RuntimeBuildProvenance = Field(
-        default_factory=legacy_runtime_build_provenance
-    )
-    environment_name: str | None
-    status: SessionStatus
-    created_at: datetime
-    updated_at: datetime
-    last_activity_at: datetime
-    run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    labels: dict[str, str] = Field(default_factory=dict)
-    label_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    labels_truncated: StrictBool = False
-
-
-class SessionInspectionUsageSummary(BaseModel):
-    """Lossless usage totals for bounded operator inspection."""
-
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
-
-    session_id: str
-    model_steps: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    tool_calls: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    provider_names: list[str] = Field(default_factory=list)
-    models: list[str] = Field(default_factory=list)
-    usage: AggregateUsageMetrics = Field(default_factory=build_aggregate_usage_metrics)
-
-    @field_validator("session_id")
-    @classmethod
-    def validate_session_id(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("provider_names", "models", mode="before")
-    @classmethod
-    def copy_string_lists(cls, value: list[str], info) -> list[str]:
-        copied = copy_durable_json_value(value, info.field_name)
-        if type(copied) is not list:
-            raise ValueError(f"{info.field_name} must be a list.")
-        result: list[str] = []
-        for index, item in enumerate(copied):
-            if type(item) is not str:
-                raise ValueError(f"{info.field_name}[{index}] must be a string.")
-            result.append(require_clean_nonblank(item, f"{info.field_name}[{index}]"))
-        return result
-
-
-class SessionInspectionSummary(BaseModel):
-    """Bounded backend-neutral diagnostic overview for one durable session."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    session: SessionInspectionIdentity
-    transcript: SerializedRecordSummary
-    events: SerializedRecordSummary
-    usage: SessionInspectionUsageSummary
-    model_calls: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    model_calls_with_usage: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    tool_calls: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    pending_action_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    pending_action_kinds: tuple[PendingActionKind, ...] = ()
-    pending_action_issue_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    queued_message_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    delivered_message_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    outstanding_message_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    operation_event_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    terminal_failure_state: Literal["none", "failed", "interrupted"]
-    budget: SessionBudgetInspection
-
-
-_SESSION_INSPECTION_MAX_RECORDS = 100_000
-_SESSION_INSPECTION_MAX_RETAINED_EVENT_BYTES = 64 * 1024 * 1024
-_SESSION_INSPECTION_PAGE_SIZE = 200
-SESSION_INSPECTION_LABEL_LIMIT = 200
-
-
-def _bounded_session_inspection_labels(
-    labels: dict[str, str],
-) -> tuple[dict[str, str], int, bool]:
-    label_count = len(labels)
-    retained_keys = heapq.nsmallest(SESSION_INSPECTION_LABEL_LIMIT, labels)
-    return (
-        {key: labels[key] for key in retained_keys},
-        label_count,
-        label_count > len(retained_keys),
-    )
-
-
-def _retain_session_inspection_event(current_bytes: int, event: Event) -> int:
-    retained_bytes = current_bytes + compact_json_utf8_size(event.model_dump(mode="json"))
-    if retained_bytes > _SESSION_INSPECTION_MAX_RETAINED_EVENT_BYTES:
-        raise ValueError(
-            "Session inspection exceeds the retained-event safety limit of "
-            f"{_SESSION_INSPECTION_MAX_RETAINED_EVENT_BYTES} bytes."
-        )
-    return retained_bytes
 
 
 class IncompleteSessionRecoveryAction(StrEnum):
@@ -12964,7 +12844,7 @@ class SessionStore(ABC):
         event_count = 0
         event_total_bytes = 0
         event_largest_bytes = 0
-        usage_accumulator = _SessionInspectionUsageAccumulator()
+        usage_accumulator = session_inspection_rules._SessionInspectionUsageAccumulator()
         budget_events: list[Event] = []
         budget_model_attempt_terminal_events: list[Event] = []
         retained_event_bytes = 0
@@ -12978,17 +12858,17 @@ class SessionStore(ABC):
                 EventQuery(
                     session_id=session_id,
                     after_sequence=after_sequence,
-                    limit=_SESSION_INSPECTION_PAGE_SIZE,
+                    limit=session_inspection_rules._SESSION_INSPECTION_PAGE_SIZE,
                     order_by=EventOrder.SEQUENCE_ASC,
                 )
             )
             if not records:
                 break
             event_count += len(records)
-            if event_count > _SESSION_INSPECTION_MAX_RECORDS:
+            if event_count > session_inspection_rules._SESSION_INSPECTION_MAX_RECORDS:
                 raise ValueError(
                     "Session inspection exceeds the "
-                    f"{_SESSION_INSPECTION_MAX_RECORDS}-event safety limit."
+                    f"{session_inspection_rules._SESSION_INSPECTION_MAX_RECORDS}-event safety limit."
                 )
             for record in records:
                 payload_bytes = compact_json_utf8_size(record.event.payload)
@@ -12997,9 +12877,11 @@ class SessionStore(ABC):
                 event = record.event
                 if is_budget_model_attempt_terminal_event(event):
                     model_attempt_event = project_budget_model_attempt_inspection_event(event)
-                    retained_event_bytes = _retain_session_inspection_event(
-                        retained_event_bytes,
-                        model_attempt_event,
+                    retained_event_bytes = (
+                        session_inspection_rules._retain_session_inspection_event(
+                            retained_event_bytes,
+                            model_attempt_event,
+                        )
                     )
                     budget_model_attempt_terminal_events.append(model_attempt_event)
                 if event.type in {
@@ -13008,16 +12890,20 @@ class SessionStore(ABC):
                     EventType.TOOL_CALL_STARTED,
                 }:
                     usage_event, usage_metrics = project_aggregate_usage_inspection_event(event)
-                    retained_event_bytes = _retain_session_inspection_event(
-                        retained_event_bytes,
-                        usage_event,
+                    retained_event_bytes = (
+                        session_inspection_rules._retain_session_inspection_event(
+                            retained_event_bytes,
+                            usage_event,
+                        )
                     )
                     usage_accumulator.add(event.type, usage_metrics)
                 if is_budget_inspection_event(event):
                     budget_event = project_budget_inspection_event(event)
-                    retained_event_bytes = _retain_session_inspection_event(
-                        retained_event_bytes,
-                        budget_event,
+                    retained_event_bytes = (
+                        session_inspection_rules._retain_session_inspection_event(
+                            retained_event_bytes,
+                            budget_event,
+                        )
                     )
                     budget_events.append(budget_event)
                 queued_message_count += event.type == EventType.SESSION_MESSAGE_QUEUED
@@ -13030,7 +12916,7 @@ class SessionStore(ABC):
                 }
                 operation_event_count += event.type == EventType.SERVER_MUTATION_ACCEPTED
             after_sequence = records[-1].sequence
-            if len(records) < _SESSION_INSPECTION_PAGE_SIZE:
+            if len(records) < session_inspection_rules._SESSION_INSPECTION_PAGE_SIZE:
                 break
 
         transcript_count = 0
@@ -13042,20 +12928,23 @@ class SessionStore(ABC):
                 TranscriptQuery(
                     session_id=session_id,
                     offset=offset,
-                    limit=_SESSION_INSPECTION_PAGE_SIZE,
+                    limit=session_inspection_rules._SESSION_INSPECTION_PAGE_SIZE,
                 )
             )
-            if offset == 0 and page.total_records > _SESSION_INSPECTION_MAX_RECORDS:
+            if (
+                offset == 0
+                and page.total_records > session_inspection_rules._SESSION_INSPECTION_MAX_RECORDS
+            ):
                 raise ValueError(
                     "Session inspection exceeds the "
-                    f"{_SESSION_INSPECTION_MAX_RECORDS}-message safety limit."
+                    f"{session_inspection_rules._SESSION_INSPECTION_MAX_RECORDS}-message safety limit."
                 )
             for record in page.records:
                 message_bytes = compact_json_utf8_size(record.message.model_dump(mode="json"))
                 transcript_count += 1
                 transcript_total_bytes += message_bytes
                 transcript_largest_bytes = max(transcript_largest_bytes, message_bytes)
-            offset += _SESSION_INSPECTION_PAGE_SIZE
+            offset += session_inspection_rules._SESSION_INSPECTION_PAGE_SIZE
             if offset >= page.total_records:
                 break
 
@@ -17222,8 +17111,8 @@ class InMemorySessionStore(
             session = self._sessions.get(session_id)
             if session is None:
                 raise KeyError(session_id)
-            labels, label_count, labels_truncated = _bounded_session_inspection_labels(
-                session.labels
+            labels, label_count, labels_truncated = (
+                session_inspection_rules._bounded_session_inspection_labels(session.labels)
             )
             return SessionInspectionIdentity(
                 id=session.id,
@@ -35023,64 +34912,6 @@ def copy_session_lineage_query(query: SessionLineageQuery) -> SessionLineageQuer
     if type(query) is not SessionLineageQuery:
         raise TypeError("Session lineage queries must be SessionLineageQuery instances.")
     return SessionLineageQuery.model_validate(query.model_dump(mode="python"))
-
-
-@dataclass
-class _SessionInspectionUsageAccumulator:
-    """Single-pass inspection fold with native aggregate usage semantics."""
-
-    totals: session_usage_rules._UsageAccumulator = dataclass_field(
-        default_factory=session_usage_rules._UsageAccumulator
-    )
-    provider_names: list[str] = dataclass_field(default_factory=list)
-    models: list[str] = dataclass_field(default_factory=list)
-    _provider_names_seen: set[str] = dataclass_field(default_factory=set)
-    _models_seen: set[str] = dataclass_field(default_factory=set)
-    tool_calls: int = 0
-
-    def add(self, event_type: str, metrics: UsageMetrics | None) -> None:
-        if event_type == EventType.TOOL_CALL_STARTED:
-            self.tool_calls += 1
-            return
-        if event_type in {
-            EventType.MODEL_HOSTED_TOOL_CALL,
-            EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
-        }:
-            if metrics is None:
-                return
-            self.totals.add_usage_only(metrics)
-            self._record_identity(metrics)
-            return
-        if event_type != EventType.MODEL_COMPLETED:
-            return
-        self.totals.add(metrics)
-        if metrics is None:
-            return
-        self._record_identity(metrics)
-
-    def _record_identity(self, metrics: UsageMetrics) -> None:
-        if (
-            metrics.provider_name is not None
-            and metrics.provider_name not in self._provider_names_seen
-        ):
-            self._provider_names_seen.add(metrics.provider_name)
-            self.provider_names.append(metrics.provider_name)
-        if metrics.model is not None and metrics.model not in self._models_seen:
-            self._models_seen.add(metrics.model)
-            self.models.append(metrics.model)
-
-    def result(self, session_id: str) -> tuple[SessionInspectionUsageSummary, int]:
-        return (
-            SessionInspectionUsageSummary(
-                session_id=session_id,
-                model_steps=self.totals.model_steps,
-                tool_calls=self.tool_calls,
-                provider_names=self.provider_names,
-                models=self.models,
-                usage=self.totals.usage,
-            ),
-            self.totals.model_steps_with_usage,
-        )
 
 
 def _session_matches_debug_state(

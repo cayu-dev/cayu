@@ -353,3 +353,10 @@ class PendingActionSession(BaseModel):
     @classmethod
     def copy_labels(cls, value: dict[str, str]) -> dict[str, str]:
         return copy_label_map(value, "labels")
+
+
+class PendingActionKind(StrEnum):
+    TOOL_APPROVAL = "tool_approval"
+    USER_INPUT = "user_input"
+    MANUAL_RECOVERY = "manual_recovery"
+    DELEGATED_ACTION = "delegated_action"

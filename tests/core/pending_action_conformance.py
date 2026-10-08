@@ -7,13 +7,12 @@ from cayu.messages import Message
 from cayu.sessions.base import (
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
     MAX_PENDING_ACTION_TOOL_CALLS,
-    PendingActionKind,
     PendingActionQuery,
     RunRequest,
     SessionIdentity,
     SessionStore,
 )
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import PendingActionKind, SessionStatus
 
 _MODEL_STEP_ID = f"mstep_{'1' * 32}"
 _MODEL_ATTEMPT_ID = f"matt_{'2' * 32}"

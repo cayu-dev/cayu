@@ -187,3 +187,96 @@ else:
 """,
         public_module,
     )
+
+
+def test_session_inspection_public_imports_and_historical_pickle_globals():
+    from cayu.sessions import base, inspection, records
+
+    for owner, names in (
+        (
+            inspection,
+            (
+                "SerializedRecordSummary",
+                "SessionInspectionIdentity",
+                "SessionInspectionUsageSummary",
+                "SessionInspectionSummary",
+            ),
+        ),
+        (records, ("PendingActionKind",)),
+    ):
+        for name in names:
+            canonical = getattr(owner, name)
+            assert getattr(base, name) is canonical
+            for module in ("cayu", "cayu.sessions", "cayu.runtime"):
+                assert getattr(importlib.import_module(module), name) is canonical
+            assert pickle.loads(f"ccayu.sessions.base\n{name}\n.".encode()) is canonical
+
+
+@pytest.mark.parametrize("public_module", ("cayu", "cayu.sessions", "cayu.runtime"))
+def test_session_inspection_bounds_and_folds_records_without_stores(public_module):
+    _assert_store_independent(
+        """
+from datetime import UTC, datetime
+from cayu.budgets.base import SessionBudgetInspection
+from cayu.budgets.usage import UsageMetrics
+from cayu.events import Event, EventType
+from cayu.sessions.inspection import (
+    SESSION_INSPECTION_LABEL_LIMIT, _SESSION_INSPECTION_MAX_RETAINED_EVENT_BYTES,
+    _SessionInspectionUsageAccumulator, _bounded_session_inspection_labels,
+    _retain_session_inspection_event,
+)
+
+labels = {f"label-{i:04d}": str(i) for i in range(SESSION_INSPECTION_LABEL_LIMIT + 1)}
+retained, total, truncated = _bounded_session_inspection_labels(labels)
+assert total == SESSION_INSPECTION_LABEL_LIMIT + 1 and truncated
+assert list(retained) == sorted(labels)[:SESSION_INSPECTION_LABEL_LIMIT]
+retained["label-0000"] = "changed"
+assert labels["label-0000"] == "0"
+metrics = UsageMetrics(input_tokens=7, output_tokens=3, total_tokens=10,
+    provider_name="provider", model="model")
+fold = _SessionInspectionUsageAccumulator()
+fold.add(EventType.MODEL_COMPLETED, metrics)
+fold.add(EventType.MODEL_COMPLETED, None)
+fold.add(EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED, metrics)
+fold.add(EventType.MODEL_HOSTED_TOOL_CALL, metrics)
+fold.add(EventType.TOOL_CALL_STARTED, None)
+usage, with_usage = fold.result("session")
+assert usage.usage.total_tokens == 30 and usage.model_steps == 2
+assert with_usage == 1 and usage.tool_calls == 1
+assert usage.provider_names == ["provider"] and usage.models == ["model"]
+fold.provider_names.append("later")
+assert usage.provider_names == ["provider"]
+stamp = datetime(2026, 1, 1, tzinfo=UTC)
+identity = public.SessionInspectionIdentity(id="session", agent_name="agent",
+    provider_name="provider", model="model", parent_session_id=None,
+    causal_budget_id="session", runtime_name="cayu", runtime_version=None,
+    environment_name=None, status="interrupted", created_at=stamp, updated_at=stamp,
+    last_activity_at=stamp, run_epoch=1, label_count=0)
+sizes = public.SerializedRecordSummary(record_count=0, total_bytes=0, largest_record_bytes=0)
+budget = SessionBudgetInspection(event_count=0, reservation_count=0,
+    reconciliation_count=0, pending_reservation_count=0,
+    completed_unsettled_reservation_count=0, reconciled_reservation_count=0,
+    conservative_reconciliation_count=0, released_reservation_count=0, cost_state="unknown")
+summary = public.SessionInspectionSummary(session=identity, transcript=sizes,
+    events=sizes, usage=usage, model_calls=2, model_calls_with_usage=1, tool_calls=1,
+    pending_action_count=1, pending_action_kinds=(public.PendingActionKind.USER_INPUT,),
+    pending_action_issue_count=0, queued_message_count=0, delivered_message_count=0,
+    outstanding_message_count=0, operation_event_count=0,
+    terminal_failure_state="interrupted", budget=budget)
+assert summary.model_dump(mode="json")["pending_action_kinds"] == ["user_input"]
+for value in (identity, sizes, usage, summary):
+    assert pickle.loads(pickle.dumps(value)) == value
+    assert get_type_hints(type(value)) and type(value).model_json_schema()
+event = Event(id="event", type=EventType.SESSION_FAILED, session_id="session",
+    timestamp=stamp, payload={"error": "failure"})
+assert _retain_session_inspection_event(0, event) > 0
+try:
+    _retain_session_inspection_event(_SESSION_INSPECTION_MAX_RETAINED_EVENT_BYTES, event)
+except ValueError as exc:
+    assert str(exc) == ("Session inspection exceeds the retained-event safety limit of "
+        f"{_SESSION_INSPECTION_MAX_RETAINED_EVENT_BYTES} bytes.")
+else:
+    raise AssertionError("Oversized retained events were accepted")
+""",
+        public_module,
+    )

@@ -1609,7 +1609,7 @@ def test_session_aggregate_commands_bound_retained_projections_not_raw_payloads(
     monkeypatch,
     capsys,
 ) -> None:
-    import cayu.sessions.base as session_runtime
+    import cayu.sessions.inspection as session_inspection
     from cayu.cli import session as session_cli
 
     database = _write_project(tmp_path)
@@ -1654,7 +1654,7 @@ def test_session_aggregate_commands_bound_retained_projections_not_raw_payloads(
     )
     assert json.loads(capsys.readouterr().out)["total_calls"] == 1
 
-    monkeypatch.setattr(session_runtime, "_SESSION_INSPECTION_MAX_RETAINED_EVENT_BYTES", 512)
+    monkeypatch.setattr(session_inspection, "_SESSION_INSPECTION_MAX_RETAINED_EVENT_BYTES", 512)
     assert (
         main(
             [
@@ -1670,7 +1670,7 @@ def test_session_aggregate_commands_bound_retained_projections_not_raw_payloads(
     )
     assert json.loads(capsys.readouterr().out)["events"]["largest_payload_bytes"] >= 4096
 
-    monkeypatch.setattr(session_runtime, "_SESSION_INSPECTION_MAX_RETAINED_EVENT_BYTES", 32)
+    monkeypatch.setattr(session_inspection, "_SESSION_INSPECTION_MAX_RETAINED_EVENT_BYTES", 32)
     assert (
         main(
             [
@@ -1702,7 +1702,7 @@ def test_session_aggregate_commands_bound_retained_projections_not_raw_payloads(
     )
     assert "0-event safety limit" in json.loads(capsys.readouterr().out)["error"]["message"]
 
-    monkeypatch.setattr(session_runtime, "_SESSION_INSPECTION_MAX_RECORDS", 0)
+    monkeypatch.setattr(session_inspection, "_SESSION_INSPECTION_MAX_RECORDS", 0)
     assert (
         main(
             [

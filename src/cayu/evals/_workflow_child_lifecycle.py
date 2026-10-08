@@ -17,7 +17,8 @@ from cayu.evals.trajectory import (
     _CaptureState,
     _strict_child_nodes,
 )
-from cayu.sessions.base import SessionInspectionIdentity, SessionLineageNode
+from cayu.sessions.base import SessionLineageNode
+from cayu.sessions.inspection import SessionInspectionIdentity
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.terminal_evidence import TerminalSessionEvidenceErrorCode
 
