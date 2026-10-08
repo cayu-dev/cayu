@@ -105,6 +105,7 @@ from cayu.sessions.invocation import (
     TaskExecutionSource,
     copy_session_invocation_binding,
 )
+from cayu.tasks._cancellation import _task_cancellation_terminalization_request
 from cayu.tasks._execution_settlement import (
     TaskExecutionSettlement,
     has_task_execution_settlement_pending,
@@ -112,7 +113,6 @@ from cayu.tasks._execution_settlement import (
 from cayu.tasks._schedule_wakeup import next_schedule_wake_at
 from cayu.tasks.base import (
     TaskStore,
-    _task_cancellation_terminalization_request,
     _terminalize_claimed_task_or_detect_peer_winner,
 )
 from cayu.tasks.cancellation import (

@@ -80,6 +80,34 @@ from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage._sqlite_connection import _run_off_thread_with_connection_ownership
 from cayu.storage.targets import require_sqlite_store_allowed
 from cayu.tasks import _verified_work_policy as verified_work_support
+from cayu.tasks._cancellation import (
+    _expired_dispatched_task_cancellation,
+    _reconciled_task_cancellation,
+    _reconciled_task_retry_cancellation,
+    _task_cancellation_requested_task,
+    _task_retry_cancellation_requested_task,
+    _validate_ordinary_task_terminalization_against_cancellation,
+    _validated_task_cancellation,
+    _validated_task_retry_cancellation,
+)
+from cayu.tasks._lifecycle import (
+    _can_attach_claimed_task_state,
+    _copy_optional_status_payload,
+    _copy_optional_status_reason,
+    _ensure_can_hold_task,
+    _ensure_can_resume_task,
+    _ensure_can_transition,
+    _ensure_exact_owned_active_task_lease,
+    _ensure_owned_active_task_lease,
+    _ensure_recovered_attached_task_failure_authority,
+    _ensure_recovered_attached_task_session,
+    _ensure_retry_series_queue_attempt,
+    _ensure_task_handoff_authority,
+    _ensure_task_terminalization_lease_authority,
+    _raise_task_claim_attach_error,
+    _require_active_attached_task_worker,
+    _require_direct_attached_task_resume,
+)
 from cayu.tasks._scheduling import (
     admitted_schedule,
     require_schedule_mutation,
@@ -120,34 +148,7 @@ from cayu.tasks.admission import (
     work_attempt_admission_prepare_sha256,
     work_attempt_execution_claim_request_sha256,
 )
-from cayu.tasks.base import (
-    TaskStore,
-    _can_attach_claimed_task_state,
-    _copy_optional_status_payload,
-    _copy_optional_status_reason,
-    _ensure_can_hold_task,
-    _ensure_can_resume_task,
-    _ensure_can_transition,
-    _ensure_exact_owned_active_task_lease,
-    _ensure_owned_active_task_lease,
-    _ensure_recovered_attached_task_failure_authority,
-    _ensure_recovered_attached_task_session,
-    _ensure_retry_series_queue_attempt,
-    _ensure_task_handoff_authority,
-    _ensure_task_terminalization_lease_authority,
-    _expired_dispatched_task_cancellation,
-    _raise_task_claim_attach_error,
-    _reconciled_task_cancellation,
-    _reconciled_task_retry_cancellation,
-    _require_active_attached_task_worker,
-    _require_direct_attached_task_resume,
-    _require_interrupted_task_handoff_authority,
-    _task_cancellation_requested_task,
-    _task_retry_cancellation_requested_task,
-    _validate_ordinary_task_terminalization_against_cancellation,
-    _validated_task_cancellation,
-    _validated_task_retry_cancellation,
-)
+from cayu.tasks.base import TaskStore
 from cayu.tasks.cancellation import (
     _TASK_CANCELLATION_REQUESTED_REASON,
     _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
@@ -271,6 +272,7 @@ from cayu.tasks.handoff import (
     TaskInterruptedHandoffRequest,
     _interrupted_task_continuation_handoff_id_sha256,
     _replay_interrupted_task_handoff_receipt,
+    _require_interrupted_task_handoff_authority,
     prepare_interrupted_task_continuation_claim_page,
     prepare_interrupted_task_handoff,
     prepare_interrupted_task_handoff_candidate_page,

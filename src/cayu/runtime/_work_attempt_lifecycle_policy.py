@@ -16,6 +16,7 @@ from cayu.runtime.work_attempt_lifecycle import (
     work_attempt_lifecycle_settlement_sha256,
     work_attempt_preparation_hold_sha256,
 )
+from cayu.tasks._lifecycle import _ensure_exact_owned_active_task_lease
 from cayu.tasks.admission import (
     WorkAttemptAdmission,
     WorkAttemptAdmissionConflict,
@@ -32,7 +33,6 @@ from cayu.tasks.admission import (
     copy_work_attempt_execution_stop_request,
     require_work_attempt_admission_result,
 )
-from cayu.tasks.base import _ensure_exact_owned_active_task_lease
 from cayu.tasks.cancellation import _task_cancellation_requested
 from cayu.tasks.contracts import (
     CompletionDecision,

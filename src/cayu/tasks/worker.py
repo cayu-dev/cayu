@@ -104,11 +104,11 @@ from cayu.sessions._invocation_terminal_decision import (
 )
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.base import IncompleteSessionRecoveryRequest, SessionStatus
+from cayu.tasks._cancellation import _task_cancellation_terminalization_request
 from cayu.tasks._execution_settlement import TaskExecutionSettlement
 from cayu.tasks._schedule_wakeup import next_schedule_wake_at
 from cayu.tasks.base import (
     TaskStore,
-    _task_cancellation_terminalization_request,
     _terminalize_claimed_task,
     _terminalize_claimed_task_or_detect_peer_winner,
     settle_task_retry_attempt_with_retry,

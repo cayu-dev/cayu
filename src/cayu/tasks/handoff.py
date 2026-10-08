@@ -26,6 +26,7 @@ from cayu._validation import require_durable_clean_nonblank as require_clean_non
 from cayu.sessions.invocation import (
     SessionInvocationBinding,
 )
+from cayu.tasks.cancellation import _task_cancellation_requested, _task_retry_cancellation_requested
 from cayu.tasks.records import (
     Task,
     TaskStatus,
@@ -381,3 +382,33 @@ def _interrupted_task_continuation_handoff_id_sha256(handoff_id: str) -> str:
 
     handoff_id = require_clean_nonblank(handoff_id, "handoff_id")
     return sha256(handoff_id.encode("utf-8")).hexdigest()
+
+
+def _require_interrupted_task_handoff_authority(
+    task: Task,
+    request: TaskInterruptedHandoffRequest,
+    *,
+    now: datetime,
+    recover_expired: bool,
+) -> None:
+    if (
+        task.id != request.task_id
+        or task.status is not TaskStatus.RUNNING
+        or task.session_id != request.session_id
+        or task.session_instance_id != request.session_instance_id
+        or task.worker_id != request.worker_id
+        or task.lease_expires_at != request.lease_expires_at
+    ):
+        raise TaskInterruptedHandoffConflict(
+            "Interrupted-task handoff authority no longer matches the task."
+        )
+    if _task_cancellation_requested(task) or _task_retry_cancellation_requested(task):
+        raise TaskInterruptedHandoffConflict(
+            "Task cancellation is still draining under its current owner."
+        )
+    expired = request.lease_expires_at <= now
+    if recover_expired is not expired:
+        boundary = "expired" if recover_expired else "live"
+        raise TaskInterruptedHandoffConflict(
+            f"Interrupted-task handoff requires an exact {boundary} worker lease."
+        )

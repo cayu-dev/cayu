@@ -12,12 +12,12 @@ from datetime import datetime, timedelta
 from hashlib import sha256
 
 from cayu._validation import canonical_durable_json_bytes
-from cayu.tasks._graphs import GRAPH_TERMINAL_STATUSES, GraphTransition, plan_graph_transition
-from cayu.tasks._groups import GroupPublication, plan_group_transition
-from cayu.tasks.base import (
+from cayu.tasks._cancellation import (
     _task_cancellation_requested_task,
     _task_retry_cancellation_requested_task,
 )
+from cayu.tasks._graphs import GRAPH_TERMINAL_STATUSES, GraphTransition, plan_graph_transition
+from cayu.tasks._groups import GroupPublication, plan_group_transition
 from cayu.tasks.graphs import graph_identifier
 from cayu.tasks.groups import (
     TaskGroupConflict,

@@ -913,20 +913,17 @@ from cayu.storage._task_group_schema import (
 from cayu.storage._task_scheduling_schema import POSTGRES_SCHEDULING_DDL
 from cayu.storage.knowledge_transition import require_empty_knowledge_revision_transition
 from cayu.tasks import _verified_work_policy as verified_work_support
-from cayu.tasks._scheduling import (
-    admitted_schedule,
-    require_schedule_mutation,
-    rescheduled_task,
-    schedule_creation_digest,
-    schedule_mutation_digest,
-    schedule_receipt,
-    schedule_revision_after,
-    schedule_transition_events,
+from cayu.tasks._cancellation import (
+    _expired_dispatched_task_cancellation,
+    _reconciled_task_cancellation,
+    _reconciled_task_retry_cancellation,
+    _task_cancellation_requested_task,
+    _task_retry_cancellation_requested_task,
+    _validate_ordinary_task_terminalization_against_cancellation,
+    _validated_task_cancellation,
+    _validated_task_retry_cancellation,
 )
-from cayu.tasks.access import runtime_collection_read, runtime_task_creation, runtime_task_mutation
-from cayu.tasks.admission import WorkAttemptExecutionClaimLost
-from cayu.tasks.base import (
-    TaskStore,
+from cayu.tasks._lifecycle import (
     _can_attach_claimed_task_state,
     _copy_optional_status_payload,
     _copy_optional_status_reason,
@@ -940,19 +937,23 @@ from cayu.tasks.base import (
     _ensure_retry_series_queue_attempt,
     _ensure_task_handoff_authority,
     _ensure_task_terminalization_lease_authority,
-    _expired_dispatched_task_cancellation,
     _raise_task_claim_attach_error,
-    _reconciled_task_cancellation,
-    _reconciled_task_retry_cancellation,
     _require_active_attached_task_worker,
     _require_direct_attached_task_resume,
-    _require_interrupted_task_handoff_authority,
-    _task_cancellation_requested_task,
-    _task_retry_cancellation_requested_task,
-    _validate_ordinary_task_terminalization_against_cancellation,
-    _validated_task_cancellation,
-    _validated_task_retry_cancellation,
 )
+from cayu.tasks._scheduling import (
+    admitted_schedule,
+    require_schedule_mutation,
+    rescheduled_task,
+    schedule_creation_digest,
+    schedule_mutation_digest,
+    schedule_receipt,
+    schedule_revision_after,
+    schedule_transition_events,
+)
+from cayu.tasks.access import runtime_collection_read, runtime_task_creation, runtime_task_mutation
+from cayu.tasks.admission import WorkAttemptExecutionClaimLost
+from cayu.tasks.base import TaskStore
 from cayu.tasks.cancellation import (
     _TASK_CANCELLATION_REQUESTED_REASON,
     _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
@@ -1003,6 +1004,7 @@ from cayu.tasks.handoff import (
     TaskInterruptedHandoffRequest,
     _interrupted_task_continuation_handoff_id_sha256,
     _replay_interrupted_task_handoff_receipt,
+    _require_interrupted_task_handoff_authority,
     prepare_interrupted_task_continuation_claim_page,
     prepare_interrupted_task_handoff,
     prepare_interrupted_task_handoff_candidate_page,

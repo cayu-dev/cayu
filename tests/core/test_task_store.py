@@ -44,16 +44,13 @@ from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
 from cayu.storage import sqlite as sqlite_storage
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.base import (
-    InMemoryTaskStore,
-    TaskStore,
-    _require_interrupted_task_handoff_authority,
-)
+from cayu.tasks.base import InMemoryTaskStore, TaskStore
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.handoff import (
     TaskInterruptedHandoffConflict,
     TaskInterruptedHandoffReceipt,
     TaskInterruptedHandoffRequest,
+    _require_interrupted_task_handoff_authority,
     interrupted_task_handoff_request,
     prepare_interrupted_task_handoff,
 )

@@ -10,7 +10,7 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import UTC, datetime
 
-from cayu.tasks.base import _ensure_active_task_lease, _ensure_can_transition
+from cayu.tasks._lifecycle import _ensure_active_task_lease, _ensure_can_transition
 from cayu.tasks.cancellation import _task_cancellation_requested
 from cayu.tasks.contracts import (
     CompletionDecision,

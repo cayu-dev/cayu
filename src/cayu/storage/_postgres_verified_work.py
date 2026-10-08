@@ -34,6 +34,7 @@ from cayu.runtime.work_attempt_lifecycle import (
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage._phase_timing import PostgresTimingScope, timed_postgres_connection
 from cayu.tasks import _verified_work_policy as verified_work_support
+from cayu.tasks._lifecycle import _ensure_exact_owned_active_task_lease
 from cayu.tasks.admission import (
     WORK_ATTEMPT_RENEWABLE_STATES,
     AdmittedCompletionProposalRequest,
@@ -63,7 +64,6 @@ from cayu.tasks.admission import (
     work_attempt_admission_prepare_sha256,
     work_attempt_execution_claim_request_sha256,
 )
-from cayu.tasks.base import _ensure_exact_owned_active_task_lease
 from cayu.tasks.completion_evaluations import (
     CompletionEvaluationRun,
     CompletionEvaluationRunRequest,
