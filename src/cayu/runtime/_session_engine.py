@@ -670,8 +670,6 @@ from cayu.sessions.base import (
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
-    EventOrder,
-    EventQuery,
     ForkExecutionProfileDecisionRecord,
     ForkExecutionProfileSelection,
     ForkSessionRequest,
@@ -795,6 +793,7 @@ from cayu.sessions.checkpoints import (
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )
 from cayu.sessions.cleanup import RecoveryCleanup, RecoveryCleanupSupervisor
+from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
     INTERACTION_SUMMARY_EVENT_TYPES,

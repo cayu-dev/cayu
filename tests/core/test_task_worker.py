@@ -57,7 +57,6 @@ from cayu.sessions._invocation_terminal_decision import (
 from cayu.sessions._terminal_evidence import interruption_request_id_from_payload
 from cayu.sessions.base import (
     EnqueueSessionMessageRequest,
-    EventQuery,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionsRecoveryRequest,
@@ -74,6 +73,7 @@ from cayu.sessions.base import (
     SessionStore,
     run_request_with_task_invocation,
 )
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.invocation import TaskExecutionSource
 from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore

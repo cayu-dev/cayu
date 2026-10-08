@@ -25,7 +25,7 @@ from cayu.messages import FilePart, Message, ToolResultPart
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
-from cayu.sessions.base import EventQuery, InMemorySessionStore, ResumeRequest, RunRequest
+from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest
 from cayu.sessions.context_views import (
     ContextViewLimits,
     ContextViewOwnershipRequest,
@@ -35,6 +35,7 @@ from cayu.sessions.context_views import (
     ParticipantSessionExecutionRequest,
     RecipientSessionCreationRequest,
 )
+from cayu.sessions.event_queries import EventQuery
 
 
 @pytest.mark.anyio

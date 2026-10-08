@@ -92,7 +92,7 @@ def test_failed_workflow_report_reopens_without_dispatch(tmp_path):
 
     from cayu._validation import canonical_durable_json_bytes
     from cayu.evals.reporting import load_eval_run, render_html_report, write_eval_run_json
-    from cayu.sessions.base import EventQuery
+    from cayu.sessions.event_queries import EventQuery
 
     async def scenario():
         path = tmp_path / "reopen.sqlite"

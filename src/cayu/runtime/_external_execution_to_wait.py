@@ -294,7 +294,7 @@ class _ExternalExecutionToWait:
         """Reuse exact post-model validation evidence during native recovery."""
         from cayu._validation import canonical_durable_json_bytes
         from cayu.events import EventType, copy_event
-        from cayu.sessions.base import EventQuery
+        from cayu.sessions.event_queries import EventQuery
 
         invocation.require_runtime_authority()
         if invocation.recovery_claim_id is None:

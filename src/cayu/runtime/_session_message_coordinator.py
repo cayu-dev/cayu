@@ -27,7 +27,6 @@ from cayu.runtime.session_message_lifecycle import (
 from cayu.sessions.base import (
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
-    EventQuery,
     SessionMessageActionResult,
     SessionMessageInspection,
     SessionMessageInspectionRecord,
@@ -35,6 +34,7 @@ from cayu.sessions.base import (
     SessionStore,
     copy_enqueue_session_message_request,
 )
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import Session
 from cayu.vaults.redaction import SecretRedactor
 

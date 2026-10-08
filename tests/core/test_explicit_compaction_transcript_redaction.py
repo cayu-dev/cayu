@@ -36,11 +36,11 @@ from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions.base import (
     CompactSessionRequest,
-    EventQuery,
     InMemorySessionStore,
     RunRequest,
     TranscriptSnapshot,
 )
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import SessionStatus
 from cayu.tools.exposure import ToolCapabilityCeiling
 from cayu.vaults import REDACTED_SECRET, SecretRedactor

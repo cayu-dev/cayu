@@ -27,7 +27,6 @@ from cayu.runtime.evidence import (
     runtime_evidence,
 )
 from cayu.sessions.base import (
-    EventQueryResultTooLarge,
     InMemorySessionStore,
     RunRequest,
     SessionIdentity,
@@ -35,6 +34,7 @@ from cayu.sessions.base import (
     SessionLineageResult,
     SessionStore,
 )
+from cayu.sessions.event_queries import EventQueryResultTooLarge
 from cayu.sessions.queries import SessionListResult, SessionQuery
 from cayu.sessions.records import SessionStatus
 from cayu.storage.migrations import SchemaMode

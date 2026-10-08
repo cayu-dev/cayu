@@ -45196,5 +45196,9 @@
     "tests/core/test_session_query_package_layout.py::test_session_queries_filter_and_page_without_loading_stores[cayu.runtime]": 0.2400293750106357,
     "tests/core/test_session_query_package_layout.py::test_session_queries_filter_and_page_without_loading_stores[cayu.sessions]": 0.22042874997714534,
     "tests/core/test_session_query_package_layout.py::test_session_queries_filter_and_page_without_loading_stores[cayu]": 0.2221107080404181,
-    "tests/core/test_session_query_package_layout.py::test_session_query_public_imports_and_historical_pickle_globals": 0.5157543329987675
+    "tests/core/test_session_query_package_layout.py::test_session_query_public_imports_and_historical_pickle_globals": 0.5157543329987675,
+    "tests/core/test_session_query_package_layout.py::test_event_queries_select_records_without_loading_stores[cayu.runtime]": 0.20968070696108043,
+    "tests/core/test_session_query_package_layout.py::test_event_queries_select_records_without_loading_stores[cayu.sessions]": 0.21012079098727554,
+    "tests/core/test_session_query_package_layout.py::test_event_queries_select_records_without_loading_stores[cayu]": 0.2553176239889581,
+    "tests/core/test_session_query_package_layout.py::test_event_query_public_imports_and_historical_pickle_globals": 0.0006710829911753535
 }

@@ -276,7 +276,7 @@ class ScopedSessionAccess:
             _query_bounds.reset(token)
 
     async def events(self, query=None, *, max_bytes: int = 1_048_576):
-        from cayu.sessions.base import copy_event_query
+        from cayu.sessions.event_queries import copy_event_query
 
         query = copy_event_query(query)
         if type(max_bytes) is not int or not 1 <= max_bytes <= 4_194_304:
@@ -286,7 +286,7 @@ class ScopedSessionAccess:
         )
 
     async def usage(self, query=None, *, by_session: bool = False):
-        from cayu.sessions.base import copy_event_query
+        from cayu.sessions.event_queries import copy_event_query
 
         query = copy_event_query(query)
         return await self._query(
@@ -294,7 +294,7 @@ class ScopedSessionAccess:
         )
 
     async def costs(self, pricing, query=None, *, by_session: bool = False):
-        from cayu.sessions.base import copy_event_query
+        from cayu.sessions.event_queries import copy_event_query
 
         query = copy_event_query(query)
         return await self._query(

@@ -5174,7 +5174,7 @@ def test_interrupted_fresh_revalidation_preserves_contradictory_lineage():
         _CaptureState,
         _revalidate_fresh_capture,
     )
-    from cayu.sessions.base import EventQuery
+    from cayu.sessions.event_queries import EventQuery
     from cayu.sessions.records import RunnerObservedEventIdentity
     from cayu.sessions.terminal_evidence import TerminalSessionEvidenceLimits
 

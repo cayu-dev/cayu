@@ -10,7 +10,8 @@ from cayu.cli.project import project_context
 from cayu.coding_products import CodingProductState
 from cayu.events import EventType
 from cayu.runners.docker_workload import DockerImageIdentity
-from cayu.sessions.base import EventQuery, InMemorySessionStore
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.event_queries import EventQuery
 from cayu.storage.memory import InMemoryKnowledgeStore
 from cayu.tasks.memory import InMemoryTaskStore
 from tests.cli.test_scaffold_coding_budget import denial_policy

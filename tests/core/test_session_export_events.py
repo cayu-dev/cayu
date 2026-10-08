@@ -25,7 +25,8 @@ from cayu.runtime._event_projection import (
     project_runtime_event,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.sessions.base import EventQuery, InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.event_queries import EventQuery
 from cayu.vaults.redaction import SecretRedactor
 
 

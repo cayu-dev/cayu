@@ -32,7 +32,7 @@ from cayu import (
 )
 from cayu.events import validate_public_custom_event_type
 from cayu.observability.events import InMemoryEventSink
-from cayu.sessions.base import EventQuery
+from cayu.sessions.event_queries import EventQuery
 from cayu.workflows import WorkflowBase
 
 _RESERVED_EVENT_TYPE = "custom.cayu.probe"

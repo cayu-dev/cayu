@@ -447,6 +447,10 @@ and can filter and page session records without a store. Public imports resolve
 to these definitions. Native stores retain authorization, event-aware filtering,
 clock sampling, locking, SQL and transactions.
 
+`sessions/event_queries.py` owns event query contracts, validated copies and pure
+record selection. Store authorization and session-aware event filtering stay in
+the stores; the query module requires only event and record contracts.
+
 ### Session checkpoint evidence
 
 `sessions/_checkpoint_preservation.py` owns callback-visible checkpoint copies,

@@ -232,7 +232,6 @@ from cayu.sessions._tool_effect_intent import ToolEffectIntent
 from cayu.sessions.base import (
     _MCP_MANIFEST_BASELINE_MAX_TOOLS,
     INHERIT_INTERACTION,
-    EventQuery,
     McpManifestBaseline,
     McpManifestBaselineLoadResult,
     McpManifestHistoryConflict,
@@ -246,6 +245,7 @@ from cayu.sessions.base import (
     resolve_interaction_attribution,
     runtime_publication_checkpoint_value_digest,
 )
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import Session, SessionStatus
 from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools import _shared_artifact_results as shared_artifact_results

@@ -37,7 +37,6 @@ from cayu.runtime import _session_engine as session_engine_module
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.sessions.base import (
     EnqueueSessionMessageRequest,
-    EventQuery,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionsRecoveryRequest,
@@ -53,6 +52,7 @@ from cayu.sessions.base import (
     SessionRunFenced,
     SessionStatusConflict,
 )
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
     InteractionStatus,

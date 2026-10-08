@@ -10,7 +10,8 @@ from cayu.applications import CayuApp
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import EventQuery, InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import ToolContext

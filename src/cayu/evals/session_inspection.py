@@ -9,7 +9,8 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from cayu.events import Event, EventType
-from cayu.sessions.base import EventOrder, EventQuery, SessionLineageQuery, SessionStore
+from cayu.sessions.base import SessionLineageQuery, SessionStore
+from cayu.sessions.event_queries import EventOrder, EventQuery
 
 
 class EvalDiagnosticV1(BaseModel):

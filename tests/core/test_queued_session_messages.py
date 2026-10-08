@@ -45,7 +45,6 @@ from cayu.sessions.base import (
     QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY,
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
     EnqueueSessionMessageRequest,
-    EventQuery,
     InMemorySessionStore,
     InterruptSessionRequest,
     QueuedInteractionProfileHandoff,
@@ -60,6 +59,7 @@ from cayu.sessions.base import (
     _canonical_runtime_publication_digest,
     _model_completion_stage_dispatch_storage_key,
 )
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tasks.creation import TaskCreate

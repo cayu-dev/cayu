@@ -14,7 +14,8 @@ from cayu.budgets.usage import session_usage_summary
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.runtime._usage_accounting import SessionUsageCache, UsageAccountingReducer
-from cayu.sessions.base import EventQuery, InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.event_queries import EventQuery
 from cayu.storage import SQLiteSessionStore
 
 _KINDS = (

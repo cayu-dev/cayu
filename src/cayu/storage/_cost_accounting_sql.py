@@ -101,7 +101,7 @@ def changed_cost_groups_statement(
     dialect: session_sql.SessionStoreSqlDialect,
     extra_clauses: Sequence[session_sql.SqlClause] = (),
 ) -> tuple[str, tuple[object, ...]]:
-    from cayu.sessions.base import copy_event_query
+    from cayu.sessions.event_queries import copy_event_query
 
     assert read.previous is not None
     previous = read.previous.through_sequence
@@ -163,7 +163,7 @@ def changed_cost_groups_statement(
 
 
 def cost_boundary_statement(query, *, dialect, extra_clauses=()):
-    from cayu.sessions.base import EventQuery
+    from cayu.sessions.event_queries import EventQuery
 
     session_id = query.session_id or (query.session_ids[0] if len(query.session_ids) == 1 else None)
     plan = session_sql.build_accounting_event_query_sql(

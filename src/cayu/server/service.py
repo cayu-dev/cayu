@@ -71,14 +71,12 @@ from cayu.server.config import (
 )
 from cayu.server.contracts import SystemDiagnosticsResponse
 from cayu.sessions.base import (
-    EventOrder,
-    EventQuery,
-    EventQueryResultTooLarge,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     ResumeRequest,
     RunRequest,
 )
+from cayu.sessions.event_queries import EventOrder, EventQuery, EventQueryResultTooLarge
 from cayu.sessions.invocation import (
     InvocationOrigin,
     InvocationOriginTrust,

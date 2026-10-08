@@ -11,13 +11,8 @@ from cayu.budgets.pricing import ModelPrice, PriceBook, estimate_causal_budget_c
 from cayu.budgets.usage import causal_budget_usage_summary, session_usage_summary
 from cayu.events import Event, EventType
 from cayu.messages import Message
-from cayu.sessions.base import (
-    EventQuery,
-    InMemorySessionStore,
-    RunRequest,
-    SessionIdentity,
-    UsageRollupQuery,
-)
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity, UsageRollupQuery
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.queries import SessionAggregateFilter
 from cayu.storage import SQLiteSessionStore
 

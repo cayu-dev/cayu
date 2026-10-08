@@ -51,8 +51,6 @@ from cayu.providers.operations import (
 )
 from cayu.runtime._model_errors import model_provider_error_from_payload
 from cayu.sessions.base import (
-    EventOrder,
-    EventQuery,
     ModelCompletionStage,
     ModelCompletionStageRelease,
     SessionOperationPublication,
@@ -60,6 +58,7 @@ from cayu.sessions.base import (
     SessionStatusConflict,
     SessionStore,
 )
+from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 from cayu.sessions.records import SessionStatus
 from cayu.vaults.redaction import SecretRedactor

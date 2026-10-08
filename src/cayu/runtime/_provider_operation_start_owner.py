@@ -59,7 +59,8 @@ from cayu.runtime.provider_operation_cancellation import (
     ProviderOperationCancellationLifecycle,
 )
 from cayu.runtime.provider_operations import provider_operation_started_event_id
-from cayu.sessions.base import EventQuery, SessionRunFenced, SessionStatusConflict, SessionStore
+from cayu.sessions.base import SessionRunFenced, SessionStatusConflict, SessionStore
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import Session, SessionStatus
 
 _PROVIDER_OPERATION_START_SETTLEMENT_TIMEOUT_SECONDS = 5.0

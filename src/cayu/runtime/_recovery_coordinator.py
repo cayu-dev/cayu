@@ -430,8 +430,6 @@ from cayu.sessions.base import (
     RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS,
     ActiveModelCompletionStage,
     CheckpointTransform,
-    EventOrder,
-    EventQuery,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
@@ -471,6 +469,7 @@ from cayu.sessions.cleanup import (
     RecoveryCleanupStepInput,
     RecoveryCleanupSupervisor,
 )
+from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
     INTERACTION_TERMINAL_EVENT_TYPES,

@@ -28,7 +28,8 @@ from cayu.sessions._execution_profile_checkpoint import (
 from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
 from cayu.sessions._pending_tool_round import PendingToolRound, pending_tool_round_identity
 from cayu.sessions._pending_tool_round_reader import pending_tool_round_from_checkpoint
-from cayu.sessions.base import EventOrder, EventQuery, SessionStore
+from cayu.sessions.base import SessionStore
+from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import INTERACTION_LIFECYCLE_EVENT_TYPES
 from cayu.sessions.records import Session
 from cayu.tools.base import ToolResult

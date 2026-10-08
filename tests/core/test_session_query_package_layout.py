@@ -136,3 +136,54 @@ else:
 """,
         public_module,
     )
+
+
+def test_event_query_public_imports_and_historical_pickle_globals():
+    from cayu.sessions import base, event_queries
+
+    surfaces = [importlib.import_module(name) for name in ("cayu", "cayu.sessions", "cayu.runtime")]
+    for name in ("EventOrder", "EventQuery", "EventQueryResultTooLarge"):
+        canonical = getattr(event_queries, name)
+        assert getattr(base, name) is canonical
+        assert all(getattr(surface, name) is canonical for surface in surfaces)
+        assert pickle.loads(f"ccayu.sessions.base\n{name}\n.".encode()) is canonical
+
+
+@pytest.mark.parametrize("public_module", ("cayu", "cayu.sessions", "cayu.runtime"))
+def test_event_queries_select_records_without_loading_stores(public_module):
+    _assert_store_independent(
+        """
+from datetime import UTC, datetime, timedelta
+from cayu.events import Event, EventType
+from cayu.sessions.event_queries import _event_record_matches, copy_event_query
+
+stamp = datetime(2026, 1, 1, tzinfo=UTC)
+query = public.EventQuery(
+    session_id="session", event_types=[EventType.SESSION_COMPLETED],
+    after_sequence=1, before_sequence=3, since=stamp, until=stamp + timedelta(seconds=1),
+)
+record = public.EventRecord(sequence=2, event=Event(
+    type=EventType.SESSION_COMPLETED, session_id="session", timestamp=stamp,
+))
+allowed = frozenset(str(kind) for kind in query.event_types)
+assert _event_record_matches(record, query, allowed, frozenset())
+assert not _event_record_matches(record, query, allowed, allowed)
+for changes in ({"after_sequence": 2}, {"before_sequence": 2}, {"session_id": "other"},
+                {"until": stamp, "since": None}):
+    copied = copy_event_query(query, update=changes)
+    assert not _event_record_matches(record, copied, allowed, frozenset())
+assert query.session_id == "session" and query.after_sequence == 1
+assert pickle.loads(pickle.dumps(query)) == query
+assert get_type_hints(public.EventQuery)
+assert public.EventQuery.model_json_schema()
+try:
+    copy_event_query(query, update={"after_sequence": 3})
+except ValueError:
+    pass
+else:
+    raise AssertionError("Query copy bypassed sequence-bound validation")
+error = public.EventQueryResultTooLarge(64)
+assert error.max_bytes == 64 and str(error) == "Event query exceeds the 64-byte safety limit."
+""",
+        public_module,
+    )

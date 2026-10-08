@@ -45,12 +45,12 @@ from cayu.runtime.tool_effects import (
 )
 from cayu.sessions import _tool_effect_intent as tool_effect_intent
 from cayu.sessions.base import (
-    EventQuery,
     RuntimePublicationMutation,
     SessionOperationPublication,
     SessionStore,
     apply_runtime_publication_checkpoint_mutation,
 )
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import Session
 
 EffectState = Literal[

@@ -109,7 +109,6 @@ from cayu.server.sse import (
     SSE_SEND_TIMEOUT_SECONDS,
 )
 from cayu.sessions.base import (
-    EventQuery,
     ForkSessionRequest,
     InMemorySessionStore,
     InterruptSessionRequest,
@@ -125,6 +124,7 @@ from cayu.sessions.base import (
     run_request_with_runtime_generated_authority,
 )
 from cayu.sessions.checkpoints import CURRENT_CHECKPOINT_SCHEMA_VERSION
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.queries import SessionListResult
 from cayu.sessions.records import EventRecord, SessionStatus
 from cayu.sessions.recovery import RecoveryExecutionRequest, RecoveryPlan

@@ -153,9 +153,9 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "DelegatedActionReference": ("cayu.sessions.base", "DelegatedActionReference"),
     "EnqueueSessionMessageRequest": ("cayu.sessions.base", "EnqueueSessionMessageRequest"),
     "EnqueueSessionMessageResult": ("cayu.sessions.base", "EnqueueSessionMessageResult"),
-    "EventOrder": ("cayu.sessions.base", "EventOrder"),
-    "EventQuery": ("cayu.sessions.base", "EventQuery"),
-    "EventQueryResultTooLarge": ("cayu.sessions.base", "EventQueryResultTooLarge"),
+    "EventOrder": ("cayu.sessions.event_queries", "EventOrder"),
+    "EventQuery": ("cayu.sessions.event_queries", "EventQuery"),
+    "EventQueryResultTooLarge": ("cayu.sessions.event_queries", "EventQueryResultTooLarge"),
     "EventRecord": ("cayu.sessions.records", "EventRecord"),
     "EventSummary": ("cayu.sessions.base", "EventSummary"),
     "ForkExecutionProfileDecisionRecord": (

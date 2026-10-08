@@ -12,7 +12,8 @@ from tests.core.test_run_limits import _controller
 from cayu.budgets.base import BudgetLimit
 from cayu.events import Event, EventType
 from cayu.messages import Message
-from cayu.sessions.base import EventQuery, InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.event_queries import EventQuery
 from cayu.storage import PostgresSessionStore, SQLiteSessionStore
 from cayu.storage.migrations import SchemaMode
 

@@ -11,13 +11,13 @@ from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.events import Event
 from cayu.messages import Message
 from cayu.sessions.base import (
-    EventQuery,
     RunRequest,
     SessionIdentity,
     SessionOperationPublication,
     SessionRunFenced,
     SessionStore,
 )
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionStatus
 

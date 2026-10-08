@@ -363,8 +363,6 @@ from cayu.sessions._terminal_evidence import interruption_request_id_from_payloa
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.base import (
     CheckpointTransform,
-    EventOrder,
-    EventQuery,
     ModelCompletionStage,
     ModelCompletionStageAbandonmentResult,
     ModelCompletionStageRequest,
@@ -375,6 +373,7 @@ from cayu.sessions.base import (
     runtime_publication_checkpoint_mutation,
 )
 from cayu.sessions.cleanup import RecoveryCleanupSupervisor
+from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.records import Session, SessionStatus
 from cayu.tools.catalogue import (
     CALL_TOOL_NAME,

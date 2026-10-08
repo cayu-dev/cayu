@@ -17,7 +17,6 @@ from cayu.messages import ToolResultPart
 from cayu.providers.base import ModelStreamEvent
 from cayu.sessions.base import (
     CompactSessionRequest,
-    EventQuery,
     InMemorySessionStore,
     Message,
     ResumeRequest,
@@ -44,6 +43,7 @@ from cayu.sessions.context_views import (
     RecipientSessionCreationRequest,
     project_context_view_extensions,
 )
+from cayu.sessions.event_queries import EventQuery
 from cayu.storage.sqlite import SQLiteSessionStore
 
 
@@ -1882,7 +1882,7 @@ async def _public_creation_cancellation_replays_after_sqlite_reopen(tmp_path, af
 
     from cayu.agents import AgentSpec
     from cayu.evals.testing import ScriptedModelProvider
-    from cayu.sessions.base import EventQuery
+    from cayu.sessions.event_queries import EventQuery
     from cayu.storage.collaboration_sqlite import SQLiteCollaborationStore
 
     entered = asyncio.Event()
@@ -2290,7 +2290,7 @@ async def _test_public_participant_session_creation_is_inert_and_replayable() ->
     from cayu.agents import AgentSpec
     from cayu.collaboration.memory import InMemoryCollaborationStore
     from cayu.evals.testing import ScriptedModelProvider
-    from cayu.sessions.base import EventQuery
+    from cayu.sessions.event_queries import EventQuery
 
     class EnabledStore(InMemorySessionStore):
         context_view_version = 1

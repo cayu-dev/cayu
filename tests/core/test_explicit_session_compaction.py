@@ -67,7 +67,6 @@ from cayu.runtime.execution_profiles import (
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions.base import (
     CompactSessionRequest,
-    EventQuery,
     ForkSessionRequest,
     InMemorySessionStore,
     ResumeRequest,
@@ -79,6 +78,7 @@ from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec

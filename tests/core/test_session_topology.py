@@ -15,8 +15,6 @@ from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.sessions.base import (
     SESSION_TOPOLOGY_MAX_NODES,
-    EventQuery,
-    EventQueryResultTooLarge,
     InMemorySessionStore,
     RunRequest,
     SessionIdentity,
@@ -31,6 +29,7 @@ from cayu.sessions.base import (
     build_session_topology_result,
     decode_session_topology_cursor,
 )
+from cayu.sessions.event_queries import EventQuery, EventQueryResultTooLarge
 from cayu.sessions.records import SessionStatus
 
 

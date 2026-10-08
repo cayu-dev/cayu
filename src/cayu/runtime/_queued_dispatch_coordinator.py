@@ -33,7 +33,6 @@ from cayu.sessions._terminal_evidence import (
 )
 from cayu.sessions.base import (
     ActiveModelCompletionStage,
-    EventQuery,
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
     RunRequest,
@@ -44,6 +43,7 @@ from cayu.sessions.base import (
     _queued_dispatch_terminal_receipts_from_checkpoint,
     session_fork_profile_relationship,
 )
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import Session, SessionStatus
 from cayu.tasks.contracts import TaskCompletionDecisionRequired
 from cayu.tasks.dispatch import (

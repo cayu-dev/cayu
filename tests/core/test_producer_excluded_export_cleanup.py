@@ -17,7 +17,7 @@ from cayu.collaboration._session_export_store import digest
 from cayu.collaboration.access import CollaborationAccessDenied
 from cayu.collaboration.participants import CollaborationUnavailable
 from cayu.events import EventType
-from cayu.sessions.base import EventQuery
+from cayu.sessions.event_queries import EventQuery
 
 
 async def process_readback(backend, address, command, *, failure_resolution=None):

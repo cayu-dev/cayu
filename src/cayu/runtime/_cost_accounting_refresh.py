@@ -20,7 +20,7 @@ from cayu.runtime._cost_accounting import (
 )
 
 if TYPE_CHECKING:
-    from cayu.sessions.base import EventQuery
+    from cayu.sessions.event_queries import EventQuery
     from cayu.sessions.records import EventRecord
 
 
@@ -125,7 +125,7 @@ class CostAccountingRead:
         through_sequence: int = 0,
         authority: CostAccountingAuthority | None = None,
     ) -> None:
-        from cayu.sessions.base import copy_event_query
+        from cayu.sessions.event_queries import copy_event_query
 
         if type(details) is not bool or type(by_session) is not bool:
             raise TypeError("Cost accounting output flags must be bools.")
@@ -221,7 +221,7 @@ class CostAccountingRead:
         )
 
     def _matches(self, record: EventRecord, query: EventQuery) -> bool:
-        from cayu.sessions.base import _event_record_matches
+        from cayu.sessions.event_queries import _event_record_matches
 
         return _event_record_matches(
             record, query, frozenset(str(kind) for kind in COST_EVENT_TYPES), frozenset()

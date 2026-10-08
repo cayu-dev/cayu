@@ -75,9 +75,6 @@ from cayu.runtime.public_authority import (
     PublicAuthorityAliasKeyring,
 )
 from cayu.sessions.base import (
-    EventOrder,
-    EventQuery,
-    EventQueryResultTooLarge,
     PendingActionKind,
     PendingActionQuery,
     RunRequest,
@@ -91,6 +88,7 @@ from cayu.sessions.base import (
     _McpManifestBaselineEvidenceInvalid,
     fork_session_invocation,
 )
+from cayu.sessions.event_queries import EventOrder, EventQuery, EventQueryResultTooLarge
 from cayu.sessions.invocation import (
     InvocationOriginClaim,
     InvocationOriginTrust,

@@ -22,13 +22,13 @@ from cayu.runtime._event_projection import public_event_id
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.sessions.base import (
     PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES,
-    EventQuery,
     InMemorySessionStore,
     PersistedEventSideEffectClaimLost,
     PersistedEventSideEffectStatus,
     RunRequest,
     SessionIdentity,
 )
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import EventRecord
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 

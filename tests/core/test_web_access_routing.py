@@ -51,7 +51,7 @@ from cayu.runtime.execution_profiles import (
     execution_profile_from_session_metadata,
 )
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
-from cayu.sessions.base import EventQuery
+from cayu.sessions.event_queries import EventQuery
 from cayu.tools import WebFetchAdapterRequest
 from cayu.tools.base import (
     ToolContext,

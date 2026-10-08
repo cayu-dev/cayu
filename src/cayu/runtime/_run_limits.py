@@ -123,12 +123,12 @@ from cayu.runtime.stop_policy import (
     first_reached_limit,
 )
 from cayu.sessions.base import (
-    EventQuery,
     ModelCompletionStage,
     SessionOperationPublication,
     SessionRunFenced,
     SessionStore,
 )
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import Session, SessionStatus
 from cayu.tools.inference import InferenceLimits
 

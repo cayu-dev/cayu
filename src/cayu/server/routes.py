@@ -306,8 +306,6 @@ from cayu.sessions.base import (
     SESSION_MESSAGE_CONTENT_MAX_BYTES,
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
-    EventOrder,
-    EventQuery,
     InterruptSessionRequest,
     ModelFailoverPolicy,
     ModelTarget,
@@ -335,6 +333,7 @@ from cayu.sessions.base import (
     run_request_with_runtime_invocation,
 )
 from cayu.sessions.checkpoints import CheckpointCompatibilityError
+from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
     INTERACTION_TERMINAL_EVENT_TYPES,

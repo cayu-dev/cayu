@@ -77,8 +77,6 @@ from cayu.sessions._terminal_evidence import (
 )
 from cayu.sessions.base import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
-    EventOrder,
-    EventQuery,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryResult,
     SessionRuntimePublicationConflict,
@@ -88,6 +86,7 @@ from cayu.sessions.base import (
     _incomplete_recovery_claim_from_checkpoint,
 )
 from cayu.sessions.cleanup import RecoveryCleanupStepInput
+from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.records import Session, SessionStatus
 from cayu.vaults.redaction import SecretRedactor
 

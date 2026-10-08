@@ -23,12 +23,12 @@ from cayu.runtime._event_projection import REDACTED_CUSTOM_EVENT_TYPE, public_ev
 from cayu.server import ServerConfig, ServerLifecycleConfig, create_server
 from cayu.server.sse import SSE_REPLAY_PAGE_EVENTS
 from cayu.sessions.base import (
-    EventQuery,
     InMemorySessionStore,
     RunRequest,
     SessionIdentity,
     SessionStateSnapshot,
 )
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import EventRecord, SessionStatus
 from cayu.storage.migrations import SchemaMode
 from cayu.vaults.redaction import SecretRedactor

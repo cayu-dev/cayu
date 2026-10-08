@@ -43,7 +43,8 @@ from cayu.providers import (
 )
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._event_projection import public_event_sequence
-from cayu.sessions.base import EventQuery, InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.event_queries import EventQuery
 
 
 def test_context_counting_oversized_result_fails_at_boundary_without_blocking_model():

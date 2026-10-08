@@ -62,7 +62,6 @@ from cayu.runtime._workflow_structured_output_handoff import (
     WorkflowStructuredOutputHandoff,
 )
 from cayu.sessions.base import (
-    EventQuery,
     IncompleteSessionsRecoveryRequest,
     InMemorySessionStore,
     ModelCompletionStageDisposition,
@@ -70,6 +69,7 @@ from cayu.sessions.base import (
     RunRequest,
     SessionIdentity,
 )
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.invocation import InvocationOriginTrust, SessionExecutionSource
 from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore

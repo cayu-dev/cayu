@@ -58,7 +58,6 @@ from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import (
-    EventQuery,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
@@ -76,6 +75,7 @@ from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.recovery import (
     RecoveryBlockerCode,

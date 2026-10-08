@@ -24,8 +24,6 @@ from cayu.sessions.base import (
     TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
     BudgetReservationIdentityConflict,
     EnqueueSessionMessageRequest,
-    EventOrder,
-    EventQuery,
     ForkSessionRequest,
     ModelCompletionStageRequest,
     PendingActionQuery,
@@ -42,6 +40,7 @@ from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
+from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.queries import SessionAggregateFilter, SessionQuery
 from cayu.sessions.records import RUNTIME_BUILD_PROVENANCE_METADATA_KEY, Session, SessionStatus
 from cayu.storage import _session_store_sql as session_store_sql
@@ -4451,7 +4450,7 @@ def _make_event(session_id: str, *, seq: int, timestamp) -> Event:
 
 
 def test_sqlite_events_reconstructed_from_columns_without_event_json(tmp_path):
-    from cayu.sessions.base import EventQuery
+    from cayu.sessions.event_queries import EventQuery
 
     db_path = tmp_path / "sessions.sqlite"
     store = SQLiteSessionStore(db_path)

@@ -25,7 +25,8 @@ from cayu.observability.watchers import (
     InMemoryEventWatcherStore,
 )
 from cayu.runtime.application_lifecycle import ApplicationAdmissionsSealed
-from cayu.sessions.base import EventQuery, InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.event_queries import EventQuery
 
 
 class _OwnedWatcherStore(InMemoryEventWatcherStore):

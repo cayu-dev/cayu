@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Literal
 
 from cayu.events import EventType
-from cayu.sessions.base import EventOrder, EventQuery, copy_event_query
+from cayu.sessions.event_queries import EventOrder, EventQuery, copy_event_query
 from cayu.sessions.queries import (
     LabelSelectorOperator,
     LabelSelectorRequirement,

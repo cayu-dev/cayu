@@ -13,7 +13,8 @@ from cayu.coding_products import CodingProductArtifactRepository
 from cayu.deadlines import ExecutionDeadline, ExecutionDeadlineExceeded
 from cayu.events import EventType
 from cayu.runners.docker_workload import DockerImageIdentity
-from cayu.sessions.base import EventQuery, InMemorySessionStore
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import SessionStatus
 from cayu.storage.memory import InMemoryKnowledgeStore
 from cayu.tasks.memory import InMemoryTaskStore

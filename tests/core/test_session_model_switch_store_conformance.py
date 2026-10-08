@@ -10,7 +10,6 @@ from cayu.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.messages import Message, ProviderStatePart, TextPart, ThinkingPart
 from cayu.sessions.base import (
     MODEL_TARGET_PROJECTION_METADATA_KEY,
-    EventQuery,
     InMemorySessionStore,
     ModelTarget,
     RunRequest,
@@ -20,6 +19,7 @@ from cayu.sessions.base import (
     SessionStore,
     session_input_messages_sha256,
 )
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import SessionStatus
 
 

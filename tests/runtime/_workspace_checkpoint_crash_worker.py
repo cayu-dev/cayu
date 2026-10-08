@@ -24,7 +24,8 @@ from cayu.events import EventType
 from cayu.messages import Message
 from cayu.runners import DockerRunner
 from cayu.runtime._runtime_records import RegisteredEnvironment
-from cayu.sessions.base import EventQuery, RunRequest
+from cayu.sessions.base import RunRequest
+from cayu.sessions.event_queries import EventQuery
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.workspaces import RunnerWorkspace
 from cayu.workspaces.checkpoint_lifecycle import (

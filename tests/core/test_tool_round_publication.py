@@ -36,7 +36,6 @@ from cayu.sessions._pending_tool_round import (
     pending_tool_round_identity,
 )
 from cayu.sessions.base import (
-    EventQuery,
     InMemorySessionStore,
     RunRequest,
     RuntimePublicationReceipt,
@@ -45,6 +44,7 @@ from cayu.sessions.base import (
     SessionIdentity,
     SessionRuntimePublicationConflict,
 )
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import Session, SessionStatus
 from cayu.tools.base import ToolResult
 

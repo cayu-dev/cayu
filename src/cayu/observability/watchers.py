@@ -22,7 +22,7 @@ from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
 from cayu.runtime._diagnostics import exception_diagnostic
-from cayu.sessions.base import EventOrder, EventQuery, copy_event_query
+from cayu.sessions.event_queries import EventOrder, EventQuery, copy_event_query
 from cayu.sessions.records import EventRecord
 from cayu.vaults import SecretRedactor
 

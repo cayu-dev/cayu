@@ -39,11 +39,11 @@ from cayu.runtime.session_message_lifecycle import (
 from cayu.server import AuthContext, ServerConfig, create_server
 from cayu.sessions.base import (
     EnqueueSessionMessageRequest,
-    EventQuery,
     InMemorySessionStore,
     RunRequest,
     SessionIdentity,
 )
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.vaults.redaction import SecretRedactor

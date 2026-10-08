@@ -21,9 +21,6 @@ from cayu.sessions.base import DeferredInteractionInput as DeferredInteractionIn
 from cayu.sessions.base import DelegatedActionReference as DelegatedActionReference
 from cayu.sessions.base import EnqueueSessionMessageRequest as EnqueueSessionMessageRequest
 from cayu.sessions.base import EnqueueSessionMessageResult as EnqueueSessionMessageResult
-from cayu.sessions.base import EventOrder as EventOrder
-from cayu.sessions.base import EventQuery as EventQuery
-from cayu.sessions.base import EventQueryResultTooLarge as EventQueryResultTooLarge
 from cayu.sessions.base import EventSummary as EventSummary
 from cayu.sessions.base import (
     ForkExecutionProfileDecisionRecord as ForkExecutionProfileDecisionRecord,
@@ -308,6 +305,9 @@ from cayu.sessions.context_views import (
 from cayu.sessions.context_views import (
     RecipientSessionCreationRequest as RecipientSessionCreationRequest,
 )
+from cayu.sessions.event_queries import EventOrder as EventOrder
+from cayu.sessions.event_queries import EventQuery as EventQuery
+from cayu.sessions.event_queries import EventQueryResultTooLarge as EventQueryResultTooLarge
 from cayu.sessions.execution import SessionExecutionConfig as SessionExecutionConfig
 from cayu.sessions.execution import SessionExecutionState as SessionExecutionState
 from cayu.sessions.exports import SessionExportBoundary as SessionExportBoundary

@@ -63,13 +63,13 @@ from cayu.runtime._run_limits import (
 )
 from cayu.runtime.stop_policy import StopLimit
 from cayu.sessions.base import (
-    EventQuery,
     InMemorySessionStore,
     ResumeRequest,
     RunRequest,
     SessionIdentity,
     SessionRunFenced,
 )
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import Session, SessionStatus
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling

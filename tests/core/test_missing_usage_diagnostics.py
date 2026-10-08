@@ -21,7 +21,8 @@ from cayu.budgets.base import BudgetLimit, budget_check_from_events, budget_chec
 from cayu.budgets.pricing import ModelPrice, PriceBook, estimate_session_cost
 from cayu.context.base import ContextBuildError
 from cayu.providers import ModelProvider, ModelProviderError
-from cayu.sessions.base import CompactSessionRequest, EventQuery, SessionIdentity, UsageRollupQuery
+from cayu.sessions.base import CompactSessionRequest, SessionIdentity, UsageRollupQuery
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import SessionStatus
 from cayu.storage import SQLiteSessionStore
 

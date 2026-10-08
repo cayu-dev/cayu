@@ -2330,7 +2330,7 @@ class InMemoryBudgetStore(BudgetStore):
             cost_pending_events,
         )
         from cayu.runtime._cost_accounting_refresh import CostAccountingRead
-        from cayu.sessions.base import _event_record_matches
+        from cayu.sessions.event_queries import _event_record_matches
 
         if scope == "causal":
             raise ValueError(
@@ -2398,7 +2398,7 @@ class SessionBudgetStore(BudgetStore):
         key: str | None,
         window: BudgetWindow,
     ) -> list[Event]:
-        from cayu.sessions.base import EventQuery
+        from cayu.sessions.event_queries import EventQuery
 
         window = copy_budget_window(window)
         since, until = window.bounds()
@@ -2460,7 +2460,7 @@ class SessionBudgetStore(BudgetStore):
 def _budget_cost_query(
     *, scope: BudgetScope, key: str | None, window: BudgetWindow, now: datetime | None
 ):
-    from cayu.sessions.base import EventQuery
+    from cayu.sessions.event_queries import EventQuery
 
     since, until = copy_budget_window(window).bounds(now)
     if scope not in {"app", "agent", "causal"}:

@@ -34,7 +34,8 @@ from cayu.evals.workflow_target import (
 )
 from cayu.messages import Message
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import EventQuery, RunRequest
+from cayu.sessions.base import RunRequest
+from cayu.sessions.event_queries import EventQuery
 from tests.qualification.repository_maintenance_case import SEED_FILES
 
 

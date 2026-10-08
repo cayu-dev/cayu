@@ -42,7 +42,7 @@ async def conformance(store):
             identity=SessionIdentity(provider_name="fake", model="fake"),
         )
     from cayu.events import Event, EventType
-    from cayu.sessions.base import EventQuery
+    from cayu.sessions.event_queries import EventQuery
 
     for suffix in ("a", "b", "c"):
         await store.append_event(

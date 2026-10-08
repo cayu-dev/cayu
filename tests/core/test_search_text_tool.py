@@ -27,7 +27,8 @@ from cayu.providers.openai import build_openai_payload
 from cayu.runners.base import ExecCommand, ExecResult, Runner, RunnerUnavailableError
 from cayu.runners.local import LocalRunner
 from cayu.runtime._event_projection import project_runtime_event
-from cayu.sessions.base import EventQuery, InMemorySessionStore, RunRequest
+from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.event_queries import EventQuery
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._runner import InvocationRunnerHandle
 from cayu.tools.base import ToolContext, ToolExecutableRequirement

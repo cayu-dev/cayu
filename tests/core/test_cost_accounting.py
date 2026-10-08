@@ -10,7 +10,7 @@ from cayu.budgets.pricing import ModelPrice, PriceBook, estimate_session_cost, s
 from cayu.budgets.usage import session_usage_summary
 from cayu.events import Event, EventType
 from cayu.runtime._cost_accounting import CostAccountingReducer, cost_group_key
-from cayu.sessions.base import EventQuery
+from cayu.sessions.event_queries import EventQuery
 
 
 def _pricing():

@@ -22,7 +22,8 @@ from cayu.sessions._foreground_child_checkpoint import (
     ForegroundParentContinuation,
     foreground_child_state_from_checkpoint,
 )
-from cayu.sessions.base import EventQuery, SessionStore
+from cayu.sessions.base import SessionStore
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.pending_actions import pending_action_evidence_round_from_checkpoint
 from cayu.sessions.records import Session, SessionStatus
 

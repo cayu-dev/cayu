@@ -75,7 +75,6 @@ from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import (
-    EventQuery,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
@@ -87,6 +86,7 @@ from cayu.sessions.base import (
     SessionIdentity,
     runtime_publication_request_digest,
 )
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import SessionStatus
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.commands import ExecCommandTool

@@ -27,7 +27,7 @@ from cayu.budgets.usage import (
 from cayu.events import EventType
 
 if TYPE_CHECKING:
-    from cayu.sessions.base import EventQuery
+    from cayu.sessions.event_queries import EventQuery
     from cayu.sessions.records import EventRecord
 
 USAGE_ACCOUNTING_PAGE_SIZE = 256
@@ -59,7 +59,7 @@ class UsageAccountingSnapshot(BaseModel):
 
 
 def usage_accounting_query(query: EventQuery) -> EventQuery:
-    from cayu.sessions.base import EventOrder, copy_event_query
+    from cayu.sessions.event_queries import EventOrder, copy_event_query
 
     query = copy_event_query(query)
     if query.event_type is not None or query.event_types or query.exclude_event_types:
@@ -109,7 +109,7 @@ class SessionUsageCache:
         cache so it never serves a result computed under a different scope.
         """
         from cayu.sessions.access import _query_bounds
-        from cayu.sessions.base import EventQuery
+        from cayu.sessions.event_queries import EventQuery
 
         session_id = query.session_id
         if by_session or by_identity or session_id is None or _query_bounds.get() is not None:

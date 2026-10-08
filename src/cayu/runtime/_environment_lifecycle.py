@@ -216,8 +216,6 @@ from cayu.sessions._terminal_evidence import (
 )
 from cayu.sessions.base import (
     CheckpointTransform,
-    EventOrder,
-    EventQuery,
     QueuedInteractionProfileHandoff,
     RuntimePublicationCheckpointOperation,
     RuntimePublicationMutation,
@@ -234,6 +232,7 @@ from cayu.sessions.base import (
     _initial_transcript_pending_interaction_id,
     session_user_metadata,
 )
+from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.records import Session, SessionStatus
 from cayu.tools._operation_boundary import BoundedInvocationOperationRegistry
 from cayu.vaults.redaction import SecretRedactor

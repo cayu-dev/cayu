@@ -573,8 +573,6 @@ from cayu.sessions.base import (
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
-    EventOrder,
-    EventQuery,
     ForkSessionRequest,
     ForkSourceSnapshot,
     IncompleteSessionRecoveryRequest,
@@ -636,6 +634,7 @@ from cayu.sessions.context_views import (
     project_context_view_extensions,
     require_independent_context_view_material,
 )
+from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.execution import (
     SessionExecutionConfig,
     SessionExecutionState,

@@ -247,8 +247,6 @@ from cayu.sessions.base import (
     BudgetReservationIdentityConflict,
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
-    EventOrder,
-    EventQuery,
     ForkExecutionProfileSelection,
     ForkSessionRequest,
     ForkSystemPromptReplacement,
@@ -302,6 +300,7 @@ from cayu.sessions.checkpoints import (
     CheckpointCompatibilityError,
 )
 from cayu.sessions.child_context import ChildSessionContextContributor
+from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import INTERACTION_LIFECYCLE_EVENT_TYPES
 from cayu.sessions.invocation import (
     InvocationOriginClaim,

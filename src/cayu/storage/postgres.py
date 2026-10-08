@@ -553,8 +553,6 @@ from cayu.sessions.base import (
     DeferredInteractionInput,
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
-    EventQuery,
-    EventQueryResultTooLarge,
     EventSummary,
     ForkCheckpointAuthorityDecoder,
     ForkSystemPromptReplacement,
@@ -789,7 +787,6 @@ from cayu.sessions.base import (
     build_session_topology_result,
     checkpoint_root_field_projection_from_storage,
     copy_enqueue_session_message_request,
-    copy_event_query,
     copy_run_request,
     copy_session_identity,
     copy_session_lineage_query,
@@ -830,6 +827,7 @@ from cayu.sessions.base import (
     transform_fork_checkpoint,
     validate_persisted_event_side_effect_error,
 )
+from cayu.sessions.event_queries import EventQuery, EventQueryResultTooLarge, copy_event_query
 from cayu.sessions.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
     INTERACTION_TERMINAL_EVENT_TYPES,

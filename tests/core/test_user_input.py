@@ -48,7 +48,6 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions.base import (
-    EventQuery,
     ForkSessionRequest,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
@@ -65,6 +64,7 @@ from cayu.sessions.checkpoints import (
     CheckpointCompatibilityError,
     decode_runtime_checkpoint,
 )
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import Session, SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec

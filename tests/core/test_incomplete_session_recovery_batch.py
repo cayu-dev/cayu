@@ -11,8 +11,6 @@ from cayu.applications import CayuApp
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.sessions.base import (
-    EventOrder,
-    EventQuery,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
@@ -21,6 +19,7 @@ from cayu.sessions.base import (
     RunRequest,
     SessionIdentity,
 )
+from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.queries import MAX_SESSION_LIST_CURSOR_BYTES, SessionListResult, SessionQuery
 from cayu.sessions.records import EventRecord, SessionStatus
 

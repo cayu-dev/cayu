@@ -14,7 +14,7 @@ from cayu.events import EventType
 from cayu.execution_profiles import (
     ExecutionProfileIdentity,
 )
-from cayu.sessions.base import EventQuery
+from cayu.sessions.event_queries import EventQuery
 from cayu.vaults.redaction import SecretRedactor
 
 

@@ -15,12 +15,12 @@ from cayu.sessions._foreground_child_checkpoint import (
     foreground_child_state_from_checkpoint,
 )
 from cayu.sessions.base import (
-    EventQuery,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
     SessionRunFenced,
     SessionStore,
 )
+from cayu.sessions.event_queries import EventQuery
 
 
 class _RecoverTerminalSession(Protocol):
