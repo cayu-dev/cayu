@@ -50,6 +50,7 @@ from cayu.sessions.base import (
 )
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
+    _DecodedRuntimeCheckpoint,
     decode_runtime_checkpoint,
     validate_runtime_checkpoint_root_projection,
 )
@@ -283,6 +284,21 @@ class _RuntimeCheckpointSessionStore:
             checkpoint = None
             raise
 
+    async def _load_decoded_runtime_checkpoint(self, session_id: str) -> _DecodedRuntimeCheckpoint:
+        load_checkpoint = self.load_checkpoint
+        if (
+            getattr(load_checkpoint, "__func__", None)
+            is _RuntimeCheckpointSessionStore.load_checkpoint
+        ):
+            load_checkpoint = self._store.load_checkpoint
+        # An override can enforce its own read policy. Preserve it even when
+        # that requires admitting its result again before transferring it.
+        checkpoint = await load_checkpoint(session_id)
+        try:
+            return _DecodedRuntimeCheckpoint(checkpoint, session_id=session_id)
+        finally:
+            checkpoint = None
+
     async def load_session_checkpoint_snapshot(
         self,
         session_id: str,
@@ -309,11 +325,16 @@ class _RuntimeCheckpointSessionStore:
             if session.id != session_id:
                 raise RuntimeError("Checkpoint snapshot received another session's authority.")
             decoded = decode_runtime_checkpoint(checkpoint, session_id=session_id)
+            unchanged = decoded == checkpoint
             snapshot = (
                 session.model_copy(deep=True),
-                (None if decoded is None else copy_durable_json_object(decoded, "checkpoint")),
+                (
+                    decoded
+                    if unchanged or decoded is None
+                    else copy_durable_json_object(decoded, "checkpoint")
+                ),
             )
-            if decoded == checkpoint:
+            if unchanged:
                 return None
             return decoded
 

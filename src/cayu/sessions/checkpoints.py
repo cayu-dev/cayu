@@ -523,6 +523,37 @@ def decode_runtime_checkpoint(
         raise error from None
 
 
+class _DecodedRuntimeCheckpoint:
+    """Transfer one privately owned, decoded snapshot to a reader exactly once.
+
+    Construction always validates and detaches the complete document. The
+    snapshot stays private until consumption, so readers can reuse that JSON
+    validation without certifying secrets, domain records or session authority.
+    """
+
+    __slots__ = ("_checkpoint", "_session_id")
+
+    def __init__(self, checkpoint: dict[str, Any] | None, *, session_id: str) -> None:
+        self._session_id: str | None = session_id
+        self._checkpoint: dict[str, Any] | None = None
+        try:
+            self._checkpoint = decode_runtime_checkpoint(checkpoint, session_id=session_id)
+        finally:
+            checkpoint = None
+
+    def take(self, *, session_id: str) -> dict[str, Any] | None:
+        if self._session_id is None:
+            raise RuntimeError("Decoded checkpoint has already been consumed.")
+        if self._session_id != session_id:
+            self._checkpoint = None
+            self._session_id = None
+            raise ValueError("Decoded checkpoint belongs to another session.")
+        checkpoint = self._checkpoint
+        self._checkpoint = None
+        self._session_id = None
+        return checkpoint
+
+
 def runtime_checkpoint_writer_view(
     checkpoint: dict[str, Any] | None,
     *,
@@ -538,11 +569,13 @@ def runtime_checkpoint_writer_view(
         else decoded
     )
     if writer_version == CURRENT_CHECKPOINT_SCHEMA_VERSION:
-        return copy_durable_json_object(current, "checkpoint")
+        return current
     if writer_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9}:
         raise ValueError("Staged runtime publication uses an unsupported writer schema.")
 
-    projected = copy_durable_json_object(current, "checkpoint")
+    # Decoding already admitted and detached this private snapshot. Projection
+    # only consumes it locally; copying and validating it again adds no boundary.
+    projected = current
     if "session_exports" in projected:
         raise ValueError("Session export authority cannot be represented by an older writer.")
     if MODEL_FAILOVER_CHECKPOINT_KEY in projected:

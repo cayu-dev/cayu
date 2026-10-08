@@ -447,6 +447,11 @@ canonical publication records and decoder; the runtime adapter selects this
 composition through the existing task-local codec scope. Native stores retain
 the atomic publication, validation and persistence boundary.
 
+Pending tool-round loads can consume a fresh, privately owned runtime checkpoint
+decode once, then copy only the round for their detached result. Standalone
+readers still validate the complete input; secret and session-provenance checks
+run with every read's current context. No runtime checkpoint cache is added.
+
 `providers/retry_policy.py` owns immutable retry configuration, its default status
 codes and the policy validation helper. Saved tool rounds, approvals and runtime
 share the same policy class. Supported root and runtime imports resolve to that

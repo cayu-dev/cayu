@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 from cayu._validation import copy_durable_json_value
@@ -9,6 +10,7 @@ from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
 from cayu.sessions.base import Session, SessionStore
+from cayu.sessions.checkpoints import _DecodedRuntimeCheckpoint
 from cayu.vaults.redaction import SecretRedactor, contains_redacted_secret
 
 
@@ -27,10 +29,34 @@ async def load_pending_tool_round(
     already inside a checkpoint transform use the synchronous parser instead.
     """
 
-    checkpoint = await session_store.load_checkpoint(session_id)
+    checkpoint = None
+    copied_checkpoint = None
+    decoded = None
     try:
-        return checkpoint, pending_tool_round_from_checkpoint(
+        load_decoded = getattr(session_store, "_load_decoded_runtime_checkpoint", None)
+        if callable(load_decoded) and getattr(load_decoded, "__self__", None) is session_store:
+            decoded = await load_decoded(session_id)
+            if type(decoded) is not _DecodedRuntimeCheckpoint:
+                raise TypeError("Runtime checkpoint reader must return a decoded snapshot.")
+            checkpoint = decoded.take(session_id=session_id)
+        else:
+            checkpoint = await session_store.load_checkpoint(session_id)
+        if type(consume_on_rejection) is not bool:
+            raise TypeError("consume_on_rejection must be a bool.")
+        if checkpoint is None:
+            return None, None
+        if decoded is None:
+            copied_checkpoint = copy_durable_json_value(checkpoint, "checkpoint")
+        else:
+            # The decoder admitted the whole document and transferred its
+            # private snapshot without exposing it to a callback. Only the
+            # round needs another copy to keep the returned pair detached.
+            # Secret/provenance checks below still use this call's context.
+            key = pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY
+            copied_checkpoint = {key: deepcopy(checkpoint.get(key))}
+        return checkpoint, _pending_tool_round_from_owned_checkpoint(
             checkpoint,
+            copied_checkpoint,
             redactor=redactor,
             consume_on_rejection=consume_on_rejection,
             runtime_session=runtime_session,
@@ -39,6 +65,8 @@ async def load_pending_tool_round(
         # The parser clears rejected private data. Its loader must not retain
         # the original snapshot in an exception traceback either.
         checkpoint = None
+        copied_checkpoint = None
+        decoded = None
 
 
 def pending_tool_round_from_checkpoint(
