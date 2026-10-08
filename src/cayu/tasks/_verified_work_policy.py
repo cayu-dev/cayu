@@ -14,8 +14,8 @@ from cayu.tasks.base import (
     CompletionDecisionApplicationReceipt,
     _ensure_active_task_lease,
     _ensure_can_transition,
-    _task_cancellation_requested,
 )
+from cayu.tasks.cancellation import _task_cancellation_requested
 from cayu.tasks.contracts import (
     CompletionDecision,
     CompletionDecisionApplicationRequest,

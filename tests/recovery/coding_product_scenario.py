@@ -51,14 +51,12 @@ from cayu.sessions.recovery import (
     RecoveryPlanRequest,
     RecoveryPlanSelection,
 )
-from cayu.tasks.base import (
+from cayu.tasks.base import TaskCreate, TaskQuery, TaskStatus
+from cayu.tasks.cancellation import (
     TaskCancellationReconciliationEvent,
     TaskCancellationReconciliationEvidence,
     TaskCancellationReconciliationOutcome,
     TaskCancellationReconciliationRequest,
-    TaskCreate,
-    TaskQuery,
-    TaskStatus,
 )
 from cayu.tasks.worker import run_task_worker
 from cayu.workspaces.local import LocalWorkspace

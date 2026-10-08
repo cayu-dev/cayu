@@ -37,8 +37,8 @@ from cayu.tasks.base import (
     WorkAttemptLifecycleReceipt,
     WorkAttemptPreparationHoldReceipt,
     _ensure_exact_owned_active_task_lease,
-    _task_cancellation_requested,
 )
+from cayu.tasks.cancellation import _task_cancellation_requested
 from cayu.tasks.contracts import (
     CompletionDecision,
     CompletionProposal,

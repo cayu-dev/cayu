@@ -73,7 +73,7 @@ assert not {
 
 
 def test_task_contracts_preserve_public_and_legacy_identity():
-    from cayu.tasks import base, handoff, records, terminalization, topology
+    from cayu.tasks import base, cancellation, handoff, records, terminalization, topology
 
     public = [importlib.import_module(name) for name in ("cayu", "cayu.tasks", "cayu.runtime")]
     for owner, names in (
@@ -107,6 +107,18 @@ def test_task_contracts_preserve_public_and_legacy_identity():
                 "TaskInterruptedHandoffRequest",
                 "TaskInterruptedHandoffReceipt",
                 "InterruptedTaskContinuationClaimPage",
+            ),
+        ),
+        (
+            cancellation,
+            (
+                "TaskCancellationReconciliationRequest",
+                "TaskCancellationReconciliationResult",
+                "TaskCancellationReconciliation",
+                "TaskCancellationReconciliationEvidence",
+                "TaskRetryCancellationReconciliationRequest",
+                "TaskRetryCancellationReconciliation",
+                "TaskRetryCancellationReconciliationEvidence",
             ),
         ),
         (
@@ -170,6 +182,14 @@ page = public.InterruptedTaskContinuationClaimPage(
 for value in (terminal, handoff, page):
     assert type(pickle.loads(pickle.dumps(value))) is type(value)
     assert get_type_hints(type(value))
+for contract in (
+    public.TaskCancellationReconciliationRequest,
+    public.TaskCancellationReconciliationResult,
+    public.TaskRetryCancellationReconciliationRequest,
+    public.TaskRetryCancellationReconciliation,
+):
+    assert contract.model_json_schema()
+    assert get_type_hints(contract)
 assert not {
     "cayu.tasks.base", "cayu.tasks.memory", "cayu.tasks.store",
     "cayu.storage.tasks_sqlite", "cayu.storage.sqlite", "cayu.storage.postgres",
