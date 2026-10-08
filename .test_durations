@@ -45009,5 +45009,12 @@
     "tests/core/test_completion_evaluations.py::test_store_fences_evaluation_intents_and_settles_once[sqlite]": 0.17585887596942484,
     "tests/core/test_completion_evaluations.py::test_unreconciled_run_is_recorded_unknown_and_the_next_run_proceeds": 0.030401957919821143,
     "tests/core/test_completion_evaluations.py::test_unsettled_run_is_reconciled_instead_of_run_again": 0.027435040974523872,
-    "tests/core/test_completion_evaluations.py::test_verifier_request_rejects_a_receipt_from_another_chain": 0.02551304205553606
+    "tests/core/test_completion_evaluations.py::test_verifier_request_rejects_a_receipt_from_another_chain": 0.02551304205553606,
+    "tests/core/test_verified_work_session_closure.py::test_closure_erases_a_task_completed_by_the_verified_worker[memory]": 0.8473685820354149,
+    "tests/core/test_verified_work_session_closure.py::test_closure_erases_a_task_completed_by_the_verified_worker[postgres]": 2.256019834021572,
+    "tests/core/test_verified_work_session_closure.py::test_closure_erases_a_task_completed_by_the_verified_worker[sqlite]": 1.094968791003339,
+    "tests/core/test_verified_work_session_closure.py::test_closure_erases_a_verified_and_applied_contract_task[memory]": 0.2480227910564281,
+    "tests/core/test_verified_work_session_closure.py::test_closure_erases_a_verified_and_applied_contract_task[postgres]": 7.570828292926308,
+    "tests/core/test_verified_work_session_closure.py::test_closure_erases_a_verified_and_applied_contract_task[sqlite]": 0.5593005829723552,
+    "tests/core/test_verified_work_session_closure.py::test_deletion_plan_covers_owned_tables_children_first": 0.31929825007682666
 }

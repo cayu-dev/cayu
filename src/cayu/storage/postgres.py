@@ -44113,7 +44113,10 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
     ) -> None:
         """Delete a bounded, quiescent session task graph transactionally."""
         from cayu.storage._postgres_task_graphs import lock_task_graphs, require_deletion_ready
-        from cayu.storage._session_closure_sql import TASK_CLOSURE_DEPENDENCIES
+        from cayu.storage._session_closure_sql import (
+            TASK_CLOSURE_DEPENDENCIES,
+            task_closure_deletion_steps,
+        )
 
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
@@ -44178,15 +44181,26 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                       AND ccu.column_name = 'id'
                     """
                 )
-                for table, column in await cur.fetchall():
-                    if (table, column) not in TASK_CLOSURE_DEPENDENCIES:
-                        continue
-                    await cur.execute(
-                        sql.SQL("DELETE FROM {} WHERE {} = ANY(%s)").format(
+                discovered = {
+                    (table, column)
+                    for table, column in await cur.fetchall()
+                    if (table, column) in TASK_CLOSURE_DEPENDENCIES
+                }
+                for table, column, parent in task_closure_deletion_steps(discovered):
+                    if parent is None:
+                        statement = sql.SQL("DELETE FROM {} WHERE {} = ANY(%s)").format(
                             sql.Identifier(table), sql.Identifier(column)
-                        ),
-                        (list(task_ids),),
-                    )
+                        )
+                    else:
+                        statement = sql.SQL(
+                            "DELETE FROM {} WHERE {} IN (SELECT {} FROM {} WHERE task_id = ANY(%s))"
+                        ).format(
+                            sql.Identifier(table),
+                            sql.Identifier(column),
+                            sql.Identifier(column),
+                            sql.Identifier(parent),
+                        )
+                    await cur.execute(statement, (list(task_ids),))
                 await cur.execute(
                     "DELETE FROM cayu_tasks WHERE session_id = %s AND id = ANY(%s)",
                     (session_id, list(task_ids)),

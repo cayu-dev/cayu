@@ -4109,7 +4109,10 @@ class SQLiteTaskStore(TaskStore):
         this method owns the SQL dependency cleanup so receipts and attempt
         records cannot outlive their task rows.
         """
-        from cayu.storage._session_closure_sql import TASK_CLOSURE_DEPENDENCIES
+        from cayu.storage._session_closure_sql import (
+            TASK_CLOSURE_DEPENDENCIES,
+            task_closure_deletion_steps,
+        )
         from cayu.storage._sqlite_task_graphs import require_deletion_ready
 
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -4154,6 +4157,7 @@ class SQLiteTaskStore(TaskStore):
                         "SELECT name FROM sqlite_master WHERE type = 'table' "
                         "AND name NOT LIKE 'sqlite_%'"
                     ).fetchall()
+                    discovered: set[tuple[str, str]] = set()
                     for table_row in table_rows:
                         table = table_row["name"]
                         if table == "cayu_tasks":
@@ -4165,13 +4169,23 @@ class SQLiteTaskStore(TaskStore):
                             if foreign_key["table"] != "cayu_tasks":
                                 continue
                             column = foreign_key["from"]
-                            if (table, column) not in TASK_CLOSURE_DEPENDENCIES:
-                                continue
-                            self._connection.execute(
-                                f'DELETE FROM "{table.replace(chr(34), chr(34) * 2)}" '
-                                f'WHERE "{column.replace(chr(34), chr(34) * 2)}" IN ({placeholders})',
-                                task_ids,
+                            if (table, column) in TASK_CLOSURE_DEPENDENCIES:
+                                discovered.add((table, column))
+                    for table, column, parent in task_closure_deletion_steps(discovered):
+                        quoted_table = table.replace(chr(34), chr(34) * 2)
+                        quoted_column = column.replace(chr(34), chr(34) * 2)
+                        if parent is None:
+                            owned = f"({placeholders})"
+                        else:
+                            quoted_parent = parent.replace(chr(34), chr(34) * 2)
+                            owned = (
+                                f'(SELECT "{quoted_column}" FROM "{quoted_parent}" '
+                                f"WHERE task_id IN ({placeholders}))"
                             )
+                        self._connection.execute(
+                            f'DELETE FROM "{quoted_table}" WHERE "{quoted_column}" IN {owned}',
+                            task_ids,
+                        )
                     self._connection.execute(
                         f"DELETE FROM cayu_tasks WHERE session_id = ? AND id IN ({placeholders})",
                         (session_id, *task_ids),

@@ -54,6 +54,55 @@ TASK_CLOSURE_DEPENDENCIES = frozenset(
 )
 
 
+# Task-owned tables reference one another with RESTRICT, which SQLite and
+# PostgreSQL check per statement, so closure deletes children before parents.
+# Each step is (table, column, parent): with no parent, rows whose column is
+# one of the closed task IDs; with a parent, rows whose column is a key of the
+# parent's rows for those tasks. Verification and execution claims carry no
+# task ID and are reached through their proposal and admission.
+TASK_CLOSURE_DELETION_PLAN: tuple[tuple[str, str, str | None], ...] = (
+    ("cayu_completion_decision_application_receipts", "task_id", None),
+    ("cayu_completion_decisions", "task_id", None),
+    ("cayu_completion_verification_claims", "proposal_id", "cayu_completion_proposals"),
+    ("cayu_completion_verifier_profiles", "task_id", None),
+    ("cayu_completion_verifier_dispatches", "task_id", None),
+    ("cayu_completion_evaluation_runs", "task_id", None),
+    ("cayu_completion_proposals", "task_id", None),
+    ("cayu_work_attempts", "task_id", None),
+    ("cayu_work_attempt_lifecycle_receipts", "task_id", None),
+    ("cayu_work_attempt_execution_claims", "admission_id", "cayu_work_attempt_admissions"),
+    ("cayu_work_attempt_admissions", "task_id", None),
+    ("cayu_work_attempt_preparation_holds", "task_id", None),
+    ("cayu_local_execution_attempts", "task_id", None),
+    ("cayu_task_schedule_receipts", "task_id", None),
+    ("cayu_task_schedule_events", "task_id", None),
+)
+
+
+def task_closure_deletion_steps(
+    discovered: set[tuple[str, str]],
+) -> tuple[tuple[str, str, str | None], ...]:
+    """Order the owned dependencies found in this schema for deletion.
+
+    ``discovered`` holds the owned ``(table, "task_id")`` references to
+    ``cayu_tasks`` present in the schema. A parent-reached step runs when its
+    parent is present. Owned dependencies outside the plan have no known
+    dependents and are deleted first.
+    """
+
+    planned = {
+        (table, column) for table, column, parent in TASK_CLOSURE_DELETION_PLAN if not parent
+    }
+    unplanned = tuple((table, column, None) for table, column in sorted(discovered - planned))
+    ordered = tuple(
+        step
+        for step in TASK_CLOSURE_DELETION_PLAN
+        if (step[0], step[1]) in discovered
+        or (step[2] is not None and (step[2], "task_id") in discovered)
+    )
+    return unplanned + ordered
+
+
 def closure_size_statement(*, postgres: bool) -> tuple[str, int]:
     parameter = "%s" if postgres else "?"
     sources = (
