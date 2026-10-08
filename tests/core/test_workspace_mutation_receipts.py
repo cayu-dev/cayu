@@ -85,9 +85,9 @@ from cayu.sessions.base import (
     RuntimePublicationRequest,
     RuntimePublicationResult,
     SessionIdentity,
-    SessionStatus,
     runtime_publication_request_digest,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.commands import ExecCommandTool
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy

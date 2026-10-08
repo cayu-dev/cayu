@@ -28,7 +28,8 @@ from cayu.vaults.redaction import SecretRedactor
 if TYPE_CHECKING:
     from datetime import datetime
 
-    from cayu.sessions.base import Session, SessionOperationPublication
+    from cayu.sessions.base import SessionOperationPublication
+    from cayu.sessions.records import Session
 
 
 @dataclass(frozen=True)

@@ -5,11 +5,11 @@ from tests.core.test_tool_round_publication import _lifecycle_events, _quarantin
 
 from cayu.sessions._assistant_tool_round_publication import StagedToolCallTerminal
 from cayu.sessions._pending_tool_round import PendingToolRound
-from cayu.sessions.base import EventRecord
 from cayu.sessions.pending_actions import (
     _pending_tool_round_evidence,
     project_pending_action_event_record,
 )
+from cayu.sessions.records import EventRecord
 
 
 @pytest.mark.parametrize(

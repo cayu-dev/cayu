@@ -3933,9 +3933,6 @@ from cayu.sessions.base import (
 from cayu.sessions.base import MAX_PENDING_ACTION_RESULT_BYTES as MAX_PENDING_ACTION_RESULT_BYTES
 from cayu.sessions.base import MAX_SESSION_ID_BYTES as MAX_SESSION_ID_BYTES
 from cayu.sessions.base import MAX_SESSION_LIST_CURSOR_BYTES as MAX_SESSION_LIST_CURSOR_BYTES
-from cayu.sessions.base import (
-    RUNTIME_BUILD_PROVENANCE_METADATA_KEY as RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
-)
 from cayu.sessions.base import SESSION_RUNTIME_METADATA_KEYS as SESSION_RUNTIME_METADATA_KEYS
 from cayu.sessions.base import SESSION_RUNTIME_METADATA_PREFIX as SESSION_RUNTIME_METADATA_PREFIX
 from cayu.sessions.base import (
@@ -3972,7 +3969,6 @@ from cayu.sessions.base import EnqueueSessionMessageResult as EnqueueSessionMess
 from cayu.sessions.base import EventOrder as EventOrder
 from cayu.sessions.base import EventQuery as EventQuery
 from cayu.sessions.base import EventQueryResultTooLarge as EventQueryResultTooLarge
-from cayu.sessions.base import EventRecord as EventRecord
 from cayu.sessions.base import EventSummary as EventSummary
 from cayu.sessions.base import (
     ForkExecutionProfileDecisionRecord as ForkExecutionProfileDecisionRecord,
@@ -4021,10 +4017,8 @@ from cayu.sessions.base import PendingActionSession as PendingActionSession
 from cayu.sessions.base import ProfiledSessionForkResult as ProfiledSessionForkResult
 from cayu.sessions.base import PromptAnatomyTransitionReceipt as PromptAnatomyTransitionReceipt
 from cayu.sessions.base import ResumeRequest as ResumeRequest
-from cayu.sessions.base import RunnerObservedEventIdentity as RunnerObservedEventIdentity
 from cayu.sessions.base import RunRequest as RunRequest
 from cayu.sessions.base import SerializedRecordSummary as SerializedRecordSummary
-from cayu.sessions.base import Session as Session
 from cayu.sessions.base import SessionAggregateFilter as SessionAggregateFilter
 from cayu.sessions.base import SessionExecutionInProgress as SessionExecutionInProgress
 from cayu.sessions.base import SessionForkProfileRelationship as SessionForkProfileRelationship
@@ -4052,7 +4046,6 @@ from cayu.sessions.base import SessionQuery as SessionQuery
 from cayu.sessions.base import SessionQueuedMessage as SessionQueuedMessage
 from cayu.sessions.base import SessionQueuedMessagesPending as SessionQueuedMessagesPending
 from cayu.sessions.base import SessionStateSnapshot as SessionStateSnapshot
-from cayu.sessions.base import SessionStatus as SessionStatus
 from cayu.sessions.base import SessionStatusConflict as SessionStatusConflict
 from cayu.sessions.base import SessionStatusCounts as SessionStatusCounts
 from cayu.sessions.base import SessionStore as SessionStore
@@ -4070,7 +4063,6 @@ from cayu.sessions.base import TerminalSessionEvidenceErrorCode as TerminalSessi
 from cayu.sessions.base import TerminalSessionEvidenceLimits as TerminalSessionEvidenceLimits
 from cayu.sessions.base import TranscriptPage as TranscriptPage
 from cayu.sessions.base import TranscriptQuery as TranscriptQuery
-from cayu.sessions.base import TranscriptRecord as TranscriptRecord
 from cayu.sessions.base import TranscriptSearchHit as TranscriptSearchHit
 from cayu.sessions.base import TranscriptSearchQuery as TranscriptSearchQuery
 from cayu.sessions.base import TranscriptSearchResult as TranscriptSearchResult
@@ -4217,6 +4209,14 @@ from cayu.sessions.invocation import session_invocation_from_task as session_inv
 from cayu.sessions.outcomes import RunOutcome as RunOutcome
 from cayu.sessions.outcomes import StructuredOutputResult as StructuredOutputResult
 from cayu.sessions.outcomes import run_to_completion as run_to_completion
+from cayu.sessions.records import (
+    RUNTIME_BUILD_PROVENANCE_METADATA_KEY as RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
+)
+from cayu.sessions.records import EventRecord as EventRecord
+from cayu.sessions.records import RunnerObservedEventIdentity as RunnerObservedEventIdentity
+from cayu.sessions.records import Session as Session
+from cayu.sessions.records import SessionStatus as SessionStatus
+from cayu.sessions.records import TranscriptRecord as TranscriptRecord
 from cayu.sessions.recovery import RECOVERY_PLAN_MAX_CONCURRENCY as RECOVERY_PLAN_MAX_CONCURRENCY
 from cayu.sessions.recovery import RECOVERY_PLAN_MAX_INSPECTIONS as RECOVERY_PLAN_MAX_INSPECTIONS
 from cayu.sessions.recovery import RECOVERY_PLAN_MAX_ITEMS as RECOVERY_PLAN_MAX_ITEMS

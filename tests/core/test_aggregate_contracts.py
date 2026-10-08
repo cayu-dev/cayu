@@ -39,17 +39,16 @@ from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.providers import bedrock_billing_identity, completed_bedrock_billing_identity
 from cayu.sessions.base import (
-    EventRecord,
     InMemorySessionStore,
     RunRequest,
     SessionAggregateFilter,
     SessionIdentity,
     SessionOperationalSnapshot,
-    SessionStatus,
     SessionStatusCounts,
     SessionStore,
     UsageRollupQuery,
 )
+from cayu.sessions.records import EventRecord, SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.memory import InMemoryTaskStore

@@ -63,15 +63,12 @@ from cayu.sessions.base import (
     CheckpointTransform,
     DeferredInteractionInput,
     EventQuery,
-    EventRecord,
     ForkSessionRequest,
     InMemorySessionStore,
     InteractionTransitionSpec,
     ResumeRequest,
     RunRequest,
-    Session,
     SessionIdentity,
-    SessionStatus,
     SessionStore,
 )
 from cayu.sessions.checkpoints import (
@@ -79,6 +76,7 @@ from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
+from cayu.sessions.records import EventRecord, Session, SessionStatus
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore

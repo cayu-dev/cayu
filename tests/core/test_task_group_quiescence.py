@@ -2237,7 +2237,8 @@ async def test_group_observation_preserves_public_identifier_contracts(
     from tests.core.test_verified_task_worker import _RecordingProvider
 
     from cayu import AgentSpec, Message, RunRequest
-    from cayu.sessions.base import InMemorySessionStore, SessionStatus
+    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.records import SessionStatus
     from cayu.storage.postgres import PostgresSessionStore
     from cayu.storage.sqlite import SQLiteSessionStore
 

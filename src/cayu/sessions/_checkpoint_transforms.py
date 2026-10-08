@@ -15,7 +15,6 @@ from cayu.sessions._checkpoint_preservation import (
 )
 from cayu.sessions.base import (
     CheckpointTransform,
-    Session,
     SessionOperationPublication,
     StoreTimeCheckpointTransform,
 )
@@ -24,6 +23,7 @@ from cayu.sessions.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     decode_runtime_checkpoint,
 )
+from cayu.sessions.records import Session
 
 
 def _preserve_checkpoint(

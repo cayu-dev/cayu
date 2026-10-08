@@ -44,7 +44,7 @@ from cayu.evals.workflow_target import (
     workflow_eval_trial_session_id,
 )
 from cayu.messages import Message
-from cayu.sessions.base import SessionStatus
+from cayu.sessions.records import SessionStatus
 from cayu.workflows.journal import WORKFLOW_ATTEMPT_EVENT_TYPE
 
 

@@ -41,12 +41,12 @@ from cayu.sessions.base import (
     RunRequest,
     RuntimePublicationRequest,
     SessionModelCompletionStageConflict,
-    SessionStatus,
     SessionStatusConflict,
     SessionStore,
     model_completion_stage_settlement_request,
     runtime_publication_checkpoint_mutation,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.exposure import ToolCapabilityCeiling
 

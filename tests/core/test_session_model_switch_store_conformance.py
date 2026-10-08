@@ -16,11 +16,11 @@ from cayu.sessions.base import (
     RunRequest,
     SessionIdentity,
     SessionModelTransition,
-    SessionStatus,
     SessionStatusConflict,
     SessionStore,
     session_input_messages_sha256,
 )
+from cayu.sessions.records import SessionStatus
 
 
 async def _close_store(store: SessionStore) -> None:

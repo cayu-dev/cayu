@@ -11,9 +11,9 @@ from cayu.sessions.base import (
     PendingActionQuery,
     RunRequest,
     SessionIdentity,
-    SessionStatus,
     SessionStore,
 )
+from cayu.sessions.records import SessionStatus
 
 _MODEL_STEP_ID = f"mstep_{'1' * 32}"
 _MODEL_ATTEMPT_ID = f"matt_{'2' * 32}"

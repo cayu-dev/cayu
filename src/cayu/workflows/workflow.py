@@ -80,7 +80,6 @@ from cayu.sessions.base import (
     RuntimeSessionCreateClaimAuthenticationDisposition,
     RuntimeSessionCreateClaimReference,
     RuntimeSessionCreateClaimReferenceKey,
-    SessionStatus,
     authenticate_runtime_session_create_claim_reference,
     run_request_with_runtime_generated_authority,
     run_request_with_runtime_invocation,
@@ -88,6 +87,7 @@ from cayu.sessions.base import (
     runtime_session_create_claim_reference,
 )
 from cayu.sessions.invocation import SessionExecutionSource
+from cayu.sessions.records import SessionStatus
 from cayu.vaults.redaction import contains_redacted_secret
 from cayu.workflows._step_identity import (
     GATED_LOOP_STEP_ID_PREFIX,

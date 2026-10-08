@@ -369,14 +369,13 @@ from cayu.sessions.base import (
     ModelCompletionStageAbandonmentResult,
     ModelCompletionStageRequest,
     RuntimePublicationRequest,
-    Session,
-    SessionStatus,
     SessionStatusConflict,
     SessionStore,
     _current_session_interaction_id,
     runtime_publication_checkpoint_mutation,
 )
 from cayu.sessions.cleanup import RecoveryCleanupSupervisor
+from cayu.sessions.records import Session, SessionStatus
 from cayu.tools.catalogue import (
     CALL_TOOL_NAME,
     SEARCH_TOOLS_NAME,

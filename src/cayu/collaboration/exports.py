@@ -57,7 +57,7 @@ if TYPE_CHECKING:
         PeerContentReceipt,
         PeerModelAttemptOrigin,
     )
-    from cayu.sessions.base import TranscriptRecord
+    from cayu.sessions.records import TranscriptRecord
 
 
 SessionExportAction = Literal[

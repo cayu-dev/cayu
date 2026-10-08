@@ -64,7 +64,7 @@ from cayu.server.config import (
     ServerLifecycleConfig,
 )
 from cayu.server.contracts import SERVER_API_PREFIX
-from cayu.sessions.base import SessionStatus
+from cayu.sessions.records import SessionStatus
 
 __all__ = [
     "CorsSettings",

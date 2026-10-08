@@ -17,9 +17,9 @@ from cayu.sessions.base import (
     SessionOperationPublication,
     SessionQuery,
     SessionRunFenced,
-    SessionStatus,
     SessionStore,
 )
+from cayu.sessions.records import SessionStatus
 
 
 async def assert_session_store_time_conformance(

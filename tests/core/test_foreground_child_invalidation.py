@@ -19,8 +19,8 @@ from cayu.sessions.base import (
     PersistedEventSideEffectStatus,
     RunRequest,
     SessionQuery,
-    SessionStatus,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
 from cayu.tools.subagents import SubagentSpec, SubagentTool

@@ -701,7 +701,7 @@ def test_native_command_payload_has_no_permit_hash_cycle():
         temporary_admission_payload_sha256,
     )
     from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
-    from cayu.sessions.base import SessionStatus
+    from cayu.sessions.records import SessionStatus
     from cayu.tools.exposure import tool_capability_ceiling_from_session_metadata
 
     async def run():

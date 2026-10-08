@@ -30,8 +30,8 @@ from cayu.sessions.base import (
     Message,
     ResumeRequest,
     RunRequest,
-    SessionStatus,
 )
+from cayu.sessions.records import SessionStatus
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])

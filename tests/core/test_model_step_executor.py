@@ -34,9 +34,9 @@ from cayu.sessions.base import (
     EventQuery,
     InMemorySessionStore,
     RunRequest,
-    Session,
     SessionIdentity,
 )
+from cayu.sessions.records import Session
 
 
 def test_context_usage_state_uses_one_latest_completed_event_query() -> None:

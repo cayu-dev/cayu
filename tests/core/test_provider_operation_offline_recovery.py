@@ -130,12 +130,12 @@ from cayu.sessions.base import (
     RunRequest,
     SessionOperationPublication,
     SessionRunFenced,
-    SessionStatus,
     SessionStatusConflict,
     SessionStore,
     _deactivate_session_run_fence,
 )
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
+from cayu.sessions.records import SessionStatus
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.creation import TaskCreate

@@ -12,8 +12,9 @@ from cayu.events import Event, EventType, copy_event
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._session_execution_presence import SessionExecutionPresence
 from cayu.sessions._terminal_evidence import interruption_request_id_from_payload
-from cayu.sessions.base import EventOrder, EventQuery, SessionStatus, SessionStore
+from cayu.sessions.base import EventOrder, EventQuery, SessionStore
 from cayu.sessions.execution import SessionExecutionConfig
+from cayu.sessions.records import SessionStatus
 
 INTERRUPT_REQUESTED_SESSION_STATUSES = {
     SessionStatus.INTERRUPTING,

@@ -13,7 +13,6 @@ from cayu.sessions.base import (
     RuntimePublicationCheckpointOperation,
     RuntimePublicationMutation,
     RuntimePublicationRequest,
-    Session,
     _apply_runtime_publication_checkpoint_mutation,
     runtime_publication_checkpoint_value_digest,
 )
@@ -28,6 +27,7 @@ from cayu.sessions.checkpoints import (
     decode_runtime_checkpoint,
     runtime_checkpoint_writer_view,
 )
+from cayu.sessions.records import Session
 
 
 def _versioned_publication_request(

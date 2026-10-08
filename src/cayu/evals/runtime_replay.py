@@ -78,10 +78,10 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     ModelTarget,
     RunRequest,
-    SessionStatus,
     session_input_messages_sha256,
     session_user_metadata,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.exposure import (

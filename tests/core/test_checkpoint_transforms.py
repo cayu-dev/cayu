@@ -15,7 +15,7 @@ from tests._session_provenance import fixture_session_invocation
 
 import cayu
 from cayu.sessions import _checkpoint_transforms as transforms
-from cayu.sessions.base import ModelCompletionStageRelease, Session, SessionOperationPublication
+from cayu.sessions.base import ModelCompletionStageRelease, SessionOperationPublication
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY as VERSION,
 )
@@ -25,6 +25,7 @@ from cayu.sessions.checkpoints import (
 from cayu.sessions.checkpoints import (
     CheckpointCompatibilityError,
 )
+from cayu.sessions.records import Session
 
 _KINDS = ("checkpoint", "store_time_checkpoint", "operation", "store_time_operation")
 _FACTORIES = {

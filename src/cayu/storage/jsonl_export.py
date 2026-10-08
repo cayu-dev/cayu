@@ -52,11 +52,9 @@ from cayu.sessions._session_continuation_store import (
 )
 from cayu.sessions.base import (
     DeferredInteractionInput,
-    Session,
     SessionOrder,
     SessionQuery,
     SessionStore,
-    TranscriptRecord,
     restore_persisted_event_authority,
 )
 from cayu.sessions.checkpoints import decode_runtime_checkpoint
@@ -67,6 +65,7 @@ from cayu.sessions.exports import (
     validate_export_boundary,
     validate_export_ownership,
 )
+from cayu.sessions.records import Session, TranscriptRecord
 from cayu.tasks.queries import TaskOrder, TaskQuery
 from cayu.tasks.records import Task
 from cayu.tasks.store import TaskStore

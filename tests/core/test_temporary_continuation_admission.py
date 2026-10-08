@@ -28,7 +28,7 @@ from cayu.runtime._temporary_continuation import (
 from cayu.runtime._temporary_continuation_scope import temporary_admission_scope
 from cayu.runtime._temporary_service_budget import admitted_service_budget_constraint
 from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
-from cayu.sessions.base import SessionStatus
+from cayu.sessions.records import SessionStatus
 from cayu.tools.exposure import tool_capability_ceiling_from_session_metadata
 
 

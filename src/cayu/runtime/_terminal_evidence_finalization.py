@@ -79,9 +79,7 @@ from cayu.sessions.base import (
     EventQuery,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryResult,
-    Session,
     SessionRuntimePublicationConflict,
-    SessionStatus,
     SessionStore,
     _checkpoint_after_session_run_operation_cleanup,
     _event_with_session_run_operation,
@@ -90,6 +88,7 @@ from cayu.sessions.base import (
     _SessionRunOperation,
 )
 from cayu.sessions.cleanup import RecoveryCleanupStepInput
+from cayu.sessions.records import Session, SessionStatus
 from cayu.vaults.redaction import SecretRedactor
 
 _INTERRUPTION_REPAIR_JOIN_MAX_ATTEMPTS = 100

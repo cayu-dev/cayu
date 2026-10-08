@@ -10,19 +10,21 @@ from uuid import uuid4
 
 from cayu._validation import copy_durable_json_object, copy_label_map
 from cayu.sessions.base import (
-    RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     PendingActionSession,
     RunRequest,
-    Session,
     SessionIdentity,
     SessionOrder,
-    SessionStatus,
-    runtime_build_provenance_from_session_metadata,
     session_instance_id_for_run_request,
     session_invocation_for_run_request,
     session_metadata_for_creation,
 )
 from cayu.sessions.invocation import SessionInvocation, TaskInvocation
+from cayu.sessions.records import (
+    RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
+    Session,
+    SessionStatus,
+    runtime_build_provenance_from_session_metadata,
+)
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage._validated_cache import validated_row_cache
 from cayu.tasks.contracts import WorkContractRef

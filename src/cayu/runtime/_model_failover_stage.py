@@ -41,7 +41,6 @@ from cayu.sessions._model_failover import (
 )
 from cayu.sessions.base import (
     ModelCompletionStage,
-    Session,
     SessionModelCompletionStageConflict,
     SessionRunFenced,
 )
@@ -50,6 +49,7 @@ from cayu.sessions.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     decode_runtime_checkpoint,
 )
+from cayu.sessions.records import Session
 
 
 @dataclass(frozen=True, slots=True, repr=False)

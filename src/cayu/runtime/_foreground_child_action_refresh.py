@@ -30,13 +30,8 @@ from cayu.sessions._foreground_child_checkpoint import (
     foreground_child_state_from_checkpoint,
 )
 from cayu.sessions._invocation_terminal_decision import invocation_terminal_decision_from_checkpoint
-from cayu.sessions.base import (
-    Session,
-    SessionOperationPublication,
-    SessionRunFenced,
-    SessionStatus,
-    SessionStore,
-)
+from cayu.sessions.base import SessionOperationPublication, SessionRunFenced, SessionStore
+from cayu.sessions.records import Session, SessionStatus
 
 if TYPE_CHECKING:
     from cayu.runtime._child_session_identity import ChildSessionRecoveryMatcher

@@ -21,13 +21,13 @@ from cayu.runtime._run_limits import (
 )
 from cayu.runtime._session_control import SessionInterruptedByRequest
 from cayu.sessions._execution_profile_checkpoint import ActiveInvocationExecutionProfile
-from cayu.sessions.base import SessionStatus
 from cayu.sessions.cleanup import (
     RecoveryCleanupCapacityExceeded,
     RecoveryCleanupDeadlineExceeded,
     RecoveryCleanupPolicy,
     RecoveryCleanupSupervisor,
 )
+from cayu.sessions.records import SessionStatus
 
 
 @pytest.mark.parametrize("control", [asyncio.CancelledError, GeneratorExit, SystemExit])

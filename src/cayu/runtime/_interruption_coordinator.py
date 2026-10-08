@@ -23,13 +23,12 @@ from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.sessions._terminal_evidence import interruption_request_id_from_payload
 from cayu.sessions.base import (
     InterruptSessionRequest,
-    Session,
     SessionOrder,
     SessionQuery,
-    SessionStatus,
     SessionStore,
     _deactivate_session_run_fence,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.vaults import SecretRedactor
 
 logger = logging.getLogger(__name__)

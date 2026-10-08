@@ -7,8 +7,8 @@ from cayu.runtime._browser_control_model import (
     browser_model_control_epoch,
     validate_browser_model_publication,
 )
-from cayu.sessions.base import Session
 from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
+from cayu.sessions.records import Session
 from cayu.tools.browser_control import (
     BrowserControlAllocation,
     BrowserControlCheckpoint,

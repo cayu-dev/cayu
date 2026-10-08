@@ -17,7 +17,8 @@ from cayu import (
     SQLiteSessionStore,
     SQLiteTaskStore,
 )
-from cayu.sessions.base import Session, StoreTimeCheckpointTransform
+from cayu.sessions.base import StoreTimeCheckpointTransform
+from cayu.sessions.records import Session
 
 _PROCESS_LOSS_EXIT_CODE = 86
 

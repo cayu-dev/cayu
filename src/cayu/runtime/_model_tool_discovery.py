@@ -22,10 +22,10 @@ from cayu.providers.base import (
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.sessions.base import (
     RuntimePublicationOperationRecordMutation,
-    Session,
     SessionStore,
     runtime_publication_operation_record_value_digest,
 )
+from cayu.sessions.records import Session
 from cayu.tools.catalogue import ToolDescriptor
 from cayu.tools.discovery import (
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,

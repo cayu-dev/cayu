@@ -29,8 +29,8 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     RunRequest,
     SessionRunFenced,
-    SessionStatus,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolExecutableRequirement, ToolExecutionRequirement, ToolSpec
 from cayu.workspaces.local import LocalWorkspace

@@ -39,7 +39,8 @@ from cayu.sessions._temporary_continuation import (
 from cayu.vaults.redaction import SecretRedactor
 
 if TYPE_CHECKING:
-    from cayu.sessions.base import Session, SessionOperationPublication
+    from cayu.sessions.base import SessionOperationPublication
+    from cayu.sessions.records import Session
 
 
 def require_service_deadline(proposed: TemporaryServiceRecord, now: datetime) -> None:
@@ -283,7 +284,7 @@ def compose_same_session_admission(
 ) -> SessionOperationPublication:
     """Compose service ownership with the native invocation transaction result."""
     from cayu.sessions._temporary_continuation_scope import require_temporary_transition
-    from cayu.sessions.base import SessionStatus
+    from cayu.sessions.records import SessionStatus
 
     require_temporary_transition(admission)
     intent = admission.dispatch.intent

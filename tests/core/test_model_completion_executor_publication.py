@@ -35,9 +35,9 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     RunRequest,
     RuntimePublicationRequest,
-    Session,
     runtime_publication_checkpoint_mutation,
 )
+from cayu.sessions.records import Session
 from cayu.tools.exposure import ToolCapabilityCeiling
 
 

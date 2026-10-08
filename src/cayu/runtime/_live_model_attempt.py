@@ -152,7 +152,8 @@ from cayu.runtime.provider_operations import (
     provider_operation_progress_envelope,
 )
 from cayu.runtime.retry_policy import RetryDecision, RetrySuppression, retry_decision
-from cayu.sessions.base import RuntimePublicationOperationRecordMutation, Session, SessionStore
+from cayu.sessions.base import RuntimePublicationOperationRecordMutation, SessionStore
+from cayu.sessions.records import Session
 from cayu.tools.exposure import ResolvedToolExposure, resolved_tool_exposure_authority
 from cayu.tools.gateway import TargetedToolGatewayProjection
 from cayu.vaults.redaction import SecretRedactor

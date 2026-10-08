@@ -67,11 +67,10 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     ResumeRequest,
     RunRequest,
-    Session,
     SessionIdentity,
     SessionRunFenced,
-    SessionStatus,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy

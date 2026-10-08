@@ -28,7 +28,6 @@ from cayu.sessions.base import (
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
     EventQuery,
-    Session,
     SessionMessageActionResult,
     SessionMessageInspection,
     SessionMessageInspectionRecord,
@@ -36,6 +35,7 @@ from cayu.sessions.base import (
     SessionStore,
     copy_enqueue_session_message_request,
 )
+from cayu.sessions.records import Session
 from cayu.vaults.redaction import SecretRedactor
 
 

@@ -101,7 +101,8 @@ def cost_accounting_query(query: EventQuery) -> EventQuery:
 def cost_pending_events(query: EventQuery, events: tuple[Event, ...]) -> tuple[Event, ...]:
     """Copy and filter a bounded in-flight tail; stores additionally check causal membership."""
     from cayu.events import copy_event
-    from cayu.sessions.base import EventRecord, _event_record_matches, copy_event_query
+    from cayu.sessions.base import _event_record_matches, copy_event_query
+    from cayu.sessions.records import EventRecord
 
     if type(events) is not tuple:
         raise TypeError("additional_events must be a tuple.")

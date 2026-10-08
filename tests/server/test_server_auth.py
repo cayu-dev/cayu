@@ -1138,7 +1138,8 @@ def test_authenticated_run_rejects_identity_that_cannot_be_persisted() -> None:
 
 def _approval_capture_app() -> tuple[CayuApp, list]:
     from cayu.messages import Message
-    from cayu.sessions.base import RunRequest, SessionIdentity, SessionStatus
+    from cayu.sessions.base import RunRequest, SessionIdentity
+    from cayu.sessions.records import SessionStatus
 
     app = CayuApp()
     app.register_provider(OneShotProvider(), default=True)
@@ -1252,7 +1253,8 @@ def test_authenticated_resolution_rejects_body_resolved_by() -> None:
 
 def _resume_capture_app() -> tuple[CayuApp, list]:
     from cayu.messages import Message
-    from cayu.sessions.base import ResumeRequest, RunRequest, SessionIdentity, SessionStatus
+    from cayu.sessions.base import ResumeRequest, RunRequest, SessionIdentity
+    from cayu.sessions.records import SessionStatus
 
     app = CayuApp()
     app.register_provider(OneShotProvider(), default=True)

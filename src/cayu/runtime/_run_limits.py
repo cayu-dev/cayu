@@ -125,12 +125,11 @@ from cayu.runtime.stop_policy import (
 from cayu.sessions.base import (
     EventQuery,
     ModelCompletionStage,
-    Session,
     SessionOperationPublication,
     SessionRunFenced,
-    SessionStatus,
     SessionStore,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.tools.inference import InferenceLimits
 
 _TRUSTED_BINDING_PROVENANCE = object()

@@ -43,7 +43,8 @@ from cayu.runtime.work_attempt_lifecycle import (
     runtime_stop_reason_for_execution_stop,
     work_attempt_admission_authority_sha256,
 )
-from cayu.sessions.base import RunRequest, SessionStatus
+from cayu.sessions.base import RunRequest
+from cayu.sessions.records import SessionStatus
 from cayu.tasks.admission import (
     WORK_ATTEMPT_ADMISSION_LEASE_MAX_SECONDS,
     WorkAttemptAdmission,

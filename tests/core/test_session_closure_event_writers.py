@@ -27,7 +27,8 @@ from cayu.runtime.session_closure import (
     SessionClosureDisposition,
     SessionClosureRecord,
 )
-from cayu.sessions.base import SessionIdentity, SessionStatus
+from cayu.sessions.base import SessionIdentity
+from cayu.sessions.records import SessionStatus
 from cayu.tools import ReadFileTool, WriteFileTool
 
 

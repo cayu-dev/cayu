@@ -11,11 +11,10 @@ from cayu.events import Event
 from cayu.sessions.base import (
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
-    Session,
     SessionExecutionInProgress,
-    SessionStatus,
     SessionStore,
 )
+from cayu.sessions.records import Session, SessionStatus
 
 
 @dataclass(frozen=True)

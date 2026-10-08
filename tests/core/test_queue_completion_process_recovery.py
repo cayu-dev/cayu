@@ -26,9 +26,9 @@ from cayu.sessions.base import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     RunRequest,
-    SessionStatus,
     _interaction_transition_storage_key,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 
 _SESSION = "rejected-only-process-completion"

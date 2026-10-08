@@ -612,7 +612,7 @@ def test_runtime_unknown_external_effect_preserves_round_and_prevents_resume_dis
         )
         if signal == "close_intent_conflict":
             from cayu.runtime._recovery_coordinator import _approval_interrupt_close_intent_matches
-            from cayu.sessions.base import SessionStatus
+            from cayu.sessions.records import SessionStatus
 
             def inject_contradictory_close_intent(_session, checkpoint):
                 # Deliberately contradictory persisted evidence: real dispatch

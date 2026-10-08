@@ -67,8 +67,8 @@ from cayu.sessions.base import (
     InterruptSessionRequest,
     ResumeRequest,
     RunRequest,
-    SessionStatus,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.queries import TaskQuery

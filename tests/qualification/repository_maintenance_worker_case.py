@@ -5,7 +5,8 @@ import importlib
 
 from cayu.coding_products import CodingProductArtifactRepository, CodingProductRunner
 from cayu.events import EventType
-from cayu.sessions.base import EventQuery, SessionStatus
+from cayu.sessions.base import EventQuery
+from cayu.sessions.records import SessionStatus
 from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import TaskStatus
 from cayu.tasks.worker import run_task_worker

@@ -15,7 +15,8 @@ from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.tool_effects import ToolEffectConflict
-from cayu.sessions.base import ResumeRequest, RunRequest, SessionStatus
+from cayu.sessions.base import ResumeRequest, RunRequest
+from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.tools.rounds import ToolRoundRecoveryRequest

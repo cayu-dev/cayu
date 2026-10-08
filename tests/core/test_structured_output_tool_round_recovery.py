@@ -37,10 +37,9 @@ from cayu.sessions.base import (
     RuntimePublicationReceipt,
     RuntimePublicationRequest,
     RuntimePublicationResult,
-    Session,
-    SessionStatus,
     runtime_publication_checkpoint_mutation,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling
 from cayu.vaults import REDACTED_SECRET, SecretRedactor

@@ -42,7 +42,8 @@ from cayu.runtime._child_session_notifications import (
     child_session_notification_occurrence_id,
 )
 from cayu.runtime.public_authority import parse_public_authority_alias
-from cayu.sessions.base import Session, SessionStore
+from cayu.sessions.base import SessionStore
+from cayu.sessions.records import Session
 
 CHILD_SESSION_CONTEXT_PROJECTION_VERSION = "cayu.child-session-context.v1"
 CHILD_SESSION_RESULT_REFERENCE_VERSION = "cayu.child-session-result-reference.v1"

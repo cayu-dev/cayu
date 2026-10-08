@@ -25,8 +25,8 @@ from cayu.sessions.base import (
     RunRequest,
     SessionIdentity,
     SessionMessageInspection,
-    SessionStatus,
 )
+from cayu.sessions.records import SessionStatus
 
 
 @pytest.mark.parametrize(

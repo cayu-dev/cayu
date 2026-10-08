@@ -53,12 +53,12 @@ from cayu.sessions._pending_tool_round_reader import pending_tool_round_from_che
 from cayu.sessions.base import (
     RuntimePublicationRequest,
     RuntimePublicationResult,
-    SessionStatus,
     SessionStore,
     runtime_publication_checkpoint_mutation,
     runtime_publication_checkpoint_value_digest,
     runtime_publication_event_reference,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.tools import _argument_publication as tool_argument_publication
 
 _TOOL_ROUND_TERMINAL_EVENT_TYPES = frozenset(

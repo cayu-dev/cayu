@@ -147,11 +147,10 @@ from cayu.sessions._provider_operation_cancellation_claim import (
 from cayu.sessions.base import (
     ModelCompletionStage,
     RuntimePublicationOperationRecordMutation,
-    Session,
     SessionRunFenced,
-    SessionStatus,
     SessionStore,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.tools.catalogue import CALL_TOOL_NAME
 from cayu.tools.discovery import (
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,

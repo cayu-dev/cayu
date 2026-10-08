@@ -20,8 +20,8 @@ from cayu.sessions.base import (
     IncompleteSessionRecoveryRequest,
     ResumeRequest,
     RunRequest,
-    SessionStatus,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolResult, ToolSpec

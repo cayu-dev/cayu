@@ -664,7 +664,6 @@ from cayu.sessions.base import (
     INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
     PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
     QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY,
-    RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     ActiveModelCompletionStage,
     CompactSessionRequest,
@@ -700,7 +699,6 @@ from cayu.sessions.base import (
     ResumeRequest,
     RunRequest,
     RuntimePublicationRequest,
-    Session,
     SessionForkActiveModelStageConflict,
     SessionForkEnvironmentAllocationOwner,
     SessionForkProfileRelationship,
@@ -718,7 +716,6 @@ from cayu.sessions.base import (
     SessionRunFenced,
     SessionRuntimeIdentity,
     SessionRuntimePublicationConflict,
-    SessionStatus,
     SessionStatusConflict,
     SessionStore,
     TranscriptQuery,
@@ -812,6 +809,7 @@ from cayu.sessions.invocation import SessionExecutionSource, SessionInvocationBi
 from cayu.sessions.invocation_release import (
     InvocationReleaseEvidence,
 )
+from cayu.sessions.records import RUNTIME_BUILD_PROVENANCE_METADATA_KEY, Session, SessionStatus
 from cayu.sessions.recovery import (
     RecoveryBlockerCode,
     StartupRecoveryBlockedSession,

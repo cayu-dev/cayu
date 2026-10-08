@@ -22,7 +22,7 @@ from cayu import (
     metadata_with_taint_labels,
     taint_labels_from_metadata,
 )
-from cayu.sessions.base import Session, SessionStatus
+from cayu.sessions.records import Session, SessionStatus
 
 
 def _request(

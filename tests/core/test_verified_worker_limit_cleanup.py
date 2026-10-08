@@ -35,7 +35,8 @@ from cayu.budgets.pricing import ModelPrice, PriceBook
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.verified_task_worker import VerifiedTaskWorker
-from cayu.sessions.base import InMemorySessionStore, SessionStatus
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.records import SessionStatus
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.queries import TaskQuery

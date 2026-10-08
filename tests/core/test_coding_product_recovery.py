@@ -112,7 +112,7 @@ def test_runner_preserves_primary_when_real_stream_close_fails(
 
     from cayu.agents import AgentSpec
     from cayu.environments.base import Environment, EnvironmentSpec
-    from cayu.sessions.base import SessionStatus
+    from cayu.sessions.records import SessionStatus
 
     runner, request, run_request, _ = product
     provider = RecordingOneShotProvider()
@@ -211,7 +211,7 @@ def test_runner_cancellation_during_failure_receipt(
 
     from cayu.agents import AgentSpec
     from cayu.environments.base import Environment, EnvironmentSpec
-    from cayu.sessions.base import SessionStatus
+    from cayu.sessions.records import SessionStatus
 
     runner, request, run_request, _ = product
     provider = RecordingOneShotProvider()

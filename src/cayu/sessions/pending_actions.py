@@ -40,12 +40,11 @@ from cayu.sessions.base import (
     MAX_PENDING_ACTION_TOOL_CALLS,
     PENDING_ACTION_EVENT_TYPE_VALUES,
     DelegatedActionReference,
-    EventRecord,
     PendingActionKind,
     PendingActionRecord,
     PendingActionSession,
-    SessionStatus,
 )
+from cayu.sessions.records import EventRecord, SessionStatus
 
 PENDING_ACTION_SESSION_STATUSES = frozenset(
     {SessionStatus.INTERRUPTED, SessionStatus.FAILED, SessionStatus.COMPLETED}

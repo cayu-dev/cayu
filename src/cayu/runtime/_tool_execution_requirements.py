@@ -2,7 +2,7 @@
 
 from cayu.environments.admission import ExecutionRequirements, ExecutionToolRequirement
 from cayu.runtime import _runtime_records as runtime_records
-from cayu.sessions.base import Session
+from cayu.sessions.records import Session
 from cayu.tools.exposure import tool_capability_ceiling_from_session_metadata
 
 

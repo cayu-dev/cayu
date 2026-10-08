@@ -64,10 +64,9 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     ResumeRequest,
     RunRequest,
-    Session,
     SessionIdentity,
-    SessionStatus,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.workspaces.base import Workspace
 from cayu.workspaces.local import LocalWorkspace
 

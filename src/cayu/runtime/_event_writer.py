@@ -35,7 +35,6 @@ from cayu.runtime.event_side_effect_health import (
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
 from cayu.sessions.base import (
     EventQuery,
-    EventRecord,
     PersistedEventSideEffectClaim,
     PersistedEventSideEffectClaimLost,
     PersistedEventSideEffectDelivery,
@@ -48,6 +47,7 @@ from cayu.sessions.base import (
     portable_persisted_event_side_effect_error,
 )
 from cayu.sessions.execution import note_execution_progress
+from cayu.sessions.records import EventRecord
 from cayu.vaults.redaction import SecretRedactor
 
 _PERSISTED_SIDE_EFFECT_RETRY_DELAY_SECONDS = 30.0

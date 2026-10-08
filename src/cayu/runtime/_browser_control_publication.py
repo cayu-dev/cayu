@@ -24,12 +24,13 @@ from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authori
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
-from cayu.sessions.base import Session, SessionOperationPublication, SessionStatus
+from cayu.sessions.base import SessionOperationPublication
 from cayu.sessions.checkpoints import (
     BROWSER_CONTROLS_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.tools.browser_control import (
     BrowserControlConflict,
     BrowserControlIdentity,

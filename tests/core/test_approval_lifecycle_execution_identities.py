@@ -32,8 +32,8 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     PendingActionQuery,
     RunRequest,
-    SessionStatus,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.tools.policy import ToolPolicy, ToolPolicyDecision, ToolPolicyRequest, ToolPolicyResult
 

@@ -27,7 +27,8 @@ from cayu.budgets.usage import (
 from cayu.events import EventType
 
 if TYPE_CHECKING:
-    from cayu.sessions.base import EventQuery, EventRecord
+    from cayu.sessions.base import EventQuery
+    from cayu.sessions.records import EventRecord
 
 USAGE_ACCOUNTING_PAGE_SIZE = 256
 USAGE_ACCOUNTING_CACHE_MAX_SESSIONS = 4096

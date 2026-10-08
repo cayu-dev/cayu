@@ -9,8 +9,9 @@ from uuid import uuid4
 from cayu._validation import canonical_durable_json_bytes, require_durable_clean_nonblank
 
 if TYPE_CHECKING:
-    from cayu.sessions.base import RunRequest, Session
+    from cayu.sessions.base import RunRequest
     from cayu.sessions.invocation import SessionInvocation
+    from cayu.sessions.records import Session
     from cayu.tools.base import ToolResult
 
 

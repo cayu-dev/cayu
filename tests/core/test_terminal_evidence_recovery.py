@@ -22,13 +22,13 @@ from cayu.sessions.base import (
     RunRequest,
     SessionIdentity,
     SessionRunFenced,
-    SessionStatus,
     _checkpoint_with_session_run_operation,
 )
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 

@@ -439,7 +439,7 @@ def test_released_status_contract_tracks_supported_session_states():
     from typing import get_args
 
     from cayu.runtime._temporary_continuation import ServiceReleasedSessionStatus
-    from cayu.sessions.base import SessionStatus
+    from cayu.sessions.records import SessionStatus
 
     assert set(get_args(ServiceReleasedSessionStatus)) == {status.value for status in SessionStatus}
 

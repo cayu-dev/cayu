@@ -17,8 +17,8 @@ from cayu.sessions.base import (
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     InterruptSessionRequest,
-    SessionStatus,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import (
     RecoveryExecutionRequest,
     RecoveryItemExecutionStatus,

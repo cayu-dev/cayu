@@ -109,7 +109,6 @@ from cayu.sessions.base import (
     SessionIdentity,
     SessionQuery,
     SessionRunFenced,
-    SessionStatus,
     SessionStatusConflict,
     SessionStore,
     session_fork_profile_relationship,
@@ -121,6 +120,7 @@ from cayu.sessions.checkpoints import (
     CheckpointCompatibilityError,
 )
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
+from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling

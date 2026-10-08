@@ -20,9 +20,9 @@ from cayu.evals.trajectory import (
 from cayu.sessions.base import (
     SessionInspectionIdentity,
     SessionLineageNode,
-    SessionStatus,
     TerminalSessionEvidenceErrorCode,
 )
+from cayu.sessions.records import SessionStatus
 
 
 @dataclass(frozen=True)

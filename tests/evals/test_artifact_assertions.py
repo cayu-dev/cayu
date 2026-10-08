@@ -75,7 +75,7 @@ from cayu.evals.published import (
 from cayu.evals.result_presentation import present_eval_result
 from cayu.evals.runner import _capture_probes
 from cayu.events import Event, EventType
-from cayu.sessions.base import Session, SessionStatus
+from cayu.sessions.records import Session, SessionStatus
 
 _STRUCTURAL_CONTENT = b'{"source":"structural-eval","status":"ready"}\n'
 

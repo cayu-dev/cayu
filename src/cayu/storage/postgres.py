@@ -554,7 +554,6 @@ from cayu.sessions.base import (
     EnqueueSessionMessageResult,
     EventQuery,
     EventQueryResultTooLarge,
-    EventRecord,
     EventSummary,
     ForkCheckpointAuthorityDecoder,
     ForkSystemPromptReplacement,
@@ -584,12 +583,10 @@ from cayu.sessions.base import (
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
     QueuedInteractionProfileHandoff,
-    RunnerObservedEventIdentity,
     RunRequest,
     RuntimePublicationMutation,
     RuntimePublicationReceipt,
     RuntimePublicationResult,
-    Session,
     SessionAggregateFilter,
     SessionForkActiveModelStageConflict,
     SessionForkProfileRelationship,
@@ -619,7 +616,6 @@ from cayu.sessions.base import (
     SessionRuntimeIdentity,
     SessionRuntimePublicationConflict,
     SessionStateSnapshot,
-    SessionStatus,
     SessionStatusConflict,
     SessionStatusCounts,
     SessionStore,
@@ -636,7 +632,6 @@ from cayu.sessions.base import (
     TerminalSessionEvidenceLimits,
     TranscriptPage,
     TranscriptQuery,
-    TranscriptRecord,
     TranscriptSearchHit,
     TranscriptSearchQuery,
     TranscriptSearchResult,
@@ -863,6 +858,13 @@ from cayu.sessions.interactions import (
     INTERACTION_TERMINAL_EVENT_TYPES,
 )
 from cayu.sessions.invocation import SessionInvocation, SessionInvocationBinding, TaskInvocation
+from cayu.sessions.records import (
+    EventRecord,
+    RunnerObservedEventIdentity,
+    Session,
+    SessionStatus,
+    TranscriptRecord,
+)
 from cayu.storage import _postgres_aggregates as postgres_aggregates
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _session_store_sql as session_store_sql

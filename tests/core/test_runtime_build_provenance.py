@@ -26,7 +26,7 @@ from cayu.runtime.execution_profiles import (
     build_execution_profile_identity,
     changed_execution_profile_components,
 )
-from cayu.sessions.base import runtime_build_provenance_from_session_metadata
+from cayu.sessions.records import runtime_build_provenance_from_session_metadata
 from cayu.snapshots.base import execution_profile_snapshot_ref
 
 

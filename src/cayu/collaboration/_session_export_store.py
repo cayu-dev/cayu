@@ -40,7 +40,7 @@ from cayu.vaults.redaction import SecretRedactor
 
 if TYPE_CHECKING:
     from cayu.events import Event
-    from cayu.sessions.base import Session, TranscriptRecord
+    from cayu.sessions.records import Session, TranscriptRecord
 
 ROOT_KEY = "session_exports"
 OPERATION_PREFIX = "session-export:"

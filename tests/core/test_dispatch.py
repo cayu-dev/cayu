@@ -75,11 +75,9 @@ from cayu.sessions.base import (
     QueuedDispatchTerminalReceipt,
     ResumeRequest,
     RunRequest,
-    Session,
     SessionIdentity,
     SessionModelTransition,
     SessionRunFenced,
-    SessionStatus,
     SessionStatusConflict,
     _checkpoint_with_session_run_operation,
     _fork_initial_invocation_request_sha256,
@@ -97,6 +95,7 @@ from cayu.sessions.invocation import (
     SessionInvocationBinding,
     TaskExecutionSource,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.creation import TaskCreate, task_create_with_runtime_invocation
 from cayu.tasks.dispatch import (

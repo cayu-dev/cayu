@@ -71,11 +71,11 @@ from cayu.sessions.base import (
     SessionMessageDeliveryMode,
     SessionMessageQueueStatus,
     SessionRunFenced,
-    SessionStatus,
     SessionStore,
     run_request_with_task_invocation,
 )
 from cayu.sessions.invocation import TaskExecutionSource
+from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.creation import (
     TaskCreate,

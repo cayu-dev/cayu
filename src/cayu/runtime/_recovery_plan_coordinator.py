@@ -76,10 +76,8 @@ from cayu.sessions.base import (
     PendingActionQuery,
     PendingActionRecord,
     PendingActionSession,
-    Session,
     SessionOrder,
     SessionQuery,
-    SessionStatus,
     SessionStore,
     _incomplete_recovery_claim_from_checkpoint,
     _session_run_operation_from_checkpoint,
@@ -91,6 +89,7 @@ from cayu.sessions.pending_actions import (
     project_pending_action_checkpoint,
     project_pending_action_event_record,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.recovery import (
     RECOVERY_PLAN_MAX_CURSOR_BYTES,
     RecoveryBlockerCode,

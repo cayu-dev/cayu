@@ -33,8 +33,8 @@ from cayu.sessions.base import (
     RunRequest,
     SessionIdentity,
     SessionMessageDeliveryMode,
-    SessionStatus,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.vaults.redaction import SecretRedactor
 

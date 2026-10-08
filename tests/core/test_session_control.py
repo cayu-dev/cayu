@@ -15,12 +15,11 @@ from cayu.runtime._session_control import (
 from cayu.sessions.base import (
     EventOrder,
     EventQuery,
-    EventRecord,
     InMemorySessionStore,
     RunRequest,
     SessionIdentity,
-    SessionStatus,
 )
+from cayu.sessions.records import EventRecord, SessionStatus
 
 
 class _CountingSessionStore(InMemorySessionStore):

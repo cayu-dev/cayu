@@ -27,7 +27,7 @@ from cayu.server import (
     mount_cayu,
     mount_dashboard,
 )
-from cayu.sessions.base import SessionStatus
+from cayu.sessions.records import SessionStatus
 
 
 def _auth(_request):

@@ -2281,7 +2281,7 @@ class InMemoryBudgetStore(BudgetStore):
                         f"{copied.session_id}/{copied.id}"
                     )
                 return
-            from cayu.sessions.base import EventRecord
+            from cayu.sessions.records import EventRecord
 
             record = EventRecord(sequence=len(self._events) + 1, event=copied)
             self._cost_event_index.validate(record)

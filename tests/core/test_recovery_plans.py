@@ -27,9 +27,9 @@ from cayu.sessions.base import (
     ResumeRequest,
     RunRequest,
     SessionIdentity,
-    SessionStatus,
     run_request_with_task_invocation,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import (
     RecoveryBlockerCode,
     RecoveryDecision,

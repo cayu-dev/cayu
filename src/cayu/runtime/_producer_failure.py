@@ -13,7 +13,8 @@ from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
     active_invocation_execution_profile_from_checkpoint,
 )
-from cayu.sessions.base import EventOrder, EventQuery, SessionStatus
+from cayu.sessions.base import EventOrder, EventQuery
+from cayu.sessions.records import SessionStatus
 
 
 async def read_native_failure(store, attachment, index):

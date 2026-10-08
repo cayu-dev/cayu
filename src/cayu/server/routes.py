@@ -303,13 +303,11 @@ from cayu.server.sse import (
 )
 from cayu.sessions.base import (
     COMPACTION_INSTRUCTIONS_MAX_CHARS,
-    RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     SESSION_MESSAGE_CONTENT_MAX_BYTES,
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
     EventOrder,
     EventQuery,
-    EventRecord,
     InterruptSessionRequest,
     LabelSelectorOperator,
     LabelSelectorRequirement,
@@ -322,7 +320,6 @@ from cayu.sessions.base import (
     PendingActionSession,
     ResumeRequest,
     RunRequest,
-    Session,
     SessionDebugState,
     SessionMessageActionResult,
     SessionMessageDeliveryMode,
@@ -330,7 +327,6 @@ from cayu.sessions.base import (
     SessionOrder,
     SessionOutcome,
     SessionQuery,
-    SessionStatus,
     SessionStore,
     SessionTopologyCycle,
     SessionTopologyDepthExceeded,
@@ -356,6 +352,12 @@ from cayu.sessions.invocation import (
     InvocationOriginTrust,
     SessionExecutionSource,
     TaskExecutionSource,
+)
+from cayu.sessions.records import (
+    RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
+    EventRecord,
+    Session,
+    SessionStatus,
 )
 from cayu.sessions.recovery import StartupRecoveryResult
 from cayu.storage.knowledge_review import KnowledgeReviewWorkflow

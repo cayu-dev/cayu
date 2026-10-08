@@ -24,7 +24,7 @@ from cayu.runtime.execution_identity import (
     ExecutionProfileBehaviorIdentity,
     copy_execution_profile_behavior_identity,
 )
-from cayu.sessions.base import Session
+from cayu.sessions.records import Session
 from cayu.tools.base import ToolEffect
 
 

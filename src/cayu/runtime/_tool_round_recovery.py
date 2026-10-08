@@ -45,8 +45,9 @@ from cayu.sessions._checkpoint_secret_validation import (
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
-from cayu.sessions.base import Session, SessionStatus, SessionStore
+from cayu.sessions.base import SessionStore
 from cayu.sessions.checkpoints import WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY
+from cayu.sessions.records import Session, SessionStatus
 from cayu.tools import _shared_artifact_result_schema as shared_artifact_result_schema
 from cayu.tools import _web_access_result_schema as web_access_result_schema
 from cayu.tools.base import ToolEffect, ToolResult

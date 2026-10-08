@@ -31,7 +31,8 @@ from cayu.evals.runner import EvalCase, EvalSuite, run_eval_suite
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.providers import ModelProvider, ModelStreamEvent
-from cayu.sessions.base import RunRequest, Session, SessionStatus
+from cayu.sessions.base import RunRequest
+from cayu.sessions.records import Session, SessionStatus
 
 
 def _session(session_id: str, status: SessionStatus, *, parent_id: str | None = None) -> Session:

@@ -41,9 +41,7 @@ from cayu.sessions.base import (
     InterruptSessionRequest,
     ResumeRequest,
     RunRequest,
-    Session,
     SessionIdentity,
-    SessionStatus,
 )
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
@@ -51,6 +49,7 @@ from cayu.sessions.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor

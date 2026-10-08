@@ -58,15 +58,14 @@ from cayu.sessions.base import (
     InterruptSessionRequest,
     ResumeRequest,
     RunRequest,
-    Session,
     SessionIdentity,
-    SessionStatus,
 )
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.storage.knowledge_indexer import KnowledgeIndexer, KnowledgeIndexRequest
 from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope
 from cayu.storage.sqlite import SQLiteSessionStore

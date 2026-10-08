@@ -25,7 +25,7 @@ from cayu.evals.models import Trajectory
 from cayu.events import Event, EventType
 from cayu.memory.attribution import MemoryAttribution, MemoryAttributionStatus
 from cayu.messages import Message, ToolCallPart
-from cayu.sessions.base import Session, SessionStatus
+from cayu.sessions.records import Session, SessionStatus
 from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 

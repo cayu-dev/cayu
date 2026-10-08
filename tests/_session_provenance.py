@@ -3,13 +3,13 @@ from __future__ import annotations
 from hashlib import sha256
 from uuid import UUID
 
-from cayu.sessions.base import Session
 from cayu.sessions.invocation import (
     InvocationOrigin,
     InvocationOriginTrust,
     SessionExecutionSource,
     SessionInvocation,
 )
+from cayu.sessions.records import Session
 
 
 def unattributed_session_invocation(

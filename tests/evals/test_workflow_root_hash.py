@@ -33,7 +33,7 @@ from cayu.evals.runner import _load_workflow_eval_records, _workflow_root_sha256
 from cayu.evals.trajectory import SessionTrajectoryError
 from cayu.events import Event
 from cayu.runtime.evidence_spool import IncrementalEvidenceAdmission, IncrementalEvidenceLimits
-from cayu.sessions.base import EventRecord
+from cayu.sessions.records import EventRecord
 from cayu.workflows.base import WorkflowSpec
 from cayu.workflows.workflow import WorkflowBase
 

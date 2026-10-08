@@ -12,7 +12,8 @@ from cayu.runtime.execution_profiles import (
     checkpoint_with_active_invocation_execution_profile,
 )
 from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
-from cayu.sessions.base import SessionRunFenced, SessionStatus
+from cayu.sessions.base import SessionRunFenced
+from cayu.sessions.records import SessionStatus
 from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 

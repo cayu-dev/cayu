@@ -56,12 +56,11 @@ from cayu.sessions.base import (
     ModelCompletionStage,
     ModelCompletionStageRequest,
     RunRequest,
-    Session,
     SessionOperationTransform,
     SessionRunFenced,
-    SessionStatus,
     SessionStore,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling, resolved_tool_exposure_authority
 from cayu.tools.policy import AllowAllToolPolicy

@@ -45,12 +45,12 @@ from cayu.sessions._terminal_evidence import (
     classify_current_terminal_evidence,
 )
 from cayu.sessions.base import (
-    RunnerObservedEventIdentity,
     _assemble_terminal_session_evidence,
     _classify_terminal_session_evidence_records,
     _event_with_session_run_operation,
     _SessionRunOperation,
 )
+from cayu.sessions.records import RunnerObservedEventIdentity
 
 
 def _session(

@@ -23,8 +23,9 @@ from cayu.messages import (
     ThinkingPart,
     ToolCallPart,
 )
-from cayu.sessions.base import RunRequest, SessionIdentity, SessionStatus
+from cayu.sessions.base import RunRequest, SessionIdentity
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
+from cayu.sessions.records import SessionStatus
 
 
 def _budget_limit_id(value: int) -> str:
@@ -2095,7 +2096,7 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
 
 def test_session_tool_rows_keep_provider_reused_call_ids_in_distinct_rounds() -> None:
     from cayu.cli.session import _tool_call_rows, _tool_inspection_record
-    from cayu.sessions.base import EventRecord
+    from cayu.sessions.records import EventRecord
 
     records: list[EventRecord] = []
     sequence = 1
@@ -2147,7 +2148,7 @@ def test_session_tool_rows_keep_provider_reused_call_ids_in_distinct_rounds() ->
 
 def test_session_tool_rows_do_not_guess_missing_execution_identity() -> None:
     from cayu.cli.session import _tool_call_rows, _tool_inspection_record
-    from cayu.sessions.base import EventRecord
+    from cayu.sessions.records import EventRecord
 
     records = [
         _tool_inspection_record(

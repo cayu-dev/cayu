@@ -35,14 +35,13 @@ from cayu.sessions.base import (
     ActiveModelCompletionStage,
     ModelCompletionManualRecoveryRequest,
     ModelCompletionManualRecoveryResult,
-    Session,
     SessionExecutionSource,
     SessionQuery,
     SessionRunFenced,
-    SessionStatus,
     SessionStore,
     _validate_model_completion_stage_dispatch,
 )
+from cayu.sessions.records import Session, SessionStatus
 
 if TYPE_CHECKING:
     from cayu.runtime._session_engine import SessionEngine

@@ -109,9 +109,9 @@ from cayu.sessions.base import (
     ResumeRequest,
     RunRequest,
     SessionMessageDeliveryMode,
-    SessionStatus,
     copy_run_request,
 )
+from cayu.sessions.records import SessionStatus
 
 
 class ScenarioExecutionError(RuntimeError):

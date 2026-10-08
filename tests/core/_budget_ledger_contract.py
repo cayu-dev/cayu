@@ -34,7 +34,8 @@ from cayu.messages import Message
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._run_limits import RunLimitController
-from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity, SessionStatus
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.records import SessionStatus
 from cayu.vaults import REDACTED_SECRET
 
 

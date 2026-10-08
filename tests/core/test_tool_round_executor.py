@@ -55,8 +55,9 @@ from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
     build_execution_profile_identity,
 )
-from cayu.sessions.base import InMemorySessionStore, RunRequest, Session, SessionStatus
+from cayu.sessions.base import InMemorySessionStore, RunRequest
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
+from cayu.sessions.records import Session, SessionStatus
 from cayu.tools import _web_access_result_schema as web_access_result_schema
 from cayu.tools import _web_access_results as web_access_results
 from cayu.tools._runner import sanitize_runner_failure_group

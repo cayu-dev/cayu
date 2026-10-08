@@ -33,10 +33,10 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     RunRequest,
     SessionIdentity,
-    SessionStatus,
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,
 )
+from cayu.sessions.records import SessionStatus
 
 
 def _scripted_app(*batches: list[ModelStreamEvent]) -> CayuApp:

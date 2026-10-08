@@ -110,7 +110,6 @@ from cayu.server.sse import (
 )
 from cayu.sessions.base import (
     EventQuery,
-    EventRecord,
     ForkSessionRequest,
     InMemorySessionStore,
     InterruptSessionRequest,
@@ -124,10 +123,10 @@ from cayu.sessions.base import (
     RunRequest,
     SessionIdentity,
     SessionListResult,
-    SessionStatus,
     run_request_with_runtime_generated_authority,
 )
 from cayu.sessions.checkpoints import CURRENT_CHECKPOINT_SCHEMA_VERSION
+from cayu.sessions.records import EventRecord, SessionStatus
 from cayu.sessions.recovery import RecoveryExecutionRequest, RecoveryPlan
 from cayu.storage.memory import (
     InMemoryKnowledgeStore,

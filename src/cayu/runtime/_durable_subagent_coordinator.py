@@ -55,10 +55,8 @@ from cayu.sessions.base import (
     InterruptSessionRequest,
     QueuedDispatchTerminalReceipt,
     RunRequest,
-    Session,
     SessionIdentity,
     SessionRunFenced,
-    SessionStatus,
     SessionStore,
     _queued_dispatch_session_instance_fingerprint,
     _session_run_operation_from_checkpoint,
@@ -72,6 +70,7 @@ from cayu.sessions.invocation import (
     SessionInvocationBinding,
     inherited_session_invocation,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.tasks.dispatch import (
     DispatchHandle,
     DispatchStatus,

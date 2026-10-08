@@ -25,8 +25,8 @@ from cayu.sessions.base import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     RunRequest,
-    SessionStatus,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.tools.base import DurableToolRecoveryEvidence, Tool, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling
 from cayu.tools.policy import ToolPolicyDecision, ToolPolicyResult

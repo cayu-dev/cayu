@@ -54,7 +54,7 @@ from cayu.memory.attribution import (
     MemoryExposureTransitionAttribution,
 )
 from cayu.memory.evidence import ContextExposureEvidenceKind, ContextExposureState
-from cayu.sessions.base import SessionStatus
+from cayu.sessions.records import SessionStatus
 
 _STATE_PATHS = {
     ContextExposureState.PLANNED: (ContextExposureState.PLANNED,),

@@ -33,8 +33,8 @@ from cayu.sessions.base import (
     ResumeRequest,
     SessionMessageDeliveryMode,
     SessionMessageQueueStatus,
-    SessionStatus,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import TaskStatus
 

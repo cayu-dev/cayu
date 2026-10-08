@@ -9,7 +9,8 @@ from cayu.messages import Message, MessageRole
 
 if TYPE_CHECKING:
     from cayu.runtime.loop_policies import LoopPolicy
-    from cayu.sessions.base import Session, TranscriptSnapshot
+    from cayu.sessions.base import TranscriptSnapshot
+    from cayu.sessions.records import Session
 
 
 BEFORE_STOP_CONTINUATIONS_CHECKPOINT_KEY = "before_stop_continuations"

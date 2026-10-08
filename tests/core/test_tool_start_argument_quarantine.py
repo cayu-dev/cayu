@@ -62,8 +62,8 @@ from cayu.sessions.base import (
     PendingActionQuery,
     ResumeRequest,
     RunRequest,
-    SessionStatus,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.storage.jsonl_export import export_sessions
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore

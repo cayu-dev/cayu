@@ -192,15 +192,12 @@ from cayu.sessions._invocation_lifecycle import (
 )
 from cayu.sessions.base import (
     RuntimePublicationMutation,
-    Session,
     SessionInvocationAdmission,
     SessionRunFenced,
-    SessionStatus,
     SessionStore,
     _current_session_run_epoch,
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
-    copy_session,
     runtime_publication_checkpoint_mutation,
 )
 from cayu.sessions.checkpoints import (
@@ -208,6 +205,7 @@ from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
+from cayu.sessions.records import Session, SessionStatus, copy_session
 from cayu.tools.discovery import (
     initial_tool_discovery_operation_records_from_initialization,
 )

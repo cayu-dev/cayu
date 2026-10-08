@@ -39,9 +39,9 @@ from cayu.sessions.base import (
     EventQuery,
     InMemorySessionStore,
     RunRequest,
-    SessionStatus,
     TranscriptSnapshot,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.tools.exposure import ToolCapabilityCeiling
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 

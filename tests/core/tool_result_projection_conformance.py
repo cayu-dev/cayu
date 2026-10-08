@@ -33,12 +33,8 @@ from cayu import (
     artifact_store_identity_sha256,
     record_artifact_write_settlement,
 )
-from cayu.sessions.base import (
-    RuntimePublicationRequest,
-    RuntimePublicationResult,
-    SessionStatus,
-    SessionStore,
-)
+from cayu.sessions.base import RuntimePublicationRequest, RuntimePublicationResult, SessionStore
+from cayu.sessions.records import SessionStatus
 
 
 class _ConformanceProvider(ModelProvider):

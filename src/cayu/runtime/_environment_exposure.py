@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     )
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime._invocation_lifecycle import InvocationContext
-    from cayu.sessions.base import Session
+    from cayu.sessions.records import Session
 
 
 _ENVIRONMENT_EXPOSURE_AUTHORITY_TOKEN = object()
@@ -104,7 +104,7 @@ def expose_registered_environment(
     )
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime._invocation_lifecycle import InvocationContext
-    from cayu.sessions.base import Session
+    from cayu.sessions.records import Session
 
     if type(registered_environment) is not runtime_records.RegisteredEnvironment:
         raise TypeError("registered_environment must be a RegisteredEnvironment.")
@@ -188,7 +188,7 @@ def _environment_exposure(
     )
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime._invocation_lifecycle import InvocationContext
-    from cayu.sessions.base import Session
+    from cayu.sessions.records import Session
 
     if registered_environment is None:
         if invocation_context.registered_environment is not None:

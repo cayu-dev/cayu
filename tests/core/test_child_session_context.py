@@ -34,11 +34,9 @@ from cayu.sessions.base import (
     ModelCompletionStageRequest,
     ResumeRequest,
     RunRequest,
-    Session,
     SessionIdentity,
     SessionModelCompletionStageConflict,
     SessionRunFenced,
-    SessionStatus,
     SessionStore,
     TranscriptTextReadLimitExceeded,
 )
@@ -58,6 +56,7 @@ from cayu.sessions.child_results import (
     ChildSessionResultUnavailable,
     project_terminal_child_session_result,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.storage import migrations as schema_migrations
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec

@@ -88,10 +88,10 @@ from cayu.sessions.base import (
     EventQuery,
     InMemorySessionStore,
     RunRequest,
-    Session,
     SessionIdentity,
     restore_persisted_event_authority,
 )
+from cayu.sessions.records import Session
 from cayu.tools.base import ToolEffect
 from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 

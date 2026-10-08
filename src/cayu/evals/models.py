@@ -64,7 +64,7 @@ from cayu.events import Event, EventType
 from cayu.failure_evidence import FailureEvidence
 from cayu.memory.attribution import MemoryAttribution
 from cayu.messages import Message, MessageRole, TextPart
-from cayu.sessions.base import Session, SessionStatus
+from cayu.sessions.records import Session, SessionStatus
 
 # Version of the persisted EvalRun JSON shape. Bump this by hand whenever the
 # saved structure changes incompatibly so load_eval_run can reject a baseline

@@ -57,7 +57,7 @@ from cayu.sessions._model_failover import (
     ModelTarget,
     copy_model_failover_policy,
 )
-from cayu.sessions.base import Session
+from cayu.sessions.records import Session
 from cayu.tools.discovery import (
     ToolDiscoveryProjectionKind,
     resolve_tool_discovery_projection,

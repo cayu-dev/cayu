@@ -9,8 +9,9 @@ from cayu._validation import copy_durable_json_value
 from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
-from cayu.sessions.base import Session, SessionStore
+from cayu.sessions.base import SessionStore
 from cayu.sessions.checkpoints import _DecodedRuntimeCheckpoint
+from cayu.sessions.records import Session
 from cayu.vaults.redaction import SecretRedactor, contains_redacted_secret
 
 

@@ -13,7 +13,6 @@ from cayu.messages import Message
 from cayu.sessions.base import (
     EventOrder,
     EventQuery,
-    EventRecord,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
@@ -23,8 +22,8 @@ from cayu.sessions.base import (
     SessionIdentity,
     SessionListResult,
     SessionQuery,
-    SessionStatus,
 )
+from cayu.sessions.records import EventRecord, SessionStatus
 
 
 def test_committed_recovery_survives_bounded_public_linkage_lookup_miss() -> None:

@@ -20,7 +20,8 @@ from cayu.runtime._cost_accounting import (
 )
 
 if TYPE_CHECKING:
-    from cayu.sessions.base import EventQuery, EventRecord
+    from cayu.sessions.base import EventQuery
+    from cayu.sessions.records import EventRecord
 
 
 class CostAccountingAuthority:
@@ -232,7 +233,7 @@ class CostAccountingRead:
         return tuple(self._pending)
 
     def add(self, sequence: int, event: Event) -> None:
-        from cayu.sessions.base import EventRecord
+        from cayu.sessions.records import EventRecord
 
         if self._cold is not None:
             self._cold.add(sequence, event)

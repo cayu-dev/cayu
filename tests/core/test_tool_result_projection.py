@@ -51,7 +51,6 @@ from cayu.runtime.public_authority import (
     PublicAuthorityAliasKeyring,
 )
 from cayu.sessions.base import (
-    EventRecord,
     InMemorySessionStore,
     InterruptSessionRequest,
     ResumeRequest,
@@ -59,8 +58,8 @@ from cayu.sessions.base import (
     RuntimePublicationRequest,
     RuntimePublicationResult,
     SessionIdentity,
-    SessionStatus,
 )
+from cayu.sessions.records import EventRecord, SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.files import ReadFileTool

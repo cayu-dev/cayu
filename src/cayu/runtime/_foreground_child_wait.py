@@ -34,13 +34,12 @@ from cayu.sessions._tool_effect_intent import ToolEffectIntent
 from cayu.sessions.base import (
     EventOrder,
     EventQuery,
-    Session,
-    SessionStatus,
     SessionStore,
     runtime_publication_checkpoint_mutation,
     runtime_publication_checkpoint_value_digest,
 )
 from cayu.sessions.pending_actions import pending_action_evidence_round_from_checkpoint
+from cayu.sessions.records import Session, SessionStatus
 from cayu.tools.base import ToolResult
 
 

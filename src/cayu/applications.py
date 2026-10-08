@@ -575,7 +575,6 @@ from cayu.sessions.base import (
     EnqueueSessionMessageResult,
     EventOrder,
     EventQuery,
-    EventRecord,
     ForkSessionRequest,
     ForkSourceSnapshot,
     IncompleteSessionRecoveryRequest,
@@ -595,12 +594,10 @@ from cayu.sessions.base import (
     QueuedDispatchTerminalReceiptQuery,
     ResumeRequest,
     RunRequest,
-    Session,
     SessionMessageActionResult,
     SessionMessageInspection,
     SessionQuery,
     SessionRunFenced,
-    SessionStatus,
     SessionStatusConflict,
     SessionStore,
     TranscriptSnapshot,
@@ -611,7 +608,6 @@ from cayu.sessions.base import (
     copy_interrupt_session_request,
     copy_model_completion_manual_recovery_request,
     copy_resume_request,
-    copy_session,
     fork_source_transcript_sha256,
     system_prompt_messages_sha256,
 )
@@ -650,6 +646,7 @@ from cayu.sessions.invocation import (
     SessionInvocationBinding,
     copy_session_invocation_binding,
 )
+from cayu.sessions.records import EventRecord, Session, SessionStatus, copy_session
 from cayu.sessions.recovery import (
     RecoveryExecutionRequest,
     RecoveryPlan,

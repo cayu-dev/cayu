@@ -31,7 +31,7 @@ from cayu.evals.published import (
 )
 from cayu.events import Event, EventType
 from cayu.messages import Message, ToolCallPart
-from cayu.sessions.base import Session, SessionStatus
+from cayu.sessions.records import Session, SessionStatus
 from cayu.tools.base import ToolResult
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 

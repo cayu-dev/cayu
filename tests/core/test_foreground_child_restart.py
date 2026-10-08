@@ -30,9 +30,9 @@ from cayu.sessions.base import (
     InterruptSessionRequest,
     RunRequest,
     SessionQuery,
-    SessionStatus,
 )
 from cayu.sessions.execution import SessionExecutionConfig
+from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import RecoveryPlanRequest, RecoveryPlanSelection
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy

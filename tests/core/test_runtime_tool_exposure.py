@@ -69,12 +69,11 @@ from cayu.sessions.base import (
     InteractionTransitionSpec,
     ResumeRequest,
     RunRequest,
-    Session,
     SessionIdentity,
     SessionInvocationAdmission,
     SessionRunFenced,
-    SessionStatus,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.tools.exposure import (

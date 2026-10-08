@@ -56,9 +56,7 @@ from cayu.sessions.base import (
     InterruptSessionRequest,
     ResumeRequest,
     RunRequest,
-    Session,
     SessionRuntimePublicationConflict,
-    SessionStatus,
 )
 from cayu.sessions.checkpoints import (
     AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY,
@@ -67,6 +65,7 @@ from cayu.sessions.checkpoints import (
     CheckpointCompatibilityError,
     decode_runtime_checkpoint,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling

@@ -6,8 +6,9 @@ import json
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from cayu.sessions.base import Session, SessionIdentity
+from cayu.sessions.base import SessionIdentity
 from cayu.sessions.context_views import ParticipantSessionBinding, ParticipantSessionCreationReceipt
+from cayu.sessions.records import Session
 from cayu.storage._participant_bindings_schema import PARTICIPANT_BINDING_COLUMNS
 
 

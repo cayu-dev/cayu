@@ -29,8 +29,8 @@ from cayu.sessions.base import (
     RunRequest,
     SessionIdentity,
     SessionRunFenced,
-    SessionStatus,
 )
+from cayu.sessions.records import SessionStatus
 
 
 class FakeProvider(ModelProvider):

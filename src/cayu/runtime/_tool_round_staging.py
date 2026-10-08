@@ -57,7 +57,8 @@ from cayu.runtime._tool_effect_state import (
 )
 from cayu.sessions import _staged_tool_terminal_reader as staged_terminal_reader
 from cayu.sessions._assistant_tool_round_publication import validate_tool_exposure_terminal_event
-from cayu.sessions.base import Session, SessionStore, runtime_publication_checkpoint_mutation
+from cayu.sessions.base import SessionStore, runtime_publication_checkpoint_mutation
+from cayu.sessions.records import Session
 from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools import _shared_artifact_results as shared_artifact_results
 from cayu.tools import _web_access_results as web_access_results

@@ -34,7 +34,8 @@ from cayu.runtime._work_attempt_invocation import (
 )
 from cayu.runtime.execution_profiles import ActiveInvocationExecutionProfile
 from cayu.runtime.work_attempt_semantics import WorkAttemptRunSemantics
-from cayu.sessions.base import InMemorySessionStore, SessionStatus
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.admission import (
     WorkAttemptAdmission,

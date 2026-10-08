@@ -235,7 +235,8 @@ def test_explicit_compaction_budget_survives_more_than_256_provider_completions(
     from cayu.applications import CayuApp
     from cayu.budgets.pricing import ModelPrice, PriceBook
     from cayu.context.base import CheckpointCompactionContextPolicy, ModelCompactor
-    from cayu.sessions.base import CompactSessionRequest, SessionStatus
+    from cayu.sessions.base import CompactSessionRequest
+    from cayu.sessions.records import SessionStatus
 
     async def run():
         provider = UsageCompactionProvider()

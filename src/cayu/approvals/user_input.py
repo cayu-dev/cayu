@@ -60,7 +60,7 @@ from cayu.tools.exposure import (
 from cayu.vaults.redaction import SecretRedactor, contains_redacted_secret
 
 if TYPE_CHECKING:
-    from cayu.sessions.base import Session
+    from cayu.sessions.records import Session
 
 PENDING_USER_INPUT_CHECKPOINT_KEY = "pending_user_input"
 USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY = "user_input_resolution_intent"

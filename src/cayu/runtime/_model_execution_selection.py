@@ -39,8 +39,9 @@ from cayu.sessions._model_failover import (
     ModelFailoverSelection,
     copy_model_failover_state,
 )
-from cayu.sessions.base import ModelCompletionStage, Session
+from cayu.sessions.base import ModelCompletionStage
 from cayu.sessions.checkpoints import decode_runtime_checkpoint
+from cayu.sessions.records import Session
 
 
 def model_failover_progress_for_session(

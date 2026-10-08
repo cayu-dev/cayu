@@ -152,7 +152,7 @@ def test_public_closure_fences_native_writes_but_allows_exact_replay(
     from cayu.events import Event, EventType
     from cayu.memory.evidence import ContextExposureTransitionRequest
     from cayu.runtime.session_closure import SessionClosureRecord
-    from cayu.sessions.base import SessionStatus
+    from cayu.sessions.records import SessionStatus
 
     if backend == "postgres":
         dsn = request.getfixturevalue("postgres_dsn")

@@ -90,13 +90,14 @@ from cayu.collaboration.participants import (
 from cayu.collaboration.peer_content import PeerAppendKey, PeerDeliveryAttemptKey
 from cayu.messages import Message
 from cayu.sessions import ResumeRequest, RunRequest
-from cayu.sessions.base import InMemorySessionStore, SessionStatus, SessionStore
+from cayu.sessions.base import InMemorySessionStore, SessionStore
 from cayu.sessions.context_views import (
     ParticipantSessionCreationRequest,
     ParticipantSessionExecutionRequest,
     RecipientSessionCreationRequest,
 )
 from cayu.sessions.invocation import InvocationOriginClaim
+from cayu.sessions.records import SessionStatus
 from cayu.vaults.redaction import SecretRedactor
 
 ACCESS = CollaborationAccessContext(principal=PRINCIPAL)

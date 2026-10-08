@@ -42,7 +42,8 @@ from cayu.sessions._temporary_service_target import (
 )
 
 if TYPE_CHECKING:
-    from cayu.sessions.base import Session, SessionOperationPublication
+    from cayu.sessions.base import SessionOperationPublication
+    from cayu.sessions.records import Session
 
 ROOT_KEY = "session_continuations"
 MAX_RETAINED_TICKETS = 64

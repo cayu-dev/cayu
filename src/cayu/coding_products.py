@@ -62,12 +62,12 @@ from cayu.sessions._invocation_lifecycle import (
 )
 from cayu.sessions.base import (
     RunRequest,
-    SessionStatus,
     parse_session_input_contract_evidence,
     session_input_messages_sha256,
 )
 from cayu.sessions.exports import SessionExportLimits, SessionExportSnapshot
 from cayu.sessions.invocation import SessionInvocationBinding
+from cayu.sessions.records import SessionStatus
 from cayu.tasks.contracts import (
     CompletionConstraintOutcome,
     CompletionContinuationPolicy,

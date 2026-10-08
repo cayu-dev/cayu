@@ -36,11 +36,8 @@ from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
-from cayu.sessions.base import (
-    Session,
-    SessionStore,
-    runtime_publication_checkpoint_value_digest,
-)
+from cayu.sessions.base import SessionStore, runtime_publication_checkpoint_value_digest
+from cayu.sessions.records import Session
 from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools.base import ToolResult
 from cayu.tools.policy import ToolPolicyDecision, ToolPolicyResult

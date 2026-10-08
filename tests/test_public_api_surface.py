@@ -178,7 +178,8 @@ def test_manifest_api_keeps_structural_types_out_of_the_root_namespace() -> None
 def test_readme_recovery_snippet_imports_and_constructs() -> None:
     # The exact snippet printed in README.md (worker crash-recovery). It must run
     # verbatim as documented.
-    from cayu.sessions.base import IncompleteSessionsRecoveryRequest, SessionStatus
+    from cayu.sessions.base import IncompleteSessionsRecoveryRequest
+    from cayu.sessions.records import SessionStatus
 
     request = IncompleteSessionsRecoveryRequest(statuses={SessionStatus.INTERRUPTING})
     assert SessionStatus.INTERRUPTING in request.statuses

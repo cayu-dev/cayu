@@ -14,11 +14,12 @@ from cayu._validation import canonical_durable_json_bytes
 from cayu._workspace_mutation import workspace_mutation_task_settlement_probe
 from cayu.events import Event, EventType
 from cayu.runtime._runtime_records import RegisteredEnvironment
-from cayu.sessions.base import Session, SessionStore
+from cayu.sessions.base import SessionStore
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
+from cayu.sessions.records import Session
 from cayu.workspaces.checkpoints import (
     WorkspaceCheckpointError,
     capture_workspace_checkpoint,

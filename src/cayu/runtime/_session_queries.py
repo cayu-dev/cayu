@@ -1,14 +1,7 @@
 from __future__ import annotations
 
-from cayu.sessions.base import (
-    EventOrder,
-    EventQuery,
-    EventRecord,
-    Session,
-    SessionQuery,
-    SessionStore,
-    copy_event_query,
-)
+from cayu.sessions.base import EventOrder, EventQuery, SessionQuery, SessionStore, copy_event_query
+from cayu.sessions.records import EventRecord, Session
 
 
 async def query_all_sessions(

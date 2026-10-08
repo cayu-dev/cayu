@@ -14,7 +14,7 @@ from cayu import AgentSpec, CayuApp, Message, RunRequest
 from cayu._validation import canonical_durable_json_bytes
 from cayu.events import Event, EventType
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
-from cayu.sessions.base import SessionStatus
+from cayu.sessions.records import SessionStatus
 from cayu.tools.base import Tool, ToolEffect, ToolSpec
 
 

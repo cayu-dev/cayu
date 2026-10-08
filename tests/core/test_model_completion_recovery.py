@@ -70,14 +70,13 @@ from cayu.sessions.base import (
     RunRequest,
     RuntimePublicationMutation,
     RuntimePublicationRequest,
-    Session,
-    SessionStatus,
     runtime_publication_checkpoint_mutation,
 )
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.recovery import (
     RecoveryBlockerCode,
     RecoveryDecision,

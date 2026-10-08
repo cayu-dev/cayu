@@ -24,13 +24,12 @@ from cayu.server import ServerConfig, ServerLifecycleConfig, create_server
 from cayu.server.sse import SSE_REPLAY_PAGE_EVENTS
 from cayu.sessions.base import (
     EventQuery,
-    EventRecord,
     InMemorySessionStore,
     RunRequest,
     SessionIdentity,
     SessionStateSnapshot,
-    SessionStatus,
 )
+from cayu.sessions.records import EventRecord, SessionStatus
 from cayu.storage.migrations import SchemaMode
 from cayu.vaults.redaction import SecretRedactor
 

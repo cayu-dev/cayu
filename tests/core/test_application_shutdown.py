@@ -17,7 +17,8 @@ from cayu.runtime.application_lifecycle import (
     _ENTRANCE_KIND,
     ApplicationAdmissionsSealed,
 )
-from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionStatus
+from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.records import SessionStatus
 from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope
 from cayu.tools.knowledge import RememberKnowledgeTool
 

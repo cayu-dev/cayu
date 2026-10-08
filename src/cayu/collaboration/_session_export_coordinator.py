@@ -97,7 +97,8 @@ from cayu.collaboration.releases import (
 )
 from cayu.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.messages import TextPart
-from cayu.sessions.base import Session, SessionStore
+from cayu.sessions.base import SessionStore
+from cayu.sessions.records import Session
 from cayu.vaults.redaction import SecretRedactor
 
 T = TypeVar("T")

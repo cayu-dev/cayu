@@ -15,13 +15,13 @@ from cayu.sessions.base import (
     SessionDebugState,
     SessionOrder,
     SessionQuery,
-    SessionStatus,
     copy_event_query,
     copy_session_query,
     decode_session_cursor,
     session_order_is_descending,
     session_sort_column,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.workflows.base import WORKFLOW_ATTEMPT_EVENT_TYPE
 
 if TYPE_CHECKING:

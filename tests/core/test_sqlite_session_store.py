@@ -21,7 +21,6 @@ from cayu.messages import Message
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.sessions.base import (
-    RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
     BudgetReservationIdentityConflict,
     EnqueueSessionMessageRequest,
@@ -32,13 +31,11 @@ from cayu.sessions.base import (
     PendingActionQuery,
     ResumeRequest,
     RunRequest,
-    Session,
     SessionAggregateFilter,
     SessionIdentity,
     SessionInspectionSummary,
     SessionMessageDeliveryMode,
     SessionQuery,
-    SessionStatus,
     TranscriptQuery,
     UsageRollupQuery,
     fork_session_invocation,
@@ -47,6 +44,7 @@ from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
+from cayu.sessions.records import RUNTIME_BUILD_PROVENANCE_METADATA_KEY, Session, SessionStatus
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_records as sqlite_records

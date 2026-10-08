@@ -34,7 +34,7 @@ from cayu.observability.watchers import (
 from cayu.observability.watchers import (
     _validate_max_attempts as validate_watcher_max_attempts,
 )
-from cayu.sessions.base import EventRecord
+from cayu.sessions.records import EventRecord
 from cayu.storage import migrations as schema
 from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage.targets import require_sqlite_store_allowed

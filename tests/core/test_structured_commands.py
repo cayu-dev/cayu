@@ -26,7 +26,7 @@ from cayu.environments.docker_toolchains import (
 )
 from cayu.runners.base import ExecResult
 from cayu.runners.docker_workload import DockerImageIdentity
-from cayu.sessions.base import Session, SessionStatus
+from cayu.sessions.records import Session, SessionStatus
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._resources import InvocationWorkspaceHandle
 from cayu.tools.base import (

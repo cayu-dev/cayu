@@ -73,17 +73,14 @@ from cayu.sessions.base import (
     InteractionTransitionSpec,
     RunRequest,
     RuntimePublicationMutation,
-    Session,
     SessionIdentity,
     SessionModelTransition,
     SessionRunFenced,
     SessionRuntimeIdentity,
-    SessionStatus,
     _authenticated_session_instance_id_for_run_request,
     _run_request_invocation_lifecycle_authority_sha256,
     apply_runtime_publication_checkpoint_mutation,
     copy_run_request,
-    copy_session,
     copy_session_identity,
     copy_session_runtime_identity,
     runtime_prepared_session_authority,
@@ -100,6 +97,7 @@ from cayu.sessions.checkpoints import (
 )
 from cayu.sessions.invocation import SessionInvocationBinding
 from cayu.sessions.invocation_release import InvocationReleaseEvidence
+from cayu.sessions.records import Session, SessionStatus, copy_session
 from cayu.tools.discovery import (
     ToolDiscoveryViewInitialization,
 )

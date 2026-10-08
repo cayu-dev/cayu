@@ -40,11 +40,11 @@ from cayu.sessions.base import (
     SessionIdentity,
     SessionInvocationAdmission,
     SessionRunFenced,
-    SessionStatus,
     SessionStatusConflict,
     SessionStore,
     run_request_with_runtime_session_instance_authority,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.tools.exposure import ToolCapabilityCeiling
 
 

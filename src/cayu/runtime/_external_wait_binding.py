@@ -26,7 +26,8 @@ from cayu.sessions.external_waits import (
 if TYPE_CHECKING:
     from cayu.runtime._invocation_lifecycle import InvocationContext
     from cayu.sessions._external_wait_transition import ExternalWaitMutation
-    from cayu.sessions.base import Session, SessionStore
+    from cayu.sessions.base import SessionStore
+    from cayu.sessions.records import Session
 
 _BINDING: ContextVar[str | None] = ContextVar("external_wait_binding", default=None)
 

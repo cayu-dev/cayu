@@ -13,7 +13,8 @@ from cayu import PostgresSessionStore, SQLiteSessionStore
 from cayu.cli import main
 from cayu.events import Event, EventType
 from cayu.messages import Message
-from cayu.sessions.base import RunRequest, SessionIdentity, SessionStatus, SessionStore
+from cayu.sessions.base import RunRequest, SessionIdentity, SessionStore
+from cayu.sessions.records import SessionStatus
 from cayu.storage.migrations import SchemaMode
 
 

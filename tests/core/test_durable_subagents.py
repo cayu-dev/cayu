@@ -60,8 +60,8 @@ from cayu.sessions.base import (
     ResumeRequest,
     RunRequest,
     SessionQuery,
-    SessionStatus,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore, PostgresTaskStore
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore

@@ -30,10 +30,10 @@ from cayu.evals.trajectory import (
 from cayu.events import Event, EventType, event_payload_authority_is_runtime_generated
 from cayu.sessions.base import (
     EventQueryResultTooLarge,
-    EventRecord,
     SessionInspectionIdentity,
     TerminalSessionEvidenceErrorCode,
 )
+from cayu.sessions.records import EventRecord
 from cayu.workflows.journal import WORKFLOW_ATTEMPT_EVENT_TYPE, WORKFLOW_JOURNAL_PROVIDER
 
 

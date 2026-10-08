@@ -12,12 +12,12 @@ from cayu._validation import canonical_durable_json_bytes
 if TYPE_CHECKING:
     from cayu.collaboration._permits import PermitReceipt
     from cayu.messages import Message
-    from cayu.sessions.base import Session
     from cayu.sessions.context_views import (
         ParticipantSessionBinding,
         ParticipantSessionCreationReceipt,
         ParticipantSessionExecutionRequest,
     )
+    from cayu.sessions.records import Session
 
 
 def require_execution_creation(

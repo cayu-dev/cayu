@@ -28,10 +28,10 @@ from cayu.runtime._session_control import TerminalFinalizationClaimHandoff
 from cayu.sessions._invocation_terminal_decision import InvocationTerminalDecision
 from cayu.sessions._terminal_evidence import interruption_request_id_from_payload
 from cayu.sessions.base import (
-    Session,
     SessionRuntimePublicationConflict,
     _incomplete_recovery_claim_from_checkpoint,
 )
+from cayu.sessions.records import Session
 
 if TYPE_CHECKING:
     from cayu.runtime._terminal_evidence_finalization import TerminalEvidenceFinalization

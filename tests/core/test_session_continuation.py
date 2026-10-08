@@ -78,11 +78,10 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     ResumeRequest,
     RunRequest,
-    Session,
     SessionOperationPublication,
-    SessionStatus,
     SessionStore,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.exposure import tool_capability_ceiling_from_session_metadata
 from cayu.tools.user_input import UserInputTool

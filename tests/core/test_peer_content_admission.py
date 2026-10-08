@@ -30,10 +30,10 @@ from cayu.sessions.base import (
     InterruptSessionRequest,
     RunRequest,
     SessionMessageDeliveryMode,
-    SessionStatus,
     SessionStatusConflict,
 )
 from cayu.sessions.context_views import ParticipantSessionCreationRequest
+from cayu.sessions.records import SessionStatus
 
 
 @pytest.mark.anyio

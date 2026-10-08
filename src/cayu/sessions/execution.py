@@ -152,7 +152,7 @@ def execution_state(
     owner,
     now,
 ):
-    from cayu.sessions.base import SessionStatus
+    from cayu.sessions.records import SessionStatus
 
     current = (
         owner is not None

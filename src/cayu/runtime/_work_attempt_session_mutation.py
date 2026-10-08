@@ -29,14 +29,12 @@ from cayu.runtime._task_store_operation_boundary import (
 from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
 from cayu.sessions.base import (
     DeferredInteractionInput,
-    EventRecord,
-    Session,
     SessionStore,
     TranscriptSnapshot,
     _initial_transcript_pending_interaction_id,
-    copy_session,
 )
 from cayu.sessions.invocation import SessionInvocationBinding
+from cayu.sessions.records import EventRecord, Session, copy_session
 from cayu.tasks.admission import (
     WorkAttemptAdmission,
     WorkAttemptAdmissionState,

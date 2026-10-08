@@ -35,11 +35,10 @@ from cayu.sessions.base import (
     RunRequest,
     SessionMessageDeliveryMode,
     SessionQueuedMessagesPending,
-    SessionStatus,
-    TranscriptRecord,
     TranscriptSnapshot,
     fork_source_transcript_sha256,
 )
+from cayu.sessions.records import SessionStatus, TranscriptRecord
 
 
 @pytest.fixture(params=["memory", "sqlite", "postgres"])

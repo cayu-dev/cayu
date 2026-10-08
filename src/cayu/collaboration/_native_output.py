@@ -6,7 +6,8 @@ from dataclasses import dataclass
 
 from cayu.collaboration._contracts import CollaborationConflict
 from cayu.collaboration._session_export_store import source_digest
-from cayu.sessions.base import SessionStore, TranscriptRecord, runtime_publication_request_digest
+from cayu.sessions.base import SessionStore, runtime_publication_request_digest
+from cayu.sessions.records import TranscriptRecord
 
 
 @dataclass(frozen=True, slots=True)

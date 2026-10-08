@@ -32,7 +32,7 @@ from cayu.memory.attribution import (
     MemoryAttributionStatus,
     MemoryAttributionUnavailableReason,
 )
-from cayu.sessions.base import SessionStatus
+from cayu.sessions.records import SessionStatus
 
 
 def _trajectory_sources(

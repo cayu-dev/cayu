@@ -431,7 +431,6 @@ from cayu.sessions.base import (
     CheckpointTransform,
     EventOrder,
     EventQuery,
-    EventRecord,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
@@ -441,13 +440,11 @@ from cayu.sessions.base import (
     InteractionTransitionSpec,
     ModelCompletionStage,
     RuntimePublicationReceipt,
-    Session,
     SessionOperationPublication,
     SessionOrder,
     SessionQuery,
     SessionRunFenced,
     SessionRuntimePublicationConflict,
-    SessionStatus,
     SessionStatusConflict,
     SessionStore,
     StoreTimeCheckpointTransform,
@@ -488,6 +485,7 @@ from cayu.sessions.invocation import (
     SessionInvocationBinding,
     inherited_session_invocation,
 )
+from cayu.sessions.records import EventRecord, Session, SessionStatus
 from cayu.tasks._terminalization import _terminalize_claimed_task
 from cayu.tasks.dispatch import (
     _new_prepared_subagent_dispatch_envelope,

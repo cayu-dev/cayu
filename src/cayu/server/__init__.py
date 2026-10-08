@@ -47,7 +47,7 @@ from cayu.project_control_plane import (
 from cayu.runtime.event_side_effect_health import safe_error
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.server._event_side_effect_health import EventSideEffectRecoveryLoop
-from cayu.sessions.base import SessionStatus
+from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import (
     RecoveryBlockerCode,
     RecoveryExecutionRequest,

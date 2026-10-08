@@ -34,7 +34,7 @@ from cayu.evals.portable_evaluation import (
 )
 from cayu.events import Event, EventType
 from cayu.messages import Message, TextPart, ToolCallPart, ToolResultPart
-from cayu.sessions.base import SessionStatus
+from cayu.sessions.records import SessionStatus
 
 _TOOL_ARGUMENT_TERMINAL_EVENT_TYPES = frozenset(
     {

@@ -12,7 +12,8 @@ from cayu.sessions._producer_checkpoint import (
     NativeProducerPausedStop,
     _publication_scope,
 )
-from cayu.sessions.base import SessionOperationPublication, SessionStatus
+from cayu.sessions.base import SessionOperationPublication
+from cayu.sessions.records import SessionStatus
 
 
 async def accept_paused_stop(store, command, index, attachment, request, closure_commitment):

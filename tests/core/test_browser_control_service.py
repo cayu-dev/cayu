@@ -21,7 +21,7 @@ from cayu.runtime._browser_control_service import (
 )
 from cayu.runtime._invocation_secrets import InvocationPublicationSnapshot
 from cayu.sessions._browser_control_checkpoint import BrowserControlCheckpointMutation
-from cayu.sessions.base import SessionStatus
+from cayu.sessions.records import SessionStatus
 from cayu.tools.base import (
     ToolContext,
     _bind_runtime_tool_invocation_authority,

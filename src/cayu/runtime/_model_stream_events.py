@@ -69,7 +69,8 @@ from cayu.runtime.model_steps import (
 )
 from cayu.runtime.provider_operations import provider_operation_progress_event_id
 from cayu.runtime.retry_policy import RetryDecision, retry_diagnostic_payload
-from cayu.sessions.base import ModelCompletionStage, Session
+from cayu.sessions.base import ModelCompletionStage
+from cayu.sessions.records import Session
 
 
 @dataclass(frozen=True)

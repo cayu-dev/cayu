@@ -21,7 +21,8 @@ from cayu.events import (
     validate_public_custom_event_type,
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import ForkSessionRequest, Session, copy_fork_session_request
+from cayu.sessions.base import ForkSessionRequest, copy_fork_session_request
+from cayu.sessions.records import Session
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.dispatch import DispatchHandle, DispatchRequest, copy_dispatch_handle
 from cayu.tasks.records import Task, copy_task

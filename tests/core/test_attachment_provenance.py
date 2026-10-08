@@ -276,7 +276,7 @@ def test_compatible_provenance_cannot_authorize_unavailable_derived_artifact(
         _FileAttachmentUnavailable,
         _resolved_file_attachments,
     )
-    from cayu.sessions.base import Session
+    from cayu.sessions.records import Session
 
     async def scenario():
         store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")

@@ -30,7 +30,6 @@ from cayu.sessions.base import (
     RuntimePublicationMutation,
     RuntimePublicationRequest,
     SessionIdentity,
-    SessionStatus,
     SessionStore,
     runtime_publication_checkpoint_value_digest,
 )
@@ -43,6 +42,7 @@ from cayu.sessions.checkpoints import (
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     CheckpointCompatibilityError,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.tools.exposure import ToolCapabilityCeiling
 from cayu.tools.user_input import UserInputTool
 from cayu.vaults import SecretRedactor

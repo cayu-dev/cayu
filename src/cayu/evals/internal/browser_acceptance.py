@@ -95,12 +95,11 @@ from cayu.sessions.base import (
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TOTAL_BYTES,
     EventQuery,
     IncompleteSessionRecoveryRequest,
-    RunnerObservedEventIdentity,
     RunRequest,
     SessionOperationPublication,
-    SessionStatus,
     TerminalSessionEvidenceLimits,
 )
+from cayu.sessions.records import RunnerObservedEventIdentity, SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import DurableToolRecoveryEvidence
 from cayu.tools.browser_session import (

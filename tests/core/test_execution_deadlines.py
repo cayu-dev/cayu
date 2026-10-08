@@ -21,13 +21,8 @@ from cayu.evals.testing import ScriptedModelProvider
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import (
-    InMemorySessionStore,
-    ResumeRequest,
-    RunRequest,
-    SessionIdentity,
-    SessionStatus,
-)
+from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest, SessionIdentity
+from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.workflows.base import WorkflowSpec
 from cayu.workflows.workflow import StepRunOptions, WorkflowBase, parallel, step

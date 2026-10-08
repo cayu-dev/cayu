@@ -362,7 +362,7 @@ def test_limit_correlation_does_not_adopt_unresolved_or_newer_terminal(tmp_path,
 
 @pytest.mark.parametrize("boundary", ["session.limit_reached", "session.interrupted"])
 def test_limit_publication_loses_to_store_epoch_fence(tmp_path, monkeypatch, boundary):
-    from cayu.sessions.base import SessionStatus
+    from cayu.sessions.records import SessionStatus
 
     async def run():
         store = SQLiteSessionStore(tmp_path / "fence.db")

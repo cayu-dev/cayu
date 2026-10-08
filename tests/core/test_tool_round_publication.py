@@ -42,11 +42,10 @@ from cayu.sessions.base import (
     RuntimePublicationReceipt,
     RuntimePublicationRequest,
     RuntimePublicationResult,
-    Session,
     SessionIdentity,
     SessionRuntimePublicationConflict,
-    SessionStatus,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.tools.base import ToolResult
 
 _INTERACTION_ID = "interaction-tool-round-publication"

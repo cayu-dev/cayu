@@ -168,7 +168,6 @@ from cayu.sessions.base import (
     MAX_PENDING_ACTION_TOOL_CALLS,
     MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
     MODEL_TARGET_PROJECTION_METADATA_KEY,
-    RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX,
     SESSION_INSPECTION_LABEL_LIMIT,
     SESSION_LINEAGE_MAX_EVENT_ID_BYTES,
@@ -186,7 +185,6 @@ from cayu.sessions.base import (
     EnqueueSessionMessageResult,
     EventQuery,
     EventQueryResultTooLarge,
-    EventRecord,
     EventSummary,
     ForkCheckpointAuthorityDecoder,
     ForkSystemPromptReplacement,
@@ -216,12 +214,10 @@ from cayu.sessions.base import (
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
     QueuedInteractionProfileHandoff,
-    RunnerObservedEventIdentity,
     RunRequest,
     RuntimePublicationMutation,
     RuntimePublicationReceipt,
     RuntimePublicationResult,
-    Session,
     SessionAggregateFilter,
     SessionForkActiveModelStageConflict,
     SessionForkProfileRelationship,
@@ -251,7 +247,6 @@ from cayu.sessions.base import (
     SessionRuntimeIdentity,
     SessionRuntimePublicationConflict,
     SessionStateSnapshot,
-    SessionStatus,
     SessionStatusConflict,
     SessionStatusCounts,
     SessionStore,
@@ -269,7 +264,6 @@ from cayu.sessions.base import (
     TerminalSessionEvidenceLimits,
     TranscriptPage,
     TranscriptQuery,
-    TranscriptRecord,
     TranscriptSearchHit,
     TranscriptSearchQuery,
     TranscriptSearchResult,
@@ -474,7 +468,6 @@ from cayu.sessions.base import (
     require_deferred_initial_transcript_replacement,
     resolve_interaction_attribution,
     restore_persisted_event_authority,
-    runtime_build_provenance_from_session_metadata,
     session_messages_input_contract_evidence,
     session_next_cursor,
     session_outcome,
@@ -493,6 +486,15 @@ from cayu.sessions.interactions import (
     INTERACTION_TERMINAL_EVENT_TYPES,
 )
 from cayu.sessions.invocation import SessionInvocation
+from cayu.sessions.records import (
+    RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
+    EventRecord,
+    RunnerObservedEventIdentity,
+    Session,
+    SessionStatus,
+    TranscriptRecord,
+    runtime_build_provenance_from_session_metadata,
+)
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _sqlite_aggregates as sqlite_aggregates
 from cayu.storage import _sqlite_connection as sqlite_connection

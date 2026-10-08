@@ -29,7 +29,8 @@ from cayu.runtime._tool_round_staging import (
     _ToolRoundPublicationCoordinator,
 )
 from cayu.sessions import _staged_tool_terminal_reader as staged_terminal_reader
-from cayu.sessions.base import Session, SessionStore
+from cayu.sessions.base import SessionStore
+from cayu.sessions.records import Session
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools.base import ToolResult
 from cayu.tools.exposure import ResolvedToolExposureAuthority

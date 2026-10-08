@@ -9,7 +9,7 @@ from cayu.tools.base import ToolResult
 
 if TYPE_CHECKING:
     from cayu.runtime._child_session_identity import ChildSessionRecoveryMatcher
-    from cayu.sessions.base import Session
+    from cayu.sessions.records import Session
 
 
 async def project_authenticated_child_result(

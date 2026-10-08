@@ -28,7 +28,8 @@ from cayu.sessions._foreground_child_checkpoint import (
     ForegroundParentContinuation,
     foreground_child_state_from_checkpoint,
 )
-from cayu.sessions.base import Session, SessionOperationPublication, SessionRunFenced, SessionStore
+from cayu.sessions.base import SessionOperationPublication, SessionRunFenced, SessionStore
+from cayu.sessions.records import Session
 
 
 def _key(kind: str, action_id: str, resolution_digest: str) -> str:

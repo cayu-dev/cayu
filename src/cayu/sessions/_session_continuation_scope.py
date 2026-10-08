@@ -21,7 +21,7 @@ if TYPE_CHECKING:
         ContinuationRetirement,
         ContinuationTicket,
     )
-    from cayu.sessions.base import Session
+    from cayu.sessions.records import Session
 
 _PUBLICATION: ContextVar[str | None] = ContextVar("continuation_publication", default=None)
 _SERVICE_PUBLICATION: ContextVar[tuple[str, str] | None] = ContextVar(
@@ -57,7 +57,8 @@ def require_preparation_writer(session: Session, checkpoint: dict | None) -> Non
     from cayu.sessions._invocation_lifecycle import (
         require_invocation_command_authority,
     )
-    from cayu.sessions.base import SessionRunFenced, SessionStatus
+    from cayu.sessions.base import SessionRunFenced
+    from cayu.sessions.records import SessionStatus
 
     authority = _PREPARATION.get()
     if authority is None:

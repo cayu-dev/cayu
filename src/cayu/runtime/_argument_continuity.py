@@ -52,7 +52,8 @@ from cayu.vaults.redaction import SecretRedactor
 if TYPE_CHECKING:
     from cayu.knowledge.scopes import KnowledgeAccessScope
     from cayu.runtime._runtime_records import ToolCallRequest
-    from cayu.sessions.base import Session, SessionStore
+    from cayu.sessions.base import SessionStore
+    from cayu.sessions.records import Session
 
 
 def scope_digest(scope: KnowledgeAccessScope | None) -> str:

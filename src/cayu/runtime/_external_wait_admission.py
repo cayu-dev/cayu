@@ -22,7 +22,7 @@ from cayu.sessions.external_waits import (
 
 if TYPE_CHECKING:
     from cayu.sessions._external_wait_transition import ExternalWaitMutation
-    from cayu.sessions.base import Session
+    from cayu.sessions.records import Session
 
 _RESUME: ContextVar[AdmitInvocationCommand | None] = ContextVar(
     "external_wait_resume", default=None

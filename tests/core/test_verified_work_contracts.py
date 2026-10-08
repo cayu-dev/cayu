@@ -67,9 +67,7 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     ResumeRequest,
     RunRequest,
-    Session,
     SessionIdentity,
-    SessionStatus,
     run_request_with_runtime_invocation,
 )
 from cayu.sessions.invocation import (
@@ -80,6 +78,7 @@ from cayu.sessions.invocation import (
     TaskExecutionSource,
     TaskInvocation,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.storage import migrations as schema_migrations
 from cayu.storage.sqlite import SQLiteTaskStore
 from cayu.tasks.contracts import (

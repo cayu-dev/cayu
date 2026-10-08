@@ -832,7 +832,7 @@ async def test_registered_producer_enters_native_participant_runtime(
     assert any(part.type == "thinking" for part in transcript[-1].content)
     if not oversized:
         from cayu.collaboration._session_export_store import source_digest
-        from cayu.sessions.base import TranscriptRecord
+        from cayu.sessions.records import TranscriptRecord
 
         visible = TranscriptRecord(
             index=2,

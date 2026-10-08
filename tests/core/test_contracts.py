@@ -108,12 +108,11 @@ from cayu.sessions.base import (
     ModelTarget,
     ResumeRequest,
     RunRequest,
-    Session,
-    SessionStatus,
     SessionStore,
     copy_resume_request,
     copy_run_request,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.storage import KnowledgeEntry, KnowledgeHit
 from cayu.storage.memory import copy_knowledge_entry
 from cayu.tasks.dispatch import (

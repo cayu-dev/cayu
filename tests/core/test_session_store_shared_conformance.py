@@ -272,7 +272,6 @@ from cayu.sessions.base import (
     RuntimePublicationMutation,
     RuntimePublicationOperationRecordMutation,
     RuntimePublicationRequest,
-    Session,
     SessionIdentity,
     SessionMessageDeliveryMode,
     SessionModelCompletionStageConflict,
@@ -283,7 +282,6 @@ from cayu.sessions.base import (
     SessionQueuedMessage,
     SessionQueuedMessagesPending,
     SessionRuntimePublicationConflict,
-    SessionStatus,
     SessionStatusConflict,
     SessionStore,
     TerminalSessionEvidenceError,
@@ -314,6 +312,7 @@ from cayu.sessions.invocation import (
     InvocationOriginTrust,
     SessionExecutionSource,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.storage.jsonl_export import export_sessions, import_sessions
 from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
 from cayu.storage.migrations import SchemaMode

@@ -43,15 +43,13 @@ from cayu.runtime.public_authority import public_authority_alias_codec_from_envi
 from cayu.sessions.base import (
     EventOrder,
     EventQuery,
-    EventRecord,
     SessionOrder,
     SessionQuery,
-    SessionStatus,
     SessionStore,
     TranscriptQuery,
-    TranscriptRecord,
 )
 from cayu.sessions.interactions import INTERACTION_TERMINAL_EVENT_TYPES, InteractionSummaryEvidence
+from cayu.sessions.records import EventRecord, SessionStatus, TranscriptRecord
 from cayu.storage import SQLiteSessionStore
 from cayu.storage import migrations as schema
 from cayu.tools.policy import ToolPolicyDecision

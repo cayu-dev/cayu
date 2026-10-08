@@ -156,17 +156,14 @@ from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.sessions.base import (
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
     EventQuery,
-    EventRecord,
-    RunnerObservedEventIdentity,
     RunRequest,
-    Session,
-    SessionStatus,
     TerminalSessionEvidence,
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,
     TerminalSessionEvidenceLimits,
     copy_run_request,
 )
+from cayu.sessions.records import EventRecord, RunnerObservedEventIdentity, Session, SessionStatus
 from cayu.tools._operation_boundary import (
     BoundedInvocationOperationRegistry,
     InvocationOperationCapacityError,

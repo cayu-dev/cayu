@@ -22,7 +22,6 @@ from cayu.sessions.base import (
     SessionIdentity,
     SessionLineageNode,
     SessionLineageResult,
-    SessionStatus,
     SessionStore,
     SessionTopologyBranch,
     SessionTopologyCycle,
@@ -32,6 +31,7 @@ from cayu.sessions.base import (
     build_session_topology_result,
     decode_session_topology_cursor,
 )
+from cayu.sessions.records import SessionStatus
 
 
 def test_session_lineage_page_requires_portable_identifier_order() -> None:

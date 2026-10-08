@@ -67,7 +67,8 @@ from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions import _staged_tool_terminal_reader as staged_terminal_reader
-from cayu.sessions.base import Session, SessionStatus, SessionStore
+from cayu.sessions.base import SessionStore
+from cayu.sessions.records import Session, SessionStatus
 from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools import _terminal_controls as tool_terminal_controls
 from cayu.tools._redaction import InvocationRedactorSnapshot

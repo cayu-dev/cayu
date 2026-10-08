@@ -76,7 +76,7 @@ def select_continuation(snapshot: CompletedTurnSnapshot) -> RecipientContinuatio
     from cayu.sessions._session_continuation_store import (
         require_continuation_selection_quiescence,
     )
-    from cayu.sessions.base import SessionStatus
+    from cayu.sessions.records import SessionStatus
 
     session = snapshot.current_session
     source = snapshot.publication

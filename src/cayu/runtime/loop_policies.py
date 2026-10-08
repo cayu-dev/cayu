@@ -20,7 +20,7 @@ from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 
 if TYPE_CHECKING:
     from cayu.runtime.model_steps import AssistantStepResult, StepClassification
-    from cayu.sessions.base import Session
+    from cayu.sessions.records import Session
 
 
 class BeforeStopAction(StrEnum):

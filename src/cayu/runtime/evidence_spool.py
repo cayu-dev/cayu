@@ -25,15 +25,13 @@ from cayu.events import Event, EventType
 from cayu.sessions.base import (
     _TERMINAL_SESSION_EVIDENCE_LIFECYCLE_EVENT_TYPES,
     TERMINAL_SESSION_EVIDENCE_HARD_MAX_RECORD_BYTES,
-    EventRecord,
-    Session,
     TerminalPublicationMarker,
     TerminalSessionEvidence,
     TerminalSessionEvidenceBoundary,
-    TranscriptRecord,
     _measure_terminal_session_evidence,
     _validate_terminal_session_evidence_content,
 )
+from cayu.sessions.records import EventRecord, Session, TranscriptRecord
 
 T = TypeVar("T", bound=BaseModel)
 

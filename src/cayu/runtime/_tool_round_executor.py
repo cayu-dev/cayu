@@ -237,10 +237,8 @@ from cayu.sessions.base import (
     McpManifestBaselineLoadResult,
     McpManifestHistoryConflict,
     McpManifestPublicationResult,
-    Session,
     SessionOperationPublication,
     SessionRunFenced,
-    SessionStatus,
     SessionStore,
     _mcp_authoritative_manifest_hash,
     _mcp_manifest_session_ref,
@@ -248,6 +246,7 @@ from cayu.sessions.base import (
     resolve_interaction_attribution,
     runtime_publication_checkpoint_value_digest,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools import _shared_artifact_results as shared_artifact_results
 from cayu.tools import _terminal_controls as tool_terminal_controls

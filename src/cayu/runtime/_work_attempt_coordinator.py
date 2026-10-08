@@ -57,18 +57,16 @@ from cayu.sessions.base import (
     IncompleteSessionRecoveryResult,
     ResumeRequest,
     RunRequest,
-    Session,
     SessionRunFenced,
-    SessionStatus,
     SessionStore,
     _activate_session_interaction,
     _activate_session_run_fence,
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
     _initial_transcript_pending_interaction_id,
-    copy_session,
 )
 from cayu.sessions.invocation import SessionInvocationBinding
+from cayu.sessions.records import Session, SessionStatus, copy_session
 from cayu.tasks.admission import (
     WORK_ATTEMPT_RECOVERY_CHECKPOINT_KEY,
     WORK_ATTEMPT_RENEWABLE_STATES,

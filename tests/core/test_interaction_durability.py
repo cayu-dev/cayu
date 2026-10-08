@@ -51,7 +51,6 @@ from cayu.sessions.base import (
     SessionIdentity,
     SessionMessageDeliveryMode,
     SessionRunFenced,
-    SessionStatus,
     SessionStatusConflict,
 )
 from cayu.sessions.interactions import (
@@ -59,6 +58,7 @@ from cayu.sessions.interactions import (
     InteractionStatus,
     InteractionSummaryEvidence,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.records import TaskStatus

@@ -31,7 +31,8 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyResult,
     execution_profile_from_session_metadata,
 )
-from cayu.sessions.base import SessionStatus, SessionStore
+from cayu.sessions.base import SessionStore
+from cayu.sessions.records import SessionStatus
 
 
 class _LoseAdmissionAcknowledgement(SessionStore):

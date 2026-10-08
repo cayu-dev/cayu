@@ -44,14 +44,12 @@ from cayu.runtime.build_provenance import (
     RuntimeBuildProvenanceOrigin,
 )
 from cayu.sessions.base import (
-    RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     CheckpointTransform,
     InMemorySessionStore,
     RunRequest,
-    Session,
     SessionIdentity,
-    SessionStatus,
 )
+from cayu.sessions.records import RUNTIME_BUILD_PROVENANCE_METADATA_KEY, Session, SessionStatus
 
 
 def _pending_approval(**kwargs) -> PendingToolApproval:

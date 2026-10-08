@@ -21,7 +21,7 @@ from cayu.tools.browser_control import (
 )
 
 if TYPE_CHECKING:
-    from cayu.sessions.base import Session
+    from cayu.sessions.records import Session
 
 
 def browser_terminal_checkpoint_mutation(

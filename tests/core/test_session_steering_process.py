@@ -21,7 +21,7 @@ from cayu.events import EventType
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
 from cayu.sessions._pending_tool_round_reader import pending_tool_round_from_checkpoint
-from cayu.sessions.base import SessionStatus
+from cayu.sessions.records import SessionStatus
 from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 

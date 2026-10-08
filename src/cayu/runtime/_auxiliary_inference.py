@@ -99,11 +99,10 @@ from cayu.sessions.base import (
     ModelCompletionStage,
     ModelCompletionStageRequest,
     RuntimePublicationRequest,
-    Session,
     SessionModelCompletionStageConflict,
-    SessionStatus,
     SessionStore,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.tools.inference import InferenceLimits, copy_inference_limits, validate_inference_purpose
 from cayu.vaults.redaction import SecretRedactor
 

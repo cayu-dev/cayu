@@ -39,7 +39,6 @@ from cayu.sessions.base import (
     ModelCompletionStageRecoveryFence,
     ProfiledSessionForkResult,
     RuntimePublicationRequest,
-    Session,
     SessionInvocationAdmission,
     SessionOperationInitializer,
     SessionStore,
@@ -54,6 +53,7 @@ from cayu.sessions.checkpoints import (
     decode_runtime_checkpoint,
     validate_runtime_checkpoint_root_projection,
 )
+from cayu.sessions.records import Session
 
 _ROOT_CHECKPOINT_GUARD = CheckpointRootFieldGuard(
     key=CHECKPOINT_SCHEMA_VERSION_KEY,

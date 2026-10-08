@@ -56,11 +56,11 @@ from cayu.sessions.base import (
     SessionMessageDeliveryMode,
     SessionModelCompletionStageConflict,
     SessionRunFenced,
-    SessionStatus,
     TranscriptQuery,
     _canonical_runtime_publication_digest,
     _model_completion_stage_dispatch_storage_key,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.memory import InMemoryTaskStore

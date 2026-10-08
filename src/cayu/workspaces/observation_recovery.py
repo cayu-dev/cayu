@@ -45,10 +45,7 @@ from cayu.sessions.base import (
     RuntimePublicationReceipt,
     RuntimePublicationRequest,
     RuntimePublicationResult,
-    Session,
-    SessionStatus,
     SessionStore,
-    copy_session,
     runtime_publication_checkpoint_value_digest,
     runtime_publication_request_digest,
 )
@@ -57,6 +54,7 @@ from cayu.sessions.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY,
 )
+from cayu.sessions.records import Session, SessionStatus, copy_session
 from cayu.vaults.redaction import SecretRedactor
 
 if TYPE_CHECKING:

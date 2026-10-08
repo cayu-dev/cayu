@@ -13,7 +13,7 @@ from cayu.runtime._browser_control_publication import (
 )
 from cayu.runtime._browser_control_publisher import BrowserControlPublisher
 from cayu.sessions._browser_control_checkpoint import BrowserControlCheckpointMutation
-from cayu.sessions.base import SessionStatus
+from cayu.sessions.records import SessionStatus
 from cayu.tools.browser_control import (
     BrowserControlConflict,
     BrowserControlPrincipal,

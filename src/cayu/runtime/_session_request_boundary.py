@@ -41,7 +41,6 @@ from cayu.sessions.base import (
     InterruptSessionRequest,
     ResumeRequest,
     RunRequest,
-    Session,
     apply_runtime_session_create_claim,
     copy_compact_session_request,
     copy_enqueue_session_message_request,
@@ -49,12 +48,12 @@ from cayu.sessions.base import (
     copy_interrupt_session_request,
     copy_resume_request,
     copy_run_request,
-    copy_session,
     effective_fork_source_execution_profile,
     run_request_authority_is_runtime_generated,
     session_user_metadata,
     strip_runtime_session_create_claim_before_redaction,
 )
+from cayu.sessions.records import Session, copy_session
 from cayu.tools.policy import TAINT_LABELS_METADATA_KEY, taint_labels_from_metadata
 from cayu.vaults.redaction import SecretRedactor
 

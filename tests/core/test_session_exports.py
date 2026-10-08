@@ -37,8 +37,8 @@ from cayu.sessions.base import (
     RunRequest,
     SessionIdentity,
     SessionOperationPublication,
-    SessionStatus,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.storage import PostgresSessionStore, SQLiteSessionStore
 from cayu.storage.migrations import SchemaMode
 from cayu.vaults.redaction import SecretRedactor

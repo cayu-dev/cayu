@@ -19,7 +19,7 @@ from cayu.cli.project import (
     project_context,
     resolve_project,
 )
-from cayu.sessions.base import SessionStatus
+from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import (
     RECOVERY_PLAN_MAX_CONCURRENCY,
     RECOVERY_PLAN_MAX_INSPECTIONS,

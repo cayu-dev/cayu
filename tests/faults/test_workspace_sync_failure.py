@@ -30,9 +30,9 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     RunRequest,
     SessionMessageDeliveryMode,
-    SessionStatus,
     SessionStatusConflict,
 )
+from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.admission import (
     WorkAttemptExecutionRequest,

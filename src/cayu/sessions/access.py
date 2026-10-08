@@ -18,13 +18,13 @@ from cayu.sessions.base import (
     LabelSelectorOperator,
     LabelSelectorRequirement,
     RunRequest,
-    Session,
     SessionIdentity,
     SessionListResult,
     SessionQuery,
     SessionStore,
     copy_session_query,
 )
+from cayu.sessions.records import Session
 
 Action = Literal[
     "read", "create", "modify", "delete", "execute", "inspect_state", "update_labels", "relabel"

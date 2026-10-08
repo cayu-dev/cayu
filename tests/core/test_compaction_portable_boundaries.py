@@ -49,7 +49,8 @@ from cayu.providers import (
     UsageDialect,
 )
 from cayu.providers.retry_policy import RetryPolicy
-from cayu.sessions.base import RunRequest, Session
+from cayu.sessions.base import RunRequest
+from cayu.sessions.records import Session
 
 
 def _assert_internal_post_dispatch_compaction_failure(

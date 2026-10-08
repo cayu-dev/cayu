@@ -48,13 +48,11 @@ from cayu.sessions.base import (
     EventOrder,
     EventQuery,
     EventQueryResultTooLarge,
-    EventRecord,
-    Session,
     SessionLineageQuery,
     SessionOrder,
     SessionQuery,
-    SessionStatus,
 )
+from cayu.sessions.records import EventRecord, Session, SessionStatus
 from cayu.tasks.topology import TaskTopologyQuery
 from cayu.tools.inference import validate_inference_purpose
 from cayu.tools.policy import taint_labels_from_metadata

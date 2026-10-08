@@ -16,7 +16,8 @@ from cayu.sessions._execution_profile_checkpoint import (
     execution_profile_from_session_metadata,
 )
 from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
-from cayu.sessions.base import ResumeRequest, Session, SessionStore
+from cayu.sessions.base import ResumeRequest, SessionStore
+from cayu.sessions.records import Session
 
 
 async def inherit_resume_configuration(

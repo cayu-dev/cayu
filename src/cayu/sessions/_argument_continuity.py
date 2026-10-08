@@ -18,7 +18,7 @@ from cayu._validation import canonical_durable_json_bytes, copy_durable_json_obj
 from cayu.messages import Message, ToolCallPart
 
 if TYPE_CHECKING:
-    from cayu.sessions.base import Session
+    from cayu.sessions.records import Session
 
 STORAGE_KEY = "cayu:private-argument-continuity"
 MAX_ROUNDS = 16

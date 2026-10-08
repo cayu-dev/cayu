@@ -14,7 +14,8 @@ from cayu.evals.testing import ScriptedModelProvider
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest, SessionStatus
+from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest
+from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import RecoveryPlanAction, RecoveryPlanRequest, RecoveryPlanSelection
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.creation import TaskCreate

@@ -15,7 +15,8 @@ from typing import TYPE_CHECKING, Any
 from cayu._validation import copy_json_value
 from cayu.events import Event, EventType, copy_event
 from cayu.runtime.tool_completion import ToolCompletionResult
-from cayu.sessions.base import ResumeRequest, SessionStatus
+from cayu.sessions.base import ResumeRequest
+from cayu.sessions.records import SessionStatus
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp

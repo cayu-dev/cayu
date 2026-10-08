@@ -17,10 +17,10 @@ from cayu.sessions.base import (
     RuntimePublicationRequest,
     SessionIdentity,
     SessionOperationPublication,
-    SessionStatus,
     _checkpoint_with_session_run_operation,
     runtime_publication_checkpoint_mutation,
 )
+from cayu.sessions.records import SessionStatus
 
 
 async def create_closure_session(store, session_id, parent=None):

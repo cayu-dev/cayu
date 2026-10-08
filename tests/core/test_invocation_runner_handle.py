@@ -49,7 +49,8 @@ from cayu.runners.base import (
 from cayu.runners.local import LocalRunner
 from cayu.runtime._invocation_secrets import InvocationSecretTracker
 from cayu.runtime._tool_execution import run_tool
-from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionStatus
+from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.records import SessionStatus
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._resources import (
     InvocationWorkspaceMutationOwner,
