@@ -418,12 +418,14 @@ from cayu.sessions._provider_operation_cancellation_claim import (
     active_provider_operation_cancellation_claim_from_checkpoint,
 )
 from cayu.sessions._terminal_evidence import (
+    _SESSION_RUN_OPERATION_CHECKPOINT_KEY,
+    _session_run_operation_from_checkpoint,
+    _SessionRunOperation,
     interruption_request_id_from_payload,
     require_interruption_event_matches_pending_marker,
 )
 from cayu.sessions.base import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
-    _SESSION_RUN_OPERATION_CHECKPOINT_KEY,
     MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES,
     MAX_SESSION_LIST_CURSOR_BYTES,
     RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS,
@@ -459,8 +461,6 @@ from cayu.sessions.base import (
     _initial_transcript_pending_interaction_id,
     _model_completion_stage_promotion_statuses,
     _queued_dispatch_session_instance_fingerprint,
-    _session_run_operation_from_checkpoint,
-    _SessionRunOperation,
     copy_interaction_transition_spec,
     runtime_publication_checkpoint_value_digest,
 )

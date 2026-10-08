@@ -63,6 +63,7 @@ from cayu.sessions._invocation_lifecycle import (
     _invocation_lifecycle_receipt_from_checkpoint,
     require_released_invocation_command_authority,
 )
+from cayu.sessions._terminal_evidence import _session_run_operation_from_checkpoint
 from cayu.sessions.base import (
     PENDING_ACTION_EVENT_TYPE_VALUES,
     EventOrder,
@@ -80,7 +81,6 @@ from cayu.sessions.base import (
     SessionQuery,
     SessionStore,
     _incomplete_recovery_claim_from_checkpoint,
-    _session_run_operation_from_checkpoint,
 )
 from cayu.sessions.pending_actions import (
     checkpoint_has_pending_action_candidate,

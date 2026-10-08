@@ -45132,5 +45132,6 @@
     "tests/core/test_session_evidence_package_layout.py::test_public_session_records_work_without_loading_concrete_stores[cayu.runtime]": 0.18568245900678448,
     "tests/core/test_session_evidence_package_layout.py::test_public_session_records_work_without_loading_concrete_stores[cayu.sessions]": 0.1858447080012411,
     "tests/core/test_session_evidence_package_layout.py::test_public_session_records_work_without_loading_concrete_stores[cayu]": 0.18448229099158198,
-    "tests/core/test_session_evidence_package_layout.py::test_session_record_imports_preserve_public_identity_and_pickle_globals": 0.6121488339849748
+    "tests/core/test_session_evidence_package_layout.py::test_session_record_imports_preserve_public_identity_and_pickle_globals": 0.6121488339849748,
+    "tests/core/test_session_evidence_package_layout.py::test_run_operation_marker_parses_without_runtime_or_stores": 0.4098453760088887
 }

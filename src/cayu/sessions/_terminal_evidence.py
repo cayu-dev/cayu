@@ -6,8 +6,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from cayu._validation import copy_durable_json_object, require_clean_nonblank
-from cayu.events import Event, EventType
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    copy_durable_json_object,
+    require_clean_nonblank,
+    require_durable_clean_nonblank,
+)
+from cayu.events import EVENT_ID_MAX_CHARS, Event, EventType
 
 TERMINAL_EVIDENCE_QUERY_LIMIT = 2
 SESSION_RUN_OPERATION_ID_PAYLOAD_KEY = "session_run_operation_id"
@@ -157,4 +162,55 @@ def classify_current_terminal_evidence(
     return CurrentTerminalEvidence(
         events=tuple(terminal_events),
         latest_lifecycle_event_type=latest_lifecycle_event_type,
+    )
+
+
+_SESSION_RUN_OPERATION_CHECKPOINT_KEY = "session_run_operation"
+
+
+@dataclass(frozen=True)
+class _SessionRunOperation:
+    operation_id: str
+    run_epoch: int
+    terminal_event_id: str | None = None
+    queue_task_id: str | None = None
+
+
+def _session_run_operation_from_checkpoint(
+    checkpoint: dict[str, Any] | None,
+) -> _SessionRunOperation | None:
+    """Parse the durable identity of the latest resumed/continued session run."""
+    if checkpoint is None or _SESSION_RUN_OPERATION_CHECKPOINT_KEY not in checkpoint:
+        return None
+    marker = checkpoint[_SESSION_RUN_OPERATION_CHECKPOINT_KEY]
+    if type(marker) is not dict or marker.get("version") != 1:
+        raise ValueError("Session run operation checkpoint is invalid.")
+    operation_id = require_durable_clean_nonblank(
+        marker.get("operation_id"),
+        "session_run_operation.operation_id",
+    )
+    run_epoch = marker.get("run_epoch")
+    if type(run_epoch) is not int or run_epoch < 1 or run_epoch > MAX_DURABLE_JSON_INTEGER:
+        raise ValueError("Session run operation checkpoint run_epoch is invalid.")
+    terminal_event_id = marker.get("terminal_event_id")
+    if terminal_event_id is not None:
+        terminal_event_id = require_durable_clean_nonblank(
+            terminal_event_id,
+            "session_run_operation.terminal_event_id",
+        )
+        if len(terminal_event_id) > EVENT_ID_MAX_CHARS:
+            raise ValueError("Session run operation terminal_event_id is too long.")
+    queue_task_id = marker.get("queue_task_id")
+    if queue_task_id is not None:
+        queue_task_id = require_durable_clean_nonblank(
+            queue_task_id,
+            "session_run_operation.queue_task_id",
+        )
+    if queue_task_id is not None and terminal_event_id is None:
+        raise ValueError("Session run operation queue_task_id requires a terminal_event_id.")
+    return _SessionRunOperation(
+        operation_id=operation_id,
+        run_epoch=run_epoch,
+        terminal_event_id=terminal_event_id,
+        queue_task_id=queue_task_id,
     )

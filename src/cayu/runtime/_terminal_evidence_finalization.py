@@ -69,6 +69,8 @@ from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._terminal_evidence import (
     TERMINAL_EVIDENCE_EVENT_TYPES,
     TERMINAL_EVIDENCE_QUERY_LIMIT,
+    _session_run_operation_from_checkpoint,
+    _SessionRunOperation,
     classify_current_terminal_evidence,
     interruption_request_id_from_payload,
     require_interruption_event_matches_pending_marker,
@@ -84,8 +86,6 @@ from cayu.sessions.base import (
     _checkpoint_after_session_run_operation_cleanup,
     _event_with_session_run_operation,
     _incomplete_recovery_claim_from_checkpoint,
-    _session_run_operation_from_checkpoint,
-    _SessionRunOperation,
 )
 from cayu.sessions.cleanup import RecoveryCleanupStepInput
 from cayu.sessions.records import Session, SessionStatus

@@ -104,3 +104,55 @@ assert not blocked.intersection(sys.modules)
         timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_run_operation_marker_parses_without_runtime_or_stores():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            r"""
+import importlib.abc
+import sys
+
+class RejectRuntimeAndStores(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.startswith(("cayu.runtime", "cayu.storage")) or fullname == "cayu.sessions.base":
+            raise AssertionError(f"Run-operation evidence imported {fullname}")
+sys.meta_path.insert(0, RejectRuntimeAndStores())
+
+from cayu.sessions._terminal_evidence import _session_run_operation_from_checkpoint
+
+assert _session_run_operation_from_checkpoint(None) is None
+assert _session_run_operation_from_checkpoint({}) is None
+marker = {
+    "version": 1, "operation_id": "operation", "run_epoch": 2,
+    "terminal_event_id": "terminal", "queue_task_id": "task",
+}
+checkpoint = {"session_run_operation": marker}
+parsed = _session_run_operation_from_checkpoint(checkpoint)
+assert (parsed.operation_id, parsed.run_epoch, parsed.terminal_event_id, parsed.queue_task_id) == (
+    "operation", 2, "terminal", "task",
+)
+marker["operation_id"] = "changed"
+assert parsed.operation_id == "operation"
+for field, value in (
+    ("version", 2), ("run_epoch", True), ("run_epoch", 0),
+    ("operation_id", " "), ("operation_id", "bad\ud800"),
+    ("terminal_event_id", None),
+):
+    malformed = {**marker, field: value}
+    try:
+        _session_run_operation_from_checkpoint({"session_run_operation": malformed})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(f"Accepted malformed marker field: {field}")
+""",
+        ],
+        env={**os.environ, "PYTHONPATH": str(Path(cayu.__file__).resolve().parent.parent)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

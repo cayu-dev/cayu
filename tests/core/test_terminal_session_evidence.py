@@ -42,13 +42,13 @@ from cayu._validation import compact_json_utf8_size
 from cayu.sessions._terminal_evidence import (
     SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
     TERMINAL_EVIDENCE_QUERY_LIMIT,
+    _SessionRunOperation,
     classify_current_terminal_evidence,
 )
 from cayu.sessions.base import (
     _assemble_terminal_session_evidence,
     _classify_terminal_session_evidence_records,
     _event_with_session_run_operation,
-    _SessionRunOperation,
 )
 from cayu.sessions.records import RunnerObservedEventIdentity
 

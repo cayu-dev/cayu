@@ -523,6 +523,7 @@ from cayu.sessions._invocation_terminal_decision import InvocationTerminalDecisi
 from cayu.sessions._provider_operation_cancellation_claim import (
     active_provider_operation_cancellation_claim_from_checkpoint,
 )
+from cayu.sessions._terminal_evidence import _session_run_operation_from_checkpoint
 from cayu.sessions.authority import CheckpointValueAuthority
 from cayu.sessions.base import (
     _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES,
@@ -755,7 +756,6 @@ from cayu.sessions.base import (
     _session_metadata_after_model_transition,
     _session_metadata_after_runtime_identity_adoption,
     _session_metadata_after_tool_capability_ceiling_admission,
-    _session_run_operation_from_checkpoint,
     _stored_mcp_manifest_baseline,
     _terminal_publication_delete_block_reason,
     _terminal_session_evidence_expected_event_type,

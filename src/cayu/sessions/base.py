@@ -56,6 +56,7 @@ from cayu.runtime.event_side_effect_health import (
 )
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _completion_finalization as completion_finalization
+from cayu.sessions import _terminal_evidence as terminal_event_evidence
 from cayu.sessions import creation_fence
 from cayu.sessions._argument_continuity import ArgumentContinuity
 from cayu.sessions._completion_finalization import (
@@ -18592,7 +18593,7 @@ class InMemorySessionStore(
                 "Cannot delete a session while incomplete-session recovery claim "
                 f"{active_recovery_claim_id} is active: {session_id}"
             )
-        run_operation = _session_run_operation_from_checkpoint(checkpoint)
+        run_operation = terminal_event_evidence._session_run_operation_from_checkpoint(checkpoint)
         if run_operation is not None:
             raise ValueError(
                 "Cannot delete a session while terminal publication "
@@ -37751,7 +37752,7 @@ def _terminal_publication_delete_block_reason(
     if checkpoint is not None and "pending_session_interrupt" in checkpoint:
         return "pending interruption terminal publication is incomplete"
 
-    run_operation = _session_run_operation_from_checkpoint(checkpoint)
+    run_operation = terminal_event_evidence._session_run_operation_from_checkpoint(checkpoint)
     classification = classify_current_terminal_evidence(
         evidence_events=evidence_events,
         expected_event_type=expected_event_type,
@@ -37841,17 +37842,8 @@ def _checkpoint_after_initial_transcript_publication(
     return updated or None
 
 
-_SESSION_RUN_OPERATION_CHECKPOINT_KEY = "session_run_operation"
 _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY = SESSION_RUN_OPERATION_ID_PAYLOAD_KEY
 _QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY = "queued_dispatch_terminal_receipts"
-
-
-@dataclass(frozen=True)
-class _SessionRunOperation:
-    operation_id: str
-    run_epoch: int
-    terminal_event_id: str | None = None
-    queue_task_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -37859,46 +37851,6 @@ class _QueuedDispatchTerminalReceiptIdentity:
     queue_task_id: str
     terminal_event_id: str
     run_epoch: int
-
-
-def _session_run_operation_from_checkpoint(
-    checkpoint: dict[str, Any] | None,
-) -> _SessionRunOperation | None:
-    """Parse the durable identity of the latest resumed/continued session run."""
-    if checkpoint is None or _SESSION_RUN_OPERATION_CHECKPOINT_KEY not in checkpoint:
-        return None
-    marker = checkpoint[_SESSION_RUN_OPERATION_CHECKPOINT_KEY]
-    if type(marker) is not dict or marker.get("version") != 1:
-        raise ValueError("Session run operation checkpoint is invalid.")
-    operation_id = require_clean_nonblank(
-        marker.get("operation_id"),
-        "session_run_operation.operation_id",
-    )
-    run_epoch = marker.get("run_epoch")
-    if type(run_epoch) is not int or run_epoch < 1 or run_epoch > MAX_DURABLE_JSON_INTEGER:
-        raise ValueError("Session run operation checkpoint run_epoch is invalid.")
-    terminal_event_id = marker.get("terminal_event_id")
-    if terminal_event_id is not None:
-        terminal_event_id = require_clean_nonblank(
-            terminal_event_id,
-            "session_run_operation.terminal_event_id",
-        )
-        if len(terminal_event_id) > EVENT_ID_MAX_CHARS:
-            raise ValueError("Session run operation terminal_event_id is too long.")
-    queue_task_id = marker.get("queue_task_id")
-    if queue_task_id is not None:
-        queue_task_id = require_clean_nonblank(
-            queue_task_id,
-            "session_run_operation.queue_task_id",
-        )
-    if queue_task_id is not None and terminal_event_id is None:
-        raise ValueError("Session run operation queue_task_id requires a terminal_event_id.")
-    return _SessionRunOperation(
-        operation_id=operation_id,
-        run_epoch=run_epoch,
-        terminal_event_id=terminal_event_id,
-        queue_task_id=queue_task_id,
-    )
 
 
 def _queued_dispatch_terminal_receipts_from_checkpoint(
@@ -37956,7 +37908,7 @@ def _queued_dispatch_terminal_receipts_for_session(
 
     session_id = require_clean_nonblank(session_id, "session_id")
     projected: dict[str, QueuedDispatchTerminalReceipt] = {}
-    run_operation = _session_run_operation_from_checkpoint(checkpoint)
+    run_operation = terminal_event_evidence._session_run_operation_from_checkpoint(checkpoint)
     if (
         run_operation is not None
         and run_operation.queue_task_id is not None
@@ -37988,13 +37940,13 @@ def _queued_dispatch_terminal_receipts_for_session(
 def _checkpoint_after_session_run_operation_cleanup(
     checkpoint: dict[str, Any] | None,
     *,
-    operation: _SessionRunOperation,
+    operation: terminal_event_evidence._SessionRunOperation,
     retain_terminal_receipt: bool,
 ) -> dict[str, Any]:
     """Clear run ownership and optionally transfer terminal retention to the queue."""
 
     updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
-    updated.pop(_SESSION_RUN_OPERATION_CHECKPOINT_KEY, None)
+    updated.pop(terminal_event_evidence._SESSION_RUN_OPERATION_CHECKPOINT_KEY, None)
     if not retain_terminal_receipt or operation.terminal_event_id is None:
         return updated
     receipts = _queued_dispatch_terminal_receipts_from_checkpoint(checkpoint)
@@ -38038,7 +37990,7 @@ def _checkpoint_after_queued_dispatch_acknowledgement(
         terminal_event_id,
         "dispatch terminal_event_id",
     )
-    current_operation = _session_run_operation_from_checkpoint(checkpoint)
+    current_operation = terminal_event_evidence._session_run_operation_from_checkpoint(checkpoint)
     receipts = _queued_dispatch_terminal_receipts_from_checkpoint(checkpoint)
     receipt = receipts.get(operation_id)
     if receipt is not None and (
@@ -38056,7 +38008,7 @@ def _checkpoint_after_queued_dispatch_acknowledgement(
 
     updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
     if current_operation is not None and current_operation.operation_id == operation_id:
-        updated.pop(_SESSION_RUN_OPERATION_CHECKPOINT_KEY, None)
+        updated.pop(terminal_event_evidence._SESSION_RUN_OPERATION_CHECKPOINT_KEY, None)
     if receipt is not None:
         receipts.pop(operation_id)
         if receipts:
@@ -38102,7 +38054,7 @@ def _checkpoint_with_session_run_operation(
         )
         if terminal_event_id is None:
             raise ValueError("Session run queue_task_id requires a terminal_event_id.")
-    existing_operation = _session_run_operation_from_checkpoint(checkpoint)
+    existing_operation = terminal_event_evidence._session_run_operation_from_checkpoint(checkpoint)
     if existing_operation is not None:
         raise RuntimeError(
             "Session has incomplete terminal evidence for its previous run. "
@@ -38132,7 +38084,7 @@ def _checkpoint_with_session_run_operation(
         marker["terminal_event_id"] = terminal_event_id
     if queue_task_id is not None:
         marker["queue_task_id"] = queue_task_id
-    updated[_SESSION_RUN_OPERATION_CHECKPOINT_KEY] = marker
+    updated[terminal_event_evidence._SESSION_RUN_OPERATION_CHECKPOINT_KEY] = marker
     return updated
 
 
@@ -38149,14 +38101,17 @@ def _copy_terminal_session_evidence_limits(
 def _terminal_session_evidence_marker_from_checkpoint(
     checkpoint: dict[str, Any] | None,
 ) -> TerminalPublicationMarker | None:
-    if checkpoint is not None and _SESSION_RUN_OPERATION_CHECKPOINT_KEY in checkpoint:
-        raw_marker = checkpoint[_SESSION_RUN_OPERATION_CHECKPOINT_KEY]
+    if (
+        checkpoint is not None
+        and terminal_event_evidence._SESSION_RUN_OPERATION_CHECKPOINT_KEY in checkpoint
+    ):
+        raw_marker = checkpoint[terminal_event_evidence._SESSION_RUN_OPERATION_CHECKPOINT_KEY]
         if type(raw_marker) is not dict or type(raw_marker.get("version")) is not int:
             raise TerminalSessionEvidenceError(
                 TerminalSessionEvidenceErrorCode.TERMINAL_PUBLICATION_MARKER_INVALID
             )
     try:
-        operation = _session_run_operation_from_checkpoint(checkpoint)
+        operation = terminal_event_evidence._session_run_operation_from_checkpoint(checkpoint)
     except (TypeError, ValueError) as exc:
         raise TerminalSessionEvidenceError(
             TerminalSessionEvidenceErrorCode.TERMINAL_PUBLICATION_MARKER_INVALID
@@ -38712,7 +38667,7 @@ def _assemble_terminal_session_evidence(
 
 def _event_with_session_run_operation(
     event: Event,
-    operation: _SessionRunOperation,
+    operation: terminal_event_evidence._SessionRunOperation,
 ) -> Event:
     """Bind terminal evidence to the durable run operation that produced it."""
     payload = copy_durable_json_object(event.payload, "event payload")

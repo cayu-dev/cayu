@@ -211,6 +211,7 @@ from cayu.sessions._invocation_lifecycle import (
 from cayu.sessions._terminal_evidence import (
     TERMINAL_EVIDENCE_EVENT_TYPES,
     TERMINAL_EVIDENCE_QUERY_LIMIT,
+    _session_run_operation_from_checkpoint,
     classify_current_terminal_evidence,
 )
 from cayu.sessions.base import (
@@ -231,7 +232,6 @@ from cayu.sessions.base import (
     _deactivate_session_run_fence,
     _incomplete_recovery_claim_from_checkpoint,
     _initial_transcript_pending_interaction_id,
-    _session_run_operation_from_checkpoint,
     session_user_metadata,
 )
 from cayu.sessions.records import Session, SessionStatus

@@ -29,6 +29,7 @@ from cayu.sessions._execution_profile_checkpoint import (
 from cayu.sessions._terminal_evidence import (
     SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
     TERMINAL_EVENT_TYPES,
+    _session_run_operation_from_checkpoint,
 )
 from cayu.sessions.base import (
     ActiveModelCompletionStage,
@@ -41,7 +42,6 @@ from cayu.sessions.base import (
     _checkpoint_after_queued_dispatch_acknowledgement,
     _queued_dispatch_session_instance_fingerprint,
     _queued_dispatch_terminal_receipts_from_checkpoint,
-    _session_run_operation_from_checkpoint,
     session_fork_profile_relationship,
 )
 from cayu.sessions.records import Session, SessionStatus

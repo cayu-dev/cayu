@@ -648,13 +648,14 @@ from cayu.sessions._invocation_terminal_decision import (
     settled_invocation_terminal_decision_from_checkpoint,
 )
 from cayu.sessions._terminal_evidence import (
+    _SESSION_RUN_OPERATION_CHECKPOINT_KEY,
+    _session_run_operation_from_checkpoint,
     interruption_request_id_from_payload,
     require_interruption_event_matches_pending_marker,
 )
 from cayu.sessions.base import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
     _QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY,
-    _SESSION_RUN_OPERATION_CHECKPOINT_KEY,
     _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
     FORK_EXECUTION_PROFILE_EXACT_SOURCE_SCHEMA_VERSION,
     FORK_EXECUTION_PROFILE_METADATA_KEY,
@@ -746,7 +747,6 @@ from cayu.sessions.base import (
     _queued_dispatch_session_instance_fingerprint,
     _runtime_resume_transport_metadata,
     _session_metadata_with_model_projection,
-    _session_run_operation_from_checkpoint,
     _set_session_interaction_recovered_active_through,
     apply_fork_system_prompt_replacement,
     attribute_event_to_current_interaction,
