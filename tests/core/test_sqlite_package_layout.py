@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 import cayu
+from cayu.storage import _sqlite_schema_history as sqlite_schema_history
 
 
 @pytest.mark.parametrize("module_name", ("cayu", "cayu.storage", "cayu.storage.tasks_sqlite"))
@@ -381,7 +382,7 @@ def test_sqlite_verified_work_schema_validates_without_migration_or_store_import
             if revision is None:
                 _sqlite_support.initialize_schema(connection)
             else:
-                connection.execute(_sqlite_support._MIGRATIONS_TABLE_DDL)
+                connection.execute(sqlite_schema_history._MIGRATIONS_TABLE_DDL)
                 _sqlite_support._apply_baseline(connection)
                 for pending in migrations.pending(migrations.BASELINE_REVISION):
                     if pending.revision > revision:

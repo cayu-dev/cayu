@@ -1,4 +1,6 @@
 {
+    "tests/core/test_sqlite_schema_history.py::test_sqlite_revision_uses_history_owner_and_rolls_back_failed_ddl": 0.3746624169871211,
+    "tests/core/test_sqlite_schema_history.py::test_sqlite_schema_history_creates_baseline_without_migration_execution": 0.14749500001198612,
     "tests/core/test_checkpoint_read_composition.py::test_custom_reader_cannot_return_unvalidated_or_reused_admission[consumed]": 0.0006893339741509408,
     "tests/core/test_checkpoint_read_composition.py::test_custom_reader_cannot_return_unvalidated_or_reused_admission[unvalidated]": 0.0005098760302644223,
     "tests/core/test_checkpoint_read_composition.py::test_custom_reader_cannot_return_unvalidated_or_reused_admission[wrong_session]": 0.0005601680313702673,

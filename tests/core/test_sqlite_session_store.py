@@ -50,6 +50,7 @@ from cayu.sessions.checkpoints import (
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_records as sqlite_records
+from cayu.storage import _sqlite_schema_history as sqlite_schema_history
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
 from cayu.storage import sqlite as sqlite_storage
@@ -3299,8 +3300,8 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
     db_path = tmp_path / "sessions.sqlite"
     connection = sqlite3.connect(db_path)
     try:
-        connection.executescript(sqlite_support._BASELINE_DDL)
-        connection.execute(sqlite_support._MIGRATIONS_TABLE_DDL)
+        connection.executescript(sqlite_schema_history._BASELINE_DDL)
+        connection.execute(sqlite_schema_history._MIGRATIONS_TABLE_DDL)
         connection.execute("DROP TABLE cayu_session_labels")
         connection.execute("DROP TABLE cayu_event_watcher_state")
         connection.execute(
@@ -3727,8 +3728,8 @@ def test_sqlite_migrate_recovers_from_a_crashed_partial_revision(tmp_path):
     db_path = tmp_path / "sessions.sqlite"
     connection = sqlite3.connect(db_path)
     try:
-        connection.executescript(sqlite_support._BASELINE_DDL)
-        connection.execute(sqlite_support._MIGRATIONS_TABLE_DDL)
+        connection.executescript(sqlite_schema_history._BASELINE_DDL)
+        connection.execute(sqlite_schema_history._MIGRATIONS_TABLE_DDL)
         connection.execute(
             "INSERT INTO cayu_schema_migrations "
             "(revision, kind, compatible_from, checksum, applied_at) "
@@ -3775,8 +3776,8 @@ def test_sqlite_migrate_revision_is_atomic_on_failure(tmp_path):
     db_path = tmp_path / "sessions.sqlite"
     connection = sqlite3.connect(db_path)
     try:
-        connection.executescript(sqlite_support._BASELINE_DDL)
-        connection.execute(sqlite_support._MIGRATIONS_TABLE_DDL)
+        connection.executescript(sqlite_schema_history._BASELINE_DDL)
+        connection.execute(sqlite_schema_history._MIGRATIONS_TABLE_DDL)
         connection.execute(
             "INSERT INTO cayu_schema_migrations "
             "(revision, kind, compatible_from, checksum, applied_at) "

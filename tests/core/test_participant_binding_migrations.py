@@ -27,9 +27,11 @@ from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.sessions.base import ResumeRequest, RunRequest
 from cayu.storage import _sqlite_functions as sqlite_functions
+from cayu.storage import _sqlite_schema_history as sqlite_schema_history
 from cayu.storage import _sqlite_support as sql
 from cayu.storage import migrations as schema
 from cayu.storage._participant_bindings_schema import validate_sqlite_participant_bindings
+from cayu.storage._task_group_schema import SQLITE_TASK_GROUP_QUIESCENCE_DDL
 from cayu.tasks.creation import TaskCreate
 
 
@@ -99,12 +101,14 @@ def test_historical_sqlite_upgrade_continues_session(
             schema, "REVISIONS", tuple(r for r in schema.REVISIONS if r.revision <= revision)
         )
         # Exact historical revision-96 step, verified against df5a41a9cb53.
-        historical.setitem(sql._MIGRATION_STEPS, 96, sql.SQLITE_TASK_GROUP_QUIESCENCE_DDL)
+        historical.setitem(
+            sqlite_schema_history._MIGRATION_STEPS, 96, SQLITE_TASK_GROUP_QUIESCENCE_DDL
+        )
         with closing(sqlite3.connect(db)) as connection:
             sqlite_functions._register_sqlite_functions(connection)
             seed_store._register_public_authority_alias_sql_function(connection)
             connection.row_factory = sqlite3.Row
-            connection.execute(sql._MIGRATIONS_TABLE_DDL)
+            connection.execute(sqlite_schema_history._MIGRATIONS_TABLE_DDL)
             sql._apply_pending(connection, sql.read_schema_state(connection))
             assert (
                 connection.execute(

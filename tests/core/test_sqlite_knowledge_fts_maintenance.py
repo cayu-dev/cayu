@@ -17,6 +17,7 @@ from cayu.sessions.base import RunRequest, SessionIdentity
 from cayu.storage import _sqlite_catalog as sqlite_catalog
 from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_records as sqlite_records
+from cayu.storage import _sqlite_schema_history as sqlite_schema_history
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
 from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore
@@ -136,7 +137,7 @@ def _downgrade_knowledge_layout_to_revision_36(db_path: Path) -> None:
             DROP TABLE cayu_knowledge_entries;
             """
         )
-        connection.executescript(sqlite_support._MIGRATION_STEPS[6])
+        connection.executescript(sqlite_schema_history._MIGRATION_STEPS[6])
         connection.execute("DROP TABLE cayu_knowledge_chunks_fts")
         connection.execute("DROP TABLE cayu_knowledge_chunks")
         connection.execute(

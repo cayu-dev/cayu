@@ -686,10 +686,13 @@ with the expected tokenizer identity supplied by schema composition.
 Closure DDL and checks share `storage/_sqlite_closure_schema.py`;
 `storage/_sqlite_catalog.py` also owns the shared SQL statement and definition utilities.
 These owners inspect existing tables, indexes, views and constraints.
-Schema reconciliation retains revision
-gates and validation order in `storage/_sqlite_support.py`, alongside migration
-history and execution. These domain checks can run on a read-only connection
-without importing migration history or store adapters.
+Baseline SQL, revision scripts and conditional-column declarations live in
+`storage/_sqlite_schema_history.py`, reusing canonical DDL from domain schema owners.
+Schema reconciliation retains revision gates and validation order in
+`storage/_sqlite_support.py`, alongside migration execution, hooks and backfills.
+History declarations can be imported without loading migration execution or store
+adapters. The domain checks can run on a read-only connection without importing
+migration history or store adapters.
 
 Files are good source-of-truth for prompts, instructions, workflows, manuals, skills, and human-reviewed memories.
 

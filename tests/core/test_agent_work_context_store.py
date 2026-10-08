@@ -44,7 +44,7 @@ from cayu import (
     SQLiteKnowledgeStore,
     agent_recall_facet_aspect,
 )
-from cayu.storage import _sqlite_support as sqlite_support
+from cayu.storage import _sqlite_schema_history as sqlite_schema_history
 from cayu.storage import migrations as schema_migrations
 from cayu.storage.migrations import SchemaMode
 
@@ -2585,10 +2585,10 @@ def test_sqlite_revision_73_rejects_pre_stream_checkpoint_schema_before_mutation
         connection.execute("DROP TABLE cayu_task_interrupted_handoff_receipts")
         connection.execute("DROP INDEX IF EXISTS idx_cayu_tasks_interrupted_handoff_recovery")
         connection.executescript(
-            _without_checkpoint_stream_identity(sqlite_support._MIGRATION_STEPS[69])
+            _without_checkpoint_stream_identity(sqlite_schema_history._MIGRATION_STEPS[69])
         )
         if historical_revision == 70:
-            connection.executescript(sqlite_support._MIGRATION_STEPS[70])
+            connection.executescript(sqlite_schema_history._MIGRATION_STEPS[70])
         connection.execute(
             "DELETE FROM cayu_schema_migrations WHERE revision > ?",
             (historical_revision,),
@@ -2872,7 +2872,7 @@ def test_sqlite_revision_69_rejects_subtle_work_context_schema_conflicts(
     database = tmp_path / f"revision-69-{malformation}.sqlite"
     store = SQLiteAgentWorkContextStore(database)
     asyncio.run(store.close())
-    ddl = sqlite_support._MIGRATION_STEPS[69]
+    ddl = sqlite_schema_history._MIGRATION_STEPS[69]
     if malformation == "nocase_identity":
         malformed_ddl = ddl.replace("COLLATE BINARY", "COLLATE NOCASE")
     elif malformation == "split_foreign_key":
