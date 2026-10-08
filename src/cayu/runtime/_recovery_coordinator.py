@@ -338,13 +338,15 @@ from cayu.runtime._tool_effect_state import (
     _validate_selected_terminal,
     validate_tool_effect_uncertainty_event,
 )
-from cayu.runtime._tool_invocation.admission import ToolApprovalRequired
+from cayu.runtime._tool_invocation.admission import (
+    ToolApprovalRequired,
+    policy_denial_payload_fields,
+)
 from cayu.runtime._tool_invocation.terminal import DeferredTerminalStager
 from cayu.runtime._tool_invocation.workspace_capture import _workspace_mutation_incomplete_event
 from cayu.runtime._tool_round_executor import (
     InterruptedToolRoundRequest,
     ToolRoundExecutor,
-    policy_denial_payload_fields,
 )
 from cayu.runtime._tool_round_staging import (
     _tool_terminal_payload_limits,
@@ -1681,6 +1683,7 @@ class RecoveryCoordinator:
         self._environment_lifecycle = environment_lifecycle
         self._run_limit_controller = run_limit_controller
         self._tool_round_executor = tool_round_executor
+        self._tool_invocation = tool_round_executor.invocation
         self._secret_redactor = secret_redactor
         self._clock = clock
         self._checkpoint_transform = checkpoint_transform
@@ -8884,7 +8887,7 @@ class RecoveryCoordinator:
                     pending_calls=pending.tool_calls,
                     tool_call_id=effect_reconciliation.tool_call_id,
                 )
-                async for event, _modified in self._tool_round_executor.hooks.after_call(
+                async for event, _modified in self._tool_invocation.hooks.after_call(
                     session=session,
                     tool_event=effect_settlement.terminal_event,
                     registered_agent=registered_agent,
@@ -9003,18 +9006,18 @@ class RecoveryCoordinator:
                 invocation_context=invocation_context,
                 redactor=base_round_redactor,
                 tool_exposure=pending.tool_exposure,
-                publication_governor=self._tool_round_executor.terminals.governor,
+                publication_governor=self._tool_invocation.terminals.governor,
                 clock=self._clock,
-                emit_result=self._tool_round_executor.terminals.publish_result,
-                emit_terminal=self._tool_round_executor.terminals.emit_staged,
+                emit_result=self._tool_invocation.terminals.publish_result,
+                emit_terminal=self._tool_invocation.terminals.emit_staged,
                 defer_terminals=defer_round_terminals,
                 terminal_payload_limits=(
                     await _tool_terminal_payload_limits(
                         registered_agent,
                         round_tool_calls,
-                        publication_governor=self._tool_round_executor.terminals.governor,
+                        publication_governor=self._tool_invocation.terminals.governor,
                         runtime_hooks=(
-                            self._tool_round_executor.hooks.registrations
+                            self._tool_invocation.hooks.registrations
                             if invocation_context is None
                             else invocation_context.runtime_hooks
                         ),
@@ -9089,7 +9092,7 @@ class RecoveryCoordinator:
                         )
                     for (
                         rejoined_event
-                    ) in await self._tool_round_executor.admission.rejoin_targeted_call(
+                    ) in await self._tool_invocation.admission.rejoin_targeted_call(
                         session=session,
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
@@ -9142,7 +9145,7 @@ class RecoveryCoordinator:
                     async for (
                         event,
                         outcome,
-                    ) in self._tool_round_executor.terminals.publish_result(
+                    ) in self._tool_invocation.terminals.publish_result(
                         event=Event(
                             type=EventType.TOOL_CALL_COMPLETED,
                             session_id=session.id,
@@ -9193,7 +9196,7 @@ class RecoveryCoordinator:
                 call_taint_labels = approval_support.taint_labels_from_pending_tool_call(
                     pending_call
                 )
-                # `ToolRoundExecutor.execute_tool_call(check_policy=False)` does not re-enforce
+                # `ToolInvocation.execute(check_policy=False)` does not re-enforce
                 # the decision, so a DENY must be blocked here explicitly (mirroring the approval
                 # resume) — otherwise a policy-denied sibling would execute. REQUIRE_APPROVAL
                 # cannot occur: it would have preempted the ask_user pause with an approval pause.
@@ -9224,7 +9227,7 @@ class RecoveryCoordinator:
                     async for (
                         event,
                         outcome,
-                    ) in self._tool_round_executor.terminals.publish_result(
+                    ) in self._tool_invocation.terminals.publish_result(
                         event=Event(
                             type=EventType.TOOL_CALL_BLOCKED,
                             session_id=session.id,
@@ -9320,7 +9323,7 @@ class RecoveryCoordinator:
                     )
 
                 async for event, outcome in round_owner.timed_continuation_dispatch(
-                    self._tool_round_executor.execute_tool_call(
+                    self._tool_invocation.execute(
                         session=session,
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
@@ -9765,7 +9768,7 @@ class RecoveryCoordinator:
         if (approval_id is None) == (input_id is None):
             raise TypeError("Exactly one approval or user-input identity is required.")
         if policy_evidence is ToolPolicyEvidence.UNEXPOSED:
-            async for event, outcome in self._tool_round_executor.execute_tool_call(
+            async for event, outcome in self._tool_invocation.execute(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
@@ -9855,7 +9858,7 @@ class RecoveryCoordinator:
             tool_call_id=tool_call.id,
             **idempotency_options,
         )
-        async for event, outcome in self._tool_round_executor.terminals.publish_result(
+        async for event, outcome in self._tool_invocation.terminals.publish_result(
             event=Event(
                 type=event_type,
                 session_id=session.id,
@@ -10408,18 +10411,18 @@ class RecoveryCoordinator:
                 invocation_context=invocation_context,
                 redactor=base_round_redactor,
                 tool_exposure=publication_round.tool_exposure,
-                publication_governor=self._tool_round_executor.terminals.governor,
+                publication_governor=self._tool_invocation.terminals.governor,
                 clock=self._clock,
-                emit_result=self._tool_round_executor.terminals.publish_result,
-                emit_terminal=self._tool_round_executor.terminals.emit_staged,
+                emit_result=self._tool_invocation.terminals.publish_result,
+                emit_terminal=self._tool_invocation.terminals.emit_staged,
                 defer_terminals=defer_round_terminals,
                 terminal_payload_limits=(
                     await _tool_terminal_payload_limits(
                         registered_agent,
                         round_tool_calls,
-                        publication_governor=self._tool_round_executor.terminals.governor,
+                        publication_governor=self._tool_invocation.terminals.governor,
                         runtime_hooks=(
-                            self._tool_round_executor.hooks.registrations
+                            self._tool_invocation.hooks.registrations
                             if invocation_context is None
                             else invocation_context.runtime_hooks
                         ),
@@ -10520,7 +10523,7 @@ class RecoveryCoordinator:
                     async for (
                         event,
                         outcome,
-                    ) in self._tool_round_executor.terminals.publish_result(
+                    ) in self._tool_invocation.terminals.publish_result(
                         event=Event(
                             type=EventType.TOOL_CALL_BLOCKED,
                             session_id=session.id,
@@ -10618,7 +10621,7 @@ class RecoveryCoordinator:
                     async for (
                         event,
                         outcome,
-                    ) in self._tool_round_executor.terminals.publish_result(
+                    ) in self._tool_invocation.terminals.publish_result(
                         event=Event(
                             type=EventType.TOOL_CALL_APPROVAL_DENIED,
                             session_id=session.id,
@@ -10716,7 +10719,7 @@ class RecoveryCoordinator:
                     raise RuntimeError("Pending tool call has no executable policy authority.")
 
                 async for event, outcome in round_owner.timed_continuation_dispatch(
-                    self._tool_round_executor.execute_tool_call(
+                    self._tool_invocation.execute(
                         session=session,
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
@@ -11880,7 +11883,7 @@ class RecoveryCoordinator:
             tool_event = emitted_recovery_events[-1]
             # Manual recovery persists the operator-supplied result before hooks run, so
             # after_tool_call is observe-only here (v1): the threaded modification is ignored.
-            async for event, _modified in self._tool_round_executor.hooks.after_call(
+            async for event, _modified in self._tool_invocation.hooks.after_call(
                 session=session,
                 tool_event=tool_event,
                 registered_agent=registered_agent,
@@ -12338,7 +12341,7 @@ class RecoveryCoordinator:
             tool_event = emitted_recovery_events[-1]
             # Manual recovery persists the operator-supplied result before hooks run, so
             # after_tool_call is observe-only here (v1): the threaded modification is ignored.
-            async for event, _modified in self._tool_round_executor.hooks.after_call(
+            async for event, _modified in self._tool_invocation.hooks.after_call(
                 session=session,
                 tool_event=tool_event,
                 registered_agent=registered_agent,
@@ -13845,7 +13848,7 @@ class RecoveryCoordinator:
             tool_event = emitted_recovery_events[-1]
             # The operator outcome is durable before hooks run. Recovery hooks are
             # observe-only so they cannot rewrite externally verified evidence.
-            async for event, _modified in self._tool_round_executor.hooks.after_call(
+            async for event, _modified in self._tool_invocation.hooks.after_call(
                 session=session,
                 tool_event=tool_event,
                 registered_agent=registered_agent,
@@ -14550,7 +14553,7 @@ class RecoveryCoordinator:
                 return
             # Receipt selection is already durable. Hooks observe the selected
             # result through the existing hook owner and cannot replace it.
-            async for event, _modified in self._tool_round_executor.hooks.after_call(
+            async for event, _modified in self._tool_invocation.hooks.after_call(
                 session=session,
                 tool_event=settlement.terminal_event,
                 registered_agent=registered_agent,
@@ -15629,7 +15632,7 @@ class RecoveryCoordinator:
             pending_round,
             _resolved_tool_calls,
             targeted_resolution_events,
-        ) = await self._tool_round_executor.admission.resolve_targeted_calls(
+        ) = await self._tool_invocation.admission.resolve_targeted_calls(
             session=session,
             registered_agent=registered_agent,
             registered_environment=registered_environment,
@@ -15771,7 +15774,7 @@ class RecoveryCoordinator:
                 (
                     approval,
                     approval_events,
-                ) = await self._tool_round_executor.admission.pause_for_approval(
+                ) = await self._tool_invocation.admission.pause_for_approval(
                     session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
@@ -16197,11 +16200,11 @@ class RecoveryCoordinator:
                 execution_profile=execution_profile,
                 invocation_context=invocation_context,
                 redactor=self._tool_round_executor._secret_redactor,
-                publication_governor=self._tool_round_executor.terminals.governor,
+                publication_governor=self._tool_invocation.terminals.governor,
                 clock=self._clock,
-                runtime_hooks=self._tool_round_executor.hooks.registrations,
-                emit_result=self._tool_round_executor.terminals.publish_result,
-                emit_terminal=self._tool_round_executor.terminals.emit_staged,
+                runtime_hooks=self._tool_invocation.hooks.registrations,
+                emit_result=self._tool_invocation.terminals.publish_result,
+                emit_terminal=self._tool_invocation.terminals.emit_staged,
                 emit_native_terminal=self._emit_confirmed_native_tool_terminal,
                 materialize_expected_deferred_input=self.materialize_expected_deferred_input,
                 interrupted=interrupted,
@@ -22917,7 +22920,7 @@ class RecoveryCoordinator:
             async for (
                 published,
                 _outcome,
-            ) in self._tool_round_executor.terminals.publish_result(
+            ) in self._tool_invocation.terminals.publish_result(
                 event=event,
                 session=session,
                 registered_agent=registered_agent,

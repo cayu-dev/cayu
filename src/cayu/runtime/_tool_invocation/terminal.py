@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import suppress
 from dataclasses import replace
@@ -15,6 +16,7 @@ from cayu._task_wait import (
 )
 from cayu._validation import (
     DurableValueError,
+    canonical_durable_json_bytes,
     extract_durable_value_error,
 )
 from cayu.artifacts.settlement import ArtifactWriteSettlementObserver
@@ -42,6 +44,11 @@ from cayu.runtime import _tool_results as tool_results
 from cayu.runtime._event_writer import RuntimeEventWriter, prepare_runtime_event
 from cayu.runtime._invocation_lifecycle import InvocationContext
 from cayu.runtime._phase_timing import timed_phase
+from cayu.runtime._tool_effect_state import (
+    ToolEffectRecord,
+    ToolEffectStateOwner,
+    ToolEffectTerminal,
+)
 from cayu.runtime._tool_round_staging import (
     _durable_payload_utf8_size,
     _event_with_tool_round_authority,
@@ -50,8 +57,9 @@ from cayu.runtime._tool_round_staging import (
     _validate_and_synchronize_tool_result_event,
 )
 from cayu.sessions.base import (
-    Session,
+    SessionStore,
 )
+from cayu.sessions.records import Session
 from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools import _shared_artifact_results as shared_artifact_results
 from cayu.tools import _terminal_controls as tool_terminal_controls
@@ -165,6 +173,93 @@ class ToolTerminalPublisher:
         self.governor = ToolTerminalPublicationGovernor()
         self._detached_projections: set[asyncio.Task[Any]] = set()
 
+    async def publish_unexecuted(
+        self,
+        *,
+        tool_call_id: str,
+        event: Event,
+        outcome: runtime_records.ToolCallOutcome,
+        snapshot: invocation_secrets.InvocationPublicationSnapshot,
+        observer: Callable[[str, invocation_secrets.InvocationPublicationSnapshot], Awaitable[None]]
+        | None,
+        stager: DeferredTerminalStager | None,
+    ) -> tuple[Event, runtime_records.ToolCallOutcome] | None:
+        """Deliver an admission rejection without dispatching or running tool hooks."""
+
+        if observer is not None:
+            await observer(tool_call_id, snapshot)
+        if stager is not None:
+            await stager(event, outcome, False, False, snapshot)
+            return None
+        return await self.emit(event), outcome
+
+    async def settle_admission_refusal(
+        self,
+        *,
+        effect: ToolEffectRecord,
+        session_store: SessionStore,
+        run_epoch: int,
+        execution_profile: ExecutionProfileIdentity | None,
+        tool_round_identity: ToolRoundIdentity,
+    ) -> None:
+        """Publish the pre-dispatch refusal with its failed external-effect state."""
+
+        # Selection, terminal evidence and the failed effect share one transaction.
+        intent = effect.intent
+        event = event_with_execution_profile_authority(
+            Event(
+                type=EventType.TOOL_CALL_FAILED,
+                session_id=intent.session_id,
+                interaction_id=intent.interaction_id,
+                agent_name=intent.agent_name,
+                environment_name=intent.environment_name,
+                tool_name=intent.tool_name,
+                payload={
+                    **{
+                        name: getattr(intent, name)
+                        for name in (
+                            "model_step_id",
+                            "model_attempt_id",
+                            "tool_round_id",
+                            "tool_call_id",
+                            "idempotency_key",
+                        )
+                    },
+                    **(
+                        {"approval_id": intent.approval_id}
+                        if intent.approval_id is not None
+                        else {}
+                    ),
+                    **({"input_id": intent.pause_id} if intent.pause_id is not None else {}),
+                    "result": ToolResult(
+                        content="Tool was not invoked because execution admission was refused.",
+                        is_error=True,
+                    ).model_dump(mode="json"),
+                },
+            ),
+            execution_profile,
+        )
+        event = self._event_writer.prepare(
+            _event_with_tool_round_authority(
+                event,
+                tool_round_identity,
+                *(field for field in ("approval_id", "input_id") if field in event.payload),
+            )
+        )
+        await ToolEffectStateOwner(session_store).transition(
+            effect,
+            state="failed",
+            run_epoch=run_epoch,
+            terminal=ToolEffectTerminal(
+                event_id=event.id,
+                result_digest=hashlib.sha256(
+                    canonical_durable_json_bytes(event.payload["result"], "effect_terminal_result")
+                ).hexdigest(),
+            ),
+            events=(event,),
+        )
+        await self._event_writer.fan_out_persisted([event])
+
     def detached_environment_work(self) -> set[asyncio.Future[Any]]:
         return set(self._detached_projections)
 
@@ -172,6 +267,13 @@ class ToolTerminalPublisher:
         """Return current content-free terminal-publication backlog and latency metrics."""
 
         return self.governor.snapshot()
+
+    async def emit(self, event: Event, *, emitter: TerminalEventEmitter | None = None) -> Event:
+        """Deliver one terminal through its selected persistence boundary."""
+
+        if emitter is not None:
+            return await emitter(event)
+        return await self._event_writer.emit(event)
 
     async def emit_staged(self, event: Event) -> Event:
         """Prepare staged payload CPU off-loop, then use the writer's exact prepared path."""
@@ -419,11 +521,6 @@ class ToolTerminalPublisher:
         if deferred_terminal_projection_recorder is not None and not publish_before_hooks:
             raise ValueError("Deferred terminal projection recording requires observational hooks.")
 
-        async def emit_terminal_event(candidate: Event) -> Event:
-            if terminal_event_emitter is not None:
-                return await terminal_event_emitter(candidate)
-            return await self._event_writer.emit(candidate)
-
         registered_tool = registered_agent.executable_tool(tool_call.name)
         quarantine_hook_output = (
             registered_tool is not None and not registered_tool.publish_arguments
@@ -632,7 +729,7 @@ class ToolTerminalPublisher:
                 if type(stored_result) is not dict:
                     raise RuntimeError("Finalized staged terminal lost its tool result.")
                 result = tool_results.tool_result_from_payload(stored_result)
-            tool_event = await emit_terminal_event(event)
+            tool_event = await self.emit(event, emitter=terminal_event_emitter)
             yield (
                 tool_event,
                 runtime_records.ToolCallOutcome(
@@ -677,7 +774,7 @@ class ToolTerminalPublisher:
                 if type(stored_result) is not dict:
                     raise RuntimeError("Projected staged terminal lost its tool result.")
                 result = tool_results.tool_result_from_payload(stored_result)
-            tool_event = await emit_terminal_event(event)
+            tool_event = await self.emit(event, emitter=terminal_event_emitter)
             yield (
                 tool_event,
                 runtime_records.ToolCallOutcome(
@@ -794,7 +891,7 @@ class ToolTerminalPublisher:
             if type(stored_result) is not dict:
                 raise RuntimeError("Finalized staged terminal lost its tool result.")
             final_result = tool_results.tool_result_from_payload(stored_result)
-        tool_event = await emit_terminal_event(event)
+        tool_event = await self.emit(event, emitter=terminal_event_emitter)
         yield (
             tool_event,
             runtime_records.ToolCallOutcome(

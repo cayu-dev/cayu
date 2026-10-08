@@ -14,6 +14,8 @@ from cayu._validation import (
     copy_durable_metadata,
     copy_durable_record,
     copy_json_value,
+    require_clean_nonblank,
+    require_nonblank,
 )
 from cayu.agents import AgentSpec
 from cayu.approvals.tools import (
@@ -32,7 +34,10 @@ from cayu.events import (
     Event,
     EventType,
 )
-from cayu.execution_units import ToolRoundIdentity, copy_tool_round_identity
+from cayu.execution_units import (
+    ToolRoundIdentity,
+    copy_tool_round_identity,
+)
 from cayu.mcp.tools import McpToolAdapter
 from cayu.messages import Message
 from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
@@ -68,12 +73,11 @@ from cayu.sessions._checkpoint_secret_validation import (
     require_secret_free_durable_object as _require_secret_free_durable_object,
 )
 from cayu.sessions.base import (
-    Session,
-    SessionStatus,
     SessionStore,
     runtime_publication_checkpoint_value_digest,
 )
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.records import Session, SessionStatus
 from cayu.tools.base import (
     ToolEffect,
 )
@@ -1481,3 +1485,34 @@ def _tool_round_publishes_arguments(
         if registered_tool is None or not registered_tool.publish_arguments:
             return False
     return True
+
+
+def _taint_labels_for_source_tool(
+    policy: ToolPolicy,
+    tool_name: str,
+    *,
+    policy_result: ToolPolicyResult | None,
+) -> set[str]:
+    taint_policy = _taint_policy(policy)
+    if taint_policy is None:
+        return set()
+    if policy_result is not None and policy_result.decision != ToolPolicyDecision.ALLOW:
+        return set()
+    return set(taint_policy.labels_for_source_tool(tool_name))
+
+
+def policy_denial_payload_fields(
+    *,
+    tool_name: str,
+    denied_by: str,
+    decision: str,
+    reason: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "tool_name": require_clean_nonblank(tool_name, "tool_name"),
+        "denied_by": require_clean_nonblank(denied_by, "denied_by"),
+        "decision": require_clean_nonblank(decision, "decision"),
+        "reason": require_nonblank(reason, "reason"),
+        "metadata": copy_durable_metadata(metadata),
+    }

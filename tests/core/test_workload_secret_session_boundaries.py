@@ -660,7 +660,7 @@ def test_fork_rejects_target_agent_derived_secret_before_any_publication(
             raise AssertionError("derived authority must be validated before taint lookup")
 
         monkeypatch.setattr(
-            app._tool_round_executor.admission,
+            app._tool_round_executor.invocation.admission,
             "prior_taint_labels",
             unexpected_taint_read,
         )

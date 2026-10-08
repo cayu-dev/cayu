@@ -434,7 +434,7 @@ def test_closing_continuation_closes_active_result_stream(
         async with continuation_store_factory() as store:
             app, provider, tool = _runtime(store, entrance, dynamic=True, include_denied=False)
             request = await _pause(app, entrance, f"close-stream-{entrance}")
-            emit = app._tool_round_executor.terminals.publish_result
+            emit = app._tool_round_executor.invocation.terminals.publish_result
             closed = []
 
             async def tracked_emit(**kwargs):
@@ -447,7 +447,9 @@ def test_closing_continuation_closes_active_result_stream(
                         await asyncio.sleep(0)
                         closed.append(kwargs["tool_call"].id)
 
-            monkeypatch.setattr(app._tool_round_executor.terminals, "publish_result", tracked_emit)
+            monkeypatch.setattr(
+                app._tool_round_executor.invocation.terminals, "publish_result", tracked_emit
+            )
             async with aclosing(_resolve(app, request)) as stream:
                 async for event in stream:
                     if event.type is EventType.TOOL_CALL_COMPLETED:

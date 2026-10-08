@@ -23066,10 +23066,12 @@ class SessionEngine:
                 )
             )
 
-        inherited_taint_labels = await self._tool_round_executor.admission.prior_taint_labels(
-            session_id=source_session.id,
-            policy=source_registered_agent.tool_policy,
-            request_metadata=source_session.metadata,
+        inherited_taint_labels = (
+            await self._tool_round_executor.invocation.admission.prior_taint_labels(
+                session_id=source_session.id,
+                policy=source_registered_agent.tool_policy,
+                request_metadata=source_session.metadata,
+            )
         )
         fork_metadata = copy_durable_metadata(request.metadata)
         if inherited_taint_labels:

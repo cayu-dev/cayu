@@ -353,7 +353,14 @@ It does not prepare the final publication request or manage individual stage
 leases. Closing the ordinary publication stream closes its active terminal hook
 stream before returning.
 
-Tool hook phases and terminal publication are independently usable components in
+`ToolInvocation.execute()` in `runtime/_tool_invocation/invocation.py` owns one
+call from admission through terminal delivery. Ordinary rounds and recovered
+approval/input continuations drive the same instance. Its stream preserves
+started events, runner and proxy evidence, hook events and the terminal outcome.
+The existing low-level tool runner retains outcome classification and process
+isolation; it also remains usable independently of the invocation owner.
+
+The invocation composes independently usable components in
 `runtime/_tool_invocation/`. `ToolInvocationHooks` owns before/after hook execution
 and safe hook evidence. `ToolTerminalPublisher` owns result limits, projection,
 deferred staging and terminal delivery, sharing one publication governor with
@@ -371,6 +378,10 @@ closes. `ToolInvocationDispatch` refreshes exposure, binds auxiliary inference,
 prepares external effects and invokes the existing tool runner. It retains the
 effect record when dispatch admission refuses the call, so settlement can use
 the original atomic effect transition.
+Cancellation context is attached through one helper, retaining the call identity,
+current redactor and existing cancellation counts. Ordinary terminal delivery
+uses `ToolTerminalPublisher.emit`; native effect-refusal settlement retains its
+atomic transaction. Workspace observation remains within the invocation lifetime.
 
 `SessionEngine` also delegates ordinary round closure after a run limit to this
 owner. It retains completed effects, publishes skipped results for unstarted

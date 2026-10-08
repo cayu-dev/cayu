@@ -494,7 +494,7 @@ def test_a_hung_projection_does_not_skip_environment_cleanup(
     async def scenario() -> None:
         app = CayuApp(enable_logging=False)
         release = asyncio.Event()
-        app._tool_round_executor.terminals._retain_detached_projection(
+        app._tool_round_executor.invocation.terminals._retain_detached_projection(
             asyncio.create_task(release.wait())
         )
         cleaned: list[float] = []

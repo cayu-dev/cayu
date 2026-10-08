@@ -1573,7 +1573,7 @@ def test_outer_close_finishes_nested_tool_stream_before_return(monkeypatch, stop
 
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="worker", model="scripted-model"), tools=[Echo()])
-        execute = app._tool_round_executor.execute_tool_call
+        execute = app._tool_round_executor.invocation.execute
 
         async def tracked_execute(**kwargs):
             try:
@@ -1584,7 +1584,7 @@ def test_outer_close_finishes_nested_tool_stream_before_return(monkeypatch, stop
                 await asyncio.sleep(0)
                 closed.append("tool stream")
 
-        monkeypatch.setattr(app._tool_round_executor, "execute_tool_call", tracked_execute)
+        monkeypatch.setattr(app._tool_round_executor.invocation, "execute", tracked_execute)
         stream = app.run(RunRequest(agent_name="worker", messages=[Message.text("user", "go")]))
         async for event in stream:
             if event.type == stop_event:

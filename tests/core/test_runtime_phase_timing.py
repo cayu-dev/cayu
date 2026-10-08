@@ -659,7 +659,17 @@ def test_structured_output_repair_does_not_reuse_an_earlier_commit(sqlite_resour
     asyncio.run(scenario())
 
 
-def test_subagent_child_time_stays_in_the_parent_call_execution(sqlite_resources):
+def test_subagent_child_time_stays_in_the_parent_call_execution(sqlite_resources, monkeypatch):
+    from tests.core.test_mcp import _fake_toolset
+
+    parent_execution_counters = []
+    manifest_counters = []
+
+    class ParentTool(SubagentTool):
+        async def run(self, ctx, args):
+            parent_execution_counters.append(current_store_counters())
+            return await super().run(ctx, args)
+
     class ChildTool(_TimedTool):
         async def run(self, ctx, args):
             await asyncio.sleep(0.1)
@@ -668,6 +678,13 @@ def test_subagent_child_time_stays_in_the_parent_call_execution(sqlite_resources
     async def scenario():
         async with sqlite_resources as resources:
             store = resources.own(SQLiteSessionStore(resources.path("subagent.sqlite")))
+            load_manifest_baselines = store.load_mcp_manifest_baselines
+
+            async def observe_manifest_baselines(history_keys):
+                manifest_counters.append(current_store_counters())
+                return await load_manifest_baselines(history_keys)
+
+            monkeypatch.setattr(store, "load_mcp_manifest_baselines", observe_manifest_baselines)
             app = CayuApp(session_store=store, enable_logging=False)
             app.register_provider(
                 VersionedFakeProvider(
@@ -695,7 +712,7 @@ def test_subagent_child_time_stays_in_the_parent_call_execution(sqlite_resources
             app.register_agent(
                 AgentSpec(name="parent", model="fake-model"),
                 tools=[
-                    SubagentTool(
+                    ParentTool(
                         app,
                         agents={
                             "reviewer": SubagentSpec(agent_name="reviewer", description="Review.")
@@ -703,18 +720,31 @@ def test_subagent_child_time_stays_in_the_parent_call_execution(sqlite_resources
                     )
                 ],
             )
-            app.register_agent(AgentSpec(name="reviewer", model="fake-model"), tools=[ChildTool()])
-            events = [
-                e
-                async for e in app.run(
-                    RunRequest(
-                        agent_name="parent",
-                        session_id="parent",
-                        messages=[Message.text("user", "go")],
-                    )
+            toolset = _fake_toolset()
+            try:
+                app.register_agent(
+                    AgentSpec(name="reviewer", model="fake-model"),
+                    tools=[ChildTool(), *toolset.tools],
                 )
-            ]
+                events = [
+                    e
+                    async for e in app.run(
+                        RunRequest(
+                            agent_name="parent",
+                            session_id="parent",
+                            messages=[Message.text("user", "go")],
+                        )
+                    )
+                ]
+            finally:
+                await toolset.close()
             assert events[-1].type == EventType.SESSION_COMPLETED
+            (parent_counters,) = parent_execution_counters
+            assert parent_counters is not None
+            assert len(manifest_counters) == 1
+            # Child startup precedes its own round: MCP history access still
+            # belongs to the execution phase of the parent subagent call.
+            assert manifest_counters[0] is parent_counters
             (parent,) = await app.inspect_recent_tool_round_timing("parent")
             child = next(
                 record

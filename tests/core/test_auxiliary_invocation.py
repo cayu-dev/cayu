@@ -28,7 +28,7 @@ from cayu.providers.response import ModelResponse
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime import _tool_execution
 from cayu.runtime._auxiliary_invocation import AuxiliaryInferenceScope, AuxiliaryInvocationPolicy
-from cayu.runtime._tool_round_executor import ToolRoundExecutor
+from cayu.runtime._tool_invocation.invocation import ToolInvocation
 from cayu.runtime.evidence import RuntimeEvidenceOperation, RuntimeEvidenceRequest, runtime_evidence
 from cayu.runtime.execution_profiles import (
     ExecutionProfileComponentClass,
@@ -1437,7 +1437,7 @@ def test_auxiliary_attempt_runs_provider_and_publishes_before_tool_returns(
 ):
     """Exercise the live owner while the public ToolContext handle is being wired."""
     bound = {}
-    original = ToolRoundExecutor.execute_tool_call
+    original = ToolInvocation.execute
     limits = InferenceLimits(max_input_tokens=10, max_output_tokens=10, timeout_seconds=1)
     started = asyncio.Event()
 
@@ -1447,7 +1447,7 @@ def test_auxiliary_attempt_runs_provider_and_publishes_before_tool_returns(
             async for event in events:
                 yield event
 
-    monkeypatch.setattr(ToolRoundExecutor, "execute_tool_call", capture)
+    monkeypatch.setattr(ToolInvocation, "execute", capture)
 
     class Summarize(Tool):
         spec = ToolSpec(
@@ -2170,7 +2170,7 @@ def test_auxiliary_invocation_policy_preserves_detached_run_baseline():
 @pytest.mark.parametrize("prepare_auxiliary", [False, True])
 def test_public_run_passes_original_accounting_to_tool_execution(monkeypatch, prepare_auxiliary):
     captured = []
-    original = ToolRoundExecutor.execute_tool_call
+    original = ToolInvocation.execute
     bounds = InferenceLimits(max_input_tokens=5, max_output_tokens=5, timeout_seconds=1)
 
     async def observe(self, **kwargs):
@@ -2304,7 +2304,7 @@ def test_public_run_passes_original_accounting_to_tool_execution(monkeypatch, pr
             async for item in stream:
                 yield item
 
-    monkeypatch.setattr(ToolRoundExecutor, "execute_tool_call", observe)
+    monkeypatch.setattr(ToolInvocation, "execute", observe)
 
     class Echo(Tool):
         spec = ToolSpec(

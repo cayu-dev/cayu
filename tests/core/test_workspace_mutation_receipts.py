@@ -22,7 +22,7 @@ from tests.provider_traceback_assertions import is_cayu_source_filename
 
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
 import cayu.runtime._session_engine as session_engine_module
-import cayu.runtime._tool_round_executor as tool_round_executor_module
+import cayu.runtime._tool_invocation.invocation as tool_invocation_module
 import cayu.sessions._staged_tool_terminal_reader as staged_terminal_reader
 import cayu.tools._operation_boundary as operation_boundary_module
 import cayu.tools._runner as runner_module
@@ -9769,7 +9769,7 @@ def test_supervisory_exit_during_cancelled_mutation_close_fences_environment_reu
             tools=[_DetachedThenBlockingWorkspaceMutationTool(dispatched=workspace.started)],
         )
 
-        original_boundary = tool_round_executor_module.await_invocation_operation
+        original_boundary = tool_invocation_module.await_invocation_operation
         original_shield = operation_boundary_module.asyncio.shield
         inside_cancelled_close = False
         supervisory_delivered = False
@@ -9796,7 +9796,7 @@ def test_supervisory_exit_during_cancelled_mutation_close_fences_environment_reu
             return await original_shield(awaitable)
 
         monkeypatch.setattr(
-            tool_round_executor_module,
+            tool_invocation_module,
             "await_invocation_operation",
             tracked_boundary,
         )

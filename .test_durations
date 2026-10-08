@@ -1,4 +1,10 @@
 {
+    "tests/core/test_tool_invocation_composition.py::test_invocation_parts_work_without_round_or_application_owners[cayu.runtime._tool_invocation.invocation]": 1.312,
+    "tests/core/test_tool_invocation_composition.py::test_invocation_parts_work_without_round_or_application_owners[cayu.workspaces.checkpoint_lifecycle]": 1.208,
+    "tests/core/test_tool_invocation_composition.py::test_invocation_parts_work_without_round_or_application_owners[cayu.runtime._tool_execution]": 1.12,
+    "tests/core/test_tool_invocation_composition.py::test_live_and_resumed_calls_use_the_composed_invocation[ordinary]": 1.059,
+    "tests/core/test_tool_invocation_composition.py::test_live_and_resumed_calls_use_the_composed_invocation[approve]": 1.674,
+    "tests/core/test_tool_invocation_composition.py::test_live_and_resumed_calls_use_the_composed_invocation[answer]": 1.721,
     "tests/core/test_sqlite_validation_owners.py::test_historical_knowledge_schema_validates_independently[missing-index]": 0.0755890839791391,
     "tests/core/test_sqlite_validation_owners.py::test_historical_knowledge_schema_validates_independently[revision-37]": 0.07324554101796821,
     "tests/core/test_sqlite_validation_owners.py::test_historical_knowledge_schema_validates_independently[wrong-fts-definition]": 0.07759708300000057,

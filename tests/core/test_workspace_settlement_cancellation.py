@@ -13,7 +13,7 @@ from tests.core.test_workspace_mutation_receipts import (
     _ScriptedProvider,
 )
 
-import cayu.runtime._tool_round_executor as executor
+import cayu.runtime._tool_invocation.invocation as invocation_module
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.deadlines import ExecutionDeadline
@@ -79,7 +79,7 @@ def test_cancel_before_workspace_terminal(
         app = registered_app(provider)
         reached = asyncio.Event()
         release_runner_publication = asyncio.Event()
-        original = executor.publish_workspace_observation_transition
+        original = invocation_module.publish_workspace_observation_transition
         paused = False
         session_id = "settlement-probe"
 
@@ -97,9 +97,11 @@ def test_cancel_before_workspace_terminal(
                 await asyncio.Event().wait()
             return await original(**kwargs)
 
-        monkeypatch.setattr(executor, "publish_workspace_observation_transition", intercept)
+        monkeypatch.setattr(
+            invocation_module, "publish_workspace_observation_transition", intercept
+        )
 
-        original_emit = executor.RuntimeEventWriter.emit
+        original_emit = invocation_module.RuntimeEventWriter.emit
 
         async def emit(writer, event, *args, **kwargs):
             nonlocal session_id, paused
@@ -116,7 +118,7 @@ def test_cancel_before_workspace_terminal(
                 await release_runner_publication.wait()
             return saved
 
-        monkeypatch.setattr(executor.RuntimeEventWriter, "emit", emit)
+        monkeypatch.setattr(invocation_module.RuntimeEventWriter, "emit", emit)
 
         async def consume():
             if native_child:

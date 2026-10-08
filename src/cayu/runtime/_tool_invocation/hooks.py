@@ -40,9 +40,9 @@ from cayu.runtime._tool_round_staging import (
 )
 from cayu.sessions.base import (
     INHERIT_INTERACTION,
-    Session,
     resolve_interaction_attribution,
 )
+from cayu.sessions.records import Session
 from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools import _shared_artifact_results as shared_artifact_results
 from cayu.tools import _web_access_results as web_access_results

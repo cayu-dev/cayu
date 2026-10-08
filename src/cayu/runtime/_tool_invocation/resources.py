@@ -49,12 +49,11 @@ from cayu.sessions._browser_control_checkpoint import (
     browser_control_checkpoint_read_scope,
 )
 from cayu.sessions.base import (
-    Session,
     SessionOperationPublication,
     SessionRunFenced,
-    SessionStatus,
     SessionStore,
 )
+from cayu.sessions.records import Session, SessionStatus
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._resources import (
     InvocationWorkspaceMutationOwner,

@@ -128,7 +128,7 @@ def test_owner_requires_admission_before_evidence_or_publication(monkeypatch, ef
 def test_closing_deferred_publication_closes_its_hook_stream_before_return(monkeypatch):
     async def scenario():
         app, _store, calls = _app(2)
-        emit = app._tool_round_executor.terminals.publish_result
+        emit = app._tool_round_executor.invocation.terminals.publish_result
         closed = []
 
         async def tracked_emit(**kwargs):
@@ -141,7 +141,9 @@ def test_closing_deferred_publication_closes_its_hook_stream_before_return(monke
                     await asyncio.sleep(0)
                     closed.append(kwargs["tool_call"].id)
 
-        monkeypatch.setattr(app._tool_round_executor.terminals, "publish_result", tracked_emit)
+        monkeypatch.setattr(
+            app._tool_round_executor.invocation.terminals, "publish_result", tracked_emit
+        )
         stream = app.run(RunRequest(agent_name="worker", messages=[Message.text("user", "go")]))
         async with aclosing(stream):
             async for event in stream:

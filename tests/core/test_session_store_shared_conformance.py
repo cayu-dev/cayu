@@ -11816,7 +11816,9 @@ def test_session_store_conformance_ambiguous_policy_recovery_remains_gated(
                     "process stopped after policy evaluation and before publication"
                 )
 
-            first_app._tool_round_executor.admission.pause_for_approval = lose_approval_publication
+            first_app._tool_round_executor.invocation.admission.pause_for_approval = (
+                lose_approval_publication
+            )
             with pytest.raises(
                 _SimulatedProcessLoss,
                 match="after policy evaluation",
@@ -17297,7 +17299,7 @@ def test_auxiliary_owner_dispatch_fences_survive_interruption(
             )
             await store.checkpoint(session_id, {"parent": "unchanged"})
             app = CayuApp(session_store=store, enable_logging=False)
-            owner = app._tool_round_executor._auxiliary_inference
+            owner = app._tool_round_executor.invocation._auxiliary_inference
             request = ModelCompletionStageRequest(
                 stage_id="aux_dispatch_attempt",
                 logical_step_id="aux_dispatch_attempt",
@@ -17368,7 +17370,7 @@ def test_auxiliary_owner_dispatch_fences_survive_interruption(
             receipt = await store.load_model_completion_stage_dispatch(session_id, request.stage_id)
             assert (receipt is not None) == (interruption in (None, "dispatch_cancel"))
             app = CayuApp(session_store=store, enable_logging=False)
-            owner = app._tool_round_executor._auxiliary_inference
+            owner = app._tool_round_executor.invocation._auxiliary_inference
             # Readback after restart is evidence, never another dispatch grant.
             with pytest.raises(SessionModelCompletionStageConflict, match="replay"):
                 await dispatch()

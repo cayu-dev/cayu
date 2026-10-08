@@ -5204,7 +5204,7 @@ class CayuApp:
     def tool_terminal_publication_status(self) -> ToolTerminalPublicationMetricsSnapshot:
         """Return content-free staged-terminal backlog and fairness measurements."""
 
-        return self._tool_round_executor.terminals.metrics()
+        return self._tool_round_executor.invocation.terminals.metrics()
 
     async def drain_recovery_cleanups(self, *, timeout_s: float = 10.0) -> bool:
         """Wait boundedly for recovery cleanup, stopped execution-presence writes,
@@ -5312,7 +5312,7 @@ class CayuApp:
         """Work using an environment's resources that outlived its caller."""
 
         return {
-            *self._tool_round_executor.detached_environment_work(),
+            *self._tool_round_executor.invocation.detached_environment_work(),
             *late_artifact_writes(self._admission),
         }
 

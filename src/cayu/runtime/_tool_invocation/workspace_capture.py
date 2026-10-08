@@ -48,9 +48,9 @@ from cayu.runtime._tool_round_staging import (
     _event_with_tool_round_authority,
 )
 from cayu.sessions.base import (
-    Session,
     SessionStore,
 )
+from cayu.sessions.records import Session
 from cayu.tools._operation_boundary import (
     BoundedInvocationOperationRegistry,
     await_invocation_operation,

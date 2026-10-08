@@ -541,7 +541,9 @@ def test_recovered_publication_closes_hook_stream_before_rejecting_changed_evide
             rejected.append(str(exc))
             raise
 
-    monkeypatch.setattr(app._tool_round_executor.terminals, "publish_result", changed_terminal)
+    monkeypatch.setattr(
+        app._tool_round_executor.invocation.terminals, "publish_result", changed_terminal
+    )
     monkeypatch.setattr(DurableToolRound, "publish_recovered", checked_publication)
 
     async def scenario():
