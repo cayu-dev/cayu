@@ -1,4 +1,13 @@
 {
+    "tests/core/test_sqlite_validation_owners.py::test_memory_evidence_schema_validates_independently[current]": 0.625008291011909,
+    "tests/core/test_sqlite_validation_owners.py::test_memory_evidence_schema_validates_independently[missing-context-exposures]": 0.1827300830045715,
+    "tests/core/test_sqlite_validation_owners.py::test_memory_evidence_schema_validates_independently[missing-item-exposures]": 0.18368479100172408,
+    "tests/core/test_sqlite_validation_owners.py::test_memory_evidence_schema_validates_independently[missing-page-index]": 0.2206642090168316,
+    "tests/core/test_sqlite_validation_owners.py::test_memory_evidence_schema_validates_independently[missing-receipts]": 0.18461474997457117,
+    "tests/core/test_sqlite_validation_owners.py::test_memory_evidence_schema_validates_independently[partial-receipt-index]": 0.22809320804663002,
+    "tests/core/test_sqlite_validation_owners.py::test_memory_evidence_schema_validates_independently[unexpected-unique-index]": 0.2634683749929536,
+    "tests/core/test_sqlite_validation_owners.py::test_memory_evidence_schema_validates_independently[wrong-index-collation]": 0.2148096669698134,
+    "tests/core/test_sqlite_validation_owners.py::test_memory_evidence_schema_validates_independently[wrong-receipt-column]": 0.19335379305994138,
     "tests/core/test_sqlite_package_layout.py::test_sqlite_session_schema_validates_without_migration_or_store_imports[current]": 1.103,
     "tests/core/test_sqlite_package_layout.py::test_sqlite_session_schema_validates_without_migration_or_store_imports[missing-child-candidates]": 0.209,
     "tests/core/test_sqlite_package_layout.py::test_sqlite_session_schema_validates_without_migration_or_store_imports[missing-deferred-inputs]": 0.21,

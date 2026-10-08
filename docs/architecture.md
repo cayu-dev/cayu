@@ -674,6 +674,8 @@ Task invocation metadata, terminal receipts, retries and interrupted handoffs
 are checked by `storage/_sqlite_task_schema.py`.
 Session identity, grants, deferred inputs, queued messages and child-lifecycle
 checks live in `storage/_sqlite_session_schema.py`.
+Recall and model-context evidence checks live in
+`storage/_sqlite_memory_evidence_schema.py`.
 These owners inspect existing tables, indexes, views and constraints.
 Schema reconciliation retains revision
 gates and validation order in `storage/_sqlite_support.py`, alongside migration
