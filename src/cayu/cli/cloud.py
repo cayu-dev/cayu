@@ -271,6 +271,51 @@ class _CloudDeploymentStillRunningError(CloudApiError):
         return details
 
 
+class _CloudReleaseNotSelectedError(CloudApiError):
+    """Unchanged source resolved to a promoted Release the Agent no longer runs."""
+
+    def __init__(
+        self,
+        *,
+        application_id: str,
+        deployment_id: str,
+        current_deployment_id: object,
+        recovery_arguments: Sequence[str] = (),
+    ) -> None:
+        app = _cloud_application_id(application_id)
+        deployment = _cloud_deployment_id(deployment_id)
+        current = (
+            _cloud_deployment_id(current_deployment_id)
+            if isinstance(current_deployment_id, str)
+            else None
+        )
+        selected = (
+            f"the Agent's selected Release is {current}"
+            if current is not None
+            else "the Agent has no selected Release"
+        )
+        message = (
+            f"This source is already Release {deployment or 'in Cayu Cloud'}, so Cayu Cloud "
+            f"reused it instead of building a new one, but {selected}. Select the reused "
+            "Release with `cayu cloud rollback`, or change `version` in cayu-cloud.toml to "
+            "build a new Release."
+        )
+        super().__init__("release_not_selected", message)
+        self.details: dict[str, object] = {"current_deployment_id": current}
+        if app is not None:
+            self.details["application"] = app
+        if deployment is not None:
+            self.details["deployment_id"] = deployment
+        if app is not None and deployment is not None:
+            command = ["cayu", "cloud", *recovery_arguments]
+            self.details["commands"] = {
+                "rollback": shlex.join(
+                    [*command, "rollback", deployment, "--application", app, "--wait"]
+                ),
+                "status": shlex.join([*command, "service", "status", "--application", app]),
+            }
+
+
 class _CloudArchiveStillRunningError(CloudApiError):
     """A local wait ended while Cayu Cloud keeps retiring the archived Agent."""
 
@@ -450,6 +495,7 @@ def _cloud_failure(exc: Exception) -> int:
             _CloudDeploymentDiagnosticUnavailableError,
             _CloudDeploymentFailureError,
             _CloudPromotionConflictError,
+            _CloudReleaseNotSelectedError,
             _CloudRetrySubmissionError,
         ),
     ):
@@ -1254,6 +1300,10 @@ def _deploy(
                 failure=failure,
                 replayed=True,
             )
+    # A Release Cloud promoted before this deploy, whether replayed directly or found
+    # through its retry family, is not published again by any promotion. A retry this
+    # deploy submitted is published by Cloud itself.
+    previously_promoted = retry is None and _deployment_status(deployment) == "promoted"
     if not arguments.no_wait:
         deployment = _wait_for_deployment(
             client,
@@ -1286,15 +1336,44 @@ def _deploy(
             f"/v1/applications/{application['id']}/runtime-artifacts/{runtime_artifact_id}",
         )
     service = None
+    service_publication_requested = False
     if project.manifest.runtime_payload() is not None and deployment.get("status") == "promoted":
+        # Unchanged source replays a Release Cloud promoted earlier. The Agent may have
+        # selected another Release since, and its service may have been destroyed;
+        # either way no finalizer is going to publish this Release now.
+        reused = previously_promoted
+        # The Agent was read when this deploy resolved it; a reused Release was promoted
+        # before that, so its selection then is the one to report. Without the field
+        # the selection is unknown, and the service wait below still applies.
+        if (
+            reused
+            and "current_deployment_id" in application
+            and application["current_deployment_id"] != deployment.get("id")
+        ):
+            raise _CloudReleaseNotSelectedError(
+                application_id=str(application["id"]),
+                deployment_id=str(deployment["id"]),
+                current_deployment_id=application.get("current_deployment_id"),
+                recovery_arguments=_cloud_recovery_arguments(arguments),
+            )
         # Promotion's finalizer owns publication. A second PUT registers and
         # restarts the same processes; observe the exact release instead.
+        service_absent = False
         try:
             service = _read_or_none(client, f"/v1/applications/{application['id']}/service")
         except CloudApiError as exc:
             if not _transient_api_error(exc):
                 raise
             service = None
+        else:
+            service_absent = service is None
+        # Only a confirmed 404 means nothing runs; an unavailable read is left to the
+        # service wait, which tolerates brief outages.
+        if service_absent and reused:
+            # Nothing runs the selected Release, and its promotion finished long ago.
+            # Publish it as `rollback` does; Cloud leaves a running service unchanged.
+            service = client.request("PUT", f"/v1/applications/{application['id']}/service")
+            service_publication_requested = True
         if not arguments.no_wait:
             service = _wait_for_service(
                 client,
@@ -1312,6 +1391,7 @@ def _deploy(
         "deployment": deployment,
         "runtime_artifact": runtime_artifact,
         "service": service,
+        "service_publication_requested": service_publication_requested,
         "service_publication_pending": (
             project.manifest.runtime_payload() is not None
             and deployment.get("status") == "promoted"
@@ -2619,10 +2699,11 @@ def _cloud_client(
                     "The Cayu Cloud login authority changed; run `cayu cloud login` again.",
                 )
 
-        def current_access_token() -> str:
+        def current_access_token(rejected: str | None = None) -> str:
             current = fresh_cloud_credentials(
                 auth_store,
                 timeout_seconds=arguments.timeout_seconds,
+                rejected_access_token=rejected,
             )
             if current is None:
                 raise CloudAuthError(
@@ -2647,6 +2728,9 @@ def _cloud_client(
             api_key=credentials.access_token,
             timeout_seconds=arguments.timeout_seconds,
             api_key_provider=current_access_token,
+            # A long deploy wait can outlive a token Cloud rejects before the local
+            # clock says it expires; refresh it once instead of failing the wait.
+            rejected_api_key_provider=current_access_token,
         )
 
     raise CloudAuthError(

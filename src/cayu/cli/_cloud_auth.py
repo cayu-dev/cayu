@@ -541,11 +541,26 @@ def fresh_cloud_credentials(
     store: CloudAuthStore,
     *,
     timeout_seconds: float,
+    rejected_access_token: str | None = None,
 ) -> CloudAuthCredentials | None:
+    """Return the saved login, refreshing it when it is about to expire.
+
+    ``rejected_access_token`` is a token Cayu Cloud just answered with HTTP 401. The
+    local clock may disagree with Cloud's, or the token may be revoked early, so the
+    saved login is refreshed regardless of its expiry, unless another command has
+    already replaced that token.
+    """
+
     credentials = store.load()
     if credentials is None:
         return None
-    if credentials.expires_at > time.time() + _REFRESH_SKEW_SECONDS:
+    if rejected_access_token is not None:
+        if not hmac.compare_digest(
+            credentials.access_token.encode("utf-8"),
+            rejected_access_token.encode("utf-8"),
+        ):
+            return credentials
+    elif credentials.expires_at > time.time() + _REFRESH_SKEW_SECONDS:
         return credentials
     with store.prepare_refresh(credentials) as publication:
         current = publication.current

@@ -101,6 +101,13 @@ class CloudApiClient:
         repr=False,
         compare=False,
     )
+    # Given a key Cloud rejected with HTTP 401, return a replacement (for example a
+    # refreshed login token), or the same key when none is available.
+    rejected_api_key_provider: Callable[[str], str] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         parsed = urlsplit(self.api_url)
@@ -154,32 +161,28 @@ class CloudApiClient:
         idempotency_key: str | None = None,
         query: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        headers = {
-            "Accept": "application/json",
-            "Authorization": f"Bearer {self._current_api_key()}",
-        }
-        body = None
-        if payload is not None:
-            headers["Content-Type"] = "application/json"
-            body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
-        if idempotency_key is not None:
-            headers["Idempotency-Key"] = idempotency_key
-        try:
-            with httpx.Client(
-                follow_redirects=False,
-                timeout=self.timeout_seconds,
-            ) as client:
-                response = client.request(
+        api_key = self._current_api_key()
+        response = self._send(
+            method,
+            path,
+            api_key=api_key,
+            payload=payload,
+            idempotency_key=idempotency_key,
+            query=query,
+        )
+        if response.status_code == 401 and self.rejected_api_key_provider is not None:
+            # Cloud rejected the credential before acting on the request, so sending it
+            # once more with a replacement is safe for every method.
+            replacement = self._validated_api_key(self.rejected_api_key_provider(api_key))
+            if replacement != api_key:
+                response = self._send(
                     method,
-                    self.api_url.rstrip("/") + path + (f"?{urlencode(query)}" if query else ""),
-                    content=body,
-                    headers=headers,
+                    path,
+                    api_key=replacement,
+                    payload=payload,
+                    idempotency_key=idempotency_key,
+                    query=query,
                 )
-        except httpx.RequestError:
-            raise CloudApiError(
-                "api_unavailable",
-                "Cayu Cloud API is unavailable.",
-            ) from None
         if not 200 <= response.status_code < 300:
             structured = _structured_api_error(response)
             detail = _safe_api_error_detail(response.status_code, structured)
@@ -209,8 +212,50 @@ class CloudApiClient:
             )
         return result
 
+    def _send(
+        self,
+        method: str,
+        path: str,
+        *,
+        api_key: str,
+        payload: dict[str, object] | None,
+        idempotency_key: str | None,
+        query: dict[str, str] | None,
+    ) -> httpx.Response:
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+        body = None
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+            body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+        if idempotency_key is not None:
+            headers["Idempotency-Key"] = idempotency_key
+        try:
+            with httpx.Client(
+                follow_redirects=False,
+                timeout=self.timeout_seconds,
+            ) as client:
+                return client.request(
+                    method,
+                    self.api_url.rstrip("/") + path + (f"?{urlencode(query)}" if query else ""),
+                    content=body,
+                    headers=headers,
+                )
+        except httpx.RequestError:
+            raise CloudApiError(
+                "api_unavailable",
+                "Cayu Cloud API is unavailable.",
+            ) from None
+
     def _current_api_key(self) -> str:
-        api_key = self.api_key_provider() if self.api_key_provider is not None else self.api_key
+        return self._validated_api_key(
+            self.api_key_provider() if self.api_key_provider is not None else self.api_key
+        )
+
+    @staticmethod
+    def _validated_api_key(api_key: str) -> str:
         if (
             not api_key
             or api_key != api_key.strip()

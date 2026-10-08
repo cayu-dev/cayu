@@ -6,6 +6,17 @@ Cayu adds provider-backed completion verification and independent completion
 evaluations, improves crash recovery, and supports explicit Cloud storage
 migration acknowledgements.
 
+- `cayu cloud deploy` of unchanged source no longer waits until `--wait-seconds`
+  expires when Cloud reuses an earlier promoted Release whose service isn't running.
+  If that Release is still selected, the deploy starts its service, as `rollback`
+  does, and reports `service_publication_requested`. If the Agent has selected
+  another Release, it exits at once with category `release_not_selected` and the
+  `rollback` command to run. See
+  [Cayu Cloud](cayu-cloud.md).
+- A Cloud CLI call that Cayu Cloud rejects with HTTP 401 while signed in with
+  `cayu cloud login` now refreshes the login once and retries the call, instead of
+  failing a long `deploy --wait` when the local clock disagrees with Cloud's or the
+  token is rejected before its expiry.
 - After recovery closes a tool call that started but never finished, the model now
   sees that call's redacted arguments when the round resolved no invocation secrets
   (no vault or credential proxy) and the tool permits argument publication. The

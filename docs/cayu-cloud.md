@@ -243,6 +243,16 @@ source and includes a `retry` receipt with the old ID, new ID, failure code, and
 The source archive and manifest version are unchanged. A newly submitted attempt that
 fails while waiting is reported to the caller rather than retried again.
 
+When unchanged source resolves to a Release that Cloud promoted earlier, no promotion
+publishes it again, so the deploy checks the Agent itself. If that Release is still the
+Agent's selected Release but no service is running it, for example after `service
+destroy`, the deploy asks Cloud to start the service, as `rollback` does, and reports
+`service_publication_requested: true`. If the Agent has selected a different Release, or
+none, the deploy exits `2` at once with category `release_not_selected`, the
+`current_deployment_id`, and ready-to-run `rollback` and `service status` commands.
+Select the reused Release with `rollback`, or change `version` in `cayu-cloud.toml` to
+build a new one.
+
 `--retry-failed` explicitly enables this default; `--no-retry-failed` reports the retained
 attempt without retrying it. Non-retryable source failures include the retained failure and
 instructions to change the source and deploy again. Terminal errors carry `deployment_id`,
@@ -317,7 +327,9 @@ cayu cloud login --no-browser
 ```
 
 The access and rotating refresh tokens are kept in a private local auth file. Cayu
-refreshes the short-lived access token before Cloud API calls. `cayu cloud logout`
+refreshes the short-lived access token before Cloud API calls. If Cloud still rejects
+it with HTTP 401, for example when the local clock runs behind, Cayu refreshes the login
+once and retries that call, so a long `deploy --wait` keeps polling. `cayu cloud logout`
 deletes that local login.
 
 Authentication selection is explicit: a successful `cayu cloud login` clears the

@@ -45016,5 +45016,20 @@
     "tests/core/test_verified_work_session_closure.py::test_closure_erases_a_verified_and_applied_contract_task[memory]": 0.2480227910564281,
     "tests/core/test_verified_work_session_closure.py::test_closure_erases_a_verified_and_applied_contract_task[postgres]": 7.570828292926308,
     "tests/core/test_verified_work_session_closure.py::test_closure_erases_a_verified_and_applied_contract_task[sqlite]": 0.5593005829723552,
-    "tests/core/test_verified_work_session_closure.py::test_deletion_plan_covers_owned_tables_children_first": 0.31929825007682666
+    "tests/core/test_verified_work_session_closure.py::test_deletion_plan_covers_owned_tables_children_first": 0.31929825007682666,
+    "tests/cli/test_cloud_reused_release.py::test_freshly_promoted_release_leaves_publication_to_cloud": 0.0012722089886665344,
+    "tests/cli/test_cloud_reused_release.py::test_reused_release_already_running_is_left_alone": 0.0008257920271717012,
+    "tests/cli/test_cloud_reused_release.py::test_reused_release_that_is_not_selected_fails_promptly[None-the Agent has no selected Release]": 0.0007950419094413519,
+    "tests/cli/test_cloud_reused_release.py::test_reused_release_that_is_not_selected_fails_promptly[dep_newer-the Agent's selected Release is dep_newer]": 0.0007369579980149865,
+    "tests/cli/test_cloud_reused_release.py::test_reused_selected_release_without_a_service_starts_it": 0.0038312480319291353,
+    "tests/cli/test_cloud_reused_release.py::test_reused_selected_release_without_a_service_starts_it_without_waiting": 0.0010753340320661664,
+    "tests/cli/test_cloud_rejected_login_token.py::test_client_reports_the_rejection_without_retrying_again[also-rejected]": 0.5439988760044798,
+    "tests/cli/test_cloud_rejected_login_token.py::test_client_reports_the_rejection_without_retrying_again[unchanged]": 0.5195248749805614,
+    "tests/cli/test_cloud_rejected_login_token.py::test_client_retries_once_with_the_replacement_key": 0.12699546001385897,
+    "tests/cli/test_cloud_rejected_login_token.py::test_client_without_a_replacement_provider_does_not_retry": 0.5089544989750721,
+    "tests/cli/test_cloud_rejected_login_token.py::test_rejected_token_already_replaced_is_not_refreshed_again": 0.001981334004085511,
+    "tests/cli/test_cloud_rejected_login_token.py::test_rejected_token_forces_a_refresh_before_its_expiry": 0.02644866704940796,
+    "tests/cli/test_cloud_rejected_login_token.py::test_workos_login_client_refreshes_a_token_cloud_rejects_early": 0.5268202070146799,
+    "tests/cli/test_cloud_reused_release.py::test_promoted_retry_found_from_a_failed_original_is_treated_as_reused": 0.0008337069884873927,
+    "tests/cli/test_cloud_reused_release.py::test_transient_service_read_keeps_polling_instead_of_publishing": 0.0009760000393725932
 }
