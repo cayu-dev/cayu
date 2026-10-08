@@ -628,7 +628,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "InMemoryEventSink": ("cayu.observability.events", "InMemoryEventSink"),
     "InMemoryEventWatcherStore": ("cayu.observability.watchers", "InMemoryEventWatcherStore"),
     "InMemorySessionStore": ("cayu.sessions.base", "InMemorySessionStore"),
-    "InMemoryTaskStore": ("cayu.tasks.base", "InMemoryTaskStore"),
+    "InMemoryTaskStore": ("cayu.tasks.memory", "InMemoryTaskStore"),
     "IncompleteSessionRecoveryAction": ("cayu.sessions.base", "IncompleteSessionRecoveryAction"),
     "IncompleteSessionRecoveryRequest": ("cayu.sessions.base", "IncompleteSessionRecoveryRequest"),
     "IncompleteSessionRecoveryResult": ("cayu.sessions.base", "IncompleteSessionRecoveryResult"),

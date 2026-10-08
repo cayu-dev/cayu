@@ -35,7 +35,7 @@ from cayu.runners.docker_workload import DockerImageIdentity
 from cayu.sessions.base import InMemorySessionStore, RunRequest
 from cayu.sessions.outcomes import run_to_completion
 from cayu.storage.memory import InMemoryKnowledgeStore
-from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tools.structured_commands import StructuredCommandToolPolicy
 from cayu.workspaces.local import LocalWorkspace
 

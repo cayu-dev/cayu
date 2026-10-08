@@ -78,6 +78,7 @@ def test_task_contracts_preserve_public_and_legacy_identity():
         cancellation,
         creation,
         handoff,
+        memory,
         queries,
         records,
         retry,
@@ -158,6 +159,7 @@ def test_task_contracts_preserve_public_and_legacy_identity():
         ),
         (work_receipts, ("CompletionDecisionApplicationReceipt",)),
         (store, ("TaskStore",)),
+        (memory, ("InMemoryTaskStore",)),
         (
             topology,
             (
@@ -245,6 +247,10 @@ assert not {
     "cayu.tasks.base", "cayu.tasks.memory", "cayu.storage.tasks_sqlite",
     "cayu.storage.sqlite", "cayu.storage.postgres",
 }.intersection(sys.modules)
+from cayu.tasks.memory import InMemoryTaskStore
+assert public.InMemoryTaskStore is InMemoryTaskStore
+assert isinstance(InMemoryTaskStore(), TaskStore)
+assert "cayu.tasks.base" not in sys.modules
 """,
             public_module,
         ],

@@ -36,7 +36,7 @@ from cayu.tasks.groups import TaskGroupConflict, TaskGroupCreate, TaskGroupInvoc
 from cayu.tasks.records import Task
 
 if TYPE_CHECKING:
-    from cayu.tasks.base import InMemoryTaskStore
+    from cayu.tasks.memory import InMemoryTaskStore
 
 
 async def create_graph(

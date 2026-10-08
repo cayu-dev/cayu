@@ -86,7 +86,6 @@ from cayu.tasks.admission import (
     WorkAttemptRecoveryRequired,
     WorkAttemptRunRequest,
 )
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.contracts import (
     CompletionContinuationPolicy,
     CompletionDecisionCreate,
@@ -97,6 +96,7 @@ from cayu.tasks.contracts import (
     WorkCompletionConflict,
 )
 from cayu.tasks.creation import TaskCreate
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import TaskClaimLost, TaskStatus
 from cayu.tasks.store import TaskStore

@@ -33,9 +33,9 @@ from cayu.tasks.admission import (
     WorkAttemptExecutionRequest,
     WorkAttemptRecoveryRequest,
 )
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.contracts import WorkCompletionConflict
 from cayu.tasks.creation import TaskCreate
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.vaults.redaction import SecretRedactor
 
 

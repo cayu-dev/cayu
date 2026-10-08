@@ -24,9 +24,9 @@ from cayu.runtime.tool_effects import (
 )
 from cayu.sessions.base import ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.handoff import interrupted_task_handoff_request
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import TaskClaimLost
 from cayu.tasks.worker import _recover_expired_interrupted_task_handoffs

@@ -30,7 +30,6 @@ from cayu.tasks.admission import WorkAttemptProposalRequest as WorkAttemptPropos
 from cayu.tasks.admission import WorkAttemptRecoveryActivate as WorkAttemptRecoveryActivate
 from cayu.tasks.admission import WorkAttemptRecoveryRequest as WorkAttemptRecoveryRequest
 from cayu.tasks.admission import WorkAttemptRecoveryRequired as WorkAttemptRecoveryRequired
-from cayu.tasks.base import InMemoryTaskStore as InMemoryTaskStore
 from cayu.tasks.cancellation import TaskCancellationReconciliation as TaskCancellationReconciliation
 from cayu.tasks.cancellation import (
     TaskCancellationReconciliationConflict as TaskCancellationReconciliationConflict,
@@ -244,6 +243,7 @@ from cayu.tasks.handoff import interrupted_task_handoff_request as interrupted_t
 from cayu.tasks.handoff import (
     new_interrupted_task_continuation_handoff_id as new_interrupted_task_continuation_handoff_id,
 )
+from cayu.tasks.memory import InMemoryTaskStore as InMemoryTaskStore
 from cayu.tasks.queries import TaskAggregateFilter as TaskAggregateFilter
 from cayu.tasks.queries import TaskOperationalSnapshot as TaskOperationalSnapshot
 from cayu.tasks.queries import TaskOrder as TaskOrder

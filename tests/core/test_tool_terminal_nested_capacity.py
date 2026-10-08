@@ -13,8 +13,8 @@ from cayu.providers.base import ModelStreamEvent
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionQuery
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.dispatch import TaskStoreDispatcher
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tools.base import Tool, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.subagents import (
     SubagentExecutionMode,

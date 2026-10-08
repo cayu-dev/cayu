@@ -9,7 +9,7 @@ from cayu import CayuApp, TaskCreate, TaskQuery, TaskRescheduleRequest, TaskStat
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresTaskStore
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.scheduling import (
     TaskScheduleCancelRequest,
     TaskScheduleConflict,

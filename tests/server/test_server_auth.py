@@ -42,7 +42,7 @@ from cayu.storage.memory import (
     KnowledgeEntry,
     KnowledgeStatus,
 )
-from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.vaults.redaction import SecretRedactor
 

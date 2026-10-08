@@ -41,8 +41,8 @@ from cayu.sessions.base import (
     Session,
     SessionStatus,
 )
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.creation import TaskCreate
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.records import TaskStatus
 from cayu.workspaces.local import LocalWorkspace
 

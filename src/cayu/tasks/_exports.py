@@ -87,7 +87,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "DispatchRuntime": ("cayu.tasks.dispatch", "DispatchRuntime"),
     "DispatchStatus": ("cayu.tasks.dispatch", "DispatchStatus"),
     "Dispatcher": ("cayu.tasks.dispatch", "Dispatcher"),
-    "InMemoryTaskStore": ("cayu.tasks.base", "InMemoryTaskStore"),
+    "InMemoryTaskStore": ("cayu.tasks.memory", "InMemoryTaskStore"),
     "InlineDispatcher": ("cayu.tasks.dispatch", "InlineDispatcher"),
     "InterruptedTaskContinuationClaimPage": (
         "cayu.tasks.handoff",

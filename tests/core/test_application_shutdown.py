@@ -482,7 +482,7 @@ async def _consume_request(app: CayuApp, request: RunRequest) -> list:
 
 def test_an_allowed_operation_in_flight_holds_owned_resources_open() -> None:
     from cayu.tasks import TaskCreate
-    from cayu.tasks.base import InMemoryTaskStore
+    from cayu.tasks.memory import InMemoryTaskStore
 
     class SlowStore(InMemoryTaskStore):
         def __init__(self) -> None:
@@ -535,7 +535,7 @@ def test_aclose_stops_model_policy_workers(monkeypatch) -> None:
 
 def test_no_operation_reaches_owned_resources_while_or_after_they_close() -> None:
     from cayu.tasks import TaskCreate
-    from cayu.tasks.base import InMemoryTaskStore
+    from cayu.tasks.memory import InMemoryTaskStore
 
     class ClosingStore(InMemoryTaskStore):
         def __init__(self) -> None:
@@ -572,7 +572,7 @@ def test_no_operation_reaches_owned_resources_while_or_after_they_close() -> Non
 
 def test_admission_stays_open_until_work_settles_then_closes_even_if_release_fails() -> None:
     from cayu.tasks import TaskCreate
-    from cayu.tasks.base import InMemoryTaskStore
+    from cayu.tasks.memory import InMemoryTaskStore
 
     class FlakyStore(InMemoryTaskStore):
         verified_work_mutations_are_cancellation_quiescent = True

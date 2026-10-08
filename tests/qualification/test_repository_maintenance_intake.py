@@ -10,8 +10,8 @@ from cayu.applications import CayuApp
 from cayu.cli.project import project_context
 from cayu.sessions.invocation import InvocationOriginClaim
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.creation import TaskCreate
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import TaskStatus
 from tests.qualification.repository_maintenance_application import maintenance_project_files

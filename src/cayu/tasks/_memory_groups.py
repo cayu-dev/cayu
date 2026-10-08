@@ -19,7 +19,7 @@ from cayu.tasks.groups import (
 )
 
 if TYPE_CHECKING:
-    from cayu.tasks.base import InMemoryTaskStore
+    from cayu.tasks.memory import InMemoryTaskStore
     from cayu.tasks.records import Task
 
 

@@ -732,7 +732,7 @@ def test_shutdown_waits_for_an_unaccepted_finalization_handoff_heartbeat() -> No
 
 def test_shutdown_waits_for_a_task_lease_renewal_its_cancelled_worker_left() -> None:
     from cayu.tasks import TaskCreate
-    from cayu.tasks.base import InMemoryTaskStore
+    from cayu.tasks.memory import InMemoryTaskStore
     from cayu.tasks.worker import run_task_worker
 
     class SlowRenewalStore(InMemoryTaskStore):

@@ -45124,7 +45124,7 @@
     "tests/core/test_verified_work_session_closure.py::test_closure_erases_provider_verifier_dispatches[memory]": 0.2593125000712462,
     "tests/core/test_verified_work_session_closure.py::test_closure_erases_provider_verifier_dispatches[postgres]": 7.8779902489623055,
     "tests/core/test_verified_work_session_closure.py::test_closure_erases_provider_verifier_dispatches[sqlite]": 0.2554006659775041,
-    "tests/core/test_task_package_layout.py::test_task_terminal_contracts_work_without_loading_stores[cayu.runtime]": 0.16311829202459194,
-    "tests/core/test_task_package_layout.py::test_task_terminal_contracts_work_without_loading_stores[cayu.tasks]": 0.1497588760103099,
-    "tests/core/test_task_package_layout.py::test_task_terminal_contracts_work_without_loading_stores[cayu]": 0.1557963329833001
+    "tests/core/test_task_package_layout.py::test_task_terminal_contracts_work_without_loading_stores[cayu.runtime]": 0.7643749580020085,
+    "tests/core/test_task_package_layout.py::test_task_terminal_contracts_work_without_loading_stores[cayu.tasks]": 0.7625894590164535,
+    "tests/core/test_task_package_layout.py::test_task_terminal_contracts_work_without_loading_stores[cayu]": 0.9215582910110243
 }

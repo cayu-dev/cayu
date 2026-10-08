@@ -244,7 +244,7 @@ def test_retirement_cannot_discard_pending_timer_publication(
     backend, tmp_path, request, monkeypatch
 ):
     from cayu.external_wait_scheduler import TaskStoreWaitScheduler
-    from cayu.tasks.base import InMemoryTaskStore
+    from cayu.tasks.memory import InMemoryTaskStore
 
     async def scenario():
         async with stores(backend, tmp_path, request, [datetime.now(UTC)]) as (store, reopen):

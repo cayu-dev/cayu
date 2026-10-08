@@ -24,7 +24,7 @@ import asyncio
 import importlib
 import sys
 
-from cayu.tasks.base import TaskCreate
+from cayu.tasks.creation import TaskCreate
 from cayu.tasks.topology import TaskTopologyQuery
 
 store_type = importlib.import_module(sys.argv[1]).SQLiteTaskStore

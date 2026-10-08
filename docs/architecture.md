@@ -790,6 +790,21 @@ the same canonical types, including persisted legacy pickle class paths.
 
 Tasks are optional durable work items, not a required execution model. A simple agent can run with only sessions and events. A background job, orchestrated multi-agent app, webhook processor, or dashboard-visible queue can use `TaskStore` to track work status, inputs, outputs, errors, ownership, and parent/child relationships. Worker-owned completion and failure use an atomic terminal receipt so acknowledgement loss can be reconciled without applying a second task transition; that receipt covers Cayu task state, not exactly-once external effects. Interrupted-session handoff uses a separate exact receipt so transient ownership-release failure preserves the running task/session link for bounded retry or expired-lease recovery. Application-owned verified-work contracts add an independent completion-authority boundary: workers propose completion, while durable verifier claims and decisions gate the terminal transition. Every contract also freezes the exact application-owned result-resolver identity used to read the accepted result from durable application state. `CayuApp.resolve_completion_result(...)` invokes that side-effect-free resolver and feeds the validated content into the existing `apply_completion_decision(...)` receipt boundary. Receipt-first replay does not require the process-local resolver after application has committed. `InMemoryTaskStore`, `SQLiteTaskStore`, and `PostgresTaskStore` expose the same verified-work lifecycle; SQLite is the local durable implementation and PostgreSQL supplies cross-process row-lock authority.
 
+Task values and shared rules have backend-independent owners in `tasks/records.py`,
+`creation.py`, `queries.py`, `terminalization.py`, `handoff.py`, `cancellation.py`,
+`retry.py` and `work_receipts.py`. The store interface and shared worker polling
+coordination live in `tasks/store.py`; bounded terminalization retries compose
+that interface in `tasks/_terminalization.py`. Shared lifecycle and cancellation
+transitions live in `tasks/_lifecycle.py` and `tasks/_cancellation.py`.
+
+`tasks/memory.py` owns the memory store's mutable state, locks, indexes and atomic
+operations. It composes the shared rules and existing task-access decorators.
+SQLite and PostgreSQL use the same contracts and rules while retaining their
+native transactions and ownership checks. Public task contracts and the store
+interface can be imported without loading a concrete backend. Existing public
+imports through `tasks/base.py` resolve to the canonical owners; internal
+consumers and generated applications use those owners directly.
+
 Verified-work persistence policy and immutable-authority validation live in
 `tasks/_verified_work_policy.py` and `tasks/_verified_work_authority.py`.
 Durable verifier-profile records, fingerprints and profile-policy contracts

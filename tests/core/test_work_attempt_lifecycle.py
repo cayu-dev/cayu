@@ -47,7 +47,6 @@ from cayu.tasks.admission import (
     require_work_attempt_execution_entry_result,
     require_work_attempt_execution_stop_result,
 )
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.contracts import (
     CompletionDecisionApplicationRequest,
     CompletionProposalCreate,
@@ -56,6 +55,7 @@ from cayu.tasks.contracts import (
     WorkCompletionConflict,
 )
 from cayu.tasks.creation import TaskCreate, task_create_with_runtime_invocation
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.queries import TaskAggregateFilter
 from cayu.tasks.records import TaskClaimLost, TaskStatus
 

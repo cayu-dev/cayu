@@ -13,7 +13,7 @@ from cayu.runners.docker_workload import DockerImageIdentity
 from cayu.sessions.base import InMemorySessionStore
 from cayu.storage.memory import InMemoryKnowledgeStore
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.workspaces.local import LocalWorkspace
 from tests.cli.test_scaffold_coding_budget import denial_policy
 from tests.core.test_queued_session_messages import RecordingOneShotProvider

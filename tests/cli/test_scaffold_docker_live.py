@@ -27,7 +27,7 @@ from cayu.environments.factory import EnvironmentFactoryReleaseAction, Environme
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.runners.base import ExecCommand
 from cayu.sessions.base import InMemorySessionStore
-from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tools.base import ToolContext
 from cayu.tools.files import EditFileTool, WriteFileTool
 from cayu.tools.git import GitChangesTool

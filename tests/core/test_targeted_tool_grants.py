@@ -55,8 +55,8 @@ from cayu.storage.jsonl_export import export_sessions, import_sessions
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.creation import TaskCreate
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.exposure import StaticToolExposurePolicy
 from cayu.tools.gateway import (

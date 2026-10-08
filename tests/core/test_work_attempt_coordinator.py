@@ -34,7 +34,7 @@ from cayu.messages import Message
 from cayu.runtime._work_attempt_coordinator import WorkAttemptCoordinator
 from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest
 from cayu.tasks.admission import WorkAttemptExecutionRequest
-from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.vaults.redaction import SecretRedactor
 
 class ReachedEngine(Exception):
@@ -153,7 +153,7 @@ def test_work_attempt_stream_clears_inherited_authority_before_yield(close_early
         _current_session_run_epoch,
     )
     from cayu.tasks.admission import WorkAttemptRunRequest
-    from cayu.tasks.base import InMemoryTaskStore
+    from cayu.tasks.memory import InMemoryTaskStore
     from cayu.vaults.redaction import SecretRedactor
 
     async def scenario() -> None:
@@ -205,7 +205,7 @@ def test_work_attempt_stream_preserves_caller_signal_during_cleanup(
         _current_session_run_epoch,
     )
     from cayu.tasks.admission import WorkAttemptRunRequest
-    from cayu.tasks.base import InMemoryTaskStore
+    from cayu.tasks.memory import InMemoryTaskStore
     from cayu.vaults.redaction import SecretRedactor
 
     class FailingReleaseStore(InMemorySessionStore):

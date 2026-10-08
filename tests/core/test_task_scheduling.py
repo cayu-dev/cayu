@@ -1084,7 +1084,7 @@ def test_memory_cancel_schedule_is_revision_fenced_and_retains_claim():
 @pytest.mark.parametrize("claimed", [False, True])
 @pytest.mark.parametrize("retry", [False, True])
 def test_memory_schedule_cancel_preparation_failure_publishes_nothing(monkeypatch, claimed, retry):
-    from cayu.tasks import base
+    from cayu.tasks import memory
 
     async def run():
         now = datetime.now(UTC)
@@ -1110,7 +1110,7 @@ def test_memory_schedule_cancel_preparation_failure_publishes_nothing(monkeypatc
             raise ValueError("receipt preparation failed")
 
         with monkeypatch.context() as patch:
-            patch.setattr(base, "schedule_receipt", fail_receipt)
+            patch.setattr(memory, "schedule_receipt", fail_receipt)
             with pytest.raises(ValueError, match="receipt preparation failed"):
                 await store.cancel_scheduled_task(request)
         assert await store.load_task(before.id) == before

@@ -32,8 +32,8 @@ from cayu.runtime.local_execution_attempts import (
     local_execution_parent_death_containment_platform_candidate,
 )
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.creation import TaskCreate
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.vaults.redaction import SecretRedactor
 
 pytestmark = [

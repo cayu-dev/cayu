@@ -23,7 +23,8 @@ from pathlib import Path
 from cayu import CayuApp, TaskGroupEventType, TaskGroupQuiescenceStatus
 from cayu.storage.sqlite import SQLiteTaskStore
 from cayu.storage.postgres import PostgresTaskStore
-from cayu.tasks.base import TaskQuery, TaskStatus
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import TaskStatus
 from cayu.tasks.worker import run_task_worker, complete_managed_task
 
 async def main():

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
 from cayu._clock import normalize_utc_datetime
@@ -24,17 +24,6 @@ from cayu.tasks.terminalization import (
     TaskTerminalizationRequest,
     TaskTerminalKind,
 )
-
-
-def _task_lifecycle_now(task: Task) -> datetime:
-    """Return a wall-clock lifecycle time that cannot move ``task`` backward."""
-
-    timestamps = [datetime.now(UTC), task.created_at, task.updated_at]
-    if task.started_at is not None:
-        timestamps.append(task.started_at)
-    if task.completed_at is not None:
-        timestamps.append(task.completed_at)
-    return max(timestamps)
 
 
 def _ensure_can_transition(task: Task, next_status: TaskStatus) -> None:

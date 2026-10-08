@@ -13,8 +13,8 @@ from cayu.sessions.access import (
 )
 from cayu.storage.sqlite import SQLiteTaskStore
 from cayu.tasks.access import ScopedTaskAccess
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.creation import TaskCreate
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.queries import TaskQuery
 
 

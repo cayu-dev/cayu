@@ -51,8 +51,8 @@ from cayu.sessions.base import (
     UsageRollupQuery,
 )
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.creation import TaskCreate
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.queries import TaskAggregateFilter
 
 

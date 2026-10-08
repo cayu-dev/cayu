@@ -26,7 +26,6 @@ from cayu import AgentSpec, CayuApp
 from cayu.sessions.base import InMemorySessionStore
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.contracts import (
     CompletionDecisionApplicationRequest,
     CompletionProposalCreate,
@@ -36,6 +35,7 @@ from cayu.tasks.contracts import (
     completion_result_sha256,
 )
 from cayu.tasks.creation import TaskCreate
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.records import TaskStatus
 from cayu.verification.completion_verifiers import CompletionVerifierExecutionRequest
 

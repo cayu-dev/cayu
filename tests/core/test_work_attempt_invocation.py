@@ -44,8 +44,8 @@ from cayu.tasks.admission import (
     WorkAttemptRecoveryRequired,
     WorkAttemptRunRequest,
 )
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.creation import TaskCreate
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.records import TaskStatus
 from cayu.tools.exposure import ToolCapabilityCeiling
 from cayu.vaults.redaction import SecretRedactor

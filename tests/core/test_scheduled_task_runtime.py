@@ -13,7 +13,7 @@ from cayu.sessions.base import InMemorySessionStore
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore, PostgresTaskStore
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.scheduling import TaskScheduleEventType, TaskSchedulePolicy
 from cayu.tasks.worker import run_task_worker
 

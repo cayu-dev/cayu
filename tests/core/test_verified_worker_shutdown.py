@@ -21,8 +21,8 @@ from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.runtime.verified_task_worker import VerifiedTaskWorker
 from cayu.sessions.base import InMemorySessionStore
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.creation import TaskCreate
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.records import TaskStatus
 
 

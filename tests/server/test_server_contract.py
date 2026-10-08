@@ -49,7 +49,7 @@ from cayu.server.sse import (
 )
 from cayu.sessions.base import InMemorySessionStore
 from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope
-from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.memory import InMemoryTaskStore
 
 
 class _TestKnowledgeStore(InMemoryKnowledgeStore):

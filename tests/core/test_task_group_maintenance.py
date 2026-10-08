@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from cayu.tasks._group_maintenance import TaskGroupMaintenance
-from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.vaults.redaction import SecretRedactor
 
 

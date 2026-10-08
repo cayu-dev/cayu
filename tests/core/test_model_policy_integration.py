@@ -16,8 +16,8 @@ from cayu.model_policy import ModelPolicy, ModelPolicyController, ModelPolicySto
 from cayu.server import ServerConfig, create_server
 from cayu.sessions.outcomes import run_to_completion
 from cayu.storage.migrations import SchemaMode
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.dispatch import TaskStoreDispatcher
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import TaskStatus
 

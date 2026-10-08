@@ -11,10 +11,10 @@ import pytest
 from cayu import CayuApp
 from cayu.storage import postgres, tasks_sqlite
 from cayu.storage.migrations import SchemaMode
-from cayu.tasks import base
-from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks import memory
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.graphs import TaskGraphCreate, TaskGraphEventType, TaskGraphNode
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import TaskStatus
 from cayu.tasks.scheduling import TaskMisfirePolicy, TaskScheduleEventType, TaskSchedulePolicy
@@ -185,7 +185,7 @@ def test_dependency_skip_schedule_publication_failure_rolls_back(
             receipt = await app.create_task_graph(request)
             initial = await observe(store, app, request)
             module = (
-                base
+                memory
                 if isinstance(store, InMemoryTaskStore)
                 else tasks_sqlite
                 if isinstance(store, tasks_sqlite.SQLiteTaskStore)

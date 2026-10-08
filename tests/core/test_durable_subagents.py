@@ -65,13 +65,13 @@ from cayu.sessions.base import (
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore, PostgresTaskStore
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.dispatch import (
     DispatchRequest,
     TaskStoreDispatcher,
     _queued_dispatch_request_sha256,
 )
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import TaskClaimLost, TaskStatus
 from cayu.tools.base import ToolContext, ToolResult

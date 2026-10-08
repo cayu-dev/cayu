@@ -32,7 +32,7 @@ from cayu.runners.docker_workload import DockerImageIdentity
 from cayu.sessions.base import EventQuery, InMemorySessionStore
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.memory import InMemoryKnowledgeStore
-from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.memory import InMemoryTaskStore
 from tests.cli.test_scaffold_coding_budget import denial_policy
 from tests.core.test_queued_session_messages import RecordingOneShotProvider
 from tests.qualification.repository_maintenance_application import maintenance_project_files

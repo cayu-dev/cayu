@@ -323,9 +323,9 @@ from cayu.sessions.recovery import (
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
 from cayu.storage.sqlite import SQLiteSessionStore
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.dispatch import Dispatcher, DispatchHandle, DispatchRequest, DispatchStatus
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.records import TaskClaimLost, TaskStatus
 from cayu.tasks.terminalization import TaskTerminalizationRequest
 from cayu.tools.base import (

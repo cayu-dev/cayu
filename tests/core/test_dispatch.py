@@ -98,7 +98,6 @@ from cayu.sessions.invocation import (
     TaskExecutionSource,
 )
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.creation import TaskCreate, task_create_with_runtime_invocation
 from cayu.tasks.dispatch import (
     _STALLED_RECOVERED_ACTIONS,
@@ -116,6 +115,7 @@ from cayu.tasks.dispatch import (
     _QueuedDispatchSettlementState,
     copy_dispatch_request,
 )
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import Task, TaskClaimLost, TaskStatus
 from cayu.tasks.store import TaskStore

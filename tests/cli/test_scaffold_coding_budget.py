@@ -15,7 +15,7 @@ from cayu.cli.scaffold import project_files
 from cayu.runners.docker_workload import DockerImageIdentity
 from cayu.sessions.base import InMemorySessionStore
 from cayu.storage.memory import InMemoryKnowledgeStore
-from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.memory import InMemoryTaskStore
 
 
 def denial_policy():

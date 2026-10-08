@@ -59,8 +59,8 @@ from cayu.sessions.interactions import (
     InteractionStatus,
     InteractionSummaryEvidence,
 )
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.creation import TaskCreate
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.records import TaskStatus
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.tools.policy import ToolPolicy, ToolPolicyDecision, ToolPolicyRequest, ToolPolicyResult

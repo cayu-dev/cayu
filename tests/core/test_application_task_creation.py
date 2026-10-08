@@ -28,7 +28,6 @@ from cayu.sessions.invocation import (
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresTaskStore
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.contracts import (
     CompletionResultResolverRef,
     CompletionVerifierRef,
@@ -37,6 +36,7 @@ from cayu.tasks.contracts import (
     work_contract_from_draft,
 )
 from cayu.tasks.creation import TaskCreate
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.vaults.redaction import SecretRedactor
 
 
@@ -72,7 +72,8 @@ class RejectControllers(importlib.abc.MetaPathFinder):
 sys.meta_path.insert(0, RejectControllers())
 from cayu._application_task_creation import create_task
 from cayu.sessions.base import InMemorySessionStore
-from cayu.tasks.base import InMemoryTaskStore, TaskCreate
+from cayu.tasks.creation import TaskCreate
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.vaults.redaction import SecretRedactor
 async def scenario():
     tasks = InMemoryTaskStore()

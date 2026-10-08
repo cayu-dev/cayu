@@ -82,7 +82,6 @@ from cayu.sessions.invocation import (
 )
 from cayu.storage import migrations as schema_migrations
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.contracts import (
     WORK_COMPLETION_APPLICATION_MAX_BYTES,
     WORK_COMPLETION_APPLICATION_MAX_ITEMS,
@@ -137,6 +136,7 @@ from cayu.tasks.dispatch import (
     DispatchStatus,
     TaskStoreDispatcher,
 )
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import Task, TaskClaimLost, TaskRetryPolicy, TaskStatus, copy_task
 from cayu.tasks.store import TaskStore

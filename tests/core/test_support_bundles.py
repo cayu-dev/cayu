@@ -16,7 +16,7 @@ import pytest
 
 import cayu.sessions.base as sessions_runtime
 import cayu.support_bundles as support_bundles
-import cayu.tasks.base as tasks_runtime
+import cayu.tasks.memory as tasks_runtime
 from cayu.applications import CayuApp
 from cayu.artifacts.local import LocalArtifactStore
 from cayu.configuration import CayuConfig, OperationsConfig
@@ -66,8 +66,8 @@ from cayu.support_bundles import (
     validate_support_bundle_archive,
     write_support_bundle_atomic,
 )
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.creation import TaskCreate
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.vaults.redaction import SecretRedactor
 
 

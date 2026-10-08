@@ -236,7 +236,7 @@ def test_business_binding_rejects_changed_native_authority(tmp_path, section, fi
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
 def test_native_receipt_ack_loss_then_application_ack_loss(tmp_path, backend):
     """Real native task entrance; evidence validation is intentionally not claimed here."""
-    from cayu.tasks.base import InMemoryTaskStore as Memory
+    from cayu.tasks.memory import InMemoryTaskStore as Memory
 
     clock = [datetime.now(UTC)]
 

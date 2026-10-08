@@ -29,7 +29,7 @@ from cayu.applications import CayuApp
 from cayu.runtime.completion_result_resolvers import CompletionResultResolver
 from cayu.runtime.completion_verifiers import CompletionVerifierExecutionError
 from cayu.sessions.base import Session, StoreTimeCheckpointTransform
-from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.vaults import SecretRedactor
 
 

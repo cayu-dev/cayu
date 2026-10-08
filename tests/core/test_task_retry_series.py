@@ -19,7 +19,6 @@ from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
 from cayu.storage import migrations as schema_migrations
 from cayu.storage.sqlite import SQLiteTaskStore
 from cayu.tasks._terminalization import settle_task_retry_attempt_with_retry
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.cancellation import (
     TaskRetryCancellationReconciliationConflict,
     TaskRetryCancellationReconciliationEventType,
@@ -29,6 +28,7 @@ from cayu.tasks.cancellation import (
     TaskRetryCancellationReconciliationRequest,
 )
 from cayu.tasks.creation import TaskCreate
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.records import (
     TaskClaimLost,
     TaskRetryPolicy,

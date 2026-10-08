@@ -1315,7 +1315,7 @@ from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
 from cayu.runtime._invocation_lifecycle import invocation_checkpoint_state_sha256
 from cayu.sessions.base import run_request_with_task_invocation
-from cayu.tasks.base import task_create_with_runtime_invocation
+from cayu.tasks.creation import task_create_with_runtime_invocation
 from cayu.server import (
     AuthenticatedAccess,
     AuthenticatedProductAccess,

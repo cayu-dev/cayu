@@ -12,8 +12,8 @@ from cayu import CayuApp
 from cayu.artifacts import ArtifactScope, LocalArtifactStore
 from cayu.environments import Environment, EnvironmentSpec
 from cayu.runtime.session_closure import RetainedSessionClosureStore
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.creation import TaskCreate
+from cayu.tasks.memory import InMemoryTaskStore
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])

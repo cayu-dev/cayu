@@ -15,7 +15,7 @@ from cayu.providers.base import ModelStreamEvent
 from cayu.sessions.base import RunRequest
 from cayu.storage.sqlite import SQLiteTaskStore
 from cayu.tasks import TaskCreate, TaskStatus
-from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.worker import run_task_worker
 
 

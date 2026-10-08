@@ -137,7 +137,6 @@ from cayu.storage.memory import (
     KnowledgeStatus,
 )
 from cayu.storage.sqlite import SQLiteSessionStore
-from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.contracts import (
     CompletionResultResolverRef,
     CompletionVerifierRef,
@@ -147,6 +146,7 @@ from cayu.tasks.contracts import (
 )
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.dispatch import Dispatcher, DispatchHandle, DispatchRequest, DispatchStatus
+from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.records import Task, TaskRetryPolicy, TaskStatus
 from cayu.tasks.retry import TaskRetryAttemptDisposition, TaskRetrySettlementRequest
 from cayu.tools.commands import ExecCommandTool

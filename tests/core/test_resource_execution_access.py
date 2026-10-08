@@ -159,7 +159,7 @@ def test_scoped_task_retains_execution_authority():
     from cayu.tasks.creation import TaskCreate
 
     async def run():
-        from cayu.tasks.base import InMemoryTaskStore
+        from cayu.tasks.memory import InMemoryTaskStore
 
         policy = Policy()
         app = CayuApp(resource_access_policy=policy, task_store=InMemoryTaskStore())
@@ -175,8 +175,8 @@ def test_scoped_task_retains_execution_authority():
 
 
 def test_revoked_task_never_calls_handler_and_releases_worker_authority():
-    from cayu.tasks.base import InMemoryTaskStore
     from cayu.tasks.creation import TaskCreate
+    from cayu.tasks.memory import InMemoryTaskStore
     from cayu.tasks.worker import run_task_worker
 
     async def run():
