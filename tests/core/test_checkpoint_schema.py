@@ -17,6 +17,7 @@ from tests.core.checkpoint_schema_conformance import (
     assert_versionless_pending_continuation_fails_closed_conformance,
 )
 
+import cayu._validation as validation
 from cayu import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -1260,3 +1261,21 @@ def test_sqlite_checkpoint_schema_runtime_conformance(tmp_path) -> None:
             await store.close()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("version", [3, 4])
+def test_decode_bounds_include_final_migration_authority(version, monkeypatch):
+    source = {CHECKPOINT_SCHEMA_VERSION_KEY: version, "retained": "x" * 300}
+    walk = validation._walk_bounded_durable_json
+
+    def bounded(value, field_name, **kwargs):
+        kwargs["max_bytes"] = 400
+        return walk(value, field_name, **kwargs)
+
+    monkeypatch.setattr(validation, "_walk_bounded_durable_json", bounded)
+    # The original document and each ordered migration fit; the final
+    # ambiguity marker must still count toward the complete result ceiling.
+    validation.copy_durable_json_object(source, "checkpoint")
+    with pytest.raises(validation.DurableValueError, match="byte"):
+        decode_runtime_checkpoint(source, session_id="session")
+    assert source == {CHECKPOINT_SCHEMA_VERSION_KEY: version, "retained": "x" * 300}

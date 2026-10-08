@@ -1,4 +1,6 @@
 {
+    "tests/core/test_checkpoint_schema.py::test_decode_bounds_include_final_migration_authority[3]": 0.0005262500199023634,
+    "tests/core/test_checkpoint_schema.py::test_decode_bounds_include_final_migration_authority[4]": 0.0004060420033056289,
     "tests/core/test_sqlite_validation_owners.py::test_closure_schema_validates_independently[current]": 0.22924245899775997,
     "tests/core/test_sqlite_validation_owners.py::test_closure_schema_validates_independently[missing-insert-guard]": 0.2396512500126846,
     "tests/core/test_sqlite_validation_owners.py::test_closure_schema_validates_independently[missing-progress]": 0.21301362497615628,

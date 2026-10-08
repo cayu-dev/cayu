@@ -512,6 +512,10 @@ def decode_runtime_checkpoint(
             decoded[INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY] = (
                 _empty_invocation_lifecycle_receipt_history()
             )
+            # The final authority marker is part of the same document budget.
+            # Readers may reuse this decode's validation, so admit its complete
+            # result after adding state outside the ordered migration chain.
+            decoded = copy_durable_json_object(decoded, "checkpoint")
         return decoded
     except CheckpointCompatibilityError as error:
         checkpoint = None
