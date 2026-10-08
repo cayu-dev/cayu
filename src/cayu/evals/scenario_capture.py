@@ -56,14 +56,16 @@ from cayu.sessions.base import (
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     SessionInputContractEvidence,
     SessionMessageDeliveryMode,
-    TerminalSessionEvidence,
-    TerminalSessionEvidenceError,
-    TerminalSessionEvidenceErrorCode,
-    TerminalSessionEvidenceLimits,
     parse_session_input_contract_evidence,
     session_input_messages_sha256,
 )
 from cayu.sessions.records import TranscriptRecord
+from cayu.sessions.terminal_evidence import (
+    TerminalSessionEvidence,
+    TerminalSessionEvidenceError,
+    TerminalSessionEvidenceErrorCode,
+    TerminalSessionEvidenceLimits,
+)
 
 SCENARIO_CAPTURE_MAX_DIAGNOSTICS = 1_024
 SCENARIO_CAPTURE_ARTIFACT_READ_CONCURRENCY = 8

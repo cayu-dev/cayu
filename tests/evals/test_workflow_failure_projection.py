@@ -193,7 +193,7 @@ def test_before_start_failure_has_no_invented_record_identity():
 
 def test_capture_event_limit_preserves_root_without_inventing_child_usage(tmp_path):
     from cayu.evals.capture_policy import SessionTrajectoryBounds
-    from cayu.sessions.base import TerminalSessionEvidenceErrorCode
+    from cayu.sessions.terminal_evidence import TerminalSessionEvidenceErrorCode
 
     async def scenario():
         store = SQLiteSessionStore(tmp_path / "limited.sqlite")

@@ -424,6 +424,20 @@ internal modules never type against or depend on the complete façade interface.
 This keeps dependency direction explicit while allowing `CayuApp` to remain the
 single composition root.
 
+### Session records and terminal evidence
+
+`sessions/records.py` owns session, event and transcript records, session status,
+runner-observed event identities, and session copy and provenance readers.
+Applications can construct and validate these values without loading concrete
+stores. Existing public imports resolve to these same definitions.
+
+`sessions/terminal_evidence.py` owns bounded terminal-session snapshot contracts,
+limits, error codes, classification, copying and exact byte accounting. It composes
+the run-operation marker parser and terminal-event classifier in
+`sessions/_terminal_evidence.py`. These rules can validate a snapshot independently
+of a store; native stores retain authorization, locking, queries and atomic reads.
+Runtime retains terminal publication and recovery orchestration.
+
 ### Session checkpoint evidence
 
 `sessions/_checkpoint_preservation.py` owns callback-visible checkpoint copies,

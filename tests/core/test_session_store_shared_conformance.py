@@ -284,8 +284,6 @@ from cayu.sessions.base import (
     SessionRuntimePublicationConflict,
     SessionStatusConflict,
     SessionStore,
-    TerminalSessionEvidenceError,
-    TerminalSessionEvidenceErrorCode,
     TranscriptQuery,
     TranscriptSnapshot,
     UsageRollupQuery,
@@ -313,6 +311,10 @@ from cayu.sessions.invocation import (
     SessionExecutionSource,
 )
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.terminal_evidence import (
+    TerminalSessionEvidenceError,
+    TerminalSessionEvidenceErrorCode,
+)
 from cayu.storage.jsonl_export import export_sessions, import_sessions
 from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
 from cayu.storage.migrations import SchemaMode

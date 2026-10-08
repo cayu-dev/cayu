@@ -58,8 +58,9 @@ from cayu.runtime.evidence_spool import (
     IncrementalEvidenceLimits,
     _settled_evidence_reads,
 )
-from cayu.sessions.base import EventQueryResultTooLarge, TerminalSessionEvidenceError
+from cayu.sessions.base import EventQueryResultTooLarge
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.terminal_evidence import TerminalSessionEvidenceError
 from cayu.workflows.journal import WORKFLOW_ATTEMPT_EVENT_TYPE
 
 

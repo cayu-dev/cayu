@@ -122,9 +122,6 @@ from cayu.sessions.base import (
     RuntimeSessionCreateClaimReference,
     SessionIdentity,
     SessionStore,
-    TerminalSessionEvidence,
-    TerminalSessionEvidenceError,
-    TerminalSessionEvidenceErrorCode,
     run_request_with_runtime_invocation,
 )
 from cayu.sessions.invocation import (
@@ -133,6 +130,11 @@ from cayu.sessions.invocation import (
     SessionExecutionSource,
 )
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.terminal_evidence import (
+    TerminalSessionEvidence,
+    TerminalSessionEvidenceError,
+    TerminalSessionEvidenceErrorCode,
+)
 from cayu.snapshots.base import (
     AgentSnapshot,
     AgentSnapshotAuthorityRef,

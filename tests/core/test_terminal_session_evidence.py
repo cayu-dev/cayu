@@ -8,7 +8,7 @@ from pydantic import ValidationError
 from tests._session_provenance import fixture_session_invocation
 from tests.core.postgres_contention_support import drop_cayu_tables
 
-import cayu.sessions.base as sessions_module
+import cayu.sessions.terminal_evidence as terminal_evidence_module
 import cayu.storage.sqlite as sqlite_store_module
 from cayu import (
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
@@ -45,12 +45,12 @@ from cayu.sessions._terminal_evidence import (
     _SessionRunOperation,
     classify_current_terminal_evidence,
 )
-from cayu.sessions.base import (
+from cayu.sessions.base import _event_with_session_run_operation
+from cayu.sessions.records import RunnerObservedEventIdentity
+from cayu.sessions.terminal_evidence import (
     _assemble_terminal_session_evidence,
     _classify_terminal_session_evidence_records,
-    _event_with_session_run_operation,
 )
-from cayu.sessions.records import RunnerObservedEventIdentity
 
 
 def _session(
@@ -1468,7 +1468,7 @@ def test_in_memory_terminal_evidence_returns_typed_missing_and_limit_errors(
 
         session_id, _ = await _create_terminal_session(store)
         sized_records = 0
-        original_record_bytes = sessions_module._terminal_session_evidence_record_bytes
+        original_record_bytes = terminal_evidence_module._terminal_session_evidence_record_bytes
 
         def record_bytes_spy(value):
             nonlocal sized_records
@@ -1476,7 +1476,7 @@ def test_in_memory_terminal_evidence_returns_typed_missing_and_limit_errors(
             return original_record_bytes(value)
 
         monkeypatch.setattr(
-            sessions_module,
+            terminal_evidence_module,
             "_terminal_session_evidence_record_bytes",
             record_bytes_spy,
         )

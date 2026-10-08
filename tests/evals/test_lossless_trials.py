@@ -29,14 +29,12 @@ from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
 from cayu.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import (
-    InMemorySessionStore,
-    RunRequest,
-    SessionIdentity,
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.records import SessionStatus
+from cayu.sessions.terminal_evidence import (
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,
 )
-from cayu.sessions.records import SessionStatus
 
 
 def _scripted_app(*batches: list[ModelStreamEvent]) -> CayuApp:

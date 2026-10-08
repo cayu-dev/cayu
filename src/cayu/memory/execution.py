@@ -121,17 +121,19 @@ from cayu.sessions.base import (
     RuntimeSessionCreateClaimReference,
     RuntimeSessionCreateClaimReferenceKey,
     SessionStore,
-    TerminalSessionEvidence,
-    TerminalSessionEvidenceError,
-    TerminalSessionEvidenceErrorCode,
     authenticate_runtime_session_create_claim_reference,
     copy_run_request,
-    copy_terminal_session_evidence,
     run_request_with_runtime_generated_authority,
     run_request_with_runtime_session_create_claim_reference,
     runtime_session_create_claim_reference,
 )
 from cayu.sessions.records import RunnerObservedEventIdentity, Session, SessionStatus, copy_session
+from cayu.sessions.terminal_evidence import (
+    TerminalSessionEvidence,
+    TerminalSessionEvidenceError,
+    TerminalSessionEvidenceErrorCode,
+    copy_terminal_session_evidence,
+)
 from cayu.snapshots.base import (
     AGENT_SNAPSHOT_TRIAL_METADATA_KEY,
     AgentSnapshot,

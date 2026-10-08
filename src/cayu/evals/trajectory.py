@@ -42,14 +42,16 @@ from cayu.sessions.base import (
     SessionLineageResult,
     SessionOrder,
     SessionQuery,
+    parse_session_input_contract_evidence,
+)
+from cayu.sessions.records import RunnerObservedEventIdentity, Session, SessionStatus
+from cayu.sessions.terminal_evidence import (
     TerminalSessionEvidence,
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,
     TerminalSessionEvidenceLimits,
     copy_terminal_session_evidence,
-    parse_session_input_contract_evidence,
 )
-from cayu.sessions.records import RunnerObservedEventIdentity, Session, SessionStatus
 
 # Fresh evals retain descendant evidence for assertions and replay. Page the durable
 # parent index instead of assuming the first page is complete, while retaining a hard

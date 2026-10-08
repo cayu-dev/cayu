@@ -78,8 +78,6 @@ from cayu.sessions.base import (
     IncompleteSessionRecoveryRequest,
     ResumeRequest,
     RunRequest,
-    TerminalSessionEvidence,
-    TerminalSessionEvidenceError,
 )
 from cayu.sessions.invocation import (
     InvocationOrigin,
@@ -87,6 +85,7 @@ from cayu.sessions.invocation import (
     TaskExecutionSource,
 )
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.terminal_evidence import TerminalSessionEvidence, TerminalSessionEvidenceError
 from cayu.tasks.creation import TaskCreate, task_create_with_runtime_invocation
 from cayu.tasks.records import Task, TaskStatus
 from cayu.vaults import (

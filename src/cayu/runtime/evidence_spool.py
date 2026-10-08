@@ -22,7 +22,8 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from cayu._validation import canonical_durable_json_bytes
 from cayu.events import Event, EventType
-from cayu.sessions.base import (
+from cayu.sessions.records import EventRecord, Session, TranscriptRecord
+from cayu.sessions.terminal_evidence import (
     _TERMINAL_SESSION_EVIDENCE_LIFECYCLE_EVENT_TYPES,
     TERMINAL_SESSION_EVIDENCE_HARD_MAX_RECORD_BYTES,
     TerminalPublicationMarker,
@@ -31,7 +32,6 @@ from cayu.sessions.base import (
     _measure_terminal_session_evidence,
     _validate_terminal_session_evidence_content,
 )
-from cayu.sessions.records import EventRecord, Session, TranscriptRecord
 
 T = TypeVar("T", bound=BaseModel)
 

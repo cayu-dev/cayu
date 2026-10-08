@@ -142,10 +142,12 @@ from cayu.sessions.base import (
     SessionIdentity,
     SessionLineageNode,
     SessionLineageOrigin,
+)
+from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.terminal_evidence import (
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,
 )
-from cayu.sessions.records import Session, SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.tools.subagents import SubagentSpec, SubagentTool
@@ -5172,8 +5174,9 @@ def test_interrupted_fresh_revalidation_preserves_contradictory_lineage():
         _CaptureState,
         _revalidate_fresh_capture,
     )
-    from cayu.sessions.base import EventQuery, TerminalSessionEvidenceLimits
+    from cayu.sessions.base import EventQuery
     from cayu.sessions.records import RunnerObservedEventIdentity
+    from cayu.sessions.terminal_evidence import TerminalSessionEvidenceLimits
 
     async def scenario():
         store = _ContradictoryInterruptedRevalidationStore()

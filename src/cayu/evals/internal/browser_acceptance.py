@@ -91,15 +91,17 @@ from cayu.sessions._execution_profile_checkpoint import (
 )
 from cayu.sessions._pending_tool_round import PENDING_TOOL_ROUND_CHECKPOINT_KEY, PendingToolRound
 from cayu.sessions.base import (
-    TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
-    TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TOTAL_BYTES,
     EventQuery,
     IncompleteSessionRecoveryRequest,
     RunRequest,
     SessionOperationPublication,
-    TerminalSessionEvidenceLimits,
 )
 from cayu.sessions.records import RunnerObservedEventIdentity, SessionStatus
+from cayu.sessions.terminal_evidence import (
+    TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
+    TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TOTAL_BYTES,
+    TerminalSessionEvidenceLimits,
+)
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import DurableToolRecoveryEvidence
 from cayu.tools.browser_session import (

@@ -32,7 +32,7 @@ from cayu.server.contracts import (
     EvaluationPromotionPreviewRequest,
     EvaluationPromotionPreviewResponse,
 )
-from cayu.sessions.base import TerminalSessionEvidenceErrorCode
+from cayu.sessions.terminal_evidence import TerminalSessionEvidenceErrorCode
 
 if TYPE_CHECKING:
     from fastapi.params import Depends

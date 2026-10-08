@@ -31,7 +31,7 @@ from cayu.applications import CayuApp
 from cayu.evals.capture_policy import SessionTrajectoryBounds, WorkflowAttemptAnchor
 from cayu.events import Event, EventType
 from cayu.messages import Message, detach_message
-from cayu.sessions.base import TerminalSessionEvidenceErrorCode
+from cayu.sessions.terminal_evidence import TerminalSessionEvidenceErrorCode
 from cayu.workflows.base import WorkflowSpec, copy_workflow_spec
 from cayu.workflows.workflow import WorkflowBase
 

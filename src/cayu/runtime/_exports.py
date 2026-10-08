@@ -1363,35 +1363,35 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "TARGETED_TOOL_GRANT_SCHEMA_VERSION",
     ),
     "TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS": (
-        "cayu.sessions.base",
+        "cayu.sessions.terminal_evidence",
         "TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS",
     ),
     "TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_RECORD_BYTES": (
-        "cayu.sessions.base",
+        "cayu.sessions.terminal_evidence",
         "TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_RECORD_BYTES",
     ),
     "TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TOTAL_BYTES": (
-        "cayu.sessions.base",
+        "cayu.sessions.terminal_evidence",
         "TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TOTAL_BYTES",
     ),
     "TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TRANSCRIPT_RECORDS": (
-        "cayu.sessions.base",
+        "cayu.sessions.terminal_evidence",
         "TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TRANSCRIPT_RECORDS",
     ),
     "TERMINAL_SESSION_EVIDENCE_HARD_MAX_EVENTS": (
-        "cayu.sessions.base",
+        "cayu.sessions.terminal_evidence",
         "TERMINAL_SESSION_EVIDENCE_HARD_MAX_EVENTS",
     ),
     "TERMINAL_SESSION_EVIDENCE_HARD_MAX_RECORD_BYTES": (
-        "cayu.sessions.base",
+        "cayu.sessions.terminal_evidence",
         "TERMINAL_SESSION_EVIDENCE_HARD_MAX_RECORD_BYTES",
     ),
     "TERMINAL_SESSION_EVIDENCE_HARD_MAX_TOTAL_BYTES": (
-        "cayu.sessions.base",
+        "cayu.sessions.terminal_evidence",
         "TERMINAL_SESSION_EVIDENCE_HARD_MAX_TOTAL_BYTES",
     ),
     "TERMINAL_SESSION_EVIDENCE_HARD_MAX_TRANSCRIPT_RECORDS": (
-        "cayu.sessions.base",
+        "cayu.sessions.terminal_evidence",
         "TERMINAL_SESSION_EVIDENCE_HARD_MAX_TRANSCRIPT_RECORDS",
     ),
     "TOOL_CAPABILITY_CEILING_SCHEMA_VERSION": (
@@ -1584,12 +1584,24 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "TaskTopologyTraversalLimitExceeded",
     ),
     "TerminalEventPublicationUncertain": ("cayu.exceptions", "TerminalEventPublicationUncertain"),
-    "TerminalPublicationMarker": ("cayu.sessions.base", "TerminalPublicationMarker"),
-    "TerminalSessionEvidence": ("cayu.sessions.base", "TerminalSessionEvidence"),
-    "TerminalSessionEvidenceBoundary": ("cayu.sessions.base", "TerminalSessionEvidenceBoundary"),
-    "TerminalSessionEvidenceError": ("cayu.sessions.base", "TerminalSessionEvidenceError"),
-    "TerminalSessionEvidenceErrorCode": ("cayu.sessions.base", "TerminalSessionEvidenceErrorCode"),
-    "TerminalSessionEvidenceLimits": ("cayu.sessions.base", "TerminalSessionEvidenceLimits"),
+    "TerminalPublicationMarker": ("cayu.sessions.terminal_evidence", "TerminalPublicationMarker"),
+    "TerminalSessionEvidence": ("cayu.sessions.terminal_evidence", "TerminalSessionEvidence"),
+    "TerminalSessionEvidenceBoundary": (
+        "cayu.sessions.terminal_evidence",
+        "TerminalSessionEvidenceBoundary",
+    ),
+    "TerminalSessionEvidenceError": (
+        "cayu.sessions.terminal_evidence",
+        "TerminalSessionEvidenceError",
+    ),
+    "TerminalSessionEvidenceErrorCode": (
+        "cayu.sessions.terminal_evidence",
+        "TerminalSessionEvidenceErrorCode",
+    ),
+    "TerminalSessionEvidenceLimits": (
+        "cayu.sessions.terminal_evidence",
+        "TerminalSessionEvidenceLimits",
+    ),
     "TieredApprovalPolicy": ("cayu.approvals.business", "TieredApprovalPolicy"),
     "TieredPricing": ("cayu.budgets.pricing", "TieredPricing"),
     "ToolApprovalDecision": ("cayu.approvals.tools", "ToolApprovalDecision"),

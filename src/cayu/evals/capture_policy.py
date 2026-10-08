@@ -6,7 +6,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
 from cayu.memory.attribution import MemoryAttributionBounds
-from cayu.sessions.base import (
+from cayu.sessions.terminal_evidence import (
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_RECORD_BYTES,
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TOTAL_BYTES,

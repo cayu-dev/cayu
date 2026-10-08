@@ -153,17 +153,15 @@ from cayu.memory.attribution import (
 from cayu.messages import Message
 from cayu.runtime._memory_evidence import memory_evidence_key
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
-from cayu.sessions.base import (
+from cayu.sessions.base import EventQuery, RunRequest, copy_run_request
+from cayu.sessions.records import EventRecord, RunnerObservedEventIdentity, Session, SessionStatus
+from cayu.sessions.terminal_evidence import (
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
-    EventQuery,
-    RunRequest,
     TerminalSessionEvidence,
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,
     TerminalSessionEvidenceLimits,
-    copy_run_request,
 )
-from cayu.sessions.records import EventRecord, RunnerObservedEventIdentity, Session, SessionStatus
 from cayu.tools._operation_boundary import (
     BoundedInvocationOperationRegistry,
     InvocationOperationCapacityError,

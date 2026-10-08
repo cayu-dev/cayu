@@ -899,30 +899,6 @@ from cayu.sessions.base import MAX_SESSION_ID_BYTES as MAX_SESSION_ID_BYTES
 from cayu.sessions.base import MAX_SESSION_LIST_CURSOR_BYTES as MAX_SESSION_LIST_CURSOR_BYTES
 from cayu.sessions.base import SESSION_RUNTIME_METADATA_KEYS as SESSION_RUNTIME_METADATA_KEYS
 from cayu.sessions.base import SESSION_RUNTIME_METADATA_PREFIX as SESSION_RUNTIME_METADATA_PREFIX
-from cayu.sessions.base import (
-    TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS as TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
-)
-from cayu.sessions.base import (
-    TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_RECORD_BYTES as TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_RECORD_BYTES,
-)
-from cayu.sessions.base import (
-    TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TOTAL_BYTES as TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TOTAL_BYTES,
-)
-from cayu.sessions.base import (
-    TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TRANSCRIPT_RECORDS as TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TRANSCRIPT_RECORDS,
-)
-from cayu.sessions.base import (
-    TERMINAL_SESSION_EVIDENCE_HARD_MAX_EVENTS as TERMINAL_SESSION_EVIDENCE_HARD_MAX_EVENTS,
-)
-from cayu.sessions.base import (
-    TERMINAL_SESSION_EVIDENCE_HARD_MAX_RECORD_BYTES as TERMINAL_SESSION_EVIDENCE_HARD_MAX_RECORD_BYTES,
-)
-from cayu.sessions.base import (
-    TERMINAL_SESSION_EVIDENCE_HARD_MAX_TOTAL_BYTES as TERMINAL_SESSION_EVIDENCE_HARD_MAX_TOTAL_BYTES,
-)
-from cayu.sessions.base import (
-    TERMINAL_SESSION_EVIDENCE_HARD_MAX_TRANSCRIPT_RECORDS as TERMINAL_SESSION_EVIDENCE_HARD_MAX_TRANSCRIPT_RECORDS,
-)
 from cayu.sessions.base import ActiveModelCompletionStage as ActiveModelCompletionStage
 from cayu.sessions.base import CheckpointRootFieldGuard as CheckpointRootFieldGuard
 from cayu.sessions.base import CheckpointRootFieldProjection as CheckpointRootFieldProjection
@@ -1068,12 +1044,6 @@ from cayu.sessions.base import StoreTimeCheckpointTransform as StoreTimeCheckpoi
 from cayu.sessions.base import (
     StoreTimeSessionOperationTransform as StoreTimeSessionOperationTransform,
 )
-from cayu.sessions.base import TerminalPublicationMarker as TerminalPublicationMarker
-from cayu.sessions.base import TerminalSessionEvidence as TerminalSessionEvidence
-from cayu.sessions.base import TerminalSessionEvidenceBoundary as TerminalSessionEvidenceBoundary
-from cayu.sessions.base import TerminalSessionEvidenceError as TerminalSessionEvidenceError
-from cayu.sessions.base import TerminalSessionEvidenceErrorCode as TerminalSessionEvidenceErrorCode
-from cayu.sessions.base import TerminalSessionEvidenceLimits as TerminalSessionEvidenceLimits
 from cayu.sessions.base import TranscriptPage as TranscriptPage
 from cayu.sessions.base import TranscriptQuery as TranscriptQuery
 from cayu.sessions.base import TranscriptSearchHit as TranscriptSearchHit
@@ -1251,6 +1221,44 @@ from cayu.sessions.recovery import RecoveryRegistrationEvidence as RecoveryRegis
 from cayu.sessions.recovery import RecoveryRegistrationStatus as RecoveryRegistrationStatus
 from cayu.sessions.recovery import RecoveryTaskClaimEvidence as RecoveryTaskClaimEvidence
 from cayu.sessions.recovery import StaleRecoveryPlanError as StaleRecoveryPlanError
+from cayu.sessions.terminal_evidence import (
+    TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS as TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
+)
+from cayu.sessions.terminal_evidence import (
+    TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_RECORD_BYTES as TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_RECORD_BYTES,
+)
+from cayu.sessions.terminal_evidence import (
+    TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TOTAL_BYTES as TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TOTAL_BYTES,
+)
+from cayu.sessions.terminal_evidence import (
+    TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TRANSCRIPT_RECORDS as TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TRANSCRIPT_RECORDS,
+)
+from cayu.sessions.terminal_evidence import (
+    TERMINAL_SESSION_EVIDENCE_HARD_MAX_EVENTS as TERMINAL_SESSION_EVIDENCE_HARD_MAX_EVENTS,
+)
+from cayu.sessions.terminal_evidence import (
+    TERMINAL_SESSION_EVIDENCE_HARD_MAX_RECORD_BYTES as TERMINAL_SESSION_EVIDENCE_HARD_MAX_RECORD_BYTES,
+)
+from cayu.sessions.terminal_evidence import (
+    TERMINAL_SESSION_EVIDENCE_HARD_MAX_TOTAL_BYTES as TERMINAL_SESSION_EVIDENCE_HARD_MAX_TOTAL_BYTES,
+)
+from cayu.sessions.terminal_evidence import (
+    TERMINAL_SESSION_EVIDENCE_HARD_MAX_TRANSCRIPT_RECORDS as TERMINAL_SESSION_EVIDENCE_HARD_MAX_TRANSCRIPT_RECORDS,
+)
+from cayu.sessions.terminal_evidence import TerminalPublicationMarker as TerminalPublicationMarker
+from cayu.sessions.terminal_evidence import TerminalSessionEvidence as TerminalSessionEvidence
+from cayu.sessions.terminal_evidence import (
+    TerminalSessionEvidenceBoundary as TerminalSessionEvidenceBoundary,
+)
+from cayu.sessions.terminal_evidence import (
+    TerminalSessionEvidenceError as TerminalSessionEvidenceError,
+)
+from cayu.sessions.terminal_evidence import (
+    TerminalSessionEvidenceErrorCode as TerminalSessionEvidenceErrorCode,
+)
+from cayu.sessions.terminal_evidence import (
+    TerminalSessionEvidenceLimits as TerminalSessionEvidenceLimits,
+)
 from cayu.tasks._terminalization import (
     settle_task_retry_attempt_with_retry as settle_task_retry_attempt_with_retry,
 )
