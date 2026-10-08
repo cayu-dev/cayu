@@ -10,6 +10,7 @@ from typing import Any
 OPTIONAL_EXTRA_MODULES = frozenset(
     {
         "cayu.storage.collaboration_postgres",
+        "cayu.storage.event_watchers_postgres",
         "cayu.storage.evals_postgres",
         "cayu.storage.postgres",
         "cayu.storage.product_operations_postgres",

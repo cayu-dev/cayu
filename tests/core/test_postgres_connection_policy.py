@@ -8,10 +8,10 @@ import pytest
 from cayu.storage._diagnostic_inspection import diagnostic_store_inspection
 from cayu.storage._postgres_base import _configure_store_connection, _PostgresStoreBase
 from cayu.storage.evals_postgres import PostgresEvalStore
+from cayu.storage.event_watchers_postgres import PostgresEventWatcherStore
 from cayu.storage.postgres import (
     PostgresAgentWorkContextStore,
     PostgresBudgetLedger,
-    PostgresEventWatcherStore,
     PostgresKnowledgeStore,
     PostgresSessionStore,
     PostgresTaskStore,

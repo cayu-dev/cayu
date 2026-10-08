@@ -4459,6 +4459,9 @@ from cayu.storage.collaboration_postgres import (
 from cayu.storage.collaboration_sqlite import SQLiteCollaborationStore as SQLiteCollaborationStore
 from cayu.storage.evals_postgres import PostgresEvalStore as PostgresEvalStore
 from cayu.storage.event_watchers import SQLiteEventWatcherStore as SQLiteEventWatcherStore
+from cayu.storage.event_watchers_postgres import (
+    PostgresEventWatcherStore as PostgresEventWatcherStore,
+)
 from cayu.storage.knowledge_embedding_memory import (
     InMemoryEmbeddingKnowledgeStore as InMemoryEmbeddingKnowledgeStore,
 )
@@ -4480,7 +4483,6 @@ from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore as SQLiteKnowledg
 from cayu.storage.postgres import PostgresAgentWorkContextStore as PostgresAgentWorkContextStore
 from cayu.storage.postgres import PostgresBudgetLedger as PostgresBudgetLedger
 from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore as PostgresEmbeddingKnowledgeStore
-from cayu.storage.postgres import PostgresEventWatcherStore as PostgresEventWatcherStore
 from cayu.storage.postgres import PostgresKnowledgeStore as PostgresKnowledgeStore
 from cayu.storage.postgres import PostgresSessionStore as PostgresSessionStore
 from cayu.storage.postgres import PostgresTaskStore as PostgresTaskStore

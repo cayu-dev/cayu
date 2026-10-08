@@ -1075,7 +1075,7 @@ async def _drop_postgres_tables(dsn: str) -> None:
 
 def test_postgres_event_watcher_store_rejects_nonportable_text(postgres_dsn: str) -> None:
     async def run() -> None:
-        from cayu.storage.postgres import PostgresEventWatcherStore
+        from cayu.storage.event_watchers_postgres import PostgresEventWatcherStore
 
         await _drop_postgres_tables(postgres_dsn)
         store = PostgresEventWatcherStore(
@@ -1094,7 +1094,7 @@ def test_postgres_event_watcher_store_rejects_nonportable_text(postgres_dsn: str
 
 def test_postgres_event_watcher_store_persists_cursor(postgres_dsn: str) -> None:
     async def run():
-        from cayu.storage.postgres import PostgresEventWatcherStore
+        from cayu.storage.event_watchers_postgres import PostgresEventWatcherStore
 
         await _drop_postgres_tables(postgres_dsn)
         session_store = InMemorySessionStore()
@@ -1154,7 +1154,7 @@ def test_postgres_event_watcher_store_persists_cursor(postgres_dsn: str) -> None
 
 def test_postgres_event_watcher_store_serializes_first_claim(postgres_dsn: str) -> None:
     async def run():
-        from cayu.storage.postgres import PostgresEventWatcherStore
+        from cayu.storage.event_watchers_postgres import PostgresEventWatcherStore
 
         await _drop_postgres_tables(postgres_dsn)
         session_store = InMemorySessionStore()

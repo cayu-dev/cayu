@@ -455,7 +455,7 @@ def test_memory_and_sqlite_sample_clock_after_acquiring_authority(tmp_path):
 
 
 def test_postgres_watcher_ignores_worker_clock_skew(postgres_dsn, monkeypatch):
-    import cayu.storage.postgres as postgres
+    from cayu.storage import event_watchers_postgres as event_watchers_postgres
 
     class SkewedClock(datetime):
         @classmethod
@@ -463,9 +463,11 @@ def test_postgres_watcher_ignores_worker_clock_skew(postgres_dsn, monkeypatch):
             return datetime(2090, 1, 1, tzinfo=UTC)
 
     async def run():
-        store = postgres.PostgresEventWatcherStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        store = event_watchers_postgres.PostgresEventWatcherStore(
+            postgres_dsn, schema_mode=SchemaMode.CREATE
+        )
         try:
-            monkeypatch.setattr(postgres, "datetime", SkewedClock)
+            monkeypatch.setattr(event_watchers_postgres, "datetime", SkewedClock)
             before = datetime.now(UTC)
             claim = await store.claim_event(
                 watcher_name=f"clock-{uuid4()}", record=record(), lease_seconds=3

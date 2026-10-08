@@ -786,6 +786,8 @@ DDL and can be used without importing PostgreSQL record codecs or store adapters
 validation, migration execution and receipts. PostgreSQL adapters inherit that owner
 directly; CLI schema commands use its readers and preflights. JSON record helpers
 remain in `storage/_postgres_support.py`.
+`storage/event_watchers_postgres.py` owns watcher claims, lease renewal, settlement
+replay and dead letters. Public imports resolve to that same concrete class.
 
 Files are good source-of-truth for prompts, instructions, workflows, manuals, skills, and human-reviewed memories.
 

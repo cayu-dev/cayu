@@ -18,6 +18,7 @@ from cayu.storage.migrations import SchemaMode
     ("module_name", "class_name"),
     [
         ("_postgres_base", "_PostgresStoreBase"),
+        ("event_watchers_postgres", "PostgresEventWatcherStore"),
         ("evals_postgres", "PostgresEvalStore"),
         ("collaboration_postgres", "PostgresCollaborationStore"),
         ("product_operations_postgres", "PostgresProductOperationStore"),
@@ -43,6 +44,12 @@ class NoMonolithicStores(importlib.abc.MetaPathFinder):
 sys.meta_path.insert(0, NoMonolithicStores())
 owner = importlib.import_module("cayu.storage." + sys.argv[1])
 store_type = getattr(owner, sys.argv[2])
+if sys.argv[2] == "PostgresEventWatcherStore":
+    import cayu
+    import cayu.storage
+    for public in (cayu, cayu.storage):
+        assert getattr(public, sys.argv[2]) is store_type
+        assert sys.argv[2] not in public.__all__
 store = store_type("postgresql://example/cayu")
 assert not store._opened
 assert store._owns_pool
