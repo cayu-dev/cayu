@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from cayu.runtime.public_authority import PublicAuthorityAliasCodec
     from cayu.server import ProductOperationStore
     from cayu.sessions.base import SessionStore
-    from cayu.tasks.base import TaskStore
+    from cayu.tasks.store import TaskStore
 
 
 class ApplicationStores:

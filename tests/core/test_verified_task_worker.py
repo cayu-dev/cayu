@@ -86,7 +86,7 @@ from cayu.tasks.admission import (
     WorkAttemptRecoveryRequired,
     WorkAttemptRunRequest,
 )
-from cayu.tasks.base import InMemoryTaskStore, TaskStore
+from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.contracts import (
     CompletionContinuationPolicy,
     CompletionDecisionCreate,
@@ -99,6 +99,7 @@ from cayu.tasks.contracts import (
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import TaskClaimLost, TaskStatus
+from cayu.tasks.store import TaskStore
 from cayu.tools.base import Tool, ToolEffect, ToolResult, ToolSpec
 from cayu.vaults.base import SecretRef
 from cayu.vaults.static import StaticVault

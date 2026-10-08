@@ -97,8 +97,8 @@ from cayu.tasks.admission import (
     work_attempt_recovery_session_authority,
     work_attempt_recovery_session_authority_from_checkpoint,
 )
-from cayu.tasks.base import TaskStore
 from cayu.tasks.contracts import CompletionProposal
+from cayu.tasks.store import TaskStore
 from cayu.vaults.redaction import SecretRedactor
 
 

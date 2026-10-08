@@ -8,7 +8,7 @@ import pytest
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresTaskStore
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore, TaskStore
+from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.graphs import (
     TaskGraphConflict,
@@ -20,6 +20,7 @@ from cayu.tasks.graphs import (
 from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import TaskSessionClosureClaim, TaskStatus
 from cayu.tasks.scheduling import TaskSchedulePolicy
+from cayu.tasks.store import TaskStore
 
 pytestmark = pytest.mark.anyio
 

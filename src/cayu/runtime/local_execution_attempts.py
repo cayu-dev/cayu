@@ -37,8 +37,8 @@ from cayu.sessions.invocation import copy_task_invocation
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp
-    from cayu.tasks.base import TaskStore
     from cayu.tasks.records import Task
+    from cayu.tasks.store import TaskStore
 
 
 LOCAL_EXECUTION_ATTEMPT_SCHEMA_VERSION = 1

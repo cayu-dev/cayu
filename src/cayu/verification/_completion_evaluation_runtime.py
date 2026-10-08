@@ -20,7 +20,6 @@ from cayu.runtime._task_store_operation_boundary import (
     capture_task_store_operation,
     raise_task_store_operation_failure,
 )
-from cayu.tasks.base import TaskStore
 from cayu.tasks.completion_evaluations import (
     CompletionEvaluationBudgetExhausted,
     CompletionEvaluationFailure,
@@ -34,6 +33,7 @@ from cayu.tasks.completion_evaluations import (
     completion_evaluation_receipt,
 )
 from cayu.tasks.contracts import CompletionEvaluationPolicy, WorkCompletionConflict
+from cayu.tasks.store import TaskStore
 from cayu.vaults.redaction import SecretRedactor
 from cayu.verification.completion_evaluators import (
     CompletionEvaluationExecutionError,

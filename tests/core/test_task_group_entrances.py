@@ -18,11 +18,11 @@ from cayu import (
     TaskGroupPolicy,
     TaskGroupStatus,
 )
-from cayu.tasks.base import TaskStore
 from cayu.tasks.graphs import TaskGraphEventType
 from cayu.tasks.groups import TaskGroupEventType
 from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import TaskStatus
+from cayu.tasks.store import TaskStore
 
 pytestmark = pytest.mark.anyio
 

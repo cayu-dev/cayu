@@ -9,9 +9,9 @@ from cayu.runtime._task_store_operation_boundary import (
     capture_task_store_operation,
     raise_task_store_operation_failure,
 )
-from cayu.tasks.base import TaskStore
 from cayu.tasks.graphs import graph_identifier
 from cayu.tasks.groups import TaskGroupUnavailable
+from cayu.tasks.store import TaskStore
 from cayu.vaults.redaction import SecretRedactor
 
 _REGISTRY_LOCK = Lock()

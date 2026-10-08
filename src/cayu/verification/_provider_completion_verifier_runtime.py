@@ -46,7 +46,6 @@ from cayu.runtime._task_store_operation_boundary import (
     raise_task_store_operation_failure,
 )
 from cayu.runtime.retry_policy import RetryDecision, retry_decision
-from cayu.tasks.base import TaskStore
 from cayu.tasks.completion_verifier_dispatches import (
     CompletionVerifierDecodeStatus,
     CompletionVerifierDispatch,
@@ -63,6 +62,7 @@ from cayu.tasks.contracts import (
     CompletionVerifierRef,
     copy_completion_verifier_decision,
 )
+from cayu.tasks.store import TaskStore
 from cayu.vaults.redaction import SecretRedactor
 from cayu.verification.completion_verifiers import CompletionVerifierRequest
 from cayu.verification.provider_completion_verifiers import (

@@ -119,7 +119,7 @@ from cayu.sessions.invocation import (
     TaskInvocation,
 )
 from cayu.storage.postgres import PostgresTaskStore
-from cayu.tasks.base import terminalize_task_with_retry
+from cayu.tasks._terminalization import terminalize_task_with_retry
 from cayu.tasks.cancellation import (
     TaskRetryCancellationReconciliationConflict,
     TaskRetryCancellationReconciliationEvidence,

@@ -81,6 +81,7 @@ def test_task_contracts_preserve_public_and_legacy_identity():
         queries,
         records,
         retry,
+        store,
         terminalization,
         topology,
         work_receipts,
@@ -156,6 +157,7 @@ def test_task_contracts_preserve_public_and_legacy_identity():
             ),
         ),
         (work_receipts, ("CompletionDecisionApplicationReceipt",)),
+        (store, ("TaskStore",)),
         (
             topology,
             (
@@ -235,6 +237,13 @@ for contract in (
 assert not {
     "cayu.tasks.base", "cayu.tasks.memory", "cayu.tasks.store",
     "cayu.storage.tasks_sqlite", "cayu.storage.sqlite", "cayu.storage.postgres",
+}.intersection(sys.modules)
+from cayu.tasks.store import TaskStore
+assert public.TaskStore is TaskStore
+assert "create_task" in TaskStore.__abstractmethods__
+assert not {
+    "cayu.tasks.base", "cayu.tasks.memory", "cayu.storage.tasks_sqlite",
+    "cayu.storage.sqlite", "cayu.storage.postgres",
 }.intersection(sys.modules)
 """,
             public_module,

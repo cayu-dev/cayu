@@ -182,7 +182,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "TaskRetrySettlementResult": ("cayu.tasks.retry", "TaskRetrySettlementResult"),
     "TaskStatus": ("cayu.tasks.records", "TaskStatus"),
     "TaskStatusCounts": ("cayu.tasks.queries", "TaskStatusCounts"),
-    "TaskStore": ("cayu.tasks.base", "TaskStore"),
+    "TaskStore": ("cayu.tasks.store", "TaskStore"),
     "TaskStoreDispatcher": ("cayu.tasks.dispatch", "TaskStoreDispatcher"),
     "TaskTerminalKind": ("cayu.tasks.terminalization", "TaskTerminalKind"),
     "TaskTerminalizationConflict": ("cayu.tasks.terminalization", "TaskTerminalizationConflict"),
@@ -250,7 +250,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "run_task_worker": ("cayu.tasks.worker", "run_task_worker"),
     "settle_task_retry_attempt_with_retry": (
-        "cayu.tasks.base",
+        "cayu.tasks._terminalization",
         "settle_task_retry_attempt_with_retry",
     ),
     "task_create_with_execution_source": (
@@ -258,7 +258,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "task_create_with_execution_source",
     ),
     "task_invocation_for_create": ("cayu.tasks.creation", "task_invocation_for_create"),
-    "terminalize_task_with_retry": ("cayu.tasks.base", "terminalize_task_with_retry"),
+    "terminalize_task_with_retry": ("cayu.tasks._terminalization", "terminalize_task_with_retry"),
     "work_contract_fingerprint": ("cayu.tasks.contracts", "work_contract_fingerprint"),
     "work_contract_from_draft": ("cayu.tasks.contracts", "work_contract_from_draft"),
     "CompletionVerifierDecodeStatus": (

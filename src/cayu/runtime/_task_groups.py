@@ -15,7 +15,6 @@ from cayu.runtime._task_store_operation_boundary import (
     task_store_group_quiescence_capability_is_complete,
 )
 from cayu.tasks._groups import validate_group_cursor
-from cayu.tasks.base import TaskStore
 from cayu.tasks.graphs import task_graph_request_sha256
 from cayu.tasks.groups import (
     TaskGroupConflict,
@@ -27,6 +26,7 @@ from cayu.tasks.groups import (
     copy_task_group_create,
     task_group_request_sha256,
 )
+from cayu.tasks.store import TaskStore
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp

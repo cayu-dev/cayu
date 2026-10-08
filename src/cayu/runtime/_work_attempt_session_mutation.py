@@ -50,7 +50,7 @@ from cayu.vaults import SecretRedactor
 _ResultT = TypeVar("_ResultT")
 
 if TYPE_CHECKING:
-    from cayu.tasks.base import TaskStore
+    from cayu.tasks.store import TaskStore
 
 
 async def record_work_attempt_execution_stop(

@@ -68,8 +68,8 @@ from cayu.sessions.invocation import (
     TaskExecutionSource,
     inherited_session_invocation,
 )
-from cayu.tasks.base import TaskStore
 from cayu.tasks.records import Task, TaskStatus
+from cayu.tasks.store import TaskStore
 from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.policy import metadata_with_taint_labels, taint_labels_from_metadata

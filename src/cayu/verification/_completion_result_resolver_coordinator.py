@@ -45,7 +45,6 @@ from cayu.sessions.base import (
     _renew_completion_result_event_publication,
     _reserve_completion_result_event_publication,
 )
-from cayu.tasks.base import TaskStore
 from cayu.tasks.contracts import (
     CompletionDecision,
     CompletionDecisionApplicationRequest,
@@ -58,6 +57,7 @@ from cayu.tasks.contracts import (
 )
 from cayu.tasks.groups import TaskGroupConflict
 from cayu.tasks.records import Task
+from cayu.tasks.store import TaskStore
 from cayu.tasks.work_receipts import CompletionDecisionApplicationReceipt
 from cayu.vaults import SecretRedactor
 from cayu.verification._completion_decision_application_coordinator import (

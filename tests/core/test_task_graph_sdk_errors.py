@@ -10,8 +10,9 @@ from cayu.applications import CayuApp
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresTaskStore
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore, TaskStore
+from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.graphs import TaskGraphEvent
+from cayu.tasks.store import TaskStore
 from cayu.vaults.redaction import SecretRedactor
 
 pytestmark = pytest.mark.anyio

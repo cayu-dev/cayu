@@ -67,8 +67,7 @@ from cayu.sessions.invocation import (
     TaskExecutionSource,
 )
 from cayu.tasks._cancellation import _task_cancellation_terminalization_request
-from cayu.tasks.base import (
-    TaskStore,
+from cayu.tasks._terminalization import (
     settle_task_retry_attempt_with_retry,
     terminalize_task_with_retry,
 )
@@ -87,6 +86,7 @@ from cayu.tasks.retry import (
     TaskRetrySettlementRequest,
     _task_retry_requested_cancellation_settlement,
 )
+from cayu.tasks.store import TaskStore
 from cayu.tasks.terminalization import (
     TaskTerminalizationConflict,
     TaskTerminalizationRequest,

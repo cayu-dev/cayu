@@ -23,7 +23,7 @@ _WORK_ATTEMPT_INVOCATION_TOKEN = object()
 _RECOVERY_OWNERSHIP_TOKEN = object()
 
 if TYPE_CHECKING:
-    from cayu.tasks.base import TaskStore
+    from cayu.tasks.store import TaskStore
 
 
 @dataclass(frozen=True, slots=True, init=False, repr=False, eq=False)

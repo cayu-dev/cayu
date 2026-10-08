@@ -16,9 +16,9 @@ from cayu.sessions.external_waits import (
     external_wait_digest,
     external_wait_timer,
 )
-from cayu.tasks.base import TaskStore
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.scheduling import TaskSchedulePolicy
+from cayu.tasks.store import TaskStore
 
 EXTERNAL_WAIT_TASK_TYPE = "cayu.external-wait-deadline.v1"
 EXTERNAL_WAIT_TIMER_BYTES = 16 * 1024

@@ -1251,6 +1251,10 @@ from cayu.sessions.recovery import RecoveryRegistrationEvidence as RecoveryRegis
 from cayu.sessions.recovery import RecoveryRegistrationStatus as RecoveryRegistrationStatus
 from cayu.sessions.recovery import RecoveryTaskClaimEvidence as RecoveryTaskClaimEvidence
 from cayu.sessions.recovery import StaleRecoveryPlanError as StaleRecoveryPlanError
+from cayu.tasks._terminalization import (
+    settle_task_retry_attempt_with_retry as settle_task_retry_attempt_with_retry,
+)
+from cayu.tasks._terminalization import terminalize_task_with_retry as terminalize_task_with_retry
 from cayu.tasks.admission import (
     AdmittedCompletionProposalRequest as AdmittedCompletionProposalRequest,
 )
@@ -1275,11 +1279,6 @@ from cayu.tasks.admission import WorkAttemptRecoveryActivate as WorkAttemptRecov
 from cayu.tasks.admission import WorkAttemptRecoveryRequest as WorkAttemptRecoveryRequest
 from cayu.tasks.admission import WorkAttemptRecoveryRequired as WorkAttemptRecoveryRequired
 from cayu.tasks.base import InMemoryTaskStore as InMemoryTaskStore
-from cayu.tasks.base import TaskStore as TaskStore
-from cayu.tasks.base import (
-    settle_task_retry_attempt_with_retry as settle_task_retry_attempt_with_retry,
-)
-from cayu.tasks.base import terminalize_task_with_retry as terminalize_task_with_retry
 from cayu.tasks.cancellation import TaskCancellationReconciliation as TaskCancellationReconciliation
 from cayu.tasks.cancellation import (
     TaskCancellationReconciliationConflict as TaskCancellationReconciliationConflict,
@@ -1491,6 +1490,7 @@ from cayu.tasks.retry import TaskRetryEvent as TaskRetryEvent
 from cayu.tasks.retry import TaskRetryEventType as TaskRetryEventType
 from cayu.tasks.retry import TaskRetrySettlementRequest as TaskRetrySettlementRequest
 from cayu.tasks.retry import TaskRetrySettlementResult as TaskRetrySettlementResult
+from cayu.tasks.store import TaskStore as TaskStore
 from cayu.tasks.terminalization import TaskTerminalizationConflict as TaskTerminalizationConflict
 from cayu.tasks.terminalization import TaskTerminalizationReceipt as TaskTerminalizationReceipt
 from cayu.tasks.terminalization import TaskTerminalizationRequest as TaskTerminalizationRequest

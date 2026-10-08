@@ -5,9 +5,9 @@ from __future__ import annotations
 from time import monotonic
 
 from cayu._validation import revalidate_model_input
-from cayu.tasks.base import TaskStore
 from cayu.tasks.queries import TaskQuery
 from cayu.tasks.scheduling import TaskScheduleWakeup
+from cayu.tasks.store import TaskStore
 
 
 async def next_schedule_wake_at(

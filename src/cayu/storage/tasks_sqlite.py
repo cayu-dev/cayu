@@ -148,7 +148,6 @@ from cayu.tasks.admission import (
     work_attempt_admission_prepare_sha256,
     work_attempt_execution_claim_request_sha256,
 )
-from cayu.tasks.base import TaskStore
 from cayu.tasks.cancellation import (
     _TASK_CANCELLATION_REQUESTED_REASON,
     _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
@@ -326,6 +325,7 @@ from cayu.tasks.scheduling import (
     TaskScheduleWakeup,
     task_schedule_eligibility,
 )
+from cayu.tasks.store import TaskStore
 from cayu.tasks.terminalization import (
     TaskTerminalizationConflict,
     TaskTerminalizationReceipt,

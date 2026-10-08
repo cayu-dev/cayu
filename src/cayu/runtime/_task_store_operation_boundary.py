@@ -24,7 +24,6 @@ from cayu.tasks.admission import (
     WorkAttemptRecoveryRequired,
     _GroupExecutionEntryRefused,
 )
-from cayu.tasks.base import TaskStore
 from cayu.tasks.completion_evaluations import CompletionEvaluationBudgetExhausted
 from cayu.tasks.completion_verifier_dispatches import CompletionVerifierDispatchBudgetExhausted
 from cayu.tasks.contracts import (
@@ -42,6 +41,7 @@ from cayu.tasks.groups import (
 )
 from cayu.tasks.records import TaskClaimLost
 from cayu.tasks.scheduling import TaskScheduleConflict
+from cayu.tasks.store import TaskStore
 from cayu.vaults.redaction import SecretRedactor
 from cayu.workspaces.observation_recovery import (
     retain_workspace_observation_pending_cancellation_requests,

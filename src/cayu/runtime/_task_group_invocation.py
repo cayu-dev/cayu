@@ -28,8 +28,8 @@ from cayu.sessions._invocation_lifecycle import (
     require_invocation_rebind_lineage,
 )
 from cayu.sessions.base import SessionRunFenced, SessionStore
-from cayu.tasks.base import TaskStore
 from cayu.tasks.groups import TaskGroupInvocationObligation, TaskGroupUnavailable
+from cayu.tasks.store import TaskStore
 from cayu.vaults.redaction import SecretRedactor
 
 

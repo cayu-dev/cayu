@@ -19,8 +19,8 @@ from cayu._validation import (
     copy_durable_json_object,
     require_durable_clean_nonblank,
 )
-from cayu.tasks.base import TaskStore
 from cayu.tasks.records import Task, TaskStatus
+from cayu.tasks.store import TaskStore
 from cayu.tasks.terminalization import (
     TaskTerminalizationReceipt,
     TaskTerminalizationRequest,

@@ -17,7 +17,8 @@ from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresBudgetLedger, PostgresSessionStore, PostgresTaskStore
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore, TaskStore
+from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.store import TaskStore
 
 
 async def wait_for_verified_worker_lease_expiry(store: TaskStore, expires_at: datetime) -> None:

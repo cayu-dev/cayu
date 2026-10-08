@@ -3885,7 +3885,7 @@ async def test_idle_dispatcher_observes_group_timeout_without_extra_runtime_port
     ],
 )
 async def test_partial_store_group_capability_rejected_before_admission(missing):
-    from cayu.tasks.base import TaskStore
+    from cayu.tasks.store import TaskStore
 
     partial_store = type(
         "PartialGroupStore", (InMemoryTaskStore,), {missing: getattr(TaskStore, missing)}

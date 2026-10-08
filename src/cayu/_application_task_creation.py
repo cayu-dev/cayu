@@ -20,7 +20,6 @@ from cayu.sessions.base import SessionStore
 from cayu.sessions.invocation import InvocationOrigin, InvocationOriginTrust, TaskExecutionSource
 from cayu.tasks._scheduling import schedule_creation_digest
 from cayu.tasks._verified_work_authority import invocation_contains_secret_public_identity
-from cayu.tasks.base import TaskStore
 from cayu.tasks.contracts import (
     WorkCompletionConflict,
     WorkContract,
@@ -40,6 +39,7 @@ from cayu.tasks.creation import (
     task_create_with_runtime_invocation,
 )
 from cayu.tasks.records import Task, TaskStatus, copy_task
+from cayu.tasks.store import TaskStore
 from cayu.vaults.redaction import SecretRedactor
 
 

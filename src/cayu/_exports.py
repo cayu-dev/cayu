@@ -5258,7 +5258,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "TaskSessionClosureStore": ("cayu.runtime.session_closure", "TaskSessionClosureStore"),
     "TaskStatus": ("cayu.tasks.records", "TaskStatus"),
     "TaskStatusCounts": ("cayu.tasks.queries", "TaskStatusCounts"),
-    "TaskStore": ("cayu.tasks.base", "TaskStore"),
+    "TaskStore": ("cayu.tasks.store", "TaskStore"),
     "TaskStoreDispatcher": ("cayu.tasks.dispatch", "TaskStoreDispatcher"),
     "TaskTerminalKind": ("cayu.tasks.terminalization", "TaskTerminalKind"),
     "TaskTerminalizationConflict": ("cayu.tasks.terminalization", "TaskTerminalizationConflict"),
@@ -6428,7 +6428,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "session_usage_summary": ("cayu.budgets.usage", "session_usage_summary"),
     "settle_task_retry_attempt_with_retry": (
-        "cayu.tasks.base",
+        "cayu.tasks._terminalization",
         "settle_task_retry_attempt_with_retry",
     ),
     "step": ("cayu.workflows.workflow", "step"),
@@ -6444,7 +6444,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "task_create_with_execution_source",
     ),
     "task_invocation_for_create": ("cayu.tasks.creation", "task_invocation_for_create"),
-    "terminalize_task_with_retry": ("cayu.tasks.base", "terminalize_task_with_retry"),
+    "terminalize_task_with_retry": ("cayu.tasks._terminalization", "terminalize_task_with_retry"),
     "tool_catalogue_descriptors_within_ceiling": (
         "cayu.tools.catalogue",
         "tool_catalogue_descriptors_within_ceiling",

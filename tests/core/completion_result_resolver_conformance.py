@@ -43,7 +43,7 @@ from cayu.sessions.base import (
     fork_session_invocation,
     run_request_with_task_invocation,
 )
-from cayu.tasks.base import TaskStore
+from cayu.tasks.store import TaskStore
 
 
 @dataclass(frozen=True)

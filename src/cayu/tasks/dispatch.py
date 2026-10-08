@@ -111,10 +111,7 @@ from cayu.tasks._execution_settlement import (
     has_task_execution_settlement_pending,
 )
 from cayu.tasks._schedule_wakeup import next_schedule_wake_at
-from cayu.tasks.base import (
-    TaskStore,
-    _terminalize_claimed_task_or_detect_peer_winner,
-)
+from cayu.tasks._terminalization import _terminalize_claimed_task_or_detect_peer_winner
 from cayu.tasks.cancellation import (
     TaskCancellationReconciliationEvent,
     TaskCancellationReconciliationEvidence,
@@ -126,6 +123,7 @@ from cayu.tasks.contracts import TaskCompletionDecisionRequired
 from cayu.tasks.creation import TaskCreate, task_create_with_runtime_invocation
 from cayu.tasks.queries import TaskOrder, TaskQuery
 from cayu.tasks.records import Task, TaskClaimLost, TaskStatus, copy_task
+from cayu.tasks.store import TaskStore
 from cayu.tasks.terminalization import (
     TaskTerminalizationConflict,
     TaskTerminalizationRequest,

@@ -107,8 +107,7 @@ from cayu.sessions.base import IncompleteSessionRecoveryRequest, SessionStatus
 from cayu.tasks._cancellation import _task_cancellation_terminalization_request
 from cayu.tasks._execution_settlement import TaskExecutionSettlement
 from cayu.tasks._schedule_wakeup import next_schedule_wake_at
-from cayu.tasks.base import (
-    TaskStore,
+from cayu.tasks._terminalization import (
     _terminalize_claimed_task,
     _terminalize_claimed_task_or_detect_peer_winner,
     settle_task_retry_attempt_with_retry,
@@ -152,6 +151,7 @@ from cayu.tasks.retry import (
     _task_retry_requested_cancellation_settlement,
     _task_retry_runtime_terminal_request,
 )
+from cayu.tasks.store import TaskStore
 from cayu.tasks.terminalization import (
     TaskTerminalizationConflict,
     TaskTerminalizationRequest,

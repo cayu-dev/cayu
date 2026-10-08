@@ -953,7 +953,6 @@ from cayu.tasks._scheduling import (
 )
 from cayu.tasks.access import runtime_collection_read, runtime_task_creation, runtime_task_mutation
 from cayu.tasks.admission import WorkAttemptExecutionClaimLost
-from cayu.tasks.base import TaskStore
 from cayu.tasks.cancellation import (
     _TASK_CANCELLATION_REQUESTED_REASON,
     _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
@@ -1056,6 +1055,7 @@ from cayu.tasks.scheduling import (
     TaskScheduleWakeup,
     task_schedule_eligibility,
 )
+from cayu.tasks.store import TaskStore
 from cayu.tasks.terminalization import (
     TaskTerminalizationConflict,
     TaskTerminalizationReceipt,

@@ -665,7 +665,6 @@ from cayu.tasks.admission import (
     WorkAttemptRecoveryRequest,
     WorkAttemptRunRequest,
 )
-from cayu.tasks.base import TaskStore
 from cayu.tasks.completion_evaluations import CompletionEvaluationRun
 from cayu.tasks.completion_verifier_dispatches import CompletionVerifierDispatch
 from cayu.tasks.completion_verifier_profiles import CompletionVerifierProfilePolicy
@@ -707,6 +706,7 @@ from cayu.tasks.scheduling import (
     TaskScheduleEvent,
     TaskScheduleReceipt,
 )
+from cayu.tasks.store import TaskStore
 from cayu.tasks.worker import abandoned_task_lease_operations
 from cayu.tools.base import (
     Tool,

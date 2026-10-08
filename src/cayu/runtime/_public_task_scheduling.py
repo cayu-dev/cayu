@@ -17,7 +17,6 @@ from cayu.runtime._task_store_operation_boundary import (
 )
 from cayu.tasks._scheduling import schedule_creation_digest, schedule_mutation_digest
 from cayu.tasks._verified_work_authority import invocation_contains_secret_public_identity
-from cayu.tasks.base import TaskStore
 from cayu.tasks.creation import (
     TaskCreate,
     TaskInvocationSnapshot,
@@ -34,6 +33,7 @@ from cayu.tasks.scheduling import (
     TaskScheduleEventType,
     TaskScheduleReceipt,
 )
+from cayu.tasks.store import TaskStore
 from cayu.vaults.redaction import SecretRedactor
 
 

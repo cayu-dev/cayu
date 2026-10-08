@@ -52,7 +52,7 @@ from cayu.runtime.local_execution_attempts import (
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp
-    from cayu.tasks.base import TaskStore
+    from cayu.tasks.store import TaskStore
 
 
 _MEMFD_CLOEXEC = 0x0001

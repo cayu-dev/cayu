@@ -21,7 +21,7 @@ from cayu.providers import ModelProvider, ModelProviderError, ModelRequest, Mode
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore, TaskStore
+from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.completion_verifier_dispatches import (
     CompletionVerifierDecodeStatus,
     CompletionVerifierDispatchBudget,
@@ -54,6 +54,7 @@ from cayu.tasks.contracts import (
     work_contract_from_draft,
 )
 from cayu.tasks.creation import TaskCreate
+from cayu.tasks.store import TaskStore
 from cayu.verification.completion_verifiers import (
     CompletionVerifierExecutionError,
     CompletionVerifierExecutionRequest,
