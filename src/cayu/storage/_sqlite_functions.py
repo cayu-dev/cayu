@@ -8,7 +8,7 @@ from typing import Any, cast
 
 from cayu._validation import require_clean_nonblank, require_execution_unit_id
 from cayu.messages import Message
-from cayu.sessions.base import (
+from cayu.sessions.transcript_queries import (
     TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
     transcript_search_document,
     transcript_search_session_token,

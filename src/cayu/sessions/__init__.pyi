@@ -146,11 +146,6 @@ from cayu.sessions.base import StoreTimeCheckpointTransform as StoreTimeCheckpoi
 from cayu.sessions.base import (
     StoreTimeSessionOperationTransform as StoreTimeSessionOperationTransform,
 )
-from cayu.sessions.base import TranscriptPage as TranscriptPage
-from cayu.sessions.base import TranscriptQuery as TranscriptQuery
-from cayu.sessions.base import TranscriptSearchHit as TranscriptSearchHit
-from cayu.sessions.base import TranscriptSearchQuery as TranscriptSearchQuery
-from cayu.sessions.base import TranscriptSearchResult as TranscriptSearchResult
 from cayu.sessions.base import TranscriptSnapshot as TranscriptSnapshot
 from cayu.sessions.base import UsageRollupQuery as UsageRollupQuery
 from cayu.sessions.base import (
@@ -421,3 +416,8 @@ from cayu.sessions.terminal_evidence import (
 from cayu.sessions.terminal_evidence import (
     TerminalSessionEvidenceLimits as TerminalSessionEvidenceLimits,
 )
+from cayu.sessions.transcript_queries import TranscriptPage as TranscriptPage
+from cayu.sessions.transcript_queries import TranscriptQuery as TranscriptQuery
+from cayu.sessions.transcript_queries import TranscriptSearchHit as TranscriptSearchHit
+from cayu.sessions.transcript_queries import TranscriptSearchQuery as TranscriptSearchQuery
+from cayu.sessions.transcript_queries import TranscriptSearchResult as TranscriptSearchResult

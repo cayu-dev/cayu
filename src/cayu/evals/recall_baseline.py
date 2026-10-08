@@ -48,15 +48,13 @@ from cayu.memory.retrieval import (
     WeightedReciprocalRankFusionConfig,
 )
 from cayu.messages import Message, MessageRole
-from cayu.sessions.base import (
+from cayu.sessions.base import RunRequest, SessionIdentity, SessionStore
+from cayu.sessions.queries import SessionQuery
+from cayu.sessions.transcript_queries import (
     TRANSCRIPT_SEARCH_MAX_BYTES,
     TRANSCRIPT_SEARCH_MAX_SCAN_LIMIT,
     TRANSCRIPT_SEARCH_MIN_MAX_BYTES,
-    RunRequest,
-    SessionIdentity,
-    SessionStore,
 )
-from cayu.sessions.queries import SessionQuery
 
 RECALL_BASELINE_CORPUS_SCHEMA_VERSION = "cayu.recall_baseline_corpus.v2"
 RECALL_BASELINE_RESULT_SCHEMA_VERSION = "cayu.recall_baseline_result.v2"

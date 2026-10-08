@@ -451,6 +451,12 @@ clock sampling, locking, SQL and transactions.
 record selection. Store authorization and session-aware event filtering stay in
 the stores; the query module requires only event and record contracts.
 
+`sessions/transcript_queries.py` owns retained-row page and query contracts,
+thinking-content projection, and bounded lexical search contracts. It also owns
+the shared tokenizer, document encoding, scoring and query-scoped search cursors.
+Native stores compose these rules with their existing transcript queries and
+indexes; index maintenance, schema validation and atomic reads remain store-owned.
+
 ### Session checkpoint evidence
 
 `sessions/_checkpoint_preservation.py` owns callback-visible checkpoint copies,

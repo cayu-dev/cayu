@@ -40,11 +40,12 @@ from cayu.execution_units import ToolRoundIdentity
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime.provider_operations import inspect_provider_operation
 from cayu.runtime.public_authority import public_authority_alias_codec_from_environment
-from cayu.sessions.base import SessionStore, TranscriptQuery
+from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import INTERACTION_TERMINAL_EVENT_TYPES, InteractionSummaryEvidence
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import EventRecord, SessionStatus, TranscriptRecord
+from cayu.sessions.transcript_queries import TranscriptQuery
 from cayu.storage import SQLiteSessionStore
 from cayu.storage import migrations as schema
 from cayu.tools.policy import ToolPolicyDecision

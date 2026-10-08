@@ -209,7 +209,7 @@ def test_memory_evidence_schema_validates_independently(tmp_path, sqlite_resourc
 def test_transcript_schema_validates_independently(
     tmp_path, sqlite_resources, damage, version, projection, expected_error
 ):
-    from cayu.sessions.base import TRANSCRIPT_SEARCH_TOKENIZER_VERSION
+    from cayu.sessions.transcript_queries import TRANSCRIPT_SEARCH_TOKENIZER_VERSION
 
     path = _prepare_database(tmp_path, sqlite_resources, damage)
     _validate_in_fresh_process(

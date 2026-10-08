@@ -715,7 +715,6 @@ from cayu.sessions.base import (
     SessionRuntimePublicationConflict,
     SessionStatusConflict,
     SessionStore,
-    TranscriptQuery,
     TranscriptSnapshot,
     _activate_session_interaction,
     _activate_session_run_fence,
@@ -813,6 +812,7 @@ from cayu.sessions.recovery import (
     StartupRecoveryBlockedSession,
     StartupRecoveryResult,
 )
+from cayu.sessions.transcript_queries import TranscriptQuery
 from cayu.tasks._terminalization import _terminalize_claimed_task
 from cayu.tasks.admission import (
     WORK_ATTEMPT_RECOVERY_CHECKPOINT_KEY,

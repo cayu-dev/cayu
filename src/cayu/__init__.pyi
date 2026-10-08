@@ -4018,11 +4018,6 @@ from cayu.sessions.base import SessionTopologyDepthExceeded as SessionTopologyDe
 from cayu.sessions.base import SessionTopologyNode as SessionTopologyNode
 from cayu.sessions.base import SessionTopologyQuery as SessionTopologyQuery
 from cayu.sessions.base import SessionTopologyStoreResult as SessionTopologyStoreResult
-from cayu.sessions.base import TranscriptPage as TranscriptPage
-from cayu.sessions.base import TranscriptQuery as TranscriptQuery
-from cayu.sessions.base import TranscriptSearchHit as TranscriptSearchHit
-from cayu.sessions.base import TranscriptSearchQuery as TranscriptSearchQuery
-from cayu.sessions.base import TranscriptSearchResult as TranscriptSearchResult
 from cayu.sessions.base import TranscriptSnapshot as TranscriptSnapshot
 from cayu.sessions.base import UsageRollupQuery as UsageRollupQuery
 from cayu.sessions.base import (
@@ -4261,6 +4256,11 @@ from cayu.sessions.terminal_evidence import (
 from cayu.sessions.terminal_evidence import (
     TerminalSessionEvidenceLimits as TerminalSessionEvidenceLimits,
 )
+from cayu.sessions.transcript_queries import TranscriptPage as TranscriptPage
+from cayu.sessions.transcript_queries import TranscriptQuery as TranscriptQuery
+from cayu.sessions.transcript_queries import TranscriptSearchHit as TranscriptSearchHit
+from cayu.sessions.transcript_queries import TranscriptSearchQuery as TranscriptSearchQuery
+from cayu.sessions.transcript_queries import TranscriptSearchResult as TranscriptSearchResult
 from cayu.snapshots.base import AGENT_SNAPSHOT_MAX_BYTES as AGENT_SNAPSHOT_MAX_BYTES
 from cayu.snapshots.base import AGENT_SNAPSHOT_NODE_RECORD_TYPE as AGENT_SNAPSHOT_NODE_RECORD_TYPE
 from cayu.snapshots.base import (

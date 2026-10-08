@@ -178,7 +178,7 @@ async def conformance(store):
         execution_access,
         model_data_access,
     )
-    from cayu.sessions.base import TranscriptQuery
+    from cayu.sessions.transcript_queries import TranscriptQuery
 
     current = SessionAccessScope(
         read=(acme,), execute=(acme,), inspect_state=(acme,), modify=(acme,)

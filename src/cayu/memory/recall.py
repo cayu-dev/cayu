@@ -69,16 +69,16 @@ from cayu.memory.retrieval import (
     WeightedReciprocalRankFusion,
     WeightedReciprocalRankFusionConfig,
 )
-from cayu.sessions.base import (
+from cayu.sessions.base import SessionStore
+from cayu.sessions.records import MAX_SESSION_ID_BYTES
+from cayu.sessions.transcript_queries import (
     TRANSCRIPT_SEARCH_INDEX_VERSION,
     TRANSCRIPT_SEARCH_MAX_BYTES,
     TRANSCRIPT_SEARCH_MAX_SCAN_LIMIT,
     TRANSCRIPT_SEARCH_MIN_MAX_BYTES,
-    SessionStore,
     TranscriptSearchQuery,
     encode_transcript_search_cursor,
 )
-from cayu.sessions.records import MAX_SESSION_ID_BYTES
 
 RECALL_ENGINE_VERSION = "cayu.recall.v1"
 KNOWLEDGE_LEXICAL_CHANNEL = "knowledge.lexical"

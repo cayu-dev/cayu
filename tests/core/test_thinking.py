@@ -45,8 +45,8 @@ from cayu.runtime.model_steps import (
     StepClassificationType,
     classify_assistant_step,
 )
-from cayu.sessions.base import TranscriptQuery, filter_transcript_records
 from cayu.sessions.records import TranscriptRecord
+from cayu.sessions.transcript_queries import TranscriptQuery, filter_transcript_records
 
 
 def _anthropic_state(state_type: str, **opaque: str) -> dict[str, str]:

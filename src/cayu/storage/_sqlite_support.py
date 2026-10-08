@@ -14,10 +14,10 @@ from cayu.knowledge.records import (
 )
 from cayu.sessions.base import (
     PENDING_ACTION_EVENT_TYPE_VALUES,
-    TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
     deferred_interaction_input_from_storage_payload,
     deferred_interaction_input_storage_payload,
 )
+from cayu.sessions.transcript_queries import TRANSCRIPT_SEARCH_TOKENIZER_VERSION
 from cayu.storage import _sqlite_budget_schema as sqlite_budget_schema
 from cayu.storage import _sqlite_catalog as sqlite_catalog
 from cayu.storage import _sqlite_closure_schema as sqlite_closure_schema

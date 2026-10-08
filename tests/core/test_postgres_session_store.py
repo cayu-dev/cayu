@@ -84,7 +84,6 @@ from cayu.sessions.base import (
     SessionRunFenced,
     SessionTopologyCycle,
     SessionTopologyQuery,
-    TranscriptQuery,
     _McpManifestBaselineEvidenceInvalid,
     fork_session_invocation,
 )
@@ -96,6 +95,7 @@ from cayu.sessions.invocation import (
 )
 from cayu.sessions.queries import SessionDebugState, SessionOrder, SessionQuery
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.transcript_queries import TranscriptQuery
 from cayu.support_bundles import (
     CollectorDisposition,
     SupportBundleContext,

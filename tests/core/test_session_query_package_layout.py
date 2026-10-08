@@ -187,3 +187,83 @@ assert error.max_bytes == 64 and str(error) == "Event query exceeds the 64-byte 
 """,
         public_module,
     )
+
+
+def test_transcript_query_public_imports_and_historical_pickle_globals():
+    from cayu.sessions import base, transcript_queries
+
+    surfaces = [importlib.import_module(name) for name in ("cayu", "cayu.sessions", "cayu.runtime")]
+    for name in (
+        "TranscriptQuery",
+        "TranscriptPage",
+        "TranscriptSearchQuery",
+        "TranscriptSearchHit",
+        "TranscriptSearchResult",
+    ):
+        canonical = getattr(transcript_queries, name)
+        assert getattr(base, name) is canonical
+        assert all(getattr(surface, name) is canonical for surface in surfaces)
+        assert pickle.loads(f"ccayu.sessions.base\n{name}\n.".encode()) is canonical
+
+
+@pytest.mark.parametrize("public_module", ("cayu", "cayu.sessions", "cayu.runtime"))
+def test_transcript_queries_filter_and_search_without_loading_stores(public_module):
+    _assert_store_independent(
+        """
+from cayu.messages import Message, TextPart, ThinkingPart
+from cayu.sessions.transcript_queries import (
+    copy_transcript_search_query, decode_transcript_search_cursor,
+    encode_transcript_search_cursor, filter_transcript_records,
+    transcript_search_document, transcript_search_document_from_text,
+    transcript_search_hit_from_message, transcript_search_query_tokens,
+    transcript_search_score,
+)
+
+message = Message(role="assistant", content=(
+    ThinkingPart(text="private reasoning"), TextPart(text="Straße café"),
+))
+records = [
+    public.TranscriptRecord(index=2, message=Message(
+        role="assistant", content=(ThinkingPart(text="hidden"),),
+    )),
+    public.TranscriptRecord(index=7, interaction_id="interaction", message=message),
+]
+filtered = filter_transcript_records(records, include_thinking=False)
+assert [record.index for record in filtered] == [7]
+assert filtered[0].interaction_id == "interaction"
+assert filtered[0].message.content == (TextPart(text="Straße café"),)
+assert len(records[1].message.content) == 2
+assert filter_transcript_records(records, include_thinking=True) is records
+assert transcript_search_query_tokens("STRASSE Straße café") == ("strasse", "café")
+assert transcript_search_document(message) == transcript_search_document_from_text("Straße café")
+query = public.TranscriptSearchQuery(text="STRASSE", session_ids=("session",))
+score = transcript_search_score("Straße café", query)
+assert score > 0
+hit = transcript_search_hit_from_message(
+    session_id="session", transcript_index=7, interaction_id="interaction",
+    message=message, max_text_bytes=100, raw_score=score,
+)
+assert hit.text == "Straße café" and hit.text_part_indexes == (1,)
+cursor = encode_transcript_search_cursor(
+    query, raw_score=int(score), session_id="session", transcript_index=7,
+)
+continued = copy_transcript_search_query(query, cursor=cursor)
+assert query.cursor is None
+assert decode_transcript_search_cursor(continued) == (int(score), "session", 7)
+try:
+    decode_transcript_search_cursor(public.TranscriptSearchQuery(
+        text="different", session_ids=("session",), cursor=cursor,
+    ))
+except ValueError as exc:
+    assert str(exc) == "Invalid transcript search cursor."
+else:
+    raise AssertionError("Search cursor escaped its query scope")
+result = public.TranscriptSearchResult(query=query, hits=(hit,), matched_records_examined=1)
+page = public.TranscriptPage(records=filtered, total_records=2)
+for value in (public.TranscriptQuery(session_id="session"), page, query, hit, result):
+    assert pickle.loads(pickle.dumps(value)) == value
+    assert get_type_hints(type(value))
+    assert type(value).model_json_schema()
+""",
+        public_module,
+    )

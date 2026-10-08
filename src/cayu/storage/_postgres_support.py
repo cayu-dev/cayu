@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from cayu._validation import copy_label_map
-from cayu.sessions.base import TRANSCRIPT_SEARCH_TOKENIZER_VERSION, SessionTopologyNode
+from cayu.sessions.base import SessionTopologyNode
 from cayu.sessions.invocation import SessionInvocation, TaskInvocation
 from cayu.sessions.queries import SessionOrder
 from cayu.sessions.records import (
@@ -15,6 +15,7 @@ from cayu.sessions.records import (
     SessionStatus,
     runtime_build_provenance_from_session_metadata,
 )
+from cayu.sessions.transcript_queries import TRANSCRIPT_SEARCH_TOKENIZER_VERSION
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage._accounting_schema import POSTGRES_ACCOUNTING_DDL
 from cayu.storage._accounting_schema import (

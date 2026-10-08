@@ -287,7 +287,6 @@ from cayu.sessions.base import (
     SessionRuntimePublicationConflict,
     SessionStatusConflict,
     SessionStore,
-    TranscriptQuery,
     _checkpoint_with_session_run_operation,
     _reserve_completion_result_event_publication,
     fork_session_invocation,
@@ -317,6 +316,7 @@ from cayu.sessions.recovery import (
     RecoveryPlanRequest,
     RecoveryPlanSelection,
 )
+from cayu.sessions.transcript_queries import TranscriptQuery
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
 from cayu.storage.sqlite import SQLiteSessionStore

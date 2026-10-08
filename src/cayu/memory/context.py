@@ -112,17 +112,17 @@ from cayu.runtime.recall_sources import (
     AutomaticRecallSourceRegistration,
     _FactoryRecallSource,
 )
-from cayu.sessions.base import (
-    TRANSCRIPT_SEARCH_MAX_BYTES,
-    TRANSCRIPT_SEARCH_MAX_SCAN_LIMIT,
-    TRANSCRIPT_SEARCH_MIN_MAX_BYTES,
-)
 from cayu.sessions.checkpoints import (
     AUTOMATIC_RECALL_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_KEY,
     RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_VERSION,
+)
+from cayu.sessions.transcript_queries import (
+    TRANSCRIPT_SEARCH_MAX_BYTES,
+    TRANSCRIPT_SEARCH_MAX_SCAN_LIMIT,
+    TRANSCRIPT_SEARCH_MIN_MAX_BYTES,
 )
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 

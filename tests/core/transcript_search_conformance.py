@@ -3,13 +3,8 @@ from __future__ import annotations
 import pytest
 
 from cayu.messages import Message, MessageRole, TextPart, ThinkingPart
-from cayu.sessions.base import (
-    RunRequest,
-    SessionIdentity,
-    SessionStore,
-    TranscriptSearchQuery,
-    transcript_search_score,
-)
+from cayu.sessions.base import RunRequest, SessionIdentity, SessionStore
+from cayu.sessions.transcript_queries import TranscriptSearchQuery, transcript_search_score
 
 
 async def assert_transcript_search_conformance(store: SessionStore) -> None:

@@ -20,8 +20,9 @@ from cayu.cli import main
 from cayu.cli import storage as storage_cli
 from cayu.events import Event, EventType
 from cayu.messages import Message
-from cayu.sessions.base import TRANSCRIPT_SEARCH_TOKENIZER_VERSION, RunRequest, SessionIdentity
+from cayu.sessions.base import RunRequest, SessionIdentity
 from cayu.sessions.event_queries import EventOrder, EventQuery
+from cayu.sessions.transcript_queries import TRANSCRIPT_SEARCH_TOKENIZER_VERSION
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import migrations as schema
 from cayu.storage import postgres as postgres_storage
