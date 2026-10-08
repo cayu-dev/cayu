@@ -359,6 +359,9 @@ and safe hook evidence. `ToolTerminalPublisher` owns result limits, projection,
 deferred staging and terminal delivery, sharing one publication governor with
 the durable round. Live execution and recovered continuations use the same
 components; detached projection work remains visible to environment cleanup.
+`ToolInvocationAdmission` owns targeted-tool resolution, policy/taint evaluation
+and durable approval pauses. Round planning and individual invocation admission
+use the same component without depending on dispatch or terminal persistence.
 
 `SessionEngine` also delegates ordinary round closure after a run limit to this
 owner. It retains completed effects, publishes skipped results for unstarted

@@ -63,6 +63,7 @@ import cayu.runtime._recovery_coordinator as recovery_coordinator_module
 import cayu.runtime._run_limits as run_limits_module
 import cayu.runtime._session_control as session_control_module
 import cayu.runtime._session_engine as session_engine_module
+import cayu.runtime._tool_invocation.admission as tool_admission_module
 import cayu.runtime._tool_round_executor as tool_round_executor_module
 import cayu.runtime.execution_profiles as execution_profiles_module
 import cayu.sessions._model_completion_publication as model_completion_publication_module
@@ -3352,7 +3353,8 @@ def test_budget_flow_preserves_runtime_generated_identity_authority(
 def test_approval_flow_preserves_runtime_generated_approval_authority(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(tool_round_executor_module, "uuid4", lambda: UUID(int=0))
+    approval_uuid = UUID(int=0)
+    monkeypatch.setattr(tool_admission_module, "uuid4", lambda: approval_uuid)
     provider = FakeProvider(
         [
             ModelStreamEvent.tool_call(
@@ -3374,8 +3376,8 @@ def test_approval_flow_preserves_runtime_generated_approval_authority(
         tool_policy=RequireApprovalPolicy(),
     )
 
-    events = asyncio.run(
-        collect_events(
+    async def run() -> list[Event]:
+        events = await collect_events(
             app,
             RunRequest(
                 agent_name="assistant",
@@ -3383,7 +3385,14 @@ def test_approval_flow_preserves_runtime_generated_approval_authority(
                 messages=[Message.text("user", "run tool")],
             ),
         )
-    )
+        approval = pending_approval_reader.pending_approval_from_checkpoint(
+            await app.session_store.load_checkpoint("session")
+        )
+        assert approval is not None
+        assert approval.approval_id == str(approval_uuid)
+        return events
+
+    events = asyncio.run(run())
 
     event_types = {event.type for event in events}
     assert len(provider.requests) == 1

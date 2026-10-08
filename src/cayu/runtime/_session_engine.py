@@ -526,9 +526,9 @@ from cayu.runtime._tool_effect_state import (
     ToolEffectReconciliationCleanupFailure,
     ToolEffectReconciliationRequired,
 )
+from cayu.runtime._tool_invocation.admission import ToolApprovalRequired
 from cayu.runtime._tool_round_executor import (
     InterruptedToolRoundRequest,
-    ToolApprovalRequired,
     ToolRoundExecutor,
     ToolRoundLimitRequest,
     UserInputRequired,
@@ -23066,7 +23066,7 @@ class SessionEngine:
                 )
             )
 
-        inherited_taint_labels = await self._tool_round_executor.prior_taint_labels_for_policy(
+        inherited_taint_labels = await self._tool_round_executor.admission.prior_taint_labels(
             session_id=source_session.id,
             policy=source_registered_agent.tool_policy,
             request_metadata=source_session.metadata,

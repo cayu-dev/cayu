@@ -11816,9 +11816,7 @@ def test_session_store_conformance_ambiguous_policy_recovery_remains_gated(
                     "process stopped after policy evaluation and before publication"
                 )
 
-            first_app._tool_round_executor.checkpoint_pending_tool_approval = (
-                lose_approval_publication
-            )
+            first_app._tool_round_executor.admission.pause_for_approval = lose_approval_publication
             with pytest.raises(
                 _SimulatedProcessLoss,
                 match="after policy evaluation",

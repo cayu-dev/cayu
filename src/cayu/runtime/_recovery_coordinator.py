@@ -338,10 +338,10 @@ from cayu.runtime._tool_effect_state import (
     _validate_selected_terminal,
     validate_tool_effect_uncertainty_event,
 )
+from cayu.runtime._tool_invocation.admission import ToolApprovalRequired
 from cayu.runtime._tool_invocation.terminal import DeferredTerminalStager
 from cayu.runtime._tool_round_executor import (
     InterruptedToolRoundRequest,
-    ToolApprovalRequired,
     ToolRoundExecutor,
     _workspace_mutation_incomplete_event,
     policy_denial_payload_fields,
@@ -9087,7 +9087,9 @@ class RecoveryCoordinator:
                         raise RuntimeError(
                             "Pending user-input call has no authoritative policy decision."
                         )
-                    for rejoined_event in await self._tool_round_executor.rejoin_targeted_tool_call(
+                    for (
+                        rejoined_event
+                    ) in await self._tool_round_executor.admission.rejoin_targeted_call(
                         session=session,
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
@@ -15627,7 +15629,7 @@ class RecoveryCoordinator:
             pending_round,
             _resolved_tool_calls,
             targeted_resolution_events,
-        ) = await self._tool_round_executor.resolve_targeted_tool_calls(
+        ) = await self._tool_round_executor.admission.resolve_targeted_calls(
             session=session,
             registered_agent=registered_agent,
             registered_environment=registered_environment,
@@ -15769,7 +15771,7 @@ class RecoveryCoordinator:
                 (
                     approval,
                     approval_events,
-                ) = await self._tool_round_executor.checkpoint_pending_tool_approval(
+                ) = await self._tool_round_executor.admission.pause_for_approval(
                     session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,

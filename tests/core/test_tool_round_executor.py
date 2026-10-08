@@ -38,8 +38,9 @@ from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
 from cayu.runtime._run_limits import RunLimitGate
 from cayu.runtime._session_control import SessionInterruptedByRequest
 from cayu.runtime._tool_effect_state import ToolEffectReconciliationRequired, ToolEffectStateOwner
+from cayu.runtime._tool_invocation.admission import _copy_agent_spec
 from cayu.runtime._tool_invocation.context import _restore_targeted_tool_invocation_event_authority
-from cayu.runtime._tool_round_executor import ToolRoundRun, _copy_agent_spec
+from cayu.runtime._tool_round_executor import ToolRoundRun
 from cayu.runtime._tool_round_recovery import checkpoint_with_pending_tool_round
 from cayu.runtime._tool_round_staging import (
     _durable_payload_utf8_size,
