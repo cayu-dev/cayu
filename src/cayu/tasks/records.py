@@ -687,3 +687,18 @@ def _validate_positive_int(value: int, field_name: str) -> int:
     if value < 1:
         raise ValueError(f"{field_name} must be >= 1.")
     return value
+
+
+_TERMINAL_TASK_STATUSES = {
+    TaskStatus.COMPLETED,
+    TaskStatus.FAILED,
+    TaskStatus.CANCELLED,
+    TaskStatus.DEPENDENCY_SKIPPED,
+}
+
+
+_HELD_TASK_STATUSES = {
+    TaskStatus.PAUSED,
+    TaskStatus.BLOCKED,
+    TaskStatus.NEEDS_ATTENTION,
+}

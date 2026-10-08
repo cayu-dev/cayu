@@ -7,11 +7,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from cayu.tasks.base import (
-    TaskRetryAttemptDisposition,
-    TaskRetrySettlementResult,
-    _runtime_task_retry_terminal_settlement,
-)
 from cayu.tasks.graphs import (
     TaskGraphConflict,
     TaskGraphCreationReceipt,
@@ -21,6 +16,11 @@ from cayu.tasks.graphs import (
     TaskGraphUnavailable,
 )
 from cayu.tasks.records import Task, TaskRetrySeriesDisposition, TaskStatus, copy_task
+from cayu.tasks.retry import (
+    TaskRetryAttemptDisposition,
+    TaskRetrySettlementResult,
+    _runtime_task_retry_terminal_settlement,
+)
 
 GRAPH_TERMINAL_STATUSES = frozenset(
     {

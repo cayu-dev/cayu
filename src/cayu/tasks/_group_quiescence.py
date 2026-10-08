@@ -15,8 +15,6 @@ from cayu._validation import canonical_durable_json_bytes
 from cayu.tasks._graphs import GRAPH_TERMINAL_STATUSES, GraphTransition, plan_graph_transition
 from cayu.tasks._groups import GroupPublication, plan_group_transition
 from cayu.tasks.base import (
-    TaskRetrySettlementResult,
-    _cancelled_task_retry_settlement,
     _task_cancellation_requested_task,
     _task_retry_cancellation_requested_task,
 )
@@ -38,6 +36,7 @@ from cayu.tasks.groups import (
     TaskGroupQuiescenceStatus as Q,
 )
 from cayu.tasks.records import Task, TaskStatus, copy_task
+from cayu.tasks.retry import TaskRetrySettlementResult, _cancelled_task_retry_settlement
 
 
 @dataclass(frozen=True)

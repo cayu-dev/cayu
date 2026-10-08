@@ -70,11 +70,8 @@ from cayu.tasks.base import (
     TaskCreate,
     TaskOrder,
     TaskQuery,
-    TaskRetryAttemptDisposition,
-    TaskRetrySettlementRequest,
     TaskStore,
     _task_cancellation_terminalization_request,
-    _task_retry_requested_cancellation_settlement,
     settle_task_retry_attempt_with_retry,
     task_create_with_execution_source,
     terminalize_task_with_retry,
@@ -86,6 +83,11 @@ from cayu.tasks.records import (
     TaskRetrySeriesDisposition,
     TaskStatus,
     copy_task,
+)
+from cayu.tasks.retry import (
+    TaskRetryAttemptDisposition,
+    TaskRetrySettlementRequest,
+    _task_retry_requested_cancellation_settlement,
 )
 from cayu.tasks.terminalization import (
     TaskTerminalizationConflict,

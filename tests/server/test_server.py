@@ -137,15 +137,7 @@ from cayu.storage.memory import (
     KnowledgeStatus,
 )
 from cayu.storage.sqlite import SQLiteSessionStore
-from cayu.tasks.base import (
-    InMemoryTaskStore,
-    Task,
-    TaskCreate,
-    TaskRetryAttemptDisposition,
-    TaskRetryPolicy,
-    TaskRetrySettlementRequest,
-    TaskStatus,
-)
+from cayu.tasks.base import InMemoryTaskStore, Task, TaskCreate, TaskRetryPolicy, TaskStatus
 from cayu.tasks.contracts import (
     CompletionResultResolverRef,
     CompletionVerifierRef,
@@ -154,6 +146,7 @@ from cayu.tasks.contracts import (
     work_contract_from_draft,
 )
 from cayu.tasks.dispatch import Dispatcher, DispatchHandle, DispatchRequest, DispatchStatus
+from cayu.tasks.retry import TaskRetryAttemptDisposition, TaskRetrySettlementRequest
 from cayu.tools.commands import ExecCommandTool
 from cayu.tools.user_input import UserInputTool
 from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor

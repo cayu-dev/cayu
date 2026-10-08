@@ -167,11 +167,8 @@ async def test_group_verified_completion_is_the_only_success_authority(store: Ta
 
 
 async def test_retry_successor_cannot_change_group_decision(store: TaskStore) -> None:
-    from cayu.tasks.base import (
-        TaskRetryAttemptDisposition,
-        TaskRetryPolicy,
-        TaskRetrySettlementRequest,
-    )
+    from cayu.tasks.base import TaskRetryPolicy
+    from cayu.tasks.retry import TaskRetryAttemptDisposition, TaskRetrySettlementRequest
 
     await store.create_task_group(
         TaskGroupCreate(

@@ -413,7 +413,8 @@ async def test_graph_operational_counts_preserve_dependency_states(store: TaskSt
 
 
 async def test_skipped_retry_member_has_matching_terminal_receipt(store: TaskStore) -> None:
-    from cayu.tasks.base import TaskRetryEventType, TaskRetryPolicy, TaskRetrySeriesDisposition
+    from cayu.tasks.base import TaskRetryPolicy, TaskRetrySeriesDisposition
+    from cayu.tasks.retry import TaskRetryEventType
 
     await store.create_task_graph(
         TaskGraphCreate(
@@ -610,11 +611,8 @@ async def test_verified_completion_atomically_releases_graph_join(store: TaskSto
 
 
 async def test_retry_successor_cannot_replace_exact_graph_prerequisite(store: TaskStore) -> None:
-    from cayu.tasks.base import (
-        TaskRetryAttemptDisposition,
-        TaskRetryPolicy,
-        TaskRetrySettlementRequest,
-    )
+    from cayu.tasks.base import TaskRetryPolicy
+    from cayu.tasks.retry import TaskRetryAttemptDisposition, TaskRetrySettlementRequest
 
     await store.create_task_graph(
         TaskGraphCreate(
@@ -673,9 +671,9 @@ async def test_retry_successor_cannot_replace_exact_graph_prerequisite(store: Ta
 
 
 async def test_retained_graph_id_collision_cannot_partially_settle_retry(store: TaskStore) -> None:
-    from cayu.tasks.base import (
+    from cayu.tasks.base import TaskRetryPolicy
+    from cayu.tasks.retry import (
         TaskRetryAttemptDisposition,
-        TaskRetryPolicy,
         TaskRetrySettlementRequest,
         _task_retry_successor_id,
     )

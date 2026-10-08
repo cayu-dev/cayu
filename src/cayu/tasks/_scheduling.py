@@ -92,7 +92,7 @@ def require_schedule_mutation(task: Task, expected_revision: int) -> TaskSchedul
 
 
 def rescheduled_task(task: Task, request: TaskRescheduleRequest, *, now: datetime) -> Task:
-    from cayu.tasks.base import _rescheduled_initial_task_retry_series
+    from cayu.tasks.retry import _rescheduled_initial_task_retry_series
 
     state = require_schedule_mutation(task, request.expected_revision)
     if state.admitted_at is not None or task.worker_id is not None or task.session_id is not None:

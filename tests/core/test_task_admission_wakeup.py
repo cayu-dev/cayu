@@ -14,15 +14,8 @@ from tests.core.test_verified_work_contracts import _contract
 from cayu.applications import CayuApp
 from cayu.runtime._durable_worker_loop import DurableWorkerDemandPolicy, DurableWorkerMetrics
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.base import (
-    InMemoryTaskStore,
-    Task,
-    TaskCreate,
-    TaskQuery,
-    TaskRetryAttemptDisposition,
-    TaskRetryPolicy,
-    TaskRetrySettlementRequest,
-)
+from cayu.tasks.base import InMemoryTaskStore, Task, TaskCreate, TaskQuery, TaskRetryPolicy
+from cayu.tasks.retry import TaskRetryAttemptDisposition, TaskRetrySettlementRequest
 from cayu.tasks.worker import run_task_worker
 
 
