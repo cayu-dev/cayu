@@ -552,7 +552,6 @@ from cayu.sessions.base import (
     DeferredInteractionInput,
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
-    EventSummary,
     ForkCheckpointAuthorityDecoder,
     ForkSystemPromptReplacement,
     ForkTranscriptValidator,
@@ -598,11 +597,9 @@ from cayu.sessions.base import (
     SessionModelCompletionDispatchAlreadyAuthorized,
     SessionModelCompletionStageConflict,
     SessionModelTransition,
-    SessionOperationalSnapshot,
     SessionOperationInitializer,
     SessionOperationPublication,
     SessionOperationTransform,
-    SessionOutcome,
     SessionQueuedMessage,
     SessionQueuedMessagesPending,
     SessionRunFenced,
@@ -806,7 +803,6 @@ from cayu.sessions.base import (
     session_invocation_for_run_request,
     session_messages_input_contract_evidence,
     session_metadata_for_creation,
-    session_outcome,
     transform_fork_checkpoint,
     validate_persisted_event_side_effect_error,
 )
@@ -836,6 +832,12 @@ from cayu.sessions.records import (
     Session,
     SessionStatus,
     TranscriptRecord,
+)
+from cayu.sessions.summaries import (
+    EventSummary,
+    SessionOperationalSnapshot,
+    SessionOutcome,
+    session_outcome,
 )
 from cayu.sessions.terminal_evidence import (
     TerminalPublicationMarker,

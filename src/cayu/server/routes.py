@@ -318,7 +318,6 @@ from cayu.sessions.base import (
     SessionMessageActionResult,
     SessionMessageDeliveryMode,
     SessionMessageInspection,
-    SessionOutcome,
     SessionStore,
     SessionTopologyCycle,
     SessionTopologyDepthExceeded,
@@ -360,6 +359,7 @@ from cayu.sessions.records import (
     SessionStatus,
 )
 from cayu.sessions.recovery import StartupRecoveryResult
+from cayu.sessions.summaries import SessionOutcome
 from cayu.sessions.transcript_queries import TranscriptQuery
 from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
 from cayu.tasks.creation import TaskCreate, task_create_with_runtime_invocation

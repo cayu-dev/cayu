@@ -197,7 +197,6 @@ from cayu.sessions.base import (
     SESSION_TOPOLOGY_MAX_IDENTIFIER_BYTES,
     SESSION_TOPOLOGY_MAX_NODES,
     DelegatedActionReference,
-    SessionOperationalSnapshot,
 )
 from cayu.sessions.execution import SessionExecutionState
 from cayu.sessions.interactions import InteractionSummaryEvidence
@@ -207,6 +206,7 @@ from cayu.sessions.invocation import (
     TaskExecutionSource,
 )
 from cayu.sessions.queries import SessionAggregateFilter
+from cayu.sessions.summaries import SessionOperationalSnapshot
 from cayu.tasks.queries import TaskAggregateFilter, TaskOperationalSnapshot
 from cayu.tasks.scheduling import TaskScheduleEventType
 from cayu.tasks.topology import (

@@ -3940,7 +3940,6 @@ from cayu.sessions.base import DeferredInteractionInput as DeferredInteractionIn
 from cayu.sessions.base import DelegatedActionReference as DelegatedActionReference
 from cayu.sessions.base import EnqueueSessionMessageRequest as EnqueueSessionMessageRequest
 from cayu.sessions.base import EnqueueSessionMessageResult as EnqueueSessionMessageResult
-from cayu.sessions.base import EventSummary as EventSummary
 from cayu.sessions.base import (
     ForkExecutionProfileDecisionRecord as ForkExecutionProfileDecisionRecord,
 )
@@ -4005,8 +4004,6 @@ from cayu.sessions.base import SessionMessageDeliveryMode as SessionMessageDeliv
 from cayu.sessions.base import SessionMessageInspection as SessionMessageInspection
 from cayu.sessions.base import SessionMessageInspectionRecord as SessionMessageInspectionRecord
 from cayu.sessions.base import SessionModelTransition as SessionModelTransition
-from cayu.sessions.base import SessionOperationalSnapshot as SessionOperationalSnapshot
-from cayu.sessions.base import SessionOutcome as SessionOutcome
 from cayu.sessions.base import SessionQueuedMessage as SessionQueuedMessage
 from cayu.sessions.base import SessionQueuedMessagesPending as SessionQueuedMessagesPending
 from cayu.sessions.base import SessionStateSnapshot as SessionStateSnapshot
@@ -4218,6 +4215,9 @@ from cayu.sessions.recovery import RecoveryTaskClaimEvidence as RecoveryTaskClai
 from cayu.sessions.recovery import StaleRecoveryPlanError as StaleRecoveryPlanError
 from cayu.sessions.recovery import StartupRecoveryBlockedSession as StartupRecoveryBlockedSession
 from cayu.sessions.recovery import StartupRecoveryResult as StartupRecoveryResult
+from cayu.sessions.summaries import EventSummary as EventSummary
+from cayu.sessions.summaries import SessionOperationalSnapshot as SessionOperationalSnapshot
+from cayu.sessions.summaries import SessionOutcome as SessionOutcome
 from cayu.sessions.terminal_evidence import (
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS as TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
 )

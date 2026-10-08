@@ -49,9 +49,7 @@ from cayu.sessions.base import (
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
     PendingActionKind,
     PendingActionQuery,
-    event_summary_from_records,
     fork_session_invocation,
-    session_outcome_from_records,
 )
 from cayu.sessions.pending_actions import (
     pending_action_event_storage_values,
@@ -64,6 +62,7 @@ from cayu.sessions.queries import (
     encode_session_cursor,
 )
 from cayu.sessions.records import MAX_SESSION_ID_BYTES
+from cayu.sessions.summaries import event_summary_from_records, session_outcome_from_records
 from cayu.storage import _session_store_sql as session_store_sql
 
 StoreFactory = Callable[[object], SessionStore]

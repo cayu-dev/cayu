@@ -487,6 +487,13 @@ the shared tokenizer, document encoding, scoring and query-scoped search cursors
 Native stores compose these rules with their existing transcript queries and
 indexes; index maintenance, schema validation and atomic reads remain store-owned.
 
+### Session summaries
+
+`sessions/summaries.py` owns stored-session outcome, event-summary and operational
+snapshot contracts. It derives outcomes from durable records, preserving interaction
+boundaries and detached event details. Stores retain authorization and atomic reads;
+the streaming `sessions/outcomes.py` API retains its separate runtime composition.
+
 ### Session checkpoint evidence
 
 `sessions/_checkpoint_preservation.py` owns callback-visible checkpoint copies,

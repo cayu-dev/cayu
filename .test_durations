@@ -45211,5 +45211,9 @@
     "tests/core/test_session_query_package_layout.py::test_transcript_queries_filter_and_search_without_loading_stores[cayu.runtime]": 0.19288345900713466,
     "tests/core/test_session_query_package_layout.py::test_transcript_queries_filter_and_search_without_loading_stores[cayu.sessions]": 0.19568299903767183,
     "tests/core/test_session_query_package_layout.py::test_transcript_queries_filter_and_search_without_loading_stores[cayu]": 0.1958915420109406,
-    "tests/core/test_session_query_package_layout.py::test_transcript_query_public_imports_and_historical_pickle_globals": 0.00035899903741665184
+    "tests/core/test_session_query_package_layout.py::test_transcript_query_public_imports_and_historical_pickle_globals": 0.00035899903741665184,
+    "tests/core/test_session_summary_package_layout.py::test_session_summaries_project_durable_records_without_stores[cayu.runtime]": 0.31793558300705627,
+    "tests/core/test_session_summary_package_layout.py::test_session_summaries_project_durable_records_without_stores[cayu.sessions]": 0.34985329100163653,
+    "tests/core/test_session_summary_package_layout.py::test_session_summaries_project_durable_records_without_stores[cayu]": 0.3890410409949254,
+    "tests/core/test_session_summary_package_layout.py::test_session_summary_public_imports_and_historical_pickle_globals": 1.977534082980128
 }

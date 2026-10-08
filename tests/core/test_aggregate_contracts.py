@@ -42,12 +42,12 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     RunRequest,
     SessionIdentity,
-    SessionOperationalSnapshot,
     SessionStore,
     UsageRollupQuery,
 )
 from cayu.sessions.queries import SessionAggregateFilter, SessionStatusCounts
 from cayu.sessions.records import EventRecord, SessionStatus
+from cayu.sessions.summaries import SessionOperationalSnapshot
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.memory import InMemoryTaskStore
