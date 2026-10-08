@@ -340,10 +340,10 @@ from cayu.runtime._tool_effect_state import (
 )
 from cayu.runtime._tool_invocation.admission import ToolApprovalRequired
 from cayu.runtime._tool_invocation.terminal import DeferredTerminalStager
+from cayu.runtime._tool_invocation.workspace_capture import _workspace_mutation_incomplete_event
 from cayu.runtime._tool_round_executor import (
     InterruptedToolRoundRequest,
     ToolRoundExecutor,
-    _workspace_mutation_incomplete_event,
     policy_denial_payload_fields,
 )
 from cayu.runtime._tool_round_staging import (

@@ -362,6 +362,10 @@ components; detached projection work remains visible to environment cleanup.
 `ToolInvocationAdmission` owns targeted-tool resolution, policy/taint evaluation
 and durable approval pauses. Round planning and individual invocation admission
 use the same component without depending on dispatch or terminal persistence.
+`ToolInvocationResources` binds the call's workspace, runner, knowledge, browser
+and secret access, including durable operation authority. Workspace evidence
+capture lives alongside it and is shared with recovery and checkpoint settlement.
+Neither component dispatches the tool or depends on the round executor.
 
 `SessionEngine` also delegates ordinary round closure after a run limit to this
 owner. It retains completed effects, publishes skipped results for unstarted

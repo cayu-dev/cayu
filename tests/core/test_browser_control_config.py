@@ -21,12 +21,12 @@ def test_application_browser_control_owns_one_coordinator_and_service():
     runtime = app._browser_control_runtime
     assert runtime is not None
     assert runtime.coordinator._policy is config.policy
-    assert app._tool_round_executor._browser_control_service is runtime.service
+    assert app._tool_round_executor.invocation.resources._browser_control_service is runtime.service
     assert not runtime.service._owners
     assert not runtime.service._viewers
     disabled = CayuApp(enable_logging=False)
     assert disabled._browser_control_runtime is None
-    assert disabled._tool_round_executor._browser_control_service is None
+    assert disabled._tool_round_executor.invocation.resources._browser_control_service is None
     assert "control.test" not in repr(config)
 
 

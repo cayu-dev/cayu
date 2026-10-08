@@ -10,7 +10,11 @@ from pathlib import Path
 _ALLOWED_RUNTIME_IMPORTS = {
     ("branch_lifecycle.py", "cayu.runtime.service_manifest", "RuntimeStoreDurability"),
     ("checkpoint_lifecycle.py", "cayu.runtime._runtime_records", "RegisteredEnvironment"),
-    ("checkpoint_lifecycle.py", "cayu.runtime._tool_round_executor", "_workspace_writer_isolation"),
+    (
+        "checkpoint_lifecycle.py",
+        "cayu.runtime._tool_invocation.workspace_capture",
+        "_workspace_writer_isolation",
+    ),
     ("observation_recovery.py", "cayu.runtime._event_writer", "RuntimeEventWriter"),
     ("observation_recovery.py", "cayu.runtime.public_authority", "PublicAuthorityAliasCodec"),
     (

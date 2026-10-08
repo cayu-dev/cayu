@@ -59,7 +59,7 @@ class WorkspaceCheckpointReceipt(BaseModel):
 
 def _isolation(registered: RegisteredEnvironment):
     # The observation contract belongs to the binding, not to tool dispatch.
-    from cayu.runtime._tool_round_executor import _workspace_writer_isolation
+    from cayu.runtime._tool_invocation.workspace_capture import _workspace_writer_isolation
 
     return _workspace_writer_isolation(registered)
 

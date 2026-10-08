@@ -71,6 +71,7 @@ from cayu.runtime._model_errors import (
     _BillingIdentityResolutionCancelled,
     detach_billing_identity_cancellation_group,
 )
+from cayu.runtime._tool_invocation import workspace_capture as workspace_capture_module
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
@@ -3575,7 +3576,7 @@ def test_thread_backed_before_observer_timeout_fences_tool_dispatch_and_reuse(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
-        tool_round_executor_module,
+        workspace_capture_module,
         "_WORKSPACE_OBSERVATION_TIMEOUT_SECONDS",
         0.01,
     )
@@ -3644,7 +3645,7 @@ def test_cancellation_resistant_after_observer_fences_finalization_and_reuse(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
-        tool_round_executor_module,
+        workspace_capture_module,
         "_WORKSPACE_OBSERVATION_TIMEOUT_SECONDS",
         0.01,
     )
@@ -6044,7 +6045,7 @@ def test_interrupted_tool_preserves_artifact_store_supervisory_exit(
     artifact_root = tmp_path / "artifacts"
     workspace_root.mkdir()
     monkeypatch.setattr(
-        tool_round_executor_module,
+        workspace_capture_module,
         "_WORKSPACE_RECEIPT_INLINE_PATH_LIMIT",
         0,
     )
@@ -6220,7 +6221,7 @@ def test_grouped_interruption_does_not_transfer_cancellation_to_stream_closer(
     artifact_root = tmp_path / "artifacts"
     workspace_root.mkdir()
     monkeypatch.setattr(
-        tool_round_executor_module,
+        workspace_capture_module,
         "_WORKSPACE_RECEIPT_INLINE_PATH_LIMIT",
         0,
     )
@@ -6463,7 +6464,7 @@ def test_stalled_receipt_artifact_write_is_bounded_without_replacing_tool_outcom
     artifact_root = tmp_path / "artifacts"
     workspace_root.mkdir()
     monkeypatch.setattr(
-        tool_round_executor_module,
+        workspace_capture_module,
         "_WORKSPACE_ARTIFACT_WRITE_TIMEOUT_SECONDS",
         0.01,
     )
@@ -6972,7 +6973,7 @@ def test_stalled_observer_is_bounded_without_replacing_tool_outcome(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
-        tool_round_executor_module,
+        workspace_capture_module,
         "_WORKSPACE_OBSERVATION_TIMEOUT_SECONDS",
         0.01,
     )
@@ -8315,7 +8316,7 @@ def test_recovery_does_not_downgrade_failed_delta_when_artifact_is_missing(
         )
 
     monkeypatch.setattr(
-        tool_round_executor_module,
+        workspace_capture_module,
         "compare_workspace_revisions",
         failed_comparison,
     )
@@ -8406,7 +8407,7 @@ def test_recovery_retains_late_artifact_intent_until_store_cleanup(
     artifact_root = tmp_path / "artifacts"
     workspace_root.mkdir()
     monkeypatch.setattr(
-        tool_round_executor_module,
+        workspace_capture_module,
         "_WORKSPACE_ARTIFACT_WRITE_TIMEOUT_SECONDS",
         0.01,
     )
