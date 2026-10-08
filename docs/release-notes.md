@@ -1,5 +1,11 @@
 # Release notes
 
+## Unreleased
+
+- Raise the PDF and OIDC dependency minimums to pypdf 6.19.0 and PyJWT
+  2.15.0, and update the locked urllib3 to 2.8.0, addressing dependency
+  denial-of-service and proxy TLS configuration advisories.
+
 ## v0.10.0
 
 Cayu adds provider-backed completion verification and independent completion
