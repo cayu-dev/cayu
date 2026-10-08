@@ -1,8 +1,10 @@
-"""Read SQLite catalog structure without domain policy or migration ownership."""
+"""SQLite catalog inspection and schema SQL utilities."""
 
 from __future__ import annotations
 
+import re
 import sqlite3
+from collections.abc import Iterator
 
 
 def _sqlite_table_columns(connection: sqlite3.Connection, table: str) -> tuple[str, ...]:
@@ -57,3 +59,24 @@ def _sqlite_foreign_key_groups(
 
 def _normalize_sqlite_schema_sql(value: object | None) -> str:
     return " ".join(str(value or "").lower().split())
+
+
+def _normalize_sqlite_schema_definition(definition: str) -> str:
+    """Normalize formatting, while preserving every structural SQL token."""
+    normalized = re.sub(r"\s+", "", definition.casefold())
+    normalized = normalized.replace('"', "").replace("`", "").replace("[", "").replace("]", "")
+    return normalized.replace("ifnotexists", "")
+
+
+def _iter_statements(script: str) -> Iterator[str]:
+    """Yield complete statements while preserving trigger bodies and literals."""
+    pending: list[str] = []
+    for line in script.splitlines(keepends=True):
+        pending.append(line)
+        statement = "".join(pending).strip()
+        if statement and sqlite3.complete_statement(statement):
+            yield statement.removesuffix(";").rstrip()
+            pending.clear()
+    trailing = "".join(pending).strip()
+    if trailing:
+        raise ValueError("SQLite migration DDL ended with an incomplete statement")

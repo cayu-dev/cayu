@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import uuid4
@@ -20,6 +20,7 @@ from cayu.sessions.base import (
     deferred_interaction_input_storage_payload,
 )
 from cayu.storage import _sqlite_catalog as sqlite_catalog
+from cayu.storage import _sqlite_closure_schema as sqlite_closure_schema
 from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_eval_schema as sqlite_eval_schema
 from cayu.storage import _sqlite_knowledge_schema as sqlite_knowledge_schema
@@ -61,6 +62,7 @@ from cayu.storage._product_operation_schema import (
     validate_sqlite_product_operation_schema,
 )
 from cayu.storage._session_execution import SQLITE_EXECUTION_DDL
+from cayu.storage._sqlite_closure_schema import SQLITE_CLOSURE_DDL
 from cayu.storage._task_graph_schema import SQLITE_TASK_GRAPH_DDL
 from cayu.storage._task_group_schema import (
     SQLITE_TASK_GROUP_DDL,
@@ -4089,46 +4091,7 @@ CREATE INDEX IF NOT EXISTS idx_cayu_side_effect_outstanding
             PRIMARY KEY (root_session_id, plan_id, child_session_id)
         );
     """,
-    88: """
-        CREATE TABLE IF NOT EXISTS cayu_task_session_closure_claims (
-            session_id TEXT COLLATE BINARY PRIMARY KEY,
-            plan_id TEXT COLLATE BINARY NOT NULL CHECK (
-                length(plan_id) = 64 AND plan_id NOT GLOB '*[^0-9a-f]*'
-            ),
-            claim_json TEXT NOT NULL CHECK (
-                json_valid(claim_json) AND json_type(claim_json) = 'object'
-                AND length(CAST(claim_json AS BLOB)) BETWEEN 1 AND 16777216
-            )
-        );
-        CREATE TRIGGER IF NOT EXISTS cayu_task_closure_insert_guard
-        BEFORE INSERT ON cayu_tasks
-        WHEN EXISTS (
-            SELECT 1 FROM cayu_task_session_closure_claims WHERE session_id = NEW.session_id
-        )
-        BEGIN
-            SELECT RAISE(ABORT, 'Task session is owned by closure.');
-        END;
-        CREATE TRIGGER IF NOT EXISTS cayu_task_closure_update_guard
-        BEFORE UPDATE ON cayu_tasks
-        WHEN EXISTS (
-            SELECT 1 FROM cayu_task_session_closure_claims
-            WHERE session_id IN (OLD.session_id, NEW.session_id)
-        )
-        BEGIN
-            SELECT RAISE(ABORT, 'Task session is owned by closure.');
-        END;
-        CREATE TABLE IF NOT EXISTS cayu_session_closure_progress (
-            root_session_id TEXT COLLATE BINARY NOT NULL,
-            plan_id TEXT COLLATE BINARY NOT NULL CHECK (
-                length(plan_id) = 64 AND plan_id NOT GLOB '*[^0-9a-f]*'
-            ),
-            progress_json TEXT NOT NULL CHECK (
-                json_valid(progress_json) AND json_type(progress_json) = 'object'
-                AND length(CAST(progress_json AS BLOB)) BETWEEN 1 AND 384000
-            ),
-            PRIMARY KEY (root_session_id, plan_id)
-        );
-    """,
+    88: SQLITE_CLOSURE_DDL,
     79: """
         CREATE TABLE IF NOT EXISTS cayu_child_session_lifecycle_candidates (
             child_session_id TEXT COLLATE BINARY PRIMARY KEY
@@ -4705,7 +4668,7 @@ def reset_empty_recall_state(connection: sqlite3.Connection) -> None:
         for table in _EMPTY_RECALL_RESET_TABLES:
             connection.execute(f"DROP TABLE IF EXISTS {table}")
         for revision in (69, 71):
-            for statement in _iter_statements(_MIGRATION_STEPS[revision]):
+            for statement in sqlite_catalog._iter_statements(_MIGRATION_STEPS[revision]):
                 connection.execute(statement)
         sqlite_work_context_schema._validate_revision_69_work_context_schema(connection)
         sqlite_work_context_schema._validate_revision_71_recall_delivery_schema(connection)
@@ -5638,16 +5601,9 @@ _WORKFLOW_REPLAY_INDEX_NAMES = frozenset(
 )
 
 
-def _normalize_sqlite_schema_definition(definition: str) -> str:
-    """Normalize formatting, while preserving every structural SQL token."""
-    normalized = re.sub(r"\s+", "", definition.casefold())
-    normalized = normalized.replace('"', "").replace("`", "").replace("[", "").replace("]", "")
-    return normalized.replace("ifnotexists", "")
-
-
 def _revision_17_index_definitions() -> dict[str, str]:
     definitions: dict[str, str] = {}
-    for statement in _iter_statements(_MIGRATION_STEPS[17]):
+    for statement in sqlite_catalog._iter_statements(_MIGRATION_STEPS[17]):
         match = re.match(
             r"CREATE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([^\s(]+)",
             statement,
@@ -5683,8 +5639,8 @@ def _validate_revision_17_indexes(
             actual_type != "index"
             or actual_definition is None
             or (
-                _normalize_sqlite_schema_definition(actual_definition)
-                != _normalize_sqlite_schema_definition(expected)
+                sqlite_catalog._normalize_sqlite_schema_definition(actual_definition)
+                != sqlite_catalog._normalize_sqlite_schema_definition(expected)
             )
         ):
             raise RuntimeError(
@@ -5712,7 +5668,7 @@ def _repair_missing_revision_17_indexes(connection: sqlite3.Connection) -> None:
 
 def _workflow_replay_index_definitions() -> dict[str, str]:
     definitions: dict[str, str] = {}
-    for statement in _iter_statements(_MIGRATION_STEPS[29]):
+    for statement in sqlite_catalog._iter_statements(_MIGRATION_STEPS[29]):
         match = re.match(
             r"CREATE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([^\s(]+)",
             statement,
@@ -5747,8 +5703,8 @@ def _validate_workflow_replay_indexes(
             actual_type != "index"
             or table_name != "cayu_events"
             or actual_definition is None
-            or _normalize_sqlite_schema_definition(actual_definition)
-            != _normalize_sqlite_schema_definition(expected)
+            or sqlite_catalog._normalize_sqlite_schema_definition(actual_definition)
+            != sqlite_catalog._normalize_sqlite_schema_definition(expected)
         ):
             raise RuntimeError(
                 f"SQLite schema object {index_name!r} conflicts with Cayu's "
@@ -5775,7 +5731,7 @@ def _repair_missing_workflow_replay_indexes(connection: sqlite3.Connection) -> N
 def _reservation_event_index_definition() -> str:
     statements = tuple(
         statement
-        for statement in _iter_statements(_MIGRATION_STEPS[23])
+        for statement in sqlite_catalog._iter_statements(_MIGRATION_STEPS[23])
         if _RESERVATION_EVENT_INDEX_NAME in statement
     )
     if len(statements) != 1:
@@ -5789,7 +5745,9 @@ def _validate_producer_cleanup_receipts(connection: sqlite3.Connection) -> None:
         ("idx_cayu_producer_cleanup_namespace", "index"),
         ("cayu_producer_cleanup_retirements", "table"),
     )
-    for (name, kind), expected in zip(names, _iter_statements(_MIGRATION_STEPS[110]), strict=True):
+    for (name, kind), expected in zip(
+        names, sqlite_catalog._iter_statements(_MIGRATION_STEPS[110]), strict=True
+    ):
         row = connection.execute(
             "SELECT type, sql FROM sqlite_master WHERE name = ?", (name,)
         ).fetchone()
@@ -5797,8 +5755,8 @@ def _validate_producer_cleanup_receipts(connection: sqlite3.Connection) -> None:
             row is None
             or row[0] != kind
             or row[1] is None
-            or _normalize_sqlite_schema_definition(row[1])
-            != _normalize_sqlite_schema_definition(expected)
+            or sqlite_catalog._normalize_sqlite_schema_definition(row[1])
+            != sqlite_catalog._normalize_sqlite_schema_definition(expected)
         ):
             raise RuntimeError(
                 "Required Cayu producer cleanup receipt table or fence is missing or conflicting."
@@ -5810,14 +5768,14 @@ def _validate_reservation_inventory_index(connection: sqlite3.Connection) -> Non
     row = connection.execute(
         "SELECT type, tbl_name, sql FROM sqlite_master WHERE name = ?", (name,)
     ).fetchone()
-    expected = next(_iter_statements(_MIGRATION_STEPS[109]))
+    expected = next(sqlite_catalog._iter_statements(_MIGRATION_STEPS[109]))
     if (
         row is None
         or row[0] != "index"
         or row[1] != "cayu_budget_reservations"
         or row[2] is None
-        or _normalize_sqlite_schema_definition(row[2])
-        != _normalize_sqlite_schema_definition(expected)
+        or sqlite_catalog._normalize_sqlite_schema_definition(row[2])
+        != sqlite_catalog._normalize_sqlite_schema_definition(expected)
     ):
         raise RuntimeError("Required Cayu reservation inventory index is missing or conflicting.")
 
@@ -5844,8 +5802,10 @@ def _validate_reservation_event_index(
         or table_name != "cayu_events"
         or actual_definition is None
         or (
-            _normalize_sqlite_schema_definition(actual_definition)
-            != _normalize_sqlite_schema_definition(_reservation_event_index_definition())
+            sqlite_catalog._normalize_sqlite_schema_definition(actual_definition)
+            != sqlite_catalog._normalize_sqlite_schema_definition(
+                _reservation_event_index_definition()
+            )
         )
     ):
         raise RuntimeError(
@@ -5869,7 +5829,7 @@ def _repair_missing_reservation_event_index(connection: sqlite3.Connection) -> N
 
 def _pending_action_scope_index_definitions() -> dict[str, str]:
     definitions: dict[str, str] = {}
-    for statement in _iter_statements(_MIGRATION_STEPS[23]):
+    for statement in sqlite_catalog._iter_statements(_MIGRATION_STEPS[23]):
         for index_name in _PENDING_ACTION_SCOPE_INDEX_NAMES:
             if index_name in statement:
                 definitions[index_name] = statement
@@ -5900,8 +5860,8 @@ def _validate_pending_action_scope_indexes(
             actual_type != "index"
             or table_name != "cayu_events"
             or actual_definition is None
-            or _normalize_sqlite_schema_definition(actual_definition)
-            != _normalize_sqlite_schema_definition(expected)
+            or sqlite_catalog._normalize_sqlite_schema_definition(actual_definition)
+            != sqlite_catalog._normalize_sqlite_schema_definition(expected)
         ):
             raise RuntimeError(
                 f"SQLite schema object {index_name!r} conflicts with Cayu's "
@@ -6185,7 +6145,7 @@ def reconcile_schema(
     if current.revision >= 79:
         sqlite_session_schema._validate_revision_79_child_lifecycle_schema(connection)
     if current.revision >= 88:
-        _validate_revision_88_closure_schema(connection)
+        sqlite_closure_schema._validate_revision_88_closure_schema(connection)
     if current.revision >= 93:
         validate_sqlite_collaboration_schema(
             connection,
@@ -6266,22 +6226,6 @@ def reconcile_schema(
         sqlite_eval_schema._validate_eval_run_trial_checkpoint_schema(connection)
 
 
-def _validate_revision_88_closure_schema(connection: sqlite3.Connection) -> None:
-    for statement in _iter_statements(_MIGRATION_STEPS[88]):
-        match = re.match(r"CREATE (TABLE|TRIGGER) IF NOT EXISTS (\w+)", statement)
-        if match is None:
-            raise RuntimeError("Unrecognized closure schema definition.")
-        object_type, name = match.groups()
-        row = connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type = ? AND name = ?",
-            (object_type.lower(), name),
-        ).fetchone()
-        if row is None or _normalize_sqlite_schema_definition(row[0]) != (
-            _normalize_sqlite_schema_definition(statement)
-        ):
-            raise RuntimeError("SQLite closure schema is missing or conflicts with its contract.")
-
-
 def _reject_revision_43_knowledge_identity_overflow(
     connection: sqlite3.Connection,
 ) -> None:
@@ -6326,20 +6270,6 @@ def read_schema_state(connection: sqlite3.Connection) -> schema.SchemaState:
     return schema.SchemaState(revision=row[0], compatible_from=row[1])
 
 
-def _iter_statements(script: str) -> Iterator[str]:
-    """Yield complete statements while preserving trigger bodies and literals."""
-    pending: list[str] = []
-    for line in script.splitlines(keepends=True):
-        pending.append(line)
-        statement = "".join(pending).strip()
-        if statement and sqlite3.complete_statement(statement):
-            yield statement.removesuffix(";").rstrip()
-            pending.clear()
-    trailing = "".join(pending).strip()
-    if trailing:
-        raise ValueError("SQLite migration DDL ended with an incomplete statement")
-
-
 def _add_column_if_missing(
     connection: sqlite3.Connection, table: str, column: str, decl: str
 ) -> None:
@@ -6376,7 +6306,7 @@ def _reject_unprofiled_verified_work_records(connection: sqlite3.Connection) -> 
 
 def _apply_baseline(connection: sqlite3.Connection) -> None:
     with sqlite_connection._transaction(connection):
-        for statement in _iter_statements(_BASELINE_DDL):
+        for statement in sqlite_catalog._iter_statements(_BASELINE_DDL):
             connection.execute(statement)
         _record_revision(connection, schema.revision(schema.BASELINE_REVISION))
         # user_version mirrors the revision as a cheap SQLite-native marker; the
@@ -6534,7 +6464,7 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
         with sqlite_connection._transaction(connection):
             _validate_reservation_event_index(connection, require=False)
             _validate_pending_action_scope_indexes(connection, require_all=False)
-            for statement in _iter_statements(_MIGRATION_STEPS[23]):
+            for statement in sqlite_catalog._iter_statements(_MIGRATION_STEPS[23]):
                 connection.execute(statement)
             hook = _MIGRATION_HOOKS[23]
             hook(connection)
@@ -6551,7 +6481,7 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
     if rev.revision == 29:
         with sqlite_connection._transaction(connection):
             _validate_workflow_replay_indexes(connection, require_all=False)
-            for statement in _iter_statements(_MIGRATION_STEPS[29]):
+            for statement in sqlite_catalog._iter_statements(_MIGRATION_STEPS[29]):
                 connection.execute(statement)
             _validate_workflow_replay_indexes(connection, require_all=True)
             _record_revision(connection, rev)
@@ -6559,7 +6489,7 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
         return
     if rev.revision == 38:
         with sqlite_connection._transaction(connection):
-            for statement in _iter_statements(_MIGRATION_STEPS[38]):
+            for statement in sqlite_catalog._iter_statements(_MIGRATION_STEPS[38]):
                 connection.execute(statement)
             sqlite_task_schema._validate_task_terminalization_receipt_table(connection)
             _record_revision(connection, rev)
@@ -6614,7 +6544,7 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _drop_column_if_present(connection, table, column)
         ddl = _MIGRATION_STEPS.get(rev.revision)
         if ddl:
-            for statement in _iter_statements(ddl):
+            for statement in sqlite_catalog._iter_statements(ddl):
                 connection.execute(statement)
         hook = _MIGRATION_HOOKS.get(rev.revision)
         if hook is not None:
@@ -6714,7 +6644,7 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
         if rev.revision == 79:
             sqlite_session_schema._validate_revision_79_child_lifecycle_schema(connection)
         if rev.revision == 88:
-            _validate_revision_88_closure_schema(connection)
+            sqlite_closure_schema._validate_revision_88_closure_schema(connection)
         if rev.revision == 93:
             validate_sqlite_collaboration_schema(connection)
         if rev.revision == 94:
@@ -6741,7 +6671,7 @@ def _apply_revision_seventy_two(
     connection.execute("PRAGMA legacy_alter_table = ON")
     try:
         with sqlite_connection._transaction(connection):
-            for statement in _iter_statements(_MIGRATION_STEPS[72]):
+            for statement in sqlite_catalog._iter_statements(_MIGRATION_STEPS[72]):
                 connection.execute(statement)
             sqlite_eval_schema._validate_eval_run_max_concurrency_schema(connection)
             violation = connection.execute("PRAGMA foreign_key_check").fetchone()
@@ -6765,7 +6695,7 @@ def _apply_revision_seventeen(
         _validate_revision_17_indexes(connection, require_all=False)
         for table, column, decl in _MIGRATION_ADD_COLUMNS[17]:
             _add_column_if_missing(connection, table, column, decl)
-        for statement in _iter_statements(_MIGRATION_STEPS[17]):
+        for statement in sqlite_catalog._iter_statements(_MIGRATION_STEPS[17]):
             connection.execute(statement)
 
     after_session_id: str | None = None

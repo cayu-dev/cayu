@@ -205,3 +205,103 @@ def test_transcript_schema_validates_independently(
         expected_tokenizer_version=version or TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
         projection=projection,
     )
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        None,
+        "DROP TABLE cayu_task_session_closure_claims",
+        "DROP TABLE cayu_session_closure_progress",
+        "DROP TRIGGER cayu_task_closure_insert_guard",
+        "DROP TRIGGER cayu_task_closure_update_guard",
+        "DROP TRIGGER cayu_task_closure_insert_guard; "
+        "CREATE TRIGGER cayu_task_closure_insert_guard "
+        "BEFORE INSERT ON cayu_tasks BEGIN SELECT 1; END",
+        "PRAGMA writable_schema=ON; "
+        "UPDATE sqlite_master SET sql=replace(sql, '384000', '384001') "
+        "WHERE type='table' AND name='cayu_session_closure_progress'; "
+        "PRAGMA writable_schema=OFF",
+    ],
+    ids=[
+        "current",
+        "missing-task-claims",
+        "missing-progress",
+        "missing-insert-guard",
+        "missing-update-guard",
+        "weakened-insert-guard",
+        "wrong-progress-limit",
+    ],
+)
+def test_closure_schema_validates_independently(tmp_path, sqlite_resources, damage):
+    path = _prepare_database(tmp_path, sqlite_resources, damage)
+    _validate_in_fresh_process(
+        path,
+        "_sqlite_closure_schema",
+        "_validate_revision_88_closure_schema",
+        "closure schema is missing or conflicts" if damage else None,
+    )
+
+
+def test_schema_statement_iteration_preserves_trigger_bodies_and_literals():
+    import sqlite3
+    from contextlib import closing
+
+    from cayu.storage import _sqlite_catalog
+
+    script = """
+        CREATE TABLE source(value TEXT);
+        CREATE TABLE audit(value TEXT);
+        CREATE TRIGGER record_value AFTER INSERT ON source
+        BEGIN
+            INSERT INTO audit VALUES ('literal; -- still text');
+            INSERT INTO audit VALUES (NEW.value);
+        END;
+    """
+    statements = list(_sqlite_catalog._iter_statements(script))
+    assert len(statements) == 3
+    with closing(sqlite3.connect(":memory:")) as connection:
+        for statement in statements:
+            connection.execute(statement)
+        connection.execute("INSERT INTO source VALUES ('retained')")
+        assert connection.execute("SELECT value FROM audit ORDER BY rowid").fetchall() == [
+            ("literal; -- still text",),
+            ("retained",),
+        ]
+
+
+def test_schema_statement_iteration_rejects_incomplete_tail_after_complete_statement():
+    from cayu.storage import _sqlite_catalog
+
+    statements = _sqlite_catalog._iter_statements(
+        "CREATE TABLE complete(value TEXT);\nCREATE TABLE incomplete("
+    )
+    assert next(statements) == "CREATE TABLE complete(value TEXT)"
+    with pytest.raises(ValueError, match="migration DDL ended with an incomplete statement"):
+        next(statements)
+
+
+@pytest.mark.parametrize("script", ["", " \n\t"])
+def test_schema_statement_iteration_accepts_empty_script(script):
+    from cayu.storage import _sqlite_catalog
+
+    assert list(_sqlite_catalog._iter_statements(script)) == []
+
+
+def test_schema_definition_comparison_preserves_structural_tokens():
+    from cayu.storage import _sqlite_catalog
+
+    normalize = _sqlite_catalog._normalize_sqlite_schema_definition
+    canonical = (
+        "CREATE TABLE IF NOT EXISTS sample(value TEXT COLLATE BINARY CHECK(length(value)<4))"
+    )
+    formatted = (
+        'create table "sample" ( [value] text collate binary check ( length (`value`) < 4 ) )'
+    )
+    assert normalize(canonical) == normalize(formatted)
+    for changed in (
+        canonical.replace("TEXT", "INTEGER"),
+        canonical.replace("BINARY", "NOCASE"),
+        canonical.replace("<4", "<5"),
+    ):
+        assert normalize(canonical) != normalize(changed)
