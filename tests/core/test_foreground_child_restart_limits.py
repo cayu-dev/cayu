@@ -22,8 +22,9 @@ from cayu.budgets.pricing import ModelPrice, PriceBook
 from cayu.budgets.run_limits import RunLimits
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import IncompleteSessionRecoveryRequest, RunRequest, SessionQuery
+from cayu.sessions.base import IncompleteSessionRecoveryRequest, RunRequest
 from cayu.sessions.invocation import InvocationOriginClaim
+from cayu.sessions.queries import SessionQuery
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
 from cayu.tools.subagents import SubagentSpec, SubagentTool

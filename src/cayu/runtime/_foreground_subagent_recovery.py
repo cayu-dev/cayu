@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 from cayu.runtime._tool_effect_state import ToolEffectReconciliationRequired
 from cayu.runtime.tool_effects import _bounded_text
-from cayu.sessions.base import MAX_SESSION_ID_BYTES
+from cayu.sessions.records import MAX_SESSION_ID_BYTES
 from cayu.tools.base import ToolResult
 
 if TYPE_CHECKING:

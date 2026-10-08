@@ -86,7 +86,7 @@ class TaskGroupInvocationObligation(BaseModel):
     @field_validator("session_id")
     @classmethod
     def validate_session_id(cls, value: str) -> str:
-        from cayu.sessions.base import _require_bounded_session_id
+        from cayu.sessions.records import _require_bounded_session_id
 
         return _require_bounded_session_id(
             require_durable_clean_nonblank(value, "session_id"), "session_id"

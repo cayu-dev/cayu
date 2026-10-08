@@ -277,8 +277,6 @@ from cayu.sessions.base import (
     SessionModelCompletionStageConflict,
     SessionModelCompletionStageIncomplete,
     SessionOperationPublication,
-    SessionOrder,
-    SessionQuery,
     SessionQueuedMessage,
     SessionQueuedMessagesPending,
     SessionRuntimePublicationConflict,
@@ -310,6 +308,7 @@ from cayu.sessions.invocation import (
     InvocationOriginTrust,
     SessionExecutionSource,
 )
+from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.terminal_evidence import (
     TerminalSessionEvidenceError,

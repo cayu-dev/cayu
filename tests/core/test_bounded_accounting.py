@@ -15,10 +15,10 @@ from cayu.sessions.base import (
     EventQuery,
     InMemorySessionStore,
     RunRequest,
-    SessionAggregateFilter,
     SessionIdentity,
     UsageRollupQuery,
 )
+from cayu.sessions.queries import SessionAggregateFilter
 from cayu.storage import SQLiteSessionStore
 
 

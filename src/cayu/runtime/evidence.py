@@ -44,14 +44,8 @@ from cayu.runtime._memory_attribution import (
 )
 from cayu.runtime._memory_evidence import memory_evidence_key
 from cayu.runtime.tool_effects import _bounded_text, _copy_string_map
-from cayu.sessions.base import (
-    EventOrder,
-    EventQuery,
-    EventQueryResultTooLarge,
-    SessionLineageQuery,
-    SessionOrder,
-    SessionQuery,
-)
+from cayu.sessions.base import EventOrder, EventQuery, EventQueryResultTooLarge, SessionLineageQuery
+from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import EventRecord, Session, SessionStatus
 from cayu.tasks.topology import TaskTopologyQuery
 from cayu.tools.inference import validate_inference_purpose

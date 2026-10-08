@@ -34,7 +34,7 @@ from cayu.memory.evidence import (
     decode_recall_evidence_cursor,
     encode_recall_evidence_cursor,
 )
-from cayu.sessions.base import MAX_SESSION_ID_BYTES
+from cayu.sessions.records import MAX_SESSION_ID_BYTES
 from cayu.storage.memory import (
     MAX_KNOWLEDGE_CHUNK_ID_BYTES,
     MAX_KNOWLEDGE_CHUNK_INDEX,

@@ -13,13 +13,8 @@ from cayu.messages import Message
 from cayu.observability.events import EventSink
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime._event_projection import public_event_id, public_event_sequence
-from cayu.sessions.base import (
-    EventQuery,
-    InMemorySessionStore,
-    RunRequest,
-    SessionIdentity,
-    SessionQuery,
-)
+from cayu.sessions.base import EventQuery, InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import EventRecord, SessionStatus
 from cayu.vaults import SecretRedactor
 

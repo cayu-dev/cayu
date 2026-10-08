@@ -20,9 +20,8 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     RunRequest,
     SessionIdentity,
-    SessionListResult,
-    SessionQuery,
 )
+from cayu.sessions.queries import MAX_SESSION_LIST_CURSOR_BYTES, SessionListResult, SessionQuery
 from cayu.sessions.records import EventRecord, SessionStatus
 
 
@@ -375,7 +374,7 @@ def test_incomplete_session_recovery_preserves_opaque_store_cursor() -> None:
     async def scenario() -> None:
         # Exercise the full lower-layer cursor budget with characters that would
         # expand if copied directly into the outer JSON envelope.
-        opaque_cursor = '\\"' * (sessions_module.MAX_SESSION_LIST_CURSOR_BYTES // 2)
+        opaque_cursor = '\\"' * (MAX_SESSION_LIST_CURSOR_BYTES // 2)
 
         class OpaqueCursorRecoveryStore(InMemorySessionStore):
             invocation_lifecycle_command_version = 1

@@ -32,8 +32,8 @@ from cayu.sessions._execution_profile_checkpoint import (
 )
 from cayu.sessions._pending_tool_round import PendingToolRound
 from cayu.sessions._tool_effect_intent import ToolEffectIntent
-from cayu.sessions.base import MAX_SESSION_ID_BYTES, ResumeRequest, SessionRunFenced
-from cayu.sessions.records import Session
+from cayu.sessions.base import ResumeRequest, SessionRunFenced
+from cayu.sessions.records import MAX_SESSION_ID_BYTES, Session
 
 FOREGROUND_CHILD_WAIT_KEY = "foreground_child_wait"
 FOREGROUND_CHILD_TERMINAL_KEY = "foreground_child_terminal"

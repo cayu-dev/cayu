@@ -711,8 +711,6 @@ from cayu.sessions.base import (
     SessionModelTransition,
     SessionOperationInitializer,
     SessionOperationPublication,
-    SessionOrder,
-    SessionQuery,
     SessionQueuedMessagesPending,
     SessionRunFenced,
     SessionRuntimeIdentity,
@@ -809,6 +807,7 @@ from cayu.sessions.invocation import SessionExecutionSource, SessionInvocationBi
 from cayu.sessions.invocation_release import (
     InvocationReleaseEvidence,
 )
+from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import RUNTIME_BUILD_PROVENANCE_METADATA_KEY, Session, SessionStatus
 from cayu.sessions.recovery import (
     RecoveryBlockerCode,

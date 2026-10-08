@@ -12,7 +12,8 @@ from cayu.sessions.access import (
     SessionAccessScope,
     SessionAccessSelector,
 )
-from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity, SessionQuery
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.queries import SessionQuery
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

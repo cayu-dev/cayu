@@ -40,10 +40,9 @@ from cayu.sessions.base import (
     SessionLineageOrigin,
     SessionLineageQuery,
     SessionLineageResult,
-    SessionOrder,
-    SessionQuery,
     parse_session_input_contract_evidence,
 )
+from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import RunnerObservedEventIdentity, Session, SessionStatus
 from cayu.sessions.terminal_evidence import (
     TerminalSessionEvidence,

@@ -81,12 +81,9 @@ from cayu.sessions.base import (
     PendingActionKind,
     PendingActionQuery,
     RunRequest,
-    SessionDebugState,
     SessionIdentity,
     SessionLineageQuery,
     SessionOperationPublication,
-    SessionOrder,
-    SessionQuery,
     SessionRunFenced,
     SessionTopologyCycle,
     SessionTopologyQuery,
@@ -99,6 +96,7 @@ from cayu.sessions.invocation import (
     InvocationOriginTrust,
     SessionExecutionSource,
 )
+from cayu.sessions.queries import SessionDebugState, SessionOrder, SessionQuery
 from cayu.sessions.records import Session, SessionStatus
 from cayu.support_bundles import (
     CollectorDisposition,

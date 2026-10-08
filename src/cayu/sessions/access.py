@@ -14,14 +14,12 @@ from typing import Literal
 from cayu._resource_access_binding import ResourceExecutionBinding
 from cayu._resource_access_errors import ResourceAccessDenied as SessionAccessDenied
 from cayu._validation import copy_label_map
-from cayu.sessions.base import (
+from cayu.sessions.base import RunRequest, SessionIdentity, SessionStore
+from cayu.sessions.queries import (
     LabelSelectorOperator,
     LabelSelectorRequirement,
-    RunRequest,
-    SessionIdentity,
     SessionListResult,
     SessionQuery,
-    SessionStore,
     copy_session_query,
 )
 from cayu.sessions.records import Session

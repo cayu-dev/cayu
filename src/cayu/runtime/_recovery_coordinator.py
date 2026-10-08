@@ -427,7 +427,6 @@ from cayu.sessions._terminal_evidence import (
 from cayu.sessions.base import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
     MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES,
-    MAX_SESSION_LIST_CURSOR_BYTES,
     RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS,
     ActiveModelCompletionStage,
     CheckpointTransform,
@@ -443,8 +442,6 @@ from cayu.sessions.base import (
     ModelCompletionStage,
     RuntimePublicationReceipt,
     SessionOperationPublication,
-    SessionOrder,
-    SessionQuery,
     SessionRunFenced,
     SessionRuntimePublicationConflict,
     SessionStatusConflict,
@@ -485,6 +482,7 @@ from cayu.sessions.invocation import (
     SessionInvocationBinding,
     inherited_session_invocation,
 )
+from cayu.sessions.queries import MAX_SESSION_LIST_CURSOR_BYTES, SessionOrder, SessionQuery
 from cayu.sessions.records import EventRecord, Session, SessionStatus
 from cayu.tasks._terminalization import _terminalize_claimed_task
 from cayu.tasks.dispatch import (

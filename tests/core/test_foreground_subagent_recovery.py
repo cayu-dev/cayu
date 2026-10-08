@@ -25,8 +25,8 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     ResumeRequest,
     RunRequest,
-    SessionQuery,
 )
+from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionStatus
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore

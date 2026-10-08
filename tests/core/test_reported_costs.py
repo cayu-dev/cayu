@@ -5,12 +5,8 @@ import pytest
 
 from cayu import Event, EventType, Message, RunRequest
 from cayu.budgets.reported import ReportedCostObservation, reported_cost_observation
-from cayu.sessions.base import (
-    InMemorySessionStore,
-    SessionAggregateFilter,
-    SessionIdentity,
-    UsageRollupQuery,
-)
+from cayu.sessions.base import InMemorySessionStore, SessionIdentity, UsageRollupQuery
+from cayu.sessions.queries import SessionAggregateFilter
 from cayu.storage.sqlite import SQLiteSessionStore
 
 pytestmark = pytest.mark.anyio

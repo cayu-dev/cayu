@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from cayu.sessions.base import EventOrder, EventQuery, SessionQuery, SessionStore, copy_event_query
+from cayu.sessions.base import EventOrder, EventQuery, SessionStore, copy_event_query
+from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import EventRecord, Session
 
 

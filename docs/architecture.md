@@ -427,7 +427,8 @@ single composition root.
 ### Session records and terminal evidence
 
 `sessions/records.py` owns session, event and transcript records, session status,
-runner-observed event identities, and session copy and provenance readers.
+runner-observed event identities, the pending-action session projection, session ID
+bounds, and session copy and provenance readers.
 Applications can construct and validate these values without loading concrete
 stores. Existing public imports resolve to these same definitions.
 
@@ -437,6 +438,14 @@ the run-operation marker parser and terminal-event classifier in
 `sessions/_terminal_evidence.py`. These rules can validate a snapshot independently
 of a store; native stores retain authorization, locking, queries and atomic reads.
 Runtime retains terminal publication and recovery orchestration.
+
+### Session query contracts
+
+`sessions/queries.py` owns session listing and aggregate filters, label selectors,
+ordering, detached query copies and keyset cursors. It composes the records owner
+and can filter and page session records without a store. Public imports resolve
+to these definitions. Native stores retain authorization, event-aware filtering,
+clock sampling, locking, SQL and transactions.
 
 ### Session checkpoint evidence
 

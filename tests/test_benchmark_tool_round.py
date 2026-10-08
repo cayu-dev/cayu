@@ -16,7 +16,8 @@ from scripts.benchmark_tool_round import (
 )
 
 import cayu._validation as validation
-from cayu.sessions.base import InMemorySessionStore, SessionQuery
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.queries import SessionQuery
 
 
 @pytest.mark.parametrize("fail", [False, True])

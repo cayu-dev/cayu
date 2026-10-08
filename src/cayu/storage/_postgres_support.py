@@ -5,15 +5,12 @@ from datetime import UTC, datetime
 from typing import Any
 
 from cayu._validation import copy_label_map
-from cayu.sessions.base import (
-    TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
-    PendingActionSession,
-    SessionOrder,
-    SessionTopologyNode,
-)
+from cayu.sessions.base import TRANSCRIPT_SEARCH_TOKENIZER_VERSION, SessionTopologyNode
 from cayu.sessions.invocation import SessionInvocation, TaskInvocation
+from cayu.sessions.queries import SessionOrder
 from cayu.sessions.records import (
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
+    PendingActionSession,
     Session,
     SessionStatus,
     runtime_build_provenance_from_session_metadata,

@@ -44,8 +44,8 @@ from cayu.sessions.base import (
     IncompleteSessionRecoveryRequest,
     ResumeRequest,
     RunRequest,
-    SessionQuery,
 )
+from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.recovery import (
     RecoveryDecision,

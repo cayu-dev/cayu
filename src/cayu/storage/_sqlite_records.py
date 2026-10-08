@@ -10,17 +10,17 @@ from uuid import uuid4
 
 from cayu._validation import copy_durable_json_object, copy_label_map
 from cayu.sessions.base import (
-    PendingActionSession,
     RunRequest,
     SessionIdentity,
-    SessionOrder,
     session_instance_id_for_run_request,
     session_invocation_for_run_request,
     session_metadata_for_creation,
 )
 from cayu.sessions.invocation import SessionInvocation, TaskInvocation
+from cayu.sessions.queries import SessionOrder
 from cayu.sessions.records import (
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
+    PendingActionSession,
     Session,
     SessionStatus,
     runtime_build_provenance_from_session_metadata,

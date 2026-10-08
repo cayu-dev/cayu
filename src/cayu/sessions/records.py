@@ -268,3 +268,88 @@ def runtime_build_provenance_from_session_metadata(
         )
     except Exception as exc:
         raise ValueError("Session runtime build-provenance metadata is malformed.") from exc
+
+
+MAX_SESSION_ID_BYTES = 2048
+
+
+def _require_bounded_session_id(value: str, field_name: str) -> str:
+    value = require_clean_nonblank(value, field_name)
+    if len(value.encode("utf-8")) > MAX_SESSION_ID_BYTES:
+        raise ValueError(f"`{field_name}` must not exceed {MAX_SESSION_ID_BYTES} UTF-8 bytes.")
+    return value
+
+
+class PendingActionSession(BaseModel):
+    """Bounded session identity embedded in pending-action query results."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    instance_id: str | None = None
+    agent_name: str
+    provider_name: str
+    model: str
+    parent_session_id: str | None = None
+    causal_budget_id: str
+    runtime_name: str
+    runtime_version: str | None = None
+    runtime_build_provenance: RuntimeBuildProvenance = Field(
+        default_factory=legacy_runtime_build_provenance
+    )
+    environment_name: str | None = None
+    status: SessionStatus
+    created_at: datetime
+    updated_at: datetime
+    labels: dict[str, str] = Field(default_factory=dict)
+
+    @classmethod
+    def from_session(cls, session: Session) -> PendingActionSession:
+        return cls(
+            id=session.id,
+            instance_id=session.instance_id,
+            agent_name=session.agent_name,
+            provider_name=session.provider_name,
+            model=session.model,
+            parent_session_id=session.parent_session_id,
+            causal_budget_id=session.causal_budget_id,
+            runtime_name=session.runtime_name,
+            runtime_version=session.runtime_version,
+            runtime_build_provenance=session.runtime_build_provenance,
+            environment_name=session.environment_name,
+            status=session.status,
+            created_at=session.created_at,
+            updated_at=session.updated_at,
+            labels=session.labels,
+        )
+
+    @field_validator(
+        "id",
+        "agent_name",
+        "provider_name",
+        "model",
+        "causal_budget_id",
+        "runtime_name",
+    )
+    @classmethod
+    def validate_nonblank_fields(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("instance_id", "parent_session_id", "environment_name", "runtime_version")
+    @classmethod
+    def validate_optional_nonblank_fields(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("created_at", "updated_at")
+    @classmethod
+    def normalize_timestamps(cls, value: datetime, info) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(f"{info.field_name} must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @field_validator("labels", mode="before")
+    @classmethod
+    def copy_labels(cls, value: dict[str, str]) -> dict[str, str]:
+        return copy_label_map(value, "labels")

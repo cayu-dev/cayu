@@ -18,8 +18,8 @@ from cayu.sessions.base import (
     InterruptSessionRequest,
     PersistedEventSideEffectStatus,
     RunRequest,
-    SessionQuery,
 )
+from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy

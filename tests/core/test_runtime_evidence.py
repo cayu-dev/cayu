@@ -33,10 +33,9 @@ from cayu.sessions.base import (
     SessionIdentity,
     SessionLineageNode,
     SessionLineageResult,
-    SessionListResult,
-    SessionQuery,
     SessionStore,
 )
+from cayu.sessions.queries import SessionListResult, SessionQuery
 from cayu.sessions.records import SessionStatus
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore

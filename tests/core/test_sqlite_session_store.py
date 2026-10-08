@@ -31,11 +31,9 @@ from cayu.sessions.base import (
     PendingActionQuery,
     ResumeRequest,
     RunRequest,
-    SessionAggregateFilter,
     SessionIdentity,
     SessionInspectionSummary,
     SessionMessageDeliveryMode,
-    SessionQuery,
     TranscriptQuery,
     UsageRollupQuery,
     fork_session_invocation,
@@ -44,6 +42,7 @@ from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
+from cayu.sessions.queries import SessionAggregateFilter, SessionQuery
 from cayu.sessions.records import RUNTIME_BUILD_PROVENANCE_METADATA_KEY, Session, SessionStatus
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _sqlite_connection as sqlite_connection

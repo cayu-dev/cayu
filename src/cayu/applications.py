@@ -596,7 +596,6 @@ from cayu.sessions.base import (
     RunRequest,
     SessionMessageActionResult,
     SessionMessageInspection,
-    SessionQuery,
     SessionRunFenced,
     SessionStatusConflict,
     SessionStore,
@@ -646,6 +645,7 @@ from cayu.sessions.invocation import (
     SessionInvocationBinding,
     copy_session_invocation_binding,
 )
+from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import EventRecord, Session, SessionStatus, copy_session
 from cayu.sessions.recovery import (
     RecoveryExecutionRequest,

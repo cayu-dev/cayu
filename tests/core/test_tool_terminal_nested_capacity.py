@@ -11,7 +11,8 @@ from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionQuery
+from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.queries import SessionQuery
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.dispatch import TaskStoreDispatcher
 from cayu.tasks.memory import InMemoryTaskStore

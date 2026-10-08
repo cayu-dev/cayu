@@ -23,7 +23,8 @@ import cayu.cli.doctor as doctor_cli
 from cayu.cli import main
 from cayu.cli.doctor import _run_bounded_worker
 from cayu.events import Event
-from cayu.sessions.base import MAX_SESSION_ID_BYTES, RunRequest, SessionIdentity
+from cayu.sessions.base import RunRequest, SessionIdentity
+from cayu.sessions.records import MAX_SESSION_ID_BYTES
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.support_bundles import (
     DEFAULT_SUPPORT_BUNDLE_LIMITS,

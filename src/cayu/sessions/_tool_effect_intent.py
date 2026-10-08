@@ -7,7 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator
 
 from cayu.runtime.tool_effects import _bounded_text
-from cayu.sessions.base import MAX_SESSION_ID_BYTES
+from cayu.sessions.records import MAX_SESSION_ID_BYTES
 
 
 class ToolEffectIntent(BaseModel):

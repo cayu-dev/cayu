@@ -285,7 +285,6 @@ from cayu.sessions.base import (
     ResumeRequest,
     RunRequest,
     SessionIdentity,
-    SessionQuery,
     SessionRunFenced,
     SessionRuntimePublicationConflict,
     SessionStatusConflict,
@@ -308,6 +307,7 @@ from cayu.sessions.checkpoints import (
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )
 from cayu.sessions.invocation import InvocationOriginTrust, SessionExecutionSource
+from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import EventRecord, Session, SessionStatus
 from cayu.sessions.recovery import (
     RecoveryBlockerCode,

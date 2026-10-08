@@ -21,13 +21,8 @@ from cayu.approvals.tools import ResolutionActor, resolution_actor_payload
 from cayu.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.sessions._terminal_evidence import interruption_request_id_from_payload
-from cayu.sessions.base import (
-    InterruptSessionRequest,
-    SessionOrder,
-    SessionQuery,
-    SessionStore,
-    _deactivate_session_run_fence,
-)
+from cayu.sessions.base import InterruptSessionRequest, SessionStore, _deactivate_session_run_fence
+from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import Session, SessionStatus
 from cayu.vaults import SecretRedactor
 

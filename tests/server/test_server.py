@@ -122,10 +122,10 @@ from cayu.sessions.base import (
     ResumeRequest,
     RunRequest,
     SessionIdentity,
-    SessionListResult,
     run_request_with_runtime_generated_authority,
 )
 from cayu.sessions.checkpoints import CURRENT_CHECKPOINT_SCHEMA_VERSION
+from cayu.sessions.queries import SessionListResult
 from cayu.sessions.records import EventRecord, SessionStatus
 from cayu.sessions.recovery import RecoveryExecutionRequest, RecoveryPlan
 from cayu.storage.memory import (

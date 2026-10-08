@@ -52,8 +52,6 @@ from cayu.sessions._session_continuation_store import (
 )
 from cayu.sessions.base import (
     DeferredInteractionInput,
-    SessionOrder,
-    SessionQuery,
     SessionStore,
     restore_persisted_event_authority,
 )
@@ -65,6 +63,7 @@ from cayu.sessions.exports import (
     validate_export_boundary,
     validate_export_ownership,
 )
+from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import Session, TranscriptRecord
 from cayu.tasks.queries import TaskOrder, TaskQuery
 from cayu.tasks.records import Task

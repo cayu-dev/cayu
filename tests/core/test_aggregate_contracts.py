@@ -41,13 +41,12 @@ from cayu.providers import bedrock_billing_identity, completed_bedrock_billing_i
 from cayu.sessions.base import (
     InMemorySessionStore,
     RunRequest,
-    SessionAggregateFilter,
     SessionIdentity,
     SessionOperationalSnapshot,
-    SessionStatusCounts,
     SessionStore,
     UsageRollupQuery,
 )
+from cayu.sessions.queries import SessionAggregateFilter, SessionStatusCounts
 from cayu.sessions.records import EventRecord, SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.creation import TaskCreate
@@ -3407,7 +3406,7 @@ def test_postgres_aggregates_match_in_memory_reference(postgres_dsn: str) -> Non
         assert unclean_metrics.billing_identity is not None
         assert unclean_metrics.billing_identity.request_evidence == {}
 
-        from cayu.sessions.base import session_query_from_aggregate_filter
+        from cayu.sessions.queries import session_query_from_aggregate_filter
         from cayu.storage import _postgres_aggregates, _session_store_sql
         from cayu.storage.postgres import _SQL_DIALECT
 

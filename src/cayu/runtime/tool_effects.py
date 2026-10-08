@@ -223,7 +223,7 @@ class ToolEffectReconciliationContext(BaseModel):
     @field_validator("*", mode="after")
     @classmethod
     def validate_identity(cls, value, info):
-        from cayu.sessions.base import MAX_SESSION_ID_BYTES
+        from cayu.sessions.records import MAX_SESSION_ID_BYTES
 
         if isinstance(value, str):
             return _bounded_text(

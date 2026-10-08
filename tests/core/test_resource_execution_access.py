@@ -204,7 +204,7 @@ def test_revoked_task_never_calls_handler_and_releases_worker_authority():
 
 
 def test_foreground_delegation_preserves_authority():
-    from cayu.sessions.base import SessionQuery
+    from cayu.sessions.queries import SessionQuery
     from cayu.tools.subagents import SubagentSpec, SubagentTool
 
     async def run():
@@ -511,7 +511,8 @@ def test_scoped_foreground_child_pause_without_checkpoint_grant(tmp_path, backen
 
     from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
     from cayu.approvals.user_input import UserInputResponse
-    from cayu.sessions.base import InMemorySessionStore, SessionQuery
+    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.queries import SessionQuery
     from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
     from cayu.tools.subagents import SubagentSpec, SubagentTool
     from cayu.tools.user_input import UserInputTool

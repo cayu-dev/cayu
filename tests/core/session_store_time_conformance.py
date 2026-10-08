@@ -15,10 +15,10 @@ from cayu.sessions.base import (
     RunRequest,
     SessionIdentity,
     SessionOperationPublication,
-    SessionQuery,
     SessionRunFenced,
     SessionStore,
 )
+from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionStatus
 
 

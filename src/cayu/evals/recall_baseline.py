@@ -54,9 +54,9 @@ from cayu.sessions.base import (
     TRANSCRIPT_SEARCH_MIN_MAX_BYTES,
     RunRequest,
     SessionIdentity,
-    SessionQuery,
     SessionStore,
 )
+from cayu.sessions.queries import SessionQuery
 
 RECALL_BASELINE_CORPUS_SCHEMA_VERSION = "cayu.recall_baseline_corpus.v2"
 RECALL_BASELINE_RESULT_SCHEMA_VERSION = "cayu.recall_baseline_result.v2"

@@ -25,13 +25,9 @@ from cayu.providers.base import ModelStreamEvent
 from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.sessions.base import (
-    IncompleteSessionRecoveryRequest,
-    InterruptSessionRequest,
-    RunRequest,
-    SessionQuery,
-)
+from cayu.sessions.base import IncompleteSessionRecoveryRequest, InterruptSessionRequest, RunRequest
 from cayu.sessions.execution import SessionExecutionConfig
+from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import RecoveryPlanRequest, RecoveryPlanSelection
 from cayu.storage.sqlite import SQLiteSessionStore

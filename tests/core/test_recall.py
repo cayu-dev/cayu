@@ -41,12 +41,12 @@ from cayu.memory.retrieval import (
 )
 from cayu.messages import Message
 from cayu.sessions.base import (
-    MAX_SESSION_ID_BYTES,
     InMemorySessionStore,
     RunRequest,
     SessionIdentity,
     TranscriptSearchQuery,
 )
+from cayu.sessions.records import MAX_SESSION_ID_BYTES
 from cayu.storage.memory import (
     InMemoryEmbeddingKnowledgeStore,
     InMemoryKnowledgeStore,
