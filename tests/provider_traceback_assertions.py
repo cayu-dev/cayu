@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import traceback
+from pathlib import Path
+
+import cayu
+
+_CAYU_PACKAGE_ROOT = str(Path(cayu.__file__).resolve().parent).replace("\\", "/")
 
 
 def is_cayu_source_filename(filename: str) -> bool:
-    """Return whether a traceback filename is below ``src/cayu`` on any OS."""
+    """Recognize the active installation and source-checkout frames on any OS."""
 
-    parts = tuple(part for part in filename.replace("\\", "/").split("/") if part)
+    normalized = filename.replace("\\", "/")
+    if normalized.startswith(_CAYU_PACKAGE_ROOT + "/"):
+        return True
+    parts = tuple(part for part in normalized.split("/") if part)
     return any(parts[index : index + 2] == ("src", "cayu") for index in range(len(parts) - 1))
 
 

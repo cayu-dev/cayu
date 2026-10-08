@@ -15,6 +15,7 @@ import pytest
 from tests.core.test_tool_completion import CrashStore, FinalTool, app_for, call, request
 from tests.core.test_tool_round_publication_failure_matrix import _TwoCallProvider
 
+import cayu
 from cayu import EventType, IncompleteSessionRecoveryRequest, SessionStatus, SQLiteSessionStore
 
 
@@ -24,6 +25,7 @@ from cayu import EventType, IncompleteSessionRecoveryRequest, SessionStatus, SQL
 @pytest.mark.parametrize("boundary", ["tool-event", "tool-publication", "completion"])
 def test_final_tool_success_survives_sigkill(backend, boundary, tmp_path, request):
     configuration = {
+        "cayu_origin": str(Path(cayu.__file__).resolve()),
         "backend": backend,
         "boundary": boundary,
         "directory": str(tmp_path),
@@ -41,7 +43,16 @@ def test_final_tool_success_survives_sigkill(backend, boundary, tmp_path, reques
             text=True,
             timeout=60,
             cwd=Path(__file__).resolve().parents[2],
-            env={**os.environ, "PYTHONPATH": "src:."},
+            env={
+                **os.environ,
+                "PYTHONPATH": os.pathsep.join(
+                    (
+                        str(Path(cayu.__file__).resolve().parent.parent),
+                        str(Path(__file__).resolve().parents[2]),
+                        os.environ.get("PYTHONPATH", ""),
+                    )
+                ),
+            },
             check=False,
         )
 
@@ -69,6 +80,7 @@ def record(path: Path, value: str) -> None:
 
 
 async def worker(configuration, mode):
+    assert str(Path(cayu.__file__).resolve()) == configuration["cayu_origin"]
     directory = Path(configuration["directory"])
 
     class ProcessLoss(CrashStore):

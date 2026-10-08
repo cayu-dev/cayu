@@ -1,4 +1,5 @@
 {
+    "tests/test_provider_traceback_assertions.py::test_traceback_retention_check_inspects_the_active_installation": 0.00041333300760015845,
     "tests/core/test_tool_invocation_composition.py::test_invocation_parts_work_without_round_or_application_owners[cayu.runtime._tool_invocation.invocation]": 1.312,
     "tests/core/test_tool_invocation_composition.py::test_invocation_parts_work_without_round_or_application_owners[cayu.workspaces.checkpoint_lifecycle]": 1.208,
     "tests/core/test_tool_invocation_composition.py::test_invocation_parts_work_without_round_or_application_owners[cayu.runtime._tool_execution]": 1.12,
