@@ -1,6 +1,10 @@
 # Release notes
 
-## Unreleased
+## v0.10.0
+
+Cayu adds provider-backed completion verification and independent completion
+evaluations, improves crash recovery, and supports explicit Cloud storage
+migration acknowledgements.
 
 - After recovery closes a tool call that started but never finished, the model now
   sees that call's redacted arguments when the round resolved no invocation secrets
@@ -29,7 +33,7 @@
   otherwise. Without the flag, deploy requests and their idempotency keys are
   unchanged. Rerunning `deploy` with the flag for unchanged source adds the
   acknowledgement to the release Cloud refused. See
-  [breaking storage revisions](cayu-cloud.md#breaking-storage-revisions).
+  [breaking storage revisions](https://github.com/cayu-dev/cayu/blob/v0.10.0/docs/cayu-cloud.md#breaking-storage-revisions).
 - `cayu cloud deploy` and `deployment wait` report Cloud's breaking-migration
   publication failures (`storage_breaking_acknowledgement_required`,
   `storage_newer_than_release`, `storage_writers_not_stopped` and
@@ -43,7 +47,7 @@
   hint, instead of falling back to the generic `deployment_failed` result. The phase
   and stage are shown as Cloud sent them, or `unknown` when missing, not a lowercase
   identifier, or unsafe to print. `smoke_test` is a known stage for release smoke-test
-  failures. See [the Cayu Cloud CLI guide](cayu-cloud.md).
+  failures. See [the Cayu Cloud CLI guide](https://github.com/cayu-dev/cayu/blob/v0.10.0/docs/cayu-cloud.md).
 - Provider-backed (model-judge) completion verifiers. Register a
   `ProviderCompletionVerifier` with `CayuApp.register_completion_verifier(...)`
   for a work contract whose verifier reference has kind `provider`. The runtime
@@ -58,7 +62,7 @@
   `CayuApp.list_completion_verifier_dispatches(...)` and
   `summarize_completion_verifier_dispatches(...)` report verifier usage and cost
   separately from the worker session. See
-  [provider-backed completion verifiers](runtime-contracts.md#provider-backed-completion-verifiers).
+  [provider-backed completion verifiers](https://github.com/cayu-dev/cayu/blob/v0.10.0/docs/runtime-contracts.md#provider-backed-completion-verifiers).
 
 - Independent completion evaluations. A work contract can declare an
   `evaluation` policy naming an evaluator registered with
@@ -71,8 +75,12 @@
   Evaluator failures and timeouts are typed execution failures, never rejected
   candidates. `CayuApp.list_completion_evaluation_runs(...)` reports runs and
   evaluator-reported usage separately. See
-  [independent completion evaluations](runtime-contracts.md#independent-completion-evaluations).
+  [independent completion evaluations](https://github.com/cayu-dev/cayu/blob/v0.10.0/docs/runtime-contracts.md#independent-completion-evaluations).
 
+- Fix session deletion ordering for completion evaluations and verifier dispatches.
+- Report retained verified-worker ownership when asynchronous shutdown is cancelled.
+
+The server contract remains **48**. Upgrade the dashboard with the server.
 Storage revision is **117** (previously **115**). Revisions 116 and 117 are
 additive: they add the `cayu_completion_verifier_dispatches` and
 `cayu_completion_evaluation_runs` tables. Task stores now require revision 117,
@@ -83,8 +91,8 @@ against a migrated database.
 
 The v0.9.0 storage migration from revision 114 to 115 is breaking. For an Agent on
 Cayu Cloud with an existing database, Cloud runs that migration when it publishes
-the first 0.9.x release, and refuses the publication until it is acknowledged. Deploy
-with `cayu cloud deploy --acknowledge-breaking 115`. Cloud stops the previous release
+the first release at 0.9.0 or later, and refuses publication until it is
+acknowledged. Deploy with `cayu cloud deploy --acknowledge-breaking 115`. Cloud stops the previous release
 during the migration, and 0.8.x releases can't be rolled back to afterwards. A new
 Agent with an empty database needs no acknowledgement.
 
