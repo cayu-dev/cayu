@@ -40,11 +40,11 @@ from cayu.tasks.base import (
     TaskCancellationReconciliationEvidence,
     TaskCancellationReconciliationOutcome,
     TaskCancellationReconciliationRequest,
-    TaskClaimLost,
     TaskQuery,
     TaskStatus,
-    TaskTerminalizationConflict,
 )
+from cayu.tasks.records import TaskClaimLost
+from cayu.tasks.terminalization import TaskTerminalizationConflict
 from cayu.tasks.worker import complete_managed_task, run_task_worker
 
 

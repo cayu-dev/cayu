@@ -684,7 +684,7 @@ async def _prepare_current_local_execution_attempt(
 ) -> tuple[LocalExecutionAttemptAuthority, LocalExecutionAttemptRecord]:
     """Bind preparation to a current claim without crossing task lineage."""
 
-    from cayu.tasks.base import TaskClaimLost
+    from cayu.tasks.records import TaskClaimLost
 
     original = authority
     current = authority

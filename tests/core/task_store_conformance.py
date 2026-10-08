@@ -14,16 +14,15 @@ from tests.core.task_invocation_fixtures import (
 from cayu.sessions.invocation import TaskExecutionSource
 from cayu.tasks.base import (
     Task,
-    TaskClaimLost,
     TaskCreate,
     TaskQuery,
     TaskStatus,
     TaskStore,
-    TaskTerminalizationRequest,
-    TaskTerminalKind,
-    interrupted_task_handoff_request,
     task_create_with_runtime_invocation,
 )
+from cayu.tasks.handoff import interrupted_task_handoff_request
+from cayu.tasks.records import TaskClaimLost
+from cayu.tasks.terminalization import TaskTerminalizationRequest, TaskTerminalKind
 
 
 async def assert_task_contract_queue_filter_conformance(store: TaskStore) -> None:

@@ -101,13 +101,10 @@ from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.base import (
     InMemoryTaskStore,
     Task,
-    TaskClaimLost,
     TaskCreate,
     TaskQuery,
     TaskStatus,
     TaskStore,
-    TaskTerminalizationRequest,
-    TaskTerminalKind,
     task_create_with_runtime_invocation,
 )
 from cayu.tasks.dispatch import (
@@ -126,6 +123,8 @@ from cayu.tasks.dispatch import (
     _QueuedDispatchSettlementState,
     copy_dispatch_request,
 )
+from cayu.tasks.records import TaskClaimLost
+from cayu.tasks.terminalization import TaskTerminalizationRequest, TaskTerminalKind
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling
 from cayu.tools.grants import TargetedToolGrant

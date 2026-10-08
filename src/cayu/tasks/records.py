@@ -675,3 +675,15 @@ def _task_retry_attempt_authority_sha256(
         "task_retry_attempt_authority",
     )
     return sha256(material).hexdigest()
+
+
+class TaskClaimLost(ValueError):
+    """A worker no longer owns the active lease required for a task mutation."""
+
+
+def _validate_positive_int(value: int, field_name: str) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{field_name} must be an integer.")
+    if value < 1:
+        raise ValueError(f"{field_name} must be >= 1.")
+    return value

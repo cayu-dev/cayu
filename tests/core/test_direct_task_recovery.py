@@ -208,7 +208,7 @@ def test_direct_task_recovery_rejects_incomplete_or_changed_evidence(
     from uuid import uuid4
 
     from cayu.sessions.recovery import RecoveryBlockerCode
-    from cayu.tasks.base import TaskClaimLost
+    from cayu.tasks.records import TaskClaimLost
 
     async def scenario() -> None:
         path = tmp_path / "state.sqlite"

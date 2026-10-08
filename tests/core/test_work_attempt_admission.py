@@ -104,16 +104,7 @@ from cayu.tasks.admission import (
     work_attempt_admission_prepare_sha256,
     work_attempt_execution_claim_request_sha256,
 )
-from cayu.tasks.base import (
-    InMemoryTaskStore,
-    Task,
-    TaskClaimLost,
-    TaskCreate,
-    TaskStatus,
-    TaskStore,
-    TaskTerminalizationRequest,
-    TaskTerminalKind,
-)
+from cayu.tasks.base import InMemoryTaskStore, Task, TaskCreate, TaskStatus, TaskStore
 from cayu.tasks.contracts import (
     WORK_COMPLETION_DECISION_MAX_BYTES,
     CompletionDecisionApplicationRequest,
@@ -125,6 +116,8 @@ from cayu.tasks.contracts import (
     WorkCompletionConflict,
     WorkEvidenceReference,
 )
+from cayu.tasks.records import TaskClaimLost
+from cayu.tasks.terminalization import TaskTerminalizationRequest, TaskTerminalKind
 from cayu.vaults.redaction import SecretRedactor
 
 

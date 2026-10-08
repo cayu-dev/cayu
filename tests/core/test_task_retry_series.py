@@ -20,7 +20,6 @@ from cayu.storage import migrations as schema_migrations
 from cayu.storage.sqlite import SQLiteTaskStore
 from cayu.tasks.base import (
     InMemoryTaskStore,
-    TaskClaimLost,
     TaskCreate,
     TaskRetryAttemptDisposition,
     TaskRetryAttemptReport,
@@ -36,12 +35,13 @@ from cayu.tasks.base import (
     TaskRetrySettlementRequest,
     TaskRetrySettlementResult,
     TaskStatus,
-    TaskTerminalizationConflict,
     _legacy_task_retry_settlement_request_sha256,
     _task_retry_settlement_request_matches_sha256,
     prepare_task_retry_settlement,
     settle_task_retry_attempt_with_retry,
 )
+from cayu.tasks.records import TaskClaimLost
+from cayu.tasks.terminalization import TaskTerminalizationConflict
 from cayu.tasks.worker import run_task_worker
 from cayu.vaults.redaction import SecretRedactor
 

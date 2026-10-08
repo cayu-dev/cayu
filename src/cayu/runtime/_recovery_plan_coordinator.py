@@ -118,16 +118,10 @@ from cayu.sessions.recovery import (
     RecoveryTaskClaimEvidence,
     StaleRecoveryPlanError,
 )
-from cayu.tasks.base import (
-    TaskClaimLost,
-    TaskInterruptedHandoffReceipt,
-    TaskQuery,
-    TaskStore,
-    TaskTerminalizationRequest,
-    TaskTerminalKind,
-    interrupted_task_handoff_request,
-)
-from cayu.tasks.records import Task, TaskStatus
+from cayu.tasks.base import TaskQuery, TaskStore
+from cayu.tasks.handoff import TaskInterruptedHandoffReceipt, interrupted_task_handoff_request
+from cayu.tasks.records import Task, TaskClaimLost, TaskStatus
+from cayu.tasks.terminalization import TaskTerminalizationRequest, TaskTerminalKind
 from cayu.tools.rounds import ToolRoundRecoveryRequest
 
 RECOVERY_PLAN_EXECUTION_CHECKPOINT_KEY = "recovery_plan_execution"

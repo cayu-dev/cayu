@@ -70,10 +70,7 @@ from cayu.storage._task_group_schema import (
 )
 from cayu.storage._task_scheduling_schema import SQLITE_SCHEDULING_DDL
 from cayu.storage.knowledge_transition import require_empty_knowledge_revision_transition
-from cayu.tasks.base import (
-    TaskInterruptedHandoffRequest,
-    prepare_interrupted_task_handoff,
-)
+from cayu.tasks.handoff import TaskInterruptedHandoffRequest, prepare_interrupted_task_handoff
 from cayu.tasks.records import Task, TaskStatus
 
 _INTERRUPTED_HANDOFF_MIGRATION_BATCH_SIZE = 256

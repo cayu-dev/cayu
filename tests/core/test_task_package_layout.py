@@ -73,7 +73,7 @@ assert not {
 
 
 def test_task_contracts_preserve_public_and_legacy_identity():
-    from cayu.tasks import base, records, topology
+    from cayu.tasks import base, handoff, records, terminalization, topology
 
     public = [importlib.import_module(name) for name in ("cayu", "cayu.tasks", "cayu.runtime")]
     for owner, names in (
@@ -85,6 +85,28 @@ def test_task_contracts_preserve_public_and_legacy_identity():
                 "TaskRetryPolicy",
                 "TaskRetrySeriesDisposition",
                 "TaskRetrySeriesSnapshot",
+                "TaskClaimLost",
+            ),
+        ),
+        (
+            terminalization,
+            (
+                "TaskTerminalKind",
+                "TaskTerminalizationConflict",
+                "TaskTerminalizationRequest",
+                "TaskTerminalizationReceipt",
+                "TaskTerminalizationRetryPolicy",
+                "TaskTerminalizationRetryResult",
+                "TaskTerminalizationUncertain",
+            ),
+        ),
+        (
+            handoff,
+            (
+                "TaskInterruptedHandoffConflict",
+                "TaskInterruptedHandoffRequest",
+                "TaskInterruptedHandoffReceipt",
+                "InterruptedTaskContinuationClaimPage",
             ),
         ),
         (
@@ -108,6 +130,59 @@ def test_task_contracts_preserve_public_and_legacy_identity():
             assert canonical.__module__ == owner.__name__
             # Protocol 0 GLOBAL records represent the original persisted class path.
             assert pickle.loads(f"ccayu.tasks.base\n{name}\n.".encode()) is canonical
+
+
+@pytest.mark.parametrize("public_module", ("cayu", "cayu.tasks", "cayu.runtime"))
+def test_task_terminal_contracts_work_without_loading_stores(public_module):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import importlib
+import pickle
+import sys
+from datetime import UTC, datetime
+from typing import get_type_hints
+
+public = importlib.import_module(sys.argv[1])
+from cayu.tasks.handoff import prepare_interrupted_task_handoff
+from cayu.tasks.terminalization import prepare_task_terminalization
+
+terminal = public.TaskTerminalizationRequest(
+    task_id="task", worker_id="worker", kind="failed", error={"reason": "test"},
+    idempotency_key="terminal",
+)
+detached, digest = prepare_task_terminalization(terminal)
+assert detached == terminal and detached is not terminal and len(digest) == 64
+detached.error["reason"] = "changed"
+assert terminal.error == {"reason": "test"}
+handoff = public.TaskInterruptedHandoffRequest(
+    task_id="task", worker_id="worker", lease_expires_at=datetime(2030, 1, 1, tzinfo=UTC),
+    session_id="session", session_instance_id="12345678-1234-4234-8234-123456789abc",
+    session_run_epoch=1, handoff_id="handoff",
+)
+detached_handoff, digest = prepare_interrupted_task_handoff(handoff)
+assert detached_handoff == handoff and detached_handoff is not handoff and len(digest) == 64
+page = public.InterruptedTaskContinuationClaimPage(
+    scanned_candidates=0, rejected_candidates=0, exhausted=True,
+)
+for value in (terminal, handoff, page):
+    assert type(pickle.loads(pickle.dumps(value))) is type(value)
+    assert get_type_hints(type(value))
+assert not {
+    "cayu.tasks.base", "cayu.tasks.memory", "cayu.tasks.store",
+    "cayu.storage.tasks_sqlite", "cayu.storage.sqlite", "cayu.storage.postgres",
+}.intersection(sys.modules)
+""",
+            public_module,
+        ],
+        env={**os.environ, "PYTHONPATH": str(Path(cayu.__file__).resolve().parent.parent)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_task_records_and_topology_support_detached_pickle_round_trips():

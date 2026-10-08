@@ -86,14 +86,11 @@ from cayu.tasks.base import (
     CompletionDecisionApplicationReceipt,
     InMemoryTaskStore,
     Task,
-    TaskClaimLost,
     TaskCreate,
     TaskQuery,
     TaskRetryPolicy,
     TaskStatus,
     TaskStore,
-    TaskTerminalizationRequest,
-    TaskTerminalKind,
     copy_task,
 )
 from cayu.tasks.contracts import (
@@ -149,6 +146,8 @@ from cayu.tasks.dispatch import (
     DispatchStatus,
     TaskStoreDispatcher,
 )
+from cayu.tasks.records import TaskClaimLost
+from cayu.tasks.terminalization import TaskTerminalizationRequest, TaskTerminalKind
 from cayu.tasks.worker import run_task_worker
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling

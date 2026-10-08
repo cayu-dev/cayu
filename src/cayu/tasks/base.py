@@ -16,6 +16,57 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, cast
 from uuid import uuid4
 
 from cayu._resource_store_surface import model_store_surface
+from cayu.tasks.handoff import (
+    _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
+    _copy_interrupted_task_handoff_receipt,
+    _interrupted_task_continuation_handoff_id_sha256,
+    _replay_interrupted_task_handoff_receipt,
+)
+from cayu.tasks.handoff import (
+    InterruptedTaskContinuationClaimPage as InterruptedTaskContinuationClaimPage,
+)
+from cayu.tasks.handoff import TaskInterruptedHandoffConflict as TaskInterruptedHandoffConflict
+from cayu.tasks.handoff import TaskInterruptedHandoffReceipt as TaskInterruptedHandoffReceipt
+from cayu.tasks.handoff import TaskInterruptedHandoffRequest as TaskInterruptedHandoffRequest
+from cayu.tasks.handoff import interrupted_task_handoff_request as interrupted_task_handoff_request
+from cayu.tasks.handoff import (
+    new_interrupted_task_continuation_handoff_id as new_interrupted_task_continuation_handoff_id,
+)
+from cayu.tasks.handoff import (
+    prepare_interrupted_task_continuation_claim_page as prepare_interrupted_task_continuation_claim_page,
+)
+from cayu.tasks.handoff import prepare_interrupted_task_handoff as prepare_interrupted_task_handoff
+from cayu.tasks.handoff import (
+    prepare_interrupted_task_handoff_candidate_page as prepare_interrupted_task_handoff_candidate_page,
+)
+from cayu.tasks.handoff import (
+    prepare_interrupted_task_handoff_receipt_lookup as prepare_interrupted_task_handoff_receipt_lookup,
+)
+from cayu.tasks.records import TaskClaimLost as TaskClaimLost
+from cayu.tasks.records import _validate_positive_int
+from cayu.tasks.terminalization import (
+    TASK_TERMINALIZATION_IDEMPOTENCY_KEY_MAX_BYTES as TASK_TERMINALIZATION_IDEMPOTENCY_KEY_MAX_BYTES,
+)
+from cayu.tasks.terminalization import TaskTerminalizationConflict as TaskTerminalizationConflict
+from cayu.tasks.terminalization import TaskTerminalizationReceipt as TaskTerminalizationReceipt
+from cayu.tasks.terminalization import TaskTerminalizationRequest as TaskTerminalizationRequest
+from cayu.tasks.terminalization import (
+    TaskTerminalizationRetryPolicy as TaskTerminalizationRetryPolicy,
+)
+from cayu.tasks.terminalization import (
+    TaskTerminalizationRetryResult as TaskTerminalizationRetryResult,
+)
+from cayu.tasks.terminalization import TaskTerminalizationUncertain as TaskTerminalizationUncertain
+from cayu.tasks.terminalization import TaskTerminalKind as TaskTerminalKind
+from cayu.tasks.terminalization import (
+    _replay_task_terminalization_receipt,
+    _task_terminalization_request_matches_sha256,
+    _validate_task_terminalization_idempotency_key,
+)
+from cayu.tasks.terminalization import prepare_task_terminalization as prepare_task_terminalization
+from cayu.tasks.terminalization import (
+    prepare_task_terminalization_receipt_lookup as prepare_task_terminalization_receipt_lookup,
+)
 
 if TYPE_CHECKING:
     from cayu.tasks._group_maintenance import TaskGroupMaintenance
@@ -349,25 +400,6 @@ _TASK_CANCELLATION_REQUESTED_REASON = "cancellation_requested"
 _TASK_RETRY_CANCELLATION_REQUESTED_REASON = "retry_cancellation_requested"
 _TASK_RETRY_RECONCILIATION_EVIDENCE_ID_MAX_BYTES = 256
 _TASK_RETRY_RECONCILIATION_VERSION_MAX_BYTES = 64
-_TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE = 100
-
-
-class TaskClaimLost(ValueError):
-    """A worker no longer owns the active lease required for a task mutation."""
-
-
-class TaskTerminalizationConflict(ValueError):
-    """An idempotency key is already bound to another terminalization intent."""
-
-
-class TaskInterruptedHandoffConflict(ValueError):
-    """An interrupted-task handoff conflicts with current durable authority."""
-
-
-class TaskTerminalKind(StrEnum):
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
 
 
 class TaskRetryAttemptDisposition(StrEnum):
@@ -1335,9 +1367,6 @@ class _TaskCancellationReconciliationRejectionRecord(BaseModel):
         return self
 
 
-TASK_TERMINALIZATION_IDEMPOTENCY_KEY_MAX_BYTES = 256
-
-
 class TaskOrder(StrEnum):
     CREATED_AT_ASC = "created_at_asc"
     CREATED_AT_DESC = "created_at_desc"
@@ -1498,299 +1527,6 @@ class TaskCreate(BaseModel):
             max_bytes=WORK_CONTRACT_TASK_MAX_BYTES,
             max_items=WORK_CONTRACT_TASK_MAX_ITEMS,
         )
-        return self
-
-
-class TaskTerminalizationRequest(BaseModel):
-    """One claim-fenced, replay-safe completion, failure, or cancellation intent."""
-
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
-
-    task_id: str
-    worker_id: str
-    # Exact lease generation returned by claim/heartbeat. A worker name is
-    # reusable and therefore is not sufficient terminalization authority.
-    lease_expires_at: datetime | None = None
-    # Exact interrupted-continuation generation. ``None`` is the authority for
-    # ordinary task claims and direct attachments; recovered continuations must
-    # present the non-null generation returned by their claim.
-    handoff_id: str | None = None
-    kind: TaskTerminalKind
-    result: dict[str, Any] | None = None
-    error: dict[str, Any] | None = None
-    idempotency_key: str
-
-    @field_validator("task_id", "worker_id")
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("handoff_id")
-    @classmethod
-    def validate_handoff_id(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return require_clean_nonblank(value, "handoff_id")
-
-    @field_validator("lease_expires_at")
-    @classmethod
-    def normalize_lease_expires_at(cls, value: datetime | None) -> datetime | None:
-        if value is None:
-            return None
-        return normalize_utc_datetime(value, "lease_expires_at")
-
-    @field_validator("idempotency_key")
-    @classmethod
-    def validate_idempotency_key(cls, value: str) -> str:
-        return _validate_task_terminalization_idempotency_key(value)
-
-    @field_validator("result", "error", mode="before")
-    @classmethod
-    def copy_payload(
-        cls,
-        value: dict[str, Any] | None,
-        info,
-    ) -> dict[str, Any] | None:
-        if value is None:
-            return None
-        return copy_durable_json_object(value, info.field_name)
-
-    @model_validator(mode="after")
-    def validate_terminal_payload(self) -> TaskTerminalizationRequest:
-        if self.kind is TaskTerminalKind.COMPLETED:
-            if self.result is None or self.error is not None:
-                raise ValueError("Completed terminalization requires result and forbids error.")
-        elif self.error is None or self.result is not None:
-            raise ValueError(
-                "Failed or cancelled terminalization requires error and forbids result."
-            )
-        return self
-
-
-class TaskTerminalizationReceipt(BaseModel):
-    """Immutable commit evidence for one task terminalization intent."""
-
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
-
-    task_id: str
-    idempotency_key: str
-    worker_id: str
-    kind: TaskTerminalKind
-    request_sha256: str
-    task: Task
-    committed_at: datetime
-
-    @field_validator("task_id", "worker_id")
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("idempotency_key")
-    @classmethod
-    def validate_idempotency_key(cls, value: str) -> str:
-        return _validate_task_terminalization_idempotency_key(value)
-
-    @field_validator("request_sha256")
-    @classmethod
-    def validate_request_sha256(cls, value: str) -> str:
-        if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
-            raise ValueError("request_sha256 must be a lowercase SHA-256 digest.")
-        return value
-
-    @field_validator("task", mode="before")
-    @classmethod
-    def copy_terminal_task(cls, value: Task) -> Task:
-        if type(value) is not Task:
-            raise TypeError("task must be a Task instance.")
-        return Task.model_validate(value.model_dump(mode="python"))
-
-    @field_validator("committed_at")
-    @classmethod
-    def normalize_committed_at(cls, value: datetime) -> datetime:
-        return normalize_utc_datetime(value, "committed_at")
-
-    @model_validator(mode="after")
-    def validate_receipt_task(self) -> TaskTerminalizationReceipt:
-        expected_status = TaskStatus(self.kind.value)
-        if self.task.id != self.task_id or self.task.status is not expected_status:
-            raise ValueError("Terminalization receipt conflicts with its terminal task.")
-        if self.task.worker_id is not None or self.task.lease_expires_at is not None:
-            raise ValueError("Terminalization receipt task retains live claim ownership.")
-        return self
-
-
-class TaskInterruptedHandoffRequest(BaseModel):
-    """Exact authority for releasing one interrupted task's worker ownership."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    task_id: str
-    worker_id: str
-    lease_expires_at: datetime
-    session_id: str
-    session_instance_id: str
-    session_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    handoff_id: str
-
-    @field_validator("task_id", "worker_id", "session_id", "handoff_id")
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("session_instance_id")
-    @classmethod
-    def validate_session_instance_id(cls, value: str) -> str:
-        return SessionInvocationBinding.validate_session_instance_id(value)
-
-    @field_validator("lease_expires_at")
-    @classmethod
-    def normalize_lease_expires_at(cls, value: datetime) -> datetime:
-        return normalize_utc_datetime(value, "lease_expires_at")
-
-
-def _interrupted_task_handoff_request_sha256(
-    request: TaskInterruptedHandoffRequest,
-) -> str:
-    return sha256(
-        canonical_durable_json_bytes(
-            {
-                "schema": "cayu.task-interrupted-handoff.v1",
-                **request.model_dump(mode="json", warnings=False),
-            },
-            "task_interrupted_handoff",
-        )
-    ).hexdigest()
-
-
-class TaskInterruptedHandoffReceipt(BaseModel):
-    """Immutable commit evidence for one exact interrupted-task handoff."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    request: TaskInterruptedHandoffRequest
-    request_sha256: str
-    task: Task
-    committed_at: datetime
-
-    @field_validator("request", mode="before")
-    @classmethod
-    def copy_request(cls, value: object) -> object:
-        return revalidate_model_input(value, TaskInterruptedHandoffRequest)
-
-    @field_validator("request_sha256")
-    @classmethod
-    def validate_request_sha256(cls, value: str) -> str:
-        if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
-            raise ValueError("request_sha256 must be a lowercase SHA-256 digest.")
-        return value
-
-    @field_validator("task", mode="before")
-    @classmethod
-    def copy_released_task(cls, value: Task) -> Task:
-        if type(value) is not Task:
-            raise TypeError("task must be a Task instance.")
-        return copy_task(value)
-
-    @field_validator("committed_at")
-    @classmethod
-    def normalize_committed_at(cls, value: datetime) -> datetime:
-        return normalize_utc_datetime(value, "committed_at")
-
-    @model_validator(mode="after")
-    def validate_receipt_task(self) -> TaskInterruptedHandoffReceipt:
-        request = self.request
-        task = self.task
-        if (
-            self.request_sha256 != _interrupted_task_handoff_request_sha256(request)
-            or task.id != request.task_id
-            or task.status is not TaskStatus.RUNNING
-            or task.session_id != request.session_id
-            or task.session_instance_id != request.session_instance_id
-            or task.interrupted_handoff_id != request.handoff_id
-            or task.worker_id is not None
-            or task.lease_expires_at is not None
-        ):
-            raise ValueError("Interrupted-task handoff receipt conflicts with its task.")
-        return self
-
-
-class InterruptedTaskContinuationClaimPage(BaseModel):
-    """One bounded continuation scan and its optional atomic task claim."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    task: Task | None = None
-    next_after: tuple[datetime, str] | None = None
-    scanned_candidates: StrictInt = Field(
-        ge=0,
-        le=_TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
-    )
-    rejected_candidates: StrictInt = Field(
-        ge=0,
-        le=_TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
-    )
-    filtered_candidates: StrictInt = Field(
-        default=0,
-        ge=0,
-        le=_TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
-    )
-    replayed: StrictBool = False
-    exhausted: StrictBool
-
-    @field_validator("task", mode="before")
-    @classmethod
-    def copy_claimed_task(cls, value: Task | None) -> Task | None:
-        if value is None:
-            return None
-        if type(value) is not Task:
-            raise TypeError("task must be an exact Task instance.")
-        return copy_task(value)
-
-    @field_validator("next_after", mode="before")
-    @classmethod
-    def validate_next_after(
-        cls,
-        value: tuple[datetime, str] | None,
-    ) -> tuple[datetime, str] | None:
-        copied, _ = prepare_interrupted_task_continuation_claim_page(
-            after=value,
-            limit=1,
-        )
-        return copied
-
-    @model_validator(mode="after")
-    def validate_page(self) -> InterruptedTaskContinuationClaimPage:
-        skipped_candidates = self.rejected_candidates + self.filtered_candidates
-        if self.replayed:
-            if (
-                self.task is None
-                or self.scanned_candidates != 0
-                or skipped_candidates != 0
-                or self.next_after != (self.task.created_at, self.task.id)
-                or self.exhausted
-            ):
-                raise ValueError("A continuation claim replay requires exact live claim evidence.")
-            return self
-        if skipped_candidates > self.scanned_candidates:
-            raise ValueError("Rejected and filtered candidates cannot exceed scanned_candidates.")
-        if self.scanned_candidates == 0:
-            if self.next_after is not None or not self.exhausted:
-                raise ValueError("An empty continuation page must be exhausted without a cursor.")
-        elif self.next_after is None:
-            raise ValueError("A non-empty continuation page requires its last inspected cursor.")
-        if self.task is None:
-            if skipped_candidates != self.scanned_candidates:
-                raise ValueError(
-                    "An unclaimed continuation page must classify every inspected row."
-                )
-        else:
-            expected_cursor = (self.task.created_at, self.task.id)
-            if self.next_after != expected_cursor:
-                raise ValueError("A continuation claim cursor must identify its claimed task.")
-            if skipped_candidates >= self.scanned_candidates:
-                raise ValueError("A claimed continuation page must contain one accepted row.")
-        if not self.exhausted and self.next_after is None:
-            raise ValueError("A non-exhausted continuation page requires a cursor.")
         return self
 
 
@@ -2325,75 +2061,6 @@ class WorkAttemptLifecycleReceipt(BaseModel):
             max_items=WORK_COMPLETION_APPLICATION_RECEIPT_MAX_ITEMS + 256,
         )
         return self
-
-
-class TaskTerminalizationRetryPolicy(BaseModel):
-    """Finite retry and backoff bounds for acknowledgement-ambiguous writes."""
-
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
-
-    max_attempts: StrictInt = Field(default=3, ge=1, le=10)
-    attempt_timeout_seconds: StrictFloat = Field(default=30.0, gt=0, le=300)
-    initial_backoff_seconds: StrictFloat = Field(default=0.05, ge=0, le=60)
-    backoff_multiplier: StrictFloat = Field(default=2.0, ge=1, le=10)
-    max_backoff_seconds: StrictFloat = Field(default=1.0, ge=0, le=60)
-
-
-class TaskTerminalizationRetryResult(BaseModel):
-    """Detached terminal task plus observable retry/reconciliation evidence."""
-
-    model_config = ConfigDict(
-        extra="forbid",
-        hide_input_in_errors=True,
-        allow_inf_nan=False,
-    )
-
-    task: Task
-    attempt_count: StrictInt = Field(ge=1, le=10)
-    receipt_reconciled: StrictBool
-    elapsed_seconds: StrictFloat = Field(default=0.0, ge=0)
-    applied_backoff_seconds: StrictFloat = Field(default=0.0, ge=0)
-
-    @field_validator("task", mode="before")
-    @classmethod
-    def copy_terminal_task(cls, value: Task) -> Task:
-        if type(value) is not Task:
-            raise TypeError("task must be a Task instance.")
-        return Task.model_validate(value.model_dump(mode="python"))
-
-
-class TaskTerminalizationUncertain(RuntimeError):
-    """Bounded evidence that no exact terminalization receipt was observed."""
-
-    def __init__(
-        self,
-        *,
-        task_id: str,
-        idempotency_key: str,
-        attempt_count: int,
-        error_category: str,
-        elapsed_seconds: float = 0.0,
-        applied_backoff_seconds: float = 0.0,
-    ) -> None:
-        for field_name, value in (
-            ("elapsed_seconds", elapsed_seconds),
-            ("applied_backoff_seconds", applied_backoff_seconds),
-        ):
-            if type(value) is not float:
-                raise TypeError(f"{field_name} must be a float.")
-            if value < 0 or not math.isfinite(value):
-                raise ValueError(f"{field_name} must be finite and non-negative.")
-        self.task_id = _bounded_task_terminalization_evidence(task_id)
-        self.idempotency_key = _bounded_task_terminalization_evidence(idempotency_key)
-        self.attempt_count = attempt_count
-        self.error_category = error_category
-        self.elapsed_seconds = elapsed_seconds
-        self.applied_backoff_seconds = applied_backoff_seconds
-        super().__init__(
-            "Task terminalization outcome is uncertain for "
-            f"task {self.task_id} after {attempt_count} attempts "
-            f"(category={error_category})."
-        )
 
 
 class TaskQuery(BaseModel):
@@ -8437,227 +8104,6 @@ def _copy_task_retry_settlement_result(
     )
 
 
-def prepare_task_terminalization(
-    request: TaskTerminalizationRequest,
-) -> tuple[TaskTerminalizationRequest, str]:
-    """Detach and deterministically digest one validated logical request."""
-
-    if type(request) is not TaskTerminalizationRequest:
-        raise TypeError(
-            "Task terminalization requests must be TaskTerminalizationRequest instances."
-        )
-    copied = TaskTerminalizationRequest.model_validate(request.model_dump(mode="python"))
-    material = {
-        "schema": "cayu.task-terminalization.v3",
-        "task_id": copied.task_id,
-        "idempotency_key": copied.idempotency_key,
-        "worker_id": copied.worker_id,
-        "lease_expires_at": (
-            None if copied.lease_expires_at is None else copied.lease_expires_at.isoformat()
-        ),
-        "kind": copied.kind.value,
-        "result": copied.result,
-        "error": copied.error,
-    }
-    if copied.handoff_id is not None:
-        material["handoff_id"] = copied.handoff_id
-    request_sha256 = sha256(
-        canonical_durable_json_bytes(material, "task_terminalization")
-    ).hexdigest()
-    return copied, request_sha256
-
-
-def _legacy_task_terminalization_request_sha256(
-    request: TaskTerminalizationRequest,
-) -> str:
-    """Reconstruct the digest emitted before lease-generation fencing."""
-
-    copied = TaskTerminalizationRequest.model_validate(request.model_dump(mode="python"))
-    material = {
-        "schema": (
-            "cayu.task-terminalization.v1"
-            if copied.handoff_id is None
-            else "cayu.task-terminalization.v2"
-        ),
-        "task_id": copied.task_id,
-        "idempotency_key": copied.idempotency_key,
-        "worker_id": copied.worker_id,
-        "kind": copied.kind.value,
-        "result": copied.result,
-        "error": copied.error,
-    }
-    if copied.handoff_id is not None:
-        material["handoff_id"] = copied.handoff_id
-    return sha256(canonical_durable_json_bytes(material, "task_terminalization")).hexdigest()
-
-
-def _task_terminalization_request_matches_sha256(
-    request: TaskTerminalizationRequest,
-    *,
-    request_sha256: str,
-    candidate_sha256: str,
-) -> bool:
-    return candidate_sha256 in {
-        request_sha256,
-        _legacy_task_terminalization_request_sha256(request),
-    }
-
-
-def prepare_interrupted_task_handoff(
-    request: TaskInterruptedHandoffRequest,
-) -> tuple[TaskInterruptedHandoffRequest, str]:
-    """Detach and digest one exact interrupted-task handoff authority."""
-
-    if type(request) is not TaskInterruptedHandoffRequest:
-        raise TypeError(
-            "Interrupted-task handoffs require TaskInterruptedHandoffRequest instances."
-        )
-    copied = TaskInterruptedHandoffRequest(
-        task_id=request.task_id,
-        worker_id=request.worker_id,
-        lease_expires_at=request.lease_expires_at,
-        session_id=request.session_id,
-        session_instance_id=request.session_instance_id,
-        session_run_epoch=request.session_run_epoch,
-        handoff_id=request.handoff_id,
-    )
-    request_sha256 = _interrupted_task_handoff_request_sha256(copied)
-    return copied, request_sha256
-
-
-def interrupted_task_handoff_request(
-    task: Task,
-    *,
-    session_run_epoch: int,
-) -> TaskInterruptedHandoffRequest:
-    """Bind one running task snapshot to an exact interrupted-session handoff."""
-
-    if type(task) is not Task:
-        raise TypeError("Interrupted-task handoff requests require a Task instance.")
-    if (
-        task.worker_id is None
-        or task.lease_expires_at is None
-        or task.session_id is None
-        or task.session_instance_id is None
-    ):
-        raise TaskInterruptedHandoffConflict(
-            "Task does not retain complete interrupted-handoff authority."
-        )
-    material = {
-        "schema": "cayu.task-interrupted-handoff-id.v2",
-        "task_id": task.id,
-        "worker_id": task.worker_id,
-        "lease_expires_at": task.lease_expires_at.isoformat(),
-        "session_id": task.session_id,
-        "session_instance_id": task.session_instance_id,
-        "session_run_epoch": session_run_epoch,
-        "prior_handoff_lineage_id": task.interrupted_handoff_id,
-    }
-    handoff_id = sha256(
-        canonical_durable_json_bytes(material, "task_interrupted_handoff_id")
-    ).hexdigest()
-    return TaskInterruptedHandoffRequest(
-        task_id=task.id,
-        worker_id=task.worker_id,
-        lease_expires_at=task.lease_expires_at,
-        session_id=task.session_id,
-        session_instance_id=task.session_instance_id,
-        session_run_epoch=session_run_epoch,
-        handoff_id=handoff_id,
-    )
-
-
-def prepare_interrupted_task_handoff_receipt_lookup(
-    task_id: str,
-    handoff_id: str,
-) -> tuple[str, str]:
-    return (
-        require_clean_nonblank(task_id, "task_id"),
-        require_clean_nonblank(handoff_id, "handoff_id"),
-    )
-
-
-def prepare_interrupted_task_handoff_candidate_page(
-    *,
-    after: tuple[datetime, str] | None,
-    limit: int,
-) -> tuple[tuple[datetime, str] | None, int]:
-    """Validate and detach one stable bounded expired-handoff page."""
-
-    limit = _validate_positive_int(limit, "limit")
-    if limit > _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE:
-        raise ValueError(f"limit must be <= {_TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE}.")
-    copied_after: tuple[datetime, str] | None = None
-    if after is not None:
-        if type(after) is not tuple or len(after) != 2:
-            raise TypeError("Interrupted-task handoff cursor must be a timestamp/task-id tuple.")
-        lease_expires_at, task_id = after
-        if type(lease_expires_at) is not datetime:
-            raise TypeError("Interrupted-task handoff cursor timestamp must be a datetime.")
-        copied_after = (
-            normalize_utc_datetime(lease_expires_at, "after lease_expires_at"),
-            require_clean_nonblank(task_id, "after task_id"),
-        )
-    return copied_after, limit
-
-
-def prepare_interrupted_task_continuation_claim_page(
-    *,
-    after: tuple[datetime, str] | None,
-    limit: int,
-) -> tuple[tuple[datetime, str] | None, int]:
-    """Validate and detach one stable bounded continuation-claim page."""
-
-    limit = _validate_positive_int(limit, "scan_limit")
-    if limit > _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE:
-        raise ValueError(
-            f"scan_limit must be <= {_TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE}."
-        )
-    copied_after: tuple[datetime, str] | None = None
-    if after is not None:
-        if type(after) is not tuple or len(after) != 2:
-            raise TypeError(
-                "Interrupted-task continuation cursor must be a timestamp/task-id tuple."
-            )
-        created_at, task_id = after
-        if type(created_at) is not datetime:
-            raise TypeError("Interrupted-task continuation cursor timestamp must be a datetime.")
-        copied_after = (
-            normalize_utc_datetime(created_at, "after created_at"),
-            require_clean_nonblank(task_id, "after task_id"),
-        )
-    return copied_after, limit
-
-
-def _copy_interrupted_task_handoff_receipt(
-    receipt: TaskInterruptedHandoffReceipt,
-) -> TaskInterruptedHandoffReceipt:
-    if type(receipt) is not TaskInterruptedHandoffReceipt:
-        raise TypeError(
-            "Interrupted-task handoff receipt loads must return "
-            "TaskInterruptedHandoffReceipt instances."
-        )
-    return TaskInterruptedHandoffReceipt(
-        request=receipt.request,
-        request_sha256=receipt.request_sha256,
-        task=copy_task(receipt.task),
-        committed_at=receipt.committed_at,
-    )
-
-
-def _replay_interrupted_task_handoff_receipt(
-    *,
-    request: TaskInterruptedHandoffRequest,
-    request_sha256: str,
-    receipt: TaskInterruptedHandoffReceipt,
-) -> TaskInterruptedHandoffReceipt:
-    if receipt.request != request or receipt.request_sha256 != request_sha256:
-        raise TaskInterruptedHandoffConflict(
-            "Interrupted-task handoff identity conflicts with another request."
-        )
-    return _copy_interrupted_task_handoff_receipt(receipt)
-
-
 def _require_interrupted_task_handoff_authority(
     task: Task,
     request: TaskInterruptedHandoffRequest,
@@ -10708,50 +10154,6 @@ def _settled_task_retry_attempt(
     return settled, successor
 
 
-def prepare_task_terminalization_receipt_lookup(
-    task_id: str,
-    idempotency_key: str,
-) -> tuple[str, str]:
-    return (
-        require_clean_nonblank(task_id, "task_id"),
-        _validate_task_terminalization_idempotency_key(idempotency_key),
-    )
-
-
-def _validate_task_terminalization_idempotency_key(value: str) -> str:
-    value = require_clean_nonblank(value, "idempotency_key")
-    if len(value.encode("utf-8")) > TASK_TERMINALIZATION_IDEMPOTENCY_KEY_MAX_BYTES:
-        raise ValueError(
-            "idempotency_key must be at most "
-            f"{TASK_TERMINALIZATION_IDEMPOTENCY_KEY_MAX_BYTES} UTF-8 bytes."
-        )
-    return value
-
-
-def _replay_task_terminalization_receipt(
-    *,
-    request: TaskTerminalizationRequest,
-    request_sha256: str,
-    receipt: TaskTerminalizationReceipt,
-    current_task: Task | None,
-) -> Task:
-    """Validate durable replay proof and return a detached terminal task."""
-
-    if not _task_terminalization_request_matches_sha256(
-        request,
-        request_sha256=request_sha256,
-        candidate_sha256=receipt.request_sha256,
-    ):
-        raise TaskTerminalizationConflict(
-            "Task terminalization idempotency key conflicts with another intent."
-        )
-    if current_task != receipt.task:
-        raise TaskTerminalizationConflict(
-            "Task terminalization receipt conflicts with the current terminal task."
-        )
-    return receipt.task.model_copy(deep=True)
-
-
 async def terminalize_task_with_retry(
     task_store: TaskStore,
     request: TaskTerminalizationRequest,
@@ -11090,16 +10492,6 @@ def _task_terminalization_error_category(exc: Exception) -> str:
     if isinstance(exc, ConnectionError):
         return "connection"
     return "database_operational"
-
-
-def _bounded_task_terminalization_evidence(value: str) -> str:
-    encoded = value.encode("utf-8")
-    if len(encoded) <= TASK_TERMINALIZATION_IDEMPOTENCY_KEY_MAX_BYTES:
-        return value
-    suffix = f"...[sha256:{sha256(encoded).hexdigest()[:8]}]"
-    prefix_bytes = TASK_TERMINALIZATION_IDEMPOTENCY_KEY_MAX_BYTES - len(suffix.encode("utf-8"))
-    prefix = encoded[:prefix_bytes].decode("utf-8", "ignore")
-    return f"{prefix}{suffix}"
 
 
 def copy_task_create(request: TaskCreate) -> TaskCreate:
@@ -11830,19 +11222,6 @@ def _ensure_task_handoff_authority(task: Task, handoff_id: str | None) -> None:
         )
 
 
-def new_interrupted_task_continuation_handoff_id() -> str:
-    """Create caller-owned authority for one replayable continuation claim."""
-
-    return str(uuid4())
-
-
-def _interrupted_task_continuation_handoff_id_sha256(handoff_id: str) -> str:
-    """Hash one validated claim generation for permanent one-use registration."""
-
-    handoff_id = require_clean_nonblank(handoff_id, "handoff_id")
-    return sha256(handoff_id.encode("utf-8")).hexdigest()
-
-
 def _require_active_attached_task_worker(
     task: Task,
     *,
@@ -12000,14 +11379,6 @@ def _sort_tasks(tasks: list[Task], order_by: TaskOrder) -> list[Task]:
         key=lambda task: task.updated_at,
         reverse=True,
     )
-
-
-def _validate_positive_int(value: int, field_name: str) -> int:
-    if type(value) is not int:
-        raise TypeError(f"{field_name} must be an integer.")
-    if value < 1:
-        raise ValueError(f"{field_name} must be >= 1.")
-    return value
 
 
 def _copy_optional_status_reason(value: str | None) -> str | None:

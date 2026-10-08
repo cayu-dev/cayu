@@ -927,17 +927,11 @@ from cayu.tasks.access import runtime_collection_read, runtime_task_creation, ru
 from cayu.tasks.admission import WorkAttemptExecutionClaimLost
 from cayu.tasks.base import (
     _TASK_CANCELLATION_REQUESTED_REASON,
-    _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
     _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
-    InterruptedTaskContinuationClaimPage,
     TaskAggregateFilter,
     TaskCancellationReconciliationRequest,
     TaskCancellationReconciliationResult,
-    TaskClaimLost,
     TaskCreate,
-    TaskInterruptedHandoffConflict,
-    TaskInterruptedHandoffReceipt,
-    TaskInterruptedHandoffRequest,
     TaskInvocationSnapshot,
     TaskOperationalSnapshot,
     TaskOrder,
@@ -948,9 +942,6 @@ from cayu.tasks.base import (
     TaskSessionClosureClaim,
     TaskStatusCounts,
     TaskStore,
-    TaskTerminalizationConflict,
-    TaskTerminalizationReceipt,
-    TaskTerminalizationRequest,
     _can_attach_claimed_task_state,
     _cancelled_task_retry_settlement,
     _claimed_task_retry_attempt_elapsed,
@@ -973,19 +964,16 @@ from cayu.tasks.base import (
     _ensure_task_terminalization_lease_authority,
     _expired_dispatched_task_cancellation,
     _expired_task_retry_settlement,
-    _interrupted_task_continuation_handoff_id_sha256,
     _raise_task_claim_attach_error,
     _reconciled_task_cancellation,
     _reconciled_task_retry_cancellation,
     _rejected_task_cancellation_reconciliation,
     _rejected_task_retry_cancellation_reconciliation,
-    _replay_interrupted_task_handoff_receipt,
     _replay_task_cancellation_reconciliation,
     _replay_task_cancellation_reconciliation_rejection,
     _replay_task_retry_cancellation_reconciliation,
     _replay_task_retry_cancellation_reconciliation_rejection,
     _replay_task_retry_settlement,
-    _replay_task_terminalization_receipt,
     _require_active_attached_task_worker,
     _require_direct_attached_task_resume,
     _require_interrupted_task_handoff_authority,
@@ -1016,15 +1004,9 @@ from cayu.tasks.base import (
     copy_task_create,
     copy_task_query,
     copy_task_session_closure_claim,
-    prepare_interrupted_task_continuation_claim_page,
-    prepare_interrupted_task_handoff,
-    prepare_interrupted_task_handoff_candidate_page,
-    prepare_interrupted_task_handoff_receipt_lookup,
     prepare_task_cancellation_reconciliation,
     prepare_task_retry_cancellation_reconciliation,
     prepare_task_retry_settlement,
-    prepare_task_terminalization,
-    prepare_task_terminalization_receipt_lookup,
     task_query_from_aggregate_filter,
 )
 from cayu.tasks.contracts import WorkCompletionConflict
@@ -1034,7 +1016,20 @@ from cayu.tasks.graphs import (
     TaskGraphEvent,
     TaskGraphSnapshot,
 )
-from cayu.tasks.records import Task, TaskRetrySeriesDisposition, TaskStatus
+from cayu.tasks.handoff import (
+    _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
+    InterruptedTaskContinuationClaimPage,
+    TaskInterruptedHandoffConflict,
+    TaskInterruptedHandoffReceipt,
+    TaskInterruptedHandoffRequest,
+    _interrupted_task_continuation_handoff_id_sha256,
+    _replay_interrupted_task_handoff_receipt,
+    prepare_interrupted_task_continuation_claim_page,
+    prepare_interrupted_task_handoff,
+    prepare_interrupted_task_handoff_candidate_page,
+    prepare_interrupted_task_handoff_receipt_lookup,
+)
+from cayu.tasks.records import Task, TaskClaimLost, TaskRetrySeriesDisposition, TaskStatus
 from cayu.tasks.scheduling import (
     TaskRescheduleRequest,
     TaskScheduleCancelRequest,
@@ -1045,6 +1040,14 @@ from cayu.tasks.scheduling import (
     TaskScheduleReceipt,
     TaskScheduleWakeup,
     task_schedule_eligibility,
+)
+from cayu.tasks.terminalization import (
+    TaskTerminalizationConflict,
+    TaskTerminalizationReceipt,
+    TaskTerminalizationRequest,
+    _replay_task_terminalization_receipt,
+    prepare_task_terminalization,
+    prepare_task_terminalization_receipt_lookup,
 )
 from cayu.tasks.topology import (
     TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,

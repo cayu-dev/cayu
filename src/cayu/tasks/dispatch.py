@@ -115,21 +115,22 @@ from cayu.tasks.base import (
     TaskCancellationReconciliationEvidence,
     TaskCancellationReconciliationOutcome,
     TaskCancellationReconciliationRequest,
-    TaskClaimLost,
     TaskCompletionDecisionRequired,
     TaskCreate,
     TaskOrder,
     TaskQuery,
     TaskStore,
-    TaskTerminalizationConflict,
-    TaskTerminalizationRequest,
-    TaskTerminalKind,
     _task_cancellation_requested,
     _task_cancellation_terminalization_request,
     _terminalize_claimed_task_or_detect_peer_winner,
     task_create_with_runtime_invocation,
 )
-from cayu.tasks.records import Task, TaskStatus, copy_task
+from cayu.tasks.records import Task, TaskClaimLost, TaskStatus, copy_task
+from cayu.tasks.terminalization import (
+    TaskTerminalizationConflict,
+    TaskTerminalizationRequest,
+    TaskTerminalKind,
+)
 from cayu.tools.exposure import ToolCapabilityCeiling, copy_tool_capability_ceiling
 from cayu.tools.grants import TargetedToolGrant, validate_targeted_tool_grants
 from cayu.vaults import SecretRedactor

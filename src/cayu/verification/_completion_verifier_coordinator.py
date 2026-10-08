@@ -61,7 +61,7 @@ from cayu.tasks._verified_work_authority import (
     require_completion_proposal_integrity,
     require_completion_verifier_profile_integrity,
 )
-from cayu.tasks.base import TaskClaimLost, TaskStore
+from cayu.tasks.base import TaskStore
 from cayu.tasks.completion_evaluations import (
     CompletionEvaluationReceipt,
 )
@@ -107,6 +107,7 @@ from cayu.tasks.contracts import (
     copy_work_contract,
     validate_completion_decision_contract,
 )
+from cayu.tasks.records import TaskClaimLost
 from cayu.vaults.redaction import SecretRedactor
 from cayu.verification._completion_evaluation_runtime import (
     CompletionEvaluationRuntime,

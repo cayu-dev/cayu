@@ -47,21 +47,15 @@ from cayu.tasks.admission import (
     WorkAttemptRecoveryActivate,
     WorkAttemptRecoveryRequest,
 )
-from cayu.tasks.base import (
-    Task,
-    TaskClaimLost,
-    TaskCreate,
-    TaskQuery,
-    TaskStatus,
-    TaskTerminalizationRequest,
-    TaskTerminalKind,
-)
+from cayu.tasks.base import Task, TaskCreate, TaskQuery, TaskStatus
 from cayu.tasks.contracts import (
     CompletionDecisionApplicationRequest,
     CompletionProposalCreate,
     CompletionVerificationClaimRequest,
     WorkAttemptCreate,
 )
+from cayu.tasks.records import TaskClaimLost
+from cayu.tasks.terminalization import TaskTerminalizationRequest, TaskTerminalKind
 
 
 class _PostgresAdmissionLockOrderStore(PostgresTaskStore):

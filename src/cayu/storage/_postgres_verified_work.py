@@ -66,7 +66,6 @@ from cayu.tasks.admission import (
 from cayu.tasks.base import (
     CompletionDecisionApplicationReceipt,
     TaskAggregateFilter,
-    TaskClaimLost,
     TaskQuery,
     WorkAttemptLifecycleReceipt,
     WorkAttemptPreparationHoldReceipt,
@@ -149,7 +148,7 @@ from cayu.tasks.contracts import (
     validate_work_completion_idempotency_key,
     work_attempt_request_sha256,
 )
-from cayu.tasks.records import Task, TaskStatus, copy_task
+from cayu.tasks.records import Task, TaskClaimLost, TaskStatus, copy_task
 from cayu.tasks.topology import TaskTopologyInconsistent
 
 _T = TypeVar("_T")

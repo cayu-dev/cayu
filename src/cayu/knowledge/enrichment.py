@@ -67,17 +67,12 @@ from cayu.sessions.invocation import (
     TaskExecutionSource,
 )
 from cayu.tasks.base import (
-    TaskClaimLost,
     TaskCreate,
     TaskOrder,
     TaskQuery,
     TaskRetryAttemptDisposition,
     TaskRetrySettlementRequest,
     TaskStore,
-    TaskTerminalizationConflict,
-    TaskTerminalizationRequest,
-    TaskTerminalizationRetryPolicy,
-    TaskTerminalKind,
     _task_cancellation_terminalization_request,
     _task_retry_requested_cancellation_settlement,
     settle_task_retry_attempt_with_retry,
@@ -86,10 +81,17 @@ from cayu.tasks.base import (
 )
 from cayu.tasks.records import (
     Task,
+    TaskClaimLost,
     TaskRetryPolicy,
     TaskRetrySeriesDisposition,
     TaskStatus,
     copy_task,
+)
+from cayu.tasks.terminalization import (
+    TaskTerminalizationConflict,
+    TaskTerminalizationRequest,
+    TaskTerminalizationRetryPolicy,
+    TaskTerminalKind,
 )
 
 KNOWLEDGE_ENRICHMENT_SCHEMA_VERSION = 1

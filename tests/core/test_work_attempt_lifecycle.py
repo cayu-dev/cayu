@@ -50,7 +50,6 @@ from cayu.tasks.admission import (
 from cayu.tasks.base import (
     InMemoryTaskStore,
     TaskAggregateFilter,
-    TaskClaimLost,
     TaskCreate,
     TaskStatus,
     task_create_with_runtime_invocation,
@@ -62,6 +61,7 @@ from cayu.tasks.contracts import (
     TaskCompletionDecisionRequired,
     WorkCompletionConflict,
 )
+from cayu.tasks.records import TaskClaimLost
 
 
 @pytest.fixture(params=["memory", "sqlite", "postgres"])

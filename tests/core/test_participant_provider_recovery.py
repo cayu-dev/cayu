@@ -33,7 +33,8 @@ from cayu.sessions.context_views import (
     ParticipantSessionCreationRequest,
     ParticipantSessionExecutionRequest,
 )
-from cayu.tasks.base import InMemoryTaskStore, TaskCreate, interrupted_task_handoff_request
+from cayu.tasks.base import InMemoryTaskStore, TaskCreate
+from cayu.tasks.handoff import interrupted_task_handoff_request
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])

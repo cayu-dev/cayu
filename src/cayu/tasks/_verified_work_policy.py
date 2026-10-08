@@ -12,8 +12,6 @@ from datetime import UTC, datetime
 
 from cayu.tasks.base import (
     CompletionDecisionApplicationReceipt,
-    TaskClaimLost,
-    TaskTerminalizationConflict,
     _ensure_active_task_lease,
     _ensure_can_transition,
     _task_cancellation_requested,
@@ -31,7 +29,8 @@ from cayu.tasks.contracts import (
     WorkContractConflict,
     WorkContractRef,
 )
-from cayu.tasks.records import Task, TaskStatus
+from cayu.tasks.records import Task, TaskClaimLost, TaskStatus
+from cayu.tasks.terminalization import TaskTerminalizationConflict
 
 
 def require_contract_reference(

@@ -652,7 +652,7 @@ async def test_undispatched_verified_preparation_entry_is_settled(store, failure
 
 @pytest.mark.parametrize("hold", ["pause_task", "block_task", "mark_task_needs_attention"])
 async def test_resumed_ordinary_callback_gets_fresh_execution_authority(store, monkeypatch, hold):
-    from cayu.tasks.base import TaskClaimLost
+    from cayu.tasks.records import TaskClaimLost
     from cayu.tasks.worker import run_task_worker
 
     app = CayuApp(task_store=store, enable_logging=False)
@@ -1324,7 +1324,7 @@ async def test_resumed_preparation_cannot_inherit_prior_settlement(
 
     from cayu import AgentSpec
     from cayu.runtime.verified_task_worker import VerifiedTaskWorker
-    from cayu.tasks.base import TaskClaimLost
+    from cayu.tasks.records import TaskClaimLost
 
     entered, release = threading.Event(), threading.Event()
     entries = []
@@ -1701,7 +1701,7 @@ async def test_verified_callback_group_stop_does_not_admit_later_work(
     from cayu import AgentSpec, CompletionResultResolutionRequest
     from cayu.runtime.completion_result_resolvers import CompletionResultResolverExecutionError
     from cayu.runtime.verified_task_worker import VerifiedTaskWorker
-    from cayu.tasks.base import TaskClaimLost
+    from cayu.tasks.records import TaskClaimLost
     from cayu.vaults import SecretRedactor
 
     entered, release = threading.Event(), threading.Event()
@@ -4289,7 +4289,7 @@ async def test_terminal_task_does_not_release_a_handler_still_finalizing(
 
 
 async def test_independent_workers_race_winner_and_late_completion(store):
-    from cayu.tasks.base import TaskTerminalizationConflict
+    from cayu.tasks.terminalization import TaskTerminalizationConflict
     from cayu.tasks.worker import complete_managed_task, run_task_worker
 
     if isinstance(store, SQLiteTaskStore):
