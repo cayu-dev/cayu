@@ -6,7 +6,7 @@ from cayu.delivery.git import (
     RemoteGitDeliveryState,
 )
 from cayu.delivery.github import GitHubDeliveryReconstructionRequiredError, GitHubDeliveryRepository
-from cayu.tasks.base import TaskStatus
+from cayu.tasks.records import TaskStatus
 from tests.qualification.repository_maintenance_git_intake import (
     _completed_digest,
     _stored_delivery,

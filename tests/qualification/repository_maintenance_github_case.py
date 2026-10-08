@@ -25,7 +25,8 @@ from cayu.delivery.github import (
     github_connector_behavior_fingerprint,
     github_pull_request_delivery_request,
 )
-from cayu.tasks.base import TaskQuery, TaskStatus
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import TaskStatus
 from cayu.tasks.worker import run_task_worker
 from cayu.vaults.base import SecretRef
 from cayu.vaults.static import StaticVault

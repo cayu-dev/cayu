@@ -21,8 +21,8 @@ from cayu.storage._accounting_schema import POSTGRES_ACCOUNTING_DDL
 from cayu.storage._accounting_schema import (
     POSTGRES_AUXILIARY_ACCOUNTING_DDL as POSTGRES_AUXILIARY_ACCOUNTING_DDL,
 )
-from cayu.tasks.base import TaskOrder
 from cayu.tasks.contracts import WorkContractRef
+from cayu.tasks.queries import TaskOrder
 from cayu.tasks.records import Task, TaskRetrySeriesSnapshot, TaskStatus
 from cayu.tasks.scheduling import TaskScheduleState
 from cayu.tasks.topology import (

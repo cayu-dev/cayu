@@ -75,17 +75,12 @@ from cayu.sessions.base import (
     SessionStore,
     run_request_with_task_invocation,
 )
+from cayu.sessions.invocation import TaskExecutionSource
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
-from cayu.tasks.base import (
-    InMemoryTaskStore,
-    Task,
+from cayu.tasks.base import InMemoryTaskStore, TaskStore
+from cayu.tasks.creation import (
     TaskCreate,
-    TaskExecutionSource,
     TaskInvocationSnapshot,
-    TaskQuery,
-    TaskRetryPolicy,
-    TaskStatus,
-    TaskStore,
     task_create_with_runtime_invocation,
 )
 from cayu.tasks.handoff import (
@@ -95,7 +90,8 @@ from cayu.tasks.handoff import (
     TaskInterruptedHandoffRequest,
     interrupted_task_handoff_request,
 )
-from cayu.tasks.records import TaskClaimLost
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import Task, TaskClaimLost, TaskRetryPolicy, TaskStatus
 from cayu.tasks.terminalization import (
     TaskTerminalizationConflict,
     TaskTerminalizationReceipt,

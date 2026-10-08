@@ -20,7 +20,8 @@ from cayu.cli.project import project_context
 from cayu.environments.docker_toolchains import DockerCodingToolchainProfile
 from cayu.evals.testing import ScriptedModelProvider
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
-from cayu.tasks.base import TaskQuery, TaskStatus
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import TaskStatus
 from cayu.tasks.worker import run_task_worker
 
 

@@ -488,12 +488,13 @@ from cayu.sessions.invocation import (
     SessionInvocationBinding,
     inherited_session_invocation,
 )
-from cayu.tasks.base import TaskQuery, TaskStore, _terminalize_claimed_task
+from cayu.tasks.base import TaskStore, _terminalize_claimed_task
 from cayu.tasks.dispatch import (
     _new_prepared_subagent_dispatch_envelope,
     _require_dispatch_task_authority,
     _task_matches_queued_dispatch,
 )
+from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import Task, TaskStatus, copy_task
 from cayu.tasks.terminalization import TaskTerminalizationRequest, TaskTerminalKind
 from cayu.tools import _argument_publication as tool_argument_publication

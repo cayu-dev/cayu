@@ -10,7 +10,7 @@ from cayu.budgets.pricing import ModelPrice, PriceBook
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.sessions.base import RunRequest, SessionIdentity
-from cayu.tasks.base import TaskQuery
+from cayu.tasks.queries import TaskQuery
 from tests.qualification.test_repository_maintenance_http import _A, _B, _BODY, _OP, client
 from tests.qualification.test_repository_maintenance_http import host as host
 from tests.qualification.test_repository_maintenance_request import consumer as consumer

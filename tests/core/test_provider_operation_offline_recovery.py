@@ -138,9 +138,11 @@ from cayu.sessions.base import (
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore, TaskCreate, TaskQuery, TaskStatus
+from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.creation import TaskCreate
 from cayu.tasks.handoff import interrupted_task_handoff_request
-from cayu.tasks.records import TaskClaimLost
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import TaskClaimLost, TaskStatus
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.exposure import (
     ResolvedToolExposure,

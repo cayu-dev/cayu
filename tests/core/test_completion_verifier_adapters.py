@@ -50,7 +50,7 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyResult,
 )
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore, TaskCreate
+from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.contracts import (
     WORK_COMPLETION_OUTCOME_MAX_EVIDENCE_REFERENCES,
     WORK_COMPLETION_VERIFIER_DECISION_MAX_BYTES,
@@ -84,6 +84,7 @@ from cayu.tasks.contracts import (
     completion_gap_fingerprint,
     work_contract_from_draft,
 )
+from cayu.tasks.creation import TaskCreate
 from cayu.vaults.redaction import SecretRedactor
 
 

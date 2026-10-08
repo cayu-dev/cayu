@@ -35,14 +35,14 @@ from cayu.sessions.recovery import (
     RecoveryPlanSelection,
 )
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
-from cayu.tasks.base import TaskQuery, TaskStatus
 from cayu.tasks.cancellation import (
     TaskCancellationReconciliationEvent,
     TaskCancellationReconciliationEvidence,
     TaskCancellationReconciliationOutcome,
     TaskCancellationReconciliationRequest,
 )
-from cayu.tasks.records import TaskClaimLost
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import TaskClaimLost, TaskStatus
 from cayu.tasks.terminalization import TaskTerminalizationConflict
 from cayu.tasks.worker import complete_managed_task, run_task_worker
 

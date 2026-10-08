@@ -105,7 +105,7 @@ def test_a_continuation_refused_by_shutdown_is_left_for_recovery() -> None:
     from tests.core.test_task_worker import _seed_receipt_backed_continuation
 
     from cayu.sessions.base import ResumeRequest
-    from cayu.tasks.base import TaskQuery
+    from cayu.tasks.queries import TaskQuery
 
     async def scenario() -> None:
         store = InMemoryTaskStore()

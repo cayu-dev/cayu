@@ -25,8 +25,9 @@ from cayu.runtime.work_attempt_lifecycle import (
     work_attempt_admission_authority_sha256,
 )
 from cayu.tasks.admission import WorkAttemptAdmissionConflict
-from cayu.tasks.base import TaskCreate, TaskStatus
 from cayu.tasks.contracts import CompletionContinuationPolicy, CompletionRejectionAction
+from cayu.tasks.creation import TaskCreate
+from cayu.tasks.records import TaskStatus
 
 
 async def _wait_past(expires_at):

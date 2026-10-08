@@ -10,7 +10,8 @@ from cayu.sessions.invocation import (
     TaskExecutionSource,
     TaskInvocation,
 )
-from cayu.tasks.base import Task, TaskCreate, TaskStatus
+from cayu.tasks.creation import TaskCreate
+from cayu.tasks.records import Task, TaskStatus
 from tests.qualification.repository_maintenance_identity import (
     MaintenanceRunIdentity,
     copy_identity,

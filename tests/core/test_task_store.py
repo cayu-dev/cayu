@@ -46,15 +46,10 @@ from cayu.storage import sqlite as sqlite_storage
 from cayu.storage.sqlite import SQLiteTaskStore
 from cayu.tasks.base import (
     InMemoryTaskStore,
-    Task,
-    TaskCreate,
-    TaskOrder,
-    TaskQuery,
-    TaskStatus,
     TaskStore,
     _require_interrupted_task_handoff_authority,
-    copy_task_query,
 )
+from cayu.tasks.creation import TaskCreate
 from cayu.tasks.handoff import (
     TaskInterruptedHandoffConflict,
     TaskInterruptedHandoffReceipt,
@@ -62,7 +57,8 @@ from cayu.tasks.handoff import (
     interrupted_task_handoff_request,
     prepare_interrupted_task_handoff,
 )
-from cayu.tasks.records import TaskClaimLost
+from cayu.tasks.queries import TaskOrder, TaskQuery, copy_task_query
+from cayu.tasks.records import Task, TaskClaimLost, TaskStatus
 from cayu.tasks.terminalization import (
     TaskTerminalizationConflict,
     TaskTerminalizationReceipt,

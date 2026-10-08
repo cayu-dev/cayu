@@ -41,7 +41,8 @@ from cayu.sessions.base import (
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
-from cayu.tasks.base import InMemoryTaskStore, TaskCreate
+from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.creation import TaskCreate
 
 
 def _identity() -> SessionIdentity:

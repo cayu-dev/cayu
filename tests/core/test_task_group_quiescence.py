@@ -25,8 +25,10 @@ from cayu import (
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresTaskStore
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore, TaskQuery, TaskStatus
+from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.groups import TaskGroupConflict, TaskGroupQuiescenceResolution
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import TaskStatus
 
 pytestmark = pytest.mark.anyio
 
@@ -133,8 +135,8 @@ async def test_failure_makes_finalizer_explicitly_ineligible(store):
 @pytest.mark.parametrize("deleted", ["a", "b", "all"])
 @pytest.mark.parametrize("outcome", ["success", "failure", "no_finalizer"])
 async def test_terminal_reconciliation_survives_permitted_member_deletion(store, deleted, outcome):
-    from cayu.tasks.base import TaskSessionClosureClaim
     from cayu.tasks.graphs import TaskGraphConflict
+    from cayu.tasks.records import TaskSessionClosureClaim
 
     app = CayuApp(task_store=store, enable_logging=False)
     creation = request(policy="all" if outcome == "failure" else "first_success")
@@ -2368,7 +2370,7 @@ async def test_ownerless_session_release_advances_group_only_after_runtime_clean
         RunRequest,
         TaskGroupInvocationSettlementPending,
     )
-    from cayu.tasks.base import TaskSessionClosureClaim
+    from cayu.tasks.records import TaskSessionClosureClaim
 
     deleted = publication == "deleted_ack_loss"
     if deleted:

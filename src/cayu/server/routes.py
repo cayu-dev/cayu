@@ -359,7 +359,8 @@ from cayu.sessions.invocation import (
 )
 from cayu.sessions.recovery import StartupRecoveryResult
 from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
-from cayu.tasks.base import TaskCreate, TaskOrder, TaskQuery, task_create_with_runtime_invocation
+from cayu.tasks.creation import TaskCreate, task_create_with_runtime_invocation
+from cayu.tasks.queries import TaskOrder, TaskQuery
 from cayu.tasks.records import Task, TaskStatus
 from cayu.tasks.scheduling import (
     TaskRescheduleRequest,

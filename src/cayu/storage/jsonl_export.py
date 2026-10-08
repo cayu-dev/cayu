@@ -67,7 +67,8 @@ from cayu.sessions.exports import (
     validate_export_boundary,
     validate_export_ownership,
 )
-from cayu.tasks.base import TaskOrder, TaskQuery, TaskStore
+from cayu.tasks.base import TaskStore
+from cayu.tasks.queries import TaskOrder, TaskQuery
 from cayu.tasks.records import Task
 from cayu.tools.grants import (
     TargetedToolGrantStateSnapshot,

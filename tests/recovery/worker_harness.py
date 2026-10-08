@@ -56,7 +56,9 @@ from cayu.sessions.recovery import (
     RecoveryPlanSelection,
 )
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
-from cayu.tasks.base import Task, TaskCreate, TaskQuery
+from cayu.tasks.creation import TaskCreate
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import Task
 from cayu.tasks.worker import TaskHandlerOutcome, run_task_worker
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy

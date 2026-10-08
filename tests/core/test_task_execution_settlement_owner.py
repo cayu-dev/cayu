@@ -26,11 +26,7 @@ from cayu import (
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.sessions.invocation import TaskExecutionSource
-from cayu.tasks.base import (
-    TaskQuery,
-    TaskStatus,
-    task_create_with_runtime_invocation,
-)
+from cayu.tasks.creation import task_create_with_runtime_invocation
 from cayu.tasks.dispatch import (
     DispatchRequest,
     DispatchStatus,
@@ -38,6 +34,8 @@ from cayu.tasks.dispatch import (
     _queued_dispatch_persisted_envelope,
     _queued_dispatch_task_id,
 )
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import TaskStatus
 from cayu.tasks.worker import run_task_worker
 from cayu.vaults.redaction import SecretRedactor
 
@@ -132,9 +130,9 @@ async def test_exact_settlement_retry_survives_permitted_task_deletion(store, mo
 
     from cayu.storage.postgres import PostgresTaskStore
     from cayu.storage.sqlite import SQLiteTaskStore
-    from cayu.tasks.base import TaskSessionClosureClaim
     from cayu.tasks.graphs import TaskGraphConflict
     from cayu.tasks.groups import TaskGroupConflict, TaskGroupEventType
+    from cayu.tasks.records import TaskSessionClosureClaim
 
     app = CayuApp(task_store=store, enable_logging=False)
     await create_group(app, TaskCreate(task_id="member", type="member"))

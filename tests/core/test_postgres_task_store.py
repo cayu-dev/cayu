@@ -119,18 +119,7 @@ from cayu.sessions.invocation import (
     TaskInvocation,
 )
 from cayu.storage.postgres import PostgresTaskStore
-from cayu.tasks.base import (
-    Task,
-    TaskCreate,
-    TaskOrder,
-    TaskQuery,
-    TaskRetryPolicy,
-    TaskRetrySeriesDisposition,
-    TaskStatus,
-    TaskTopologyQuery,
-    task_create_with_execution_source,
-    terminalize_task_with_retry,
-)
+from cayu.tasks.base import terminalize_task_with_retry
 from cayu.tasks.cancellation import (
     TaskRetryCancellationReconciliationConflict,
     TaskRetryCancellationReconciliationEvidence,
@@ -151,13 +140,21 @@ from cayu.tasks.contracts import (
     WorkCompletionConflict,
     completion_verification_claim_authority_sha256,
 )
+from cayu.tasks.creation import TaskCreate, task_create_with_execution_source
 from cayu.tasks.handoff import (
     TaskInterruptedHandoffConflict,
     TaskInterruptedHandoffReceipt,
     TaskInterruptedHandoffRequest,
     interrupted_task_handoff_request,
 )
-from cayu.tasks.records import TaskClaimLost
+from cayu.tasks.queries import TaskOrder, TaskQuery
+from cayu.tasks.records import (
+    Task,
+    TaskClaimLost,
+    TaskRetryPolicy,
+    TaskRetrySeriesDisposition,
+    TaskStatus,
+)
 from cayu.tasks.retry import TaskRetryAttemptDisposition, TaskRetrySettlementRequest
 from cayu.tasks.terminalization import (
     TaskTerminalizationConflict,
@@ -167,6 +164,7 @@ from cayu.tasks.terminalization import (
     TaskTerminalKind,
     prepare_task_terminalization,
 )
+from cayu.tasks.topology import TaskTopologyQuery
 from cayu.tasks.worker import run_task_worker
 
 pytestmark = pytest.mark.usefixtures("postgres_dsn")

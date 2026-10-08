@@ -23,15 +23,7 @@ from cayu.sessions.invocation import (
     TaskExecutionSource,
 )
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.base import (
-    CompletionDecisionApplicationReceipt,
-    InMemoryTaskStore,
-    Task,
-    TaskCreate,
-    TaskStatus,
-    TaskStore,
-    task_create_with_runtime_invocation,
-)
+from cayu.tasks.base import InMemoryTaskStore, TaskStore
 from cayu.tasks.contracts import (
     CompletionContinuationPolicy,
     CompletionCriterionOutcome,
@@ -61,7 +53,10 @@ from cayu.tasks.contracts import (
     copy_completion_decision_application_request,
     work_contract_from_draft,
 )
+from cayu.tasks.creation import TaskCreate, task_create_with_runtime_invocation
 from cayu.tasks.graphs import TaskGraphCreate, TaskGraphNode
+from cayu.tasks.records import Task, TaskStatus
+from cayu.tasks.work_receipts import CompletionDecisionApplicationReceipt
 from cayu.vaults.redaction import SecretRedactor
 
 

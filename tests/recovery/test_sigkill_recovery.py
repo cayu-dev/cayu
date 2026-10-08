@@ -27,7 +27,7 @@ from cayu.sessions.checkpoints import (
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )
-from cayu.tasks.base import TaskStatus
+from cayu.tasks.records import TaskStatus
 
 pytestmark = [
     pytest.mark.process,

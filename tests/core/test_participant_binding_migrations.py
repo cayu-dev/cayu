@@ -30,7 +30,7 @@ from cayu.storage import _sqlite_functions as sqlite_functions
 from cayu.storage import _sqlite_support as sql
 from cayu.storage import migrations as schema
 from cayu.storage._participant_bindings_schema import validate_sqlite_participant_bindings
-from cayu.tasks.base import TaskCreate
+from cayu.tasks.creation import TaskCreate
 
 
 def _app(store):

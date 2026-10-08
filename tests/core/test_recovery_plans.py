@@ -44,13 +44,10 @@ from cayu.sessions.recovery import (
     RecoveryTaskClaimEvidence,
 )
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
-from cayu.tasks.base import (
-    InMemoryTaskStore,
-    TaskCreate,
-    TaskInvocationSnapshot,
-    TaskQuery,
-    TaskStatus,
-)
+from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.creation import TaskCreate, TaskInvocationSnapshot
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import TaskStatus
 from cayu.vaults.redaction import SecretRedactor
 
 

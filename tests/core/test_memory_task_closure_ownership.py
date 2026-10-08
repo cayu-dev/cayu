@@ -17,13 +17,13 @@ from tests.core.test_verified_work_contracts import (
 )
 
 from cayu import CayuApp, InMemoryTaskStore, TaskCreate
-from cayu.tasks.base import TaskTopologyQuery
 from cayu.tasks.contracts import (
     CompletionDecisionApplicationRequest,
     CompletionProposalCreate,
     CompletionVerificationClaimRequest,
     WorkAttemptCreate,
 )
+from cayu.tasks.topology import TaskTopologyQuery
 
 
 def test_public_memory_closure_preserves_other_namespaces():

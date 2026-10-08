@@ -12,7 +12,10 @@ from cayu.runtime.session_closure import SessionClosureDisposition, SessionClosu
 from cayu.sessions.base import InMemorySessionStore
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore, TaskCreate, TaskQuery, TaskSessionClosureClaim
+from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.creation import TaskCreate
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import TaskSessionClosureClaim
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])

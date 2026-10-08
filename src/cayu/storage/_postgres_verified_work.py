@@ -63,17 +63,7 @@ from cayu.tasks.admission import (
     work_attempt_admission_prepare_sha256,
     work_attempt_execution_claim_request_sha256,
 )
-from cayu.tasks.base import (
-    CompletionDecisionApplicationReceipt,
-    TaskAggregateFilter,
-    TaskQuery,
-    WorkAttemptLifecycleReceipt,
-    WorkAttemptPreparationHoldReceipt,
-    _ensure_exact_owned_active_task_lease,
-    _task_invocation_for_attachment,
-    _task_session_instance_for_attachment,
-    _work_attempt_discovery_query,
-)
+from cayu.tasks.base import _ensure_exact_owned_active_task_lease
 from cayu.tasks.completion_evaluations import (
     CompletionEvaluationRun,
     CompletionEvaluationRunRequest,
@@ -148,8 +138,18 @@ from cayu.tasks.contracts import (
     validate_work_completion_idempotency_key,
     work_attempt_request_sha256,
 )
+from cayu.tasks.creation import (
+    _task_invocation_for_attachment,
+    _task_session_instance_for_attachment,
+)
+from cayu.tasks.queries import TaskAggregateFilter, TaskQuery, _work_attempt_discovery_query
 from cayu.tasks.records import Task, TaskClaimLost, TaskStatus, copy_task
 from cayu.tasks.topology import TaskTopologyInconsistent
+from cayu.tasks.work_receipts import (
+    CompletionDecisionApplicationReceipt,
+    WorkAttemptLifecycleReceipt,
+    WorkAttemptPreparationHoldReceipt,
+)
 
 _T = TypeVar("_T")
 _POSTGRES_MUTATION_CANCELLATION_GRACE_SECONDS = 1.0

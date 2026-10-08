@@ -107,7 +107,6 @@ from cayu.sessions.base import IncompleteSessionRecoveryRequest, SessionStatus
 from cayu.tasks._execution_settlement import TaskExecutionSettlement
 from cayu.tasks._schedule_wakeup import next_schedule_wake_at
 from cayu.tasks.base import (
-    TaskQuery,
     TaskStore,
     _task_cancellation_terminalization_request,
     _terminalize_claimed_task,
@@ -137,6 +136,7 @@ from cayu.tasks.handoff import (
     new_interrupted_task_continuation_handoff_id,
     prepare_interrupted_task_handoff,
 )
+from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import (
     Task,
     TaskClaimLost,

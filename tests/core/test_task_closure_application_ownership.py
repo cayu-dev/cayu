@@ -10,7 +10,7 @@ from cayu import CayuApp
 from cayu.storage._session_closure_sql import TASK_CLOSURE_DEPENDENCIES
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
-from cayu.tasks.base import TaskCreate
+from cayu.tasks.creation import TaskCreate
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "postgres"])

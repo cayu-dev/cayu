@@ -22,7 +22,7 @@ from cayu.tasks._graphs import (
     require_member_authority,
 )
 from cayu.tasks._groups import prepare_group_admission
-from cayu.tasks.base import TaskCreate
+from cayu.tasks.creation import TaskCreate
 from cayu.tasks.graphs import (
     TaskGraphConflict,
     TaskGraphCreate,

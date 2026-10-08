@@ -840,16 +840,14 @@ from cayu.tasks.admission import (
     work_attempt_recovery_session_authority,
     work_attempt_recovery_session_authority_from_checkpoint,
 )
-from cayu.tasks.base import (
-    TaskCompletionDecisionRequired,
-    TaskQuery,
-    TaskStore,
+from cayu.tasks.base import TaskStore, _terminalize_claimed_task
+from cayu.tasks.contracts import TaskCompletionDecisionRequired, WorkCompletionConflict
+from cayu.tasks.creation import (
     _task_invocation_for_attachment,
     _task_session_instance_for_attachment,
-    _terminalize_claimed_task,
 )
-from cayu.tasks.contracts import WorkCompletionConflict
 from cayu.tasks.dispatch import DispatchRequest
+from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import Task, TaskClaimLost, TaskStatus, copy_task
 from cayu.tasks.terminalization import (
     TaskTerminalizationRequest,

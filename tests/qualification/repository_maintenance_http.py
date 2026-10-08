@@ -13,7 +13,7 @@ from operations.maintenance_requests import (  # ty: ignore[unresolved-import]
 
 from cayu.coding_products import CodingProductReconstructionRequiredError
 from cayu.server import AuthenticatedAccess, mount_cayu
-from cayu.tasks.base import Task, TaskStatus
+from cayu.tasks.records import Task, TaskStatus
 from tests.qualification.repository_maintenance_auth import MaintenanceAccess
 from tests.qualification.repository_maintenance_budget import require_maintenance_budget
 from tests.qualification.repository_maintenance_cost import inspect_cost_evidence

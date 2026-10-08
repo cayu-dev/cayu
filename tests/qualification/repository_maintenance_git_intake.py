@@ -20,7 +20,8 @@ from cayu.sessions.invocation import (
     InvocationOriginTrust,
     TaskInvocation,
 )
-from cayu.tasks.base import Task, TaskCreate, TaskStatus
+from cayu.tasks.creation import TaskCreate
+from cayu.tasks.records import Task, TaskStatus
 from tests.qualification.repository_maintenance_identity import copy_identity
 from tests.qualification.repository_maintenance_intake import (
     MaintenanceTaskConflict,

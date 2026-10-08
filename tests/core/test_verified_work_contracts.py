@@ -23,8 +23,8 @@ from tests.core.task_invocation_fixtures import (
 )
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
-import cayu.tasks.base as tasks_module
 import cayu.tasks.contracts as work_contracts_module
+import cayu.tasks.creation as tasks_module
 from cayu._validation import FrozenJsonDict, FrozenJsonList, canonical_durable_json_bytes
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
@@ -82,17 +82,7 @@ from cayu.sessions.invocation import (
 )
 from cayu.storage import migrations as schema_migrations
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.base import (
-    CompletionDecisionApplicationReceipt,
-    InMemoryTaskStore,
-    Task,
-    TaskCreate,
-    TaskQuery,
-    TaskRetryPolicy,
-    TaskStatus,
-    TaskStore,
-    copy_task,
-)
+from cayu.tasks.base import InMemoryTaskStore, TaskStore
 from cayu.tasks.contracts import (
     WORK_COMPLETION_APPLICATION_MAX_BYTES,
     WORK_COMPLETION_APPLICATION_MAX_ITEMS,
@@ -139,6 +129,7 @@ from cayu.tasks.contracts import (
     work_attempt_request_sha256,
     work_contract_from_draft,
 )
+from cayu.tasks.creation import TaskCreate
 from cayu.tasks.dispatch import (
     Dispatcher,
     DispatchHandle,
@@ -146,8 +137,10 @@ from cayu.tasks.dispatch import (
     DispatchStatus,
     TaskStoreDispatcher,
 )
-from cayu.tasks.records import TaskClaimLost
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import Task, TaskClaimLost, TaskRetryPolicy, TaskStatus, copy_task
 from cayu.tasks.terminalization import TaskTerminalizationRequest, TaskTerminalKind
+from cayu.tasks.work_receipts import CompletionDecisionApplicationReceipt
 from cayu.tasks.worker import run_task_worker
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling

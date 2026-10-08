@@ -11,7 +11,7 @@ from cayu.delivery.git import (
     RemoteGitDeliveryRequest,
     RemoteGitDeliveryState,
 )
-from cayu.tasks.base import TaskQuery
+from cayu.tasks.queries import TaskQuery
 from tests.qualification.test_repository_maintenance_git_intake import git_intake as git_intake
 from tests.qualification.test_repository_maintenance_intake import intake as intake
 

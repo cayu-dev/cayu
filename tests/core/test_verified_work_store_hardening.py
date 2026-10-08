@@ -13,7 +13,7 @@ from tests.core.task_invocation_fixtures import (
     unattributed_session_invocation_binding,
 )
 
-import cayu.tasks.base as tasks_module
+import cayu.tasks.creation as tasks_module
 from cayu import (
     CayuApp,
     CompletionCriterionOutcome,

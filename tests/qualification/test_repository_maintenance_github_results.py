@@ -13,7 +13,7 @@ from cayu.delivery.github import (
     GitHubReviewState,
     approve_github_delivery,
 )
-from cayu.tasks.base import TaskQuery
+from cayu.tasks.queries import TaskQuery
 from tests.core.test_github_delivery import FakeTransport, _connector, _pr
 from tests.qualification.test_repository_maintenance_github_intake import enqueue
 from tests.qualification.test_repository_maintenance_github_intake import (

@@ -25,8 +25,8 @@ from cayu.sessions.base import (
 from cayu.sessions.invocation import SessionInvocation, TaskInvocation
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage._validated_cache import validated_row_cache
-from cayu.tasks.base import TaskOrder
 from cayu.tasks.contracts import WorkContractRef
+from cayu.tasks.queries import TaskOrder
 from cayu.tasks.records import Task, TaskRetrySeriesSnapshot, TaskStatus
 from cayu.tasks.scheduling import TaskScheduleState
 from cayu.tasks.topology import (

@@ -14,7 +14,8 @@ from cayu.delivery.github import (
     GitHubDeliveryApproval,
     github_connector_behavior_fingerprint,
 )
-from cayu.tasks.base import TaskQuery, TaskStatus
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import TaskStatus
 from cayu.tasks.worker import run_task_worker
 from tests.core.test_github_delivery import FakeTransport, _connector, _pr
 from tests.qualification.test_repository_maintenance_github_intake import configuration, enqueue

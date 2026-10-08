@@ -62,7 +62,9 @@ from cayu.sessions.base import (
     _model_completion_stage_dispatch_storage_key,
 )
 from cayu.storage.sqlite import SQLiteSessionStore
-from cayu.tasks.base import InMemoryTaskStore, TaskCreate, TaskStatus
+from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.creation import TaskCreate
+from cayu.tasks.records import TaskStatus
 from cayu.tasks.worker import TaskHandlerOutcome, run_task_worker
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling

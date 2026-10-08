@@ -13,7 +13,9 @@ import pytest
 
 from cayu.applications import CayuApp
 from cayu.cli.project import project_context
-from cayu.tasks.base import InMemoryTaskStore, TaskCreate, TaskStatus
+from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.creation import TaskCreate
+from cayu.tasks.records import TaskStatus
 from cayu.tasks.worker import complete_managed_task
 from tests.cli.test_worker import _running_worker, _wait_for_worker_start
 from tests.qualification.test_repository_maintenance_application import project as project

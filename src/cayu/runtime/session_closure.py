@@ -52,8 +52,8 @@ from cayu.storage._knowledge_closure import (
     KnowledgeClosureQuery,
     validate_knowledge_closure_inventory,
 )
-from cayu.tasks.base import TaskQuery, TaskSessionClosureClaim, copy_task_session_closure_claim
-from cayu.tasks.records import TaskStatus
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import TaskSessionClosureClaim, TaskStatus, copy_task_session_closure_claim
 from cayu.vaults.redaction import SecretRedactor
 
 SESSION_CLOSURE_SCHEMA_VERSION = 1

@@ -15,7 +15,7 @@ from tests.core.task_invocation_fixtures import unattributed_session_invocation_
 from cayu.applications import CayuApp
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore, TaskCreate, TaskStore
+from cayu.tasks.base import InMemoryTaskStore, TaskStore
 from cayu.tasks.completion_evaluations import (
     CompletionEvaluationBudgetExhausted,
     CompletionEvaluationFailure,
@@ -47,6 +47,7 @@ from cayu.tasks.contracts import (
     WorkCriterion,
     work_contract_from_draft,
 )
+from cayu.tasks.creation import TaskCreate
 from cayu.verification.completion_evaluators import (
     CompletionEvaluationExecutionError,
     CompletionEvaluationRequest,

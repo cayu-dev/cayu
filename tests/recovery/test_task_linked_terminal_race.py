@@ -35,7 +35,8 @@ from cayu.sessions.base import (
     SessionMessageQueueStatus,
     SessionStatus,
 )
-from cayu.tasks.base import TaskQuery, TaskStatus
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import TaskStatus
 
 pytestmark = pytest.mark.process
 

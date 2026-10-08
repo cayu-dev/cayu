@@ -17,7 +17,8 @@ from cayu.delivery.github import (
     github_pull_request_delivery_request,
 )
 from cayu.sessions.invocation import InvocationOriginClaim
-from cayu.tasks.base import Task, TaskCreate
+from cayu.tasks.creation import TaskCreate
+from cayu.tasks.records import Task
 from tests.qualification.repository_maintenance_git_intake import (
     _completed_digest,
     _encode,

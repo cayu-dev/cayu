@@ -66,7 +66,8 @@ from cayu.support_bundles import (
     validate_support_bundle_archive,
     write_support_bundle_atomic,
 )
-from cayu.tasks.base import InMemoryTaskStore, TaskCreate
+from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.creation import TaskCreate
 from cayu.vaults.redaction import SecretRedactor
 
 

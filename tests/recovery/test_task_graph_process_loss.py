@@ -10,8 +10,8 @@ import pytest
 
 from cayu.storage.postgres import PostgresTaskStore
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.base import TaskStatus
 from cayu.tasks.graphs import TaskGraphEventType
+from cayu.tasks.records import TaskStatus
 
 pytestmark = pytest.mark.process
 

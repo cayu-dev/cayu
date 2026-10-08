@@ -24,7 +24,8 @@ from cayu.evals.testing import ScriptedModelProvider
 from cayu.providers.base import ModelStreamEvent
 from cayu.runners.docker_workload import DockerImageIdentity
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
-from cayu.tasks.base import TaskQuery, TaskStatus
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import TaskStatus
 from cayu.tasks.worker import run_task_worker
 from tests.qualification.repository_maintenance_delivery_case import build_journey_http
 from tests.qualification.repository_maintenance_toolchain import maintenance_toolchain

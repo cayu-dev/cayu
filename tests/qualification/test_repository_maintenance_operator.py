@@ -6,7 +6,7 @@ import warnings
 
 import pytest
 
-from cayu.tasks.base import TaskQuery
+from cayu.tasks.queries import TaskQuery
 from tests.qualification.test_repository_maintenance_http import (
     _A,
     _B,

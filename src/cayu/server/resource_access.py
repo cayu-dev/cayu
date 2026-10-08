@@ -28,7 +28,8 @@ from cayu.sessions.base import (
     RunRequest,
     SessionQuery,
 )
-from cayu.tasks.base import TaskCreate, TaskQuery
+from cayu.tasks.creation import TaskCreate
+from cayu.tasks.queries import TaskQuery
 
 
 class _Labels(BaseModel):

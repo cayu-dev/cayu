@@ -665,10 +665,7 @@ from cayu.tasks.admission import (
     WorkAttemptRecoveryRequest,
     WorkAttemptRunRequest,
 )
-from cayu.tasks.base import (
-    TaskCreate,
-    TaskStore,
-)
+from cayu.tasks.base import TaskStore
 from cayu.tasks.completion_evaluations import CompletionEvaluationRun
 from cayu.tasks.completion_verifier_dispatches import CompletionVerifierDispatch
 from cayu.tasks.completion_verifier_profiles import CompletionVerifierProfilePolicy
@@ -684,6 +681,7 @@ from cayu.tasks.contracts import (
     WorkContractDraft,
     WorkContractRef,
 )
+from cayu.tasks.creation import TaskCreate
 from cayu.tasks.dispatch import (
     Dispatcher,
     DispatchHandle,

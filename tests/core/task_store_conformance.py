@@ -12,16 +12,11 @@ from tests.core.task_invocation_fixtures import (
 )
 
 from cayu.sessions.invocation import TaskExecutionSource
-from cayu.tasks.base import (
-    Task,
-    TaskCreate,
-    TaskQuery,
-    TaskStatus,
-    TaskStore,
-    task_create_with_runtime_invocation,
-)
+from cayu.tasks.base import TaskStore
+from cayu.tasks.creation import TaskCreate, task_create_with_runtime_invocation
 from cayu.tasks.handoff import interrupted_task_handoff_request
-from cayu.tasks.records import TaskClaimLost
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import Task, TaskClaimLost, TaskStatus
 from cayu.tasks.terminalization import TaskTerminalizationRequest, TaskTerminalKind
 
 

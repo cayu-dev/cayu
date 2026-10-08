@@ -13,7 +13,8 @@ from cayu.sessions.external_waits import ExternalEventDelivery, ExternalWaitConf
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresTaskStore
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore, TaskQuery
+from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.queries import TaskQuery
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])

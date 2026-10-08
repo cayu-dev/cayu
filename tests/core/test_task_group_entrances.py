@@ -18,9 +18,11 @@ from cayu import (
     TaskGroupPolicy,
     TaskGroupStatus,
 )
-from cayu.tasks.base import TaskQuery, TaskStatus, TaskStore
+from cayu.tasks.base import TaskStore
 from cayu.tasks.graphs import TaskGraphEventType
 from cayu.tasks.groups import TaskGroupEventType
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import TaskStatus
 
 pytestmark = pytest.mark.anyio
 
@@ -96,8 +98,8 @@ async def test_group_verified_completion_is_the_only_success_authority(store: Ta
 
     from cayu import CayuApp
     from cayu.sessions.invocation import TaskExecutionSource
-    from cayu.tasks.base import task_create_with_runtime_invocation
     from cayu.tasks.contracts import CompletionDecisionApplicationRequest, CompletionVerdict
+    from cayu.tasks.creation import task_create_with_runtime_invocation
 
     contract = await store.publish_work_contract(_contract())
     binding = unattributed_session_invocation_binding("graph-verification")
@@ -167,7 +169,7 @@ async def test_group_verified_completion_is_the_only_success_authority(store: Ta
 
 
 async def test_retry_successor_cannot_change_group_decision(store: TaskStore) -> None:
-    from cayu.tasks.base import TaskRetryPolicy
+    from cayu.tasks.records import TaskRetryPolicy
     from cayu.tasks.retry import TaskRetryAttemptDisposition, TaskRetrySettlementRequest
 
     await store.create_task_group(

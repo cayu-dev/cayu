@@ -486,7 +486,7 @@ def test_named_workers_share_durable_task_claims_without_duplicates(tmp_path):
     import asyncio
 
     from cayu.storage.sqlite import SQLiteTaskStore
-    from cayu.tasks.base import TaskCreate
+    from cayu.tasks.creation import TaskCreate
 
     _project(
         tmp_path,

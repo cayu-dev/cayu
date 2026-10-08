@@ -9,8 +9,9 @@ import pytest
 
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresTaskStore
-from cayu.tasks.base import TaskCreate, TaskStatus
+from cayu.tasks.creation import TaskCreate
 from cayu.tasks.graphs import TaskGraphCreate, TaskGraphEventType, TaskGraphNode
+from cayu.tasks.records import TaskStatus
 
 
 def test_postgres_graph_outcomes_reconstruct(postgres_dsn: str) -> None:
@@ -98,7 +99,7 @@ def test_postgres_graph_lock_wait_does_not_consume_claim_lease(
             async with store._connection() as conn, conn.cursor() as cur:
                 await original_lock(cur, "lease-wait")
                 monkeypatch.setattr(graphs, "lock_graph", observed_lock)
-                from cayu.tasks.base import TaskQuery
+                from cayu.tasks.queries import TaskQuery
 
                 claim = asyncio.create_task(
                     store.claim_task("lease-worker", TaskQuery(type="lease-wait"), lease_seconds=1)

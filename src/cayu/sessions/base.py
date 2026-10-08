@@ -433,7 +433,7 @@ from cayu.sessions.invocation import (
     inherited_session_invocation,
     session_invocation_from_task,
 )
-from cayu.tasks.base import TaskInvocationSnapshot
+from cayu.tasks.creation import TaskInvocationSnapshot
 from cayu.tools.catalogue import CALL_TOOL_NAME
 from cayu.tools.exposure import (
     TOOL_CAPABILITY_CEILING_METADATA_KEY,

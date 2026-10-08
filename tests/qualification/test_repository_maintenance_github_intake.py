@@ -15,7 +15,7 @@ from cayu.delivery.github import (
     GitHubRepositoryAuthority,
     GitHubSourceAuthority,
 )
-from cayu.tasks.base import TaskQuery
+from cayu.tasks.queries import TaskQuery
 from tests.qualification.test_repository_maintenance_intake import intake as intake
 
 

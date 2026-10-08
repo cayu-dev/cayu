@@ -15,7 +15,7 @@ from cayu.runtime._task_store_operation_boundary import (
 from cayu.sessions.invocation import TaskExecutionSource
 from cayu.tasks._graph_admission import prepare_graph_admission
 from cayu.tasks._verified_work_authority import invocation_contains_secret_public_identity
-from cayu.tasks.base import TaskInvocationSnapshot, task_create_with_runtime_invocation
+from cayu.tasks.creation import TaskInvocationSnapshot, task_create_with_runtime_invocation
 from cayu.tasks.graphs import (
     TaskGraphConflict,
     TaskGraphCreate,

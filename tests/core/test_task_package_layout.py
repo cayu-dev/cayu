@@ -73,7 +73,18 @@ assert not {
 
 
 def test_task_contracts_preserve_public_and_legacy_identity():
-    from cayu.tasks import base, cancellation, handoff, records, retry, terminalization, topology
+    from cayu.tasks import (
+        base,
+        cancellation,
+        creation,
+        handoff,
+        queries,
+        records,
+        retry,
+        terminalization,
+        topology,
+        work_receipts,
+    )
 
     public = [importlib.import_module(name) for name in ("cayu", "cayu.tasks", "cayu.runtime")]
     for owner, names in (
@@ -86,6 +97,7 @@ def test_task_contracts_preserve_public_and_legacy_identity():
                 "TaskRetrySeriesDisposition",
                 "TaskRetrySeriesSnapshot",
                 "TaskClaimLost",
+                "TaskSessionClosureClaim",
             ),
         ),
         (
@@ -132,6 +144,18 @@ def test_task_contracts_preserve_public_and_legacy_identity():
                 "TaskRetrySettlementResult",
             ),
         ),
+        (creation, ("TaskCreate", "TaskInvocationSnapshot")),
+        (
+            queries,
+            (
+                "TaskQuery",
+                "TaskAggregateFilter",
+                "TaskOrder",
+                "TaskStatusCounts",
+                "TaskOperationalSnapshot",
+            ),
+        ),
+        (work_receipts, ("CompletionDecisionApplicationReceipt",)),
         (
             topology,
             (
@@ -200,6 +224,11 @@ for contract in (
     public.TaskRetryCancellationReconciliation,
     public.TaskRetrySettlementRequest,
     public.TaskRetrySettlementResult,
+    public.TaskCreate,
+    public.TaskQuery,
+    public.TaskOperationalSnapshot,
+    public.TaskSessionClosureClaim,
+    public.CompletionDecisionApplicationReceipt,
 ):
     assert contract.model_json_schema()
     assert get_type_hints(contract)

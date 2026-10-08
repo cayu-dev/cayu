@@ -8,14 +8,8 @@ import pytest
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresTaskStore
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.base import (
-    InMemoryTaskStore,
-    TaskCreate,
-    TaskQuery,
-    TaskSessionClosureClaim,
-    TaskStatus,
-    TaskStore,
-)
+from cayu.tasks.base import InMemoryTaskStore, TaskStore
+from cayu.tasks.creation import TaskCreate
 from cayu.tasks.graphs import (
     TaskGraphConflict,
     TaskGraphCreate,
@@ -23,6 +17,8 @@ from cayu.tasks.graphs import (
     TaskGraphNode,
     TaskGraphUnavailable,
 )
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import TaskSessionClosureClaim, TaskStatus
 from cayu.tasks.scheduling import TaskSchedulePolicy
 
 pytestmark = pytest.mark.anyio
@@ -88,7 +84,7 @@ async def test_contract_join_reserves_dependency_skip_capacity(
 
     from cayu import CayuApp
     from cayu._validation import canonical_durable_json_bytes
-    from cayu.tasks import base
+    from cayu.tasks import creation
     from cayu.tasks.contracts import (
         WORK_CONTRACT_TASK_CREATION_MAX_BYTES,
         WORK_CONTRACT_TASK_CREATION_MAX_ITEMS,
@@ -100,7 +96,7 @@ async def test_contract_join_reserves_dependency_skip_capacity(
             return datetime(2026, 9, 16, 0, 0, 0, 123456, tzinfo=UTC)
 
     # Exact byte-boundary sizing must not depend on timestamp microsecond width.
-    monkeypatch.setattr(base, "datetime", FixedDateTime)
+    monkeypatch.setattr(creation, "datetime", FixedDateTime)
     contract = await store.publish_work_contract(_contract())
     prerequisites = tuple(f"b{index:02d}" for index in range(64))
     join = TaskCreate(
@@ -109,7 +105,7 @@ async def test_contract_join_reserves_dependency_skip_capacity(
         work_contract=contract.reference(),
         input={"padding": [] if dimension == "items" else ""},
     )
-    prototype = base._task_from_create(
+    prototype = creation._task_from_create(
         join, task_id="z", parent_task=None, supports_verified_work_contracts=True
     ).model_copy(
         update={
@@ -143,7 +139,7 @@ async def test_contract_join_reserves_dependency_skip_capacity(
     join = join.model_copy(update={"input": {"padding": padding}})
     # Even rejected cases satisfy the old initial-snapshot check, including
     # offset=131, which fills its entire 32,704-value allowance.
-    base.require_contract_bound_task_creation_snapshot(
+    creation.require_contract_bound_task_creation_snapshot(
         prototype.model_copy(update={"input": join.input})
     )
     request = TaskGraphCreate(
@@ -240,7 +236,7 @@ async def test_graph_retry_cancellation_recovery_skips_dependents(store: TaskSto
         _postgres_retry_cancellation_reconciliation_request,
     )
 
-    from cayu.tasks.base import TaskRetryPolicy
+    from cayu.tasks.records import TaskRetryPolicy
 
     request = graph_request()
     root = next(node for node in request.nodes if node.task.task_id == "root")
@@ -266,7 +262,7 @@ async def test_graph_retry_cancellation_recovery_skips_dependents(store: TaskSto
 
 
 async def test_graph_active_retry_deadline_skips_dependents(store: TaskStore) -> None:
-    from cayu.tasks.base import TaskRetryPolicy
+    from cayu.tasks.records import TaskRetryPolicy
 
     request = graph_request()
     root = next(node for node in request.nodes if node.task.task_id == "root")
@@ -413,7 +409,7 @@ async def test_graph_operational_counts_preserve_dependency_states(store: TaskSt
 
 
 async def test_skipped_retry_member_has_matching_terminal_receipt(store: TaskStore) -> None:
-    from cayu.tasks.base import TaskRetryPolicy, TaskRetrySeriesDisposition
+    from cayu.tasks.records import TaskRetryPolicy, TaskRetrySeriesDisposition
     from cayu.tasks.retry import TaskRetryEventType
 
     await store.create_task_graph(
@@ -455,7 +451,7 @@ async def test_graph_outcome_and_retry_skip_roll_back_together(
 ) -> None:
     from cayu.storage import _postgres_task_graphs, _sqlite_task_graphs
     from cayu.tasks import _memory_graphs
-    from cayu.tasks.base import TaskRetryPolicy
+    from cayu.tasks.records import TaskRetryPolicy
 
     module = (
         _memory_graphs
@@ -553,8 +549,8 @@ async def test_verified_completion_atomically_releases_graph_join(store: TaskSto
 
     from cayu import CayuApp
     from cayu.sessions.invocation import TaskExecutionSource
-    from cayu.tasks.base import task_create_with_runtime_invocation
     from cayu.tasks.contracts import CompletionDecisionApplicationRequest, CompletionVerdict
+    from cayu.tasks.creation import task_create_with_runtime_invocation
 
     contract = await store.publish_work_contract(_contract())
     binding = unattributed_session_invocation_binding("graph-verification")
@@ -611,7 +607,7 @@ async def test_verified_completion_atomically_releases_graph_join(store: TaskSto
 
 
 async def test_retry_successor_cannot_replace_exact_graph_prerequisite(store: TaskStore) -> None:
-    from cayu.tasks.base import TaskRetryPolicy
+    from cayu.tasks.records import TaskRetryPolicy
     from cayu.tasks.retry import TaskRetryAttemptDisposition, TaskRetrySettlementRequest
 
     await store.create_task_graph(
@@ -671,7 +667,7 @@ async def test_retry_successor_cannot_replace_exact_graph_prerequisite(store: Ta
 
 
 async def test_retained_graph_id_collision_cannot_partially_settle_retry(store: TaskStore) -> None:
-    from cayu.tasks.base import TaskRetryPolicy
+    from cayu.tasks.records import TaskRetryPolicy
     from cayu.tasks.retry import (
         TaskRetryAttemptDisposition,
         TaskRetrySettlementRequest,
@@ -873,7 +869,7 @@ async def test_graph_exact_replay_rejects_changed_node(changed: str, store: Task
     from tests.core.test_verified_work_contracts import _contract
 
     from cayu.sessions.invocation import InvocationOriginClaim
-    from cayu.tasks.base import TaskRetryPolicy
+    from cayu.tasks.records import TaskRetryPolicy
 
     request = graph_request()
     receipt = await store.create_task_graph(request)
@@ -1023,7 +1019,7 @@ async def test_public_graph_replay_binds_exact_resolved_session(
 
     from cayu import CayuApp
     from cayu.sessions.invocation import TaskExecutionSource
-    from cayu.tasks.base import task_create_with_runtime_invocation
+    from cayu.tasks.creation import task_create_with_runtime_invocation
 
     app = CayuApp(task_store=store, enable_logging=False)
     binding = unattributed_session_invocation_binding("graph-session")

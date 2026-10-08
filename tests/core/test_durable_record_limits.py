@@ -36,7 +36,7 @@ from cayu.sessions.base import (
 )
 from cayu.storage.knowledge_indexer import KnowledgeIndexRequest
 from cayu.storage.memory import KnowledgeChunk, KnowledgeEntry
-from cayu.tasks.base import TaskCreate
+from cayu.tasks.creation import TaskCreate
 from cayu.tasks.dispatch import DispatchRequest
 from cayu.tools.rounds import ToolRoundRecoveryRequest
 from cayu.tools.subagents import SubagentSpec

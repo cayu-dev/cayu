@@ -30,7 +30,7 @@ from cayu.tasks._graph_identity import TASK_GRAPH_MAX_BYTES as TASK_GRAPH_MAX_BY
 from cayu.tasks._graph_identity import TASK_GRAPH_MAX_EDGES as TASK_GRAPH_MAX_EDGES
 from cayu.tasks._graph_identity import TASK_GRAPH_MAX_NODES as TASK_GRAPH_MAX_NODES
 from cayu.tasks._graph_identity import graph_identifier as graph_identifier
-from cayu.tasks.base import TaskCreate, TaskInvocationSnapshot, copy_task_create
+from cayu.tasks.creation import TaskCreate, TaskInvocationSnapshot, copy_task_create
 from cayu.tasks.records import TaskStatus
 
 

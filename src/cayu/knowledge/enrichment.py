@@ -67,15 +67,13 @@ from cayu.sessions.invocation import (
     TaskExecutionSource,
 )
 from cayu.tasks.base import (
-    TaskCreate,
-    TaskOrder,
-    TaskQuery,
     TaskStore,
     _task_cancellation_terminalization_request,
     settle_task_retry_attempt_with_retry,
-    task_create_with_execution_source,
     terminalize_task_with_retry,
 )
+from cayu.tasks.creation import TaskCreate, task_create_with_execution_source
+from cayu.tasks.queries import TaskOrder, TaskQuery
 from cayu.tasks.records import (
     Task,
     TaskClaimLost,

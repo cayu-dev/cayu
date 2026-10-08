@@ -62,7 +62,7 @@ from cayu.sessions.cleanup import (
     RecoveryCleanupDeadlineScope,
     RecoveryCleanupSupervisorSnapshot,
 )
-from cayu.tasks.base import TaskOperationalSnapshot
+from cayu.tasks.queries import TaskOperationalSnapshot
 from cayu.workspaces.branches import (
     WorkspaceBranchCapabilities,
     WorkspaceBranchLifecycleSummary,

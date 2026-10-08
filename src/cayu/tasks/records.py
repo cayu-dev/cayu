@@ -26,6 +26,7 @@ from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
     copy_durable_metadata,
+    inspect_bounded_durable_json,
     revalidate_model_input,
 )
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
@@ -702,3 +703,49 @@ _HELD_TASK_STATUSES = {
     TaskStatus.BLOCKED,
     TaskStatus.NEEDS_ATTENTION,
 }
+
+
+class TaskSessionClosureClaim(BaseModel):
+    """Exact non-expiring authority for retiring one session's task set."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    session_id: str = Field(strict=True, min_length=1, max_length=256)
+    plan_id: str = Field(strict=True, pattern=r"^[0-9a-f]{64}$")
+    task_ids: tuple[str, ...]
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session(cls, value):
+        return require_clean_nonblank(value, "session_id")
+
+    @field_validator("task_ids", mode="before")
+    @classmethod
+    def validate_task_ids(cls, value):
+        if type(value) not in (tuple, list) or len(value) > 100_000:
+            raise ValueError("Invalid closure task set.")
+        if any(type(item) is not str or not 0 < len(item) <= 256 for item in value):
+            raise ValueError("Invalid closure task identity.")
+        copied = tuple(require_clean_nonblank(item, "task_id") for item in value)
+        if len(set(copied)) != len(copied):
+            raise ValueError("Closure task identities must be unique.")
+        return tuple(sorted(copied))
+
+    @model_validator(mode="after")
+    def validate_claim_bound(self):
+        inspect_bounded_durable_json(
+            {"session_id": self.session_id, "plan_id": self.plan_id, "task_ids": self.task_ids},
+            "task closure claim",
+            max_bytes=8 * 1024 * 1024,
+            max_nodes=100_010,
+            allow_tuples=True,
+        )
+        return self
+
+
+def copy_task_session_closure_claim(claim: TaskSessionClosureClaim) -> TaskSessionClosureClaim:
+    if type(claim) is not TaskSessionClosureClaim:
+        raise TypeError("A typed task closure claim is required.")
+    return TaskSessionClosureClaim(
+        session_id=claim.session_id, plan_id=claim.plan_id, task_ids=claim.task_ids
+    )

@@ -6,7 +6,7 @@ import importlib
 import pytest
 
 from cayu.delivery.git import RemoteGitDeliveryApproval, RemoteGitDeliveryState
-from cayu.tasks.base import TaskQuery
+from cayu.tasks.queries import TaskQuery
 from tests.qualification.test_repository_maintenance_git_approval import (
     approval_context as approval_context,
 )

@@ -33,7 +33,8 @@ from cayu.sessions.base import (
     SessionLineageResult,
 )
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore, TaskCreate
+from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.creation import TaskCreate
 from cayu.vaults.redaction import SecretRedactor
 
 

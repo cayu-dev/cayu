@@ -34,7 +34,7 @@ from cayu.tasks._verified_work_authority import (
     require_completion_decision_integrity,
     require_completion_verifier_profile_integrity,
 )
-from cayu.tasks.base import CompletionDecisionApplicationReceipt, TaskStore
+from cayu.tasks.base import TaskStore
 from cayu.tasks.completion_verifier_profiles import (
     CompletionVerifierProfilePreparationRequest,
     CompletionVerifierProfileRecord,
@@ -61,6 +61,7 @@ from cayu.tasks.contracts import (
     copy_work_contract,
 )
 from cayu.tasks.records import Task, TaskStatus, copy_task
+from cayu.tasks.work_receipts import CompletionDecisionApplicationReceipt
 from cayu.vaults import SecretRedactor
 from cayu.workspaces.observation_recovery import (
     retain_workspace_observation_pending_cancellation_requests,

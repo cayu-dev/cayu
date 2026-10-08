@@ -28,7 +28,9 @@ from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequ
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions.base import IncompleteSessionRecoveryRequest, RunRequest, SessionStore
 from cayu.storage import SQLiteSessionStore
-from cayu.tasks.base import InMemoryTaskStore, TaskCreate, TaskStatus, TaskStore
+from cayu.tasks.base import InMemoryTaskStore, TaskStore
+from cayu.tasks.creation import TaskCreate
+from cayu.tasks.records import TaskStatus
 from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 

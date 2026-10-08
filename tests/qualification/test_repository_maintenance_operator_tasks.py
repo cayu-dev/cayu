@@ -7,7 +7,8 @@ from uuid import uuid4
 
 import pytest
 
-from cayu.tasks.base import TaskQuery, TaskStatus
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import TaskStatus
 from tests.qualification.test_repository_maintenance_git_approval import (
     approval_context as approval_context,
 )

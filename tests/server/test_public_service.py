@@ -97,7 +97,7 @@ from cayu.server.service import (
 )
 from cayu.sessions.base import run_request_with_task_invocation
 from cayu.storage.evals_sqlite import SQLiteEvalStore
-from cayu.tasks.base import task_create_with_runtime_invocation
+from cayu.tasks.creation import task_create_with_runtime_invocation
 
 
 def _product_task_create(

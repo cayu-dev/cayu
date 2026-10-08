@@ -61,13 +61,6 @@ from cayu.tasks.admission import (
     require_work_attempt_admission_result,
     work_attempt_admission_prepare_sha256,
 )
-from cayu.tasks.base import (
-    TaskAggregateFilter,
-    TaskQuery,
-    WorkAttemptLifecycleReceipt,
-    WorkAttemptPreparationHoldReceipt,
-    copy_task_query,
-)
 from cayu.tasks.contracts import (
     CompletionDecision,
     CompletionProposal,
@@ -86,7 +79,9 @@ from cayu.tasks.contracts import (
     require_bounded_work_completion_document,
 )
 from cayu.tasks.groups import TaskGroupResultResolutionPending
+from cayu.tasks.queries import TaskAggregateFilter, TaskQuery, copy_task_query
 from cayu.tasks.records import Task, TaskClaimLost, TaskStatus, copy_task
+from cayu.tasks.work_receipts import WorkAttemptLifecycleReceipt, WorkAttemptPreparationHoldReceipt
 from cayu.verification._completion_verifier_coordinator import CompletionVerifierOwnedExecution
 from cayu.verification._leased_adapter_runner import (
     LeasedAdapterRunner,

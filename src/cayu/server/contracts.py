@@ -207,7 +207,7 @@ from cayu.sessions.invocation import (
     SessionExecutionSource,
     TaskExecutionSource,
 )
-from cayu.tasks.base import TaskAggregateFilter, TaskOperationalSnapshot
+from cayu.tasks.queries import TaskAggregateFilter, TaskOperationalSnapshot
 from cayu.tasks.scheduling import TaskScheduleEventType
 from cayu.tasks.topology import (
     TASK_TOPOLOGY_DEFAULT_BRANCH_LIMIT,

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from cayu.tasks._graphs import dependency_skip_evidence
-from cayu.tasks.base import (
+from cayu.tasks.creation import (
     TaskCreate,
     TaskInvocationSnapshot,
     _task_from_create,

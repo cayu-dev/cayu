@@ -121,27 +121,13 @@ from cayu.tasks.admission import (
     work_attempt_execution_claim_request_sha256,
 )
 from cayu.tasks.base import (
-    CompletionDecisionApplicationReceipt,
-    TaskAggregateFilter,
-    TaskCreate,
-    TaskInvocationSnapshot,
-    TaskOperationalSnapshot,
-    TaskOrder,
-    TaskQuery,
-    TaskSessionClosureClaim,
-    TaskStatusCounts,
     TaskStore,
-    WorkAttemptLifecycleReceipt,
-    WorkAttemptPreparationHoldReceipt,
     _can_attach_claimed_task_state,
-    _copy_optional_session_binding,
     _copy_optional_status_payload,
     _copy_optional_status_reason,
-    _copy_required_session_binding,
     _ensure_can_hold_task,
     _ensure_can_resume_task,
     _ensure_can_transition,
-    _ensure_claim_query_supported,
     _ensure_exact_owned_active_task_lease,
     _ensure_owned_active_task_lease,
     _ensure_recovered_attached_task_failure_authority,
@@ -156,23 +142,11 @@ from cayu.tasks.base import (
     _require_active_attached_task_worker,
     _require_direct_attached_task_resume,
     _require_interrupted_task_handoff_authority,
-    _running_task_from_create,
     _task_cancellation_requested_task,
-    _task_from_create,
-    _task_invocation_for_attachment,
-    _task_matches_claim_filter,
     _task_retry_cancellation_requested_task,
-    _task_session_id_for_start,
-    _task_session_instance_for_attachment,
     _validate_ordinary_task_terminalization_against_cancellation,
     _validated_task_cancellation,
     _validated_task_retry_cancellation,
-    _work_attempt_discovery_query,
-    copy_task_aggregate_filter,
-    copy_task_create,
-    copy_task_query,
-    copy_task_session_closure_claim,
-    task_query_from_aggregate_filter,
 )
 from cayu.tasks.cancellation import (
     _TASK_CANCELLATION_REQUESTED_REASON,
@@ -271,6 +245,18 @@ from cayu.tasks.contracts import (
     validate_work_completion_idempotency_key,
     work_attempt_request_sha256,
 )
+from cayu.tasks.creation import (
+    TaskCreate,
+    TaskInvocationSnapshot,
+    _copy_optional_session_binding,
+    _copy_required_session_binding,
+    _running_task_from_create,
+    _task_from_create,
+    _task_invocation_for_attachment,
+    _task_session_id_for_start,
+    _task_session_instance_for_attachment,
+    copy_task_create,
+)
 from cayu.tasks.graphs import (
     TaskGraphCreate,
     TaskGraphCreationReceipt,
@@ -290,12 +276,27 @@ from cayu.tasks.handoff import (
     prepare_interrupted_task_handoff_candidate_page,
     prepare_interrupted_task_handoff_receipt_lookup,
 )
+from cayu.tasks.queries import (
+    TaskAggregateFilter,
+    TaskOperationalSnapshot,
+    TaskOrder,
+    TaskQuery,
+    TaskStatusCounts,
+    _ensure_claim_query_supported,
+    _task_matches_claim_filter,
+    _work_attempt_discovery_query,
+    copy_task_aggregate_filter,
+    copy_task_query,
+    task_query_from_aggregate_filter,
+)
 from cayu.tasks.records import (
     Task,
     TaskClaimLost,
     TaskRetrySeriesDisposition,
+    TaskSessionClosureClaim,
     TaskStatus,
     copy_task,
+    copy_task_session_closure_claim,
 )
 from cayu.tasks.retry import (
     TaskRetrySettlementRequest,
@@ -342,6 +343,11 @@ from cayu.tasks.topology import (
     _validate_task_topology_ancestry,
     build_task_topology_result,
     decode_task_topology_cursor,
+)
+from cayu.tasks.work_receipts import (
+    CompletionDecisionApplicationReceipt,
+    WorkAttemptLifecycleReceipt,
+    WorkAttemptPreparationHoldReceipt,
 )
 
 _T = TypeVar("_T")

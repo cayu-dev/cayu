@@ -51,7 +51,9 @@ from cayu.sessions.base import (
     UsageRollupQuery,
 )
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore, TaskAggregateFilter, TaskCreate
+from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.creation import TaskCreate
+from cayu.tasks.queries import TaskAggregateFilter
 
 
 def _identity() -> SessionIdentity:

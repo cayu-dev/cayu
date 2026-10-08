@@ -22,7 +22,7 @@ from cayu.events import (
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions.base import ForkSessionRequest, Session, copy_fork_session_request
-from cayu.tasks.base import TaskCreate
+from cayu.tasks.creation import TaskCreate
 from cayu.tasks.dispatch import DispatchHandle, DispatchRequest, copy_dispatch_handle
 from cayu.tasks.records import Task, copy_task
 from cayu.tools.base import ToolResult

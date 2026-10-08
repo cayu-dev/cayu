@@ -12,8 +12,11 @@ from cayu import CayuApp
 from cayu.storage import postgres, tasks_sqlite
 from cayu.storage.migrations import SchemaMode
 from cayu.tasks import base
-from cayu.tasks.base import InMemoryTaskStore, TaskCreate, TaskQuery, TaskStatus
+from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.creation import TaskCreate
 from cayu.tasks.graphs import TaskGraphCreate, TaskGraphEventType, TaskGraphNode
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import TaskStatus
 from cayu.tasks.scheduling import TaskMisfirePolicy, TaskScheduleEventType, TaskSchedulePolicy
 
 

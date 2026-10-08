@@ -17,7 +17,10 @@ from cayu.delivery.github import (
     approve_github_delivery,
 )
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore, TaskCreate, TaskQuery, TaskStatus
+from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.creation import TaskCreate
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import TaskStatus
 from cayu.tasks.worker import run_task_worker
 from tests.core.test_github_delivery import FakeTransport, _connector, _pr, _request
 from tests.qualification.test_repository_maintenance_application import project as project

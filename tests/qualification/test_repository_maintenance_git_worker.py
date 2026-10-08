@@ -8,7 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 from cayu.delivery.git import RemoteGitDeliveryApproval
-from cayu.tasks.base import TaskQuery, TaskStatus
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import TaskStatus
 from cayu.tasks.worker import run_task_worker
 from tests.qualification.test_repository_maintenance_git_approval import (
     approval_context as approval_context,

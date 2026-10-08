@@ -28,7 +28,6 @@ from cayu._validation import canonical_durable_json_bytes
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresTaskStore
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.base import copy_task
 from cayu.tasks.contracts import (
     WORK_CONTRACT_TASK_CREATION_MAX_BYTES,
     WORK_CONTRACT_TASK_MAX_BYTES,
@@ -38,6 +37,7 @@ from cayu.tasks.contracts import (
     WorkContractRef,
     WorkCriterion,
 )
+from cayu.tasks.records import copy_task
 from cayu.vaults.redaction import SecretRedactor
 
 

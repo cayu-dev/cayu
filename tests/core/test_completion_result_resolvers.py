@@ -61,7 +61,8 @@ from cayu.sessions.base import (
     StoreTimeCheckpointTransform,
     run_request_with_task_invocation,
 )
-from cayu.tasks.base import CompletionDecisionApplicationReceipt, TaskStore
+from cayu.tasks.base import TaskStore
+from cayu.tasks.work_receipts import CompletionDecisionApplicationReceipt
 from cayu.vaults import SecretRedactor
 
 

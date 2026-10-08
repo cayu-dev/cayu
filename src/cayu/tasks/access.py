@@ -9,7 +9,9 @@ from dataclasses import dataclass
 from cayu._resource_access_errors import ResourceAccessDenied
 from cayu._validation import copy_label_map
 from cayu.sessions.access import SessionAccessScope, _SessionAccessBounds
-from cayu.tasks.base import TaskCreate, TaskQuery, TaskStore, copy_task_create, copy_task_query
+from cayu.tasks.base import TaskStore
+from cayu.tasks.creation import TaskCreate, copy_task_create
+from cayu.tasks.queries import TaskQuery, copy_task_query
 
 
 @dataclass(frozen=True, slots=True)

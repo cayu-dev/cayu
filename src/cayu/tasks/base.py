@@ -7,7 +7,6 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from enum import StrEnum
 from hashlib import sha256
 from itertools import islice
 from threading import Lock
@@ -92,6 +91,31 @@ from cayu.tasks.cancellation import (
 from cayu.tasks.cancellation import (
     prepare_task_retry_cancellation_reconciliation as prepare_task_retry_cancellation_reconciliation,
 )
+from cayu.tasks.creation import TaskCreate as TaskCreate
+from cayu.tasks.creation import TaskInvocationSnapshot as TaskInvocationSnapshot
+from cayu.tasks.creation import (
+    _copy_optional_session_binding,
+    _copy_required_session_binding,
+    _running_task_from_create,
+    _task_from_create,
+    _task_invocation_for_attachment,
+    _task_session_id_for_start,
+    _task_session_instance_for_attachment,
+)
+from cayu.tasks.creation import copy_task_create as copy_task_create
+from cayu.tasks.creation import (
+    preflight_contract_bound_task_creation as preflight_contract_bound_task_creation,
+)
+from cayu.tasks.creation import (
+    require_contract_bound_task_creation_snapshot as require_contract_bound_task_creation_snapshot,
+)
+from cayu.tasks.creation import (
+    task_create_with_execution_source as task_create_with_execution_source,
+)
+from cayu.tasks.creation import (
+    task_create_with_runtime_invocation as task_create_with_runtime_invocation,
+)
+from cayu.tasks.creation import task_invocation_for_create as task_invocation_for_create
 from cayu.tasks.handoff import (
     _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
     _copy_interrupted_task_handoff_receipt,
@@ -118,8 +142,25 @@ from cayu.tasks.handoff import (
 from cayu.tasks.handoff import (
     prepare_interrupted_task_handoff_receipt_lookup as prepare_interrupted_task_handoff_receipt_lookup,
 )
+from cayu.tasks.queries import TaskAggregateFilter as TaskAggregateFilter
+from cayu.tasks.queries import TaskOperationalSnapshot as TaskOperationalSnapshot
+from cayu.tasks.queries import TaskOrder as TaskOrder
+from cayu.tasks.queries import TaskQuery as TaskQuery
+from cayu.tasks.queries import TaskStatusCounts as TaskStatusCounts
+from cayu.tasks.queries import (
+    _ensure_claim_query_supported,
+    _sort_tasks,
+    _task_matches,
+    _task_matches_claim_filter,
+    _work_attempt_discovery_query,
+)
+from cayu.tasks.queries import copy_task_aggregate_filter as copy_task_aggregate_filter
+from cayu.tasks.queries import copy_task_query as copy_task_query
+from cayu.tasks.queries import task_query_from_aggregate_filter as task_query_from_aggregate_filter
 from cayu.tasks.records import _HELD_TASK_STATUSES, _TERMINAL_TASK_STATUSES, _validate_positive_int
 from cayu.tasks.records import TaskClaimLost as TaskClaimLost
+from cayu.tasks.records import TaskSessionClosureClaim as TaskSessionClosureClaim
+from cayu.tasks.records import copy_task_session_closure_claim as copy_task_session_closure_claim
 from cayu.tasks.retry import TaskRetryAttemptDisposition as TaskRetryAttemptDisposition
 from cayu.tasks.retry import TaskRetryAttemptReport as TaskRetryAttemptReport
 from cayu.tasks.retry import TaskRetryEvent as TaskRetryEvent
@@ -139,8 +180,6 @@ from cayu.tasks.retry import (
     _task_retry_cancellation_requested_event,
     _task_retry_events,
     _task_retry_runtime_idempotency_key,
-    _task_retry_series_id,
-    _task_retry_series_snapshot,
     _validate_task_retry_settlement_receipt_identity,
     _validated_task_retry_terminal_accounting,
 )
@@ -167,6 +206,13 @@ from cayu.tasks.terminalization import prepare_task_terminalization as prepare_t
 from cayu.tasks.terminalization import (
     prepare_task_terminalization_receipt_lookup as prepare_task_terminalization_receipt_lookup,
 )
+from cayu.tasks.work_receipts import (
+    CompletionDecisionApplicationReceipt as CompletionDecisionApplicationReceipt,
+)
+from cayu.tasks.work_receipts import WorkAttemptLifecycleReceipt as WorkAttemptLifecycleReceipt
+from cayu.tasks.work_receipts import (
+    WorkAttemptPreparationHoldReceipt as WorkAttemptPreparationHoldReceipt,
+)
 
 if TYPE_CHECKING:
     from cayu.tasks._group_maintenance import TaskGroupMaintenance
@@ -186,24 +232,11 @@ if TYPE_CHECKING:
         TaskGroupSnapshot,
     )
 
-from pydantic import (
-    BaseModel,
-    ConfigDict,
-    Field,
-    PrivateAttr,
-    StrictBool,
-    StrictInt,
-    field_validator,
-    model_validator,
-)
 
 from cayu._clock import normalize_utc_datetime, utc_clock
 from cayu._validation import (
-    MAX_DURABLE_JSON_INTEGER,
     canonical_durable_json_bytes,
     copy_durable_json_object,
-    copy_durable_metadata,
-    inspect_bounded_durable_json,
     revalidate_model_input,
 )
 from cayu._validation import (
@@ -219,8 +252,6 @@ from cayu.approvals.tools import (
 from cayu.budgets.aggregates import (
     _IN_MEMORY_AGGREGATE_CANCELLATION_INTERVAL,
     EXACT_AGGREGATE,
-    AggregateAccuracy,
-    AggregateCount,
     _cooperate_with_in_memory_aggregate_cancellation,
 )
 from cayu.runtime._durable_worker_loop import (
@@ -264,17 +295,7 @@ from cayu.runtime.work_attempt_lifecycle import (
     work_attempt_preparation_hold_sha256,
 )
 from cayu.sessions.invocation import (
-    InvocationOrigin,
-    InvocationOriginClaim,
-    InvocationOriginTrust,
     SessionInvocationBinding,
-    TaskExecutionSource,
-    TaskInvocation,
-    copy_invocation_origin,
-    copy_invocation_origin_claim,
-    copy_session_invocation_binding,
-    copy_task_invocation,
-    inherited_task_invocation,
 )
 from cayu.tasks._scheduling import (
     admitted_schedule,
@@ -349,12 +370,6 @@ from cayu.tasks.completion_verifier_profiles import (
     require_completion_verifier_profile_transition,
 )
 from cayu.tasks.contracts import (
-    WORK_COMPLETION_APPLICATION_RECEIPT_MAX_BYTES,
-    WORK_COMPLETION_APPLICATION_RECEIPT_MAX_ITEMS,
-    WORK_CONTRACT_TASK_CREATION_MAX_BYTES,
-    WORK_CONTRACT_TASK_CREATION_MAX_ITEMS,
-    WORK_CONTRACT_TASK_MAX_BYTES,
-    WORK_CONTRACT_TASK_MAX_ITEMS,
     CompletionDecision,
     CompletionDecisionApplicationRequest,
     CompletionDecisionCreate,
@@ -386,7 +401,6 @@ from cayu.tasks.contracts import (
     copy_work_attempt_create,
     copy_work_contract,
     copy_work_contract_ref,
-    require_bounded_work_completion_document,
     validate_completion_decision_contract,
     validate_work_completion_idempotency_key,
     validate_work_completion_linked_id,
@@ -429,12 +443,9 @@ from cayu.tasks.scheduling import (
     TaskScheduleEligibility,
     TaskScheduleEvent,
     TaskScheduleEventType,
-    TaskSchedulePolicy,
     TaskScheduleReceipt,
-    TaskScheduleState,
     TaskScheduleWakeup,
     task_schedule_eligibility,
-    validate_task_schedule_window,
 )
 from cayu.tasks.topology import (
     TASK_TOPOLOGY_DEFAULT_BRANCH_LIMIT as TASK_TOPOLOGY_DEFAULT_BRANCH_LIMIT,
@@ -492,502 +503,6 @@ from cayu.tasks.topology import decode_task_topology_cursor as decode_task_topol
 from cayu.tasks.topology import encode_task_topology_cursor as encode_task_topology_cursor
 
 _DURABLE_WORKER_POLLER_REGISTRY_LOCK = Lock()
-
-
-class TaskOrder(StrEnum):
-    CREATED_AT_ASC = "created_at_asc"
-    CREATED_AT_DESC = "created_at_desc"
-    UPDATED_AT_ASC = "updated_at_asc"
-    UPDATED_AT_DESC = "updated_at_desc"
-
-
-class TaskInvocationSnapshot(BaseModel):
-    """Bounded task identity and immutable provenance for delegation boundaries."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    id: str
-    session_id: str | None
-    session_instance_id: str | None = None
-    invocation: TaskInvocation
-
-    @field_validator("id")
-    @classmethod
-    def validate_id(cls, value: str) -> str:
-        return require_clean_nonblank(value, "id")
-
-    @field_validator("session_id")
-    @classmethod
-    def validate_session_id(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return require_clean_nonblank(value, "session_id")
-
-    @field_validator("session_instance_id")
-    @classmethod
-    def validate_session_instance_id(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return SessionInvocationBinding.validate_session_instance_id(value)
-
-    @model_validator(mode="after")
-    def validate_session_instance_binding(self) -> TaskInvocationSnapshot:
-        if self.session_instance_id is not None and self.session_id is None:
-            raise ValueError("Task invocation session instance requires a session_id.")
-        return self
-
-    @field_validator("invocation")
-    @classmethod
-    def copy_invocation(cls, value: TaskInvocation) -> TaskInvocation:
-        return copy_task_invocation(value)
-
-
-class TaskCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
-
-    task_id: str | None = None
-    type: str
-    title: str | None = None
-    description: str | None = None
-    session_id: str | None = None
-    parent_task_id: str | None = None
-    assigned_agent_name: str | None = None
-    available_at: datetime | None = None
-    schedule_policy: TaskSchedulePolicy | None = None
-    input: dict[str, Any] = Field(default_factory=dict)
-    metadata: dict[str, Any] = Field(default_factory=dict)
-    retry_policy: TaskRetryPolicy | None = None
-    work_contract: WorkContractRef | None = None
-    invocation_origin: InvocationOriginClaim | None = None
-    _verified_invocation_origin: InvocationOrigin | None = PrivateAttr(default=None)
-    _runtime_invocation_source: TaskExecutionSource | None = PrivateAttr(default=None)
-    _runtime_session_binding: SessionInvocationBinding | None = PrivateAttr(default=None)
-
-    @field_validator("schedule_policy", mode="before")
-    @classmethod
-    def copy_schedule_policy(cls, value: object) -> object:
-        return revalidate_model_input(value, TaskSchedulePolicy)
-
-    @model_validator(mode="after")
-    def validate_schedule(self) -> TaskCreate:
-        if self.schedule_policy is not None:
-            if self.task_id is None or self.available_at is None:
-                raise ValueError("Managed task schedules require task_id and available_at.")
-            if self.session_id is not None:
-                raise ValueError("Managed schedules start as unattached queue tasks.")
-            validate_task_schedule_window(self.available_at, self.schedule_policy)
-        return self
-
-    @model_validator(mode="before")
-    @classmethod
-    def preflight_work_contract_payloads(cls, value: object) -> object:
-        if type(value) is not dict:
-            return value
-        document = cast("dict[str, object]", value)
-        if document.get("work_contract") is None:
-            return value
-        _preflight_bounded_task_payloads(document, ("input", "metadata"))
-        return value
-
-    @field_validator("input", "metadata", mode="before")
-    @classmethod
-    def copy_json_object(cls, value: dict[str, Any], info) -> dict[str, Any]:
-        if info.field_name == "metadata":
-            return copy_durable_metadata(value)
-        return copy_durable_json_object(value, info.field_name)
-
-    @field_validator("type")
-    @classmethod
-    def validate_nonblank_type(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator(
-        "task_id",
-        "title",
-        "description",
-        "session_id",
-        "parent_task_id",
-        "assigned_agent_name",
-    )
-    @classmethod
-    def validate_optional_nonblank_strings(
-        cls,
-        value: str | None,
-        info,
-    ) -> str | None:
-        if value is None:
-            return None
-        if info.field_name in {"title", "description"}:
-            return require_nonblank(value, info.field_name)
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("available_at")
-    @classmethod
-    def normalize_available_at(cls, value: datetime | None) -> datetime | None:
-        if value is None:
-            return None
-        return normalize_utc_datetime(value, "available_at")
-
-    @field_validator("work_contract", mode="before")
-    @classmethod
-    def copy_work_contract(cls, value: object) -> object:
-        return revalidate_model_input(value, WorkContractRef)
-
-    @model_validator(mode="after")
-    def validate_retry_and_work_contract_shape(self) -> TaskCreate:
-        if self.retry_policy is not None:
-            if self.task_id is not None:
-                _validate_task_retry_reconciliation_identity(self.task_id, "task_id")
-            if self.session_id is not None:
-                raise ValueError("Retry-series tasks must start as unattached queue work.")
-            if self.work_contract is not None:
-                raise ValueError("Retry-series tasks cannot use verified work contracts.")
-        if self.work_contract is None:
-            return self
-        if self.task_id is not None:
-            validate_work_completion_linked_id(self.task_id, "task_id")
-        if self.session_id is not None:
-            validate_work_completion_linked_id(self.session_id, "session_id")
-        require_bounded_work_completion_document(
-            self.model_dump(mode="json", warnings=False),
-            "Contract-bound task creation request",
-            max_bytes=WORK_CONTRACT_TASK_MAX_BYTES,
-            max_items=WORK_CONTRACT_TASK_MAX_ITEMS,
-        )
-        return self
-
-
-class CompletionDecisionApplicationReceipt(BaseModel):
-    """Immutable evidence that one verifier decision was applied to its task."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    task_id: str
-    decision_id: str
-    verifier_profile_fingerprint: str
-    idempotency_key: str
-    request_sha256: str
-    task: Task
-    applied_at: datetime
-
-    @field_validator("task_id", "decision_id", "idempotency_key")
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        if info.field_name == "idempotency_key":
-            return validate_work_completion_idempotency_key(value)
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("verifier_profile_fingerprint", "request_sha256")
-    @classmethod
-    def validate_sha256(cls, value: str, info) -> str:
-        if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
-            raise ValueError(f"{info.field_name} must be a lowercase SHA-256 digest.")
-        return value
-
-    @field_validator("task", mode="before")
-    @classmethod
-    def copy_task(cls, value: object) -> object:
-        if type(value) is Task:
-            _preflight_bounded_task_payloads(
-                value,
-                field_label="Decision-application receipt task",
-            )
-        return revalidate_model_input(value, Task)
-
-    @field_validator("applied_at")
-    @classmethod
-    def normalize_applied_at(cls, value: datetime) -> datetime:
-        return normalize_utc_datetime(value, "applied_at")
-
-    @model_validator(mode="after")
-    def validate_receipt_task(self) -> CompletionDecisionApplicationReceipt:
-        if self.task.id != self.task_id:
-            raise ValueError("Decision-application receipt conflicts with its task.")
-        if self.task.work_contract is None:
-            raise ValueError("Decision-application receipt requires a contract-bound task.")
-        require_bounded_work_completion_document(
-            self.model_dump(mode="json", warnings=False),
-            "Completion decision application receipt",
-            max_bytes=WORK_COMPLETION_APPLICATION_RECEIPT_MAX_BYTES,
-            max_items=WORK_COMPLETION_APPLICATION_RECEIPT_MAX_ITEMS,
-        )
-        return self
-
-
-class WorkAttemptPreparationHoldReceipt(BaseModel):
-    """Original non-success result for one exact pre-admission callback failure."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    request: WorkAttemptPreparationHold
-    request_sha256: str
-    task: Task
-
-    @field_validator("request", mode="before")
-    @classmethod
-    def copy_request(cls, value: object) -> object:
-        return revalidate_model_input(value, WorkAttemptPreparationHold)
-
-    @field_validator("task", mode="before")
-    @classmethod
-    def copy_result_task(cls, value: object) -> object:
-        if type(value) is Task:
-            _preflight_bounded_task_payloads(value, field_label="Preparation hold receipt task")
-        return revalidate_model_input(value, Task)
-
-    @model_validator(mode="after")
-    def validate_authority(self) -> WorkAttemptPreparationHoldReceipt:
-        if (
-            self.request_sha256 != work_attempt_preparation_hold_sha256(self.request)
-            or self.task.id != self.request.task_id
-            or self.task.work_contract != self.request.contract
-            or self.task.status
-            is not (
-                TaskStatus.CANCELLED
-                if self.request.reason == "work_contract_group_cancelled"
-                else TaskStatus.NEEDS_ATTENTION
-            )
-            or self.task.status_reason != self.request.reason
-            or self.task.worker_id is not None
-            or self.task.lease_expires_at is not None
-            or self.task.session_id is not None
-            or self.task.session_instance_id is not None
-        ):
-            raise ValueError("Preparation hold receipt conflicts with its exact non-success task.")
-        require_bounded_work_completion_document(
-            self.model_dump(mode="json", warnings=False),
-            "Work-attempt preparation hold receipt",
-            max_bytes=WORK_COMPLETION_APPLICATION_RECEIPT_MAX_BYTES + 32 * 1024,
-            max_items=WORK_COMPLETION_APPLICATION_RECEIPT_MAX_ITEMS + 256,
-        )
-        return self
-
-
-class WorkAttemptLifecycleReceipt(BaseModel):
-    """Original final task result and exact invocation-release evidence."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    request: WorkAttemptLifecycleSettlement
-    request_sha256: str
-    task: Task
-    retired_contract_binding: StrictBool
-    settled_at: datetime
-
-    @field_validator("request", mode="before")
-    @classmethod
-    def copy_request(cls, value: object) -> object:
-        return revalidate_model_input(value, WorkAttemptLifecycleSettlement)
-
-    @field_validator("task", mode="before")
-    @classmethod
-    def copy_result_task(cls, value: object) -> object:
-        if type(value) is Task:
-            _preflight_bounded_task_payloads(
-                value, field_label="Work-attempt lifecycle receipt task"
-            )
-        return revalidate_model_input(value, Task)
-
-    @field_validator("settled_at")
-    @classmethod
-    def normalize_settled_at(cls, value: datetime) -> datetime:
-        return normalize_utc_datetime(value, "settled_at")
-
-    @model_validator(mode="after")
-    def validate_authority(self) -> WorkAttemptLifecycleReceipt:
-        if self.request_sha256 != work_attempt_lifecycle_settlement_sha256(self.request):
-            raise ValueError("Work-attempt receipt conflicts with its exact settlement request.")
-        if self.task.id != self.request.task_id or self.task.work_contract is None:
-            raise ValueError("Work-attempt receipt requires its exact contract-bound task.")
-        if self.task.session_id != self.request.release_evidence.session_id or (
-            self.task.session_instance_id != self.request.release_evidence.session_instance_id
-        ):
-            raise ValueError("Work-attempt receipt conflicts with its released invocation.")
-        if self.retired_contract_binding != (
-            self.task.status is TaskStatus.COMPLETED
-            or (
-                self.request.kind == "group_cancellation"
-                and self.task.status is TaskStatus.CANCELLED
-            )
-        ):
-            raise ValueError(
-                "Only accepted or quiescent group-cancelled work retires its contract binding."
-            )
-        if self.request.kind in {
-            "runtime_stop",
-            "proposal_deadline_stop",
-            "continuation_deadline_stop",
-        } and (
-            self.task.status is not TaskStatus.NEEDS_ATTENTION
-            or self.task.status_reason != self.request.stop_reason
-        ):
-            raise ValueError("Runtime-stop receipt requires its typed non-success result.")
-        if self.request.kind == "group_cancellation" and (
-            self.task.status is not TaskStatus.CANCELLED
-            or self.task.status_reason != self.request.stop_reason
-        ):
-            raise ValueError("Group-stop receipt requires its typed cancellation result.")
-        require_bounded_work_completion_document(
-            self.model_dump(mode="json", warnings=False),
-            "Work-attempt lifecycle receipt",
-            max_bytes=WORK_COMPLETION_APPLICATION_RECEIPT_MAX_BYTES + 32 * 1024,
-            max_items=WORK_COMPLETION_APPLICATION_RECEIPT_MAX_ITEMS + 256,
-        )
-        return self
-
-
-class TaskQuery(BaseModel):
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
-
-    q: str | None = None
-    status: TaskStatus | None = None
-    type: str | None = None
-    session_id: str | None = None
-    parent_task_id: str | None = None
-    assigned_agent_name: str | None = None
-    has_work_contract: StrictBool | None = None
-    limit: StrictInt = Field(default=100, ge=1, le=1000)
-    offset: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    order_by: TaskOrder = TaskOrder.UPDATED_AT_DESC
-
-    @field_validator("q", "type", "session_id", "parent_task_id", "assigned_agent_name")
-    @classmethod
-    def validate_optional_nonblank_strings(
-        cls,
-        value: str | None,
-        info,
-    ) -> str | None:
-        if value is None:
-            return None
-        return require_clean_nonblank(value, info.field_name)
-
-
-class TaskAggregateFilter(BaseModel):
-    """Current task attributes that may scope a store-native aggregate."""
-
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
-
-    type: str | None = None
-    session_id: str | None = None
-    parent_task_id: str | None = None
-    assigned_agent_name: str | None = None
-
-    @field_validator("type", "session_id", "parent_task_id", "assigned_agent_name")
-    @classmethod
-    def validate_optional_nonblank_strings(
-        cls,
-        value: str | None,
-        info,
-    ) -> str | None:
-        if value is None:
-            return None
-        return require_clean_nonblank(value, info.field_name)
-
-
-class TaskStatusCounts(BaseModel):
-    """Complete current-task counts for every lifecycle status."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    pending: AggregateCount = Field(ge=0)
-    waiting_dependencies: AggregateCount = Field(default=0, ge=0)
-    waiting_group: AggregateCount = Field(default=0, ge=0)
-    dependency_skipped: AggregateCount = Field(default=0, ge=0)
-    claimed: AggregateCount = Field(ge=0)
-    running: AggregateCount = Field(ge=0)
-    paused: AggregateCount = Field(ge=0)
-    blocked: AggregateCount = Field(ge=0)
-    needs_attention: AggregateCount = Field(ge=0)
-    completed: AggregateCount = Field(ge=0)
-    failed: AggregateCount = Field(ge=0)
-    cancelled: AggregateCount = Field(ge=0)
-
-
-class TaskOperationalSnapshot(BaseModel):
-    """Exact current task counts captured by one store-local read snapshot."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    as_of: datetime
-    total_count: AggregateCount = Field(ge=0)
-    counts_by_status: TaskStatusCounts
-    claimable_pending_count: AggregateCount = Field(ge=0)
-    scheduled_pending_count: AggregateCount = Field(ge=0)
-    accuracy: AggregateAccuracy
-
-    @field_validator("counts_by_status")
-    @classmethod
-    def copy_counts_by_status(cls, value: TaskStatusCounts) -> TaskStatusCounts:
-        return TaskStatusCounts.model_validate(value.model_dump(mode="python", warnings=False))
-
-    @field_validator("accuracy")
-    @classmethod
-    def copy_accuracy(cls, value: AggregateAccuracy) -> AggregateAccuracy:
-        return AggregateAccuracy.model_validate(value.model_dump(mode="python", warnings=False))
-
-    @field_validator("as_of")
-    @classmethod
-    def normalize_as_of(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("as_of must be timezone-aware.")
-        return value.astimezone(UTC)
-
-    @model_validator(mode="after")
-    def validate_total(self) -> TaskOperationalSnapshot:
-        if sum(self.counts_by_status.model_dump().values()) != self.total_count:
-            raise ValueError("Task status counts must sum to total_count.")
-        if (
-            self.claimable_pending_count + self.scheduled_pending_count
-            > self.counts_by_status.pending
-        ):
-            raise ValueError("Claimable and scheduled pending counts cannot exceed pending count.")
-        return self
-
-
-class TaskSessionClosureClaim(BaseModel):
-    """Exact non-expiring authority for retiring one session's task set."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    session_id: str = Field(strict=True, min_length=1, max_length=256)
-    plan_id: str = Field(strict=True, pattern=r"^[0-9a-f]{64}$")
-    task_ids: tuple[str, ...]
-
-    @field_validator("session_id")
-    @classmethod
-    def validate_session(cls, value):
-        return require_clean_nonblank(value, "session_id")
-
-    @field_validator("task_ids", mode="before")
-    @classmethod
-    def validate_task_ids(cls, value):
-        if type(value) not in (tuple, list) or len(value) > 100_000:
-            raise ValueError("Invalid closure task set.")
-        if any(type(item) is not str or not 0 < len(item) <= 256 for item in value):
-            raise ValueError("Invalid closure task identity.")
-        copied = tuple(require_clean_nonblank(item, "task_id") for item in value)
-        if len(set(copied)) != len(copied):
-            raise ValueError("Closure task identities must be unique.")
-        return tuple(sorted(copied))
-
-    @model_validator(mode="after")
-    def validate_claim_bound(self):
-        inspect_bounded_durable_json(
-            {"session_id": self.session_id, "plan_id": self.plan_id, "task_ids": self.task_ids},
-            "task closure claim",
-            max_bytes=8 * 1024 * 1024,
-            max_nodes=100_010,
-            allow_tuples=True,
-        )
-        return self
-
-
-def copy_task_session_closure_claim(claim: TaskSessionClosureClaim) -> TaskSessionClosureClaim:
-    if type(claim) is not TaskSessionClosureClaim:
-        raise TypeError("A typed task closure claim is required.")
-    return TaskSessionClosureClaim(
-        session_id=claim.session_id, plan_id=claim.plan_id, task_ids=claim.task_ids
-    )
 
 
 class TaskStore(ABC):
@@ -7822,346 +7337,6 @@ def _task_terminalization_error_category(exc: Exception) -> str:
     return "database_operational"
 
 
-def copy_task_create(request: TaskCreate) -> TaskCreate:
-    if type(request) is not TaskCreate:
-        raise TypeError("Task creation requires a TaskCreate instance.")
-    if request.work_contract is not None:
-        _preflight_bounded_task_payloads(request, ("input", "metadata"))
-    copied = TaskCreate(
-        task_id=request.task_id,
-        type=request.type,
-        title=request.title,
-        description=request.description,
-        session_id=request.session_id,
-        parent_task_id=request.parent_task_id,
-        assigned_agent_name=request.assigned_agent_name,
-        available_at=request.available_at,
-        schedule_policy=request.schedule_policy,
-        input=copy_durable_json_object(request.input, "input"),
-        metadata=copy_durable_metadata(request.metadata),
-        retry_policy=(
-            None
-            if request.retry_policy is None
-            else TaskRetryPolicy.model_validate(
-                request.retry_policy.model_dump(mode="python", warnings=False)
-            )
-        ),
-        work_contract=copy_work_contract_ref(request.work_contract),
-        invocation_origin=copy_invocation_origin_claim(request.invocation_origin),
-    )
-    copied._verified_invocation_origin = (
-        None
-        if request._verified_invocation_origin is None
-        else copy_invocation_origin(request._verified_invocation_origin)
-    )
-    copied._runtime_invocation_source = request._runtime_invocation_source
-    copied._runtime_session_binding = _copy_optional_session_binding(
-        request._runtime_session_binding
-    )
-    return copied
-
-
-def task_create_with_runtime_invocation(
-    request: TaskCreate,
-    *,
-    source: TaskExecutionSource,
-    verified_origin: InvocationOrigin | None = None,
-    session_invocation: SessionInvocationBinding | None = None,
-) -> TaskCreate:
-    """Attach provenance authority minted by a trusted Cayu boundary."""
-
-    if type(request) is not TaskCreate:
-        raise TypeError("Runtime task invocation authority requires a TaskCreate request.")
-    if type(source) is not TaskExecutionSource:
-        raise TypeError("source must be a TaskExecutionSource.")
-    if verified_origin is not None:
-        verified_origin = copy_invocation_origin(verified_origin)
-        if verified_origin.trust is not InvocationOriginTrust.SERVER_VERIFIED:
-            raise ValueError("Runtime-verified task origins must use server_verified trust.")
-        if request.invocation_origin is not None:
-            raise ValueError("A verified task cannot also carry a host origin claim.")
-    session_binding = _copy_optional_session_binding(session_invocation)
-    if session_binding is not None and (
-        request.invocation_origin is not None or verified_origin is not None
-    ):
-        raise ValueError("Session-derived tasks must inherit their root invocation origin.")
-    copied = copy_task_create(request)
-    copied._runtime_invocation_source = source
-    copied._verified_invocation_origin = verified_origin
-    copied._runtime_session_binding = session_binding
-    return copied
-
-
-def task_create_with_execution_source(
-    request: TaskCreate,
-    *,
-    source: TaskExecutionSource,
-) -> TaskCreate:
-    """Classify work at a trusted direct-SDK host boundary.
-
-    The source is private model state rather than request JSON. Server-owned
-    sources are intentionally rejected; only Cayu's server/runtime adapters may
-    mint those classifications.
-    """
-
-    if type(source) is not TaskExecutionSource:
-        raise TypeError("source must be a TaskExecutionSource.")
-    if source not in {
-        TaskExecutionSource.SDK_TASK,
-        TaskExecutionSource.SCHEDULED,
-        TaskExecutionSource.WEBHOOK,
-    }:
-        raise ValueError("Direct SDK task sources must be sdk_task, scheduled, or webhook.")
-    return task_create_with_runtime_invocation(request, source=source)
-
-
-def task_invocation_for_create(request, *, task_id, parent_task, session_invocation=None):
-    from cayu.tasks.access import creation_invocation
-
-    invocation = _task_invocation_for_create_unscoped(
-        request, task_id=task_id, parent_task=parent_task, session_invocation=session_invocation
-    )
-    return creation_invocation(invocation, request, parent_task)
-
-
-def _task_invocation_for_create_unscoped(
-    request: TaskCreate,
-    *,
-    task_id: str,
-    parent_task: Task | TaskInvocationSnapshot | None,
-    session_invocation: SessionInvocationBinding | None = None,
-) -> TaskInvocation:
-    """Derive exact provenance inside the atomic task-store create boundary."""
-
-    if type(request) is not TaskCreate:
-        raise TypeError("Task invocation derivation requires a TaskCreate request.")
-    task_id = require_clean_nonblank(task_id, "task_id")
-    source = request._runtime_invocation_source or TaskExecutionSource.SDK_TASK
-    verified_origin = request._verified_invocation_origin
-    request_session_binding = request._runtime_session_binding
-    supplied_session_binding = _copy_optional_session_binding(session_invocation)
-    if (
-        request_session_binding is not None
-        and supplied_session_binding is not None
-        and request_session_binding != supplied_session_binding
-    ):
-        raise ValueError("Task creation carries contradictory session invocation bindings.")
-    session_binding = supplied_session_binding or request_session_binding
-    if request.invocation_origin is not None and verified_origin is not None:
-        raise ValueError("A task cannot carry both host-asserted and verified origins.")
-    if parent_task is not None:
-        if type(parent_task) not in {Task, TaskInvocationSnapshot}:
-            raise TypeError("Parent task provenance must be a task or invocation snapshot.")
-        if request.parent_task_id != parent_task.id:
-            raise ValueError("Parent task identity conflicts with invocation derivation.")
-        if request.invocation_origin is not None or verified_origin is not None:
-            raise ValueError("Derived tasks must inherit their root invocation origin.")
-        if (
-            session_binding is not None
-            and request.session_id is not None
-            and request.session_id != session_binding.id
-        ):
-            raise ValueError("Task session identity conflicts with its provenance binding.")
-        if session_binding is not None and (
-            parent_task.invocation.origin != session_binding.invocation.origin
-            or parent_task.invocation.root_invocation_id
-            != session_binding.invocation.root_invocation_id
-        ):
-            raise ValueError("Parent task and attached session invocation provenance conflict.")
-        return inherited_task_invocation(
-            parent_task.invocation,
-            source=source,
-            root_session_id=(
-                None if session_binding is None else session_binding.invocation.root_session_id
-            ),
-        )
-    if request.parent_task_id is not None:
-        raise ValueError("Parent task not found for invocation provenance.")
-    if session_binding is not None:
-        if request.invocation_origin is not None or verified_origin is not None:
-            raise ValueError("Session-derived tasks must inherit their root invocation origin.")
-        if request.session_id is not None and request.session_id != session_binding.id:
-            raise ValueError("Task session identity conflicts with its provenance binding.")
-        return inherited_task_invocation(
-            session_binding.invocation,
-            source=source,
-        )
-    if source is TaskExecutionSource.TASK_DISPATCH:
-        raise ValueError("Task dispatch provenance requires a parent task or session.")
-    if verified_origin is not None:
-        if source not in {TaskExecutionSource.HTTP_RUN, TaskExecutionSource.PRODUCT_OPERATION}:
-            raise ValueError("Verified task origins require a server-owned task source.")
-        origin = copy_invocation_origin(verified_origin)
-    elif request.invocation_origin is not None:
-        if source not in {
-            TaskExecutionSource.SDK_TASK,
-            TaskExecutionSource.SCHEDULED,
-            TaskExecutionSource.WEBHOOK,
-        }:
-            raise ValueError("Host-asserted task origins require a trusted host source.")
-        origin = InvocationOrigin(
-            trust=InvocationOriginTrust.HOST_ASSERTED,
-            subject=request.invocation_origin.subject,
-            tenant=request.invocation_origin.tenant,
-        )
-    else:
-        if source not in {
-            TaskExecutionSource.SDK_TASK,
-            TaskExecutionSource.SCHEDULED,
-            TaskExecutionSource.WEBHOOK,
-        }:
-            raise ValueError(f"{source.value} task provenance requires a trusted origin.")
-        origin = InvocationOrigin(trust=InvocationOriginTrust.UNATTRIBUTED)
-    from cayu.resource_access import current_binding
-
-    return TaskInvocation(
-        resource_access=current_binding(),
-        origin=origin,
-        root_invocation_id=str(uuid4()),
-        root_session_id=request.session_id,
-        source=source,
-    )
-
-
-def _copy_optional_session_binding(
-    value: SessionInvocationBinding | None,
-) -> SessionInvocationBinding | None:
-    if value is None:
-        return None
-    return copy_session_invocation_binding(value)
-
-
-def _copy_required_session_binding(
-    value: SessionInvocationBinding,
-) -> SessionInvocationBinding:
-    if value is None:
-        raise TypeError("Running task creation requires session invocation provenance.")
-    return copy_session_invocation_binding(value)
-
-
-def _task_invocation_for_attachment(
-    task_invocation: TaskInvocation,
-    *,
-    session_id: str | None,
-    session_binding: SessionInvocationBinding | None,
-) -> TaskInvocation:
-    task_invocation = copy_task_invocation(task_invocation)
-    if session_id is None:
-        if session_binding is not None:
-            raise ValueError("Session provenance binding requires a session_id attachment.")
-        return task_invocation
-    if session_binding is None:
-        raise ValueError("Session provenance binding is required to attach this task.")
-    if session_binding.id != session_id:
-        raise ValueError("Task session identity conflicts with its provenance binding.")
-    session_invocation = session_binding.invocation
-    if (
-        task_invocation.origin != session_invocation.origin
-        or task_invocation.root_invocation_id != session_invocation.root_invocation_id
-    ):
-        raise ValueError("Task and session invocation provenance conflict.")
-    if (
-        task_invocation.root_session_id is not None
-        and task_invocation.root_session_id != session_invocation.root_session_id
-    ):
-        raise ValueError("Task and session root identities conflict.")
-    return task_invocation
-
-
-def _task_session_instance_for_attachment(
-    *,
-    stored_session_instance_id: str | None,
-    session_id: str | None,
-    session_binding: SessionInvocationBinding | None,
-) -> str | None:
-    """Bind one task attachment to the exact durable session incarnation."""
-
-    if session_id is None:
-        if session_binding is not None or stored_session_instance_id is not None:
-            raise ValueError("Session-instance authority requires a session attachment.")
-        return None
-    if session_binding is None:
-        raise ValueError("Session-instance authority is required to attach this task.")
-    if session_binding.id != session_id:
-        raise ValueError("Task session identity conflicts with its instance authority.")
-    if (
-        stored_session_instance_id is not None
-        and stored_session_instance_id != session_binding.session_instance_id
-    ):
-        raise ValueError("Task is already bound to another session instance.")
-    return session_binding.session_instance_id
-
-
-def _task_session_id_for_start(
-    *,
-    task_id: str,
-    stored_session_id: str | None,
-    requested_session_id: str | None,
-) -> str | None:
-    """Resolve one start transition's canonical session without allowing reassignment."""
-
-    task_id = require_clean_nonblank(task_id, "task_id")
-    if (
-        stored_session_id is not None
-        and requested_session_id is not None
-        and stored_session_id != requested_session_id
-    ):
-        raise ValueError(f"Task {task_id} is already bound to a different session.")
-    return stored_session_id if stored_session_id is not None else requested_session_id
-
-
-def copy_task_query(query: TaskQuery | None) -> TaskQuery:
-    if query is None:
-        return TaskQuery()
-    if type(query) is not TaskQuery:
-        raise TypeError("Task queries must be TaskQuery instances.")
-    return TaskQuery(
-        q=query.q,
-        status=query.status,
-        type=query.type,
-        session_id=query.session_id,
-        parent_task_id=query.parent_task_id,
-        assigned_agent_name=query.assigned_agent_name,
-        has_work_contract=query.has_work_contract,
-        limit=query.limit,
-        offset=query.offset,
-        order_by=query.order_by,
-    )
-
-
-def copy_task_aggregate_filter(
-    filters: TaskAggregateFilter | None,
-) -> TaskAggregateFilter:
-    if filters is None:
-        return TaskAggregateFilter()
-    if type(filters) is not TaskAggregateFilter:
-        raise TypeError("Task aggregate filters must be TaskAggregateFilter instances.")
-    return TaskAggregateFilter.model_validate(filters.model_dump(mode="python"))
-
-
-def task_query_from_aggregate_filter(filters: TaskAggregateFilter) -> TaskQuery:
-    filters = copy_task_aggregate_filter(filters)
-    return TaskQuery(
-        type=filters.type,
-        session_id=filters.session_id,
-        parent_task_id=filters.parent_task_id,
-        assigned_agent_name=filters.assigned_agent_name,
-    )
-
-
-def require_contract_bound_task_creation_snapshot(task: Task) -> None:
-    """Enforce the initial-snapshot reserve shared by every supporting store."""
-
-    if type(task) is not Task or task.work_contract is None:
-        raise TypeError("Creation-snapshot validation requires a contract-bound Task.")
-    require_bounded_work_completion_document(
-        task.model_dump(mode="json", warnings=False),
-        "Contract-bound task creation snapshot",
-        max_bytes=WORK_CONTRACT_TASK_CREATION_MAX_BYTES,
-        max_items=WORK_CONTRACT_TASK_CREATION_MAX_ITEMS,
-    )
-
-
 def _task_lifecycle_now(task: Task) -> datetime:
     """Return a wall-clock lifecycle time that cannot move ``task`` backward."""
 
@@ -8171,155 +7346,6 @@ def _task_lifecycle_now(task: Task) -> datetime:
     if task.completed_at is not None:
         timestamps.append(task.completed_at)
     return max(timestamps)
-
-
-def _task_from_create(
-    request: TaskCreate,
-    *,
-    task_id: str,
-    parent_task: Task | TaskInvocationSnapshot | None,
-    session_invocation: SessionInvocationBinding | None = None,
-    retry_started_at: datetime | None = None,
-    supports_verified_work_contracts: bool = False,
-) -> Task:
-    if request.work_contract is not None and not supports_verified_work_contracts:
-        raise NotImplementedError(
-            "This TaskStore does not support verified work-contract task bindings."
-        )
-    now = datetime.now(UTC)
-    retry_started_at = (
-        now
-        if retry_started_at is None
-        else normalize_utc_datetime(retry_started_at, "retry_started_at")
-    )
-    if request.schedule_policy is not None:
-        now = retry_started_at
-    invocation = task_invocation_for_create(
-        request,
-        task_id=task_id,
-        parent_task=parent_task,
-        session_invocation=session_invocation,
-    )
-    effective_session_binding = (
-        session_invocation if session_invocation is not None else request._runtime_session_binding
-    )
-    retry_policy = request.retry_policy
-    if retry_policy is None:
-        retry_series = None
-    else:
-        retry_series_id = _task_retry_series_id(task_id)
-        authority_sha256 = _task_retry_attempt_authority_sha256(
-            task_id=task_id,
-            task_type=request.type,
-            title=request.title,
-            description=request.description,
-            parent_task_id=request.parent_task_id,
-            assigned_agent_name=request.assigned_agent_name,
-            available_at=request.available_at,
-            created_at=now,
-            task_input=request.input,
-            metadata=request.metadata,
-            invocation=invocation,
-            series_id=retry_series_id,
-            causal_budget_id=retry_series_id,
-            attempt=1,
-            policy=retry_policy,
-            started_at=retry_started_at,
-            cumulative_tokens=0,
-            cumulative_estimated_cost=Decimal(0),
-            predecessor_task_id=None,
-        )
-        retry_series = _task_retry_series_snapshot(
-            series_id=retry_series_id,
-            causal_budget_id=retry_series_id,
-            authority_sha256=authority_sha256,
-            attempt=1,
-            policy=retry_policy,
-            started_at=retry_started_at,
-        )
-    task = Task(
-        id=task_id,
-        type=request.type,
-        title=request.title,
-        description=request.description,
-        status=TaskStatus.PENDING,
-        session_id=request.session_id,
-        session_instance_id=(
-            None
-            if request.session_id is None or effective_session_binding is None
-            else effective_session_binding.session_instance_id
-        ),
-        parent_task_id=request.parent_task_id,
-        assigned_agent_name=request.assigned_agent_name,
-        available_at=request.available_at,
-        input=copy_durable_json_object(request.input, "input"),
-        metadata=copy_durable_metadata(request.metadata),
-        created_at=now,
-        updated_at=now,
-        invocation=invocation,
-        retry_series=retry_series,
-        work_contract=copy_work_contract_ref(request.work_contract),
-    )
-    if request.schedule_policy is not None:
-        task = task.model_copy(
-            update={
-                "schedule": TaskScheduleState(
-                    policy=request.schedule_policy,
-                    creation_sha256=schedule_creation_digest(request),
-                )
-            }
-        )
-    if task.work_contract is not None:
-        require_contract_bound_task_creation_snapshot(task)
-    return task
-
-
-def _running_task_from_create(
-    request: TaskCreate,
-    *,
-    task_id: str,
-    parent_task: Task | TaskInvocationSnapshot | None,
-    session_invocation: SessionInvocationBinding,
-    retry_started_at: datetime | None = None,
-    supports_verified_work_contracts: bool = False,
-) -> Task:
-    task = _task_from_create(
-        request,
-        task_id=task_id,
-        parent_task=parent_task,
-        session_invocation=session_invocation,
-        retry_started_at=retry_started_at,
-        supports_verified_work_contracts=supports_verified_work_contracts,
-    )
-    if task.session_id is None:
-        raise ValueError("TaskCreate.session_id is required to create a running task.")
-    running = task.model_copy(
-        update={
-            "status": TaskStatus.RUNNING,
-            "started_at": task.created_at,
-        }
-    )
-    return copy_task(running) if running.work_contract is not None else running
-
-
-def preflight_contract_bound_task_creation(
-    request: TaskCreate,
-    *,
-    parent_task: Task | TaskInvocationSnapshot | None,
-) -> None:
-    """Validate the authoritative pending snapshot before an extension mutates."""
-
-    if type(request) is not TaskCreate or request.work_contract is None:
-        raise TypeError("Creation preflight requires a contract-bound TaskCreate request.")
-    if request.task_id is None:
-        raise ValueError("Contract-bound task creation requires a caller-stable task_id.")
-    preview = _task_from_create(
-        request,
-        task_id=request.task_id,
-        parent_task=parent_task,
-        supports_verified_work_contracts=True,
-    )
-    del preview
 
 
 def _ensure_can_transition(task: Task, next_status: TaskStatus) -> None:
@@ -8608,105 +7634,6 @@ def _raise_task_claim_attach_error(
     if task.session_id is not None:
         raise ValueError(f"Task {task.id} is already attached to session {task.session_id}.")
     raise RuntimeError(f"Task {task.id} active claim could not be attached.")
-
-
-def _work_attempt_discovery_query(
-    task_filter: TaskAggregateFilter | None, *, limit: int, after: str | None
-) -> tuple[TaskQuery, str | None]:
-    copied = copy_task_aggregate_filter(task_filter)
-    query = TaskQuery(
-        type=copied.type,
-        session_id=copied.session_id,
-        parent_task_id=copied.parent_task_id,
-        assigned_agent_name=copied.assigned_agent_name,
-        has_work_contract=True,
-        limit=limit,
-    )
-    return query, None if after is None else validate_work_completion_linked_id(after, "after")
-
-
-def _task_matches(task: Task, query: TaskQuery) -> bool:
-    if (
-        query.has_work_contract is not None
-        and (task.work_contract is not None) != query.has_work_contract
-    ):
-        return False
-    if query.q is not None and not _task_matches_search(task, query.q):
-        return False
-    if query.status is not None and task.status != query.status:
-        return False
-    if query.type is not None and task.type != query.type:
-        return False
-    if query.session_id is not None and task.session_id != query.session_id:
-        return False
-    if query.parent_task_id is not None and task.parent_task_id != query.parent_task_id:
-        return False
-    return not (
-        query.assigned_agent_name is not None
-        and task.assigned_agent_name != query.assigned_agent_name
-    )
-
-
-def _task_matches_search(task: Task, query: str) -> bool:
-    needle = query.casefold()
-    haystacks = (
-        task.id,
-        task.type,
-        task.title,
-        task.description,
-        task.status.value,
-        task.session_id,
-        task.parent_task_id,
-        task.assigned_agent_name,
-        task.worker_id,
-        task.status_reason,
-    )
-    return any(value is not None and needle in value.casefold() for value in haystacks)
-
-
-def _task_matches_claim_filter(task: Task, query: TaskQuery) -> bool:
-    if (
-        query.has_work_contract is not None
-        and (task.work_contract is not None) != query.has_work_contract
-    ):
-        return False
-    if query.type is not None and task.type != query.type:
-        return False
-    if query.parent_task_id is not None and task.parent_task_id != query.parent_task_id:
-        return False
-    return not (
-        query.assigned_agent_name is not None
-        and task.assigned_agent_name != query.assigned_agent_name
-    )
-
-
-def _ensure_claim_query_supported(query: TaskQuery) -> None:
-    if query.q is not None:
-        raise ValueError("Task claim queries do not support q.")
-    if query.session_id is not None:
-        raise ValueError("Task claim queries do not support session_id.")
-    if query.limit != TaskQuery.model_fields["limit"].default:
-        raise ValueError("Task claim queries do not support limit.")
-    if query.offset != TaskQuery.model_fields["offset"].default:
-        raise ValueError("Task claim queries do not support offset.")
-
-
-def _sort_tasks(tasks: list[Task], order_by: TaskOrder) -> list[Task]:
-    if order_by == TaskOrder.CREATED_AT_ASC:
-        return sorted(tasks, key=lambda task: (task.created_at, task.id))
-    if order_by == TaskOrder.CREATED_AT_DESC:
-        return sorted(
-            sorted(tasks, key=lambda task: task.id),
-            key=lambda task: task.created_at,
-            reverse=True,
-        )
-    if order_by == TaskOrder.UPDATED_AT_ASC:
-        return sorted(tasks, key=lambda task: (task.updated_at, task.id))
-    return sorted(
-        sorted(tasks, key=lambda task: task.id),
-        key=lambda task: task.updated_at,
-        reverse=True,
-    )
 
 
 def _copy_optional_status_reason(value: str | None) -> str | None:

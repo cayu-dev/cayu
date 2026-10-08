@@ -29,7 +29,8 @@ from cayu.storage.jsonl_export import (
     import_sessions,
     import_tasks,
 )
-from cayu.tasks.base import InMemoryTaskStore, TaskCreate
+from cayu.tasks.base import InMemoryTaskStore
+from cayu.tasks.creation import TaskCreate
 
 
 def _identity() -> SessionIdentity:

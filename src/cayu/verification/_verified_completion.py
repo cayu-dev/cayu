@@ -42,11 +42,7 @@ from cayu.tasks.admission import (
     WorkAttemptRecoveryRequired,
     require_work_attempt_admission_result,
 )
-from cayu.tasks.base import (
-    CompletionDecisionApplicationReceipt,
-    TaskStore,
-    WorkAttemptLifecycleReceipt,
-)
+from cayu.tasks.base import TaskStore
 from cayu.tasks.completion_verifier_profiles import CompletionVerifierProfilePolicy
 from cayu.tasks.contracts import (
     CompletionDecision,
@@ -61,6 +57,10 @@ from cayu.tasks.contracts import (
 )
 from cayu.tasks.groups import TaskGroupConflict
 from cayu.tasks.records import TaskStatus, copy_task
+from cayu.tasks.work_receipts import (
+    CompletionDecisionApplicationReceipt,
+    WorkAttemptLifecycleReceipt,
+)
 from cayu.vaults.redaction import SecretRedactor
 from cayu.verification._completion_decision_application_coordinator import (
     CompletionDecisionApplicationCoordinator,

@@ -21,7 +21,7 @@ from cayu.tasks._graphs import (
     require_member_authority,
 )
 from cayu.tasks._groups import prepare_group_admission
-from cayu.tasks.base import TaskInvocationSnapshot
+from cayu.tasks.creation import TaskInvocationSnapshot
 from cayu.tasks.graphs import (
     TASK_GRAPH_MAX_NODES,
     TaskGraphConflict,

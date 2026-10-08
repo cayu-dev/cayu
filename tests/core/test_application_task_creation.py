@@ -28,7 +28,7 @@ from cayu.sessions.invocation import (
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresTaskStore
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore, TaskCreate
+from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.contracts import (
     CompletionResultResolverRef,
     CompletionVerifierRef,
@@ -36,6 +36,7 @@ from cayu.tasks.contracts import (
     WorkCriterion,
     work_contract_from_draft,
 )
+from cayu.tasks.creation import TaskCreate
 from cayu.vaults.redaction import SecretRedactor
 
 

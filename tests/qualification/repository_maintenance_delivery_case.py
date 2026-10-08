@@ -26,7 +26,8 @@ from cayu.delivery.git import (
     remote_git_delivery_request,
 )
 from cayu.server import ProductPrincipal
-from cayu.tasks.base import TaskQuery, TaskStatus
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import TaskStatus
 from cayu.tasks.worker import run_task_worker
 from tests.qualification.repository_maintenance_github_case import exercise_github_delivery
 from tests.qualification.repository_maintenance_restart_case import exercise_approval_restart

@@ -24,7 +24,7 @@ from cayu.tasks.scheduling import (
 )
 
 if TYPE_CHECKING:
-    from cayu.tasks.base import TaskCreate
+    from cayu.tasks.creation import TaskCreate
     from cayu.tasks.records import Task
 
 

@@ -32,8 +32,10 @@ from cayu.storage import migrations as schema
 from cayu.storage import postgres as postgres_storage
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore, PostgresTaskStore
-from cayu.tasks.base import TaskCreate, TaskQuery, TaskStatus
+from cayu.tasks.creation import TaskCreate
 from cayu.tasks.handoff import interrupted_task_handoff_request
+from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import TaskStatus
 from cayu.tasks.terminalization import TaskTerminalizationRequest, TaskTerminalKind
 
 pytestmark = pytest.mark.usefixtures("postgres_dsn")

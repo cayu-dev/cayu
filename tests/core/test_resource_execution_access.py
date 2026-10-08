@@ -156,7 +156,7 @@ def test_stream_context_is_not_exposed_to_consumer(tmp_path):
 
 
 def test_scoped_task_retains_execution_authority():
-    from cayu.tasks.base import TaskCreate
+    from cayu.tasks.creation import TaskCreate
 
     async def run():
         from cayu.tasks.base import InMemoryTaskStore
@@ -175,7 +175,8 @@ def test_scoped_task_retains_execution_authority():
 
 
 def test_revoked_task_never_calls_handler_and_releases_worker_authority():
-    from cayu.tasks.base import InMemoryTaskStore, TaskCreate
+    from cayu.tasks.base import InMemoryTaskStore
+    from cayu.tasks.creation import TaskCreate
     from cayu.tasks.worker import run_task_worker
 
     async def run():
@@ -360,7 +361,7 @@ def test_stream_revocation_stops_producer_and_recovery_allows_only_settlement():
 
 def test_durable_worker_run_inherits_task_classification_after_restart(tmp_path):
     from cayu.storage.sqlite import SQLiteTaskStore
-    from cayu.tasks.base import TaskCreate
+    from cayu.tasks.creation import TaskCreate
     from cayu.tasks.worker import run_task_worker
 
     async def run():

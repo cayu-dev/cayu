@@ -19,8 +19,9 @@ from cayu import (
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresTaskStore
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.base import InMemoryTaskStore, TaskStatus
+from cayu.tasks.base import InMemoryTaskStore
 from cayu.tasks.groups import TaskGroupConflict, TaskGroupEventType
+from cayu.tasks.records import TaskStatus
 
 pytestmark = pytest.mark.anyio
 
@@ -275,7 +276,7 @@ async def test_claimed_cancellation_is_not_terminal_until_reconciled(store):
         ordinary_cancellation_reconciliation_request,
     )
 
-    from cayu.tasks.base import TaskQuery
+    from cayu.tasks.queries import TaskQuery
 
     app = CayuApp(task_store=store, enable_logging=False)
     request = group_request("all")
@@ -297,7 +298,7 @@ async def test_claimed_cancellation_is_not_terminal_until_reconciled(store):
 
 
 async def test_real_worker_executes_setup_and_selected_members(store):
-    from cayu.tasks.base import TaskQuery
+    from cayu.tasks.queries import TaskQuery
     from cayu.tasks.worker import complete_managed_task, run_task_worker
 
     request = group_request("quorum", setup=True)
@@ -331,8 +332,8 @@ async def test_real_worker_executes_setup_and_selected_members(store):
 
 
 async def test_group_inspection_survives_terminal_member_deletion(store):
-    from cayu.tasks.base import TaskSessionClosureClaim
     from cayu.tasks.graphs import TaskGraphConflict
+    from cayu.tasks.records import TaskSessionClosureClaim
 
     request = group_request("first_success")
     first = request.member_task_ids[0]

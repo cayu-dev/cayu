@@ -36,8 +36,9 @@ from cayu.tasks.admission import (
     WorkAttemptExecutionEntryRequest,
     require_work_attempt_execution_entry_result,
 )
-from cayu.tasks.base import TaskCreate, TaskStatus
 from cayu.tasks.contracts import CompletionContinuationPolicy, CompletionRejectionAction
+from cayu.tasks.creation import TaskCreate
+from cayu.tasks.records import TaskStatus
 
 
 def _crash_prepared_expiry(

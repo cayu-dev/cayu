@@ -32,12 +32,7 @@ from cayu.tasks.admission import (
     copy_work_attempt_execution_stop_request,
     require_work_attempt_admission_result,
 )
-from cayu.tasks.base import (
-    CompletionDecisionApplicationReceipt,
-    WorkAttemptLifecycleReceipt,
-    WorkAttemptPreparationHoldReceipt,
-    _ensure_exact_owned_active_task_lease,
-)
+from cayu.tasks.base import _ensure_exact_owned_active_task_lease
 from cayu.tasks.cancellation import _task_cancellation_requested
 from cayu.tasks.contracts import (
     CompletionDecision,
@@ -46,6 +41,11 @@ from cayu.tasks.contracts import (
     CompletionVerificationClaim,
 )
 from cayu.tasks.records import Task, TaskStatus, copy_task
+from cayu.tasks.work_receipts import (
+    CompletionDecisionApplicationReceipt,
+    WorkAttemptLifecycleReceipt,
+    WorkAttemptPreparationHoldReceipt,
+)
 
 
 def plan_work_attempt_execution_entry(
