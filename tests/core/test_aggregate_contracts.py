@@ -38,16 +38,11 @@ from cayu.budgets.usage import HostedToolUsageMetrics, UsageMetrics, build_aggre
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.providers import bedrock_billing_identity, completed_bedrock_billing_identity
-from cayu.sessions.base import (
-    InMemorySessionStore,
-    RunRequest,
-    SessionIdentity,
-    SessionStore,
-    UsageRollupQuery,
-)
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity, SessionStore
 from cayu.sessions.queries import SessionAggregateFilter, SessionStatusCounts
 from cayu.sessions.records import EventRecord, SessionStatus
 from cayu.sessions.summaries import SessionOperationalSnapshot
+from cayu.sessions.usage import UsageRollupQuery
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.memory import InMemoryTaskStore
@@ -1281,13 +1276,13 @@ def test_in_memory_usage_breakdown_remains_exact_within_candidate_bound() -> Non
 
 
 def test_in_memory_usage_breakdown_samples_bounded_heavy_hitters() -> None:
-    import cayu.sessions.base as session_runtime
+    from cayu.sessions.usage import _IN_MEMORY_USAGE_GROUP_CANDIDATE_LIMIT
 
     async def run() -> None:
         store = InMemorySessionStore()
         start = datetime(2026, 7, 1, tzinfo=UTC)
         await store.create(_request("high-cardinality"), identity=_identity())
-        candidate_limit = session_runtime._IN_MEMORY_USAGE_GROUP_CANDIDATE_LIMIT
+        candidate_limit = _IN_MEMORY_USAGE_GROUP_CANDIDATE_LIMIT
         events = [
             _model_event(
                 event_id=f"one-off-{index}",

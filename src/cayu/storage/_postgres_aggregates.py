@@ -30,7 +30,7 @@ from cayu.budgets.aggregates import (
     build_aggregate_usage_metrics,
 )
 from cayu.events import EventType
-from cayu.sessions.base import UsageRollupQuery
+from cayu.sessions.usage import UsageRollupQuery
 from cayu.storage._reported_costs import reported_cost_page, reported_cost_statement
 from cayu.storage._session_store_sql import SessionQuerySqlPlan
 

@@ -188,7 +188,6 @@ from cayu.server.sse import (
     SseErrorKind,
 )
 from cayu.sessions.base import (
-    MAX_USAGE_ROLLUP_WINDOW,
     SESSION_TOPOLOGY_DEFAULT_CHILD_LIMIT,
     SESSION_TOPOLOGY_MAX_ANCESTOR_DEPTH,
     SESSION_TOPOLOGY_MAX_CHILD_LIMIT,
@@ -207,6 +206,7 @@ from cayu.sessions.invocation import (
 )
 from cayu.sessions.queries import SessionAggregateFilter
 from cayu.sessions.summaries import SessionOperationalSnapshot
+from cayu.sessions.usage import MAX_USAGE_ROLLUP_WINDOW
 from cayu.tasks.queries import TaskAggregateFilter, TaskOperationalSnapshot
 from cayu.tasks.scheduling import TaskScheduleEventType
 from cayu.tasks.topology import (

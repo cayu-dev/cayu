@@ -5453,7 +5453,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "UsageRecorded": ("cayu.evals.assertions", "UsageRecorded"),
     "UsageRecordedAssertionSpec": ("cayu.evals.corpus", "UsageRecordedAssertionSpec"),
     "UsageRollupInconsistent": ("cayu.budgets.aggregates", "UsageRollupInconsistent"),
-    "UsageRollupQuery": ("cayu.sessions.base", "UsageRollupQuery"),
+    "UsageRollupQuery": ("cayu.sessions.usage", "UsageRollupQuery"),
     "UsageRollupResultTooLarge": ("cayu.budgets.aggregates", "UsageRollupResultTooLarge"),
     "UsageRollupStoreResult": ("cayu.budgets.aggregates", "UsageRollupStoreResult"),
     "UsageSessionAggregateBreakdown": ("cayu.budgets.aggregates", "UsageSessionAggregateBreakdown"),

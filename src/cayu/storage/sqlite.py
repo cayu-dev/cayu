@@ -248,7 +248,6 @@ from cayu.sessions.base import (
     StoreTimeSessionOperationTransform,
     TranscriptSnapshot,
     TranscriptTextReadLimitExceeded,
-    UsageRollupQuery,
     _activate_session_run_fence,
     _active_model_completion_stage_record,
     _active_unexpired_incomplete_recovery_claim_id,
@@ -415,7 +414,6 @@ from cayu.sessions.base import (
     copy_session_runtime_identity,
     copy_session_user_metadata,
     copy_transcript_messages,
-    copy_usage_rollup_query,
     decode_session_lineage_cursor,
     decode_session_topology_cursor,
     deferred_interaction_input_for_run_request,
@@ -501,6 +499,7 @@ from cayu.sessions.transcript_queries import (
     transcript_search_query_document,
     transcript_search_session_token,
 )
+from cayu.sessions.usage import UsageRollupQuery, copy_usage_rollup_query
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _sqlite_aggregates as sqlite_aggregates
 from cayu.storage import _sqlite_connection as sqlite_connection

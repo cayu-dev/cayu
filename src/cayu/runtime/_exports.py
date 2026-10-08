@@ -1713,7 +1713,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "UsageMetrics": ("cayu.budgets.usage", "UsageMetrics"),
     "UsagePricingInput": ("cayu.budgets.aggregates", "UsagePricingInput"),
     "UsageRollupInconsistent": ("cayu.budgets.aggregates", "UsageRollupInconsistent"),
-    "UsageRollupQuery": ("cayu.sessions.base", "UsageRollupQuery"),
+    "UsageRollupQuery": ("cayu.sessions.usage", "UsageRollupQuery"),
     "UsageRollupResultTooLarge": ("cayu.budgets.aggregates", "UsageRollupResultTooLarge"),
     "UsageRollupStoreResult": ("cayu.budgets.aggregates", "UsageRollupStoreResult"),
     "UsageSessionAggregateBreakdown": ("cayu.budgets.aggregates", "UsageSessionAggregateBreakdown"),

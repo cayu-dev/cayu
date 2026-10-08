@@ -144,7 +144,6 @@ from cayu.sessions.base import (
     StoreTimeSessionOperationTransform as StoreTimeSessionOperationTransform,
 )
 from cayu.sessions.base import TranscriptSnapshot as TranscriptSnapshot
-from cayu.sessions.base import UsageRollupQuery as UsageRollupQuery
 from cayu.sessions.base import (
     checkpoint_root_field_projection_from_storage as checkpoint_root_field_projection_from_storage,
 )
@@ -421,3 +420,4 @@ from cayu.sessions.transcript_queries import TranscriptQuery as TranscriptQuery
 from cayu.sessions.transcript_queries import TranscriptSearchHit as TranscriptSearchHit
 from cayu.sessions.transcript_queries import TranscriptSearchQuery as TranscriptSearchQuery
 from cayu.sessions.transcript_queries import TranscriptSearchResult as TranscriptSearchResult
+from cayu.sessions.usage import UsageRollupQuery as UsageRollupQuery

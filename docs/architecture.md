@@ -494,6 +494,11 @@ snapshot contracts. It derives outcomes from durable records, preserving interac
 boundaries and detached event details. Stores retain authorization and atomic reads;
 the streaming `sessions/outcomes.py` API retains its separate runtime composition.
 
+`sessions/usage.py` owns usage-rollup queries and the complete bounded event-record
+aggregation. It retains candidate selection, exact re-aggregation, group remainders
+and pricing-input collection. Memory stores supply repeatable records under their
+existing read boundary; SQL stores reuse the query contract with native aggregation.
+
 ### Session checkpoint evidence
 
 `sessions/_checkpoint_preservation.py` owns callback-visible checkpoint copies,

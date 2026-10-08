@@ -114,7 +114,7 @@ async def test_gateway_completion_observations_survive_sqlite_reopen(tmp_path, c
         assert completed.payload["usage"] == usage
         from datetime import timedelta
 
-        from cayu.sessions.base import UsageRollupQuery
+        from cayu.sessions.usage import UsageRollupQuery
 
         rollup = await reopened.aggregate_usage(
             UsageRollupQuery(

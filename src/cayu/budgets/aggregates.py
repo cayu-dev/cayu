@@ -48,7 +48,7 @@ from cayu.events import Event, EventType
 from cayu.runtime._cost_diagnostics import UnpricedReason, _unpriced_reason
 
 if TYPE_CHECKING:
-    from cayu.sessions.base import UsageRollupQuery
+    from cayu.sessions.usage import UsageRollupQuery
 
 
 class AggregateAccuracyKind(StrEnum):
@@ -1269,7 +1269,7 @@ class UsageRollupStoreResult(BaseModel):
     def validate_for_query(self, query: UsageRollupQuery) -> UsageRollupStoreResult:
         """Return a bounded, canonically revalidated result for one query."""
 
-        from cayu.sessions.base import UsageRollupQuery
+        from cayu.sessions.usage import UsageRollupQuery
 
         if type(query) is not UsageRollupQuery:
             raise TypeError("Usage rollup result validation requires a UsageRollupQuery.")

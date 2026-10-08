@@ -117,3 +117,73 @@ for value in (outcome, summary, snapshot):
 """,
         public_module,
     )
+
+
+def test_session_usage_public_imports_and_historical_pickle_global():
+    from cayu.sessions import base, usage
+
+    assert base.UsageRollupQuery is usage.UsageRollupQuery
+    for module in ("cayu", "cayu.sessions", "cayu.runtime"):
+        assert importlib.import_module(module).UsageRollupQuery is usage.UsageRollupQuery
+    assert pickle.loads(b"ccayu.sessions.base\nUsageRollupQuery\n.") is usage.UsageRollupQuery
+
+
+@pytest.mark.parametrize("public_module", ("cayu", "cayu.sessions", "cayu.runtime"))
+def test_session_usage_aggregates_bounded_records_without_stores(public_module):
+    _assert_store_independent(
+        """
+from datetime import UTC, datetime, timedelta
+from cayu.events import Event, EventType
+from cayu.sessions.usage import _usage_rollup_from_session_records, copy_usage_rollup_query
+
+stamp = datetime(2026, 1, 1, tzinfo=UTC)
+end = stamp + timedelta(hours=1)
+query = public.UsageRollupQuery(start_at=stamp, end_at=end,
+    group_limit=1, session_group_limit=1, include_pricing_inputs=True,
+    sessions=public.SessionAggregateFilter(labels={"team": "support"}))
+copied = copy_usage_rollup_query(query)
+copied.sessions.labels["team"] = "changed"
+assert query.sessions.labels == {"team": "support"}
+def record(sequence, session_id, tokens, provider, at=stamp, kind=EventType.MODEL_COMPLETED):
+    payload = {} if tokens is None else {"usage_metrics": {
+        "input_tokens": tokens, "output_tokens": 0, "total_tokens": tokens,
+        "provider_name": provider, "model": "model",
+    }}
+    return public.EventRecord(sequence=sequence, event=Event(
+        id=f"event-{session_id}-{sequence}", type=kind, session_id=session_id,
+        timestamp=at, payload=payload,
+    ))
+rows = [
+    ("a", public.SessionStatus.COMPLETED, (
+        record(1, "a", 10, "provider-a"), record(2, "a", None, None),
+        record(3, "a", 999, "excluded", at=end),
+    )),
+    ("b", public.SessionStatus.RUNNING, (
+        record(1, "b", 20, "provider-b"),
+        record(2, "b", None, None, kind=EventType.TOOL_CALL_STARTED),
+    )),
+]
+result = _usage_rollup_from_session_records(session_records=lambda: iter(rows),
+    query=query, as_of=end, matching_session_count=2, active_session_count=1)
+assert result.totals.usage.total_tokens == 30
+assert result.totals.model_steps == 3 and result.totals.model_steps_with_usage == 2
+assert result.totals.tool_calls == 1 and result.totals.session_count == 2
+assert result.provider_breakdown.groups[0].provider_name == "provider-b"
+assert result.provider_breakdown.remainder.totals.usage.total_tokens == 10
+assert result.provider_breakdown.accuracy.kind.value == "truncated"
+assert result.session_breakdown.groups[0].session_id == "b"
+assert result.session_breakdown.remainder.totals.usage.total_tokens == 10
+assert result.session_breakdown.remainder.group_count == 1
+assert result.matching_session_count == 2 and result.active_session_count == 1
+assert result.pricing_inputs_included and result.session_pricing_inputs_included
+assert pickle.loads(pickle.dumps(query)) == query
+assert get_type_hints(type(query)) and type(query).model_json_schema()
+try:
+    copy_usage_rollup_query(object())
+except TypeError as exc:
+    assert str(exc) == "Usage aggregate queries must be UsageRollupQuery instances."
+else:
+    raise AssertionError("Invalid query type accepted")
+""",
+        public_module,
+    )

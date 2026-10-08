@@ -324,7 +324,6 @@ from cayu.sessions.base import (
     SessionTopologyNode,
     SessionTopologyQuery,
     SessionTopologyStoreResult,
-    UsageRollupQuery,
     _with_runtime_resume_transport_metadata,
     decode_session_topology_cursor,
     run_request_with_runtime_generated_authority,
@@ -361,6 +360,7 @@ from cayu.sessions.records import (
 from cayu.sessions.recovery import StartupRecoveryResult
 from cayu.sessions.summaries import SessionOutcome
 from cayu.sessions.transcript_queries import TranscriptQuery
+from cayu.sessions.usage import UsageRollupQuery
 from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
 from cayu.tasks.creation import TaskCreate, task_create_with_runtime_invocation
 from cayu.tasks.queries import TaskOrder, TaskQuery
