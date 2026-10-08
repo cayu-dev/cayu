@@ -45223,5 +45223,6 @@
     "tests/core/test_session_summary_package_layout.py::test_session_inspection_bounds_and_folds_records_without_stores[cayu.runtime]": 0.28292583298753016,
     "tests/core/test_session_summary_package_layout.py::test_session_inspection_bounds_and_folds_records_without_stores[cayu.sessions]": 0.266895751003176,
     "tests/core/test_session_summary_package_layout.py::test_session_inspection_bounds_and_folds_records_without_stores[cayu]": 0.3501240010082256,
-    "tests/core/test_session_summary_package_layout.py::test_session_inspection_public_imports_and_historical_pickle_globals": 0.00033633303246460855
+    "tests/core/test_session_summary_package_layout.py::test_session_inspection_public_imports_and_historical_pickle_globals": 0.00033633303246460855,
+    "tests/core/test_postgres_schema_history.py::test_postgres_history_creates_baseline_without_store_imports": 1.299633749993518
 }

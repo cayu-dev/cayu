@@ -23,6 +23,7 @@ from cayu.messages import Message
 from cayu.sessions.base import RunRequest, SessionIdentity
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.transcript_queries import TRANSCRIPT_SEARCH_TOKENIZER_VERSION
+from cayu.storage import _postgres_schema_history as postgres_schema_history
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import migrations as schema
 from cayu.storage import postgres as postgres_storage
@@ -40,10 +41,11 @@ pytestmark = pytest.mark.usefixtures("postgres_dsn")
 def test_revision_seventeen_builds_hot_indexes_concurrently() -> None:
     assert all(
         "CREATE INDEX" not in statement
-        for statement in postgres_storage._MIGRATION_STEPS.get(17, ())
+        for statement in postgres_schema_history._MIGRATION_STEPS.get(17, ())
     )
     indexes = {
-        index.index_name: index for index in postgres_storage._CONCURRENT_INDEX_MIGRATIONS[17]
+        index.index_name: index
+        for index in postgres_schema_history._CONCURRENT_INDEX_MIGRATIONS[17]
     }
     assert {
         "idx_cayu_checkpoints_pending_control_action",
@@ -58,16 +60,17 @@ def test_revision_seventeen_builds_hot_indexes_concurrently() -> None:
         for event_type in ("session.resumed", "session.completed", "session.failed")
     )
     assert "tool.call" not in (barrier_index.predicate_definition or "")
-    assert "session_id > %s" in postgres_storage._REVISION_17_CHECKPOINT_BACKFILL_SQL
-    assert "sequence > %s" in postgres_storage._REVISION_17_EVENT_BACKFILL_SMALL_SQL
-    assert "LIMIT 25" in postgres_storage._REVISION_17_EVENT_BACKFILL_SMALL_SQL
-    assert "sequence > %s" in postgres_storage._REVISION_17_EVENT_BACKFILL_LARGE_SQL
-    assert "LIMIT 1" in postgres_storage._REVISION_17_EVENT_BACKFILL_LARGE_SQL
+    assert "session_id > %s" in postgres_schema_history._REVISION_17_CHECKPOINT_BACKFILL_SQL
+    assert "sequence > %s" in postgres_schema_history._REVISION_17_EVENT_BACKFILL_SMALL_SQL
+    assert "LIMIT 25" in postgres_schema_history._REVISION_17_EVENT_BACKFILL_SMALL_SQL
+    assert "sequence > %s" in postgres_schema_history._REVISION_17_EVENT_BACKFILL_LARGE_SQL
+    assert "LIMIT 1" in postgres_schema_history._REVISION_17_EVENT_BACKFILL_LARGE_SQL
 
 
 def test_revision_twenty_nine_builds_workflow_replay_indexes_concurrently() -> None:
     indexes = {
-        index.index_name: index for index in postgres_storage._CONCURRENT_INDEX_MIGRATIONS[29]
+        index.index_name: index
+        for index in postgres_schema_history._CONCURRENT_INDEX_MIGRATIONS[29]
     }
     assert indexes.keys() == {
         "idx_cayu_events_workflow_step_replay",
@@ -131,7 +134,7 @@ def test_constraint_fragment_matching_is_catalog_order_independent() -> None:
 
 
 def test_revision_thirty_rebuilds_session_lineage_index_with_c_collation() -> None:
-    indexes = postgres_storage._CONCURRENT_INDEX_MIGRATIONS[30]
+    indexes = postgres_schema_history._CONCURRENT_INDEX_MIGRATIONS[30]
 
     assert len(indexes) == 1
     index = indexes[0]
@@ -139,7 +142,7 @@ def test_revision_thirty_rebuilds_session_lineage_index_with_c_collation() -> No
     assert index.required_key_collations == (None, None, "C")
     assert index.replace_existing is True
     assert 'id COLLATE "C"' in index.create_statement
-    required = postgres_storage._required_concurrent_indexes(30)
+    required = postgres_schema_history._required_concurrent_indexes(30)
     matching = [
         candidate
         for candidate in required
@@ -149,7 +152,7 @@ def test_revision_thirty_rebuilds_session_lineage_index_with_c_collation() -> No
 
 
 def test_revision_thirty_four_builds_task_availability_index_concurrently() -> None:
-    indexes = postgres_storage._CONCURRENT_INDEX_MIGRATIONS[34]
+    indexes = postgres_schema_history._CONCURRENT_INDEX_MIGRATIONS[34]
 
     assert len(indexes) == 1
     index = indexes[0]
@@ -157,11 +160,11 @@ def test_revision_thirty_four_builds_task_availability_index_concurrently() -> N
     assert index.key_definitions == ("created_at", "id", "available_at")
     assert index.predicate_definition == "status = 'pending' AND session_id IS NULL"
     assert "CREATE INDEX CONCURRENTLY" in index.create_statement
-    assert postgres_storage._required_concurrent_indexes(34)[-1] == index
+    assert postgres_schema_history._required_concurrent_indexes(34)[-1] == index
 
 
 def test_revision_forty_six_builds_transcript_search_index_concurrently() -> None:
-    indexes = postgres_storage._CONCURRENT_INDEX_MIGRATIONS[46]
+    indexes = postgres_schema_history._CONCURRENT_INDEX_MIGRATIONS[46]
 
     assert len(indexes) == 1
     index = indexes[0]
@@ -174,11 +177,11 @@ def test_revision_forty_six_builds_transcript_search_index_concurrently() -> Non
     assert "message ->> 'role'" in (index.predicate_definition or "")
     assert "CREATE INDEX CONCURRENTLY" in index.create_statement
     assert "USING GIN" in index.create_statement
-    assert postgres_storage._required_concurrent_indexes(46)[-1] == index
+    assert postgres_schema_history._required_concurrent_indexes(46)[-1] == index
 
 
 def test_revision_seventy_builds_handoff_recovery_index_concurrently() -> None:
-    indexes = postgres_storage._CONCURRENT_INDEX_MIGRATIONS[70]
+    indexes = postgres_schema_history._CONCURRENT_INDEX_MIGRATIONS[70]
 
     assert len(indexes) == 1
     index = indexes[0]
@@ -186,20 +189,20 @@ def test_revision_seventy_builds_handoff_recovery_index_concurrently() -> None:
     assert index.table_name == "cayu_tasks"
     assert index.key_definitions == ("status", "lease_expires_at", "id")
     assert "CREATE INDEX CONCURRENTLY" in index.create_statement
-    assert postgres_storage._required_concurrent_indexes(70)[-1] == index
+    assert postgres_schema_history._required_concurrent_indexes(70)[-1] == index
 
 
 def test_revision_109_indexes_session_budget_inventory_concurrently() -> None:
-    (index,) = postgres_storage._CONCURRENT_INDEX_MIGRATIONS[109]
+    (index,) = postgres_schema_history._CONCURRENT_INDEX_MIGRATIONS[109]
     assert index.table_name == "cayu_budget_reservations"
     assert index.key_definitions == ("session_id", "reservation_id")
     assert index.predicate_definition is None
     assert "CREATE INDEX CONCURRENTLY" in index.create_statement
-    assert postgres_storage._required_concurrent_indexes(109)[-1] == index
+    assert postgres_schema_history._required_concurrent_indexes(109)[-1] == index
 
 
 def test_revision_seventy_six_builds_bounded_continuation_index_concurrently() -> None:
-    indexes = postgres_storage._CONCURRENT_INDEX_MIGRATIONS[76]
+    indexes = postgres_schema_history._CONCURRENT_INDEX_MIGRATIONS[76]
 
     assert len(indexes) == 2
     continuation_index, generation_index = indexes
@@ -214,7 +217,7 @@ def test_revision_seventy_six_builds_bounded_continuation_index_concurrently() -
     assert generation_index.key_definitions == ("interrupted_handoff_id",)
     assert generation_index.unique
     assert "CREATE UNIQUE INDEX CONCURRENTLY" in generation_index.create_statement
-    assert postgres_storage._required_concurrent_indexes(76)[-1] == generation_index
+    assert postgres_schema_history._required_concurrent_indexes(76)[-1] == generation_index
 
 
 @pytest.mark.parametrize("conflicting", [False, True])
@@ -238,7 +241,7 @@ def test_pending_action_index_upgrade_preserves_exact_replacement_contract(
 
         old = next(
             index
-            for index in postgres_storage._CONCURRENT_INDEX_MIGRATIONS[17]
+            for index in postgres_schema_history._CONCURRENT_INDEX_MIGRATIONS[17]
             if index.index_name == "idx_cayu_events_pending_action_lookup"
         )
         statement = old.transactional_create_statement()
@@ -270,17 +273,21 @@ def test_pending_action_index_upgrade_preserves_exact_replacement_contract(
 
 
 def test_closure_revisions_preserve_health_and_defer_pending_action_index() -> None:
-    assert "idx_cayu_side_effect_health" in " ".join(postgres_storage._MIGRATION_STEPS[86])
-    assert "cayu_session_closure_tombstones" in " ".join(postgres_storage._MIGRATION_STEPS[87])
-    assert "cayu_task_session_closure_claims" in " ".join(postgres_storage._MIGRATION_STEPS[88])
+    assert "idx_cayu_side_effect_health" in " ".join(postgres_schema_history._MIGRATION_STEPS[86])
+    assert "cayu_session_closure_tombstones" in " ".join(
+        postgres_schema_history._MIGRATION_STEPS[87]
+    )
+    assert "cayu_task_session_closure_claims" in " ".join(
+        postgres_schema_history._MIGRATION_STEPS[88]
+    )
     original = next(
         index
-        for index in postgres_storage._CONCURRENT_INDEX_MIGRATIONS[17]
+        for index in postgres_schema_history._CONCURRENT_INDEX_MIGRATIONS[17]
         if index.index_name == "idx_cayu_events_pending_action_lookup"
     )
     effective = next(
         index
-        for index in postgres_storage._required_concurrent_indexes(88)
+        for index in postgres_schema_history._required_concurrent_indexes(88)
         if index.index_name == "idx_cayu_events_pending_action_lookup"
     )
     assert effective == original
@@ -1598,7 +1605,7 @@ def test_create_mode_rolls_back_schema_when_transactional_index_creation_fails(
         import psycopg
 
         await _drop_all(postgres_dsn)
-        availability_index = postgres_storage._CONCURRENT_INDEX_MIGRATIONS[34][0]
+        availability_index = postgres_schema_history._CONCURRENT_INDEX_MIGRATIONS[34][0]
         broken_index = replace(
             availability_index,
             create_statement=(
@@ -1607,7 +1614,7 @@ def test_create_mode_rolls_back_schema_when_transactional_index_creation_fails(
             ),
         )
         monkeypatch.setitem(
-            postgres_storage._CONCURRENT_INDEX_MIGRATIONS,
+            postgres_schema_history._CONCURRENT_INDEX_MIGRATIONS,
             34,
             (broken_index,),
         )
@@ -2764,7 +2771,7 @@ def test_revision_fifteen_requires_session_sequence_index_migration(
         async def delayed_index(conn, index, **kwargs):
             if index is next(
                 candidate
-                for candidate in postgres_storage._CONCURRENT_INDEX_MIGRATIONS[17]
+                for candidate in postgres_schema_history._CONCURRENT_INDEX_MIGRATIONS[17]
                 if candidate.index_name == "idx_cayu_events_pending_action_lookup"
             ):
                 paused.set()

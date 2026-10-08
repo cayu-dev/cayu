@@ -2654,7 +2654,7 @@ def test_postgres_revision_73_rejects_pre_stream_checkpoint_schema_before_mutati
         import psycopg
 
         from cayu import PostgresAgentWorkContextStore
-        from cayu.storage import postgres as postgres_storage
+        from cayu.storage import _postgres_schema_history as postgres_schema_history
 
         await _drop_postgres_schema(postgres_dsn)
         creator = PostgresAgentWorkContextStore(
@@ -2678,12 +2678,12 @@ def test_postgres_revision_73_rejects_pre_stream_checkpoint_schema_before_mutati
                 await cursor.execute(
                     "DROP INDEX IF EXISTS idx_cayu_tasks_interrupted_handoff_recovery"
                 )
-                for statement in postgres_storage._MIGRATION_STEPS[69]:
+                for statement in postgres_schema_history._MIGRATION_STEPS[69]:
                     await cursor.execute(_without_checkpoint_stream_identity(statement))
                 if historical_revision == 70:
-                    for statement in postgres_storage._MIGRATION_STEPS[70]:
+                    for statement in postgres_schema_history._MIGRATION_STEPS[70]:
                         await cursor.execute(statement)
-                    for index in postgres_storage._CONCURRENT_INDEX_MIGRATIONS[70]:
+                    for index in postgres_schema_history._CONCURRENT_INDEX_MIGRATIONS[70]:
                         await cursor.execute(index.transactional_create_statement())
                 await cursor.execute(
                     "DELETE FROM cayu_schema_migrations WHERE revision > %s",

@@ -95,7 +95,7 @@ async def test_postgres_cleanup_schema_refuses_missing_or_session_owned_receipts
         await reopened.close()
         # postgres_dsn is module-scoped. Restore only this test-created empty
         # table so the next corruption case starts from the qualified schema.
-        from cayu.storage.postgres import _MIGRATION_STEPS
+        from cayu.storage._postgres_schema_history import _MIGRATION_STEPS
 
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
             await connection.execute("DROP TABLE IF EXISTS cayu_producer_cleanup_receipts")
@@ -129,7 +129,8 @@ async def test_postgres_retirement_requires_durable_fence_and_ordered_index(
 ):
     import psycopg
 
-    from cayu.storage.postgres import _MIGRATION_STEPS, PostgresSessionStore
+    from cayu.storage._postgres_schema_history import _MIGRATION_STEPS
+    from cayu.storage.postgres import PostgresSessionStore
 
     store = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
     try:

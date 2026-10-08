@@ -779,6 +779,10 @@ History declarations can be imported without loading migration execution or stor
 adapters. The domain checks can run on a read-only connection without importing
 migration history or store adapters.
 
+PostgreSQL baseline and bookkeeping SQL, revision scripts, backfill SQL and concurrent-index
+declarations live in `storage/_postgres_schema_history.py`. It imports canonical domain
+DDL and can be used without importing PostgreSQL record codecs or store adapters.
+
 Files are good source-of-truth for prompts, instructions, workflows, manuals, skills, and human-reviewed memories.
 
 Databases/indexes are better for sessions, event logs, high-volume memories, permissions, embeddings, search, and hosted multi-user state.

@@ -31,7 +31,10 @@ from cayu.storage import _sqlite_schema_history as sqlite_schema_history
 from cayu.storage import _sqlite_support as sql
 from cayu.storage import migrations as schema
 from cayu.storage._participant_bindings_schema import validate_sqlite_participant_bindings
-from cayu.storage._task_group_schema import SQLITE_TASK_GROUP_QUIESCENCE_DDL
+from cayu.storage._task_group_schema import (
+    POSTGRES_TASK_GROUP_QUIESCENCE_DDL,
+    SQLITE_TASK_GROUP_QUIESCENCE_DDL,
+)
 from cayu.tasks.creation import TaskCreate
 
 
@@ -240,6 +243,7 @@ def test_current_sqlite_revision_rejects_missing_binding_structure(
 def test_historical_postgres_upgrade_continues_session(postgres_dsn, revision, monkeypatch):
     import psycopg
 
+    from cayu.storage import _postgres_schema_history as postgres_schema_history
     from cayu.storage import postgres as pg
 
     async def run():
@@ -252,7 +256,9 @@ def test_historical_postgres_upgrade_continues_session(postgres_dsn, revision, m
             historical.setattr(
                 schema, "REVISIONS", tuple(r for r in schema.REVISIONS if r.revision <= revision)
             )
-            historical.setitem(pg._MIGRATION_STEPS, 96, pg.POSTGRES_TASK_GROUP_QUIESCENCE_DDL)
+            historical.setitem(
+                postgres_schema_history._MIGRATION_STEPS, 96, POSTGRES_TASK_GROUP_QUIESCENCE_DDL
+            )
             store = pg.PostgresSessionStore(postgres_dsn, schema_mode=schema.SchemaMode.CREATE)
             try:
                 events = [
