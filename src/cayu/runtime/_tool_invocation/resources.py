@@ -104,6 +104,8 @@ class ToolInvocationCall:
     environment_name: str | None
     idempotency_key: str
     model_step: int | None
+    approval_id: str | None
+    input_id: str | None
 
 
 @dataclass(frozen=True, slots=True)

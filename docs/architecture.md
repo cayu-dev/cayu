@@ -366,6 +366,11 @@ use the same component without depending on dispatch or terminal persistence.
 and secret access, including durable operation authority. Workspace evidence
 capture lives alongside it and is shared with recovery and checkpoint settlement.
 Neither component dispatches the tool or depends on the round executor.
+`InvocationEvidence` retains runner completion detail until secret registration
+closes. `ToolInvocationDispatch` refreshes exposure, binds auxiliary inference,
+prepares external effects and invokes the existing tool runner. It retains the
+effect record when dispatch admission refuses the call, so settlement can use
+the original atomic effect transition.
 
 `SessionEngine` also delegates ordinary round closure after a run limit to this
 owner. It retains completed effects, publishes skipped results for unstarted

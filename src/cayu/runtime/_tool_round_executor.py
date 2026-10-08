@@ -72,7 +72,6 @@ from cayu.context.structured_output import (
     copy_structured_output_spec,
 )
 from cayu.context.thinking import ThinkingConfig
-from cayu.environments.deferred import materialization_trigger
 from cayu.events import (
     Event,
     EventType,
@@ -124,7 +123,6 @@ from cayu.runtime._durable_tool_round import (
     _interrupted_tool_call_outcome as _interrupted_tool_call_outcome,
 )
 from cayu.runtime._environment_exposure import (
-    refresh_and_require_environment_exposed,
     require_environment_exposed,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter, prepare_runtime_event
@@ -148,7 +146,6 @@ from cayu.runtime._session_control import (
 from cayu.runtime._tool_effect_state import (
     ToolEffectReconciliationCleanupFailure,
     ToolEffectReconciliationRequired,
-    ToolEffectRecord,
     ToolEffectStateOwner,
     ToolEffectTerminal,
 )
@@ -180,6 +177,8 @@ from cayu.runtime._tool_invocation.context import (
     _workspace,
     _workspace_id,
 )
+from cayu.runtime._tool_invocation.dispatch import ToolInvocationDispatch
+from cayu.runtime._tool_invocation.evidence import InvocationEvidence, InvocationPublication
 from cayu.runtime._tool_invocation.hooks import (
     ToolInvocationHooks,
     _BeforeToolCallResolution,
@@ -229,7 +228,6 @@ from cayu.sessions._checkpoint_secret_validation import (
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
-from cayu.sessions._tool_effect_intent import ToolEffectIntent
 from cayu.sessions.base import (
     _MCP_MANIFEST_BASELINE_MAX_TOOLS,
     McpManifestBaseline,
@@ -1522,89 +1520,11 @@ class ToolRoundExecutor:
             tool_calls=[tool_call],
         )
         provisional_output_redactor = invocation_redactor
-        publication_snapshot_recorded = False
-
-        async def record_publication_snapshot(
-            snapshot: invocation_secrets.InvocationPublicationSnapshot,
-        ) -> None:
-            nonlocal publication_snapshot_recorded
-            if publication_snapshot_recorded:
-                return
-            if publication_snapshot_observer is not None:
-                await publication_snapshot_observer(tool_call.id, snapshot)
-            publication_snapshot_recorded = True
-
-        async def record_static_publication_scope() -> (
-            invocation_secrets.InvocationPublicationSnapshot
-        ):
-            snapshot = invocation_secrets.InvocationPublicationSnapshot(
-                redactor=invocation_redactor,
-                unsafe_output=False,
-            )
-            await record_publication_snapshot(snapshot)
-            return snapshot
-
-        async def record_interrupted_publication_scope(
-            interrupt: BaseException,
-        ) -> bool:
-            """Persist the final scope without replacing an owned interrupt."""
-
-            def record_abandoned_publication_diagnostic(error: BaseException) -> None:
-                if type(error) is GeneratorExit:
-                    error_type = "GeneratorExit"
-                elif isinstance(error, BaseExceptionGroup):
-                    error_type = "BaseExceptionGroup"
-                elif isinstance(error, asyncio.CancelledError):
-                    error_type = "CancelledError"
-                else:
-                    # Exception subclass names and messages are extension-owned
-                    # and can contain workload-derived values. Keep only a fixed
-                    # classification at this public cancellation boundary.
-                    error_type = "BaseException"
-                note = (
-                    "Assistant publication projection terminated with "
-                    f"{error_type} while preserving cancellation."
-                )
-                interrupt.add_note(note)
-                if isinstance(interrupt, BaseExceptionGroup):
-                    for candidate in iter_exception_tree(interrupt):
-                        if isinstance(candidate, asyncio.CancelledError):
-                            candidate.add_note(note)
-
-            publication_task = asyncio.create_task(
-                persist_sealed_invocation_evidence(invocation_secret_scope.seal_for_publication())
-            )
-            publication_outcome = await await_shielded_task_outcome(publication_task)
-            publication_error = publication_outcome.error
-            if publication_error is not None and not isinstance(publication_error, Exception):
-                if type(publication_error) in (KeyboardInterrupt, SystemExit):
-                    # Process-level interpreter signals retain their ordinary
-                    # semantics; this issue does not redefine process shutdown.
-                    raise publication_error
-                # Caller cancellation remains authoritative over task-contained
-                # snapshot abandonment. Retain only a fixed diagnostic because
-                # raw extension-owned exception state is unsafe to publish.
-                record_abandoned_publication_diagnostic(publication_error)
-            if publication_error is not None and isinstance(publication_error, Exception):
-                interrupt.add_note(
-                    "Failed to persist the assistant publication projection while "
-                    "preserving cancellation."
-                )
-            later_cancellation = publication_outcome.cancellation
-            if later_cancellation is None:
-                return False
-            current_task = asyncio.current_task()
-            if current_task is None:  # pragma: no cover - coroutine execution invariant
-                interrupt.add_note(
-                    "A later cancellation could not be redelivered after publication."
-                )
-                return False
-            cancellation_args = later_cancellation.args
-            if not cancellation_args:
-                current_task.cancel()
-            else:
-                current_task.cancel(cancellation_args[0])
-            return True
+        publication = InvocationPublication(
+            tool_call=tool_call,
+            redactor=invocation_redactor,
+            observer=publication_snapshot_observer,
+        )
 
         started_event: Event | None = None
         if registered_tool is not None and not registered_tool.publish_arguments:
@@ -1667,7 +1587,7 @@ class ToolRoundExecutor:
             yield started_event, None
 
         if registered_tool is None:
-            publication_snapshot = await record_static_publication_scope()
+            publication_snapshot = await publication.static_scope()
             result = ToolResult(
                 content=f"Tool not registered: {tool_call.name}",
                 is_error=True,
@@ -1728,7 +1648,7 @@ class ToolRoundExecutor:
             else:
                 resolved_policy_result = tool_execution.validate_tool_policy_result(policy_result)
             if resolved_policy_result.decision == ToolPolicyDecision.DENY:
-                publication_snapshot = await record_static_publication_scope()
+                publication_snapshot = await publication.static_scope()
                 public_policy_result = (
                     resolved_policy_result
                     if argument_error is not None
@@ -1858,7 +1778,7 @@ class ToolRoundExecutor:
             else {}
         )
         if before_resolution.block_reason is not None:
-            publication_snapshot = await record_static_publication_scope()
+            publication_snapshot = await publication.static_scope()
             block_reason = (
                 before_resolution.block_reason
                 if registered_tool.publish_arguments
@@ -1892,7 +1812,7 @@ class ToolRoundExecutor:
                 yield event
             return
         if before_resolution.short_circuit_result is not None:
-            publication_snapshot = await record_static_publication_scope()
+            publication_snapshot = await publication.static_scope()
             short_result = (
                 before_resolution.short_circuit_result
                 if registered_tool.publish_arguments
@@ -1942,7 +1862,7 @@ class ToolRoundExecutor:
                 taint_labels=taint_labels,
             )
             if reauthorization.decision != ToolPolicyDecision.ALLOW:
-                publication_snapshot = await record_static_publication_scope()
+                publication_snapshot = await publication.static_scope()
                 if reauthorization.decision == ToolPolicyDecision.DENY:
                     public_reauthorization = (
                         reauthorization
@@ -2010,8 +1930,6 @@ class ToolRoundExecutor:
 
         invocation_secret_scope = invocation_secrets.InvocationSecretTracker(invocation_redactor)
         proxy_authorizations: list[invocation_secrets.ProxyAuthorizationRecord] = []
-        staged_runner_completion_events: list[tuple[Event, int]] = []
-        runner_events: list[Event] = []
         ctx_metadata = tool_execution.context_metadata(
             request_metadata=request_metadata,
             tool_call_id=tool_call.id,
@@ -2024,134 +1942,6 @@ class ToolRoundExecutor:
             ctx_metadata[TAINT_LABELS_METADATA_KEY] = sorted(taint_labels)
         if execution_profile is not None:
             ctx_metadata[EXECUTION_PROFILE_FINGERPRINT_FIELD] = execution_profile.fingerprint
-
-        def redactor_provider():
-            return invocation_secret_scope.redactor
-
-        async def observe_runner_execution(
-            phase: Literal["started", "completed"],
-            payload: dict[str, Any],
-            command_evidence_revision: int,
-        ) -> None:
-            if type(command_evidence_revision) is not int or command_evidence_revision < 0:
-                raise TypeError("Runner command evidence revision must be a non-negative integer.")
-            event = Event(
-                type=(
-                    EventType.RUNNER_EXEC_STARTED
-                    if phase == "started"
-                    else EventType.RUNNER_EXEC_COMPLETED
-                ),
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
-                tool_name=tool_call.name,
-                payload={
-                    **payload,
-                    "tool_call_id": tool_call.id,
-                    "idempotency_key": idempotency_key,
-                    **identity_payload,
-                    **({"approval_id": approval_id} if approval_id is not None else {}),
-                    **({"input_id": input_id} if input_id is not None else {}),
-                },
-            )
-            event = event_with_execution_profile_authority(event, execution_profile)
-            event = _event_with_tool_round_authority(
-                event,
-                tool_round_identity,
-                *(field for field in ("approval_id", "input_id") if field in event.payload),
-            )
-
-            command = event.payload.get("command")
-            if not isinstance(command, dict) or command.get("kind") not in {
-                "process",
-                "shell",
-            }:
-                raise RuntimeError("Runner command evidence is malformed.")
-            if phase == "started":
-                # A command must not cross the runner boundary until its exact
-                # invocation/profile linkage is durable. Command arguments can
-                # become secret only after dispatch, so the pre-dispatch record
-                # is deliberately content-free instead of being held in memory.
-                event = event.model_copy(
-                    update={
-                        "payload": {
-                            **event.payload,
-                            "command": {
-                                "kind": command["kind"],
-                                "arguments_state": "unavailable",
-                            },
-                        }
-                    },
-                    deep=True,
-                )
-                runner_events.append(
-                    await self._event_writer.emit(
-                        prepare_runtime_event(
-                            event,
-                            redactor=invocation_secret_scope.redactor,
-                        )
-                    )
-                )
-                return
-            staged_runner_completion_events.append((event, command_evidence_revision))
-
-        async def publish_staged_runner_events(
-            snapshot: invocation_secrets.InvocationPublicationSnapshot,
-        ) -> None:
-            """Publish runner completion detail after late secret registration closes."""
-
-            nonlocal staged_runner_completion_events
-            if not staged_runner_completion_events:
-                return
-            final_revision = invocation_secret_scope.snapshot().revision
-            captured_events = staged_runner_completion_events
-            staged_runner_completion_events = []
-            prepared_events: list[Event] = []
-            for event, command_evidence_revision in captured_events:
-                if snapshot.secret_scope_incomplete or command_evidence_revision != final_revision:
-                    command = event.payload.get("command")
-                    if not isinstance(command, dict) or command.get("kind") not in {
-                        "process",
-                        "shell",
-                    }:
-                        raise RuntimeError("Runner command evidence is malformed.")
-                    event = event.model_copy(
-                        update={
-                            "payload": {
-                                **event.payload,
-                                "command": {
-                                    "kind": command["kind"],
-                                    "arguments_state": "unavailable",
-                                },
-                            }
-                        },
-                        deep=True,
-                    )
-                prepared_events.append(prepare_runtime_event(event, redactor=snapshot.redactor))
-            captured_events.clear()
-            for event in prepared_events:
-                runner_events.append(await self._event_writer.emit(event))
-
-        async def persist_sealed_invocation_evidence(
-            snapshot: invocation_secrets.InvocationPublicationSnapshot,
-        ) -> None:
-            await record_publication_snapshot(snapshot)
-            await publish_staged_runner_events(snapshot)
-
-        async def persist_resolved_secret_projection(
-            snapshot: InvocationRedactorSnapshot,
-        ) -> None:
-            if resolved_redactor_observer is not None:
-                await resolved_redactor_observer(tool_call.id, snapshot)
-                return
-            await self._session_store.transform_checkpoint(
-                session.id,
-                tool_round_recovery.assistant_publication_redactor_transform(
-                    tool_round_identity=tool_round_identity,
-                    tool_call_id=tool_call.id,
-                    redactor=snapshot.redactor,
-                ),
-            )
 
         invocation_call = ToolInvocationCall(
             session=session,
@@ -2169,15 +1959,26 @@ class ToolRoundExecutor:
             environment_name=environment_name,
             idempotency_key=idempotency_key,
             model_step=model_step,
+            approval_id=approval_id,
+            input_id=input_id,
         )
+        evidence = InvocationEvidence(
+            call=invocation_call,
+            secret_scope=invocation_secret_scope,
+            publication=publication,
+            session_store=self._session_store,
+            event_writer=self._event_writer,
+            resolved_redactor_observer=resolved_redactor_observer,
+        )
+        runner_events = evidence.runner_events
         invocation_resources = self.resources.bind(
             invocation_call,
             ctx_metadata=ctx_metadata,
             invocation_secret_scope=invocation_secret_scope,
             proxy_authorizations=proxy_authorizations,
-            redactor_provider=redactor_provider,
-            observe_runner_execution=observe_runner_execution,
-            persist_resolved_secret_projection=persist_resolved_secret_projection,
+            redactor_provider=evidence.redactor,
+            observe_runner_execution=evidence.observe_runner,
+            persist_resolved_secret_projection=evidence.persist_resolved,
         )
         tool_context = invocation_resources.context
         raw_workspace = invocation_resources.raw_workspace
@@ -2335,6 +2136,7 @@ class ToolRoundExecutor:
             interrupt: BaseException,
             cancellation: asyncio.CancelledError,
         ) -> None:
+
             nonlocal workspace_capture_failure_detail, workspace_settlement_failure
             outcome = await await_invocation_operation(
                 close_workspace_mutation_window,
@@ -2372,6 +2174,7 @@ class ToolRoundExecutor:
         async def consume_post_tool_cancellation(
             cancellation: asyncio.CancelledError,
         ) -> asyncio.CancelledError | None:
+
             nonlocal post_tool_cancellation_requests_consumed
             current_task = asyncio.current_task()
             await _receive_restored_post_tool_cancellation()
@@ -2402,9 +2205,9 @@ class ToolRoundExecutor:
                 publish_before_hooks: bool,
                 snapshot: invocation_secrets.InvocationPublicationSnapshot,
             ) -> Event:
+
                 nonlocal post_tool_cancellation
                 nonlocal workspace_events, workspace_lifecycle, workspace_capture_payload
-
                 uncertainty_error: ToolEffectReconciliationRequired | None = None
                 try:
                     if registered_environment is not None and workspace_window_id is not None:
@@ -2842,190 +2645,32 @@ class ToolRoundExecutor:
                         attach_runner_cancellation_failure(candidate, failure)
                 set_exception_cause(interrupt, failure)
 
-        effect_dispatch: ToolEffectRecord | None = None
-        auxiliary_events: list[Event] = []
+        dispatch = ToolInvocationDispatch(
+            call=invocation_call,
+            context=tool_context,
+            secret_scope=invocation_secret_scope,
+            session_store=self._session_store,
+            auxiliary_inference=self._auxiliary_inference,
+            auxiliary_policy=auxiliary_invocation_policy,
+            tool_timeout_seconds=self._tool_timeout_seconds,
+            strict_common_budget_admission=self._strict_common_budget_admission,
+            runner_events=runner_events,
+            settle_workspace=(
+                close_workspace_mutation_window if workspace_window_id is not None else None
+            ),
+        )
         try:
-
-            async def require_live_environment_exposure() -> None:
-                if registered_environment is None:
-                    return
-                assert invocation_context is not None
-                assert execution_profile is not None
-                await refresh_and_require_environment_exposed(
-                    registered_environment,
-                    session=session,
-                    invocation_context=invocation_context,
-                    registered_agent=registered_agent,
-                    execution_profile=execution_profile,
-                    redactor=invocation_secret_scope.redactor,
-                )
-
-            # Refuse missing/stale environment authority before consuming a
-            # protected effect. The exact dispatch seam below still performs
-            # main's independent freshness check after durable preparation.
-            await require_live_environment_exposure()
-            from cayu.resource_access import require_dispatch
-
-            await require_dispatch()
-            inference_scope = None
-            if registered_tool.auxiliary_inference is not None:
-                if invocation_context is None or auxiliary_invocation_policy is None:
-                    raise RuntimeError("Auxiliary inference requires frozen invocation authority.")
-                inference_scope = self._auxiliary_inference.create_scope(
-                    session=session,
-                    invocation=invocation_context,
-                    policy=auxiliary_invocation_policy,
-                    registered_tool=registered_tool,
-                    parent=tool_round_identity,
-                    tool_call_id=effective_tool_call.id,
-                    idempotency_key=idempotency_key,
-                    budget_limits=budget_limits,
-                    budget_binding=auxiliary_invocation_policy.budget_binding,
-                    redactor=lambda: invocation_secret_scope.redactor,
-                    refresh=require_live_environment_exposure,
-                    observe_event=auxiliary_events.append,
-                )
-                tool_context._bind_runtime_inference(inference_scope)
-            if registered_tool.effect is ToolEffect.EXTERNAL:
-                if self._strict_common_budget_admission:
-                    raise RuntimeError(
-                        "Opaque external tool adapters are not qualified for common-root "
-                        "budget admission and are refused before dispatch."
-                    )
-                if invocation_context is None or execution_profile is None:
-                    raise RuntimeError(
-                        "External tool dispatch requires frozen invocation authority."
-                    )
-                targeted_material = _targeted_tool_invocation_payload(effective_tool_call)
-                effect_intent = ToolEffectIntent(
-                    session_id=session.id,
-                    session_instance_id=session.instance_id,
-                    source_run_epoch=session.run_epoch,
-                    interaction_id=invocation_context.active_profile.interaction_id,
-                    model_step_id=tool_round_identity.model_step_id,
-                    model_attempt_id=tool_round_identity.model_attempt_id,
-                    tool_round_id=tool_round_identity.tool_round_id,
-                    agent_name=registered_agent.spec.name,
-                    tool_name=effective_tool_call.name,
-                    tool_call_id=effective_tool_call.id,
-                    idempotency_key=idempotency_key,
-                    execution_profile_fingerprint=execution_profile.fingerprint,
-                    schema_digest=hashlib.sha256(
-                        canonical_durable_json_bytes(
-                            registered_tool.schema,
-                            "effect_schema",
-                        )
-                    ).hexdigest(),
-                    arguments_digest=hashlib.sha256(
-                        canonical_durable_json_bytes(
-                            effective_tool_call.arguments,
-                            "effect_arguments",
-                        )
-                    ).hexdigest(),
-                    approval_id=approval_id,
-                    pause_id=input_id,
-                    environment_name=environment_name,
-                    allocation_fingerprint=(
-                        None
-                        if registered_environment is None
-                        else registered_environment.live_allocation_fingerprint
-                    ),
-                    reconciler_fingerprint=(
-                        None
-                        if registered_tool.effect_reconciler is None
-                        else registered_tool.effect_reconciler.fingerprint
-                    ),
-                    targeted_invocation_digest=(
-                        None
-                        if not targeted_material
-                        else hashlib.sha256(
-                            canonical_durable_json_bytes(
-                                targeted_material,
-                                "effect_targeted_invocation",
-                            )
-                        ).hexdigest()
-                    ),
-                )
-                effect_dispatch = await ToolEffectStateOwner(self._session_store).begin(
-                    effect_intent,
-                    run_epoch=session.run_epoch,
-                    child_recovery_arguments=(
-                        effective_tool_call.arguments
-                        if registered_tool.child_session_recovery is not None
-                        else None
-                    ),
-                )
-
-            async def reconcile_child_result() -> ToolResult | None:
-                if effect_dispatch is None or registered_tool.child_session_recovery is None:
-                    return None
-                from cayu.runtime._foreground_child_wait import (
-                    ForegroundChildActionRequired,
-                    observe_foreground_child_wait,
-                    project_current_foreground_child_result,
-                    retain_foreground_child_wait,
-                )
-
-                child_wait = await observe_foreground_child_wait(
-                    self._session_store,
-                    parent=session,
-                    intent=effect_dispatch.intent,
-                    matcher=registered_tool.child_session_recovery,
-                    arguments=effective_tool_call.arguments,
-                )
-                if child_wait is not None:
-                    if workspace_window_id is not None:
-                        await close_workspace_mutation_window()
-                    await retain_foreground_child_wait(
-                        self._session_store,
-                        parent=session,
-                        effect=effect_dispatch,
-                        wait=child_wait,
-                    )
-                    raise ForegroundChildActionRequired(child_wait)
-                return await project_current_foreground_child_result(
-                    self._session_store,
-                    parent=session,
-                    intent=effect_dispatch.intent,
-                    matcher=registered_tool.child_session_recovery,
-                    arguments=effective_tool_call.arguments,
-                )
-
-            async def require_resource_dispatch():
-                await require_live_environment_exposure()
-                await require_dispatch()
-
-            # A deferred environment attributes its materialization to this call.
-            with materialization_trigger(
-                tool_call_id=effective_tool_call.id,
-                tool_name=effective_tool_call.name,
-                # Yielded with the call's runner evidence before its terminal.
-                event_sink=runner_events.append,
-            ):
-                execution_outcome = await tool_execution.run_tool(
-                    tool=registered_tool.tool,
-                    effect=registered_tool.effect,
-                    ctx=tool_context,
-                    arguments=effective_tool_call.arguments,
-                    redactor=lambda: invocation_secret_scope.redactor,
-                    registered_schema=registered_tool.schema,
-                    registered_execution_contract=registered_tool.execution_contract,
-                    finalize_publication=invocation_secret_scope.seal_for_publication,
-                    timeout_seconds=self._tool_timeout_seconds,
-                    before_dispatch=require_resource_dispatch,
-                    reconcile_result=reconcile_child_result,
-                    inference_scope=inference_scope,
-                )
-            for auxiliary_event in auxiliary_events:
+            execution_outcome = await dispatch.run()
+            for auxiliary_event in dispatch.events:
                 yield auxiliary_event, None
         except tool_execution.ToolDispatchAdmissionRefusal as refused:
             refusal = refused.refusal
-            if effect_dispatch is not None:
+            if dispatch.effect is not None:
                 try:
                     # This proof comes from the runtime callback, never a
                     # tool-authored result or exception. Selection and its
                     # evidence share the existing effect transaction.
-                    intent = effect_dispatch.intent
+                    intent = dispatch.effect.intent
                     event = event_with_execution_profile_authority(
                         Event(
                             type=EventType.TOOL_CALL_FAILED,
@@ -3075,7 +2720,7 @@ class ToolRoundExecutor:
                         )
                     )
                     await ToolEffectStateOwner(self._session_store).transition(
-                        effect_dispatch,
+                        dispatch.effect,
                         state="failed",
                         run_epoch=session.run_epoch,
                         terminal=ToolEffectTerminal(
@@ -3136,7 +2781,7 @@ class ToolRoundExecutor:
                     exc,
                     group_cancellation,
                 )
-                await record_interrupted_publication_scope(exc)
+                await evidence.persist_interrupted(exc)
                 (
                     grouped_artifacts,
                     grouped_artifacts_by_id,
@@ -3159,7 +2804,7 @@ class ToolRoundExecutor:
             )
             invocation_secrets.set_cancellation_tool_call_id(exc, tool_call.id)
             await close_workspace_mutation_window_after_interrupt(exc, exc)
-            cancellation_redelivered = await record_interrupted_publication_scope(exc)
+            cancellation_redelivered = await evidence.persist_interrupted(exc)
             await stage_interrupted_workspace_outcome(
                 exc,
                 artifacts=invocation_secrets.cancellation_artifacts(exc),
@@ -3249,7 +2894,7 @@ class ToolRoundExecutor:
             # evidence precedes terminal staging, so cancellation here must not
             # discard that result and turn a completed effect into ambiguity.
             publication_outcome = await await_shielded_task_outcome(
-                asyncio.create_task(persist_sealed_invocation_evidence(publication_snapshot))
+                asyncio.create_task(evidence.persist_sealed(publication_snapshot))
             )
             post_tool_cancellation_requests_consumed += (
                 publication_outcome.cancellation_requests_consumed
@@ -3659,12 +3304,12 @@ class ToolRoundExecutor:
             if workspace_settlement_failure is not None:
                 raise workspace_settlement_failure from None
         except BaseException as publication_failure:
-            if effect_dispatch is not None:
+            if dispatch.effect is not None:
                 from cayu.runtime._tool_effect_conflicts import raise_after_tool_dispatch_audit
 
                 await raise_after_tool_dispatch_audit(
                     self._session_store,
-                    effect_dispatch,
+                    dispatch.effect,
                     publication_failure,
                     candidate_event_id=None if result_event is None else result_event.id,
                 )
