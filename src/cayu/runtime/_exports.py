@@ -415,7 +415,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "DEFAULT_MAX_PARALLEL_TOOL_CALLS": ("cayu.configuration", "DEFAULT_MAX_PARALLEL_TOOL_CALLS"),
     "DEFAULT_MAX_STEPS": ("cayu.configuration", "DEFAULT_MAX_STEPS"),
     "DEFAULT_PENDING_ACTION_RESULT_MAX_BYTES": (
-        "cayu.sessions.base",
+        "cayu.sessions.pending_action_contracts",
         "DEFAULT_PENDING_ACTION_RESULT_MAX_BYTES",
     ),
     "DEFAULT_RECOVERY_CLEANUP_MAX_SUPERVISED_TASKS": (
@@ -448,7 +448,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "DefaultContextPolicy": ("cayu.context.base", "DefaultContextPolicy"),
     "DeferredInteractionInput": ("cayu.sessions.base", "DeferredInteractionInput"),
-    "DelegatedActionReference": ("cayu.sessions.base", "DelegatedActionReference"),
+    "DelegatedActionReference": (
+        "cayu.sessions.pending_action_contracts",
+        "DelegatedActionReference",
+    ),
     "DenyPatternRule": ("cayu.tools.policy", "DenyPatternRule"),
     "EnvironmentScopedToolPolicy": ("cayu.tools.policy", "EnvironmentScopedToolPolicy"),
     "DeterministicCompletionVerifier": (
@@ -777,7 +780,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.sessions.base",
         "MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES",
     ),
-    "MAX_PENDING_ACTION_RESULT_BYTES": ("cayu.sessions.base", "MAX_PENDING_ACTION_RESULT_BYTES"),
+    "MAX_PENDING_ACTION_RESULT_BYTES": (
+        "cayu.sessions.pending_action_contracts",
+        "MAX_PENDING_ACTION_RESULT_BYTES",
+    ),
     "MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES": (
         "cayu.tools.result_projection",
         "MAX_PROJECTED_TOOL_RESULT_CONTENT_BYTES",
@@ -885,13 +891,19 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "ParameterConstrainedToolPolicy": ("cayu.tools.policy", "ParameterConstrainedToolPolicy"),
     "ParameterRule": ("cayu.tools.policy", "ParameterRule"),
     "ParsedPublicAuthorityAlias": ("cayu.runtime.public_authority", "ParsedPublicAuthorityAlias"),
-    "PendingActionIssue": ("cayu.sessions.base", "PendingActionIssue"),
-    "PendingActionIssueCode": ("cayu.sessions.base", "PendingActionIssueCode"),
+    "PendingActionIssue": ("cayu.sessions.pending_action_contracts", "PendingActionIssue"),
+    "PendingActionIssueCode": ("cayu.sessions.pending_action_contracts", "PendingActionIssueCode"),
     "PendingActionKind": ("cayu.sessions.records", "PendingActionKind"),
-    "PendingActionListResult": ("cayu.sessions.base", "PendingActionListResult"),
-    "PendingActionQuery": ("cayu.sessions.base", "PendingActionQuery"),
-    "PendingActionRecord": ("cayu.sessions.base", "PendingActionRecord"),
-    "PendingActionResultTooLarge": ("cayu.sessions.base", "PendingActionResultTooLarge"),
+    "PendingActionListResult": (
+        "cayu.sessions.pending_action_contracts",
+        "PendingActionListResult",
+    ),
+    "PendingActionQuery": ("cayu.sessions.pending_action_contracts", "PendingActionQuery"),
+    "PendingActionRecord": ("cayu.sessions.pending_action_contracts", "PendingActionRecord"),
+    "PendingActionResultTooLarge": (
+        "cayu.sessions.pending_action_contracts",
+        "PendingActionResultTooLarge",
+    ),
     "PendingActionSession": ("cayu.sessions.records", "PendingActionSession"),
     "PendingToolApproval": ("cayu.approvals.tools", "PendingToolApproval"),
     "PendingToolApprovalEventView": ("cayu.approvals.tools", "PendingToolApprovalEventView"),

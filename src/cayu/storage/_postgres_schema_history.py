@@ -6,7 +6,10 @@ from dataclasses import dataclass
 
 from cayu._validation import EXECUTION_UNIT_ID_MAX_CHARS
 from cayu.approvals.tools import _PENDING_TOOL_APPROVAL_EVENT_PROJECTION_KEYS
-from cayu.sessions.base import MAX_PENDING_ACTION_RESULT_BYTES, MAX_PENDING_ACTION_TOOL_CALLS
+from cayu.sessions.pending_action_contracts import (
+    MAX_PENDING_ACTION_RESULT_BYTES,
+    MAX_PENDING_ACTION_TOOL_CALLS,
+)
 from cayu.sessions.transcript_queries import TRANSCRIPT_SEARCH_TOKENIZER_VERSION
 from cayu.storage._accounting_schema import (
     POSTGRES_ACCOUNTING_DDL,

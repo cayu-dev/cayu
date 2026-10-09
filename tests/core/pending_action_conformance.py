@@ -4,13 +4,11 @@ from typing import Any
 
 from cayu.events import Event, EventType
 from cayu.messages import Message
-from cayu.sessions.base import (
+from cayu.sessions.base import RunRequest, SessionIdentity, SessionStore
+from cayu.sessions.pending_action_contracts import (
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
     MAX_PENDING_ACTION_TOOL_CALLS,
     PendingActionQuery,
-    RunRequest,
-    SessionIdentity,
-    SessionStore,
 )
 from cayu.sessions.records import PendingActionKind, SessionStatus
 

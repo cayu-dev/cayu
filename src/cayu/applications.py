@@ -585,8 +585,6 @@ from cayu.sessions.base import (
     ModelCompletionManualRecoveryResult,
     ModelCompletionStage,
     ModelTarget,
-    PendingActionQuery,
-    PendingActionResultTooLarge,
     PersistedEventSideEffectClaim,
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
@@ -644,6 +642,7 @@ from cayu.sessions.invocation import (
     SessionInvocationBinding,
     copy_session_invocation_binding,
 )
+from cayu.sessions.pending_action_contracts import PendingActionQuery, PendingActionResultTooLarge
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import EventRecord, Session, SessionStatus, copy_session
 from cayu.sessions.recovery import (

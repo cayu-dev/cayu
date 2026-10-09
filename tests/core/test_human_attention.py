@@ -51,7 +51,7 @@ def test_attention_native_pause_resolution_and_identity(session_store_case, kind
             attention = HumanAttentionRequest.from_pending_action(action)
             assert attention is not None
             assert attention.reference.attention_id == action.attention_id
-            from cayu.sessions.base import PendingActionRecord
+            from cayu.sessions.pending_action_contracts import PendingActionRecord
 
             restored = PendingActionRecord.model_validate_json(action.model_dump_json())
             assert restored.attention_id == action.attention_id
@@ -148,7 +148,7 @@ def test_attention_supersession_is_not_an_answer(tmp_path):
 
 
 def test_attention_failed_and_incomplete_reads_remain_unavailable(tmp_path, monkeypatch):
-    from cayu.sessions.base import PendingActionListResult
+    from cayu.sessions.pending_action_contracts import PendingActionListResult
 
     async def run():
         app, store, _inbox = build(tmp_path, phase="pause")

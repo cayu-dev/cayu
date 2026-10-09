@@ -113,10 +113,6 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     InterruptSessionRequest,
     ModelTarget,
-    PendingActionIssue,
-    PendingActionIssueCode,
-    PendingActionListResult,
-    PendingActionQuery,
     PersistedEventSideEffectStatus,
     ResumeRequest,
     RunRequest,
@@ -125,6 +121,12 @@ from cayu.sessions.base import (
 )
 from cayu.sessions.checkpoints import CURRENT_CHECKPOINT_SCHEMA_VERSION
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.pending_action_contracts import (
+    PendingActionIssue,
+    PendingActionIssueCode,
+    PendingActionListResult,
+    PendingActionQuery,
+)
 from cayu.sessions.queries import SessionListResult
 from cayu.sessions.records import EventRecord, SessionStatus
 from cayu.sessions.recovery import RecoveryExecutionRequest, RecoveryPlan
@@ -5724,7 +5726,7 @@ def test_server_pending_actions_returns_413_for_oversized_page() -> None:
 
         async def query_pending_actions(self, query=None, *, checkpoint_root_guard=None):
             del checkpoint_root_guard
-            from cayu.sessions.base import PendingActionResultTooLarge
+            from cayu.sessions.pending_action_contracts import PendingActionResultTooLarge
 
             raise PendingActionResultTooLarge(2 * 1024 * 1024)
 

@@ -103,13 +103,12 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.sessions.base import (
     EnqueueSessionMessageRequest,
-    PendingActionQuery,
-    PendingActionRecord,
     ResumeRequest,
     RunRequest,
     SessionMessageDeliveryMode,
     copy_run_request,
 )
+from cayu.sessions.pending_action_contracts import PendingActionQuery, PendingActionRecord
 from cayu.sessions.records import PendingActionKind, SessionStatus
 
 

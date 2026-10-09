@@ -45268,5 +45268,9 @@
     "tests/core/test_abandoned_session_resume.py::test_failed_resume_after_takeover_keeps_round_for_next_continuation[resume-during_replay]": 6.508999125973787,
     "tests/core/test_abandoned_session_resume.py::test_replay_that_a_hook_skips_is_not_marked_replayed[block]": 5.332566333003342,
     "tests/core/test_abandoned_session_resume.py::test_replay_that_a_hook_skips_is_not_marked_replayed[short_circuit]": 4.891590291052125,
-    "tests/core/test_tool_call_replay_identity.py::test_only_the_taken_over_session_may_elect_a_replay": 0.0004638350219465792
+    "tests/core/test_tool_call_replay_identity.py::test_only_the_taken_over_session_may_elect_a_replay": 0.0004638350219465792,
+    "tests/core/test_session_discovery_package_layout.py::test_pending_action_bounds_and_identity_without_stores[cayu.runtime]": 0.4641949590004515,
+    "tests/core/test_session_discovery_package_layout.py::test_pending_action_bounds_and_identity_without_stores[cayu.sessions]": 0.36450562498066574,
+    "tests/core/test_session_discovery_package_layout.py::test_pending_action_bounds_and_identity_without_stores[cayu]": 0.3785455840115901,
+    "tests/core/test_session_discovery_package_layout.py::test_pending_action_public_imports_and_historical_pickle_globals": 0.9539567519677803
 }

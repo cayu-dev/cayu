@@ -63,7 +63,6 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     InterruptSessionRequest,
     ModelCompletionStageDisposition,
-    PendingActionQuery,
     ResumeRequest,
     RunRequest,
     SessionIdentity,
@@ -75,6 +74,7 @@ from cayu.sessions.base import (
 )
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.invocation import TaskExecutionSource
+from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.creation import (

@@ -25,7 +25,6 @@ from cayu.sessions.base import (
     EnqueueSessionMessageRequest,
     ForkSessionRequest,
     ModelCompletionStageRequest,
-    PendingActionQuery,
     ResumeRequest,
     RunRequest,
     SessionIdentity,
@@ -38,6 +37,7 @@ from cayu.sessions.checkpoints import (
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.inspection import SessionInspectionSummary
+from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.queries import SessionAggregateFilter, SessionQuery
 from cayu.sessions.records import RUNTIME_BUILD_PROVENANCE_METADATA_KEY, Session, SessionStatus
 from cayu.sessions.transcript_queries import TRANSCRIPT_SEARCH_TOKENIZER_VERSION, TranscriptQuery

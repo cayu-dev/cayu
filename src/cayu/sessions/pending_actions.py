@@ -34,7 +34,7 @@ from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions import _staged_tool_terminal_reader as staged_terminal_reader
 from cayu.sessions import _tool_call_evidence as tool_call_evidence
-from cayu.sessions.base import (
+from cayu.sessions.pending_action_contracts import (
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
     MAX_PENDING_ACTION_RESULT_BYTES,
     MAX_PENDING_ACTION_TOOL_CALLS,

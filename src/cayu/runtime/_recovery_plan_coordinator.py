@@ -65,18 +65,20 @@ from cayu.sessions._invocation_lifecycle import (
 )
 from cayu.sessions._terminal_evidence import _session_run_operation_from_checkpoint
 from cayu.sessions.base import (
-    PENDING_ACTION_EVENT_TYPE_VALUES,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
     ModelCompletionManualRecoveryRequest,
     ModelCompletionManualRecoveryResult,
-    PendingActionQuery,
-    PendingActionRecord,
     SessionStore,
     _incomplete_recovery_claim_from_checkpoint,
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery
+from cayu.sessions.pending_action_contracts import (
+    PENDING_ACTION_EVENT_TYPE_VALUES,
+    PendingActionQuery,
+    PendingActionRecord,
+)
 from cayu.sessions.pending_actions import (
     checkpoint_has_pending_action_candidate,
     pending_action_from_records,

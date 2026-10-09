@@ -499,6 +499,14 @@ the shared tokenizer, document encoding, scoring and query-scoped search cursors
 Native stores compose these rules with their existing transcript queries and
 indexes; index maintenance, schema validation and atomic reads remain store-owned.
 
+### Session discovery
+
+`sessions/pending_action_contracts.py` owns bounded pending-action queries,
+discovery records, issue reports and result-size limits. It composes session
+records without importing stores or approval-resolution machinery. The existing
+`sessions/pending_actions.py` classifier derives actions from checkpoint and event
+evidence; native stores retain candidate reads, authorization and transactions.
+
 ### Session summaries
 
 `sessions/summaries.py` owns stored-session outcome, event-summary and operational

@@ -134,7 +134,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "DEFAULT_CHILD_SESSION_RESULT_MAX_CHARS",
     ),
     "DEFAULT_PENDING_ACTION_RESULT_MAX_BYTES": (
-        "cayu.sessions.base",
+        "cayu.sessions.pending_action_contracts",
         "DEFAULT_PENDING_ACTION_RESULT_MAX_BYTES",
     ),
     "DEFAULT_RECOVERY_CLEANUP_MAX_SUPERVISED_TASKS": (
@@ -150,7 +150,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "DEFAULT_RECOVERY_CLEANUP_STEP_TIMEOUT_SECONDS",
     ),
     "DeferredInteractionInput": ("cayu.sessions.base", "DeferredInteractionInput"),
-    "DelegatedActionReference": ("cayu.sessions.base", "DelegatedActionReference"),
+    "DelegatedActionReference": (
+        "cayu.sessions.pending_action_contracts",
+        "DelegatedActionReference",
+    ),
     "EnqueueSessionMessageRequest": ("cayu.sessions.base", "EnqueueSessionMessageRequest"),
     "EnqueueSessionMessageResult": ("cayu.sessions.base", "EnqueueSessionMessageResult"),
     "EventOrder": ("cayu.sessions.event_queries", "EventOrder"),
@@ -203,7 +206,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.sessions.base",
         "MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES",
     ),
-    "MAX_PENDING_ACTION_RESULT_BYTES": ("cayu.sessions.base", "MAX_PENDING_ACTION_RESULT_BYTES"),
+    "MAX_PENDING_ACTION_RESULT_BYTES": (
+        "cayu.sessions.pending_action_contracts",
+        "MAX_PENDING_ACTION_RESULT_BYTES",
+    ),
     "MAX_SESSION_ID_BYTES": ("cayu.sessions.records", "MAX_SESSION_ID_BYTES"),
     "MAX_SESSION_LIST_CURSOR_BYTES": ("cayu.sessions.queries", "MAX_SESSION_LIST_CURSOR_BYTES"),
     "MIN_SUPPORTED_CHECKPOINT_SCHEMA_VERSION": (
@@ -239,13 +245,19 @@ EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "ModelFailoverPolicy": ("cayu.sessions.base", "ModelFailoverPolicy"),
     "ModelTarget": ("cayu.sessions.base", "ModelTarget"),
-    "PendingActionIssue": ("cayu.sessions.base", "PendingActionIssue"),
-    "PendingActionIssueCode": ("cayu.sessions.base", "PendingActionIssueCode"),
+    "PendingActionIssue": ("cayu.sessions.pending_action_contracts", "PendingActionIssue"),
+    "PendingActionIssueCode": ("cayu.sessions.pending_action_contracts", "PendingActionIssueCode"),
     "PendingActionKind": ("cayu.sessions.records", "PendingActionKind"),
-    "PendingActionListResult": ("cayu.sessions.base", "PendingActionListResult"),
-    "PendingActionQuery": ("cayu.sessions.base", "PendingActionQuery"),
-    "PendingActionRecord": ("cayu.sessions.base", "PendingActionRecord"),
-    "PendingActionResultTooLarge": ("cayu.sessions.base", "PendingActionResultTooLarge"),
+    "PendingActionListResult": (
+        "cayu.sessions.pending_action_contracts",
+        "PendingActionListResult",
+    ),
+    "PendingActionQuery": ("cayu.sessions.pending_action_contracts", "PendingActionQuery"),
+    "PendingActionRecord": ("cayu.sessions.pending_action_contracts", "PendingActionRecord"),
+    "PendingActionResultTooLarge": (
+        "cayu.sessions.pending_action_contracts",
+        "PendingActionResultTooLarge",
+    ),
     "PendingActionSession": ("cayu.sessions.records", "PendingActionSession"),
     "PersistedEventSideEffectClaim": ("cayu.sessions.base", "PersistedEventSideEffectClaim"),
     "PersistedEventSideEffectClaimLost": (

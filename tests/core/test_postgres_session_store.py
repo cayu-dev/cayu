@@ -75,7 +75,6 @@ from cayu.runtime.public_authority import (
     PublicAuthorityAliasKeyring,
 )
 from cayu.sessions.base import (
-    PendingActionQuery,
     RunRequest,
     SessionIdentity,
     SessionLineageQuery,
@@ -92,6 +91,7 @@ from cayu.sessions.invocation import (
     InvocationOriginTrust,
     SessionExecutionSource,
 )
+from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.queries import SessionDebugState, SessionOrder, SessionQuery
 from cayu.sessions.records import PendingActionKind, Session, SessionStatus
 from cayu.sessions.transcript_queries import TranscriptQuery

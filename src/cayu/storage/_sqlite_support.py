@@ -13,10 +13,10 @@ from cayu.knowledge.records import (
     MAX_KNOWLEDGE_ENTRY_ID_BYTES,
 )
 from cayu.sessions.base import (
-    PENDING_ACTION_EVENT_TYPE_VALUES,
     deferred_interaction_input_from_storage_payload,
     deferred_interaction_input_storage_payload,
 )
+from cayu.sessions.pending_action_contracts import PENDING_ACTION_EVENT_TYPE_VALUES
 from cayu.sessions.transcript_queries import TRANSCRIPT_SEARCH_TOKENIZER_VERSION
 from cayu.storage import _sqlite_budget_schema as sqlite_budget_schema
 from cayu.storage import _sqlite_catalog as sqlite_catalog

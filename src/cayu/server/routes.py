@@ -309,9 +309,6 @@ from cayu.sessions.base import (
     InterruptSessionRequest,
     ModelFailoverPolicy,
     ModelTarget,
-    PendingActionQuery,
-    PendingActionRecord,
-    PendingActionResultTooLarge,
     ResumeRequest,
     RunRequest,
     SessionMessageActionResult,
@@ -340,6 +337,11 @@ from cayu.sessions.invocation import (
     InvocationOriginTrust,
     SessionExecutionSource,
     TaskExecutionSource,
+)
+from cayu.sessions.pending_action_contracts import (
+    PendingActionQuery,
+    PendingActionRecord,
+    PendingActionResultTooLarge,
 )
 from cayu.sessions.queries import (
     LabelSelectorOperator,

@@ -23,11 +23,11 @@ from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.loop_policies import BeforeStopDecision, LoopPolicy
 from cayu.sessions.base import (
     InMemorySessionStore,
-    PendingActionQuery,
     RunRequest,
     SessionRunFenced,
     SessionRuntimePublicationConflict,
 )
+from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.queries import SessionQuery
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy

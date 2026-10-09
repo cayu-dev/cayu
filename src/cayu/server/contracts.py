@@ -195,7 +195,6 @@ from cayu.sessions.base import (
     SESSION_TOPOLOGY_MAX_EXPANDED_PARENTS,
     SESSION_TOPOLOGY_MAX_IDENTIFIER_BYTES,
     SESSION_TOPOLOGY_MAX_NODES,
-    DelegatedActionReference,
 )
 from cayu.sessions.execution import SessionExecutionState
 from cayu.sessions.interactions import InteractionSummaryEvidence
@@ -204,6 +203,7 @@ from cayu.sessions.invocation import (
     SessionExecutionSource,
     TaskExecutionSource,
 )
+from cayu.sessions.pending_action_contracts import DelegatedActionReference
 from cayu.sessions.queries import SessionAggregateFilter
 from cayu.sessions.summaries import SessionOperationalSnapshot
 from cayu.sessions.usage import MAX_USAGE_ROLLUP_WINDOW
