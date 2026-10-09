@@ -8630,7 +8630,7 @@ class CayuApp:
             raise TaskCompletionDecisionRequired(
                 "Contracted tasks require the verifier-aware execution entrance."
             ) from None
-        stream = self._session_engine._run_recovery_session(request)
+        stream = self._session_engine.continue_run(request)
         stream = await self._guard_resource_session_stream(stream, request.session.id)
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:

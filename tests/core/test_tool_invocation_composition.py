@@ -48,6 +48,7 @@ from cayu.runtime._tool_invocation.evidence import InvocationPublication
 from cayu.runtime._tool_invocation.admission import ToolInvocationAdmission
 from cayu.runtime._tool_invocation.resources import ToolInvocationResources
 from cayu.runtime._tool_invocation.terminal import ToolTerminalPublisher
+from cayu.runtime._paused_tool_round import PausedToolRound, ApprovalRoundPause, UserInputRoundPause
 from cayu.runtime._runtime_records import ToolCallRequest
 from cayu.runtime._tool_execution import run_tool
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec

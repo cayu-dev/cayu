@@ -24026,9 +24026,8 @@ class SessionEngine:
             raise cancellation
         return outcome.result
 
-    async def _run_recovery_session(
-        self, request: RecoverySessionRunRequest
-    ) -> AsyncGenerator[Event, None]:
+    async def continue_run(self, request: RecoverySessionRunRequest) -> AsyncGenerator[Event, None]:
+        """Continue an admitted invocation after its recovery gate has settled."""
         invocation_context = request.invocation_context
         invocation_context._validate()
         invocation_context.with_admitted_session(request.session)

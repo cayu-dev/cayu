@@ -436,10 +436,17 @@ hook modes, seals secret snapshots, fences stages left by earlier attempts and
 publishes terminals in model order. The phase preserves the distinct paused-round
 staging rules. Closing its publication stream closes the active result stream
 before returning. Unpublished durable stages retain their capacity for recovery.
-The recovery coordinator supplies approval decisions and answers, dispatches
-authorized calls, and owns the exact pending-action closure and subsequent
-session continuation. These closures retain their approval/input receipts and
-authority checks.
+`PausedToolRound` binds that phase to the shared invocation owner for approval
+and user-input continuations. It prepares staging, publishes supplied results,
+closes calls without executable policy authority and dispatches authorized calls
+with the same round identity, secret scope and timing. Typed approval/input pause
+values preserve their different event and idempotency identities.
+The recovery coordinator validates grants and answers, selects recorded outcomes,
+and owns the exact pending-action closure. Approval rechecks remaining budgets;
+user input retains its pause-time projection. Their receipt checks, deferred-input
+handling and failure settlement remain distinct. Both hand off through
+`SessionEngine.continue_run`; the application retains participant, task and
+resource checks before that entrance.
 
 The owner reads fresh checkpoint state for each observation and uses the same
 source snapshot when preparing final publication. It does not cache validation

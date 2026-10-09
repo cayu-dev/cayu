@@ -18,6 +18,7 @@ from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
 from cayu.approvals.user_input import UserInputResponse
 from cayu.environments import Environment, EnvironmentSpec
 from cayu.events import EventType
+from cayu.runtime._tool_execution import tool_idempotency_key
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.sessions.access import SessionAccessDenied, SessionAccessScope
 from cayu.sessions.records import SessionStatus
@@ -257,6 +258,37 @@ def test_continuation_close_replays_without_repeating_tools(
             assert not store.close_results[0].replayed and store.close_results[1].replayed
             assert store.close_results[0].receipt == store.close_results[1].receipt
             transcript = await _assert_closed(store, request.session_id, entrance=entrance)
+            retained = await store.load_events(request.session_id)
+            terminals = [event for event in retained if event.type in _TERMINALS]
+            pause_key = "input_id" if entrance == "answer" else "approval_id"
+            other_key = "approval_id" if entrance == "answer" else "input_id"
+            resumed = next(event for event in retained if event.type is EventType.SESSION_RESUMED)
+            pause_id = resumed.payload[pause_key]
+            for terminal in terminals:
+                assert terminal.payload[pause_key] == pause_id
+                assert other_key not in terminal.payload
+                assert terminal.payload["idempotency_key"] == tool_idempotency_key(
+                    session_id=request.session_id,
+                    tool_round_id=terminal.payload["tool_round_id"],
+                    tool_call_id=terminal.payload["tool_call_id"],
+                    **{"pause_id" if entrance == "answer" else "approval_id": pause_id},
+                )
+            starts = [event for event in retained if event.type is EventType.TOOL_CALL_STARTED]
+            approved = [event for event in retained if event.type is EventType.TOOL_CALL_APPROVED]
+            assert len(approved) == (1 if entrance == "approve" else 0)
+            if entrance == "approve":
+                assert retained.index(resumed) < retained.index(approved[0])
+                assert all(retained.index(approved[0]) < retained.index(start) for start in starts)
+            if entrance == "deny":
+                assert not starts
+            close_id = store.close_requests[0].events[0].id
+            close_index = next(i for i, event in enumerate(retained) if event.id == close_id)
+            assert all(
+                retained.index(resumed) < retained.index(event) < close_index for event in terminals
+            )
+            assert any(
+                event.type is EventType.MODEL_STARTED for event in retained[close_index + 1 :]
+            )
             await _drain(_resolve(app, request))
             assert tool.calls == expected_calls and len(provider.requests) == 2
             assert await store.load_transcript(request.session_id) == transcript

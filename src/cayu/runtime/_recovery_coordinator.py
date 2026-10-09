@@ -35,6 +35,7 @@ from cayu.runtime._durable_tool_round import (
 from cayu.runtime._durable_tool_round import (
     _interrupted_tool_round_results as _interrupted_tool_round_results,
 )
+from cayu.runtime._paused_tool_round import ApprovalRoundPause, PausedToolRound, UserInputRoundPause
 from cayu.sessions import _completion_finalization as completion_finalization
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
@@ -343,14 +344,12 @@ from cayu.runtime._tool_invocation.admission import (
     ToolApprovalRequired,
     policy_denial_payload_fields,
 )
-from cayu.runtime._tool_invocation.terminal import DeferredTerminalStager
 from cayu.runtime._tool_invocation.workspace_capture import _workspace_mutation_incomplete_event
 from cayu.runtime._tool_round_executor import (
     InterruptedToolRoundRequest,
     ToolRoundExecutor,
 )
 from cayu.runtime._tool_round_staging import (
-    _tool_terminal_payload_limits,
     restore_staged_terminal_authority,
 )
 from cayu.runtime._work_attempt_invocation import WorkAttemptInvocationAuthority
@@ -8965,7 +8964,6 @@ class RecoveryCoordinator:
                 approval_support.tool_call_request_from_pending(pending_call)
                 for pending_call in pending.tool_calls
             ]
-            publish_arguments_as_unavailable = len(round_tool_calls) > 1
             base_round_redactor = self._tool_round_executor.redactor_for_tool_calls(
                 registered_agent=registered_agent,
                 tool_calls=round_tool_calls,
@@ -8983,52 +8981,27 @@ class RecoveryCoordinator:
                 persisted_secret_resolution_scope,
                 registered_environment,
             )
-            defer_round_terminals = (
-                len(round_tool_calls) > 1 and pause_secret_resolution_scope != "static"
-            ) or any(
-                registered is not None
-                and (registered.workspace_mutation or registered.effect is ToolEffect.EXTERNAL)
-                for registered in (
-                    registered_agent.executable_tool(tool_call.name)
-                    for tool_call in round_tool_calls
-                )
-            )
-            round_owner = DurableToolRound.for_continuation(
-                session=session,
-                tool_round_identity=tool_round_identity,
+            paused_round = await PausedToolRound.prepare(
                 session_store=self._session_store,
                 event_writer=self._event_writer,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                environment_name=environment_name,
-                tool_calls=round_tool_calls,
-                task_id=pending.task_id,
-                execution_profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
-                redactor=base_round_redactor,
-                tool_exposure=pending.tool_exposure,
-                publication_governor=self._tool_invocation.terminals.governor,
+                invocation=self._tool_invocation,
                 clock=self._clock,
-                emit_result=self._tool_invocation.terminals.publish_result,
-                emit_terminal=self._tool_invocation.terminals.emit_staged,
-                defer_terminals=defer_round_terminals,
-                terminal_payload_limits=(
-                    await _tool_terminal_payload_limits(
-                        registered_agent,
-                        round_tool_calls,
-                        publication_governor=self._tool_invocation.terminals.governor,
-                        runtime_hooks=(
-                            self._tool_invocation.hooks.registrations
-                            if invocation_context is None
-                            else invocation_context.runtime_hooks
-                        ),
-                    )
-                    if defer_round_terminals
-                    else None
-                ),
-                pause_authority={"input_id": pending.input_id},
-                idempotency_options={"pause_id": pending.input_id},
+                session=session,
+                agent=registered_agent,
+                environment=registered_environment,
+                environment_name=environment_name,
+                profile=execution_profile_snapshot.profile,
+                invocation_context=invocation_context,
+                identity=tool_round_identity,
+                task_id=pending.task_id,
+                tool_calls=round_tool_calls,
+                tool_exposure=pending.tool_exposure,
+                redactor=base_round_redactor,
+                secret_resolution_scope=pause_secret_resolution_scope,
+                secret_redactor=self._secret_redactor,
+                pause=UserInputRoundPause(pending.input_id),
             )
+            round_owner = paused_round.round
             await round_owner.admit()
 
             # Reuse any outcomes already recorded for this round — e.g. a prior resume attempt
@@ -9146,7 +9119,7 @@ class RecoveryCoordinator:
                     async for (
                         event,
                         outcome,
-                    ) in self._tool_invocation.terminals.publish_result(
+                    ) in paused_round.publish_result(
                         event=Event(
                             type=EventType.TOOL_CALL_COMPLETED,
                             session_id=session.id,
@@ -9162,32 +9135,8 @@ class RecoveryCoordinator:
                                 "result": result.model_dump(),
                             },
                         ),
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
                         tool_call=tool_call,
                         result=result,
-                        task_id=pending.task_id,
-                        execution_profile=execution_profile_snapshot.profile,
-                        invocation_context=invocation_context,
-                        redactor=(
-                            None
-                            if not round_owner.defers_terminals
-                            else round_owner.continuation_redactor
-                        ),
-                        output_redactor=(
-                            None
-                            if not round_owner.defers_terminals
-                            else round_owner.continuation_redactor
-                        ),
-                        deferred_terminal_stager=(
-                            None if not round_owner.defers_terminals else round_owner.stage_terminal
-                        ),
-                        publication_snapshot=invocation_secrets.InvocationPublicationSnapshot(
-                            redactor=base_round_redactor,
-                            unsafe_output=False,
-                            secret_scope_incomplete=False,
-                        ),
                     ):
                         yield event
                         if outcome is not None:
@@ -9228,7 +9177,7 @@ class RecoveryCoordinator:
                     async for (
                         event,
                         outcome,
-                    ) in self._tool_invocation.terminals.publish_result(
+                    ) in paused_round.publish_result(
                         event=Event(
                             type=EventType.TOOL_CALL_BLOCKED,
                             session_id=session.id,
@@ -9250,32 +9199,8 @@ class RecoveryCoordinator:
                                 "result": blocked_result.model_dump(),
                             },
                         ),
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
                         tool_call=tool_call,
                         result=blocked_result,
-                        task_id=pending.task_id,
-                        execution_profile=execution_profile_snapshot.profile,
-                        invocation_context=invocation_context,
-                        redactor=(
-                            None
-                            if not round_owner.defers_terminals
-                            else round_owner.continuation_redactor
-                        ),
-                        output_redactor=(
-                            None
-                            if not round_owner.defers_terminals
-                            else round_owner.continuation_redactor
-                        ),
-                        deferred_terminal_stager=(
-                            None if not round_owner.defers_terminals else round_owner.stage_terminal
-                        ),
-                        publication_snapshot=invocation_secrets.InvocationPublicationSnapshot(
-                            redactor=base_round_redactor,
-                            unsafe_output=False,
-                            secret_scope_incomplete=False,
-                        ),
                     ):
                         yield event
                         if outcome is not None:
@@ -9291,27 +9216,9 @@ class RecoveryCoordinator:
                     async for (
                         event,
                         outcome,
-                    ) in self._emit_non_authoritative_policy_call(
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        environment_name=environment_name,
+                    ) in paused_round.reject_policy(
                         tool_call=tool_call,
                         policy_evidence=policy_evidence,
-                        tool_exposure=pending.tool_exposure,
-                        tool_round_identity=tool_round_identity,
-                        task_id=pending.task_id,
-                        execution_profile=execution_profile_snapshot.profile,
-                        invocation_context=invocation_context,
-                        input_id=pending.input_id,
-                        deferred_terminal_stager=(
-                            None if not round_owner.defers_terminals else round_owner.stage_terminal
-                        ),
-                        publication_snapshot=invocation_secrets.InvocationPublicationSnapshot(
-                            redactor=base_round_redactor,
-                            unsafe_output=False,
-                            secret_scope_incomplete=False,
-                        ),
                     ):
                         yield event
                         if outcome is not None:
@@ -9323,46 +9230,18 @@ class RecoveryCoordinator:
                         "Pending user-input sibling has no executable policy authority."
                     )
 
-                async for event, outcome in round_owner.timed_continuation_dispatch(
-                    self._tool_invocation.execute(
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        tool_call=tool_call,
-                        request_metadata=response.metadata,
-                        budget_limits=pending.budget_limits or (),
-                        task_id=pending.task_id,
-                        auxiliary_invocation_policy=AuxiliaryInvocationPolicy(
-                            limits=effective_limits,
-                            retry_policy=effective_retry_policy,
-                            accounting=continued_run_limit_accounting,
-                        ),
-                        execution_profile=execution_profile_snapshot.profile,
-                        invocation_context=invocation_context,
-                        check_policy=False,
-                        policy_result=policy_result,
-                        policy_output_secret_resolution_scope=pause_secret_resolution_scope,
-                        input_id=pending.input_id,
-                        tool_round_identity=tool_round_identity,
-                        model_step=pending.model_step,
-                        taint_labels=call_taint_labels,
-                        publish_arguments_as_unavailable=publish_arguments_as_unavailable,
-                        deferred_terminal_stager=(
-                            None if not round_owner.defers_terminals else round_owner.stage_terminal
-                        ),
-                        deferred_terminal_capture_recorder=(
-                            None
-                            if not round_owner.defers_terminals
-                            else round_owner.record_workspace_capture
-                        ),
-                        resolved_redactor_observer=(
-                            None
-                            if not round_owner.defers_terminals
-                            else round_owner.record_redactor
-                        ),
-                        publication_snapshot_observer=round_owner.record_publication_snapshot,
-                        rejoin_targeted_invocation=True,
-                    )
+                async for event, outcome in paused_round.execute(
+                    tool_call=tool_call,
+                    request_metadata=response.metadata,
+                    budget_limits=pending.budget_limits or (),
+                    auxiliary_invocation_policy=AuxiliaryInvocationPolicy(
+                        limits=effective_limits,
+                        retry_policy=effective_retry_policy,
+                        accounting=continued_run_limit_accounting,
+                    ),
+                    policy_result=policy_result,
+                    model_step=pending.model_step,
+                    taint_labels=call_taint_labels,
                 ):
                     yield event
                     if outcome is not None:
@@ -9740,153 +9619,6 @@ class RecoveryCoordinator:
             if round_owner is not None:
                 round_owner.finish_dispatch()
                 round_owner.finish_continuation_timing()
-
-    async def _emit_non_authoritative_policy_call(
-        self,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        environment_name: str | None,
-        tool_call: runtime_records.ToolCallRequest,
-        policy_evidence: ToolPolicyEvidence,
-        tool_exposure: ResolvedToolExposureAuthority | None,
-        tool_round_identity: ToolRoundIdentity,
-        task_id: str | None,
-        execution_profile: ExecutionProfileIdentity,
-        invocation_context: InvocationContext | None = None,
-        approval_id: str | None = None,
-        input_id: str | None = None,
-        requested_decision: ToolApprovalDecision | None = None,
-        resolved_by_payload: dict[str, Any] | None = None,
-        resolution_reason: str | None = None,
-        resolution_metadata: dict[str, Any] | None = None,
-        deferred_terminal_stager: DeferredTerminalStager | None = None,
-        publication_snapshot: invocation_secrets.InvocationPublicationSnapshot | None = None,
-    ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
-        """Close a call that lacks positive policy authority without dispatch."""
-
-        if (approval_id is None) == (input_id is None):
-            raise TypeError("Exactly one approval or user-input identity is required.")
-        if policy_evidence is ToolPolicyEvidence.UNEXPOSED:
-            async for event, outcome in self._tool_invocation.execute(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                tool_call=tool_call,
-                request_metadata={},
-                budget_limits=(),
-                auxiliary_invocation_policy=None,
-                task_id=task_id,
-                execution_profile=execution_profile,
-                invocation_context=invocation_context,
-                check_policy=False,
-                emit_started=False,
-                policy_evidence=policy_evidence,
-                tool_exposure=tool_exposure,
-                approval_id=approval_id,
-                input_id=input_id,
-                tool_round_identity=tool_round_identity,
-                deferred_terminal_stager=deferred_terminal_stager,
-            ):
-                yield event, outcome
-            return
-        evidence_payload: dict[str, Any]
-        structured: dict[str, Any]
-        if policy_evidence is ToolPolicyEvidence.AMBIGUOUS:
-            event_type = EventType.TOOL_CALL_BLOCKED
-            reason = (
-                "Tool policy evaluation did not produce a durable decision; "
-                "the call was not executed."
-            )
-            evidence_payload = {
-                "decision": "ambiguous",
-                "blocked_by": "policy_evaluation_ambiguous",
-                "reason": reason,
-            }
-            structured = {
-                "decision": "ambiguous",
-                "blocked_by": "policy_evaluation_ambiguous",
-            }
-        elif policy_evidence is ToolPolicyEvidence.UNREGISTERED:
-            event_type = EventType.TOOL_CALL_FAILED
-            reason = f"Tool was not registered when the policy plan was recorded: {tool_call.name}"
-            evidence_payload = {
-                "registration_state": "unregistered_at_policy_plan",
-            }
-            structured = {
-                "registration_state": "unregistered_at_policy_plan",
-            }
-        else:
-            raise ValueError(
-                "Non-authoritative closure requires ambiguous, unregistered, or unexposed evidence."
-            )
-
-        pause_payload: dict[str, Any]
-        idempotency_options: dict[str, str]
-        if approval_id is not None:
-            pause_payload = {"approval_id": approval_id}
-            idempotency_options = {"approval_id": approval_id}
-            if requested_decision is not None:
-                evidence_payload["requested_decision"] = requested_decision.value
-                evidence_payload["resolution_reason"] = resolution_reason
-                evidence_payload.update(
-                    approval_support.bounded_resolution_metadata_payload(
-                        {} if resolution_metadata is None else resolution_metadata,
-                        redactor=self._secret_redactor,
-                    )
-                )
-            evidence_payload["resolved_by"] = resolved_by_payload
-        else:
-            assert input_id is not None
-            pause_payload = {"input_id": input_id}
-            idempotency_options = {"pause_id": input_id}
-
-        result = ToolResult(
-            content=reason,
-            structured={
-                **tool_round_identity.payload(),
-                **pause_payload,
-                "tool_call_id": tool_call.id,
-                "tool_name": tool_call.name,
-                **structured,
-            },
-            is_error=True,
-        )
-        idempotency_key = tool_execution.tool_idempotency_key(
-            session_id=session.id,
-            tool_round_id=tool_round_identity.tool_round_id,
-            tool_call_id=tool_call.id,
-            **idempotency_options,
-        )
-        async for event, outcome in self._tool_invocation.terminals.publish_result(
-            event=Event(
-                type=event_type,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
-                tool_name=tool_call.name,
-                payload={
-                    **tool_round_identity.payload(),
-                    **pause_payload,
-                    "tool_call_id": tool_call.id,
-                    "idempotency_key": idempotency_key,
-                    **evidence_payload,
-                    "result": result.model_dump(),
-                },
-            ),
-            session=session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            tool_call=tool_call,
-            result=result,
-            task_id=task_id,
-            execution_profile=execution_profile,
-            invocation_context=invocation_context,
-            deferred_terminal_stager=deferred_terminal_stager,
-            publication_snapshot=publication_snapshot,
-        ):
-            yield event, outcome
 
     async def continue_tool_approval_resolution(
         self,
@@ -10371,7 +10103,6 @@ class RecoveryCoordinator:
                     return
 
             pending_round_tool_calls = approval_support.pending_round_tool_calls(pending_approval)
-            publish_arguments_as_unavailable = len(pending_round_tool_calls) > 1
             round_tool_calls = [
                 approval_support.tool_call_request_from_pending(pending_tool_call)
                 for pending_tool_call in pending_round_tool_calls
@@ -10388,52 +10119,27 @@ class RecoveryCoordinator:
                 pending_approval.secret_resolution_scope,
                 registered_environment,
             )
-            defer_round_terminals = (
-                len(round_tool_calls) > 1 and pause_secret_resolution_scope != "static"
-            ) or any(
-                registered is not None
-                and (registered.workspace_mutation or registered.effect is ToolEffect.EXTERNAL)
-                for registered in (
-                    registered_agent.executable_tool(tool_call.name)
-                    for tool_call in round_tool_calls
-                )
-            )
-            round_owner = DurableToolRound.for_continuation(
-                session=session,
-                tool_round_identity=tool_round_identity,
+            paused_round = await PausedToolRound.prepare(
                 session_store=self._session_store,
                 event_writer=self._event_writer,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                environment_name=environment_name,
-                tool_calls=round_tool_calls,
-                task_id=pending_approval.task_id,
-                execution_profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
-                redactor=base_round_redactor,
-                tool_exposure=publication_round.tool_exposure,
-                publication_governor=self._tool_invocation.terminals.governor,
+                invocation=self._tool_invocation,
                 clock=self._clock,
-                emit_result=self._tool_invocation.terminals.publish_result,
-                emit_terminal=self._tool_invocation.terminals.emit_staged,
-                defer_terminals=defer_round_terminals,
-                terminal_payload_limits=(
-                    await _tool_terminal_payload_limits(
-                        registered_agent,
-                        round_tool_calls,
-                        publication_governor=self._tool_invocation.terminals.governor,
-                        runtime_hooks=(
-                            self._tool_invocation.hooks.registrations
-                            if invocation_context is None
-                            else invocation_context.runtime_hooks
-                        ),
-                    )
-                    if defer_round_terminals
-                    else None
-                ),
-                pause_authority={"approval_id": pending_approval.approval_id},
-                idempotency_options={"approval_id": pending_approval.approval_id},
+                session=session,
+                agent=registered_agent,
+                environment=registered_environment,
+                environment_name=environment_name,
+                profile=execution_profile_snapshot.profile,
+                invocation_context=invocation_context,
+                identity=tool_round_identity,
+                task_id=pending_approval.task_id,
+                tool_calls=round_tool_calls,
+                tool_exposure=publication_round.tool_exposure,
+                redactor=base_round_redactor,
+                secret_resolution_scope=pause_secret_resolution_scope,
+                secret_redactor=self._secret_redactor,
+                pause=ApprovalRoundPause(pending_approval.approval_id),
             )
+            round_owner = paused_round.round
             await round_owner.admit()
 
             restarted_staged_ids = await round_owner.fence_restarted_continuation(
@@ -10471,26 +10177,13 @@ class RecoveryCoordinator:
 
                 if policy_evidence is ToolPolicyEvidence.UNEXPOSED:
                     await round_owner.record_continuation_scope(tool_call.id)
-                    async for event, outcome in self._emit_non_authoritative_policy_call(
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        environment_name=environment_name,
+                    async for event, outcome in paused_round.reject_policy(
                         tool_call=tool_call,
                         policy_evidence=policy_evidence,
-                        tool_exposure=publication_round.tool_exposure,
-                        tool_round_identity=tool_round_identity,
-                        task_id=pending_approval.task_id,
-                        execution_profile=execution_profile_snapshot.profile,
-                        invocation_context=invocation_context,
-                        approval_id=pending_approval.approval_id,
                         requested_decision=request.decision,
                         resolved_by_payload=resolved_by_payload,
                         resolution_reason=request.reason,
                         resolution_metadata=request.metadata,
-                        deferred_terminal_stager=(
-                            None if not round_owner.defers_terminals else round_owner.stage_terminal
-                        ),
                     ):
                         yield event
                         if outcome is not None:
@@ -10524,7 +10217,7 @@ class RecoveryCoordinator:
                     async for (
                         event,
                         outcome,
-                    ) in self._tool_invocation.terminals.publish_result(
+                    ) in paused_round.publish_result(
                         event=Event(
                             type=EventType.TOOL_CALL_BLOCKED,
                             session_id=session.id,
@@ -10546,32 +10239,8 @@ class RecoveryCoordinator:
                                 "result": result.model_dump(),
                             },
                         ),
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
                         tool_call=tool_call,
                         result=result,
-                        task_id=pending_approval.task_id,
-                        execution_profile=execution_profile_snapshot.profile,
-                        invocation_context=invocation_context,
-                        redactor=(
-                            None
-                            if not round_owner.defers_terminals
-                            else round_owner.continuation_redactor
-                        ),
-                        output_redactor=(
-                            None
-                            if not round_owner.defers_terminals
-                            else round_owner.continuation_redactor
-                        ),
-                        deferred_terminal_stager=(
-                            None if not round_owner.defers_terminals else round_owner.stage_terminal
-                        ),
-                        publication_snapshot=invocation_secrets.InvocationPublicationSnapshot(
-                            redactor=base_round_redactor,
-                            unsafe_output=False,
-                            secret_scope_incomplete=False,
-                        ),
                     ):
                         yield event
                         if outcome is not None:
@@ -10622,7 +10291,7 @@ class RecoveryCoordinator:
                     async for (
                         event,
                         outcome,
-                    ) in self._tool_invocation.terminals.publish_result(
+                    ) in paused_round.publish_result(
                         event=Event(
                             type=EventType.TOOL_CALL_APPROVAL_DENIED,
                             session_id=session.id,
@@ -10645,32 +10314,8 @@ class RecoveryCoordinator:
                                 "result": result.model_dump(),
                             },
                         ),
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
                         tool_call=tool_call,
                         result=result,
-                        task_id=pending_approval.task_id,
-                        execution_profile=execution_profile_snapshot.profile,
-                        invocation_context=invocation_context,
-                        redactor=(
-                            None
-                            if not round_owner.defers_terminals
-                            else round_owner.continuation_redactor
-                        ),
-                        output_redactor=(
-                            None
-                            if not round_owner.defers_terminals
-                            else round_owner.continuation_redactor
-                        ),
-                        deferred_terminal_stager=(
-                            None if not round_owner.defers_terminals else round_owner.stage_terminal
-                        ),
-                        publication_snapshot=invocation_secrets.InvocationPublicationSnapshot(
-                            redactor=base_round_redactor,
-                            unsafe_output=False,
-                            secret_scope_incomplete=False,
-                        ),
                     ):
                         yield event
                         if outcome is not None:
@@ -10685,31 +10330,13 @@ class RecoveryCoordinator:
                     async for (
                         event,
                         outcome,
-                    ) in self._emit_non_authoritative_policy_call(
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        environment_name=environment_name,
+                    ) in paused_round.reject_policy(
                         tool_call=tool_call,
                         policy_evidence=policy_evidence,
-                        tool_exposure=publication_round.tool_exposure,
-                        tool_round_identity=tool_round_identity,
-                        task_id=pending_approval.task_id,
-                        execution_profile=execution_profile_snapshot.profile,
-                        invocation_context=invocation_context,
-                        approval_id=pending_approval.approval_id,
                         requested_decision=request.decision,
                         resolved_by_payload=resolved_by_payload,
                         resolution_reason=request.reason,
                         resolution_metadata=request.metadata,
-                        deferred_terminal_stager=(
-                            None if not round_owner.defers_terminals else round_owner.stage_terminal
-                        ),
-                        publication_snapshot=invocation_secrets.InvocationPublicationSnapshot(
-                            redactor=base_round_redactor,
-                            unsafe_output=False,
-                            secret_scope_incomplete=False,
-                        ),
                     ):
                         yield event
                         if outcome is not None:
@@ -10719,46 +10346,17 @@ class RecoveryCoordinator:
                 if policy_evidence is not ToolPolicyEvidence.AUTHORITATIVE:
                     raise RuntimeError("Pending tool call has no executable policy authority.")
 
-                async for event, outcome in round_owner.timed_continuation_dispatch(
-                    self._tool_invocation.execute(
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        tool_call=tool_call,
-                        request_metadata=request.metadata,
-                        budget_limits=pending_approval.budget_limits or (),
-                        task_id=pending_approval.task_id,
-                        auxiliary_invocation_policy=AuxiliaryInvocationPolicy(
-                            limits=effective_limits,
-                            retry_policy=effective_retry_policy,
-                            accounting=continued_run_limit_accounting,
-                        ),
-                        execution_profile=execution_profile_snapshot.profile,
-                        invocation_context=invocation_context,
-                        check_policy=False,
-                        emit_started=True,
-                        policy_output_secret_resolution_scope=pause_secret_resolution_scope,
-                        approval_id=pending_approval.approval_id,
-                        tool_round_identity=tool_round_identity,
-                        model_step=publication_round.model_step,
-                        taint_labels=call_taint_labels,
-                        publish_arguments_as_unavailable=publish_arguments_as_unavailable,
-                        deferred_terminal_stager=(
-                            None if not round_owner.defers_terminals else round_owner.stage_terminal
-                        ),
-                        deferred_terminal_capture_recorder=(
-                            None
-                            if not round_owner.defers_terminals
-                            else round_owner.record_workspace_capture
-                        ),
-                        resolved_redactor_observer=(
-                            None
-                            if not round_owner.defers_terminals
-                            else round_owner.record_redactor
-                        ),
-                        publication_snapshot_observer=round_owner.record_publication_snapshot,
-                        rejoin_targeted_invocation=True,
-                    )
+                async for event, outcome in paused_round.execute(
+                    tool_call=tool_call,
+                    request_metadata=request.metadata,
+                    budget_limits=pending_approval.budget_limits or (),
+                    auxiliary_invocation_policy=AuxiliaryInvocationPolicy(
+                        limits=effective_limits,
+                        retry_policy=effective_retry_policy,
+                        accounting=continued_run_limit_accounting,
+                    ),
+                    model_step=publication_round.model_step,
+                    taint_labels=call_taint_labels,
                 ):
                     yield event
                     if outcome is not None:
