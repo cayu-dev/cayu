@@ -5633,6 +5633,57 @@ class RecoveryCoordinator:
         if not await interaction_finished():
             self._foreground_gate_policy_owner.retain(record, request.loop_policies)
 
+    async def _prepare_gate_invocation(
+        self,
+        *,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        semantics: _RecoveryInvocationSemantics,
+        structured_output: StructuredOutputSpec | None,
+        request_loop_policies: tuple[LoopPolicy, ...],
+        secret_resolution_scope: invocation_secrets.SecretResolutionScope,
+    ) -> tuple[ActiveInvocationExecutionProfile, InvocationContext]:
+        """Authenticate frozen runtime collaborators before a typed gate claim.
+
+        Keep the validated checkpoint profile separate from the context's rebound
+        profile. Callers retain their exact claim, receipt and resolution checks.
+        """
+        registered_agent = self._resolve_registered_agent(session.agent_name)
+        registered_provider = self._resolve_registered_provider(session.provider_name)
+        budget_policy_snapshot = copy_budget_policy(self._resolve_budget_policy())
+        execution_profile_snapshot = await self._validate_execution_profile_continuation(
+            session,
+            checkpoint,
+            registered_agent,
+            registered_provider,
+            request_loop_policies,
+            budget_policy=budget_policy_snapshot,
+            request_budget_limits=semantics.budget_limits,
+            structured_output=semantics.structured_output,
+            thinking=semantics.thinking,
+            max_steps=semantics.max_steps,
+            limits=semantics.limits,
+            retry_policy=semantics.retry_policy,
+            invocation_semantics_available=True,
+        )
+        _require_native_structured_output_support(
+            structured_output, registered_provider=registered_provider
+        )
+        registered_environment = self._resolve_registered_environment(session.environment_name)
+        invocation_secrets.require_continuation_secret_resolution_compatibility(
+            secret_resolution_scope, registered_environment
+        )
+        invocation_context = self._reconstruct_invocation_context(
+            session=session,
+            execution_profile_snapshot=execution_profile_snapshot,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            registered_environment=registered_environment,
+            budget_policy=budget_policy_snapshot,
+            request_loop_policies=request_loop_policies,
+        )
+        return execution_profile_snapshot, invocation_context
+
     async def resolve_user_input(
         self,
         response: UserInputResponse | UserInputRecoveryRequest,
@@ -5810,47 +5861,20 @@ class RecoveryCoordinator:
             field_name="UserInputResponse.structured_output",
         )
 
-        registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
-        registered_provider = self._resolve_registered_provider(loaded_session.provider_name)
-        budget_policy_snapshot = copy_budget_policy(self._resolve_budget_policy())
-        execution_profile_snapshot = await self._validate_execution_profile_continuation(
-            loaded_session,
-            checkpoint,
-            registered_agent,
-            registered_provider,
-            response.loop_policies,
-            budget_policy=budget_policy_snapshot,
-            request_budget_limits=invocation_semantics.budget_limits,
-            structured_output=invocation_semantics.structured_output,
-            thinking=invocation_semantics.thinking,
-            max_steps=invocation_semantics.max_steps,
-            limits=invocation_semantics.limits,
-            retry_policy=invocation_semantics.retry_policy,
-            invocation_semantics_available=True,
-        )
-        _require_native_structured_output_support(
-            effective_structured_output, registered_provider=registered_provider
-        )
-        registered_environment = self._resolve_registered_environment(
-            loaded_session.environment_name
-        )
-        invocation_secrets.require_continuation_secret_resolution_compatibility(
-            (
-                "unknown"
-                if pending.assistant_publication is None
-                else pending.assistant_publication.secret_resolution_scope
-            ),
-            registered_environment,
-        )
-        invocation_context = self._reconstruct_invocation_context(
+        execution_profile_snapshot, invocation_context = await self._prepare_gate_invocation(
             session=loaded_session,
-            execution_profile_snapshot=execution_profile_snapshot,
-            registered_agent=registered_agent,
-            registered_provider=registered_provider,
-            registered_environment=registered_environment,
-            budget_policy=budget_policy_snapshot,
+            checkpoint=checkpoint,
+            semantics=invocation_semantics,
+            structured_output=effective_structured_output,
             request_loop_policies=response.loop_policies,
+            secret_resolution_scope="unknown"
+            if pending.assistant_publication is None
+            else pending.assistant_publication.secret_resolution_scope,
         )
+        registered_agent = invocation_context.registered_agent
+        registered_provider = invocation_context.registered_provider
+        registered_environment = invocation_context.registered_environment
+        budget_policy_snapshot = invocation_context.budget_policy
         claimed_intent: UserInputResolutionIntent | None = None
 
         def claim_exact_user_input(
@@ -6117,47 +6141,20 @@ class RecoveryCoordinator:
                 model_attempt_id=pending.model_attempt_id,
             ),
         )
-        registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
-        registered_provider = self._resolve_registered_provider(loaded_session.provider_name)
-        budget_policy_snapshot = copy_budget_policy(self._resolve_budget_policy())
-        execution_profile_snapshot = await self._validate_execution_profile_continuation(
-            loaded_session,
-            checkpoint,
-            registered_agent,
-            registered_provider,
-            request.loop_policies,
-            budget_policy=budget_policy_snapshot,
-            request_budget_limits=invocation_semantics.budget_limits,
-            structured_output=invocation_semantics.structured_output,
-            thinking=invocation_semantics.thinking,
-            max_steps=invocation_semantics.max_steps,
-            limits=invocation_semantics.limits,
-            retry_policy=invocation_semantics.retry_policy,
-            invocation_semantics_available=True,
-        )
-        _require_native_structured_output_support(
-            effective_structured_output, registered_provider=registered_provider
-        )
-        registered_environment = self._resolve_registered_environment(
-            loaded_session.environment_name
-        )
-        invocation_secrets.require_continuation_secret_resolution_compatibility(
-            (
-                "unknown"
-                if pending.assistant_publication is None
-                else pending.assistant_publication.secret_resolution_scope
-            ),
-            registered_environment,
-        )
-        invocation_context = self._reconstruct_invocation_context(
+        execution_profile_snapshot, invocation_context = await self._prepare_gate_invocation(
             session=loaded_session,
-            execution_profile_snapshot=execution_profile_snapshot,
-            registered_agent=registered_agent,
-            registered_provider=registered_provider,
-            registered_environment=registered_environment,
-            budget_policy=budget_policy_snapshot,
+            checkpoint=checkpoint,
+            semantics=invocation_semantics,
+            structured_output=effective_structured_output,
             request_loop_policies=request.loop_policies,
+            secret_resolution_scope="unknown"
+            if pending.assistant_publication is None
+            else pending.assistant_publication.secret_resolution_scope,
         )
+        registered_agent = invocation_context.registered_agent
+        registered_provider = invocation_context.registered_provider
+        registered_environment = invocation_context.registered_environment
+        budget_policy_snapshot = invocation_context.budget_policy
         claimed_intent: UserInputResolutionIntent | None = None
 
         def claim_exact_user_input_recovery(
@@ -6500,43 +6497,18 @@ class RecoveryCoordinator:
             redactor=self._secret_redactor,
             field_name="ToolApprovalRequest.structured_output",
         )
-        registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
-        registered_provider = self._resolve_registered_provider(loaded_session.provider_name)
-        budget_policy_snapshot = copy_budget_policy(self._resolve_budget_policy())
-        execution_profile_snapshot = await self._validate_execution_profile_continuation(
-            loaded_session,
-            checkpoint,
-            registered_agent,
-            registered_provider,
-            request.loop_policies,
-            budget_policy=budget_policy_snapshot,
-            request_budget_limits=invocation_semantics.budget_limits,
-            structured_output=invocation_semantics.structured_output,
-            thinking=invocation_semantics.thinking,
-            max_steps=invocation_semantics.max_steps,
-            limits=invocation_semantics.limits,
-            retry_policy=invocation_semantics.retry_policy,
-            invocation_semantics_available=True,
-        )
-        _require_native_structured_output_support(
-            effective_structured_output, registered_provider=registered_provider
-        )
-        registered_environment = self._resolve_registered_environment(
-            loaded_session.environment_name
-        )
-        invocation_secrets.require_continuation_secret_resolution_compatibility(
-            candidate_approval.secret_resolution_scope,
-            registered_environment,
-        )
-        invocation_context = self._reconstruct_invocation_context(
+        execution_profile_snapshot, invocation_context = await self._prepare_gate_invocation(
             session=loaded_session,
-            execution_profile_snapshot=execution_profile_snapshot,
-            registered_agent=registered_agent,
-            registered_provider=registered_provider,
-            registered_environment=registered_environment,
-            budget_policy=budget_policy_snapshot,
+            checkpoint=checkpoint,
+            semantics=invocation_semantics,
+            structured_output=effective_structured_output,
             request_loop_policies=request.loop_policies,
+            secret_resolution_scope=candidate_approval.secret_resolution_scope,
         )
+        registered_agent = invocation_context.registered_agent
+        registered_provider = invocation_context.registered_provider
+        registered_environment = invocation_context.registered_environment
+        budget_policy_snapshot = invocation_context.budget_policy
         pending_approval: PendingToolApproval | None = None
         pending_round: pending_rounds.PendingToolRound | None = None
         claimed_intent: pending_approval_reader.ApprovalResolutionIntent | None = None
@@ -7858,43 +7830,18 @@ class RecoveryCoordinator:
             approval=candidate_approval,
             tool_call_id=request.tool_call_id,
         )
-        registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
-        registered_provider = self._resolve_registered_provider(loaded_session.provider_name)
-        budget_policy_snapshot = copy_budget_policy(self._resolve_budget_policy())
-        execution_profile_snapshot = await self._validate_execution_profile_continuation(
-            loaded_session,
-            checkpoint,
-            registered_agent,
-            registered_provider,
-            request_loop_policies,
-            budget_policy=budget_policy_snapshot,
-            request_budget_limits=invocation_semantics.budget_limits,
-            structured_output=invocation_semantics.structured_output,
-            thinking=invocation_semantics.thinking,
-            max_steps=invocation_semantics.max_steps,
-            limits=invocation_semantics.limits,
-            retry_policy=invocation_semantics.retry_policy,
-            invocation_semantics_available=True,
-        )
-        _require_native_structured_output_support(
-            effective_structured_output, registered_provider=registered_provider
-        )
-        registered_environment = self._resolve_registered_environment(
-            loaded_session.environment_name
-        )
-        invocation_secrets.require_continuation_secret_resolution_compatibility(
-            candidate_approval.secret_resolution_scope,
-            registered_environment,
-        )
-        invocation_context = self._reconstruct_invocation_context(
+        execution_profile_snapshot, invocation_context = await self._prepare_gate_invocation(
             session=loaded_session,
-            execution_profile_snapshot=execution_profile_snapshot,
-            registered_agent=registered_agent,
-            registered_provider=registered_provider,
-            registered_environment=registered_environment,
-            budget_policy=budget_policy_snapshot,
+            checkpoint=checkpoint,
+            semantics=invocation_semantics,
+            structured_output=effective_structured_output,
             request_loop_policies=request_loop_policies,
+            secret_resolution_scope=candidate_approval.secret_resolution_scope,
         )
+        registered_agent = invocation_context.registered_agent
+        registered_provider = invocation_context.registered_provider
+        registered_environment = invocation_context.registered_environment
+        budget_policy_snapshot = invocation_context.budget_policy
         pending_approval: PendingToolApproval | None = None
         pending_round: pending_rounds.PendingToolRound | None = None
         claimed_resolution_intent: pending_approval_reader.ApprovalResolutionIntent | None = None

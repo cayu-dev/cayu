@@ -457,6 +457,12 @@ abandonment cleanup use that current state. Typed callers retain their error
 settlement rules. After exact pause closure, approval and input share construction
 of the engine handoff while keeping ownership of the returned event stream.
 
+Approval/input resolution and manual-recovery admission also share frozen
+profile validation and context reconstruction before their typed claim
+transactions. Preparation checks native structured output and secret-scope
+compatibility in the same order, retaining the checkpoint profile separately
+from the authenticated context's rebound profile.
+
 `ManualRecoveryPublication` retains the preassigned result event and acknowledged
 append state for manual approval/input recovery. It shares persistence readback
 and diagnostic projection after an append or delivery failure. The shielded
