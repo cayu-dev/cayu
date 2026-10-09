@@ -40,6 +40,7 @@ from tests.core.verified_worker_fixtures import (
     verified_worker_store_factory as verified_worker_store_factory,
 )
 
+import cayu
 from cayu._exception_groups import iter_exception_tree
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
@@ -110,6 +111,23 @@ from cayu.vaults.static import StaticVault
 # verification and settlement. This is a harness deadlock guard, not a runtime
 # deadline contract; ten seconds cancelled healthy progress on loaded CI hosts.
 _RECOVERY_COMPLETION_TIMEOUT_SECONDS = 60
+
+_EXPECTED_RUNTIME_ROOT = os.environ.get("CAYU_TEST_VERIFIED_WORKER_RUNTIME_ROOT")
+if _EXPECTED_RUNTIME_ROOT is not None:
+    assert Path(cayu.__file__).resolve().parent.parent == Path(_EXPECTED_RUNTIME_ROOT)
+
+
+def _worker_environment() -> dict[str, str]:
+    """Keep crash workers on the parent's source tree or installed package."""
+    runtime_root = str(Path(cayu.__file__).resolve().parent.parent)
+    inherited_pythonpath = os.environ.get("PYTHONPATH")
+    return {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join(
+            (runtime_root, *((inherited_pythonpath,) if inherited_pythonpath else ()))
+        ),
+        "CAYU_TEST_VERIFIED_WORKER_RUNTIME_ROOT": runtime_root,
+    }
 
 
 class _ContinueOnceVerifier(RecordingVerifier):
@@ -1131,7 +1149,7 @@ def test_worker_recovers_tool_publication_after_process_exit(
     crash_staged_terminal = publication_boundary == "staged"
     repository = Path(__file__).resolve().parents[2]
     factory = store_factory or VerifiedWorkerStoreFactory("sqlite", tmp_path)
-    child_environment = {**os.environ, "PYTHONPATH": str(repository / "src")}
+    child_environment = _worker_environment()
     child_environment.pop("CAYU_TEST_VERIFIED_WORKER_DSN", None)
     if factory.postgres_dsn is not None:
         child_environment["CAYU_TEST_VERIFIED_WORKER_DSN"] = factory.postgres_dsn
@@ -1662,7 +1680,7 @@ def test_worker_recovers_recorded_background_operation_after_process_exit(
 
     repository = Path(__file__).resolve().parents[2]
     factory = verified_worker_store_factory
-    child_environment = {**os.environ, "PYTHONPATH": str(repository / "src")}
+    child_environment = _worker_environment()
     child_environment.pop("CAYU_TEST_VERIFIED_WORKER_DSN", None)
     if factory.postgres_dsn is not None:
         child_environment["CAYU_TEST_VERIFIED_WORKER_DSN"] = factory.postgres_dsn
@@ -2149,7 +2167,7 @@ def test_worker_recovers_terminal_model_stage_after_process_exit(
 ):
     repository = Path(__file__).resolve().parents[2]
     factory = store_factory or VerifiedWorkerStoreFactory("sqlite", tmp_path)
-    child_environment = {**os.environ, "PYTHONPATH": str(repository / "src")}
+    child_environment = _worker_environment()
     child_environment.pop("CAYU_TEST_VERIFIED_WORKER_DSN", None)
     if factory.postgres_dsn is not None:
         child_environment["CAYU_TEST_VERIFIED_WORKER_DSN"] = factory.postgres_dsn
@@ -2515,7 +2533,7 @@ def test_worker_model_replay_runs_registered_stop_policy(tmp_path, action, after
             str(after_promotion),
         ],
         cwd=repository,
-        env={**os.environ, "PYTHONPATH": str(repository / "src")},
+        env=_worker_environment(),
         capture_output=True,
         text=True,
         timeout=30,
@@ -2635,7 +2653,7 @@ def test_worker_keeps_unknown_model_dispatch_fenced_after_process_exit(
 ):
     repository = Path(__file__).resolve().parents[2]
     factory = store_factory or VerifiedWorkerStoreFactory("sqlite", tmp_path)
-    child_environment = {**os.environ, "PYTHONPATH": str(repository / "src")}
+    child_environment = _worker_environment()
     child_environment.pop("CAYU_TEST_VERIFIED_WORKER_DSN", None)
     if factory.postgres_dsn is not None:
         child_environment["CAYU_TEST_VERIFIED_WORKER_DSN"] = factory.postgres_dsn
