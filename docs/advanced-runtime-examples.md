@@ -63,7 +63,9 @@ The stable claim is not that every model writes the same report. The result must
 prove that:
 
 - all sessions share the intended causal budget and lineage;
-- compaction state is persisted before the candidate forks;
+- compaction state is persisted before the candidate forks, and the checkpoint
+  summary actually represents the prepared source messages (a persisted
+  zero-coverage checkpoint does not count);
 - compacted and uncompacted branches use the same source and prompts;
 - provider-reported input usage is measured separately for first attempts and
   total attempts, including retries;

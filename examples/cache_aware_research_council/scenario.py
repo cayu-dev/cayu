@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from examples._advanced_support import (
     ComparisonSessionEvidence,
@@ -34,6 +34,7 @@ from cayu import (
     Message,
     PairedQualityEvidence,
     PriceBook,
+    PromptCacheCompactor,
     QualityEvidenceReference,
     QualityEvidenceStatus,
     ResolutionActor,
@@ -41,11 +42,19 @@ from cayu import (
     ResumeRequest,
     RunRequest,
     SessionStore,
-    TranscriptDigestCompactor,
 )
 from cayu.providers import ModelProvider
 
 _STRUCTURED_OUTPUT_TEXT_MAX_CHARS = 1024
+# The source compacts its two preparation turns at the cache-deadline turn,
+# before the first fork. Branches only activate that stored view: none of them
+# grows past this threshold before its single report, so the candidate measures
+# the source checkpoint, not a second per-branch compaction.
+_SOURCE_COMPACT_AFTER_MESSAGES = 4
+_BRANCH_COMPACT_AFTER_MESSAGES = 40
+SOURCE_PLANNING_PROMPT = (
+    "Name the three questions the research branches must answer, one short line each."
+)
 
 # The live provider needs room for ordinary report prose without avoidable
 # structured-output repair retries. Prompts and array bounds still keep the
@@ -157,7 +166,14 @@ async def run_scenario(
     model: str,
     mode: str,
     price_book: PriceBook | None = None,
+    require_compaction_cache_read: bool = False,
 ) -> ScenarioResult:
+    """Run the paired research council.
+
+    ``require_compaction_cache_read`` adds an assertion that the cache-aware
+    compaction read the warm provider prompt cache. Enable it only for providers
+    configured to cache the conversation prefix and report cache reads.
+    """
     prompts = {
         "source": SOURCE_CONTEXT,
         "primary-sources": "Prioritize primary technical evidence and quantify claims.",
@@ -183,6 +199,21 @@ async def run_scenario(
     )
     if not any(event.type == EventType.SESSION_COMPLETED for event in source_events):
         raise RuntimeError("Research source session did not complete.")
+    # A provider can cache a conversation prefix only up to the message before
+    # the newest one, so the first request cannot cache the shared source
+    # context. This second preparation turn leaves that context in a warm
+    # prompt cache, and the cache-aware compactor below extends this request.
+    planning_events = await collect_events(
+        app.resume(
+            ResumeRequest(
+                session_id=source_id,
+                messages=[Message.text("user", SOURCE_PLANNING_PROMPT)],
+                limits=advanced_run_limits(),
+            )
+        )
+    )
+    if not any(event.type == EventType.SESSION_COMPLETED for event in planning_events):
+        raise RuntimeError("Research source planning turn did not complete.")
 
     cache_decision = CacheWindowDecision(
         observed_at_s=970.0,
@@ -213,11 +244,21 @@ async def run_scenario(
     compaction_checkpoint = (checkpoint or {}).get("context_compaction")
     if len(compaction_completed) != 1 or not isinstance(compaction_checkpoint, dict):
         raise RuntimeError("Research source did not persist one compaction checkpoint.")
+    compaction_payload = compaction_completed[0].payload
+    compaction_cache_read_input_tokens = sum(
+        _cache_read_input_tokens(event.payload.get("usage"))
+        for event in compaction_events
+        if event.type == EventType.MODEL_COMPLETED
+        and event.payload.get("purpose") == "context_compaction"
+    )
     checkpoint_evidence = {
         "version": compaction_checkpoint.get("version"),
         "compacted_transcript_cursor": compaction_checkpoint.get("compacted_transcript_cursor"),
         "metadata": compaction_checkpoint.get("metadata"),
         "summary_chars": len(str(compaction_checkpoint.get("summary", ""))),
+        "coverage_mode": compaction_payload.get("coverage_mode"),
+        "represented_message_count": compaction_payload.get("represented_message_count"),
+        "cache_read_input_tokens": compaction_cache_read_input_tokens,
     }
 
     # Run the paired uncompacted branches from the exact same post-decision
@@ -381,6 +422,13 @@ async def run_scenario(
             cache_decision.compact_before_next_turn
             and compaction_checkpoint.get("compacted_transcript_cursor", 0) > 0
         ),
+        # A checkpoint can be persisted without representing any source, for
+        # example when a compactor cannot fit the oldest message. Require the
+        # source prefix the forks rely on to be represented by the summary.
+        "compaction_represented_source_context": (
+            compaction_payload.get("coverage_mode") == "full"
+            and compaction_payload.get("represented_message_count", 0) > 0
+        ),
         "paired_baseline_recorded": (
             set(baseline_reports) == set(reports)
             and baseline_first_attempt_input_tokens > 0
@@ -405,6 +453,8 @@ async def run_scenario(
         ),
         "strategies_are_distinct": len(strategy_names) == 3,
     }
+    if require_compaction_cache_read:
+        assertions["compaction_read_warm_prompt_cache"] = compaction_cache_read_input_tokens > 0
     model_requests = completed_model_attempts(
         runtime_report, [session.session_id for session in sessions]
     )
@@ -580,10 +630,18 @@ def _build_app(
         if name == "source" or (
             compact_branch_context and name in {"primary-sources", "contrarian", "practitioner"}
         ):
+            # A deterministic digest can only represent whole messages within its
+            # character budget, and the prepared source message is far larger than
+            # any useful summary. Summarize it with the provider instead, extending
+            # the still-warm source request prefix before the cache deadline.
             context_policy = CheckpointCompactionContextPolicy(
-                compactor=TranscriptDigestCompactor(max_summary_chars=2_000),
+                compactor=PromptCacheCompactor(provider=provider),
                 max_user_turns=1,
-                compact_after_messages=2,
+                compact_after_messages=(
+                    _SOURCE_COMPACT_AFTER_MESSAGES
+                    if name == "source"
+                    else _BRANCH_COMPACT_AFTER_MESSAGES
+                ),
             )
         app.register_agent(
             AgentSpec(
@@ -597,6 +655,13 @@ def _build_app(
             context_policy=context_policy,
         )
     return app
+
+
+def _cache_read_input_tokens(usage: object) -> int:
+    if not isinstance(usage, dict):
+        return 0
+    value = cast("dict[str, Any]", usage).get("cache_read_input_tokens")
+    return value if type(value) is int and value > 0 else 0
 
 
 def _semantic_terms(value: str) -> set[str]:

@@ -12,6 +12,7 @@ from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME, Structur
 from cayu.events import Event, EventType
 from cayu.providers.anthropic import AnthropicProvider
 from cayu.providers.base import ModelProvider, ModelStreamEvent
+from cayu.providers.cache import CachePolicy
 from cayu.providers.chat_completions import ChatCompletionsProvider
 from cayu.providers.deadlines import ProviderStreamDeadlines
 from cayu.providers.openai import OpenAIProvider
@@ -332,7 +333,16 @@ def validated_output(events: list[Event]) -> dict[str, Any]:
     return output
 
 
-def live_provider(provider_name: str | None = None) -> tuple[ModelProvider, str]:
+def live_provider(
+    provider_name: str | None = None,
+    *,
+    anthropic_cache_policy: CachePolicy | None = None,
+) -> tuple[ModelProvider, str]:
+    """Return the selected live provider and model.
+
+    ``anthropic_cache_policy`` applies only to the Anthropic provider; ``None``
+    keeps the provider's default cache-marker placement.
+    """
     selected = (provider_name or os.environ.get("CAYU_ADVANCED_PROVIDER", "gemini")).strip().lower()
     if selected == "gemini":
         if not os.environ.get("GEMINI_API_KEY"):
@@ -360,5 +370,8 @@ def live_provider(provider_name: str | None = None) -> tuple[ModelProvider, str]
     if selected == "anthropic":
         if not os.environ.get("ANTHROPIC_API_KEY"):
             raise RuntimeError("Set ANTHROPIC_API_KEY to run the live Anthropic examples.")
-        return AnthropicProvider(), os.environ.get("CAYU_ANTHROPIC_MODEL", "claude-sonnet-4-6")
+        return (
+            AnthropicProvider(cache_policy=anthropic_cache_policy),
+            os.environ.get("CAYU_ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+        )
     raise ValueError("Live provider must be gemini, openai, or anthropic.")

@@ -13,6 +13,19 @@ Gemini does not report a cache-expiration deadline through this API.
 When the injected observation enters the safety margin, the example triggers
 Cayu's checkpoint-backed compaction, rebuilds the application around the same
 session store, and only then creates the research forks.
+The source prepares its context over two turns, so the second request leaves
+the shared source context in a warm provider prompt cache (a conversation
+prefix cache ends before the newest message). It then compacts with
+`PromptCacheCompactor`, which summarizes by extending that warm request. The live
+Anthropic run configures an explicit `CachePolicy` that includes
+`CONVERSATION_PREFIX` and additionally requires the compaction call to report
+`cache_read_input_tokens > 0`; the count is recorded in the checkpoint evidence
+for every mode. A deterministic `TranscriptDigestCompactor`
+represents only whole messages that fit its character budget, so it cannot
+summarize the large prepared source message; the scenario requires the
+completed compaction to report full coverage of that source prefix. The
+compacted branches only activate the stored checkpoint view and do not compact
+again before their report.
 From the same post-decision source checkpoint, it runs the same three branch
 prompts with the full transcript and with compacted context. The evidence
 envelope records total provider-reported input usage, including retries, and
@@ -34,9 +47,12 @@ OPENAI_API_KEY=... uv run python -m examples.cache_aware_research_council.app --
 ANTHROPIC_API_KEY=... uv run python -m examples.cache_aware_research_council.app --mode live --provider anthropic
 ```
 
-Assertions cover lineage, shared causal budget, the paired token delta, strategy
-diversity, evaluator criticism, repair, and the cache-window decision. They do
-not assert exact prose.
+Assertions cover lineage, shared causal budget, compaction source coverage, the
+paired token delta, strategy diversity, evaluator criticism, repair, and the
+cache-window decision. They do not assert exact prose.
+Deterministic mode reports each scripted call's input usage from the size of the
+serialized request the runtime sent, so the paired token assertions fail if
+compacted forks silently receive the full source transcript.
 Input-token savings use total provider-reported usage, including structured-output
 retries. First-attempt context size and model-step counts are recorded separately
 to show whether compaction reduced the prepared request. Set
