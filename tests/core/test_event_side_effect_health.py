@@ -326,7 +326,7 @@ def test_health_pagination_beyond_one_batch(session_store_case):
 
 def test_skew_and_expired_lease_memory():
     from cayu.runtime import InMemorySessionStore
-    from cayu.sessions.base import PersistedEventSideEffectDelivery
+    from cayu.sessions.event_delivery import PersistedEventSideEffectDelivery
 
     async def run():
         now = datetime.now(UTC)
@@ -407,7 +407,7 @@ def test_health_expired_claim_and_acknowledgement_race(session_store_case):
 
 
 def test_sqlite_health_uses_aggregate_and_covering_index(tmp_path):
-    from cayu.runtime.event_side_effect_health import health_sql
+    from cayu.sessions.event_delivery import health_sql
     from cayu.storage import SQLiteSessionStore
     from cayu.storage import _sqlite_records as sqlite_records
 

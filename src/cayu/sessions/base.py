@@ -46,16 +46,11 @@ from cayu.deadlines import (
     current_execution_deadline,
     effective_deadline,
 )
-from cayu.runtime import event_side_effect_health as side_effect_health
-from cayu.runtime.event_side_effect_health import (
-    PersistedEventSideEffectHealth,
-    PersistedEventSideEffectPage,
-    PersistedEventSideEffectQuery,
-)
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _completion_finalization as completion_finalization
 from cayu.sessions import _terminal_evidence as terminal_event_evidence
 from cayu.sessions import creation_fence
+from cayu.sessions import event_delivery as side_effect_health
 from cayu.sessions import event_queries as event_query_rules
 from cayu.sessions import inspection as session_inspection_rules
 from cayu.sessions import messaging as session_messaging
@@ -70,6 +65,32 @@ from cayu.sessions._completion_finalization import (
 )
 from cayu.sessions._durable_operation_ownership import DurableOperationOwnership
 from cayu.sessions._external_wait_memory import MemoryExternalWaitMixin
+from cayu.sessions.event_delivery import (
+    PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES as PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES,
+)
+from cayu.sessions.event_delivery import (
+    PersistedEventSideEffectClaim as PersistedEventSideEffectClaim,
+)
+from cayu.sessions.event_delivery import (
+    PersistedEventSideEffectClaimLost as PersistedEventSideEffectClaimLost,
+)
+from cayu.sessions.event_delivery import (
+    PersistedEventSideEffectDelivery as PersistedEventSideEffectDelivery,
+)
+from cayu.sessions.event_delivery import (
+    PersistedEventSideEffectHealth,
+    PersistedEventSideEffectPage,
+    PersistedEventSideEffectQuery,
+)
+from cayu.sessions.event_delivery import (
+    PersistedEventSideEffectStatus as PersistedEventSideEffectStatus,
+)
+from cayu.sessions.event_delivery import (
+    portable_persisted_event_side_effect_error as portable_persisted_event_side_effect_error,
+)
+from cayu.sessions.event_delivery import (
+    validate_persisted_event_side_effect_error as validate_persisted_event_side_effect_error,
+)
 from cayu.sessions.event_queries import EventOrder as EventOrder
 from cayu.sessions.event_queries import EventQuery as EventQuery
 from cayu.sessions.event_queries import EventQueryResultTooLarge as EventQueryResultTooLarge
@@ -866,57 +887,10 @@ class _McpManifestBaselineEvidenceInvalid(ValueError):
     """Stored MCP baseline evidence could not be decoded or validated safely."""
 
 
-class PersistedEventSideEffectClaimLost(RuntimeError):
-    """A side-effect acknowledgement lost ownership to a replacement claim."""
-
-
-PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES = 4096
 # These budgets are nested deliberately. A maximum-size session ID is
 # base64-encoded into a list cursor that fits 4 KiB; a maximum-size custom-store
 # list cursor is base64-encoded into a recovery cursor that fits 8 KiB.
 MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES = 8192
-_NONPORTABLE_PERSISTED_EVENT_SIDE_EFFECT_ERROR = (
-    "Persisted event side effect failed with non-portable error details."
-)
-_TRUNCATED_PERSISTED_EVENT_SIDE_EFFECT_ERROR_SUFFIX = "... [truncated]"
-
-
-def validate_persisted_event_side_effect_error(
-    value: str,
-    field_name: str = "error",
-) -> str:
-    """Validate a portable, bounded side-effect failure description."""
-
-    value = require_nonblank(value, field_name)
-    if len(value.encode("utf-8")) > PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES:
-        raise ValueError(
-            f"`{field_name}` must not exceed "
-            f"{PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES} UTF-8 bytes."
-        )
-    return value
-
-
-def portable_persisted_event_side_effect_error(value: object) -> str:
-    """Project untrusted exception text into the durable handoff contract."""
-
-    if type(value) is not str:
-        return _NONPORTABLE_PERSISTED_EVENT_SIDE_EFFECT_ERROR
-    try:
-        value = require_nonblank(value, "error")
-    except ValueError:
-        return _NONPORTABLE_PERSISTED_EVENT_SIDE_EFFECT_ERROR
-
-    encoded = value.encode("utf-8")
-    if len(encoded) <= PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES:
-        return value
-
-    suffix = _TRUNCATED_PERSISTED_EVENT_SIDE_EFFECT_ERROR_SUFFIX
-    prefix = encoded[: PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES - len(suffix.encode("utf-8"))]
-    while True:
-        try:
-            return prefix.decode("utf-8") + suffix
-        except UnicodeDecodeError:
-            prefix = prefix[:-1]
 
 
 class SessionRuntimePublicationConflict(ValueError):
@@ -6627,79 +6601,6 @@ class QueuedDispatchTerminalReceiptQuery(BaseModel):
         if (self.after_session_id is None) != (self.after_operation_id is None):
             raise ValueError("Queued dispatch receipt cursor fields must be supplied together.")
         return self
-
-
-class PersistedEventSideEffectStatus(StrEnum):
-    PENDING = "pending"
-    LEASED = "leased"
-    DELIVERED = "delivered"
-    FAILED = "failed"
-    DEAD_LETTERED = "dead_lettered"
-
-
-class PersistedEventSideEffectClaim(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    session_id: str
-    event_id: str
-    event_sequence: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
-    event: Event
-    attempt: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
-    claim_id: str = Field(default_factory=lambda: str(uuid4()))
-    lease_expires_at: datetime
-
-    @field_validator("session_id", "event_id", "claim_id")
-    @classmethod
-    def validate_clean_strings(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("event")
-    @classmethod
-    def copy_claim_event(cls, value: Event) -> Event:
-        return copy_event(value)
-
-    @field_validator("lease_expires_at")
-    @classmethod
-    def normalize_lease_expires_at(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("lease_expires_at must be timezone-aware.")
-        return value.astimezone(UTC)
-
-
-class PersistedEventSideEffectDelivery(BaseModel):
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
-
-    session_id: str
-    event_id: str
-    event_sequence: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
-    status: PersistedEventSideEffectStatus
-    attempts: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    claim_id: str | None = None
-    lease_expires_at: datetime | None = None
-    next_attempt_at: datetime | None = None
-    last_error: str | None = None
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-
-    @field_validator("session_id", "event_id", "claim_id", "last_error")
-    @classmethod
-    def validate_optional_strings(cls, value: str | None, info) -> str | None:
-        if value is None:
-            return None
-        if info.field_name == "last_error":
-            # Stores validate every new write strictly. Normalize legacy rows on
-            # reconstruction so an older unbounded diagnostic cannot wedge the
-            # side-effect recovery queue after an upgrade.
-            return portable_persisted_event_side_effect_error(value)
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("lease_expires_at", "next_attempt_at", "updated_at")
-    @classmethod
-    def normalize_delivery_timestamp(cls, value: datetime | None, info) -> datetime | None:
-        if value is None:
-            return None
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError(f"{info.field_name} must be timezone-aware.")
-        return value.astimezone(UTC)
 
 
 def _copy_pending_first_event_delivery(

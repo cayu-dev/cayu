@@ -62,12 +62,12 @@ from cayu.sessions.base import (
     InterruptSessionRequest,
     ModelCompletionStageRequest,
     ModelCompletionStageResult,
-    PersistedEventSideEffectClaim,
     ResumeRequest,
     RunRequest,
     SessionIdentity,
     SessionRunFenced,
 )
+from cayu.sessions.event_delivery import PersistedEventSideEffectClaim
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import EventRecord, SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore

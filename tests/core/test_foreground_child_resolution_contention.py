@@ -21,11 +21,11 @@ from cayu.runtime._invocation_lifecycle import (
 from cayu.sessions.base import (
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
-    PersistedEventSideEffectStatus,
     RunRequest,
     SessionRuntimePublicationConflict,
     SessionStatusConflict,
 )
+from cayu.sessions.event_delivery import PersistedEventSideEffectStatus
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionStatus
 from cayu.storage.migrations import SchemaMode

@@ -240,7 +240,6 @@ from cayu.sessions._model_completion_publication import (
 )
 from cayu.sessions.base import (
     MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES,
-    PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES,
     QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY,
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     BudgetReservationIdentityConflict,
@@ -257,9 +256,6 @@ from cayu.sessions.base import (
     ModelCompletionStageDisposition,
     ModelCompletionStageRequest,
     ModelTarget,
-    PersistedEventSideEffectClaimLost,
-    PersistedEventSideEffectDelivery,
-    PersistedEventSideEffectStatus,
     QueuedDispatchTerminalReceiptQuery,
     QueuedInteractionProfileHandoff,
     ResumeRequest,
@@ -293,6 +289,12 @@ from cayu.sessions.checkpoints import (
     CheckpointCompatibilityError,
 )
 from cayu.sessions.child_context import ChildSessionContextContributor
+from cayu.sessions.event_delivery import (
+    PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES,
+    PersistedEventSideEffectClaimLost,
+    PersistedEventSideEffectDelivery,
+    PersistedEventSideEffectStatus,
+)
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import INTERACTION_LIFECYCLE_EVENT_TYPES
 from cayu.sessions.invocation import (

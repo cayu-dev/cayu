@@ -688,8 +688,6 @@ from cayu.sessions.base import (
     ModelCompletionStageSettlementRequest,
     ModelFailoverPolicy,
     ModelTarget,
-    PersistedEventSideEffectDelivery,
-    PersistedEventSideEffectStatus,
     ProfiledSessionForkResult,
     PromptAnatomyTransitionReceipt,
     QueuedInteractionProfileHandoff,
@@ -787,6 +785,10 @@ from cayu.sessions.checkpoints import (
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )
 from cayu.sessions.cleanup import RecoveryCleanup, RecoveryCleanupSupervisor
+from cayu.sessions.event_delivery import (
+    PersistedEventSideEffectDelivery,
+    PersistedEventSideEffectStatus,
+)
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,

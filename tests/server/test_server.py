@@ -113,13 +113,13 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     InterruptSessionRequest,
     ModelTarget,
-    PersistedEventSideEffectStatus,
     ResumeRequest,
     RunRequest,
     SessionIdentity,
     run_request_with_runtime_generated_authority,
 )
 from cayu.sessions.checkpoints import CURRENT_CHECKPOINT_SCHEMA_VERSION
+from cayu.sessions.event_delivery import PersistedEventSideEffectStatus
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.pending_action_contracts import (
     PendingActionIssue,

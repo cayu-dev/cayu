@@ -5,7 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from cayu.runtime.event_side_effect_health import PersistedEventSideEffectHealth
+from cayu.sessions.event_delivery import PersistedEventSideEffectHealth
 
 
 class EventSideEffectRecoveryLoop(BaseModel):

@@ -13,12 +13,12 @@ from cayu._task_wait import (
     unexpected_child_cancellation_error,
 )
 from cayu.runtime._durable_worker_loop import run_durable_lease_heartbeat
-from cayu.sessions.base import (
+from cayu.sessions.base import SessionStore
+from cayu.sessions.event_delivery import (
     PersistedEventSideEffectClaim,
     PersistedEventSideEffectClaimLost,
     PersistedEventSideEffectDelivery,
     PersistedEventSideEffectStatus,
-    SessionStore,
 )
 
 _T = TypeVar("_T")

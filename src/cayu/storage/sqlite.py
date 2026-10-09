@@ -25,15 +25,10 @@ from cayu.collaboration.peer_content import (
     PeerContentUnavailable,
 )
 from cayu.runtime import _session_message_queue as message_queue
-from cayu.runtime import event_side_effect_health as side_effect_health
 from cayu.runtime._cost_accounting import CostAccountingSnapshot
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot
-from cayu.runtime.event_side_effect_health import (
-    PersistedEventSideEffectHealth,
-    PersistedEventSideEffectPage,
-    PersistedEventSideEffectQuery,
-)
 from cayu.sessions import creation_fence
+from cayu.sessions import event_delivery as side_effect_health
 from cayu.sessions.access import (
     require_resource_session,
     runtime_session_mutation,
@@ -44,6 +39,11 @@ from cayu.sessions.base import (
     _closure_progress_targets,
     _validate_closure_progress_update,
     _validate_session_closure_detach_replay,
+)
+from cayu.sessions.event_delivery import (
+    PersistedEventSideEffectHealth,
+    PersistedEventSideEffectPage,
+    PersistedEventSideEffectQuery,
 )
 from cayu.sessions.messaging import (
     SESSION_MESSAGE_QUEUE_STORAGE_VALUE_MAX_BYTES,
@@ -188,10 +188,6 @@ from cayu.sessions.base import (
     ModelCompletionStageDispatch,
     ModelCompletionStageResult,
     ModelCompletionStageSettlementRequest,
-    PersistedEventSideEffectClaim,
-    PersistedEventSideEffectClaimLost,
-    PersistedEventSideEffectDelivery,
-    PersistedEventSideEffectStatus,
     ProfiledSessionForkResult,
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
@@ -392,6 +388,12 @@ from cayu.sessions.base import (
     restore_persisted_event_authority,
     session_messages_input_contract_evidence,
     transform_fork_checkpoint,
+)
+from cayu.sessions.event_delivery import (
+    PersistedEventSideEffectClaim,
+    PersistedEventSideEffectClaimLost,
+    PersistedEventSideEffectDelivery,
+    PersistedEventSideEffectStatus,
     validate_persisted_event_side_effect_error,
 )
 from cayu.sessions.event_queries import EventQuery, EventQueryResultTooLarge, copy_event_query

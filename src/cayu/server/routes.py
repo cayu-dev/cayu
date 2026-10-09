@@ -137,16 +137,6 @@ from cayu.runtime._event_projection import (
     public_event_sequence,
 )
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot
-from cayu.runtime.event_side_effect_health import (
-    PersistedEventSideEffectPage,
-    PersistedEventSideEffectQuery,
-)
-from cayu.runtime.event_side_effect_health import (
-    Status as EventSideEffectStatus,
-)
-from cayu.runtime.event_side_effect_health import (
-    cursor_key as event_side_effect_cursor_key,
-)
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.provider_operations import (
     ProviderOperationResolutionAction,
@@ -305,6 +295,9 @@ from cayu.sessions.base import (
     run_request_with_runtime_invocation,
 )
 from cayu.sessions.checkpoints import CheckpointCompatibilityError
+from cayu.sessions.event_delivery import PersistedEventSideEffectPage, PersistedEventSideEffectQuery
+from cayu.sessions.event_delivery import Status as EventSideEffectStatus
+from cayu.sessions.event_delivery import cursor_key as event_side_effect_cursor_key
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,

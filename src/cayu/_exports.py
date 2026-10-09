@@ -611,19 +611,19 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "TaskScheduleState": ("cayu.tasks.scheduling", "TaskScheduleState"),
     "TaskScheduleWakeup": ("cayu.tasks.scheduling", "TaskScheduleWakeup"),
     "PersistedEventSideEffectHealth": (
-        "cayu.runtime.event_side_effect_health",
+        "cayu.sessions.event_delivery",
         "PersistedEventSideEffectHealth",
     ),
     "PersistedEventSideEffectInspection": (
-        "cayu.runtime.event_side_effect_health",
+        "cayu.sessions.event_delivery",
         "PersistedEventSideEffectInspection",
     ),
     "PersistedEventSideEffectPage": (
-        "cayu.runtime.event_side_effect_health",
+        "cayu.sessions.event_delivery",
         "PersistedEventSideEffectPage",
     ),
     "PersistedEventSideEffectQuery": (
-        "cayu.runtime.event_side_effect_health",
+        "cayu.sessions.event_delivery",
         "PersistedEventSideEffectQuery",
     ),
     "HumanAttentionObservation": ("cayu.runtime.human_attention", "HumanAttentionObservation"),

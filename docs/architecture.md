@@ -515,6 +515,11 @@ records, bounded lifecycle authority, and pure copy, input and rejection rules.
 These values compose without session stores. Applications authorize access;
 `SessionStore` owns queue admission, freshness checks and terminal mutations.
 
+`sessions/event_delivery.py` owns durable event claims, delivery records,
+portable error bounds and operational health projections. Its shared SQL builders
+preserve the same classification as the in-memory projections. Stores own lease
+mutations and transactions; delivery workers own invocation and retry scheduling.
+
 ### Session discovery
 
 `sessions/pending_action_contracts.py` owns bounded pending-action queries,

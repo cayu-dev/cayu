@@ -259,13 +259,22 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "PendingActionResultTooLarge",
     ),
     "PendingActionSession": ("cayu.sessions.records", "PendingActionSession"),
-    "PersistedEventSideEffectClaim": ("cayu.sessions.base", "PersistedEventSideEffectClaim"),
+    "PersistedEventSideEffectClaim": (
+        "cayu.sessions.event_delivery",
+        "PersistedEventSideEffectClaim",
+    ),
     "PersistedEventSideEffectClaimLost": (
-        "cayu.sessions.base",
+        "cayu.sessions.event_delivery",
         "PersistedEventSideEffectClaimLost",
     ),
-    "PersistedEventSideEffectDelivery": ("cayu.sessions.base", "PersistedEventSideEffectDelivery"),
-    "PersistedEventSideEffectStatus": ("cayu.sessions.base", "PersistedEventSideEffectStatus"),
+    "PersistedEventSideEffectDelivery": (
+        "cayu.sessions.event_delivery",
+        "PersistedEventSideEffectDelivery",
+    ),
+    "PersistedEventSideEffectStatus": (
+        "cayu.sessions.event_delivery",
+        "PersistedEventSideEffectStatus",
+    ),
     "ProfiledSessionForkResult": ("cayu.sessions.base", "ProfiledSessionForkResult"),
     "PromptAnatomyTransitionReceipt": ("cayu.sessions.base", "PromptAnatomyTransitionReceipt"),
     "RECOVERY_CLEANUP_MAX_TIMEOUT_SECONDS": (

@@ -490,11 +490,6 @@ from cayu.runtime.application_lifecycle import (
 )
 from cayu.runtime.build_provenance import current_runtime_build_provenance
 from cayu.runtime.config_inspection import EffectiveRunConfiguration
-from cayu.runtime.event_side_effect_health import (
-    PersistedEventSideEffectHealth,
-    PersistedEventSideEffectPage,
-    PersistedEventSideEffectQuery,
-)
 from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicy,
 )
@@ -576,7 +571,6 @@ from cayu.sessions.base import (
     ModelCompletionManualRecoveryResult,
     ModelCompletionStage,
     ModelTarget,
-    PersistedEventSideEffectClaim,
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
     ResumeRequest,
@@ -620,6 +614,12 @@ from cayu.sessions.context_views import (
     json_commitment,
     project_context_view_extensions,
     require_independent_context_view_material,
+)
+from cayu.sessions.event_delivery import (
+    PersistedEventSideEffectClaim,
+    PersistedEventSideEffectHealth,
+    PersistedEventSideEffectPage,
+    PersistedEventSideEffectQuery,
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.execution import (

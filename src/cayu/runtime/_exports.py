@@ -17,19 +17,19 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "RuntimeEvidenceAuxiliaryInference",
     ),
     "PersistedEventSideEffectHealth": (
-        "cayu.runtime.event_side_effect_health",
+        "cayu.sessions.event_delivery",
         "PersistedEventSideEffectHealth",
     ),
     "PersistedEventSideEffectInspection": (
-        "cayu.runtime.event_side_effect_health",
+        "cayu.sessions.event_delivery",
         "PersistedEventSideEffectInspection",
     ),
     "PersistedEventSideEffectPage": (
-        "cayu.runtime.event_side_effect_health",
+        "cayu.sessions.event_delivery",
         "PersistedEventSideEffectPage",
     ),
     "PersistedEventSideEffectQuery": (
-        "cayu.runtime.event_side_effect_health",
+        "cayu.sessions.event_delivery",
         "PersistedEventSideEffectQuery",
     ),
     "HumanAttentionObservation": ("cayu.runtime.human_attention", "HumanAttentionObservation"),
@@ -913,13 +913,22 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "PendingToolCallApprovalEventView",
     ),
     "PendingUserInput": ("cayu.approvals.user_input", "PendingUserInput"),
-    "PersistedEventSideEffectClaim": ("cayu.sessions.base", "PersistedEventSideEffectClaim"),
+    "PersistedEventSideEffectClaim": (
+        "cayu.sessions.event_delivery",
+        "PersistedEventSideEffectClaim",
+    ),
     "PersistedEventSideEffectClaimLost": (
-        "cayu.sessions.base",
+        "cayu.sessions.event_delivery",
         "PersistedEventSideEffectClaimLost",
     ),
-    "PersistedEventSideEffectDelivery": ("cayu.sessions.base", "PersistedEventSideEffectDelivery"),
-    "PersistedEventSideEffectStatus": ("cayu.sessions.base", "PersistedEventSideEffectStatus"),
+    "PersistedEventSideEffectDelivery": (
+        "cayu.sessions.event_delivery",
+        "PersistedEventSideEffectDelivery",
+    ),
+    "PersistedEventSideEffectStatus": (
+        "cayu.sessions.event_delivery",
+        "PersistedEventSideEffectStatus",
+    ),
     "PreparedInvocationBinding": (
         "cayu.sessions._invocation_lifecycle",
         "PreparedInvocationBinding",

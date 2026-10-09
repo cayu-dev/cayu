@@ -16,9 +16,9 @@ from cayu.sessions.base import (
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     InterruptSessionRequest,
-    PersistedEventSideEffectStatus,
     RunRequest,
 )
+from cayu.sessions.event_delivery import PersistedEventSideEffectStatus
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore

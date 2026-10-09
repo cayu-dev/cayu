@@ -62,12 +62,6 @@ from cayu.sessions.base import (
 )
 from cayu.sessions.base import ModelFailoverPolicy as ModelFailoverPolicy
 from cayu.sessions.base import ModelTarget as ModelTarget
-from cayu.sessions.base import PersistedEventSideEffectClaim as PersistedEventSideEffectClaim
-from cayu.sessions.base import (
-    PersistedEventSideEffectClaimLost as PersistedEventSideEffectClaimLost,
-)
-from cayu.sessions.base import PersistedEventSideEffectDelivery as PersistedEventSideEffectDelivery
-from cayu.sessions.base import PersistedEventSideEffectStatus as PersistedEventSideEffectStatus
 from cayu.sessions.base import ProfiledSessionForkResult as ProfiledSessionForkResult
 from cayu.sessions.base import PromptAnatomyTransitionReceipt as PromptAnatomyTransitionReceipt
 from cayu.sessions.base import ResumeRequest as ResumeRequest
@@ -263,6 +257,18 @@ from cayu.sessions.context_views import (
 )
 from cayu.sessions.context_views import (
     RecipientSessionCreationRequest as RecipientSessionCreationRequest,
+)
+from cayu.sessions.event_delivery import (
+    PersistedEventSideEffectClaim as PersistedEventSideEffectClaim,
+)
+from cayu.sessions.event_delivery import (
+    PersistedEventSideEffectClaimLost as PersistedEventSideEffectClaimLost,
+)
+from cayu.sessions.event_delivery import (
+    PersistedEventSideEffectDelivery as PersistedEventSideEffectDelivery,
+)
+from cayu.sessions.event_delivery import (
+    PersistedEventSideEffectStatus as PersistedEventSideEffectStatus,
 )
 from cayu.sessions.event_queries import EventOrder as EventOrder
 from cayu.sessions.event_queries import EventQuery as EventQuery

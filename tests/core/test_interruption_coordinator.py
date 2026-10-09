@@ -9,7 +9,7 @@ from cayu.runtime._foreground_child_delivery import (
     ForegroundChildDeliveryOwner,
     ForegroundChildDeliverySealed,
 )
-from cayu.sessions.base import PersistedEventSideEffectClaimLost
+from cayu.sessions.event_delivery import PersistedEventSideEffectClaimLost
 
 
 def test_interruption_cascade_suppression_restores_same_context() -> None:
