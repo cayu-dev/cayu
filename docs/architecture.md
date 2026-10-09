@@ -457,6 +457,12 @@ abandonment cleanup use that current state. Typed callers retain their error
 settlement rules. After exact pause closure, approval and input share construction
 of the engine handoff while keeping ownership of the returned event stream.
 
+`ManualRecoveryPublication` retains the preassigned result event and acknowledged
+append state for manual approval/input recovery. It shares persistence readback
+and diagnostic projection after an append or delivery failure. The shielded
+readback operation is also usable by ordinary tool-round recovery. Typed callers
+retain cancellation cleanup, interruption policy and exact resolution authority.
+
 `DurableToolRound` reads fresh checkpoint state for each observation and uses the same
 source snapshot when preparing final publication. It does not cache validation
 across checkpoint writes. Shared staging, projection and receipt algorithms keep

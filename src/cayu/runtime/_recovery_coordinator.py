@@ -36,6 +36,10 @@ from cayu.runtime._durable_tool_round import (
 from cayu.runtime._durable_tool_round import (
     _interrupted_tool_round_results as _interrupted_tool_round_results,
 )
+from cayu.runtime._manual_recovery_publication import (
+    ManualRecoveryPublication,
+    reconcile_manual_recovery_persistence,
+)
 from cayu.runtime._paused_tool_round import ApprovalRoundPause, PausedToolRound, UserInputRoundPause
 from cayu.sessions import _completion_finalization as completion_finalization
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
@@ -1466,13 +1470,6 @@ class _ManualRecoveryStreamOutcome:
 class _ManualRecoverySupervisorResult:
     error: BaseException | None
     cleanup_failure: BaseException | None
-
-
-@dataclass(frozen=True)
-class _ManualRecoveryPersistenceReconciliation:
-    persisted: bool | None
-    error: Exception | None = None
-    cancellation: asyncio.CancelledError | None = None
 
 
 @dataclass(frozen=True)
@@ -11128,32 +11125,6 @@ class RecoveryCoordinator:
         ):
             yield event
 
-    async def _reconcile_manual_recovery_persistence(
-        self,
-        event: Event,
-    ) -> _ManualRecoveryPersistenceReconciliation:
-        """Classify an append failure using the preassigned durable event id."""
-        outcome = await await_shielded_task_outcome(
-            asyncio.create_task(self._event_writer.is_persisted(event))
-        )
-        if outcome.error is None:
-            return _ManualRecoveryPersistenceReconciliation(
-                persisted=bool(outcome.result),
-                cancellation=outcome.cancellation,
-            )
-        if isinstance(outcome.error, asyncio.CancelledError):
-            return _ManualRecoveryPersistenceReconciliation(
-                persisted=None,
-                cancellation=outcome.cancellation or outcome.error,
-            )
-        if not isinstance(outcome.error, Exception):
-            raise outcome.error
-        return _ManualRecoveryPersistenceReconciliation(
-            persisted=None,
-            error=outcome.error,
-            cancellation=outcome.cancellation,
-        )
-
     async def fence_expired_incomplete_recovery_claim(
         self,
         *,
@@ -11231,9 +11202,8 @@ class RecoveryCoordinator:
             model_attempt_id=pending.model_attempt_id,
         )
         recovery_prepared = False
-        recovery_persisted = False
+        publication = ManualRecoveryPublication(self._event_writer)
         cancellation_baseline = _task_cancellation_count()
-        recovery_event_to_reconcile: Event | None = None
         authoritative_failure: BaseException | None = None
         abandoned = False
         environment = ContinuationEnvironment(
@@ -11362,7 +11332,7 @@ class RecoveryCoordinator:
                 recovery_tool_event,
                 "resolution_request_digest",
             )
-            recovery_event_to_reconcile = recovery_tool_event
+            publication.event = recovery_tool_event
             recovery_events = [
                 event_with_execution_profile_authority(
                     Event(
@@ -11382,10 +11352,7 @@ class RecoveryCoordinator:
                 ),
                 recovery_tool_event,
             ]
-            emitted_recovery_events = await self._event_writer.persist_many(
-                session.id, recovery_events
-            )
-            recovery_persisted = True
+            emitted_recovery_events = await publication.persist(session.id, recovery_events)
             await self._event_writer.fan_out_persisted(emitted_recovery_events)
             for event in emitted_recovery_events:
                 yield event
@@ -11418,46 +11385,29 @@ class RecoveryCoordinator:
             raise
         except Exception as exc:
             authoritative_failure = exc
-            reconciliation_error: Exception | None = None
-            if not recovery_persisted and recovery_event_to_reconcile is not None:
-                try:
-                    reconciliation = await self._reconcile_manual_recovery_persistence(
-                        recovery_event_to_reconcile
+            try:
+                reconciliation = await publication.reconcile()
+            except BaseException as reconciliation_failure:
+                authoritative_failure = reconciliation_failure
+                abandoned = (
+                    _recovery_abandonment_signal(
+                        reconciliation_failure,
+                        cancellation_baseline=cancellation_baseline,
                     )
-                except BaseException as reconciliation_failure:
-                    authoritative_failure = reconciliation_failure
-                    abandoned = (
-                        _recovery_abandonment_signal(
-                            reconciliation_failure,
-                            cancellation_baseline=cancellation_baseline,
-                        )
-                        is not None
-                    )
-                    raise
-                if reconciliation.cancellation is not None:
-                    reconciliation.cancellation.add_note(
-                        "Manual user-input recovery append failed while persistence "
-                        "reconciliation was running."
-                    )
-                    authoritative_failure = reconciliation.cancellation
-                    abandoned = True
-                    raise reconciliation.cancellation from exc
-                recovery_persisted = reconciliation.persisted is True
-                reconciliation_error = reconciliation.error
-            if recovery_persisted or reconciliation_error is not None:
-                persistence_payload = (
-                    {"manual_recovery_persisted": True}
-                    if recovery_persisted
-                    else {
-                        "manual_recovery_persistence_unknown": True,
-                        "persistence_reconciliation_error_type": (
-                            _optional_exception_type_name(
-                                reconciliation_error,
-                                redactor=self._secret_redactor,
-                            )
-                        ),
-                    }
+                    is not None
                 )
+                raise
+            if reconciliation.cancellation is not None:
+                reconciliation.cancellation.add_note(
+                    "Manual user-input recovery append failed while persistence "
+                    "reconciliation was running."
+                )
+                authoritative_failure = reconciliation.cancellation
+                abandoned = True
+                raise reconciliation.cancellation from exc
+            publication.persisted = reconciliation.persisted is True
+            persistence_payload = reconciliation.failure_payload(redactor=self._secret_redactor)
+            if persistence_payload is not None:
                 diagnostic = exception_diagnostic(
                     exc,
                     redactor=self._secret_redactor,
@@ -11528,7 +11478,7 @@ class RecoveryCoordinator:
                 )
                 is not None
             )
-            if recovery_persisted and not abandoned:
+            if publication.persisted and not abandoned:
                 async for event in self._interrupt_session_for_recovery(
                     RecoveryInterruptionRequest(
                         session=session,
@@ -11636,9 +11586,8 @@ class RecoveryCoordinator:
             model_attempt_id=pending_approval.model_attempt_id,
         )
         recovery_prepared = False
-        recovery_persisted = False
+        publication = ManualRecoveryPublication(self._event_writer)
         cancellation_baseline = _task_cancellation_count()
-        recovery_event_to_reconcile: Event | None = None
         authoritative_failure: BaseException | None = None
         abandoned = False
         environment = ContinuationEnvironment(
@@ -11750,8 +11699,8 @@ class RecoveryCoordinator:
                 if settlement is None:
                     raise RuntimeError("Receipt recovery returned no settlement.")
                 if isinstance(settlement, _ToolEffectObservationReplay):
-                    recovery_event_to_reconcile = settlement.event
-                    recovery_persisted = True
+                    publication.event = settlement.event
+                    publication.persisted = True
                     await self._event_writer.fan_out_persisted([settlement.event])
                     yield copy_event(settlement.event)
                     async for event in self._interrupt_unresolved_tool_effect(
@@ -11764,8 +11713,8 @@ class RecoveryCoordinator:
                     ):
                         yield event
                     return
-                recovery_event_to_reconcile = settlement.terminal_event
-                recovery_persisted = True
+                publication.event = settlement.terminal_event
+                publication.persisted = True
                 emitted_recovery_events = [settlement.terminal_event]
                 public_recovered_result = ToolResult.model_validate(
                     settlement.terminal_event.payload["result"]
@@ -11811,7 +11760,7 @@ class RecoveryCoordinator:
                     recovery_tool_event,
                     execution_profile_snapshot.profile,
                 )
-                recovery_event_to_reconcile = recovery_tool_event
+                publication.event = recovery_tool_event
                 recovery_events = [
                     approval_support.resumed_event(
                         session=session,
@@ -11824,10 +11773,7 @@ class RecoveryCoordinator:
                     ),
                     recovery_tool_event,
                 ]
-                emitted_recovery_events = await self._event_writer.persist_many(
-                    session.id, recovery_events
-                )
-                recovery_persisted = True
+                emitted_recovery_events = await publication.persist(session.id, recovery_events)
             await self._event_writer.fan_out_persisted(emitted_recovery_events)
             for event in emitted_recovery_events:
                 yield event
@@ -11864,46 +11810,29 @@ class RecoveryCoordinator:
                 # Finish the claimed recovery through its existing cleanup owner.
                 abandoned = True
                 raise
-            reconciliation_error: Exception | None = None
-            if not recovery_persisted and recovery_event_to_reconcile is not None:
-                try:
-                    reconciliation = await self._reconcile_manual_recovery_persistence(
-                        recovery_event_to_reconcile
+            try:
+                reconciliation = await publication.reconcile()
+            except BaseException as reconciliation_failure:
+                authoritative_failure = reconciliation_failure
+                abandoned = (
+                    _recovery_abandonment_signal(
+                        reconciliation_failure,
+                        cancellation_baseline=cancellation_baseline,
                     )
-                except BaseException as reconciliation_failure:
-                    authoritative_failure = reconciliation_failure
-                    abandoned = (
-                        _recovery_abandonment_signal(
-                            reconciliation_failure,
-                            cancellation_baseline=cancellation_baseline,
-                        )
-                        is not None
-                    )
-                    raise
-                if reconciliation.cancellation is not None:
-                    reconciliation.cancellation.add_note(
-                        "Manual tool-approval recovery append failed while persistence "
-                        "reconciliation was running."
-                    )
-                    authoritative_failure = reconciliation.cancellation
-                    abandoned = True
-                    raise reconciliation.cancellation from exc
-                recovery_persisted = reconciliation.persisted is True
-                reconciliation_error = reconciliation.error
-            if recovery_persisted or reconciliation_error is not None:
-                persistence_payload = (
-                    {"manual_recovery_persisted": True}
-                    if recovery_persisted
-                    else {
-                        "manual_recovery_persistence_unknown": True,
-                        "persistence_reconciliation_error_type": (
-                            _optional_exception_type_name(
-                                reconciliation_error,
-                                redactor=self._secret_redactor,
-                            )
-                        ),
-                    }
+                    is not None
                 )
+                raise
+            if reconciliation.cancellation is not None:
+                reconciliation.cancellation.add_note(
+                    "Manual tool-approval recovery append failed while persistence "
+                    "reconciliation was running."
+                )
+                authoritative_failure = reconciliation.cancellation
+                abandoned = True
+                raise reconciliation.cancellation from exc
+            publication.persisted = reconciliation.persisted is True
+            persistence_payload = reconciliation.failure_payload(redactor=self._secret_redactor)
+            if persistence_payload is not None:
                 diagnostic = exception_diagnostic(
                     exc,
                     redactor=self._secret_redactor,
@@ -11954,7 +11883,7 @@ class RecoveryCoordinator:
                 )
                 is not None
             )
-            if recovery_persisted and not abandoned:
+            if publication.persisted and not abandoned:
                 async for event in self._interrupt_session_for_recovery(
                     RecoveryInterruptionRequest(
                         session=session,
@@ -13418,8 +13347,8 @@ class RecoveryCoordinator:
             reconciliation_error: Exception | None = None
             if not recovery_persisted and recovery_event_to_reconcile is not None:
                 try:
-                    reconciliation = await self._reconcile_manual_recovery_persistence(
-                        recovery_event_to_reconcile
+                    reconciliation = await reconcile_manual_recovery_persistence(
+                        self._event_writer, recovery_event_to_reconcile
                     )
                 except BaseException as reconciliation_failure:
                     if (

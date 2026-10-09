@@ -1,4 +1,13 @@
 {
+    "tests/core/test_manual_recovery_publication.py::test_caller_cancellation_waits_for_reconciliation_without_accepting_read_evidence[False]": 0.001,
+    "tests/core/test_manual_recovery_publication.py::test_caller_cancellation_waits_for_reconciliation_without_accepting_read_evidence[True]": 0.001,
+    "tests/core/test_manual_recovery_publication.py::test_child_read_cancellation_is_preserved_without_cancelling_the_parent": 0.0,
+    "tests/core/test_manual_recovery_publication.py::test_failed_read_retains_unknown_persistence_without_error_message": 0.0,
+    "tests/core/test_manual_recovery_publication.py::test_failure_before_an_event_is_prepared_does_not_read_persistence": 0.0,
+    "tests/core/test_manual_recovery_publication.py::test_fatal_read_failure_is_not_reclassified_as_unknown_persistence": 0.0,
+    "tests/core/test_manual_recovery_publication.py::test_lost_append_acknowledgement_reads_the_preassigned_event[False]": 0.001,
+    "tests/core/test_manual_recovery_publication.py::test_lost_append_acknowledgement_reads_the_preassigned_event[True]": 0.001,
+    "tests/core/test_manual_recovery_publication.py::test_successful_append_retains_evidence_without_reading_it_again": 0.001,
     "tests/core/test_continuation_environment.py::test_cancelled_environment_operation_keeps_prior_invocation_authority[bind]": 0.001173083990579471,
     "tests/core/test_continuation_environment.py::test_cancelled_environment_operation_keeps_prior_invocation_authority[reconnect]": 0.0013974170142319053,
     "tests/core/test_continuation_environment.py::test_environment_authority_is_retained_before_result_publication[False-bind]": 0.0040973750001285225,
