@@ -6,12 +6,12 @@ import asyncio
 import contextvars
 import os
 import sqlite3
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from concurrent.futures import Executor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypeVar, cast
+from typing import Protocol, TypeVar, cast
 from urllib.parse import quote
 
 from cayu.storage._diagnostic_inspection import (
@@ -20,6 +20,12 @@ from cayu.storage._diagnostic_inspection import (
 )
 
 _T = TypeVar("_T")
+
+
+class SQLiteOperationRunner(Protocol):
+    """Execute one operation while retaining connection and cancellation ownership."""
+
+    def __call__(self, operation: Callable[[sqlite3.Connection], _T], /) -> Awaitable[_T]: ...
 
 
 async def _run_off_thread_with_connection_ownership(

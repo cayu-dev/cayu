@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any
 
 from cayu._clock import utc_duration_cutoff
 from cayu._validation import (
@@ -85,22 +85,12 @@ from cayu.sessions.usage import UsageRollupQuery, copy_usage_rollup_query
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _sqlite_aggregates as sqlite_aggregates
 from cayu.storage import _sqlite_records as sqlite_records
+from cayu.storage._sqlite_connection import SQLiteOperationRunner
 
 if TYPE_CHECKING:
     from cayu.runtime._cost_accounting_refresh import CostAccountingAuthority
     from cayu.runtime._usage_accounting import SessionUsageCache
     from cayu.sessions.access import _SessionAccessBounds
-
-
-_ReadResult = TypeVar("_ReadResult")
-
-
-class SQLiteReadRunner(Protocol):
-    """Execute one read while retaining native connection and cancellation ownership."""
-
-    def __call__(
-        self, query: Callable[[sqlite3.Connection], _ReadResult], /
-    ) -> Awaitable[_ReadResult]: ...
 
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
@@ -186,7 +176,7 @@ def _session_topology_node_from_sqlite_row(row: sqlite3.Row) -> SessionTopologyN
 
 
 async def inspect_identity(
-    run_read: SQLiteReadRunner, session_id: str
+    run_read: SQLiteOperationRunner, session_id: str
 ) -> SessionInspectionIdentity:
     session_id = require_clean_nonblank(session_id, "session_id")
 
@@ -253,7 +243,7 @@ async def inspect_identity(
     return await run_read(query)
 
 
-async def load_events(run_read: SQLiteReadRunner, session_id: str) -> list[Event]:
+async def load_events(run_read: SQLiteOperationRunner, session_id: str) -> list[Event]:
     from cayu.resource_access import current_data_bounds
 
     access_bounds = await current_data_bounds()
@@ -282,7 +272,7 @@ async def load_events(run_read: SQLiteReadRunner, session_id: str) -> list[Event
 
 
 async def load_user_input_supersession_events(
-    run_read: SQLiteReadRunner, session_id: str, input_id: str
+    run_read: SQLiteOperationRunner, session_id: str, input_id: str
 ) -> list[Event]:
     from cayu.sessions.pending_actions import pending_action_lookup_key
 
@@ -315,7 +305,7 @@ async def load_user_input_supersession_events(
 
 
 async def load_tool_round_lifecycle_events(
-    run_read: SQLiteReadRunner, session_id: str, tool_call_ids: list[str] | tuple[str, ...]
+    run_read: SQLiteOperationRunner, session_id: str, tool_call_ids: list[str] | tuple[str, ...]
 ) -> list[Event]:
     from cayu.sessions.pending_actions import pending_action_lookup_key
 
@@ -353,7 +343,7 @@ async def load_tool_round_lifecycle_events(
 
 
 async def load_tool_round_lifecycle_events_for_round(
-    run_read: SQLiteReadRunner,
+    run_read: SQLiteOperationRunner,
     session_id: str,
     tool_call_ids: list[str] | tuple[str, ...],
     *,
@@ -409,7 +399,7 @@ async def load_tool_round_lifecycle_events_for_round(
 
 @runtime_session_query
 async def query_events(
-    run_read: SQLiteReadRunner, query: EventQuery | None = None
+    run_read: SQLiteOperationRunner, query: EventQuery | None = None
 ) -> list[EventRecord]:
     query = copy_event_query(query)
     if len(query.session_ids) > _EVENT_QUERY_SESSION_IDS_BATCH_SIZE:
@@ -442,7 +432,7 @@ async def query_events(
 
 
 @runtime_session_query
-async def event_exists(run_read: SQLiteReadRunner, query: EventQuery) -> bool:
+async def event_exists(run_read: SQLiteOperationRunner, query: EventQuery) -> bool:
     plan = session_store_sql.build_accounting_event_query_sql(query, dialect=SQL_DIALECT)
 
     def read(connection: sqlite3.Connection) -> bool:
@@ -461,7 +451,7 @@ async def event_exists(run_read: SQLiteReadRunner, query: EventQuery) -> bool:
 
 @runtime_session_query
 async def read_usage_accounting(
-    run_read: SQLiteReadRunner,
+    run_read: SQLiteOperationRunner,
     query: EventQuery,
     *,
     by_session: bool = False,
@@ -554,7 +544,7 @@ async def read_usage_accounting(
 
 @runtime_session_query
 async def read_cost_accounting(
-    run_read: SQLiteReadRunner,
+    run_read: SQLiteOperationRunner,
     query: EventQuery,
     pricing: PriceBook,
     *,
@@ -689,7 +679,7 @@ async def read_cost_accounting(
 
 @runtime_session_query
 async def query_events_bounded(
-    run_read: SQLiteReadRunner, query: EventQuery, *, max_bytes: int
+    run_read: SQLiteOperationRunner, query: EventQuery, *, max_bytes: int
 ) -> list[EventRecord]:
     query = copy_event_query(query)
     if type(max_bytes) is not int or max_bytes < 1:
@@ -753,7 +743,7 @@ async def query_events_bounded(
 
 
 async def query_latest_interaction_events(
-    run_read: SQLiteReadRunner,
+    run_read: SQLiteOperationRunner,
     session_id: str,
     *,
     before_sequence: int | None = None,
@@ -791,7 +781,7 @@ async def query_latest_interaction_events(
     return await run_read(run_query)
 
 
-async def summarize_events(run_read: SQLiteReadRunner, session_id: str) -> EventSummary:
+async def summarize_events(run_read: SQLiteOperationRunner, session_id: str) -> EventSummary:
     from cayu.resource_access import current_data_bounds
 
     access_bounds = await current_data_bounds()
@@ -845,7 +835,7 @@ async def summarize_events(run_read: SQLiteReadRunner, session_id: str) -> Event
 
 
 async def query_session_topology(
-    run_read: SQLiteReadRunner, query: SessionTopologyQuery
+    run_read: SQLiteOperationRunner, query: SessionTopologyQuery
 ) -> SessionTopologyStoreResult:
     if type(query) is not SessionTopologyQuery:
         raise TypeError("Session topology queries must be SessionTopologyQuery instances.")
@@ -990,7 +980,7 @@ async def query_session_topology(
 
 
 async def query_session_lineage(
-    run_read: SQLiteReadRunner, query: SessionLineageQuery
+    run_read: SQLiteOperationRunner, query: SessionLineageQuery
 ) -> SessionLineageResult:
     query = copy_session_lineage_query(query)
 
@@ -1103,7 +1093,7 @@ async def query_session_lineage(
 
 
 async def query_child_session_lifecycle(
-    run_read: SQLiteReadRunner, query: ChildSessionLifecycleQuery
+    run_read: SQLiteOperationRunner, query: ChildSessionLifecycleQuery
 ) -> ChildSessionLifecyclePage:
     query = ChildSessionLifecycleQuery.model_validate(query)
 
@@ -1241,7 +1231,7 @@ async def query_child_session_lifecycle(
 
 
 async def aggregate_usage(
-    run_read: SQLiteReadRunner, query: UsageRollupQuery
+    run_read: SQLiteOperationRunner, query: UsageRollupQuery
 ) -> UsageRollupStoreResult:
     query = copy_usage_rollup_query(query)
     plan = session_store_sql.build_session_query_sql(
@@ -1260,7 +1250,7 @@ async def aggregate_usage(
 
 
 async def _query_events_by_session_id_batches(
-    run_read: SQLiteReadRunner, query: EventQuery
+    run_read: SQLiteOperationRunner, query: EventQuery
 ) -> list[EventRecord]:
     records: list[EventRecord] = []
     for batch in _event_query_session_id_batches(query.session_ids):
@@ -1281,7 +1271,7 @@ async def _query_events_by_session_id_batches(
 
 
 async def list_sessions(
-    run_read: SQLiteReadRunner,
+    run_read: SQLiteOperationRunner,
     query: SessionQuery | None,
     *,
     pending_interruption_cascade_only: bool,
