@@ -12,7 +12,7 @@ import pytest
 
 import cayu
 
-_OWNERS = ["_postgres_catalog", "_postgres_eval_schema"]
+_OWNERS = ["_postgres_catalog", "_postgres_eval_schema", "_postgres_knowledge_schema"]
 
 
 def _validators(owner):
