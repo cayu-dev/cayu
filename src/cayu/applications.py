@@ -348,6 +348,7 @@ from cayu.resource_access import ResourceAccessPolicy, runtime_stream_entrance
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_request_boundary as session_request_boundary
+from cayu.runtime._assistant_model_publication import AssistantModelPublication
 from cayu.runtime._auxiliary_inference import AuxiliaryInferenceOwner
 from cayu.runtime._browser_control_runtime import BrowserControlRuntime
 from cayu.runtime._checkpoint_store import (
@@ -404,8 +405,6 @@ from cayu.runtime._isolated_tool_process import (
 )
 from cayu.runtime._local_execution_attempt_owner import retained_local_execution_tasks
 from cayu.runtime._model_completion_contracts import (
-    ModelCompletionPublicationRequest,
-    ModelCompletionPublicationResult,
     ModelCompletionRecoveryContext,
     model_completion_recovery_context_from_stage,
 )
@@ -459,7 +458,6 @@ from cayu.runtime._session_engine import (
 from cayu.runtime._session_execution_presence import process_owner_id
 from cayu.runtime._session_message_coordinator import SessionMessageCoordinator
 from cayu.runtime._session_request_boundary import _validate_resume_request, _validate_run_request
-from cayu.runtime._structured_output_tool_round import _has_structured_output_tool_call
 from cayu.runtime._task_store_operation_boundary import (
     raise_task_store_operation_failure,
     task_store_completion_evaluation_capability_is_complete,
@@ -1455,6 +1453,11 @@ class CayuApp:
             session_store=self._runtime_session_store, execution_config=session_execution
         )
         self._provider_operation_cancellation_lifecycle = ProviderOperationCancellationLifecycle()
+        self._assistant_model_publication = AssistantModelPublication(
+            session_store=self._runtime_session_store,
+            event_writer=self._event_writer,
+            secret_redactor=self._secret_redactor,
+        )
         self._model_step_executor = ModelStepExecutor(
             session_store=self._runtime_session_store,
             recovery_cleanup_supervisor=self._recovery_cleanup_supervisor,
@@ -1591,6 +1594,7 @@ class CayuApp:
             run_limit_controller=self._run_limit_controller,
             session_control=self._session_control,
             model_step_executor=self._model_step_executor,
+            assistant_model_publication=self._assistant_model_publication,
             request_footprint=self._request_footprint,
             tool_round_executor=self._tool_round_executor,
             recovery_coordinator=self._recovery_coordinator,
@@ -6078,53 +6082,6 @@ class CayuApp:
             )
         )
 
-    def _provider_operation_completion_publisher(
-        self,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        publication_context: ModelCompletionRecoveryContext,
-    ) -> Callable[
-        [ModelCompletionPublicationRequest],
-        Awaitable[ModelCompletionPublicationResult],
-    ]:
-        async def publish(
-            publication: ModelCompletionPublicationRequest,
-        ) -> ModelCompletionPublicationResult:
-            return await self._session_engine._publish_assistant_model_completion(
-                publication,
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                task_id=publication_context.task_id,
-                request_metadata=publication_context.request_metadata,
-                structured_output=publication_context.structured_output,
-                thinking=publication_context.thinking,
-                max_steps=publication_context.max_steps,
-                limits=publication_context.limits,
-                budget_limits=publication_context.budget_limits,
-                retry_policy=publication_context.retry_policy,
-                structured_output_attempt=(
-                    publication_context.structured_output_attempt
-                    if (
-                        publication.assistant_step_result is not None
-                        and _has_structured_output_tool_call(
-                            publication.assistant_step_result.tool_calls
-                        )
-                    )
-                    else None
-                ),
-                structured_output_retries=(
-                    max(publication_context.structured_output_attempt - 1, 0)
-                    if publication_context.structured_output_attempt is not None
-                    else 0
-                ),
-                run_limit_accounting=publication_context.run_limit_accounting,
-            )
-
-        return publish
-
     async def _recover_provider_operation(
         self,
         session: Session,
@@ -6138,7 +6095,7 @@ class CayuApp:
     ) -> ProviderOperationRecoveryResult:
         recovery_context = model_completion_recovery_context_from_stage(stage)
         publication_context = recovery_context or ModelCompletionRecoveryContext()
-        publish = self._provider_operation_completion_publisher(
+        publish = self._assistant_model_publication.recovery_publisher(
             session=session,
             registered_agent=registered_agent,
             registered_environment=registered_environment,
@@ -6171,7 +6128,7 @@ class CayuApp:
     ) -> ProviderOperationRecoveryResult:
         recovery_context = model_completion_recovery_context_from_stage(stage)
         publication_context = recovery_context or ModelCompletionRecoveryContext()
-        publish = self._provider_operation_completion_publisher(
+        publish = self._assistant_model_publication.recovery_publisher(
             session=session,
             registered_agent=registered_agent,
             registered_environment=registered_environment,

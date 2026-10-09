@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from cayu.resource_access import ResourceAccessPolicy, restore_session_stream
+from cayu.runtime._assistant_model_publication import AssistantModelPublication
 from cayu.runtime._durable_tool_round import DurableToolRound
 from cayu.runtime._durable_tool_round import _environment_name as _environment_name
 from cayu.runtime._durable_tool_round import (
@@ -321,7 +322,6 @@ from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
-from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _model_target as model_target
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
@@ -688,7 +688,6 @@ from cayu.sessions.base import (
     QueuedInteractionProfileHandoff,
     ResumeRequest,
     RunRequest,
-    RuntimePublicationRequest,
     SessionForkActiveModelStageConflict,
     SessionForkEnvironmentAllocationOwner,
     SessionForkProfileRelationship,
@@ -874,7 +873,6 @@ from cayu.tools.exposure import (
     resolved_tool_exposure_from_authority,
     session_metadata_with_tool_capability_ceiling,
     tool_capability_ceiling_from_session_metadata,
-    validate_resolved_tool_exposure_authority,
 )
 from cayu.tools.grants import (
     PreparedTargetedToolGrant,
@@ -5058,6 +5056,7 @@ class SessionEngine:
         run_limit_controller: RunLimitController,
         session_control: SessionControl[SessionUsageTracker],
         model_step_executor: ModelStepExecutor,
+        assistant_model_publication: AssistantModelPublication,
         request_footprint: RequestFootprintConfig,
         tool_round_executor: ToolRoundExecutor,
         recovery_coordinator: RecoveryCoordinator,
@@ -5102,6 +5101,7 @@ class SessionEngine:
         self._run_limit_controller = run_limit_controller
         self._session_control = session_control
         self._model_step_executor = model_step_executor
+        self._assistant_model_publication = assistant_model_publication
         self._request_footprint = copy_request_footprint_config(request_footprint)
         self._tool_round_executor = tool_round_executor
         self._recovery_coordinator = recovery_coordinator
@@ -23808,230 +23808,6 @@ class SessionEngine:
         # delivered to event sinks without changing that public stream contract.
         yield delivered_fork_event
 
-    async def _publish_assistant_model_completion(
-        self,
-        publication: ModelCompletionPublicationRequest,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        task_id: str | None,
-        request_metadata: dict[str, Any],
-        structured_output: StructuredOutputSpec | None,
-        thinking: ThinkingConfig | None,
-        max_steps: int,
-        limits: RunLimits,
-        budget_limits: tuple[BudgetLimit, ...],
-        retry_policy: RetryPolicy,
-        structured_output_attempt: int | None,
-        structured_output_retries: int,
-        run_limit_accounting: RunLimitAccountingContext | None,
-    ) -> ModelCompletionPublicationResult:
-        """Commit one staged model completion and its next durable action atomically."""
-
-        if publication.dispatch.stage.session_id != session.id:
-            raise RuntimeError("Model completion publication belongs to a different session.")
-        assistant_step_result = publication.assistant_step_result
-        assistant_message = publication.authoritative_assistant_message
-        tool_calls = (
-            assistant_step_result.tool_calls
-            if assistant_message is not None and assistant_step_result is not None
-            else []
-        )
-        tool_round_identity = (
-            assistant_step_result.tool_round_identity
-            if assistant_message is not None and assistant_step_result is not None
-            else None
-        )
-        if bool(tool_calls) != (tool_round_identity is not None):
-            raise RuntimeError(
-                "Model completion tool calls and tool-round identity must be published together."
-            )
-        source_checkpoint = await self.session_store.load_checkpoint(session.id)
-        target_checkpoint = source_checkpoint
-        tool_round_id = None if tool_round_identity is None else tool_round_identity.tool_round_id
-        if tool_calls:
-            if tool_round_identity is None or assistant_step_result is None:
-                raise RuntimeError("Model completion lost its tool-round execution material.")
-            if publication.tool_exposure is None:
-                raise RuntimeError("Model completion lost its frozen tool exposure.")
-            tool_exposure = validate_resolved_tool_exposure_authority(
-                publication.tool_exposure,
-                registered_agent.tool_capabilities,
-                catalogue_revision=registered_agent.tool_catalogue.revision,
-            )
-            tool_redactor = self._tool_round_executor.redactor_for_tool_calls(
-                registered_agent=registered_agent,
-                tool_calls=tool_calls,
-            )
-            target_checkpoint, _pending_round = (
-                tool_round_recovery.checkpoint_with_pending_tool_round(
-                    source_checkpoint,
-                    agent_name=registered_agent.spec.name,
-                    interaction_id=(
-                        publication.completion_event.interaction_id
-                        if any(
-                            call.name == CALL_TOOL_NAME
-                            or call.targeted_tool_grant_id is not None
-                            or call.targeted_tool_invocation is not None
-                            or call.targeted_tool_rejection is not None
-                            for call in tool_calls
-                        )
-                        else None
-                    ),
-                    environment_name=_environment_name(registered_environment),
-                    task_id=task_id,
-                    source_run_epoch=publication.dispatch.stage.source_run_epoch,
-                    tool_calls=tool_calls,
-                    policy_outcomes=None,
-                    tool_exposure=tool_exposure,
-                    policy_context_version=1,
-                    request_metadata=request_metadata,
-                    assistant_message_state=(
-                        "quarantined" if publication.defer_assistant_message else "published"
-                    ),
-                    quarantined_assistant_message=(
-                        assistant_message if publication.defer_assistant_message else None
-                    ),
-                    secret_resolution_scope=invocation_secrets.registered_environment_secret_resolution_scope(
-                        registered_environment
-                    ),
-                    continuity_tool_names=frozenset(
-                        tool.name
-                        for tool in registered_agent.tools.values()
-                        if tool.retain_arguments_for_model and not tool.publish_arguments
-                    ),
-                    continuity_knowledge_scope=_knowledge_access_scope(registered_environment),
-                    structured_output=structured_output,
-                    thinking=thinking,
-                    max_steps=max_steps,
-                    limits=limits,
-                    run_limit_accounting=run_limit_accounting,
-                    budget_limits=budget_limits,
-                    retry_policy=retry_policy,
-                    tool_round_identity=tool_round_identity,
-                    redactor=tool_redactor,
-                    source_model_step_id=tool_round_identity.model_step_id,
-                    source_transcript_cursor=(publication.dispatch.stage.source_transcript_cursor),
-                    model_step=assistant_step_result.step,
-                    structured_output_attempt=structured_output_attempt,
-                    structured_output_retries=structured_output_retries,
-                    structured_output_validation=(publication.structured_output_validation),
-                    runtime_session=session,
-                )
-            )
-            if (
-                _pending_round.assistant_publication is not None
-                and _pending_round.assistant_publication.argument_continuity is not None
-                and not self.session_store.supports_private_argument_continuity
-            ):
-                raise RuntimeError("Session store does not support private argument continuity.")
-        target_checkpoint = (
-            {}
-            if target_checkpoint is None
-            else copy_durable_record(target_checkpoint, "model_completion_checkpoint")
-        )
-        classification = publication.completion_event.payload.get("step_classification")
-        if type(classification) is not dict:
-            raise RuntimeError(
-                "Model completion publication requires a durable step classification."
-            )
-        pointer = model_completion_publication.ModelStepPublicationCheckpoint(
-            logical_step_id=publication.dispatch.logical_step_id,
-            stage_id=publication.dispatch.stage_id,
-            source_transcript_cursor=(publication.dispatch.stage.source_transcript_cursor),
-            transcript_end_cursor=(
-                publication.dispatch.stage.source_transcript_cursor
-                + int(assistant_message is not None and not publication.defer_assistant_message)
-            ),
-            completion_event_id=publication.completion_event.id,
-            classification=classification,
-            assistant_message_published=(
-                assistant_message is not None and not publication.defer_assistant_message
-            ),
-            assistant_message_deferred=publication.defer_assistant_message,
-            tool_round_id=tool_round_id,
-        )
-        target_checkpoint[
-            model_completion_publication.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY
-        ] = pointer.model_dump(mode="json")
-        runtime_publication = RuntimePublicationRequest(
-            publication_id=publication.dispatch.logical_step_id,
-            kind="model-step",
-            interaction_id=publication.completion_event.interaction_id,
-            intent=publication.dispatch.intent,
-            mutation=runtime_publication_checkpoint_mutation(
-                source_checkpoint,
-                target_checkpoint,
-            ),
-            transcript_messages=(
-                ()
-                if assistant_message is None or publication.defer_assistant_message
-                else (assistant_message,)
-            ),
-            events=(publication.completion_event,),
-            operation_record_mutations=publication.operation_record_mutations,
-        )
-
-        async def commit_and_fan_out_once() -> ModelCompletionPublicationResult:
-            completion = await self.session_store.complete_model_completion_stage(
-                session.id,
-                stage_id=publication.dispatch.stage_id,
-                publication=runtime_publication,
-            )
-            promoted = await self.session_store.promote_model_completion_stage(
-                session.id,
-                stage_id=publication.dispatch.stage_id,
-                expected_run_epoch=session.run_epoch,
-            )
-            await self._event_writer.fan_out_persisted([publication.completion_event])
-            return ModelCompletionPublicationResult(
-                completion=completion,
-                publication=promoted,
-            )
-
-        async def commit_and_fan_out() -> ModelCompletionPublicationResult:
-            try:
-                return await commit_and_fan_out_once()
-            except Exception as first_error:
-                try:
-                    return await commit_and_fan_out_once()
-                except Exception as replay_error:
-                    replay_error.add_note(
-                        "Exact model-completion publication replay also failed after "
-                        f"{type(first_error).__name__}: {first_error}"
-                    )
-                    raise replay_error from first_error
-
-        commit_task = asyncio.create_task(commit_and_fan_out())
-        outcome = await await_shielded_task_outcome(commit_task)
-        cancellation = outcome.cancellation
-        error = outcome.error
-        if isinstance(error, asyncio.CancelledError) and cancellation is None:
-            error = unexpected_child_cancellation_error(
-                error,
-                operation="Model completion durable publication",
-            )
-        if error is not None:
-            if cancellation is not None:
-                cancellation.add_note(
-                    "Model completion durable publication also failed: "
-                    f"{type(error).__name__}: {error}"
-                )
-                raise cancellation from error
-            raise error
-        if outcome.result is None:
-            result_error = RuntimeError(
-                "Model completion durable publication returned no acknowledgement."
-            )
-            if cancellation is not None:
-                cancellation.add_note(str(result_error))
-                raise cancellation from result_error
-            raise result_error
-        if cancellation is not None:
-            raise cancellation
-        return outcome.result
-
     async def continue_run(self, request: RecoverySessionRunRequest) -> AsyncGenerator[Event, None]:
         """Continue an admitted invocation after its recovery gate has settled."""
         invocation_context = request.invocation_context
@@ -25873,7 +25649,7 @@ class SessionEngine:
             async def publish_model_completion(
                 publication: ModelCompletionPublicationRequest,
             ) -> ModelCompletionPublicationResult:
-                return await self._publish_assistant_model_completion(
+                return await self._assistant_model_publication.publish(
                     publication,
                     session=session,
                     registered_agent=registered_agent,

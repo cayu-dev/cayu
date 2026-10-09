@@ -487,6 +487,14 @@ internal modules never type against or depend on the complete façade interface.
 This keeps dependency direction explicit while allowing `CayuApp` to remain the
 single composition root.
 
+`AssistantModelPublication` owns the shared assistant-result commit used by live
+model execution and provider-operation recovery. It prepares the pending tool
+round and model-step pointer, completes and promotes the exact durable stage,
+then delivers the persisted completion event. Its replay and cancellation rules
+remain within that operation. `CayuApp` constructs one instance from the session
+store, event writer and secret redactor; recovery binds saved invocation settings
+directly to it without calling back into `SessionEngine`.
+
 ### Session records and terminal evidence
 
 `sessions/records.py` owns session, event and transcript records, session status,

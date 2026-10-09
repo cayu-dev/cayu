@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 
+import pytest
+
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.context.base import ObservedDeltaContextEstimator, context_input_coverage
@@ -17,6 +19,45 @@ from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import EventRecord, SessionStatus
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_provider_recovery_publishes_without_a_session_engine(backend, tmp_path, monkeypatch):
+    from tests.core.test_provider_operation_offline_recovery import (
+        assert_offline_provider_operation_recovery,
+    )
+
+    from cayu.storage.sqlite import SQLiteSessionStore
+
+    recover = CayuApp._recover_provider_operation
+    recovered = []
+
+    async def without_engine(app, *args, **kwargs):
+        engine = app._session_engine
+        app._session_engine = None
+        try:
+            result = await recover(app, *args, **kwargs)
+            recovered.append(result)
+            return result
+        finally:
+            app._session_engine = engine
+
+    monkeypatch.setattr(CayuApp, "_recover_provider_operation", without_engine)
+
+    async def scenario():
+        store = (
+            InMemorySessionStore()
+            if backend == "memory"
+            else SQLiteSessionStore(tmp_path / "independent-publication.sqlite3")
+        )
+        try:
+            await assert_offline_provider_operation_recovery(store)
+            assert len(recovered) == 1
+        finally:
+            if backend == "sqlite":
+                await store.close()
+
+    asyncio.run(scenario())
 
 
 class _ScriptedProvider(ModelProvider):

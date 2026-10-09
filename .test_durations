@@ -1,4 +1,6 @@
 {
+    "tests/core/test_model_completion_runtime_publication.py::test_provider_recovery_publishes_without_a_session_engine[memory]": 1.217,
+    "tests/core/test_model_completion_runtime_publication.py::test_provider_recovery_publishes_without_a_session_engine[sqlite]": 1.839,
     "tests/core/test_manual_recovery_publication.py::test_caller_cancellation_waits_for_reconciliation_without_accepting_read_evidence[False]": 0.001,
     "tests/core/test_manual_recovery_publication.py::test_caller_cancellation_waits_for_reconciliation_without_accepting_read_evidence[True]": 0.001,
     "tests/core/test_manual_recovery_publication.py::test_child_read_cancellation_is_preserved_without_cancelling_the_parent": 0.0,
