@@ -171,6 +171,7 @@ from cayu.providers.bedrock import bedrock_billing_identity, completed_bedrock_b
 from cayu.providers.operations import ProviderOperationState, ProviderOperationStatus
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _tool_execution as tool_execution
+from cayu.runtime._approval_support import _pending_approval_for_atomic_claim
 from cayu.runtime._child_session_notifications import (
     CHILD_SESSION_NOTIFICATION_INTENT_KEY,
     ChildSessionLifecycleQuery,
@@ -190,7 +191,6 @@ from cayu.runtime._invocation_lifecycle import (
 )
 from cayu.runtime._recovery_coordinator import (
     _checkpoint_with_legacy_approval_round,
-    _pending_approval_for_atomic_claim,
 )
 from cayu.runtime.authority import SessionRunFenced
 from cayu.runtime.evidence import RuntimeEvidenceRequest, runtime_evidence
@@ -7926,7 +7926,9 @@ def test_session_store_conformance_releases_offline_supersession_claim_after_pre
                 reason="operator supersedes the paused question",
             )
             recovery = app._session_engine._recovery_coordinator
-            original_cancel_provider = recovery.cancel_provider_operation_for_interruption
+            original_cancel_provider = (
+                recovery._model_completion_recovery.cancel_provider_operation_for_interruption
+            )
 
             async def fail_after_terminal_claim(*args, **kwargs):
                 checkpoint = await store.load_checkpoint(session_id)
@@ -7934,7 +7936,7 @@ def test_session_store_conformance_releases_offline_supersession_claim_after_pre
                 assert "incomplete_session_recovery_claim" in checkpoint
                 raise preparation_failure_type("provider cancellation preparation failed")
 
-            recovery.cancel_provider_operation_for_interruption = (  # type: ignore[method-assign]
+            recovery._model_completion_recovery.cancel_provider_operation_for_interruption = (  # type: ignore[method-assign]
                 fail_after_terminal_claim
             )
             with (
@@ -7942,7 +7944,7 @@ def test_session_store_conformance_releases_offline_supersession_claim_after_pre
                 pytest.raises(expected_failure_type, match=expected_message),
             ):
                 await _collect_events(app.interrupt_session(request))
-            recovery.cancel_provider_operation_for_interruption = (  # type: ignore[method-assign]
+            recovery._model_completion_recovery.cancel_provider_operation_for_interruption = (  # type: ignore[method-assign]
                 original_cancel_provider
             )
 
@@ -17385,10 +17387,14 @@ def test_auxiliary_owner_dispatch_fences_survive_interruption(
             assert await store.load_events(session_id) == []
             if interruption in {"prepare_error", "prepare_cancel"}:
                 coordinator = app._session_engine._recovery_coordinator
-                recovered = await coordinator.reconcile_model_completion_boundary(running)
+                recovered = await coordinator._model_completion_recovery.reconcile_model_completion_boundary(
+                    running
+                )
                 assert recovered.state == "prepared_abandoned"
                 assert await store.load_active_model_completion_stage(session_id) is None
-                replay = await coordinator.reconcile_model_completion_boundary(running)
+                replay = await coordinator._model_completion_recovery.reconcile_model_completion_boundary(
+                    running
+                )
                 assert replay.state == "none"
                 assert entered == []
                 assert await store.load_checkpoint(session_id) == {"parent": "unchanged"}

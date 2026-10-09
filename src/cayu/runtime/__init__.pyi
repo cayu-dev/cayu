@@ -437,7 +437,7 @@ from cayu.runtime._durable_worker_loop import (
 )
 from cayu.runtime._environment_lifecycle import EnvironmentCapacityError as EnvironmentCapacityError
 from cayu.runtime._invocation_lifecycle import InvocationContext as InvocationContext
-from cayu.runtime._recovery_coordinator import (
+from cayu.runtime._model_completion_contracts import (
     ModelCompletionManualRecoveryRequired as ModelCompletionManualRecoveryRequired,
 )
 from cayu.runtime._session_continuation_owner import (

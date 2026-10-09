@@ -23,6 +23,7 @@ from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.events import EventType
 from cayu.messages import Message
+from cayu.runtime import _recovery_coordinator as recovery_coordinator_module
 from cayu.runtime._invocation_lifecycle import (
     PreparedInvocationBinding,
     _authenticated_invocation_context,
@@ -468,7 +469,7 @@ def test_work_attempt_recovers_entry_before_model_dispatch(backend, tmp_path, mo
             replacement.register_provider(provider, default=True)
             replacement.register_agent(AgentSpec(name="worker", model="verified-work-test-model"))
             coordinator = replacement._session_engine._recovery_coordinator
-            factory = coordinator._reconstruct_invocation_context
+            factory = recovery_coordinator_module.reconstruct_invocation_context
             recovery_contexts = []
 
             def record_recovery_context(**kwargs):
@@ -478,7 +479,9 @@ def test_work_attempt_recovers_entry_before_model_dispatch(backend, tmp_path, mo
 
             with monkeypatch.context() as patch:
                 patch.setattr(
-                    coordinator, "_reconstruct_invocation_context", record_recovery_context
+                    recovery_coordinator_module,
+                    "reconstruct_invocation_context",
+                    record_recovery_context,
                 )
                 recovered = await replacement.recover_work_attempt(
                     WorkAttemptRecoveryRequest(

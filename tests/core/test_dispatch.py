@@ -38,7 +38,7 @@ from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import _execution_profile_continuation as execution_profile_continuation
 from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
 from cayu.runtime._durable_worker_loop import DurableWorkerMetrics
-from cayu.runtime._recovery_coordinator import ModelCompletionBoundaryReconciliation
+from cayu.runtime._model_completion_contracts import ModelCompletionBoundaryReconciliation
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
@@ -5659,7 +5659,7 @@ def test_provider_pending_status_ack_loss_retains_queued_dispatch_ownership(
             )
 
         monkeypatch.setattr(
-            h.app._session_engine._recovery_coordinator,
+            h.app._session_engine._model_completion_recovery,
             "reconcile_model_completion_boundary",
             pending_provider_operation,
         )

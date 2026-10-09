@@ -14,6 +14,11 @@ from cayu._validation import (
 )
 from cayu.events import EVENT_ID_MAX_CHARS, Event, EventType
 
+_INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED = "tool_approval_required"
+_INTERRUPTION_TYPE_USER_INPUT_REQUIRED = "user_input_required"
+_INTERRUPTION_TYPE_RUNTIME_INTERRUPTED = "runtime_interrupted"
+_INTERRUPTION_TYPE_OPERATOR_REQUESTED = "operator_requested"
+
 TERMINAL_EVIDENCE_QUERY_LIMIT = 2
 SESSION_RUN_OPERATION_ID_PAYLOAD_KEY = "session_run_operation_id"
 TERMINAL_EVENT_TYPES = (

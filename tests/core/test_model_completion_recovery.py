@@ -48,9 +48,11 @@ from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY, public_event_id
 from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime._model_completion_contracts import ModelCompletionRecoveryContext
+from cayu.runtime._model_completion_contracts import (
+    ModelCompletionManualRecoveryRequired,
+    ModelCompletionRecoveryContext,
+)
 from cayu.runtime._model_step_executor import reconstruct_assistant_step_result
-from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
 from cayu.runtime.build_provenance import current_runtime_build_provenance
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import ExecutionProfileIdentity, ExecutionProfileMismatchError
@@ -1085,7 +1087,7 @@ def test_model_reconciliation_retains_exact_detached_completed_stage(
             session = publication.session
         expected = await store.load_model_completion_stage(session.id, staged.stage.stage_id)
         app = _register_runtime(store, provider)
-        result = await app._recovery_coordinator.reconcile_model_completion_boundary(session)
+        result = await app._model_completion_recovery.reconcile_model_completion_boundary(session)
         assert result.state == ("already_promoted" if already_promoted else "promoted")
         assert result.completed_stage == expected
         assert result.completed_stage.publication.events == (result.completion_event,)
@@ -1100,7 +1102,9 @@ def test_model_reconciliation_retains_exact_detached_completed_stage(
             await store.load_model_completion_stage(session.id, staged.stage.stage_id) == expected
         )
         assert "caller-mutation" not in result.completion_event.payload
-        replay = await app._recovery_coordinator.reconcile_model_completion_boundary(result.session)
+        replay = await app._model_completion_recovery.reconcile_model_completion_boundary(
+            result.session
+        )
         assert replay.completed_stage == expected
         assert provider.requests == []
 
@@ -1132,7 +1136,7 @@ def test_reconstruct_reconciled_model_result(
             )
             boundary = await _register_runtime(
                 store, provider
-            )._recovery_coordinator.reconcile_model_completion_boundary(staged.session)
+            )._model_completion_recovery.reconcile_model_completion_boundary(staged.session)
             result = reconstruct_assistant_step_result(
                 stage=boundary.completed_stage,
                 pointer=boundary.pointer,
@@ -1209,7 +1213,7 @@ def test_reconstruct_non_turn_does_not_accept_earlier_stop_metadata(
             )
             boundary = await _register_runtime(
                 store, provider
-            )._recovery_coordinator.reconcile_model_completion_boundary(staged.session)
+            )._model_completion_recovery.reconcile_model_completion_boundary(staged.session)
             assert boundary.completion_event.payload["completion"]["finish_reason"] == "stop"
             assert (
                 reconstruct_assistant_step_result(
@@ -1261,7 +1265,7 @@ def test_reconstruct_model_result_rejects_conflicting_evidence(conflict) -> None
         )
         boundary = await _register_runtime(
             store, provider
-        )._recovery_coordinator.reconcile_model_completion_boundary(staged.session)
+        )._model_completion_recovery.reconcile_model_completion_boundary(staged.session)
         stage = boundary.completed_stage
         pointer = boundary.pointer
         kwargs = {
@@ -2850,7 +2854,9 @@ def test_model_boundary_rejects_invalid_tail_after_missing_tool_round_marker(
         app = _register_runtime(store, provider)
 
         with pytest.raises(RuntimeError, match="does not exactly close"):
-            await app._recovery_coordinator.reconcile_model_completion_boundary(promoted.session)
+            await app._model_completion_recovery.reconcile_model_completion_boundary(
+                promoted.session
+            )
 
         assert provider.requests == []
 
@@ -2894,7 +2900,9 @@ def test_model_boundary_rejects_tool_results_without_publication_receipt() -> No
         app = _register_runtime(store, provider)
 
         with pytest.raises(RuntimeError, match="without durable tool-round publication provenance"):
-            await app._recovery_coordinator.reconcile_model_completion_boundary(promoted.session)
+            await app._model_completion_recovery.reconcile_model_completion_boundary(
+                promoted.session
+            )
 
         assert provider.requests == []
 
@@ -2922,7 +2930,7 @@ def test_model_boundary_accepts_exact_receiptless_approval_continuation() -> Non
         )
         app = _register_runtime(tail.store, tail.provider)
 
-        reconciliation = await app._recovery_coordinator.reconcile_model_completion_boundary(
+        reconciliation = await app._model_completion_recovery.reconcile_model_completion_boundary(
             tail.promoted_session
         )
 
@@ -2958,7 +2966,7 @@ def test_model_boundary_rejects_receiptless_user_input_continuation() -> None:
             RuntimeError,
             match="no exact publication authority",
         ):
-            await app._recovery_coordinator.reconcile_model_completion_boundary(
+            await app._model_completion_recovery.reconcile_model_completion_boundary(
                 tail.promoted_session
             )
 
@@ -3004,7 +3012,7 @@ def test_model_boundary_accepts_maximum_receiptless_pause_continuation(
         tool = _NeverExecutedTool()
         app = _register_runtime(tail.store, tail.provider, tool=tool)
 
-        reconciliation = await app._recovery_coordinator.reconcile_model_completion_boundary(
+        reconciliation = await app._model_completion_recovery.reconcile_model_completion_boundary(
             tail.promoted_session
         )
 
@@ -3159,7 +3167,7 @@ def test_model_boundary_rejects_invalid_receiptless_pause_provenance(
         app = _register_runtime(tail.store, tail.provider)
 
         with pytest.raises(RuntimeError):
-            await app._recovery_coordinator.reconcile_model_completion_boundary(
+            await app._model_completion_recovery.reconcile_model_completion_boundary(
                 tail.promoted_session
             )
 
@@ -3309,7 +3317,7 @@ def test_model_boundary_accepts_exact_published_tool_round() -> None:
         )
         app = _register_runtime(store, provider)
 
-        reconciliation = await app._recovery_coordinator.reconcile_model_completion_boundary(
+        reconciliation = await app._model_completion_recovery.reconcile_model_completion_boundary(
             promoted.session
         )
 

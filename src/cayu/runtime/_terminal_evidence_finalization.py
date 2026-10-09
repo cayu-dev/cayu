@@ -63,10 +63,15 @@ from cayu.runtime._terminal_finalization_lifetime import (
     InterruptionFinalization,
 )
 from cayu.runtime._tool_completion import recorded_terminal_tool_completion_payload
+from cayu.runtime._user_input_recovery_evidence import UserInputRecoveryEvidence
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._terminal_evidence import (
+    _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
+    _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+    _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
+    _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
     TERMINAL_EVIDENCE_EVENT_TYPES,
     TERMINAL_EVIDENCE_QUERY_LIMIT,
     _session_run_operation_from_checkpoint,
@@ -95,10 +100,6 @@ _INTERRUPTION_REPAIR_JOIN_INTERVAL_SECONDS = 0.01
 
 _RecoveryResultT = TypeVar("_RecoveryResultT")
 _TERMINAL_FINALIZATION_PROCESS_CONTROL_SIGNALS = (GeneratorExit, KeyboardInterrupt, SystemExit)
-_INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED = "tool_approval_required"
-_INTERRUPTION_TYPE_USER_INPUT_REQUIRED = "user_input_required"
-_INTERRUPTION_TYPE_RUNTIME_INTERRUPTED = "runtime_interrupted"
-_INTERRUPTION_TYPE_OPERATOR_REQUESTED = "operator_requested"
 _TERMINAL_EVIDENCE_REPAIR_NAMESPACE = UUID("bd021bef-ec8f-4e1e-950d-734e2c9ac513")
 _TERMINAL_EVENT_TYPE_BY_STATUS = {
     SessionStatus.COMPLETED: EventType.SESSION_COMPLETED,
@@ -227,13 +228,6 @@ class _FinalizationRecoveryOperations(Protocol):
 
     async def _require_session(self, session_id: str) -> Session: ...
 
-    async def _validated_user_input_supersession_interrupt_payload(
-        self,
-        *,
-        session: Session,
-        pending_interrupt_payload: dict[str, Any],
-    ) -> dict[str, Any] | None: ...
-
     async def _classify_user_input_pause(
         self,
         *,
@@ -299,6 +293,7 @@ class TerminalEvidenceFinalization:
         session_store: SessionStore,
         session_control: SessionControl[SessionUsageTracker],
         recovery: _FinalizationRecoveryOperations,
+        user_input_evidence: UserInputRecoveryEvidence,
         event_writer: RuntimeEventWriter,
         secret_redactor: SecretRedactor,
         logger: logging.Logger,
@@ -306,6 +301,7 @@ class TerminalEvidenceFinalization:
         self._session_store = session_store
         self._session_control = session_control
         self._recovery = recovery
+        self._user_input_evidence = user_input_evidence
         self._event_writer = event_writer
         self._secret_redactor = secret_redactor
         self._logger = logger
@@ -912,7 +908,7 @@ class TerminalEvidenceFinalization:
                     "Terminal evidence is not repairable: the pending interruption marker "
                     "has no stable request identity."
                 )
-            await self._recovery._validated_user_input_supersession_interrupt_payload(
+            await self._user_input_evidence.validated_user_input_supersession_interrupt_payload(
                 session=session,
                 pending_interrupt_payload=pending_interrupt_payload,
             )

@@ -19,7 +19,7 @@ from cayu import (
     SQLiteSessionStore,
 )
 from cayu.providers.base import ModelProvider
-from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
+from cayu.runtime._model_completion_contracts import ModelCompletionManualRecoveryRequired
 
 
 class _Provider(ModelProvider):

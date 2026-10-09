@@ -35,8 +35,10 @@ from cayu.providers import (
     ProviderStreamDeadlineEvidence,
 )
 from cayu.providers._credential_boundary import ProviderStreamCleanupError
-from cayu.runtime._model_completion_contracts import ModelCompletionRecoveryContext
-from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
+from cayu.runtime._model_completion_contracts import (
+    ModelCompletionManualRecoveryRequired,
+    ModelCompletionRecoveryContext,
+)
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.provider_operations import (
     ProviderOperationEvidenceError,

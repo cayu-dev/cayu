@@ -898,7 +898,7 @@ def test_auxiliary_terminal_recovery_settles_before_promoting_parent_unchanged(m
                 active = await app.session_store.load_active_model_completion_stage(ctx.session_id)
                 assert active is not None and active.stage.state == "completed"
                 session = await app.session_store.load(ctx.session_id)
-                boundary = await app._session_engine._recovery_coordinator.reconcile_model_completion_boundary(
+                boundary = await app._session_engine._model_completion_recovery.reconcile_model_completion_boundary(
                     session
                 )
                 assert boundary.state == "promoted"

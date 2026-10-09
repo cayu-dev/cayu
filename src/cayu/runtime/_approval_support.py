@@ -1250,3 +1250,25 @@ def _pending_approval_and_round_for_atomic_claim(
     ):
         raise ValueError("Recovery tool call is not part of the pending approval round.")
     return approval, pending_round
+
+
+def _pending_approval_for_atomic_claim(
+    checkpoint: dict[str, Any] | None,
+    *,
+    approval_id: str,
+    tool_round_id: str,
+    gating_tool_call_id: str | None = None,
+    recovery_tool_call_id: str | None = None,
+    redactor: SecretRedactor,
+    runtime_session: Session | None = None,
+) -> PendingToolApproval:
+    approval, _pending_round = _pending_approval_and_round_for_atomic_claim(
+        checkpoint,
+        approval_id=approval_id,
+        tool_round_id=tool_round_id,
+        gating_tool_call_id=gating_tool_call_id,
+        recovery_tool_call_id=recovery_tool_call_id,
+        redactor=redactor,
+        runtime_session=runtime_session,
+    )
+    return approval

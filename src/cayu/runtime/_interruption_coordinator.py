@@ -20,7 +20,10 @@ from cayu._validation import copy_durable_metadata, copy_json_value
 from cayu.approvals.tools import ResolutionActor, resolution_actor_payload
 from cayu.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.sessions._terminal_evidence import interruption_request_id_from_payload
+from cayu.sessions._terminal_evidence import (
+    _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
+    interruption_request_id_from_payload,
+)
 from cayu.sessions.base import InterruptSessionRequest, SessionStore, _deactivate_session_run_fence
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import Session, SessionStatus
@@ -37,7 +40,6 @@ _BACKGROUND_INTERRUPTION_LEASE_SECONDS = 30.0
 _BACKGROUND_INTERRUPTION_HEARTBEAT_SECONDS = 10.0
 _BACKGROUND_INTERRUPTION_HEARTBEAT_RETRY_SECONDS = 1.0
 _BACKGROUND_INTERRUPTION_ERROR_MAX_BYTES = 4096
-_INTERRUPTION_TYPE_OPERATOR_REQUESTED = "operator_requested"
 _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY = "pending_session_interrupt"
 _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY = "pending_interruption_cascade"
 

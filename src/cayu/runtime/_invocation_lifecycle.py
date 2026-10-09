@@ -211,6 +211,7 @@ from cayu.tools.discovery import (
 )
 from cayu.tools.exposure import (
     ToolCapabilityCeiling,
+    tool_capability_ceiling_from_session_metadata,
 )
 from cayu.tools.grants import PreparedTargetedToolGrant
 
@@ -1522,3 +1523,63 @@ __all__ = [
     "require_invocation_admission_source_authority",
     "require_invocation_command_authority",
 ]
+
+
+def _rebound_active_invocation_profile(
+    session: Session,
+    snapshot: ActiveInvocationExecutionProfile,
+) -> ActiveInvocationExecutionProfile:
+    """Carry one validated profile into the run epoch claimed for recovery."""
+
+    if snapshot.session_id != session.id:
+        raise RuntimeError("Recovery profile authority belongs to a different session.")
+    return snapshot.model_copy(update={"run_epoch": session.run_epoch})
+
+
+def reconstruct_invocation_context(
+    *,
+    runtime_hooks: tuple[runtime_records.RegisteredRuntimeHook, ...],
+    loop_policies: tuple[LoopPolicy, ...],
+    session: Session,
+    execution_profile_snapshot: ActiveInvocationExecutionProfile,
+    registered_agent: runtime_records.RegisteredAgentState,
+    registered_provider: runtime_records.RegisteredProvider,
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+    budget_policy: BudgetPolicy | None,
+    request_loop_policies: tuple[LoopPolicy, ...] = (),
+    recovery_claim_id: str | None = None,
+    work_attempt: WorkAttemptInvocationAuthority | None = None,
+) -> InvocationContext:
+    """Authenticate restart-resolved collaborators before recovery effects."""
+
+    active_profile = _rebound_active_invocation_profile(
+        session,
+        execution_profile_snapshot,
+    )
+    return _authenticated_invocation_context(
+        active_profile=active_profile,
+        binding=AdmittedInvocationBinding(
+            session_id=session.id,
+            session_instance_id=session.instance_id,
+            interaction_id=active_profile.interaction_id,
+            run_epoch=session.run_epoch,
+            agent_name=session.agent_name,
+            provider_name=session.provider_name,
+            model=session.model,
+            runtime_name=session.runtime_name,
+            runtime_version=session.runtime_version,
+            runtime_build_provenance=session.runtime_build_provenance,
+            environment_name=session.environment_name,
+        ),
+        validated_profile=active_profile.profile,
+        registered_agent=registered_agent,
+        registered_provider=registered_provider,
+        registered_environment=registered_environment,
+        runtime_hooks=runtime_hooks,
+        loop_policies=loop_policies,
+        request_loop_policies=request_loop_policies,
+        budget_policy=budget_policy,
+        tool_capability_ceiling=tool_capability_ceiling_from_session_metadata(session.metadata),
+        recovery_claim_id=recovery_claim_id,
+        work_attempt=work_attempt,
+    )

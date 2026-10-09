@@ -44,7 +44,7 @@ from cayu.providers.operations import (
     ProviderOperationStatus,
 )
 from cayu.providers.retry_policy import RetryPolicy
-from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
+from cayu.runtime._model_completion_contracts import ModelCompletionManualRecoveryRequired
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.provider_operations import (
     ProviderOperationInspectionStatus,

@@ -394,8 +394,10 @@ def test_receiptless_limit_skip_requires_exact_never_dispatched_provenance(case)
         await tail.store.append_transcript_messages(tail.staged.session.id, [message])
         app = _register_runtime(tail.store, tail.provider)
         if case in {"valid", "model-steps"}:
-            reconciliation = await app._recovery_coordinator.reconcile_model_completion_boundary(
-                tail.promoted_session
+            reconciliation = (
+                await app._model_completion_recovery.reconcile_model_completion_boundary(
+                    tail.promoted_session
+                )
             )
             assert reconciliation.state == "already_promoted"
         elif case == "public-legacy":
@@ -431,7 +433,7 @@ def test_receiptless_limit_skip_requires_exact_never_dispatched_provenance(case)
             return
         else:
             with pytest.raises(RuntimeError):
-                await app._recovery_coordinator.reconcile_model_completion_boundary(
+                await app._model_completion_recovery.reconcile_model_completion_boundary(
                     tail.promoted_session
                 )
         assert tail.provider.requests == []

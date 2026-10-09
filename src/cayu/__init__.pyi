@@ -3547,13 +3547,13 @@ from cayu.runtime._host_continuation_discovery import (
     ContinuationDiscoveryPage as ContinuationDiscoveryPage,
 )
 from cayu.runtime._host_continuation_discovery import ContinuationRecovery as ContinuationRecovery
+from cayu.runtime._model_completion_contracts import (
+    ModelCompletionManualRecoveryRequired as ModelCompletionManualRecoveryRequired,
+)
 from cayu.runtime._producer_retirement import (
     ProducerCleanupReclamation as ProducerCleanupReclamation,
 )
 from cayu.runtime._producer_retirement import ProducerCleanupRetirement as ProducerCleanupRetirement
-from cayu.runtime._recovery_coordinator import (
-    ModelCompletionManualRecoveryRequired as ModelCompletionManualRecoveryRequired,
-)
 from cayu.runtime._task_group_invocation import (
     TaskGroupInvocationSettlementPending as TaskGroupInvocationSettlementPending,
 )

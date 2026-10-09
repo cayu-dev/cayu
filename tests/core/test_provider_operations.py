@@ -43,11 +43,11 @@ from cayu.runtime._model_completion_contracts import (
     _MODEL_COMPLETION_RECOVERY_V1_DEFAULT_MAX_STEPS,
     MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS,
     MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES,
+    ModelCompletionManualRecoveryRequired,
     ModelCompletionRecoveryContext,
 )
 from cayu.runtime._model_completion_delivery import ModelAttemptFailed
 from cayu.runtime._model_step_executor import _raise_terminal_model_attempt_failure
-from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.provider_operations import (
     ProviderOperationAccountingStatus,

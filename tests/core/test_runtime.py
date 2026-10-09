@@ -59,7 +59,6 @@ import cayu.providers.deadlines as provider_deadlines_module
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
 import cayu.runtime._live_model_attempt as live_model_attempt_module
 import cayu.runtime._model_step_executor as model_step_executor_module
-import cayu.runtime._recovery_coordinator as recovery_coordinator_module
 import cayu.runtime._run_limits as run_limits_module
 import cayu.runtime._session_control as session_control_module
 import cayu.runtime._session_engine as session_engine_module
@@ -231,6 +230,7 @@ from cayu.runners.base import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, Exec
 from cayu.runtime import _approval_support as approval_support_module
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
 from cayu.runtime import _interruption_coordinator as interruption_coordinator_module
+from cayu.runtime import _recovery_coordinator as recovery_coordinator_module
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime._binding_cleanup import (
     binding_cleanup_status,
@@ -243,11 +243,11 @@ from cayu.runtime._event_projection import (
     public_event_linkage_id,
     public_event_sequence,
 )
+from cayu.runtime._model_completion_contracts import ModelCompletionManualRecoveryRequired
 from cayu.runtime._model_errors import (
     _BillingIdentityResolutionCancelled,
     detach_billing_identity_cancellation_group,
 )
-from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
 from cayu.runtime._session_engine import _require_native_structured_output_support
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import (
@@ -32307,15 +32307,14 @@ def test_cayu_app_recover_tool_round_reconstruction_failure_releases_claim(
         outcome=ToolApprovalRecoveryOutcome.COMPLETED,
         message="side effect verified externally",
     )
-    coordinator = app._recovery_coordinator
-    reconstruct_invocation_context = coordinator._reconstruct_invocation_context
+    reconstruct_invocation_context = recovery_coordinator_module.reconstruct_invocation_context
 
     def fail_reconstruction(**_kwargs: Any) -> None:
         raise RuntimeError("manual recovery invocation reconstruction failed")
 
     monkeypatch.setattr(
-        coordinator,
-        "_reconstruct_invocation_context",
+        recovery_coordinator_module,
+        "reconstruct_invocation_context",
         fail_reconstruction,
     )
     with pytest.raises(
@@ -32335,8 +32334,8 @@ def test_cayu_app_recover_tool_round_reconstruction_failure_releases_claim(
     # the runtime context builder permits a same-process retry without waiting
     # for the former claim lease to expire.
     monkeypatch.setattr(
-        coordinator,
-        "_reconstruct_invocation_context",
+        recovery_coordinator_module,
+        "reconstruct_invocation_context",
         reconstruct_invocation_context,
     )
     recovered = asyncio.run(collect_tool_round_recovery_events(app, request))

@@ -61,6 +61,7 @@ from cayu.runtime._invocation_lifecycle import (
     InvocationContext,
     SettleInvocationCommand,
     invocation_checkpoint_state_sha256,
+    reconstruct_invocation_context,
 )
 from cayu.runtime._model_completion_contracts import model_completion_recovery_context_from_stage
 from cayu.runtime._recovery_coordinator import RecoverySessionRunRequest
@@ -533,7 +534,9 @@ def test_recovery_session_boundary_validates_full_active_profile_authority(
         monkeypatch.setattr(app._session_engine, "_run_session", unexpected_run_session)
         request = RecoverySessionRunRequest(
             session=session,
-            invocation_context=app._recovery_coordinator._reconstruct_invocation_context(
+            invocation_context=reconstruct_invocation_context(
+                runtime_hooks=app._runtime_hooks,
+                loop_policies=app._loop_policies,
                 session=session,
                 execution_profile_snapshot=expected_profile,
                 registered_agent=app._agents["assistant"],
@@ -4937,11 +4940,13 @@ def test_model_reconciliation_uses_frozen_provider_after_registration_mutation()
             session = await store.load(session_id)
             assert session is not None
             assert await store.load_active_model_completion_stage(session_id) is not None
-            reconciliation = await app._recovery_coordinator.reconcile_model_completion_boundary(
-                session,
-                registered_agent=frozen_agent,
-                registered_provider=frozen_provider,
-                registered_environment=None,
+            reconciliation = (
+                await app._model_completion_recovery.reconcile_model_completion_boundary(
+                    session,
+                    registered_agent=frozen_agent,
+                    registered_provider=frozen_provider,
+                    registered_environment=None,
+                )
             )
 
             assert reconciliation.state == "provider_operation_reconciled"

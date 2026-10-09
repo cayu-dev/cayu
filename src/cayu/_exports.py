@@ -4092,7 +4092,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "ModelCompletionManualRecoveryRequest",
     ),
     "ModelCompletionManualRecoveryRequired": (
-        "cayu.runtime._recovery_coordinator",
+        "cayu.runtime._model_completion_contracts",
         "ModelCompletionManualRecoveryRequired",
     ),
     "ModelCompletionManualRecoveryResult": (

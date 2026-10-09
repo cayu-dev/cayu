@@ -22,27 +22,14 @@ from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
-def test_provider_recovery_publishes_without_a_session_engine(backend, tmp_path, monkeypatch):
+def test_provider_recovery_publishes_without_a_session_engine(backend, tmp_path):
     from tests.core.test_provider_operation_offline_recovery import (
-        assert_offline_provider_operation_recovery,
+        _OfflineOperationProvider,
+        _stage_offline_operation,
     )
 
+    from cayu.providers.operations import ProviderOperationStatus
     from cayu.storage.sqlite import SQLiteSessionStore
-
-    recover = CayuApp._recover_provider_operation
-    recovered = []
-
-    async def without_engine(app, *args, **kwargs):
-        engine = app._session_engine
-        app._session_engine = None
-        try:
-            result = await recover(app, *args, **kwargs)
-            recovered.append(result)
-            return result
-        finally:
-            app._session_engine = engine
-
-    monkeypatch.setattr(CayuApp, "_recover_provider_operation", without_engine)
 
     async def scenario():
         store = (
@@ -51,8 +38,39 @@ def test_provider_recovery_publishes_without_a_session_engine(backend, tmp_path,
             else SQLiteSessionStore(tmp_path / "independent-publication.sqlite3")
         )
         try:
-            await assert_offline_provider_operation_recovery(store)
-            assert len(recovered) == 1
+            provider = _OfflineOperationProvider(ProviderOperationStatus.COMPLETED)
+            user_message = await _stage_offline_operation(
+                store,
+                session_id="independent-model-recovery",
+                provider=provider,
+                record_input_coverage=True,
+            )
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            recovery = app._model_completion_recovery
+            app._session_engine = None
+            app._recovery_coordinator = None
+            session = await store.load("independent-model-recovery")
+            assert session is not None
+            result = await recovery.reconcile_model_completion_boundary(session)
+            assert result.state == "provider_operation_reconciled"
+            replay = await recovery.reconcile_model_completion_boundary(result.session)
+            assert replay.state == "already_promoted"
+            assert provider.adapter.start_calls == 0
+            assert provider.adapter.retrieve_calls == [provider.adapter.state]
+            transcript = await store.load_transcript(session.id)
+            assert transcript[0] == user_message
+            assert transcript[1].content[0].text == "finished while offline"
+            events = await store.load_events(session.id)
+            completed = [event for event in events if event.type is EventType.MODEL_COMPLETED]
+            assert len(completed) == 1
+            assert completed[0].payload["usage_metrics"]["input_tokens"] == 3
+            assert completed[0].payload["usage_metrics"]["output_tokens"] == 4
+            assert completed[0].payload["input_coverage"] == context_input_coverage(
+                [user_message], transcript_cursor=1
+            ).model_dump(mode="json")
+            assert await store.load_active_model_completion_stage(session.id) is None
         finally:
             if backend == "sqlite":
                 await store.close()

@@ -59,13 +59,17 @@ from cayu.runtime._model_execution_selection import ModelFailoverAttempt
 from cayu.runtime._run_limits import BudgetStepReservation
 from cayu.runtime.model_steps import AssistantStepResult
 from cayu.runtime.tool_completion import ToolCompletionPolicy
+from cayu.sessions import _model_completion_publication as model_completion_publication
+from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions.base import (
     MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES,
     ModelCompletionStage,
     ModelCompletionStageResult,
     RuntimePublicationOperationRecordMutation,
+    RuntimePublicationReceipt,
     RuntimePublicationResult,
 )
+from cayu.sessions.records import Session
 from cayu.tools.exposure import ResolvedToolExposureAuthority, copy_resolved_tool_exposure_authority
 
 MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES = MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES
@@ -595,4 +599,48 @@ class ModelCompletionDispatchNotAuthorized(RuntimeError):
         super().__init__(
             "Model completion dispatch was not authorized because its durable "
             f"stage already exists: {stage.stage_id}."
+        )
+
+
+class ModelCompletionManualRecoveryRequired(RuntimeError):
+    """A model dispatch cannot be reconstructed safely without operator input."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            f"{message} Inspect the registered application with `cayu recovery plan` "
+            "before selecting an operator recovery decision."
+        )
+
+
+@dataclass(frozen=True)
+class ModelCompletionBoundaryReconciliation:
+    """Verified state at the durable model-completion publication boundary."""
+
+    state: Literal[
+        "none",
+        "prepared_abandoned",
+        "promoted",
+        "already_promoted",
+        "provider_operation_pending",
+        "provider_operation_reconciled",
+        "provider_operation_unavailable",
+    ]
+    session: Session
+    pointer: model_completion_publication.ModelStepPublicationCheckpoint | None = None
+    completion_event: Event | None = None
+    pending_tool_round: pending_rounds.PendingToolRound | None = None
+    transcript_cursor: int = 0
+    recovery_events: tuple[Event, ...] = ()
+    # Retain the exact validated publication and its original execution
+    # identities for governed replay; this is evidence, not dispatch authority.
+    completed_stage: ModelCompletionStage | None = None
+    closed_tool_receipt: RuntimePublicationReceipt | None = None
+    structured_output_events: tuple[Event, ...] = ()
+
+    @property
+    def blocks_provider_dispatch(self) -> bool:
+        return (
+            self.pointer is not None
+            and self.pending_tool_round is None
+            and self.transcript_cursor == self.pointer.transcript_end_cursor
         )

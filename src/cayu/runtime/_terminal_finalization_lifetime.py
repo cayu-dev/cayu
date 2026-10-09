@@ -597,11 +597,9 @@ class InterruptedRunFinalization:
         )
         if user_input_supersession_retained:
             if self._task is None or self._handoff is None:
-                authenticated_payload = await (
-                    self._recovery._validated_user_input_supersession_interrupt_payload(
-                        session=loaded_interrupted,
-                        pending_interrupt_payload=payload,
-                    )
+                authenticated_payload = await self._finalization._user_input_evidence.validated_user_input_supersession_interrupt_payload(
+                    session=loaded_interrupted,
+                    pending_interrupt_payload=payload,
                 )
                 if authenticated_payload is None:
                     raise SessionRuntimePublicationConflict(

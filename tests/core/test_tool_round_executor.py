@@ -35,6 +35,7 @@ from cayu.runners.base import RunnerExecutionError, attach_cancellation_artifact
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
+from cayu.runtime._invocation_lifecycle import reconstruct_invocation_context
 from cayu.runtime._run_limits import RunLimitGate
 from cayu.runtime._session_control import SessionInterruptedByRequest
 from cayu.runtime._tool_effect_state import ToolEffectReconciliationRequired, ToolEffectStateOwner
@@ -531,7 +532,9 @@ async def _tool_round_run(
     assert active is not None
     interaction_id = active.interaction_id
     registered_agent = app._get_registered_agent("assistant")
-    context = app._recovery_coordinator._reconstruct_invocation_context(
+    context = reconstruct_invocation_context(
+        runtime_hooks=app._runtime_hooks,
+        loop_policies=app._loop_policies,
         session=session,
         execution_profile_snapshot=active,
         registered_agent=registered_agent,

@@ -2250,8 +2250,8 @@ def test_worker_recovers_terminal_model_stage_after_process_exit(
             handler = _StaticHandler()
             faults_observed = []
             if closed_fault is not None:
-                coordinator = app._session_engine._recovery_coordinator
-                read_closed = coordinator._load_closed_structured_output_events
+                model_recovery = app._model_completion_recovery
+                read_closed = model_recovery.load_closed_structured_output_events
                 read_receipt = sessions.load_runtime_publication_receipt
                 read_events = sessions.query_events
 
@@ -2356,7 +2356,7 @@ def test_worker_recovers_terminal_model_stage_after_process_exit(
                             patch.setattr(sessions, "query_events", corrupted_events)
                         return await read_closed(*args, **kwargs)
 
-                coordinator._load_closed_structured_output_events = read_conflicting_closed
+                model_recovery.load_closed_structured_output_events = read_conflicting_closed
             async with VerifiedTaskWorker(app, handler, worker_id="replacement") as worker:
                 assert (
                     await asyncio.wait_for(

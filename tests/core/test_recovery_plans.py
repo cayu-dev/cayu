@@ -214,7 +214,9 @@ def test_automatic_recovery_carries_exact_plan_owner_to_model_boundary(monkeypat
         store = InMemorySessionStore()
         app = _app(store)
         await _create_running_session(store, app, "plan-model-owner")
-        original = app._session_engine._recovery_coordinator.reconcile_model_completion_boundary
+        original = (
+            app._session_engine._model_completion_recovery.reconcile_model_completion_boundary
+        )
         observed = []
 
         async def observe(session, **kwargs):
@@ -230,7 +232,7 @@ def test_automatic_recovery_carries_exact_plan_owner_to_model_boundary(monkeypat
             return await original(session, **kwargs)
 
         monkeypatch.setattr(
-            app._session_engine._recovery_coordinator,
+            app._session_engine._model_completion_recovery,
             "reconcile_model_completion_boundary",
             observe,
         )

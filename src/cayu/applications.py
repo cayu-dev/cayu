@@ -343,7 +343,6 @@ from cayu.observability.watchers import (
 )
 from cayu.providers.base import ModelProvider, ModelRequest
 from cayu.providers.hosted import OpenAIWebSearch
-from cayu.providers.operations import ProviderOperationSnapshot
 from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.resource_access import ResourceAccessPolicy, runtime_stream_entrance
 from cayu.runtime import _approval_support as approval_support
@@ -406,11 +405,7 @@ from cayu.runtime._isolated_tool_process import (
     wait_for_retained_isolated_tool_cleanups,
 )
 from cayu.runtime._local_execution_attempt_owner import retained_local_execution_tasks
-from cayu.runtime._model_completion_contracts import (
-    ModelCompletionRecoveryContext,
-    model_completion_recovery_context_from_stage,
-)
-from cayu.runtime._model_execution_selection import ModelExecutionSelection
+from cayu.runtime._model_completion_recovery import ModelCompletionRecovery
 from cayu.runtime._model_policy import ModelPolicy
 from cayu.runtime._model_step_executor import (
     ModelStepBudgetEvaluationRequest,
@@ -470,6 +465,7 @@ from cayu.runtime._tool_round_executor import (
     ToolRoundExecutor,
     ToolRoundLimitRequest,
 )
+from cayu.runtime._user_input_recovery_evidence import UserInputRecoveryEvidence
 from cayu.runtime._work_attempt_coordinator import WorkAttemptCoordinator
 from cayu.runtime._work_attempt_invocation import (
     WorkAttemptRecoveryOwnership,
@@ -512,11 +508,8 @@ from cayu.runtime.provider_operation_cancellation import (
     ProviderOperationCancellationLifecycleSnapshot,
 )
 from cayu.runtime.provider_operations import (
-    ProviderOperationRecoveryResult,
     ProviderOperationResolutionAction,
     ProviderOperationResolutionRequest,
-    RecoverableProviderOperation,
-    RecoverableProviderOperationStart,
     copy_provider_operation_resolution_request,
     load_provider_operation_resolution,
     prepare_provider_operation_resolution_request,
@@ -566,7 +559,6 @@ from cayu.sessions.base import (
     InterruptSessionRequest,
     ModelCompletionManualRecoveryRequest,
     ModelCompletionManualRecoveryResult,
-    ModelCompletionStage,
     ModelTarget,
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
@@ -1542,6 +1534,23 @@ class CayuApp:
             strict_common_budget_admission=self.enable_common_root_budget_binding,
             knowledge_publication_scope=self._knowledge_publication_scope,
         )
+        self._user_input_evidence = UserInputRecoveryEvidence(self._runtime_session_store)
+        self._model_completion_recovery = ModelCompletionRecovery(
+            session_store=self._runtime_session_store,
+            event_writer=self._event_writer,
+            run_limit_controller=self._run_limit_controller,
+            secret_redactor=self._secret_redactor,
+            resolve_registered_agent=self._get_registered_agent,
+            resolve_registered_provider=self._get_registered_provider,
+            resolve_registered_environment=self._get_registered_environment_for_session,
+            resolve_budget_policy=lambda: self.budget_policy,
+            execution_profile_continuation=self._execution_profile_continuation,
+            model_step_executor=self._model_step_executor,
+            assistant_model_publication=self._assistant_model_publication,
+            user_input_evidence=self._user_input_evidence,
+            runtime_hooks=self._runtime_hooks,
+            loop_policies=self._loop_policies,
+        )
         self._recovery_coordinator = RecoveryCoordinator(
             resource_access_policy=resource_access_policy,
             require_participant_execution=self._require_participant_execution,
@@ -1570,15 +1579,14 @@ class CayuApp:
             resolve_registered_environment=self._get_registered_environment_for_session,
             resolve_budget_policy=lambda: self.budget_policy,
             execution_profile_continuation=self._execution_profile_continuation,
+            model_completion_recovery=self._model_completion_recovery,
+            user_input_evidence=self._user_input_evidence,
             interrupt_session_for_recovery=self._interrupt_session_for_recovery,
             pending_session_interrupt_checkpoint=(
                 self._pending_session_interrupt_checkpoint_for_recovery
             ),
             abandoned_turn_completed=self._complete_abandoned_recovery_turn,
             resume_interaction=self._resume_recovery_interaction,
-            recover_provider_operation=self._recover_provider_operation,
-            recover_provider_operation_start=self._recover_provider_operation_start,
-            cancel_provider_operation=self._cancel_provider_operation,
             interaction_transition_replay_failures=_interaction_transition_replay_failures,
             recovery_cleanup_supervisor=self._recovery_cleanup_supervisor,
             runtime_hooks=self._runtime_hooks,
@@ -1620,6 +1628,8 @@ class CayuApp:
             model_step_executor=self._model_step_executor,
             assistant_model_publication=self._assistant_model_publication,
             execution_profile_continuation=self._execution_profile_continuation,
+            model_completion_recovery=self._model_completion_recovery,
+            user_input_evidence=self._user_input_evidence,
             request_footprint=self._request_footprint,
             tool_round_executor=self._tool_round_executor,
             recovery_coordinator=self._recovery_coordinator,
@@ -1664,6 +1674,7 @@ class CayuApp:
             task_store=self.task_store,
             event_writer=self._event_writer,
             recovery_coordinator=self._recovery_coordinator,
+            model_completion_recovery=self._model_completion_recovery,
             resolve_registered_agent=self._get_registered_agent,
             resolve_registered_provider=self._get_registered_provider,
             resolve_registered_environment=self._get_registered_environment_for_session,
@@ -1706,7 +1717,7 @@ class CayuApp:
             get_environment=self._get_registered_environment_for_session,
             redact_request=self.redact_dispatch_request,
             project_event=self._project_emitted_event_for_public_api,
-            load_model_completion=self._recovery_coordinator.load_model_completion_boundary,
+            load_model_completion=self._model_completion_recovery.load_model_completion_boundary,
             run=self._run_private,
             dispatch=self._dispatch_inline_private,
         )
@@ -6376,93 +6387,6 @@ class CayuApp:
                 size_bytes=artifact.size_bytes,
                 metadata=artifact.metadata,
             )
-        )
-
-    async def _recover_provider_operation(
-        self,
-        session: Session,
-        stage: ModelCompletionStage,
-        operation: RecoverableProviderOperation,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_provider: runtime_records.RegisteredProvider,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        invocation_context: InvocationContext | None = None,
-        model_execution_selection: ModelExecutionSelection | None = None,
-    ) -> ProviderOperationRecoveryResult:
-        recovery_context = model_completion_recovery_context_from_stage(stage)
-        publication_context = recovery_context or ModelCompletionRecoveryContext()
-        publish = self._assistant_model_publication.recovery_publisher(
-            session=session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            publication_context=publication_context,
-        )
-
-        return await self._model_step_executor.recover_provider_operation(
-            session=session,
-            stage=stage,
-            operation=operation,
-            registered_agent=registered_agent,
-            registered_provider=registered_provider,
-            environment_name=_environment_name(registered_environment),
-            recovery_context=recovery_context,
-            model_completion_publisher=publish,
-            invocation_context=invocation_context,
-            model_execution_selection=model_execution_selection,
-        )
-
-    async def _recover_provider_operation_start(
-        self,
-        session: Session,
-        stage: ModelCompletionStage,
-        start: RecoverableProviderOperationStart,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_provider: runtime_records.RegisteredProvider,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        invocation_context: InvocationContext | None = None,
-        model_execution_selection: ModelExecutionSelection | None = None,
-    ) -> ProviderOperationRecoveryResult:
-        recovery_context = model_completion_recovery_context_from_stage(stage)
-        publication_context = recovery_context or ModelCompletionRecoveryContext()
-        publish = self._assistant_model_publication.recovery_publisher(
-            session=session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            publication_context=publication_context,
-        )
-
-        return await self._model_step_executor.recover_provider_operation_start(
-            session=session,
-            stage=stage,
-            start=start,
-            registered_agent=registered_agent,
-            registered_provider=registered_provider,
-            environment_name=_environment_name(registered_environment),
-            model_completion_publisher=publish,
-            invocation_context=invocation_context,
-            model_execution_selection=model_execution_selection,
-        )
-
-    async def _cancel_provider_operation(
-        self,
-        session: Session,
-        stage: ModelCompletionStage,
-        operation: RecoverableProviderOperation,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_provider: runtime_records.RegisteredProvider,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        invocation_context: InvocationContext | None = None,
-        model_execution_selection: ModelExecutionSelection | None = None,
-    ) -> ProviderOperationSnapshot | None:
-        return await self._model_step_executor.cancel_provider_operation_for_interruption(
-            session=session,
-            stage=stage,
-            operation=operation,
-            registered_agent=registered_agent,
-            registered_provider=registered_provider,
-            environment_name=_environment_name(registered_environment),
-            invocation_context=invocation_context,
-            model_execution_selection=model_execution_selection,
         )
 
     def _get_registered_provider(

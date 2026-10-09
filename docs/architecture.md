@@ -495,6 +495,21 @@ remain within that operation. `CayuApp` constructs one instance from the session
 store, event writer and secret redactor; recovery binds saved invocation settings
 directly to it without calling back into `SessionEngine`.
 
+`ModelCompletionRecovery` owns saved model-stage inspection, dispatch preflight,
+provider reattachment, exact stage promotion, budget reconciliation and validation
+of an already-published model/tool boundary. The engine, continuation coordinator
+and recovery planner use this component directly. Provider recovery composes the
+model-step executor and assistant publication owner without an application
+forwarder.
+
+`ExecutionProfileContinuation` validates saved execution settings for both live
+execution and recovery, including exact profile rejection and queued-interaction
+handoff repair. Its process-local policy identity registry is shared by all
+engine entrances. `UserInputRecoveryEvidence` authenticates opening, closure and
+supersession receipts for model recovery, continuation and terminal finalization.
+These parts preserve the existing store protocols; recovery and finalization
+retain their claim supervision and cleanup lifetimes.
+
 ### Session records and terminal evidence
 
 `sessions/records.py` owns session, event and transcript records, session status,

@@ -29,12 +29,13 @@ from cayu.runtime._environment_allocation import (
     checkpoint_object_map,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime._model_completion_contracts import model_completion_recovery_context_from_stage
-from cayu.runtime._provider_cleanup_evidence import local_http_cleanup_event_id
-from cayu.runtime._recovery_coordinator import (
+from cayu.runtime._model_completion_contracts import (
     ModelCompletionManualRecoveryRequired,
-    RecoveryCoordinator,
+    model_completion_recovery_context_from_stage,
 )
+from cayu.runtime._model_completion_recovery import ModelCompletionRecovery
+from cayu.runtime._provider_cleanup_evidence import local_http_cleanup_event_id
+from cayu.runtime._recovery_coordinator import RecoveryCoordinator
 from cayu.runtime._task_store_operation_boundary import (
     task_store_exact_interrupted_handoff_capability_is_complete,
 )
@@ -428,6 +429,7 @@ class RecoveryPlanCoordinator:
         task_store: TaskStore | None,
         event_writer: RuntimeEventWriter,
         recovery_coordinator: RecoveryCoordinator,
+        model_completion_recovery: ModelCompletionRecovery,
         resolve_registered_agent: ResolveRegisteredAgent,
         resolve_registered_provider: ResolveRegisteredProvider,
         resolve_registered_environment: ResolveRegisteredEnvironment,
@@ -444,6 +446,7 @@ class RecoveryPlanCoordinator:
         self._task_store = task_store
         self._event_writer = event_writer
         self._recovery_coordinator = recovery_coordinator
+        self._model_completion_recovery = model_completion_recovery
         self._resolve_registered_agent = resolve_registered_agent
         self._resolve_registered_provider = resolve_registered_provider
         self._resolve_registered_environment = resolve_registered_environment
@@ -889,7 +892,7 @@ class RecoveryPlanCoordinator:
             if registered_provider is not None:
                 try:
                     recoverable_operation = (
-                        await self._recovery_coordinator._recoverable_provider_operation(
+                        await self._model_completion_recovery.recoverable_provider_operation(
                             active.stage, registered_provider=registered_provider
                         )
                     )

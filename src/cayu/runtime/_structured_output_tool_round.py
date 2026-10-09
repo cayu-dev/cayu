@@ -17,6 +17,7 @@ from cayu.context.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
     StructuredOutputError,
     StructuredOutputSpec,
+    StructuredOutputStrategy,
     StructuredOutputValidation,
     structured_output_repair_lead,
     validate_structured_output_tool_arguments,
@@ -391,4 +392,27 @@ def _redact_structured_output_validation(
             )
             for error in validation.errors
         ],
+    )
+
+
+def has_recoverable_structured_output_round(
+    pending_round: pending_rounds.PendingToolRound,
+) -> bool:
+    """Advisory readiness for a recorded, reserved-only finalizer round.
+
+    Unlike application tools this round has no external dispatch to settle.
+    The elected recovery owner still validates and publishes its exact
+    persisted validation through _recover_structured_output_tool_round.
+    """
+    spec = pending_round.structured_output
+    attempt = pending_round.structured_output_attempt
+    return (
+        bool(pending_round.tool_calls)
+        and all(call.tool_name == STRUCTURED_OUTPUT_TOOL_NAME for call in pending_round.tool_calls)
+        and spec is not None
+        and spec.strategy is StructuredOutputStrategy.TOOL
+        and pending_round.model_step is not None
+        and attempt is not None
+        and attempt <= spec.max_retries + 1
+        and pending_round.structured_output_validation is not None
     )

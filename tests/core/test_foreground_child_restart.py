@@ -22,7 +22,7 @@ from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
 from cayu.approvals.user_input import UserInputResponse
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
-from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
+from cayu.runtime._model_completion_contracts import ModelCompletionManualRecoveryRequired
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.sessions.base import InterruptSessionRequest, RunRequest

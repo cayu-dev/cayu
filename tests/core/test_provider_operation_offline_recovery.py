@@ -78,12 +78,14 @@ from cayu.runtime import _recovery_coordinator as recovery_coordinator_module
 from cayu.runtime import _session_engine as session_engine_module
 from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
 from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime._model_completion_contracts import ModelCompletionRecoveryContext
+from cayu.runtime._model_completion_contracts import (
+    ModelCompletionManualRecoveryRequired,
+    ModelCompletionRecoveryContext,
+)
 from cayu.runtime._model_errors import _BillingIdentityResolutionCancelled
 from cayu.runtime._provider_operation_recovery_owner import (
     _ProviderRecoveryRequiredPublicationFailureEvidence,
 )
-from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import (
     ExecutionProfileComponentClass,
@@ -7503,7 +7505,7 @@ def test_offline_interruption_keeps_provider_frozen_across_status_transition(
         admitted_registered_provider = app._provider_registry.registrations[provider.name]
         captured_contexts: list[Any] = []
         cancel_provider_operation = (
-            app._recovery_coordinator.cancel_provider_operation_for_interruption
+            app._model_completion_recovery.cancel_provider_operation_for_interruption
         )
 
         async def capture_context(*args: Any, **kwargs: Any):
@@ -7513,7 +7515,7 @@ def test_offline_interruption_keeps_provider_frozen_across_status_transition(
             return authority
 
         monkeypatch.setattr(
-            app._recovery_coordinator,
+            app._model_completion_recovery,
             "cancel_provider_operation_for_interruption",
             capture_context,
         )

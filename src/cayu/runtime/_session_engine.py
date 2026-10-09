@@ -38,8 +38,14 @@ from cayu.runtime._execution_profile_continuation import (
     _execution_profile_provider_options,
     _execution_profile_structured_output,
 )
+from cayu.runtime._model_completion_contracts import (
+    ModelCompletionManualRecoveryRequired,
+)
+from cayu.runtime._model_completion_recovery import ModelCompletionRecovery
 from cayu.runtime._model_policy import PolicySelection
 from cayu.runtime._policy_wire import decode as decode_policy_evidence
+from cayu.runtime._structured_output_tool_round import has_recoverable_structured_output_round
+from cayu.runtime._user_input_recovery_evidence import UserInputRecoveryEvidence
 from cayu.runtime._work_attempt_invocation import (
     _WorkAttemptRecoveryAlreadyActive,
     _WorkAttemptRuntimeAuthority,
@@ -467,7 +473,6 @@ from cayu.runtime._producer_execution import _ProducerExecution
 from cayu.runtime._provider_operation_start_owner import is_ambiguous_provider_operation_start_error
 from cayu.runtime._recovery_coordinator import (
     _INCOMPLETE_RECOVERY_CLAIM_LEASE,
-    ModelCompletionManualRecoveryRequired,
     RecoveryAbandonedSessionRequest,
     RecoveryCoordinator,
     RecoverySessionRunRequest,
@@ -4751,6 +4756,8 @@ class SessionEngine:
         model_step_executor: ModelStepExecutor,
         assistant_model_publication: AssistantModelPublication,
         execution_profile_continuation: ExecutionProfileContinuation,
+        model_completion_recovery: ModelCompletionRecovery,
+        user_input_evidence: UserInputRecoveryEvidence,
         request_footprint: RequestFootprintConfig,
         tool_round_executor: ToolRoundExecutor,
         recovery_coordinator: RecoveryCoordinator,
@@ -4842,6 +4849,8 @@ class SessionEngine:
             "execution_profile_process_identity",
         )
         self._execution_profile_continuation = execution_profile_continuation
+        self._model_completion_recovery = model_completion_recovery
+        self._user_input_evidence = user_input_evidence
         self._detached_session_operation_tasks: set[asyncio.Task[Any]] = set()
         self._session_operation_failures = LateFailures("Final session accounting")
 
@@ -10991,7 +11000,10 @@ class SessionEngine:
             return False
         # Stop intent is not quiescence. Model-stage publication and the existing
         # checkpoint guards retain uncertain external work with its current owner.
-        if await self._recovery_coordinator.load_model_completion_boundary(session) is not None:
+        if (
+            await self._model_completion_recovery.load_model_completion_boundary(session)
+            is not None
+        ):
             return False
         try:
             _reject_unresumable_session_checkpoint(
@@ -11019,7 +11031,7 @@ class SessionEngine:
         if admission.execution_entry is None or admission.execution_stop is not None:
             return False
         session, checkpoint = await self._load_work_attempt_execution_snapshot(admission)
-        active = await self._recovery_coordinator.load_model_completion_boundary(session)
+        active = await self._model_completion_recovery.load_model_completion_boundary(session)
         if active is not None:
             stage = active.stage
             if stage.state == "in_flight":
@@ -11029,7 +11041,9 @@ class SessionEngine:
                     and recovery_context.execution_profile_fingerprint
                     == admission.source_execution_profile_fingerprint
                     and stage.source_run_epoch <= session.run_epoch
-                    and await self._recovery_coordinator.has_recoverable_provider_operation(stage)
+                    and await self._model_completion_recovery.has_recoverable_provider_operation(
+                        stage
+                    )
                 )
             if stage.state != "completed" or stage.publication is None:
                 return False
@@ -11074,9 +11088,7 @@ class SessionEngine:
                     interaction_id=admission.interaction_id,
                     source_run_epoch=stage.source_run_epoch,
                 )
-                if self._recovery_coordinator.has_recoverable_structured_output_round(
-                    pending_round
-                ):
+                if has_recoverable_structured_output_round(pending_round):
                     return True
                 if active is not None:
                     return False
@@ -18620,7 +18632,7 @@ class SessionEngine:
                 # delegated interaction; do not supersede or re-answer the gate.
                 interrupted_pending_user_input = None
             if interrupted_pending_user_input is not None:
-                await self._recovery_coordinator._require_exact_user_input_open_receipt(
+                await self._user_input_evidence.require_exact_user_input_open_receipt(
                     session=loaded_session,
                     pending=interrupted_pending_user_input,
                 )
@@ -18628,9 +18640,11 @@ class SessionEngine:
                 loaded_session.id,
                 default={},
             )
-            retained_supersession = await self._validated_user_input_supersession_interrupt_payload(
-                session=loaded_session,
-                pending_interrupt_payload=pending_interrupt_payload,
+            retained_supersession = (
+                await self._user_input_evidence.validated_user_input_supersession_interrupt_payload(
+                    session=loaded_session,
+                    pending_interrupt_payload=pending_interrupt_payload,
+                )
             )
             if retained_supersession is not None:
                 if (
@@ -18760,7 +18774,7 @@ class SessionEngine:
                 yield existing_interrupt_event
                 return
             adopted_user_input_interrupt_payload = (
-                await self._validated_user_input_supersession_interrupt_payload(
+                await self._user_input_evidence.validated_user_input_supersession_interrupt_payload(
                     session=loaded_session,
                     pending_interrupt_payload=pending_interrupt_payload,
                 )
@@ -18842,11 +18856,11 @@ class SessionEngine:
                 return None, None
             interrupt_checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
             if invocation_terminal_decision_from_checkpoint(interrupt_checkpoint) is None:
-                active_model = await self._recovery_coordinator.load_model_completion_boundary(
+                active_model = await self._model_completion_recovery.load_model_completion_boundary(
                     loaded_session
                 )
                 if active_model is not None and (
-                    await self._recovery_coordinator.has_recoverable_provider_operation(
+                    await self._model_completion_recovery.has_recoverable_provider_operation(
                         active_model.stage
                     )
                 ):
@@ -19156,7 +19170,7 @@ class SessionEngine:
                     return
                 raise TimeoutError(f"Session interruption is still finalizing: {session.id}")
             provider_operation_profile = await finalization.await_operation(
-                lambda: self._recovery_coordinator.cancel_provider_operation_for_interruption(
+                lambda: self._model_completion_recovery.cancel_provider_operation_for_interruption(
                     session,
                     registered_agent=registered_agent,
                     registered_provider=registered_provider,
@@ -20238,7 +20252,7 @@ class SessionEngine:
         # concurrent checkpoint update cannot bypass the guard.
         if request.failover is not None:
             recovery_checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
-            recovery_stage = await self._recovery_coordinator.load_model_completion_boundary(
+            recovery_stage = await self._model_completion_recovery.load_model_completion_boundary(
                 loaded_session
             )
             if (
@@ -20295,7 +20309,7 @@ class SessionEngine:
         # repair and advance the durable run epoch.
         model_failover: execution_profile_admission.ModelFailoverProfileResolution | None = None
         active_model_completion_boundary = (
-            await self._recovery_coordinator.load_model_completion_boundary(loaded_session)
+            await self._model_completion_recovery.load_model_completion_boundary(loaded_session)
         )
         if active_model_completion_boundary is None:
             pending_model_completion = False
@@ -20320,7 +20334,7 @@ class SessionEngine:
             continuing_execution_profile_snapshot = continuing_profile_resolution.snapshot
             model_failover = continuing_profile_resolution.model_failover
             pending_model_completion = (
-                await self._recovery_coordinator.preflight_model_completion_boundary(
+                await self._model_completion_recovery.preflight_model_completion_boundary(
                     loaded_session,
                     registered_provider=registered_provider,
                     active_stage=active_model_completion_boundary,
@@ -21244,12 +21258,14 @@ class SessionEngine:
                     yield targeted_tool_grant_event_record
             for reconstructed_event in reconstructed_targeted_tool_grant_events:
                 yield reconstructed_event
-            model_boundary = await self._recovery_coordinator.reconcile_model_completion_boundary(
-                session,
-                invocation_context=invocation_context,
-                registered_agent=registered_agent,
-                registered_provider=registered_provider,
-                registered_environment=registered_environment,
+            model_boundary = (
+                await self._model_completion_recovery.reconcile_model_completion_boundary(
+                    session,
+                    invocation_context=invocation_context,
+                    registered_agent=registered_agent,
+                    registered_provider=registered_provider,
+                    registered_environment=registered_environment,
+                )
             )
             session = model_boundary.session
             for recovery_event in model_boundary.recovery_events:
@@ -24228,12 +24244,14 @@ class SessionEngine:
             if limits.scope == "run" and has_run_limits(limits) and run_limit_accounting is None:
                 run_baseline = await self._run_limit_controller.session_usage_summary(session.id)
 
-            model_boundary = await self._recovery_coordinator.reconcile_model_completion_boundary(
-                session,
-                invocation_context=invocation_context,
-                registered_agent=registered_agent,
-                registered_provider=registered_provider,
-                registered_environment=registered_environment,
+            model_boundary = (
+                await self._model_completion_recovery.reconcile_model_completion_boundary(
+                    session,
+                    invocation_context=invocation_context,
+                    registered_agent=registered_agent,
+                    registered_provider=registered_provider,
+                    registered_environment=registered_environment,
+                )
             )
             session = model_boundary.session
             recovered_assistant_step: AssistantStepResult | None = None
@@ -24261,14 +24279,12 @@ class SessionEngine:
                     # effect reconciliation and fail-closed policy recovery.
                     # Neither case reconstructs tool calls for fresh execution.
                     if model_boundary.closed_tool_receipt is not None:
-                        recovered_structured_events = (
-                            await self._recovery_coordinator._load_closed_structured_output_events(
-                                session,
-                                stage,
-                                invocation_context,
-                                model_boundary.closed_tool_receipt,
-                                expected_spec=recovered_semantics.structured_output,
-                            )
+                        recovered_structured_events = await self._model_completion_recovery.load_closed_structured_output_events(
+                            session,
+                            stage,
+                            invocation_context,
+                            model_boundary.closed_tool_receipt,
+                            expected_spec=recovered_semantics.structured_output,
                         )
                     completion_event = model_boundary.completion_event
                     completed_step = (
@@ -29750,19 +29766,6 @@ class SessionEngine:
                 raise ValueError("Provider cancellation interruption request ID is missing.")
             payload["provider_cancellation_failures"] = [dict(item) for item in failures]
         return payload
-
-    async def _validated_user_input_supersession_interrupt_payload(
-        self,
-        *,
-        session: Session,
-        pending_interrupt_payload: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        return await (
-            self._recovery_coordinator._validated_user_input_supersession_interrupt_payload(
-                session=session,
-                pending_interrupt_payload=pending_interrupt_payload,
-            )
-        )
 
     async def _clear_pending_session_interrupt(
         self,

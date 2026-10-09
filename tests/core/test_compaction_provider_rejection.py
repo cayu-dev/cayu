@@ -24,7 +24,7 @@ from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent, OpenAIAPIError
 from cayu.providers.retry_policy import RetryPolicy
-from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
+from cayu.runtime._model_completion_contracts import ModelCompletionManualRecoveryRequired
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions.base import RunRequest, SessionStore
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest

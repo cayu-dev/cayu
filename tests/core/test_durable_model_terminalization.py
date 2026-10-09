@@ -200,7 +200,7 @@ def test_recovery_plan_executes_terminalization_without_registrations(tmp_path):
     ["incarnation", "epoch", "stage", "dependent_checkpoint", "undispatched", "accounting"],
 )
 def test_terminalization_rejects_invalid_authority_without_mutation(mismatch):
-    from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
+    from cayu.runtime._model_completion_contracts import ModelCompletionManualRecoveryRequired
     from cayu.sessions.base import SessionRunFenced
 
     async def exercise():
