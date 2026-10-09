@@ -8,6 +8,7 @@ import sys
 import threading
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from tests.core._execution_profile_fixtures import (
@@ -16,6 +17,7 @@ from tests.core._execution_profile_fixtures import (
     runtime_interaction_started_event,
 )
 
+import cayu
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.collaboration._capabilities import CapabilityDescriptor
@@ -86,6 +88,29 @@ from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.exposure import tool_capability_ceiling_from_session_metadata
 from cayu.tools.user_input import UserInputTool
 from cayu.vaults.redaction import SecretRedactor
+
+
+def _run_continuation_child(script: str, *args: str) -> subprocess.CompletedProcess[str]:
+    package_file = Path(cayu.__file__).resolve()
+    repository = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        (str(package_file.parent.parent), str(repository), env.get("PYTHONPATH", ""))
+    )
+    env["CAYU_CONTINUATION_TEST_PACKAGE_FILE"] = str(package_file)
+    import_check = (
+        "import os, cayu\n"
+        "from pathlib import Path\n"
+        "assert str(Path(cayu.__file__).resolve()) == "
+        "os.environ['CAYU_CONTINUATION_TEST_PACKAGE_FILE']\n"
+    )
+    return subprocess.run(
+        [sys.executable, "-c", import_check + script, *args],
+        cwd=repository,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
 
 
 class _QualifiedReceiver:
@@ -1587,15 +1612,7 @@ async def main():
 
 asyncio.run(main())
 """
-    env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(("src", ".", env.get("PYTHONPATH", "")))
-    completed = subprocess.run(
-        [sys.executable, "-c", child, str(path), ticket_json],
-        cwd=os.getcwd(),
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    completed = _run_continuation_child(child, str(path), ticket_json)
     # The child intentionally exits non-zero after the durable latch commit,
     # modeling a lost acknowledgement/process loss.  The parent must still
     # recover the committed latch from a fresh store instance.
@@ -2889,21 +2906,11 @@ async def main():
 
 asyncio.run(main())
 """
-    env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(("src", ".", env.get("PYTHONPATH", "")))
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            child,
-            str(path),
-            json.dumps(prepared.model_dump(mode="json"), separators=(",", ":")),
-            json.dumps(command.model_dump(mode="json"), separators=(",", ":")),
-        ],
-        cwd=os.getcwd(),
-        env=env,
-        capture_output=True,
-        text=True,
+    completed = _run_continuation_child(
+        child,
+        str(path),
+        json.dumps(prepared.model_dump(mode="json"), separators=(",", ":")),
+        json.dumps(command.model_dump(mode="json"), separators=(",", ":")),
     )
     assert completed.returncode == 0, completed.stderr
 
@@ -2979,20 +2986,10 @@ async def main():
 
 asyncio.run(main())
 """
-    env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(("src", ".", env.get("PYTHONPATH", "")))
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            child,
-            continuation_postgres_dsn,
-            json.dumps(ticket.model_dump(mode="json"), separators=(",", ":")),
-        ],
-        cwd=os.getcwd(),
-        env=env,
-        capture_output=True,
-        text=True,
+    completed = _run_continuation_child(
+        child,
+        continuation_postgres_dsn,
+        json.dumps(ticket.model_dump(mode="json"), separators=(",", ":")),
     )
     assert completed.returncode == 17, completed.stderr
 
