@@ -4545,8 +4545,8 @@ def test_failed_continuation_resume_cleanup_keeps_prevalidated_profile_object(
 
         coordinator = app._recovery_coordinator
         monkeypatch.setattr(
-            coordinator,
-            "_validate_execution_profile_continuation",
+            coordinator._execution_profile_continuation,
+            "validate",
             return_prevalidated_profile,
         )
         monkeypatch.setattr(coordinator, "_resume_interaction", fail_resume_interaction)

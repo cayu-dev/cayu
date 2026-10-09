@@ -39,6 +39,7 @@ from cayu.messages import Message, ToolCallPart, ToolResultPart
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
+from cayu.runtime import _execution_profile_continuation as execution_profile_continuation
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_engine as session_engine
 from cayu.runtime import _tool_execution as tool_execution
@@ -234,7 +235,7 @@ def _test_execution_profile(
     return execution_profile_admission.resolve_execution_profile_identity(
         registered_agent=profile_app._agents["assistant"],
         runtime_name="cayu",
-        runtime_version=session_engine._runtime_version(),
+        runtime_version=execution_profile_continuation._runtime_version(),
         provider_name=provider_name,
         model="fake-model",
         durable_system_prompt=None,

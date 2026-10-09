@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import partial
 from hashlib import sha256
-from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 from uuid import UUID, uuid4, uuid5
 
 from cayu.runtime._continuation_environment import ContinuationEnvironment
@@ -36,6 +36,7 @@ from cayu.runtime._durable_tool_round import (
 from cayu.runtime._durable_tool_round import (
     _interrupted_tool_round_results as _interrupted_tool_round_results,
 )
+from cayu.runtime._execution_profile_continuation import ExecutionProfileContinuation
 from cayu.runtime._manual_recovery_publication import (
     ManualRecoveryPublication,
     reconcile_manual_recovery_persistence,
@@ -1517,30 +1518,6 @@ RegisteredEnvironmentResolver = Callable[[str | None], runtime_records.Registere
 BudgetPolicyResolver = Callable[[], BudgetPolicy | None]
 
 
-class ExecutionProfileContinuationValidator(Protocol):
-    def __call__(
-        self,
-        session: Session,
-        checkpoint: dict[str, Any] | None,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_provider: runtime_records.RegisteredProvider,
-        request_loop_policies: tuple[LoopPolicy, ...] | None = None,
-        frozen_candidate_profile: ExecutionProfileIdentity | None = None,
-        *,
-        budget_policy: BudgetPolicy | None,
-        request_budget_limits: tuple[BudgetLimit, ...] = (),
-        structured_output: StructuredOutputSpec | None = None,
-        thinking: ThinkingConfig | None = None,
-        max_steps: int | None = None,
-        limits: RunLimits | None = None,
-        retry_policy: RetryPolicy | None = None,
-        invocation_semantics_available: bool = False,
-        require_open_interaction: bool = True,
-        additional_profile_fingerprints: tuple[str, ...] = (),
-        record_rejection: bool = True,
-    ) -> Awaitable[ActiveInvocationExecutionProfile]: ...
-
-
 RecoveryInterruptionStream = Callable[[RecoveryInterruptionRequest], AsyncIterator[Event]]
 PendingSessionInterruptCheckpoint = Callable[[dict[str, Any], datetime], CheckpointTransform]
 AbandonedTurnCompleted = Callable[[RecoveryAbandonedTurnRequest], Awaitable[Session]]
@@ -1662,7 +1639,7 @@ class RecoveryCoordinator:
         resolve_registered_provider: RegisteredProviderResolver,
         resolve_registered_environment: RegisteredEnvironmentResolver,
         resolve_budget_policy: BudgetPolicyResolver,
-        validate_execution_profile_continuation: ExecutionProfileContinuationValidator,
+        execution_profile_continuation: ExecutionProfileContinuation,
         interrupt_session_for_recovery: RecoveryInterruptionStream,
         pending_session_interrupt_checkpoint: PendingSessionInterruptCheckpoint,
         abandoned_turn_completed: AbandonedTurnCompleted,
@@ -1703,7 +1680,7 @@ class RecoveryCoordinator:
         self._resolve_registered_provider = resolve_registered_provider
         self._resolve_registered_environment = resolve_registered_environment
         self._resolve_budget_policy = resolve_budget_policy
-        self._validate_execution_profile_continuation = validate_execution_profile_continuation
+        self._execution_profile_continuation = execution_profile_continuation
         self._interrupt_session_for_recovery = interrupt_session_for_recovery
         self._pending_session_interrupt_checkpoint = pending_session_interrupt_checkpoint
         self._abandoned_turn_completed = abandoned_turn_completed
@@ -2312,12 +2289,12 @@ class RecoveryCoordinator:
             if invocation_context is None
             else invocation_context.budget_policy
         )
-        snapshot = await self._validate_execution_profile_continuation(
-            session,
-            checkpoint,
-            registered_agent,
-            registered_provider,
-            None,
+        snapshot = await self._execution_profile_continuation.validate(
+            session=session,
+            checkpoint=checkpoint,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            request_loop_policies=None,
             budget_policy=budget_policy,
         )
         # The validator checked every candidate. Do not replace those collaborators
@@ -5604,12 +5581,12 @@ class RecoveryCoordinator:
         validate_gate_restoration_request(record, request, redactor=self._secret_redactor)
         checkpoint = await self._session_store.load_checkpoint(session.id)
         semantics = attached.request
-        snapshot = await self._validate_execution_profile_continuation(
-            session,
-            checkpoint,
-            self._resolve_registered_agent(session.agent_name),
-            self._resolve_registered_provider(session.provider_name),
-            request.loop_policies,
+        snapshot = await self._execution_profile_continuation.validate(
+            session=session,
+            checkpoint=checkpoint,
+            registered_agent=self._resolve_registered_agent(session.agent_name),
+            registered_provider=self._resolve_registered_provider(session.provider_name),
+            request_loop_policies=request.loop_policies,
             budget_policy=copy_budget_policy(self._resolve_budget_policy()),
             request_budget_limits=semantics.budget_limits,
             structured_output=semantics.structured_output,
@@ -5655,12 +5632,12 @@ class RecoveryCoordinator:
         registered_agent = self._resolve_registered_agent(session.agent_name)
         registered_provider = self._resolve_registered_provider(session.provider_name)
         budget_policy_snapshot = copy_budget_policy(self._resolve_budget_policy())
-        execution_profile_snapshot = await self._validate_execution_profile_continuation(
-            session,
-            checkpoint,
-            registered_agent,
-            registered_provider,
-            request_loop_policies,
+        execution_profile_snapshot = await self._execution_profile_continuation.validate(
+            session=session,
+            checkpoint=checkpoint,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            request_loop_policies=request_loop_policies,
             budget_policy=budget_policy_snapshot,
             request_budget_limits=semantics.budget_limits,
             structured_output=semantics.structured_output,
@@ -6397,11 +6374,11 @@ class RecoveryCoordinator:
                 )
                 checkpoint = await self._session_store.load_checkpoint(current_session.id)
                 budget_policy_snapshot = copy_budget_policy(self._resolve_budget_policy())
-                execution_profile_snapshot = await self._validate_execution_profile_continuation(
-                    current_session,
-                    checkpoint,
-                    registered_agent,
-                    registered_provider,
+                execution_profile_snapshot = await self._execution_profile_continuation.validate(
+                    session=current_session,
+                    checkpoint=checkpoint,
+                    registered_agent=registered_agent,
+                    registered_provider=registered_provider,
                     budget_policy=budget_policy_snapshot,
                     require_open_interaction=False,
                     record_rejection=False,
@@ -7254,11 +7231,11 @@ class RecoveryCoordinator:
                 raise RuntimeError(
                     "Provider-operation fallback requires durable model-completion context."
                 )
-        execution_profile_snapshot = await self._validate_execution_profile_continuation(
-            loaded_session,
-            checkpoint,
-            registered_agent,
-            registered_provider,
+        execution_profile_snapshot = await self._execution_profile_continuation.validate(
+            session=loaded_session,
+            checkpoint=checkpoint,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
             budget_policy=budget_policy_snapshot,
             request_budget_limits=(
                 () if recovery_context is None else recovery_context.budget_limits
@@ -8278,12 +8255,12 @@ class RecoveryCoordinator:
             )
         registered_provider = self._resolve_registered_provider(loaded_session.provider_name)
         budget_policy_snapshot = copy_budget_policy(self._resolve_budget_policy())
-        execution_profile_snapshot = await self._validate_execution_profile_continuation(
-            loaded_session,
-            checkpoint,
-            registered_agent,
-            registered_provider,
-            request_loop_policies,
+        execution_profile_snapshot = await self._execution_profile_continuation.validate(
+            session=loaded_session,
+            checkpoint=checkpoint,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            request_loop_policies=request_loop_policies,
             budget_policy=budget_policy_snapshot,
             request_budget_limits=invocation_semantics.budget_limits,
             structured_output=invocation_semantics.structured_output,
@@ -8361,13 +8338,13 @@ class RecoveryCoordinator:
                 pending_calls=pending_round.tool_calls,
                 tool_call_id=request.tool_call_id,
             )
-            execution_profile_snapshot = await self._validate_execution_profile_continuation(
-                loaded_session,
-                checkpoint,
-                registered_agent,
-                registered_provider,
-                request_loop_policies,
-                execution_profile_snapshot.profile,
+            execution_profile_snapshot = await self._execution_profile_continuation.validate(
+                session=loaded_session,
+                checkpoint=checkpoint,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                request_loop_policies=request_loop_policies,
+                frozen_candidate_profile=execution_profile_snapshot.profile,
                 budget_policy=budget_policy_snapshot,
                 request_budget_limits=invocation_semantics.budget_limits,
                 structured_output=invocation_semantics.structured_output,
@@ -17606,11 +17583,11 @@ class RecoveryCoordinator:
                     )
                 execution_profile_snapshot = active_invocation_profile
             else:
-                execution_profile_snapshot = await self._validate_execution_profile_continuation(
-                    session,
-                    checkpoint,
-                    registered_agent,
-                    registered_provider,
+                execution_profile_snapshot = await self._execution_profile_continuation.validate(
+                    session=session,
+                    checkpoint=checkpoint,
+                    registered_agent=registered_agent,
+                    registered_provider=registered_provider,
                     budget_policy=budget_policy_snapshot,
                     request_loop_policies=(
                         None

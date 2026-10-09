@@ -26972,11 +26972,11 @@ def test_session_store_conformance_repairs_exact_legacy_queued_handoff(
             fresh = CayuApp(session_store=store, enable_logging=False)
             fresh.register_provider(provider, default=True)
             fresh.register_agent(AgentSpec(name="assistant", model="fake-model"))
-            repaired = await fresh._validate_execution_profile_continuation_for_recovery(
-                session,
-                checkpoint,
-                fresh._get_registered_agent(session.agent_name),
-                fresh._get_registered_provider(session.provider_name),
+            repaired = await fresh._execution_profile_continuation.validate(
+                session=session,
+                checkpoint=checkpoint,
+                registered_agent=fresh._get_registered_agent(session.agent_name),
+                registered_provider=fresh._get_registered_provider(session.provider_name),
                 budget_policy=None,
             )
             assert repaired.interaction_id == starts[1].interaction_id

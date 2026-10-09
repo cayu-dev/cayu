@@ -75,7 +75,6 @@ from cayu.artifacts.resources import (
 )
 from cayu.budgets.base import (
     BudgetLedger,
-    BudgetLimit,
     BudgetPolicy,
     BudgetStore,
     InMemoryBudgetLedger,
@@ -89,7 +88,6 @@ from cayu.budgets.pricing import (
     SessionCostSummary,
     SessionCostTotals,
 )
-from cayu.budgets.run_limits import RunLimits
 from cayu.budgets.usage import (
     CausalBudgetUsageSummary,
     SessionUsageSummary,
@@ -271,10 +269,6 @@ from cayu.context.footprints import (
     RequestFootprintConfig,
     copy_request_footprint_config,
 )
-from cayu.context.structured_output import (
-    StructuredOutputSpec,
-)
-from cayu.context.thinking import ThinkingConfig
 from cayu.deadlines import (
     ExecutionDeadline,
     current_execution_deadline,
@@ -389,6 +383,7 @@ from cayu.runtime._event_projection import (
 )
 from cayu.runtime._event_watcher_delivery import EventWatcherSupervisor
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._execution_profile_continuation import ExecutionProfileContinuation
 from cayu.runtime._execution_profile_identity_validation import (
     copy_secret_free_execution_profile_behavior_identity,
 )
@@ -556,7 +551,6 @@ from cayu.runtime.tool_effects import (
 )
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions._execution_profile_checkpoint import (
-    ActiveInvocationExecutionProfile,
     SessionExecutionProfiles,
     execution_profile_from_session_metadata,
     session_execution_profiles,
@@ -1472,6 +1466,18 @@ class CayuApp:
         self._session_control = SessionControl[SessionUsageTracker](
             session_store=self._runtime_session_store, execution_config=session_execution
         )
+        self._execution_profile_continuation = ExecutionProfileContinuation(
+            session_store=self._runtime_session_store,
+            event_writer=self._event_writer,
+            secret_redactor=self._secret_redactor,
+            clock=self._clock,
+            execution_profile_process_identity=self._execution_profile_process_identity,
+            get_registered_environment_for_session=self._get_registered_environment_for_session,
+            get_registered_provider=self._get_registered_provider,
+            runtime_hooks=self._runtime_hooks,
+            loop_policies=self._loop_policies,
+            loop_policy_execution_profile_identities=self._loop_policy_execution_profile_identities,
+        )
         self._provider_operation_cancellation_lifecycle = ProviderOperationCancellationLifecycle()
         self._assistant_model_publication = AssistantModelPublication(
             session_store=self._runtime_session_store,
@@ -1563,9 +1569,7 @@ class CayuApp:
             resolve_registered_provider=self._get_registered_provider,
             resolve_registered_environment=self._get_registered_environment_for_session,
             resolve_budget_policy=lambda: self.budget_policy,
-            validate_execution_profile_continuation=(
-                self._validate_execution_profile_continuation_for_recovery
-            ),
+            execution_profile_continuation=self._execution_profile_continuation,
             interrupt_session_for_recovery=self._interrupt_session_for_recovery,
             pending_session_interrupt_checkpoint=(
                 self._pending_session_interrupt_checkpoint_for_recovery
@@ -1615,6 +1619,7 @@ class CayuApp:
             session_control=self._session_control,
             model_step_executor=self._model_step_executor,
             assistant_model_publication=self._assistant_model_publication,
+            execution_profile_continuation=self._execution_profile_continuation,
             request_footprint=self._request_footprint,
             tool_round_executor=self._tool_round_executor,
             recovery_coordinator=self._recovery_coordinator,
@@ -8881,47 +8886,6 @@ class CayuApp:
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:
                 yield item
-
-    async def _validate_execution_profile_continuation_for_recovery(
-        self,
-        session: Session,
-        checkpoint: dict[str, Any] | None,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_provider: runtime_records.RegisteredProvider,
-        request_loop_policies: tuple[LoopPolicy, ...] | None = None,
-        frozen_candidate_profile: ExecutionProfileIdentity | None = None,
-        *,
-        budget_policy: BudgetPolicy | None,
-        request_budget_limits: tuple[BudgetLimit, ...] = (),
-        structured_output: StructuredOutputSpec | None = None,
-        thinking: ThinkingConfig | None = None,
-        max_steps: int | None = None,
-        limits: RunLimits | None = None,
-        retry_policy: RetryPolicy | None = None,
-        invocation_semantics_available: bool = False,
-        require_open_interaction: bool = True,
-        additional_profile_fingerprints: tuple[str, ...] = (),
-        record_rejection: bool = True,
-    ) -> ActiveInvocationExecutionProfile:
-        return await self._session_engine.validate_execution_profile_continuation(
-            session=session,
-            checkpoint=checkpoint,
-            registered_agent=registered_agent,
-            registered_provider=registered_provider,
-            request_loop_policies=request_loop_policies,
-            budget_policy=copy_budget_policy(budget_policy),
-            request_budget_limits=request_budget_limits,
-            structured_output=structured_output,
-            thinking=thinking,
-            max_steps=max_steps,
-            limits=limits,
-            retry_policy=retry_policy,
-            invocation_semantics_available=invocation_semantics_available,
-            frozen_candidate_profile=frozen_candidate_profile,
-            require_open_interaction=require_open_interaction,
-            additional_profile_fingerprints=additional_profile_fingerprints,
-            record_rejection=record_rejection,
-        )
 
     def _emit_recovery_terminal_event_with_hooks(
         self,

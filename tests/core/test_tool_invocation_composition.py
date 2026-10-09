@@ -52,6 +52,7 @@ from cayu.runtime._paused_tool_round import PausedToolRound, ApprovalRoundPause,
 from cayu.runtime._continuation_environment import ContinuationEnvironment
 from cayu.runtime._manual_recovery_publication import ManualRecoveryPublication
 from cayu.runtime._assistant_model_publication import AssistantModelPublication
+from cayu.runtime._execution_profile_continuation import ExecutionProfileContinuation
 from cayu.runtime._runtime_records import ToolCallRequest
 from cayu.runtime._tool_execution import run_tool
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec

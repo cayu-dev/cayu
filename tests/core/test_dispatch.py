@@ -19,7 +19,6 @@ from tests.core._execution_profile_fixtures import (
     runtime_interaction_started_event,
 )
 
-import cayu.runtime._session_engine as session_engine_module
 from cayu._exception_groups import exception_cause, iter_exception_tree
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
@@ -36,6 +35,7 @@ from cayu.events import (
 from cayu.messages import Message, ProviderStatePart, TextPart
 from cayu.observability.hooks import RuntimeHook, RuntimeHookContext
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runtime import _execution_profile_continuation as execution_profile_continuation
 from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
 from cayu.runtime._durable_worker_loop import DurableWorkerMetrics
 from cayu.runtime._recovery_coordinator import ModelCompletionBoundaryReconciliation
@@ -3416,7 +3416,9 @@ def test_queued_dispatch_preserves_compatible_active_profile_after_release(
         store = InMemorySessionStore()
         tasks = InMemoryTaskStore()
         dispatcher = TaskStoreDispatcher(tasks)
-        monkeypatch.setattr(session_engine_module, "_runtime_version", lambda: "old-runtime")
+        monkeypatch.setattr(
+            execution_profile_continuation, "_runtime_version", lambda: "old-runtime"
+        )
         producer = _configured_app(
             session_store=store,
             task_store=tasks,
@@ -3436,7 +3438,9 @@ def test_queued_dispatch_preserves_compatible_active_profile_after_release(
         assert session is not None
         baseline_profile = execution_profile_from_session_metadata(session.metadata)
 
-        monkeypatch.setattr(session_engine_module, "_runtime_version", lambda: "new-runtime")
+        monkeypatch.setattr(
+            execution_profile_continuation, "_runtime_version", lambda: "new-runtime"
+        )
         policy = CompatibleProfilePolicy()
         provider = BlockingFirstProvider()
         worker = CayuApp(

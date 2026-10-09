@@ -1410,7 +1410,7 @@ def profiled_session_identity(
             invocation_loop_policies=invocation_loop_policies,
             invocation_loop_policy_identities=invocation_loop_policy_identities,
             invocation_loop_policy_instance_identities=(
-                engine._request_loop_policy_instance_identities(
+                engine._execution_profile_continuation.request_loop_policy_instance_identities(
                     invocation_loop_policies
                 )
             ),

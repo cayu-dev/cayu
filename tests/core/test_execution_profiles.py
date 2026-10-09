@@ -105,6 +105,7 @@ from cayu.providers.retry_policy import RetryPolicy
 from cayu.runners.base import ExecCommand, ExecResult, Runner
 from cayu.runners.docker import DockerRunner
 from cayu.runners.local import LocalRunner
+from cayu.runtime import _execution_profile_continuation as execution_profile_continuation
 from cayu.runtime._event_projection import (
     prepare_new_runtime_event,
     project_persisted_runtime_event,
@@ -2508,7 +2509,7 @@ def test_runtime_owned_private_option_commitments_survive_secret_collision() -> 
     first_options = {"fake": {"temperature": 0.25, "private_route": "private-route-alpha"}}
     second_options = {"fake": {"temperature": 0.25, "private_route": "private-route-beta"}}
     projected_options = [
-        session_engine_module._execution_profile_provider_options(
+        execution_profile_continuation._execution_profile_provider_options(
             options,
             process_identity=process_identity,
         )[0]
@@ -5955,7 +5956,7 @@ def test_authorized_runtime_build_adoption_advances_durable_identity_atomically(
             artifact_digest="b" * 64,
             source_revision="revision-b",
         )
-        monkeypatch.setattr(session_engine_module, "_runtime_version", lambda: "0.4.0")
+        monkeypatch.setattr(execution_profile_continuation, "_runtime_version", lambda: "0.4.0")
         monkeypatch.setattr(
             session_engine_module,
             "current_runtime_build_provenance",
@@ -5983,7 +5984,7 @@ def test_authorized_runtime_build_adoption_advances_durable_identity_atomically(
             assert before is not None
             baseline = before.metadata[EXECUTION_PROFILE_METADATA_KEY]["baseline"]
 
-            monkeypatch.setattr(session_engine_module, "_runtime_version", lambda: "0.4.1")
+            monkeypatch.setattr(execution_profile_continuation, "_runtime_version", lambda: "0.4.1")
             monkeypatch.setattr(
                 session_engine_module,
                 "current_runtime_build_provenance",
@@ -6071,7 +6072,7 @@ def test_authorized_current_child_fork_adopts_complete_runtime_identity_and_resu
             artifact_kind=RuntimeBuildArtifactKind.OTHER,
             artifact_digest="b" * 64,
         )
-        monkeypatch.setattr(session_engine_module, "_runtime_version", lambda: "0.4.0")
+        monkeypatch.setattr(execution_profile_continuation, "_runtime_version", lambda: "0.4.0")
         monkeypatch.setattr(
             session_engine_module,
             "current_runtime_build_provenance",
@@ -6096,7 +6097,7 @@ def test_authorized_current_child_fork_adopts_complete_runtime_identity_and_resu
                 )
             )
 
-            monkeypatch.setattr(session_engine_module, "_runtime_version", lambda: "0.4.1")
+            monkeypatch.setattr(execution_profile_continuation, "_runtime_version", lambda: "0.4.1")
             monkeypatch.setattr(
                 session_engine_module,
                 "current_runtime_build_provenance",
@@ -7855,7 +7856,9 @@ def test_explicit_policy_can_classify_non_authority_drift_as_compatible(
 ) -> None:
     async def exercise() -> None:
         store = InMemorySessionStore()
-        monkeypatch.setattr(session_engine_module, "_runtime_version", lambda: "old-runtime")
+        monkeypatch.setattr(
+            execution_profile_continuation, "_runtime_version", lambda: "old-runtime"
+        )
         original_app = CayuApp(session_store=store, enable_logging=False)
         original_app.register_provider(_completed_provider(), default=True)
         original_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -7869,7 +7872,9 @@ def test_explicit_policy_can_classify_non_authority_drift_as_compatible(
             )
         )
 
-        monkeypatch.setattr(session_engine_module, "_runtime_version", lambda: "new-runtime")
+        monkeypatch.setattr(
+            execution_profile_continuation, "_runtime_version", lambda: "new-runtime"
+        )
         policy = RecordingExecutionProfilePolicy(
             ExecutionProfilePolicyResult(
                 action=ExecutionProfilePolicyAction.COMPATIBLE_REUSE,
@@ -7907,7 +7912,9 @@ def test_versioned_policy_can_replace_prior_default_rejection(
 ) -> None:
     async def exercise() -> None:
         store = InMemorySessionStore()
-        monkeypatch.setattr(session_engine_module, "_runtime_version", lambda: "old-runtime")
+        monkeypatch.setattr(
+            execution_profile_continuation, "_runtime_version", lambda: "old-runtime"
+        )
         original_app = CayuApp(session_store=store, enable_logging=False)
         original_app.register_provider(_completed_provider(), default=True)
         original_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -7921,7 +7928,9 @@ def test_versioned_policy_can_replace_prior_default_rejection(
             )
         )
 
-        monkeypatch.setattr(session_engine_module, "_runtime_version", lambda: "new-runtime")
+        monkeypatch.setattr(
+            execution_profile_continuation, "_runtime_version", lambda: "new-runtime"
+        )
         rejected_app = CayuApp(session_store=store, enable_logging=False)
         rejected_app.register_provider(_completed_provider(), default=True)
         rejected_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -7986,7 +7995,9 @@ def test_explicit_policy_authority_denial_cannot_admit_non_authority_drift(
 ) -> None:
     async def exercise() -> None:
         store = InMemorySessionStore()
-        monkeypatch.setattr(session_engine_module, "_runtime_version", lambda: "old-runtime")
+        monkeypatch.setattr(
+            execution_profile_continuation, "_runtime_version", lambda: "old-runtime"
+        )
         original_app = CayuApp(session_store=store, enable_logging=False)
         original_app.register_provider(_completed_provider(), default=True)
         original_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -8002,7 +8013,9 @@ def test_explicit_policy_authority_denial_cannot_admit_non_authority_drift(
         before = await store.load("execution-profile-authority-denied")
         assert before is not None
 
-        monkeypatch.setattr(session_engine_module, "_runtime_version", lambda: "new-runtime")
+        monkeypatch.setattr(
+            execution_profile_continuation, "_runtime_version", lambda: "new-runtime"
+        )
         policy = RecordingExecutionProfilePolicy(
             ExecutionProfilePolicyResult(
                 action=ExecutionProfilePolicyAction.ADOPT,

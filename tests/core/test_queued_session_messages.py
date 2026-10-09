@@ -2170,11 +2170,11 @@ def test_fresh_runtime_repairs_only_exact_legacy_queued_handoff(
         fresh_runtime.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
         async def validate():
-            return await fresh_runtime._validate_execution_profile_continuation_for_recovery(
-                session,
-                checkpoint,
-                fresh_runtime._get_registered_agent(session.agent_name),
-                fresh_runtime._get_registered_provider(session.provider_name),
+            return await fresh_runtime._execution_profile_continuation.validate(
+                session=session,
+                checkpoint=checkpoint,
+                registered_agent=fresh_runtime._get_registered_agent(session.agent_name),
+                registered_provider=fresh_runtime._get_registered_provider(session.provider_name),
                 budget_policy=None,
             )
 
