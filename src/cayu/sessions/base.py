@@ -58,6 +58,7 @@ from cayu.sessions import _terminal_evidence as terminal_event_evidence
 from cayu.sessions import creation_fence
 from cayu.sessions import event_queries as event_query_rules
 from cayu.sessions import inspection as session_inspection_rules
+from cayu.sessions import messaging as session_messaging
 from cayu.sessions import queries as session_query_rules
 from cayu.sessions import records as session_record_rules
 from cayu.sessions import summaries as session_summary_rules
@@ -107,6 +108,29 @@ from cayu.sessions.lineage import SessionLineageResult as SessionLineageResult
 from cayu.sessions.lineage import copy_session_lineage_query as copy_session_lineage_query
 from cayu.sessions.lineage import decode_session_lineage_cursor as decode_session_lineage_cursor
 from cayu.sessions.lineage import encode_session_lineage_cursor as encode_session_lineage_cursor
+from cayu.sessions.messaging import (
+    SESSION_MESSAGE_CONTENT_MAX_BYTES as SESSION_MESSAGE_CONTENT_MAX_BYTES,
+)
+from cayu.sessions.messaging import (
+    SESSION_MESSAGE_DELIVERY_BATCH_LIMIT as SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
+)
+from cayu.sessions.messaging import (
+    SESSION_MESSAGE_QUEUE_STORAGE_VALUE_MAX_BYTES as SESSION_MESSAGE_QUEUE_STORAGE_VALUE_MAX_BYTES,
+)
+from cayu.sessions.messaging import EnqueueSessionMessageRequest as EnqueueSessionMessageRequest
+from cayu.sessions.messaging import EnqueueSessionMessageResult as EnqueueSessionMessageResult
+from cayu.sessions.messaging import SessionMessageActionResult as SessionMessageActionResult
+from cayu.sessions.messaging import SessionMessageDeliveryBatch as SessionMessageDeliveryBatch
+from cayu.sessions.messaging import SessionMessageDeliveryMode as SessionMessageDeliveryMode
+from cayu.sessions.messaging import SessionMessageInspection as SessionMessageInspection
+from cayu.sessions.messaging import SessionMessageInspectionRecord as SessionMessageInspectionRecord
+from cayu.sessions.messaging import SessionQueuedMessage as SessionQueuedMessage
+from cayu.sessions.messaging import SessionQueuedMessagesPending as SessionQueuedMessagesPending
+from cayu.sessions.messaging import (
+    copy_enqueue_session_message_request as copy_enqueue_session_message_request,
+)
+from cayu.sessions.messaging import enqueue_session_message_input as enqueue_session_message_input
+from cayu.sessions.messaging import queued_session_message_input as queued_session_message_input
 from cayu.sessions.pending_action_contracts import (
     DEFAULT_PENDING_ACTION_RESULT_MAX_BYTES as DEFAULT_PENDING_ACTION_RESULT_MAX_BYTES,
 )
@@ -598,19 +622,6 @@ from cayu.runtime.public_authority import (
     parse_public_authority_alias,
 )
 from cayu.runtime.service_manifest import RuntimeStoreDurability
-from cayu.runtime.session_message_lifecycle import (
-    SessionMessageActionRequest,
-    SessionMessageConditions,
-    SessionMessageConflict,
-    SessionMessageCursor,
-    SessionMessageQuery,
-    SessionMessageQueueStatus,
-    SessionMessageSource,
-    copy_session_message_action,
-    copy_session_message_conditions,
-    session_message_checkpoint_sha256,
-    session_message_rejection,
-)
 from cayu.runtime.tool_completion import ToolCompletionPolicy, copy_tool_completion_policy
 from cayu.sessions._execution_profile_checkpoint import (
     EXECUTION_PROFILE_METADATA_KEY,
@@ -683,6 +694,17 @@ from cayu.sessions.invocation import (
     copy_task_invocation,
     inherited_session_invocation,
     session_invocation_from_task,
+)
+from cayu.sessions.messaging import (
+    SessionMessageActionRequest,
+    SessionMessageConditions,
+    SessionMessageConflict,
+    SessionMessageQuery,
+    SessionMessageQueueStatus,
+    SessionMessageSource,
+    copy_session_message_action,
+    session_message_checkpoint_sha256,
+    session_message_rejection,
 )
 from cayu.tasks.creation import TaskInvocationSnapshot
 from cayu.tools.catalogue import CALL_TOOL_NAME
@@ -895,10 +917,6 @@ def portable_persisted_event_side_effect_error(value: object) -> str:
             return prefix.decode("utf-8") + suffix
         except UnicodeDecodeError:
             prefix = prefix[:-1]
-
-
-class SessionQueuedMessagesPending(RuntimeError):
-    """Terminalization lost a race to durable queued session input."""
 
 
 class SessionRuntimePublicationConflict(ValueError):
@@ -1552,13 +1570,6 @@ def _assert_session_run_epoch_value(session_id: str, current_run_epoch: int) -> 
 
 # Compaction guidance can carry a domain glossary or a list of facts to keep.
 COMPACTION_INSTRUCTIONS_MAX_CHARS = 32_768
-# Steering messages match server prompts: a 1 MiB request minus a JSON envelope.
-SESSION_MESSAGE_CONTENT_MAX_BYTES = 1024 * 1024 - 64 * 1024
-# Queue reads project a stored column inline only up to this size; larger
-# values are reported as an out-of-band digest (an unreadable record). Twice the
-# content limit leaves room for the typed message JSON envelope.
-SESSION_MESSAGE_QUEUE_STORAGE_VALUE_MAX_BYTES = 2 * SESSION_MESSAGE_CONTENT_MAX_BYTES
-SESSION_MESSAGE_DELIVERY_BATCH_LIMIT = 100
 MODEL_TARGET_PROJECTION_METADATA_KEY = "cayu:model_target_projection"
 MODEL_TARGET_PROJECTION_RECORD_TYPE = "cayu.model-target-projection"
 MODEL_TARGET_PROJECTION_SCHEMA_VERSION = 1
@@ -1960,11 +1971,6 @@ def session_prompt_anatomy_transition(
     ):
         raise ValueError("Session prompt-anatomy transition conflicts with session identity.")
     return receipt
-
-
-class SessionMessageDeliveryMode(StrEnum):
-    NEXT_TURN = "next_turn"
-    ON_IDLE = "on_idle"
 
 
 SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY = "input_contract"
@@ -2536,283 +2542,6 @@ class CompactSessionRequest(BaseModel):
                 "CompactSessionRequest.requested_by",
             )
         return self
-
-
-class EnqueueSessionMessageRequest(BaseModel):
-    """Submit durable user steering for an active session."""
-
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
-
-    session_id: str
-    idempotency_key: str = Field(max_length=256)
-    # ``content`` remains the bounded human-readable projection used by
-    # existing clients and audit surfaces. ``message`` is the authoritative
-    # typed input when present, allowing queued multimodal user messages to
-    # retain their artifact references across durable delivery.
-    content: str = Field(max_length=SESSION_MESSAGE_CONTENT_MAX_BYTES)
-    message: Message | None = None
-    delivery_mode: SessionMessageDeliveryMode
-    requested_by: ResolutionActor | None = None
-    conditions: SessionMessageConditions = Field(default_factory=SessionMessageConditions)
-    _input_redactions_applied: bool = PrivateAttr(default=False)
-
-    @field_validator("conditions", mode="before")
-    @classmethod
-    def copy_conditions(cls, value):
-        if isinstance(value, SessionMessageConditions):
-            return copy_session_message_conditions(value)
-        return value
-
-    @field_validator("session_id", "idempotency_key")
-    @classmethod
-    def validate_required_strings(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("content")
-    @classmethod
-    def validate_content(cls, value: str) -> str:
-        value = require_nonblank(value, "content")
-        if len(value.encode("utf-8")) > SESSION_MESSAGE_CONTENT_MAX_BYTES:
-            raise ValueError(
-                "content exceeds the maximum encoded size of "
-                f"{SESSION_MESSAGE_CONTENT_MAX_BYTES} bytes."
-            )
-        return value
-
-    @field_validator("message")
-    @classmethod
-    def copy_typed_message(cls, value: Message | None) -> Message | None:
-        if value is None:
-            return None
-        message = detach_message(value)
-        if message.role is not MessageRole.USER:
-            raise ValueError("Queued session messages must have the user role.")
-        if compact_json_utf8_size(message.model_dump(mode="json")) > (
-            SESSION_MESSAGE_CONTENT_MAX_BYTES
-        ):
-            raise ValueError(
-                "message exceeds the maximum encoded size of "
-                f"{SESSION_MESSAGE_CONTENT_MAX_BYTES} bytes."
-            )
-        return message
-
-    @field_validator("requested_by")
-    @classmethod
-    def copy_requested_by(cls, value: ResolutionActor | None) -> ResolutionActor | None:
-        return copy_resolution_actor(value)
-
-    @model_validator(mode="after")
-    def validate_durable_text(self) -> EnqueueSessionMessageRequest:
-        require_durable_json_text(
-            self.model_dump(mode="json", exclude={"requested_by"}),
-            "EnqueueSessionMessageRequest",
-        )
-        if self.requested_by is not None:
-            require_durable_json_text(
-                self.requested_by.model_dump(mode="json", exclude={"claims"}),
-                "EnqueueSessionMessageRequest.requested_by",
-            )
-        return self
-
-
-class SessionQueuedMessage(BaseModel):
-    """One durable queued user message and its delivery state."""
-
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
-
-    queue_id: str
-    session_id: str
-    idempotency_key: str
-    content: str
-    message: Message | None = None
-    delivery_mode: SessionMessageDeliveryMode
-    status: SessionMessageQueueStatus
-    ordering_key: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
-    accepted_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    accepted_transcript_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    accepted_event_id: str
-    accepted_at: datetime
-    requested_by: ResolutionActor | None = None
-    delivered_run_epoch: StrictInt | None = Field(default=None, ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    delivered_transcript_cursor: StrictInt | None = Field(
-        default=None, ge=0, le=MAX_DURABLE_JSON_INTEGER
-    )
-    delivered_event_id: str | None = None
-    delivered_at: datetime | None = None
-    conditions: SessionMessageConditions = Field(default_factory=SessionMessageConditions)
-
-    @field_validator("conditions", mode="before")
-    @classmethod
-    def copy_conditions(cls, value):
-        if isinstance(value, SessionMessageConditions):
-            return copy_session_message_conditions(value)
-        return value
-
-    @field_validator(
-        "queue_id",
-        "session_id",
-        "idempotency_key",
-        "content",
-        "accepted_event_id",
-        "delivered_event_id",
-    )
-    @classmethod
-    def validate_strings(cls, value: str | None, info) -> str | None:
-        if value is None:
-            return None
-        return require_nonblank(value, info.field_name)
-
-    @field_validator("requested_by")
-    @classmethod
-    def copy_requested_by(cls, value: ResolutionActor | None) -> ResolutionActor | None:
-        return copy_resolution_actor(value)
-
-    @field_validator("message")
-    @classmethod
-    def copy_typed_message(cls, value: Message | None) -> Message | None:
-        if value is None:
-            return None
-        message = detach_message(value)
-        if message.role is not MessageRole.USER and not (
-            message.role is MessageRole.ASSISTANT
-            and message.content
-            and all(type(part) is PeerContentPart for part in message.content)
-        ):
-            raise ValueError(
-                "Queued session messages must have the user role or peer assistant content."
-            )
-        return message
-
-
-class SessionMessageInspectionRecord(BaseModel):
-    """Safe row envelope: unreadable content never becomes deliverable input."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    queue_id: StrictStr = Field(min_length=1, max_length=512)
-    ordering_key: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
-    revision: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
-    status: SessionMessageQueueStatus | None
-    validity: Literal["valid", "unreadable"]
-    message: SessionQueuedMessage | None = Field(default=None, repr=False)
-    terminal_event_id: StrictStr | None = Field(default=None, min_length=1, max_length=512)
-
-    @model_validator(mode="after")
-    def validate_inspection(self) -> SessionMessageInspectionRecord:
-        if self.validity == "valid":
-            if (
-                self.message is None
-                or self.status != self.message.status
-                or self.queue_id != self.message.queue_id
-                or self.ordering_key != self.message.ordering_key
-            ):
-                raise ValueError("Queue inspection record has inconsistent typed evidence.")
-        elif self.message is not None:
-            raise ValueError("Unreadable queue inspection cannot contain message content.")
-        return self
-
-
-class SessionMessageInspection(BaseModel):
-    """One protected delivery-priority page and its exact session instance."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    session_id: StrictStr = Field(min_length=1, max_length=512)
-    session_instance_id: StrictStr = Field(min_length=1, max_length=512)
-    records: tuple[SessionMessageInspectionRecord, ...] = Field(default=(), max_length=100)
-    next_cursor: SessionMessageCursor | None = None
-
-    @model_validator(mode="after")
-    def validate_cursor(self) -> SessionMessageInspection:
-        if self.next_cursor is not None and (
-            self.next_cursor.session_instance_id != self.session_instance_id
-            or not self.records
-            or self.next_cursor.after_ordering_key != self.records[-1].ordering_key
-            or any(
-                record.ordering_key > self.next_cursor.through_ordering_key
-                for record in self.records
-            )
-        ):
-            raise ValueError("Queue inspection cursor conflicts with its page.")
-        return self
-
-
-class SessionMessageActionResult(BaseModel):
-    """Terminal queue mutation and its atomically persisted content-free event."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    record: SessionMessageInspectionRecord
-    event: Event
-    replayed: StrictBool = False
-
-
-class EnqueueSessionMessageResult(BaseModel):
-    """Typed enqueue result, including the durable acceptance event."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    message: SessionQueuedMessage
-    event: Event
-    replayed: StrictBool = False
-
-    @field_validator("message")
-    @classmethod
-    def copy_message(cls, value: SessionQueuedMessage) -> SessionQueuedMessage:
-        if type(value) is not SessionQueuedMessage:
-            raise TypeError("message must be a SessionQueuedMessage.")
-        return value.model_copy(deep=True)
-
-    @field_validator("event")
-    @classmethod
-    def copy_event(cls, value: Event) -> Event:
-        return copy_event(value)
-
-
-class SessionMessageDeliveryBatch(BaseModel):
-    """One bounded atomic queue-delivery batch at a fixed eligibility cutoff."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    messages: tuple[SessionQueuedMessage, ...] = Field(default_factory=tuple)
-    events: tuple[Event, ...] = Field(default_factory=tuple)
-    delivery_id: str
-    interaction_id: str | None = None
-    eligible_through: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    has_more: StrictBool = False
-    replayed: StrictBool = False
-    active_invocation_profile: ActiveInvocationExecutionProfile | None = None
-
-    @field_validator("messages", mode="before")
-    @classmethod
-    def copy_messages(cls, value) -> tuple[SessionQueuedMessage, ...]:
-        return tuple(message.model_copy(deep=True) for message in value)
-
-    @field_validator("events", mode="before")
-    @classmethod
-    def copy_events(cls, value) -> tuple[Event, ...]:
-        return tuple(copy_event(event) for event in value)
-
-    @field_validator("delivery_id", "interaction_id")
-    @classmethod
-    def validate_identifiers(cls, value: str | None, info) -> str | None:
-        if value is None:
-            if info.field_name == "delivery_id":
-                raise ValueError("delivery_id is required.")
-            return None
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("active_invocation_profile", mode="before")
-    @classmethod
-    def copy_active_invocation_profile(
-        cls,
-        value: object,
-    ) -> ActiveInvocationExecutionProfile | None:
-        if value is None:
-            return None
-        if isinstance(value, ActiveInvocationExecutionProfile):
-            value = value.model_dump(mode="json")
-        return ActiveInvocationExecutionProfile.model_validate(value)
 
 
 class QueuedInteractionProfileHandoff(BaseModel):
@@ -19546,7 +19275,7 @@ class InMemorySessionStore(
                     environment_name=target.environment_name,
                     timestamp=accepted_at,
                     payload={
-                        **_queued_session_message_event_payload(
+                        **session_messaging._queued_session_message_event_payload(
                             queue_id=queue_id,
                             delivery_mode=delivery_mode,
                             ordering_key=ordering_key,
@@ -19880,7 +19609,7 @@ class InMemorySessionStore(
                 else messages_by_idempotency.get(request.idempotency_key)
             )
             if existing is not None:
-                _validate_equivalent_queued_session_message(existing, request)
+                session_messaging._validate_equivalent_queued_session_message(existing, request)
                 record = self._event_records_by_id.get(
                     (request.session_id, existing.accepted_event_id)
                 )
@@ -19920,7 +19649,7 @@ class InMemorySessionStore(
                     environment_name=session.environment_name,
                     timestamp=accepted_at,
                     payload={
-                        **_queued_session_message_event_payload(
+                        **session_messaging._queued_session_message_event_payload(
                             queue_id=queue_id,
                             delivery_mode=request.delivery_mode,
                             ordering_key=ordering_key,
@@ -20266,7 +19995,7 @@ class InMemorySessionStore(
                         environment_name=session.environment_name,
                         timestamp=delivered_at,
                         payload={
-                            **_queued_session_message_event_payload(
+                            **session_messaging._queued_session_message_event_payload(
                                 queue_id=queued_message.queue_id,
                                 delivery_mode=queued_message.delivery_mode,
                                 ordering_key=queued_message.ordering_key,
@@ -25811,24 +25540,6 @@ def copy_compact_session_request(request: CompactSessionRequest) -> CompactSessi
     )
 
 
-def copy_enqueue_session_message_request(
-    request: EnqueueSessionMessageRequest,
-) -> EnqueueSessionMessageRequest:
-    if type(request) is not EnqueueSessionMessageRequest:
-        raise TypeError("Queued input requires an EnqueueSessionMessageRequest.")
-    copied = EnqueueSessionMessageRequest(
-        session_id=request.session_id,
-        idempotency_key=request.idempotency_key,
-        content=request.content,
-        message=(None if request.message is None else detach_message(request.message)),
-        delivery_mode=request.delivery_mode,
-        requested_by=copy_resolution_actor(request.requested_by),
-        conditions=copy_session_message_conditions(request.conditions),
-    )
-    copied._input_redactions_applied = request._input_redactions_applied
-    return copied
-
-
 def copy_interrupt_session_request(request: InterruptSessionRequest) -> InterruptSessionRequest:
     if type(request) is not InterruptSessionRequest:
         raise TypeError("Session interruption requires an InterruptSessionRequest.")
@@ -26435,62 +26146,6 @@ def _audit_resolution_actor(actor: ResolutionActor | None) -> ResolutionActor | 
         tenant=actor.tenant,
         source=actor.source,
     )
-
-
-def _queued_session_message_event_payload(
-    *,
-    queue_id: str,
-    delivery_mode: SessionMessageDeliveryMode,
-    ordering_key: int,
-    actor: ResolutionActor | None,
-    run_epoch: int,
-    transcript_cursor: int,
-) -> dict[str, Any]:
-    return {
-        "queue_id": queue_id,
-        "delivery_mode": str(delivery_mode),
-        "ordering_key": ordering_key,
-        "actor": resolution_actor_payload(actor),
-        "run_epoch": run_epoch,
-        "transcript_cursor": transcript_cursor,
-    }
-
-
-def _validate_equivalent_queued_session_message(
-    existing: SessionQueuedMessage,
-    request: EnqueueSessionMessageRequest,
-) -> None:
-    if (
-        existing.content != request.content
-        or existing.message != request.message
-        or existing.delivery_mode != request.delivery_mode
-        or existing.conditions != request.conditions
-        or resolution_actor_payload(existing.requested_by)
-        != resolution_actor_payload(request.requested_by)
-    ):
-        raise ValueError(
-            "Session message idempotency key was already used for a different request."
-        )
-
-
-def queued_session_message_input(message: SessionQueuedMessage) -> Message:
-    """Return the authoritative detached user input for a queued record."""
-
-    if type(message) is not SessionQueuedMessage:
-        raise TypeError("message must be a SessionQueuedMessage.")
-    if message.message is not None:
-        return detach_message(message.message)
-    return Message.text(MessageRole.USER, message.content)
-
-
-def enqueue_session_message_input(request: EnqueueSessionMessageRequest) -> Message:
-    """Return the authoritative detached user input for an enqueue request."""
-
-    if type(request) is not EnqueueSessionMessageRequest:
-        raise TypeError("request must be an EnqueueSessionMessageRequest.")
-    if request.message is not None:
-        return detach_message(request.message)
-    return Message.text(MessageRole.USER, request.content)
 
 
 def _prepare_session_fork_request(

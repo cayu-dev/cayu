@@ -18,16 +18,15 @@ from cayu.applications import CayuApp
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
-from cayu.runtime.session_message_lifecycle import SessionMessageConditions
 from cayu.sessions._terminal_evidence import _SESSION_RUN_OPERATION_CHECKPOINT_KEY
 from cayu.sessions.base import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
-    EnqueueSessionMessageRequest,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     RunRequest,
     _interaction_transition_storage_key,
 )
+from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageConditions
 from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 

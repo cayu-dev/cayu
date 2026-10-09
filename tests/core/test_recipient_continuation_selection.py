@@ -546,7 +546,7 @@ async def test_public_continue_refuses_native_occupancy_without_admission(
     native_stores, monkeypatch, occupancy
 ):
     from cayu.collaboration.participants import CollaborationUnavailable
-    from cayu.sessions.base import EnqueueSessionMessageRequest, SessionMessageDeliveryMode
+    from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageDeliveryMode
 
     application, resolver, command, provider, session, _ = await prepared_continue_scenario(
         native_stores, queued_turn=occupancy == "queue"

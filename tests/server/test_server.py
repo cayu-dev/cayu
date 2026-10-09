@@ -12364,8 +12364,8 @@ def test_sse_replay_preserves_canonical_policy_denial_attribution() -> None:
 
 
 def _authorized_message_endpoint():
-    from cayu.runtime.session_message_lifecycle import SessionMessageAccessPolicy
     from cayu.server import AuthContext
+    from cayu.sessions.messaging import SessionMessageAccessPolicy
 
     class MessagePolicy(SessionMessageAccessPolicy):
         def authorize(self, context, *, session_id, session_instance_id, action):

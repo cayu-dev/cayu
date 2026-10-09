@@ -19,21 +19,18 @@ from pydantic import SecretStr
 from cayu.applications import CayuApp
 from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.runtime.session_message_lifecycle import (
+from cayu.sessions.base import RunRequest, SessionIdentity
+from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.messaging import (
+    EnqueueSessionMessageRequest,
     SessionMessageAccessContext,
     SessionMessageAccessDenied,
     SessionMessageAccessPolicy,
     SessionMessageActionRequest,
     SessionMessageConflict,
+    SessionMessageDeliveryMode,
     SessionMessageQuery,
 )
-from cayu.sessions.base import (
-    EnqueueSessionMessageRequest,
-    RunRequest,
-    SessionIdentity,
-    SessionMessageDeliveryMode,
-)
-from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.vaults.redaction import SecretRedactor

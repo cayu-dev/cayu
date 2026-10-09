@@ -22,13 +22,11 @@ from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.sessions.base import (
     BudgetReservationIdentityConflict,
-    EnqueueSessionMessageRequest,
     ForkSessionRequest,
     ModelCompletionStageRequest,
     ResumeRequest,
     RunRequest,
     SessionIdentity,
-    SessionMessageDeliveryMode,
     fork_session_invocation,
 )
 from cayu.sessions.checkpoints import (
@@ -37,6 +35,7 @@ from cayu.sessions.checkpoints import (
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.inspection import SessionInspectionSummary
+from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageDeliveryMode
 from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.queries import SessionAggregateFilter, SessionQuery
 from cayu.sessions.records import RUNTIME_BUILD_PROVENANCE_METADATA_KEY, Session, SessionStatus

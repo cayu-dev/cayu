@@ -25,7 +25,7 @@ from cayu.collaboration.prepared_admission import prepared_budget
 from cayu.collaboration.request_access import PreparedAdmissionRegistration, RequestRegistration
 from cayu.collaboration.requests import RequestControl
 from cayu.runtime.authority import SessionRunFenced
-from cayu.runtime.session_message_lifecycle import SessionMessageQuery
+from cayu.sessions.messaging import SessionMessageQuery
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.budget_postgres import PostgresBudgetLedger
 from cayu.storage.collaboration_postgres import PostgresCollaborationStore

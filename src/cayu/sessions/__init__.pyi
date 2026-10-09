@@ -14,8 +14,6 @@ from cayu.sessions.base import CheckpointRootFieldProjection as CheckpointRootFi
 from cayu.sessions.base import CheckpointTransform as CheckpointTransform
 from cayu.sessions.base import CompactSessionRequest as CompactSessionRequest
 from cayu.sessions.base import DeferredInteractionInput as DeferredInteractionInput
-from cayu.sessions.base import EnqueueSessionMessageRequest as EnqueueSessionMessageRequest
-from cayu.sessions.base import EnqueueSessionMessageResult as EnqueueSessionMessageResult
 from cayu.sessions.base import (
     ForkExecutionProfileDecisionRecord as ForkExecutionProfileDecisionRecord,
 )
@@ -91,8 +89,6 @@ from cayu.sessions.base import SessionForkProfileRelationship as SessionForkProf
 from cayu.sessions.base import SessionIdentity as SessionIdentity
 from cayu.sessions.base import SessionInvocationAdmission as SessionInvocationAdmission
 from cayu.sessions.base import SessionInvocationSnapshot as SessionInvocationSnapshot
-from cayu.sessions.base import SessionMessageDeliveryBatch as SessionMessageDeliveryBatch
-from cayu.sessions.base import SessionMessageDeliveryMode as SessionMessageDeliveryMode
 from cayu.sessions.base import SessionMessageQueueStatus as SessionMessageQueueStatus
 from cayu.sessions.base import (
     SessionModelCompletionStageConflict as SessionModelCompletionStageConflict,
@@ -104,8 +100,6 @@ from cayu.sessions.base import SessionModelTransition as SessionModelTransition
 from cayu.sessions.base import SessionOperationInitializer as SessionOperationInitializer
 from cayu.sessions.base import SessionOperationPublication as SessionOperationPublication
 from cayu.sessions.base import SessionOperationTransform as SessionOperationTransform
-from cayu.sessions.base import SessionQueuedMessage as SessionQueuedMessage
-from cayu.sessions.base import SessionQueuedMessagesPending as SessionQueuedMessagesPending
 from cayu.sessions.base import SessionRunFenced as SessionRunFenced
 from cayu.sessions.base import (
     SessionRuntimePublicationConflict as SessionRuntimePublicationConflict,
@@ -298,6 +292,12 @@ from cayu.sessions.lineage import SessionLineageNode as SessionLineageNode
 from cayu.sessions.lineage import SessionLineageOrigin as SessionLineageOrigin
 from cayu.sessions.lineage import SessionLineageQuery as SessionLineageQuery
 from cayu.sessions.lineage import SessionLineageResult as SessionLineageResult
+from cayu.sessions.messaging import EnqueueSessionMessageRequest as EnqueueSessionMessageRequest
+from cayu.sessions.messaging import EnqueueSessionMessageResult as EnqueueSessionMessageResult
+from cayu.sessions.messaging import SessionMessageDeliveryBatch as SessionMessageDeliveryBatch
+from cayu.sessions.messaging import SessionMessageDeliveryMode as SessionMessageDeliveryMode
+from cayu.sessions.messaging import SessionQueuedMessage as SessionQueuedMessage
+from cayu.sessions.messaging import SessionQueuedMessagesPending as SessionQueuedMessagesPending
 from cayu.sessions.outcomes import RunOutcome as RunOutcome
 from cayu.sessions.outcomes import StructuredOutputResult as StructuredOutputResult
 from cayu.sessions.outcomes import run_to_completion as run_to_completion

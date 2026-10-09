@@ -222,7 +222,6 @@ from cayu.runtime.provider_operations import (
     resolve_provider_operation_stage,
 )
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.runtime.session_message_lifecycle import SessionMessageQueueStatus
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
@@ -246,7 +245,6 @@ from cayu.sessions.base import (
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     BudgetReservationIdentityConflict,
     CompactSessionRequest,
-    EnqueueSessionMessageRequest,
     ForkExecutionProfileSelection,
     ForkSessionRequest,
     ForkSystemPromptReplacement,
@@ -271,12 +269,9 @@ from cayu.sessions.base import (
     RuntimePublicationOperationRecordMutation,
     RuntimePublicationRequest,
     SessionIdentity,
-    SessionMessageDeliveryMode,
     SessionModelCompletionStageConflict,
     SessionModelCompletionStageIncomplete,
     SessionOperationPublication,
-    SessionQueuedMessage,
-    SessionQueuedMessagesPending,
     SessionRuntimePublicationConflict,
     SessionStatusConflict,
     SessionStore,
@@ -304,6 +299,13 @@ from cayu.sessions.invocation import (
     InvocationOriginClaim,
     InvocationOriginTrust,
     SessionExecutionSource,
+)
+from cayu.sessions.messaging import (
+    EnqueueSessionMessageRequest,
+    SessionMessageDeliveryMode,
+    SessionMessageQueueStatus,
+    SessionQueuedMessage,
+    SessionQueuedMessagesPending,
 )
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import Session, SessionStatus

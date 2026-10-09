@@ -603,7 +603,7 @@ def test_public_participant_peer_delivery_uses_registered_policy(
         peer_projector = PeerExportProjector()
         from cayu.context.base import DefaultContextPolicy, UsageTriggeredContextPolicy
         from cayu.context.counting import ContextCountingConfig, ContextCountingMode
-        from cayu.runtime.session_message_lifecycle import (
+        from cayu.sessions.messaging import (
             SessionMessageAccessContext,
             SessionMessageAccessPolicy,
             SessionMessageQuery,
@@ -1327,9 +1327,9 @@ def test_peer_attempt_generation_bounds(generation):
 def test_store_append_replay_and_conflict(tmp_path, backend, request):
     from cayu.collaboration._contracts import OwnerRef
     from cayu.collaboration.participants import ParticipantRef
-    from cayu.runtime.session_message_lifecycle import SessionMessageQuery
     from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
     from cayu.sessions.context_views import ParticipantSessionBinding
+    from cayu.sessions.messaging import SessionMessageQuery
     from cayu.sessions.records import SessionStatus
 
     async def run():

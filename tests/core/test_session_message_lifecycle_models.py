@@ -8,23 +8,19 @@ import pytest
 
 from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
 from cayu.messages import Message
-from cayu.runtime.session_message_lifecycle import (
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.messaging import (
+    EnqueueSessionMessageRequest,
     SessionMessageActionRequest,
     SessionMessageConditions,
     SessionMessageConflict,
     SessionMessageCursor,
+    SessionMessageInspection,
     SessionMessageQuery,
     SessionMessageQueueStatus,
     SessionMessageTarget,
     copy_session_message_conditions,
     session_message_rejection,
-)
-from cayu.sessions.base import (
-    EnqueueSessionMessageRequest,
-    InMemorySessionStore,
-    RunRequest,
-    SessionIdentity,
-    SessionMessageInspection,
 )
 from cayu.sessions.records import SessionStatus
 

@@ -7,12 +7,12 @@ import pytest
 from tests.core.test_session_message_lifecycle_stores import _action, _request, _session
 from tests.core.test_session_store_shared_conformance import _close_store, _open_store
 
-from cayu.runtime.session_message_lifecycle import (
+from cayu.sessions.messaging import (
     SessionMessageConditions,
+    SessionMessageDeliveryMode,
     SessionMessageQuery,
     SessionMessageTarget,
 )
-from cayu.sessions.base import SessionMessageDeliveryMode
 from cayu.sessions.records import SessionStatus
 
 

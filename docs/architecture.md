@@ -508,6 +508,13 @@ the shared tokenizer, document encoding, scoring and query-scoped search cursors
 Native stores compose these rules with their existing transcript queries and
 indexes; index maintenance, schema validation and atomic reads remain store-owned.
 
+### Session control contracts
+
+`sessions/messaging.py` owns queued-message requests, inspection and delivery
+records, bounded lifecycle authority, and pure copy, input and rejection rules.
+These values compose without session stores. Applications authorize access;
+`SessionStore` owns queue admission, freshness checks and terminal mutations.
+
 ### Session discovery
 
 `sessions/pending_action_contracts.py` owns bounded pending-action queries,

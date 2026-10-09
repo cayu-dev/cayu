@@ -45335,5 +45335,9 @@
     "tests/core/test_session_discovery_package_layout.py::test_session_lineage_bounds_and_cursors_without_stores[cayu.runtime]": 0.2117424989992287,
     "tests/core/test_session_discovery_package_layout.py::test_session_lineage_bounds_and_cursors_without_stores[cayu.sessions]": 0.20824095801799558,
     "tests/core/test_session_discovery_package_layout.py::test_session_lineage_bounds_and_cursors_without_stores[cayu]": 0.22104120801668614,
-    "tests/core/test_session_discovery_package_layout.py::test_session_lineage_public_imports_and_historical_pickle_globals": 1.022201584011782
+    "tests/core/test_session_discovery_package_layout.py::test_session_lineage_public_imports_and_historical_pickle_globals": 1.022201584011782,
+    "tests/core/test_session_control_package_layout.py::test_session_message_public_imports_and_historical_pickle_globals": 2.049250292009674,
+    "tests/core/test_session_control_package_layout.py::test_session_message_values_and_rules_without_stores[cayu.runtime]": 0.8378356670436915,
+    "tests/core/test_session_control_package_layout.py::test_session_message_values_and_rules_without_stores[cayu.sessions.messaging]": 0.8820050419890322,
+    "tests/core/test_session_control_package_layout.py::test_session_message_values_and_rules_without_stores[cayu]": 1.0175233329937328
 }

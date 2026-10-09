@@ -43,22 +43,24 @@ from cayu.sessions._invocation_terminal_decision import (
 from cayu.sessions.base import (
     MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
     QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY,
-    SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
-    EnqueueSessionMessageRequest,
     InMemorySessionStore,
     InterruptSessionRequest,
     QueuedInteractionProfileHandoff,
     ResumeRequest,
     RunRequest,
     SessionIdentity,
-    SessionMessageDeliveryBatch,
-    SessionMessageDeliveryMode,
     SessionModelCompletionStageConflict,
     SessionRunFenced,
     _canonical_runtime_publication_digest,
     _model_completion_stage_dispatch_storage_key,
 )
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.messaging import (
+    SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
+    EnqueueSessionMessageRequest,
+    SessionMessageDeliveryBatch,
+    SessionMessageDeliveryMode,
+)
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.transcript_queries import TranscriptQuery
 from cayu.storage.sqlite import SQLiteSessionStore

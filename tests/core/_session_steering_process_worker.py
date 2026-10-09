@@ -15,12 +15,8 @@ from cayu.providers.base import ModelProvider, ModelStreamEvent
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
 from cayu.runtime.session_steering import StopAfterCurrentToolRoundRequest
-from cayu.sessions.base import (
-    EnqueueSessionMessageRequest,
-    IncompleteSessionRecoveryRequest,
-    ResumeRequest,
-    RunRequest,
-)
+from cayu.sessions.base import IncompleteSessionRecoveryRequest, ResumeRequest, RunRequest
+from cayu.sessions.messaging import EnqueueSessionMessageRequest
 from cayu.sessions.records import SessionStatus
 from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore

@@ -160,16 +160,6 @@ from cayu.runtime.request_costs import (
     RequestCostSummary,
     disabled_request_cost_summary,
 )
-from cayu.runtime.session_message_lifecycle import (
-    SessionMessageAccessContext,
-    SessionMessageAccessDenied,
-    SessionMessageActionRequest,
-    SessionMessageConditions,
-    SessionMessageConflict,
-    SessionMessageCursor,
-    SessionMessageQuery,
-    SessionMessageSource,
-)
 from cayu.runtime.tool_completion import ToolCompletionPolicy
 from cayu.server._browser_client import (
     BROWSER_CLIENT_MODULE,
@@ -303,17 +293,12 @@ from cayu.server.sse import (
 )
 from cayu.sessions.base import (
     COMPACTION_INSTRUCTIONS_MAX_CHARS,
-    SESSION_MESSAGE_CONTENT_MAX_BYTES,
     CompactSessionRequest,
-    EnqueueSessionMessageRequest,
     InterruptSessionRequest,
     ModelFailoverPolicy,
     ModelTarget,
     ResumeRequest,
     RunRequest,
-    SessionMessageActionResult,
-    SessionMessageDeliveryMode,
-    SessionMessageInspection,
     SessionStore,
     _with_runtime_resume_transport_metadata,
     run_request_with_runtime_generated_authority,
@@ -331,6 +316,21 @@ from cayu.sessions.invocation import (
     InvocationOriginTrust,
     SessionExecutionSource,
     TaskExecutionSource,
+)
+from cayu.sessions.messaging import (
+    SESSION_MESSAGE_CONTENT_MAX_BYTES,
+    EnqueueSessionMessageRequest,
+    SessionMessageAccessContext,
+    SessionMessageAccessDenied,
+    SessionMessageActionRequest,
+    SessionMessageActionResult,
+    SessionMessageConditions,
+    SessionMessageConflict,
+    SessionMessageCursor,
+    SessionMessageDeliveryMode,
+    SessionMessageInspection,
+    SessionMessageQuery,
+    SessionMessageSource,
 )
 from cayu.sessions.pending_action_contracts import (
     PendingActionQuery,

@@ -23,14 +23,8 @@ from cayu.events import EventType
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime.authority import SessionRunFenced
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.runtime.session_message_lifecycle import SessionMessageQuery
-from cayu.sessions.base import (
-    EnqueueSessionMessageRequest,
-    IncompleteSessionRecoveryRequest,
-    Message,
-    ResumeRequest,
-    RunRequest,
-)
+from cayu.sessions.base import IncompleteSessionRecoveryRequest, Message, ResumeRequest, RunRequest
+from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageQuery
 from cayu.sessions.records import SessionStatus
 
 

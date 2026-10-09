@@ -388,8 +388,7 @@ class _StaticHandler(VerifiedTaskHandler):
 def test_worker_fences_queued_steering_before_input_or_interaction_publication(
     backend, delivery_mode, entrance, verified_worker_store_factory, monkeypatch
 ):
-    from cayu.runtime.session_message_lifecycle import SessionMessageQuery
-    from cayu.sessions.base import EnqueueSessionMessageRequest
+    from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageQuery
     from cayu.tasks.contracts import TaskCompletionDecisionRequired
 
     async def scenario():
@@ -550,8 +549,8 @@ def test_worker_fences_queued_steering_before_input_or_interaction_publication(
 def test_worker_retirement_restores_ordinary_queued_steering(
     backend, delivery_mode, verified_worker_store_factory, monkeypatch
 ):
-    from cayu.runtime.session_message_lifecycle import SessionMessageQuery
-    from cayu.sessions.base import EnqueueSessionMessageRequest, ResumeRequest
+    from cayu.sessions.base import ResumeRequest
+    from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageQuery
 
     async def scenario():
         sessions, tasks = verified_worker_store_factory()

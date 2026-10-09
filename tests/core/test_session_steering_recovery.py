@@ -26,12 +26,12 @@ from cayu.runtime.provider_operations import (
 )
 from cayu.runtime.session_steering import StopAfterCurrentToolRoundRequest
 from cayu.sessions.base import (
-    EnqueueSessionMessageRequest,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     ResumeRequest,
     RunRequest,
 )
+from cayu.sessions.messaging import EnqueueSessionMessageRequest
 from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 

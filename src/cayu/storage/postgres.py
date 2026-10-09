@@ -32,14 +32,6 @@ from cayu.runtime.event_side_effect_health import (
     PersistedEventSideEffectPage,
     PersistedEventSideEffectQuery,
 )
-from cayu.runtime.session_message_lifecycle import (
-    SessionMessageActionRequest,
-    SessionMessageConditions,
-    SessionMessageConflict,
-    SessionMessageQuery,
-    SessionMessageSource,
-    session_message_rejection,
-)
 from cayu.sessions import creation_fence
 from cayu.sessions.access import (
     require_resource_session,
@@ -47,14 +39,22 @@ from cayu.sessions.access import (
     runtime_session_query,
 )
 from cayu.sessions.base import (
-    SESSION_MESSAGE_QUEUE_STORAGE_VALUE_MAX_BYTES,
-    SessionMessageActionResult,
-    SessionMessageDeliveryMode,
-    SessionMessageInspection,
     _check_closure_lineage_owner,
     _closure_progress_targets,
     _validate_closure_progress_update,
     _validate_session_closure_detach_replay,
+)
+from cayu.sessions.messaging import (
+    SESSION_MESSAGE_QUEUE_STORAGE_VALUE_MAX_BYTES,
+    SessionMessageActionRequest,
+    SessionMessageActionResult,
+    SessionMessageConditions,
+    SessionMessageConflict,
+    SessionMessageDeliveryMode,
+    SessionMessageInspection,
+    SessionMessageQuery,
+    SessionMessageSource,
+    session_message_rejection,
 )
 from cayu.storage import _creation_fence
 from cayu.storage import _postgres_base as postgres_base
@@ -195,14 +195,11 @@ from cayu.sessions.base import (
     LATEST_TRANSCRIPT_TEXT_MAX_PARTS,
     LATEST_TRANSCRIPT_TEXT_MAX_SOURCE_BYTES,
     MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
-    SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     BudgetReservationIdentityConflict,
     CheckpointRootFieldGuard,
     CheckpointTransform,
     DeferredInteractionInput,
-    EnqueueSessionMessageRequest,
-    EnqueueSessionMessageResult,
     ForkCheckpointAuthorityDecoder,
     ForkSystemPromptReplacement,
     ForkTranscriptValidator,
@@ -234,7 +231,6 @@ from cayu.sessions.base import (
     SessionForkProfileRelationship,
     SessionIdentity,
     SessionInvocationSnapshot,
-    SessionMessageDeliveryBatch,
     SessionMessageQueueStatus,
     SessionModelCompletionDispatchAlreadyAuthorized,
     SessionModelCompletionStageConflict,
@@ -242,8 +238,6 @@ from cayu.sessions.base import (
     SessionOperationInitializer,
     SessionOperationPublication,
     SessionOperationTransform,
-    SessionQueuedMessage,
-    SessionQueuedMessagesPending,
     SessionRunFenced,
     SessionRuntimeIdentity,
     SessionRuntimePublicationConflict,
@@ -342,7 +336,6 @@ from cayu.sessions.base import (
     _project_interruption_cascade_marker_fields,
     _public_authority_alias_store_key,
     _queued_dispatch_terminal_receipts_from_checkpoint,
-    _queued_session_message_event_payload,
     _reconstruct_active_model_completion_stage,
     _reconstruct_active_model_completion_stage_record,
     _reconstruct_interaction_transition_receipt,
@@ -371,7 +364,6 @@ from cayu.sessions.base import (
     _terminal_publication_delete_block_reason,
     _tool_lifecycle_publication_identity,
     _tool_round_lifecycle_event_limit,
-    _validate_equivalent_queued_session_message,
     _validate_execution_profile_admission,
     _validate_execution_profile_rejection_session,
     _validate_inactive_for_seconds,
@@ -413,7 +405,6 @@ from cayu.sessions.base import (
     _validate_user_input_checkpoint_mutation,
     apply_fork_system_prompt_replacement,
     checkpoint_root_field_projection_from_storage,
-    copy_enqueue_session_message_request,
     copy_run_request,
     copy_session_identity,
     copy_session_runtime_identity,
@@ -422,9 +413,7 @@ from cayu.sessions.base import (
     deferred_interaction_input_for_run_request,
     deferred_interaction_input_from_storage_payload,
     deferred_interaction_input_storage_payload,
-    enqueue_session_message_input,
     fork_transcript_is_accepted,
-    queued_session_message_input,
     replace_session_user_metadata,
     require_deferred_initial_transcript_replacement,
     resolve_interaction_attribution,
@@ -454,6 +443,19 @@ from cayu.sessions.lineage import (
     copy_session_lineage_query,
     decode_session_lineage_cursor,
     encode_session_lineage_cursor,
+)
+from cayu.sessions.messaging import (
+    SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
+    EnqueueSessionMessageRequest,
+    EnqueueSessionMessageResult,
+    SessionMessageDeliveryBatch,
+    SessionQueuedMessage,
+    SessionQueuedMessagesPending,
+    _queued_session_message_event_payload,
+    _validate_equivalent_queued_session_message,
+    copy_enqueue_session_message_request,
+    enqueue_session_message_input,
+    queued_session_message_input,
 )
 from cayu.sessions.pending_action_contracts import (
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,

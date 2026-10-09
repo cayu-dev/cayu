@@ -15,7 +15,8 @@ from cayu.environments.factory import (
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.sessions.base import EnqueueSessionMessageRequest, RunRequest, SessionMessageDeliveryMode
+from cayu.sessions.base import RunRequest
+from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageDeliveryMode
 
 
 class _QueuedProvider(ModelProvider):

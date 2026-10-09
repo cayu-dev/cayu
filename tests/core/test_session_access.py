@@ -212,7 +212,7 @@ async def conformance(store):
         with pytest.raises(SessionAccessDenied):
             await store.query_transcript(TranscriptQuery(session_id=prefix + "b"))
         assert not (await store.query_transcript(TranscriptQuery(session_id=prefix + "a"))).records
-        from cayu.sessions.base import EnqueueSessionMessageRequest
+        from cayu.sessions.messaging import EnqueueSessionMessageRequest
 
         for foreign_id in (prefix + "b", prefix + "missing"):
             with pytest.raises(SessionAccessDenied):

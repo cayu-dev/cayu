@@ -15,26 +15,24 @@ from cayu.events import Event, event_with_durable_sequence
 from cayu.runtime._event_projection import public_event_id
 from cayu.runtime._message_redaction import redact_untrusted_message_for_boundary
 from cayu.runtime._session_request_boundary import require_secret_free_session_authority
-from cayu.runtime.session_message_lifecycle import (
+from cayu.sessions.base import SessionStore
+from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.messaging import (
+    EnqueueSessionMessageRequest,
+    EnqueueSessionMessageResult,
     SessionMessageAccessContext,
     SessionMessageAccessDenied,
     SessionMessageAccessPolicy,
     SessionMessageActionRequest,
-    SessionMessageConflict,
-    SessionMessageQuery,
-    SessionMessageSource,
-)
-from cayu.sessions.base import (
-    EnqueueSessionMessageRequest,
-    EnqueueSessionMessageResult,
     SessionMessageActionResult,
+    SessionMessageConflict,
     SessionMessageInspection,
     SessionMessageInspectionRecord,
+    SessionMessageQuery,
+    SessionMessageSource,
     SessionQueuedMessage,
-    SessionStore,
     copy_enqueue_session_message_request,
 )
-from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import Session
 from cayu.vaults.redaction import SecretRedactor
 

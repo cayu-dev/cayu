@@ -3847,29 +3847,6 @@ from cayu.runtime.session_closure import SessionClosureStore as SessionClosureSt
 from cayu.runtime.session_closure import SessionEvidenceClosureStore as SessionEvidenceClosureStore
 from cayu.runtime.session_closure import SharedSessionClosureStore as SharedSessionClosureStore
 from cayu.runtime.session_closure import TaskSessionClosureStore as TaskSessionClosureStore
-from cayu.runtime.session_message_lifecycle import (
-    SessionMessageAccessContext as SessionMessageAccessContext,
-)
-from cayu.runtime.session_message_lifecycle import (
-    SessionMessageAccessDenied as SessionMessageAccessDenied,
-)
-from cayu.runtime.session_message_lifecycle import (
-    SessionMessageAccessPolicy as SessionMessageAccessPolicy,
-)
-from cayu.runtime.session_message_lifecycle import (
-    SessionMessageActionRequest as SessionMessageActionRequest,
-)
-from cayu.runtime.session_message_lifecycle import (
-    SessionMessageConditions as SessionMessageConditions,
-)
-from cayu.runtime.session_message_lifecycle import SessionMessageConflict as SessionMessageConflict
-from cayu.runtime.session_message_lifecycle import SessionMessageCursor as SessionMessageCursor
-from cayu.runtime.session_message_lifecycle import SessionMessageQuery as SessionMessageQuery
-from cayu.runtime.session_message_lifecycle import (
-    SessionMessageQueueStatus as SessionMessageQueueStatus,
-)
-from cayu.runtime.session_message_lifecycle import SessionMessageSource as SessionMessageSource
-from cayu.runtime.session_message_lifecycle import SessionMessageTarget as SessionMessageTarget
 from cayu.runtime.session_steering import SessionSteeringConflict as SessionSteeringConflict
 from cayu.runtime.session_steering import SessionSteeringReceipt as SessionSteeringReceipt
 from cayu.runtime.session_steering import (
@@ -3933,8 +3910,6 @@ from cayu.sessions.base import CheckpointRootFieldGuard as CheckpointRootFieldGu
 from cayu.sessions.base import CheckpointRootFieldProjection as CheckpointRootFieldProjection
 from cayu.sessions.base import CompactSessionRequest as CompactSessionRequest
 from cayu.sessions.base import DeferredInteractionInput as DeferredInteractionInput
-from cayu.sessions.base import EnqueueSessionMessageRequest as EnqueueSessionMessageRequest
-from cayu.sessions.base import EnqueueSessionMessageResult as EnqueueSessionMessageResult
 from cayu.sessions.base import (
     ForkExecutionProfileDecisionRecord as ForkExecutionProfileDecisionRecord,
 )
@@ -3978,14 +3953,7 @@ from cayu.sessions.base import SessionForkProfileRelationship as SessionForkProf
 from cayu.sessions.base import SessionIdentity as SessionIdentity
 from cayu.sessions.base import SessionInvocationAdmission as SessionInvocationAdmission
 from cayu.sessions.base import SessionInvocationSnapshot as SessionInvocationSnapshot
-from cayu.sessions.base import SessionMessageActionResult as SessionMessageActionResult
-from cayu.sessions.base import SessionMessageDeliveryBatch as SessionMessageDeliveryBatch
-from cayu.sessions.base import SessionMessageDeliveryMode as SessionMessageDeliveryMode
-from cayu.sessions.base import SessionMessageInspection as SessionMessageInspection
-from cayu.sessions.base import SessionMessageInspectionRecord as SessionMessageInspectionRecord
 from cayu.sessions.base import SessionModelTransition as SessionModelTransition
-from cayu.sessions.base import SessionQueuedMessage as SessionQueuedMessage
-from cayu.sessions.base import SessionQueuedMessagesPending as SessionQueuedMessagesPending
 from cayu.sessions.base import SessionStateSnapshot as SessionStateSnapshot
 from cayu.sessions.base import SessionStatusConflict as SessionStatusConflict
 from cayu.sessions.base import SessionStore as SessionStore
@@ -4139,6 +4107,26 @@ from cayu.sessions.lineage import SessionLineageNode as SessionLineageNode
 from cayu.sessions.lineage import SessionLineageOrigin as SessionLineageOrigin
 from cayu.sessions.lineage import SessionLineageQuery as SessionLineageQuery
 from cayu.sessions.lineage import SessionLineageResult as SessionLineageResult
+from cayu.sessions.messaging import EnqueueSessionMessageRequest as EnqueueSessionMessageRequest
+from cayu.sessions.messaging import EnqueueSessionMessageResult as EnqueueSessionMessageResult
+from cayu.sessions.messaging import SessionMessageAccessContext as SessionMessageAccessContext
+from cayu.sessions.messaging import SessionMessageAccessDenied as SessionMessageAccessDenied
+from cayu.sessions.messaging import SessionMessageAccessPolicy as SessionMessageAccessPolicy
+from cayu.sessions.messaging import SessionMessageActionRequest as SessionMessageActionRequest
+from cayu.sessions.messaging import SessionMessageActionResult as SessionMessageActionResult
+from cayu.sessions.messaging import SessionMessageConditions as SessionMessageConditions
+from cayu.sessions.messaging import SessionMessageConflict as SessionMessageConflict
+from cayu.sessions.messaging import SessionMessageCursor as SessionMessageCursor
+from cayu.sessions.messaging import SessionMessageDeliveryBatch as SessionMessageDeliveryBatch
+from cayu.sessions.messaging import SessionMessageDeliveryMode as SessionMessageDeliveryMode
+from cayu.sessions.messaging import SessionMessageInspection as SessionMessageInspection
+from cayu.sessions.messaging import SessionMessageInspectionRecord as SessionMessageInspectionRecord
+from cayu.sessions.messaging import SessionMessageQuery as SessionMessageQuery
+from cayu.sessions.messaging import SessionMessageQueueStatus as SessionMessageQueueStatus
+from cayu.sessions.messaging import SessionMessageSource as SessionMessageSource
+from cayu.sessions.messaging import SessionMessageTarget as SessionMessageTarget
+from cayu.sessions.messaging import SessionQueuedMessage as SessionQueuedMessage
+from cayu.sessions.messaging import SessionQueuedMessagesPending as SessionQueuedMessagesPending
 from cayu.sessions.outcomes import RunOutcome as RunOutcome
 from cayu.sessions.outcomes import StructuredOutputResult as StructuredOutputResult
 from cayu.sessions.outcomes import run_to_completion as run_to_completion

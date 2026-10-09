@@ -35,7 +35,6 @@ from cayu.sessions.base import (
     MODEL_TARGET_PROJECTION_METADATA_KEY,
     PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
     CompactSessionRequest,
-    EnqueueSessionMessageRequest,
     ForkExecutionProfileSource,
     ForkSessionRequest,
     InterruptSessionRequest,
@@ -43,7 +42,6 @@ from cayu.sessions.base import (
     RunRequest,
     apply_runtime_session_create_claim,
     copy_compact_session_request,
-    copy_enqueue_session_message_request,
     copy_fork_session_request,
     copy_interrupt_session_request,
     copy_resume_request,
@@ -52,6 +50,10 @@ from cayu.sessions.base import (
     run_request_authority_is_runtime_generated,
     session_user_metadata,
     strip_runtime_session_create_claim_before_redaction,
+)
+from cayu.sessions.messaging import (
+    EnqueueSessionMessageRequest,
+    copy_enqueue_session_message_request,
 )
 from cayu.sessions.records import Session, copy_session
 from cayu.tools.policy import TAINT_LABELS_METADATA_KEY, taint_labels_from_metadata

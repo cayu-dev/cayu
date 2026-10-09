@@ -25,19 +25,19 @@ from cayu.observability.hooks import RuntimeHook, RuntimeHookContext
 from cayu.runtime._environment_exposure import require_environment_exposed
 from cayu.runtime._environment_lifecycle import EnvironmentLifecycle
 from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
-from cayu.runtime.session_message_lifecycle import (
+from cayu.sessions.base import (
+    PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
+    IncompleteSessionRecoveryRequest,
+    InMemorySessionStore,
+    RunRequest,
+)
+from cayu.sessions.messaging import (
+    EnqueueSessionMessageRequest,
     SessionMessageAccessContext,
     SessionMessageAccessPolicy,
     SessionMessageConditions,
     SessionMessageQuery,
     SessionMessageTarget,
-)
-from cayu.sessions.base import (
-    PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
-    EnqueueSessionMessageRequest,
-    IncompleteSessionRecoveryRequest,
-    InMemorySessionStore,
-    RunRequest,
 )
 from cayu.sessions.records import Session, SessionStatus
 from cayu.tasks.creation import TaskCreate

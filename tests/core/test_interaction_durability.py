@@ -36,7 +36,6 @@ from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import _session_engine as session_engine_module
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.sessions.base import (
-    EnqueueSessionMessageRequest,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionsRecoveryRequest,
@@ -48,7 +47,6 @@ from cayu.sessions.base import (
     ResumeRequest,
     RunRequest,
     SessionIdentity,
-    SessionMessageDeliveryMode,
     SessionRunFenced,
     SessionStatusConflict,
 )
@@ -58,6 +56,7 @@ from cayu.sessions.interactions import (
     InteractionStatus,
     InteractionSummaryEvidence,
 )
+from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageDeliveryMode
 from cayu.sessions.records import SessionStatus
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.memory import InMemoryTaskStore

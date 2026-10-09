@@ -24,14 +24,13 @@ from cayu.runtime import _environment_lifecycle as lifecycle_module
 from cayu.runtime.verified_task_worker import VerifiedTaskHandler, VerifiedTaskWorker
 from cayu.sessions._completion_finalization import pending_completion_finalization_from_checkpoint
 from cayu.sessions.base import (
-    EnqueueSessionMessageRequest,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     RunRequest,
-    SessionMessageDeliveryMode,
     SessionStatusConflict,
 )
+from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageDeliveryMode
 from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.admission import (

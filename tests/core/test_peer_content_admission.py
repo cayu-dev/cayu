@@ -19,20 +19,16 @@ from cayu.collaboration.peer_content import (
     PeerContentUnavailable,
 )
 from cayu.messages import Message
-from cayu.runtime.session_message_lifecycle import (
+from cayu.sessions.base import InterruptSessionRequest, RunRequest, SessionStatusConflict
+from cayu.sessions.context_views import ParticipantSessionCreationRequest
+from cayu.sessions.messaging import (
+    EnqueueSessionMessageRequest,
     SessionMessageAccessContext,
     SessionMessageAccessPolicy,
     SessionMessageActionRequest,
+    SessionMessageDeliveryMode,
     SessionMessageQuery,
 )
-from cayu.sessions.base import (
-    EnqueueSessionMessageRequest,
-    InterruptSessionRequest,
-    RunRequest,
-    SessionMessageDeliveryMode,
-    SessionStatusConflict,
-)
-from cayu.sessions.context_views import ParticipantSessionCreationRequest
 from cayu.sessions.records import SessionStatus
 
 

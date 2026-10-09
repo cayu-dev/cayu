@@ -542,13 +542,6 @@ from cayu.runtime.session_closure import (
     SessionClosureStore,
     TaskSessionClosureStore,
 )
-from cayu.runtime.session_message_lifecycle import (
-    SessionMessageAccessContext,
-    SessionMessageAccessPolicy,
-    SessionMessageActionRequest,
-    SessionMessageQuery,
-    SessionMessageSource,
-)
 from cayu.runtime.session_steering import (
     SessionSteeringReceipt,
     StopAfterCurrentToolRoundRequest,
@@ -571,8 +564,6 @@ from cayu.sessions._session_continuation import ContinuationTicket
 from cayu.sessions.base import (
     _RECIPIENT_PROVENANCE_CAPABILITY,
     CompactSessionRequest,
-    EnqueueSessionMessageRequest,
-    EnqueueSessionMessageResult,
     ForkSessionRequest,
     ForkSourceSnapshot,
     IncompleteSessionRecoveryRequest,
@@ -590,8 +581,6 @@ from cayu.sessions.base import (
     QueuedDispatchTerminalReceiptQuery,
     ResumeRequest,
     RunRequest,
-    SessionMessageActionResult,
-    SessionMessageInspection,
     SessionRunFenced,
     SessionStatusConflict,
     SessionStore,
@@ -641,6 +630,17 @@ from cayu.sessions.execution import (
 from cayu.sessions.invocation import (
     SessionInvocationBinding,
     copy_session_invocation_binding,
+)
+from cayu.sessions.messaging import (
+    EnqueueSessionMessageRequest,
+    EnqueueSessionMessageResult,
+    SessionMessageAccessContext,
+    SessionMessageAccessPolicy,
+    SessionMessageActionRequest,
+    SessionMessageActionResult,
+    SessionMessageInspection,
+    SessionMessageQuery,
+    SessionMessageSource,
 )
 from cayu.sessions.pending_action_contracts import PendingActionQuery, PendingActionResultTooLarge
 from cayu.sessions.queries import SessionQuery

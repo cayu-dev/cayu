@@ -56,7 +56,6 @@ from cayu.sessions._invocation_terminal_decision import (
 )
 from cayu.sessions._terminal_evidence import interruption_request_id_from_payload
 from cayu.sessions.base import (
-    EnqueueSessionMessageRequest,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionsRecoveryRequest,
@@ -66,7 +65,6 @@ from cayu.sessions.base import (
     ResumeRequest,
     RunRequest,
     SessionIdentity,
-    SessionMessageDeliveryMode,
     SessionMessageQueueStatus,
     SessionRunFenced,
     SessionStore,
@@ -74,6 +72,7 @@ from cayu.sessions.base import (
 )
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.invocation import TaskExecutionSource
+from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageDeliveryMode
 from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.records import SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore

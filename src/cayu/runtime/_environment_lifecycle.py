@@ -219,7 +219,6 @@ from cayu.sessions.base import (
     QueuedInteractionProfileHandoff,
     RuntimePublicationCheckpointOperation,
     RuntimePublicationMutation,
-    SessionMessageDeliveryBatch,
     SessionOperationPublication,
     SessionRunFenced,
     SessionStore,
@@ -233,6 +232,7 @@ from cayu.sessions.base import (
     session_user_metadata,
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery
+from cayu.sessions.messaging import SessionMessageDeliveryBatch
 from cayu.sessions.records import Session, SessionStatus
 from cayu.tools._operation_boundary import BoundedInvocationOperationRegistry
 from cayu.vaults.redaction import SecretRedactor
