@@ -242,7 +242,13 @@ from cayu.sessions.records import PendingActionSession as PendingActionSession
 from cayu.sessions.records import RunnerObservedEventIdentity as RunnerObservedEventIdentity
 from cayu.sessions.records import Session as Session
 from cayu.sessions.records import SessionIdentity as SessionIdentity
+from cayu.sessions.records import (
+    SessionInvocationSnapshot as SessionInvocationSnapshot,
+)
 from cayu.sessions.records import SessionRuntimeIdentity as SessionRuntimeIdentity
+from cayu.sessions.records import (
+    SessionStateSnapshot as SessionStateSnapshot,
+)
 from cayu.sessions.records import SessionStatus as SessionStatus
 from cayu.sessions.records import TranscriptRecord as TranscriptRecord
 from cayu.sessions.records import copy_session as copy_session
@@ -4217,37 +4223,6 @@ class _SessionCreateMaterial:
             runtime_build_provenance=session.runtime_build_provenance,
             environment_name=session.environment_name,
         )
-
-
-class SessionStateSnapshot(BaseModel):
-    """Bounded session state for status polling and control-plane coordination."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    status: SessionStatus
-    updated_at: datetime
-    last_activity_at: datetime
-
-    @field_validator("id")
-    @classmethod
-    def validate_id(cls, value: str) -> str:
-        return require_clean_nonblank(value, "id")
-
-    @field_validator("updated_at", "last_activity_at")
-    @classmethod
-    def normalize_timestamp(cls, value: datetime, info) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError(f"{info.field_name} must be timezone-aware.")
-        return value.astimezone(UTC)
-
-
-class SessionInvocationSnapshot(SessionInvocationBinding):
-    """Bounded immutable invocation state for trusted task/dispatch boundaries."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    status: SessionStatus
 
 
 _INTERRUPTION_CASCADE_ATTEMPT_ID_MAX_CHARS = 128

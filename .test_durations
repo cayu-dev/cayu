@@ -45959,5 +45959,11 @@
     "tests/core/test_session_identity_package_layout.py::test_session_identity_copy_and_validation_without_implementations[cayu.sessions.records]": 0.1819477080134675,
     "tests/core/test_session_identity_package_layout.py::test_session_identity_copy_and_validation_without_implementations[cayu.sessions]": 0.1902448339969851,
     "tests/core/test_session_identity_package_layout.py::test_session_identity_copy_and_validation_without_implementations[cayu]": 0.18947395798750222,
-    "tests/core/test_session_identity_package_layout.py::test_session_instance_fingerprints_without_implementations": 0.17625683199730702
+    "tests/core/test_session_identity_package_layout.py::test_session_instance_fingerprints_without_implementations": 0.17625683199730702,
+    "tests/core/test_session_identity_package_layout.py::test_bounded_snapshots_without_implementations[cayu.runtime]": 0.17081308396882378,
+    "tests/core/test_session_identity_package_layout.py::test_bounded_snapshots_without_implementations[cayu.sessions.records]": 0.17068579097394831,
+    "tests/core/test_session_identity_package_layout.py::test_bounded_snapshots_without_implementations[cayu.sessions]": 0.1709967089991551,
+    "tests/core/test_session_identity_package_layout.py::test_bounded_snapshots_without_implementations[cayu]": 0.1702931659820024,
+    "tests/core/test_session_identity_package_layout.py::test_snapshot_public_imports_and_historical_pickle_globals[SessionInvocationSnapshot]": 0.00015816697850823402,
+    "tests/core/test_session_identity_package_layout.py::test_snapshot_public_imports_and_historical_pickle_globals[SessionStateSnapshot]": 0.0003811240312643349
 }

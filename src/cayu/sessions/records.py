@@ -529,3 +529,34 @@ def copy_session_identity(identity: SessionIdentity) -> SessionIdentity:
             )
         ),
     )
+
+
+class SessionStateSnapshot(BaseModel):
+    """Bounded session state for status polling and control-plane coordination."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    status: SessionStatus
+    updated_at: datetime
+    last_activity_at: datetime
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str) -> str:
+        return require_clean_nonblank(value, "id")
+
+    @field_validator("updated_at", "last_activity_at")
+    @classmethod
+    def normalize_timestamp(cls, value: datetime, info) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(f"{info.field_name} must be timezone-aware.")
+        return value.astimezone(UTC)
+
+
+class SessionInvocationSnapshot(SessionInvocationBinding):
+    """Bounded immutable invocation state for trusted task/dispatch boundaries."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    status: SessionStatus

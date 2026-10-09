@@ -1,4 +1,4 @@
-"""Session identity values compose independently of runtime and storage."""
+"""Session values compose without runtime execution or storage implementations."""
 
 from __future__ import annotations
 
@@ -165,4 +165,66 @@ shifted = session.model_copy(update={
 assert records._queued_dispatch_session_instance_fingerprint(shifted) == records._queued_dispatch_session_instance_fingerprint(session)
 """,
         "cayu.sessions.records",
+    )
+
+
+@pytest.mark.parametrize("name", ("SessionStateSnapshot", "SessionInvocationSnapshot"))
+def test_snapshot_public_imports_and_historical_pickle_globals(name):
+    canonical = getattr(importlib.import_module("cayu.sessions.records"), name)
+    for module in ("cayu", "cayu.sessions", "cayu.runtime", "cayu.sessions.base"):
+        assert getattr(importlib.import_module(module), name) is canonical
+    assert pickle.loads(f"ccayu.sessions.base\n{name}\n.".encode()) is canonical
+
+
+@pytest.mark.parametrize(
+    "public_module",
+    (
+        "cayu",
+        "cayu.sessions",
+        "cayu.runtime",
+        "cayu.sessions.records",
+    ),
+)
+def test_bounded_snapshots_without_implementations(public_module):
+    _without_stores(
+        """
+stamp = datetime(2026, 1, 1, 6, tzinfo=timezone(timedelta(hours=6)))
+state = public.SessionStateSnapshot(id="session", status="pending",
+                                   updated_at=stamp, last_activity_at=stamp)
+assert state.updated_at == datetime(2026, 1, 1, tzinfo=UTC)
+assert state.updated_at.tzinfo is UTC and state.last_activity_at.tzinfo is UTC
+bound = public.SessionInvocationSnapshot(
+    id="session", status="pending", invocation=invocation,
+    session_instance_id="12345678-1234-4234-8234-123456789abc",
+)
+assert bound.invocation == invocation and bound.invocation is not invocation
+for value in (state, bound):
+    assert pickle.loads(pickle.dumps(value)) == value
+    assert type(value).model_validate_json(value.model_dump_json()) == value
+    assert get_type_hints(type(value))
+    assert type(value).model_json_schema()
+for value, field, bad in (
+    (state, "updated_at", datetime(2026, 1, 1)),
+    (state, "last_activity_at", datetime(2026, 1, 1)),
+    (state, "id", " "),
+    (bound, "session_instance_id", "invalid-sensitive-instance"),
+    (bound, "status", "invalid"),
+):
+    payload = value.model_dump(mode="python")
+    payload[field] = bad
+    try:
+        type(value).model_validate(payload)
+    except ValueError as error:
+        if value is bound:
+            assert "invalid-sensitive-instance" not in str(error)
+    else:
+        raise AssertionError(f"Invalid {field} was accepted")
+try:
+    bound.status = records.SessionStatus.COMPLETED
+except ValueError:
+    pass
+else:
+    raise AssertionError("Invocation snapshot was mutable")
+""",
+        public_module,
     )

@@ -941,7 +941,6 @@ from cayu.sessions.base import RuntimePublicationResult as RuntimePublicationRes
 from cayu.sessions.base import SessionExecutionInProgress as SessionExecutionInProgress
 from cayu.sessions.base import SessionForkProfileRelationship as SessionForkProfileRelationship
 from cayu.sessions.base import SessionInvocationAdmission as SessionInvocationAdmission
-from cayu.sessions.base import SessionInvocationSnapshot as SessionInvocationSnapshot
 from cayu.sessions.base import (
     SessionModelCompletionStageConflict as SessionModelCompletionStageConflict,
 )
@@ -955,7 +954,6 @@ from cayu.sessions.base import SessionOperationTransform as SessionOperationTran
 from cayu.sessions.base import (
     SessionRuntimePublicationConflict as SessionRuntimePublicationConflict,
 )
-from cayu.sessions.base import SessionStateSnapshot as SessionStateSnapshot
 from cayu.sessions.base import SessionStatusConflict as SessionStatusConflict
 from cayu.sessions.base import SessionStore as SessionStore
 from cayu.sessions.base import StoreTimeCheckpointTransform as StoreTimeCheckpointTransform
@@ -1199,6 +1197,8 @@ from cayu.sessions.records import PendingActionSession as PendingActionSession
 from cayu.sessions.records import RunnerObservedEventIdentity as RunnerObservedEventIdentity
 from cayu.sessions.records import Session as Session
 from cayu.sessions.records import SessionIdentity as SessionIdentity
+from cayu.sessions.records import SessionInvocationSnapshot as SessionInvocationSnapshot
+from cayu.sessions.records import SessionStateSnapshot as SessionStateSnapshot
 from cayu.sessions.records import SessionStatus as SessionStatus
 from cayu.sessions.records import TranscriptRecord as TranscriptRecord
 from cayu.sessions.recovery import (
