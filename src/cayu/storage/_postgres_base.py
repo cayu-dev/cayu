@@ -9,13 +9,18 @@ import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from typing import Any, LiteralString, NoReturn, cast
+from typing import Any, LiteralString, cast
 
+from cayu.storage import _postgres_budget_schema as postgres_budget_schema
 from cayu.storage import _postgres_catalog as postgres_catalog
 from cayu.storage import _postgres_eval_schema as postgres_eval_schema
 from cayu.storage import _postgres_knowledge_schema as postgres_knowledge_schema
+from cayu.storage import _postgres_memory_evidence_schema as postgres_memory_evidence_schema
+from cayu.storage import _postgres_producer_schema as postgres_producer_schema
+from cayu.storage import _postgres_session_schema as postgres_session_schema
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _postgres_task_schema as postgres_task_schema
+from cayu.storage import _postgres_transcript_schema as postgres_transcript_schema
 from cayu.storage import _postgres_verified_work_schema as postgres_verified_work_schema
 from cayu.storage import _postgres_work_context_schema as postgres_work_context_schema
 from cayu.storage._phase_timing import PostgresTimingScope
@@ -917,7 +922,7 @@ class _PostgresStoreBase:
                         if current_state.revision >= 108:
                             await validate_postgres_context_selection_schema(cur)
                         if current_state.revision >= 110:
-                            await self._validate_producer_cleanup_receipts(cur)
+                            await postgres_producer_schema._validate_producer_cleanup_receipts(cur)
                         if current_state.revision >= 96:
                             await validate_postgres_participant_bindings(cur)
                         if current_state.revision >= 111:
@@ -925,7 +930,7 @@ class _PostgresStoreBase:
                         if current_state.revision >= 112:
                             await validate_postgres_product_operation_schema(cur)
                         if self._min_required_revision >= 36:
-                            await self._validate_session_invocation_column(cur)
+                            await postgres_session_schema._validate_session_invocation_column(cur)
                         if self._min_required_revision >= 38:
                             await postgres_task_schema._validate_task_terminalization_receipt_table(
                                 cur
@@ -981,7 +986,9 @@ class _PostgresStoreBase:
                         if self._min_required_revision >= 45:
                             await postgres_task_schema._validate_task_retry_series_schema(cur)
                         if self._min_required_revision >= 46:
-                            await self._validate_transcript_search_document_column(cur)
+                            await postgres_transcript_schema._validate_transcript_search_document_column(
+                                cur, tokenizer_version=TRANSCRIPT_SEARCH_TOKENIZER_VERSION
+                            )
                         if self._min_required_revision >= 47:
                             await postgres_eval_schema._validate_eval_result_baseline_schema(cur)
                         if self._min_required_revision >= 48:
@@ -994,9 +1001,11 @@ class _PostgresStoreBase:
                         if self._min_required_revision >= 50:
                             await postgres_eval_schema._validate_eval_run_invocation_column(cur)
                         if self._min_required_revision >= 51:
-                            await self._validate_memory_evidence_schema(cur)
+                            await postgres_memory_evidence_schema._validate_memory_evidence_schema(
+                                cur
+                            )
                         if self._min_required_revision >= 52:
-                            await self._validate_targeted_tool_grant_schema(cur)
+                            await postgres_session_schema._validate_targeted_tool_grant_schema(cur)
                         if self._min_required_revision >= 53:
                             await postgres_eval_schema._validate_eval_scenario_schema(cur)
                         if self._min_required_revision >= 55:
@@ -1008,11 +1017,17 @@ class _PostgresStoreBase:
                                 cur
                             )
                         if self._min_required_revision >= 57:
-                            await self._validate_session_message_queue_typed_message_column(cur)
+                            await postgres_session_schema._validate_session_message_queue_typed_message_column(
+                                cur
+                            )
                         if self._min_required_revision >= 83:
-                            await self._validate_session_message_lifecycle_columns(cur)
+                            await (
+                                postgres_session_schema._validate_session_message_lifecycle_columns(
+                                    cur
+                                )
+                            )
                         if self._min_required_revision >= 59:
-                            await self._validate_session_instance_schema(cur)
+                            await postgres_session_schema._validate_session_instance_schema(cur)
                         if self._min_required_revision >= 61:
                             await postgres_verified_work_schema._validate_work_attempt_admission_schema(
                                 cur
@@ -1064,12 +1079,14 @@ class _PostgresStoreBase:
                                 expected_guard_sql=postgres_schema_history._MIGRATION_STEPS[88][1],
                             )
                         if current_state.revision >= 23:
-                            await self._validate_budget_reservation_identity_registry(
+                            await postgres_budget_schema._validate_budget_reservation_identity_registry(
                                 cur,
                                 require=True,
                             )
                         if current_state.revision >= 28:
-                            await self._validate_public_authority_alias_registry(cur)
+                            await postgres_session_schema._validate_public_authority_alias_registry(
+                                cur
+                            )
                         recorded_indexes = postgres_schema_history._required_concurrent_indexes(
                             current_state.revision
                         )
@@ -1136,7 +1153,7 @@ class _PostgresStoreBase:
                 if state.revision < concurrent_revision.revision:
                     await self._validate_revision_schema_objects(cur, concurrent_revision)
                     if concurrent_revision.revision == 23:
-                        await self._validate_budget_reservation_identity_registry(
+                        await postgres_budget_schema._validate_budget_reservation_identity_registry(
                             cur,
                             require=True,
                             verify_event_ownership=True,
@@ -1282,66 +1299,6 @@ class _PostgresStoreBase:
             after_sequence = 0
             await asyncio.sleep(0.05)
 
-    async def _validate_producer_cleanup_receipts(self, cur: Any) -> None:
-        await cur.execute(
-            "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull "
-            "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
-            "WHERE c.oid = to_regclass('cayu_producer_cleanup_receipts') "
-            "AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attname"
-        )
-        if list(await cur.fetchall()) != [
-            ("generation", "bigint", True),
-            ("namespace_key", "text", True),
-            ("operation_key", "text", True),
-            ("receipt_json", "jsonb", True),
-        ]:
-            raise RuntimeError(
-                "Required Cayu producer cleanup receipt table is missing or conflicting."
-            )
-        await cur.execute(
-            "SELECT contype, pg_get_constraintdef(oid) FROM pg_constraint "
-            "WHERE conrelid = to_regclass('cayu_producer_cleanup_receipts') AND contype IN ('p', 'f')"
-        )
-        if list(await cur.fetchall()) != [("p", "PRIMARY KEY (operation_key)")]:
-            raise RuntimeError(
-                "Producer cleanup receipts require an independent exact primary key."
-            )
-        await cur.execute(
-            "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull "
-            "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
-            "WHERE c.oid = to_regclass('cayu_producer_cleanup_retirements') "
-            "AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attname"
-        )
-        if list(await cur.fetchall()) != [
-            ("namespace_key", "text", True),
-            ("through_generation", "bigint", True),
-        ]:
-            raise RuntimeError("Producer cleanup retirement fence is missing or conflicting.")
-        await cur.execute(
-            "SELECT contype, pg_get_constraintdef(oid) FROM pg_constraint "
-            "WHERE conrelid = to_regclass('cayu_producer_cleanup_retirements') AND contype IN ('p', 'f')"
-        )
-        if list(await cur.fetchall()) != [("p", "PRIMARY KEY (namespace_key)")]:
-            raise RuntimeError("Producer cleanup retirement fence requires an independent key.")
-        await cur.execute(
-            "SELECT i.indisvalid, i.indisready, i.indisunique, i.indpred IS NULL, i.indexprs IS NULL, "
-            "ARRAY(SELECT a.attname FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ordinal) "
-            "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum ORDER BY k.ordinal) "
-            "FROM pg_index i WHERE i.indexrelid = to_regclass('idx_cayu_producer_cleanup_namespace') "
-            "AND i.indrelid = to_regclass('cayu_producer_cleanup_receipts')"
-        )
-        if await cur.fetchone() != (
-            True,
-            True,
-            False,
-            True,
-            True,
-            ["namespace_key", "generation", "operation_key"],
-        ):
-            raise RuntimeError(
-                "Producer cleanup receipt namespace index is missing or conflicting."
-            )
-
     def _validate_postgres_revision(self, state: schema.SchemaState) -> None:
         if state.revision < self._min_required_revision:
             raise schema.SchemaTooOld(
@@ -1355,7 +1312,7 @@ class _PostgresStoreBase:
         if state.revision >= 108:
             await validate_postgres_context_selection_schema(cur)
         if state.revision >= 110:
-            await self._validate_producer_cleanup_receipts(cur)
+            await postgres_producer_schema._validate_producer_cleanup_receipts(cur)
         if state.revision >= 96:
             await validate_postgres_participant_bindings(cur)
         if state.revision >= 111:
@@ -1371,7 +1328,7 @@ class _PostgresStoreBase:
                 planning=state.revision >= 107,
             )
         if self._min_required_revision >= 36:
-            await self._validate_session_invocation_column(cur)
+            await postgres_session_schema._validate_session_invocation_column(cur)
         if self._min_required_revision >= 38:
             await postgres_task_schema._validate_task_terminalization_receipt_table(cur)
         if self._min_required_revision >= 39:
@@ -1411,7 +1368,9 @@ class _PostgresStoreBase:
         if self._min_required_revision >= 45:
             await postgres_task_schema._validate_task_retry_series_schema(cur)
         if self._min_required_revision >= 46:
-            await self._validate_transcript_search_document_column(cur)
+            await postgres_transcript_schema._validate_transcript_search_document_column(
+                cur, tokenizer_version=TRANSCRIPT_SEARCH_TOKENIZER_VERSION
+            )
         if self._min_required_revision >= 47:
             await postgres_eval_schema._validate_eval_result_baseline_schema(cur)
         if self._min_required_revision >= 48:
@@ -1424,9 +1383,9 @@ class _PostgresStoreBase:
         if self._min_required_revision >= 50:
             await postgres_eval_schema._validate_eval_run_invocation_column(cur)
         if self._min_required_revision >= 51:
-            await self._validate_memory_evidence_schema(cur)
+            await postgres_memory_evidence_schema._validate_memory_evidence_schema(cur)
         if self._min_required_revision >= 52:
-            await self._validate_targeted_tool_grant_schema(cur)
+            await postgres_session_schema._validate_targeted_tool_grant_schema(cur)
         if self._min_required_revision >= 53:
             await postgres_eval_schema._validate_eval_scenario_schema(cur)
         if self._min_required_revision >= 55:
@@ -1434,9 +1393,9 @@ class _PostgresStoreBase:
         if self._min_required_revision >= 56:
             await postgres_eval_schema._validate_eval_run_scenario_progress_column(cur)
         if self._min_required_revision >= 57:
-            await self._validate_session_message_queue_typed_message_column(cur)
+            await postgres_session_schema._validate_session_message_queue_typed_message_column(cur)
         if self._min_required_revision >= 83:
-            await self._validate_session_message_lifecycle_columns(cur)
+            await postgres_session_schema._validate_session_message_lifecycle_columns(cur)
         if self._min_required_revision >= 61:
             await postgres_verified_work_schema._validate_work_attempt_admission_schema(cur)
         if self._min_required_revision >= 84:
@@ -1463,18 +1422,18 @@ class _PostgresStoreBase:
         if self._min_required_revision >= 78:
             await postgres_knowledge_schema._validate_knowledge_semantic_watch_schema(cur)
         if self._min_required_revision >= 79:
-            await self._validate_child_session_lifecycle_schema(cur)
+            await postgres_session_schema._validate_child_session_lifecycle_schema(cur)
         if self._min_required_revision >= 88:
             await postgres_task_schema._validate_task_closure_guard(
                 cur, expected_guard_sql=postgres_schema_history._MIGRATION_STEPS[88][1]
             )
         if state.revision >= 23:
-            await self._validate_budget_reservation_identity_registry(
+            await postgres_budget_schema._validate_budget_reservation_identity_registry(
                 cur,
                 require=True,
             )
         if state.revision >= 28:
-            await self._validate_public_authority_alias_registry(cur)
+            await postgres_session_schema._validate_public_authority_alias_registry(cur)
         for index in postgres_schema_history._required_concurrent_indexes(state.revision):
             existing = await self._concurrent_index_state(cur, index)
             if existing is None:
@@ -1488,23 +1447,6 @@ class _PostgresStoreBase:
                     f"Required Cayu Postgres index is not ready: {index.index_name}. "
                     "Run `cayu storage migrate` to repair the schema."
                 )
-
-    async def _validate_session_invocation_column(self, cur: Any) -> None:
-        await cur.execute(
-            """
-            SELECT data_type, is_nullable, is_generated
-            FROM information_schema.columns
-            WHERE table_schema = current_schema()
-              AND table_name = 'cayu_sessions'
-              AND column_name = 'invocation'
-            """
-        )
-        if await cur.fetchone() != ("jsonb", "NO", "NEVER"):
-            raise RuntimeError(
-                "Postgres schema object 'cayu_sessions.invocation' conflicts with "
-                "Cayu's required invocation-provenance contract. Recreate the Cayu "
-                "database from a known-good revision-36 schema."
-            )
 
     async def _validate_revision_schema_objects(
         self,
@@ -1522,7 +1464,7 @@ class _PostgresStoreBase:
         if revision.revision == 108:
             await validate_postgres_context_selection_schema(cur)
         if revision.revision == 110:
-            await self._validate_producer_cleanup_receipts(cur)
+            await postgres_producer_schema._validate_producer_cleanup_receipts(cur)
         if revision.revision == 111:
             await validate_postgres_wait_discovery(cur)
         if revision.revision == 112:
@@ -1530,7 +1472,7 @@ class _PostgresStoreBase:
         if revision.revision == 102:
             await validate_postgres_participant_bindings(cur)
         if revision.revision == 36:
-            await self._validate_session_invocation_column(cur)
+            await postgres_session_schema._validate_session_invocation_column(cur)
         if revision.revision == 38:
             await postgres_task_schema._validate_task_terminalization_receipt_table(cur)
         if revision.revision == 39:
@@ -1548,7 +1490,9 @@ class _PostgresStoreBase:
         if revision.revision == 45:
             await postgres_task_schema._validate_task_retry_series_schema(cur)
         if revision.revision == 46:
-            await self._validate_transcript_search_document_column(cur)
+            await postgres_transcript_schema._validate_transcript_search_document_column(
+                cur, tokenizer_version=TRANSCRIPT_SEARCH_TOKENIZER_VERSION
+            )
         if revision.revision == 47:
             await postgres_eval_schema._validate_eval_result_baseline_schema(cur)
         if revision.revision == 48:
@@ -1556,9 +1500,9 @@ class _PostgresStoreBase:
         if revision.revision == 50:
             await postgres_eval_schema._validate_eval_run_invocation_column(cur)
         if revision.revision == 51:
-            await self._validate_memory_evidence_schema(cur)
+            await postgres_memory_evidence_schema._validate_memory_evidence_schema(cur)
         if revision.revision == 52:
-            await self._validate_targeted_tool_grant_schema(cur)
+            await postgres_session_schema._validate_targeted_tool_grant_schema(cur)
         if revision.revision == 53:
             await postgres_eval_schema._validate_eval_scenario_schema(cur)
         if revision.revision == 55:
@@ -1566,9 +1510,9 @@ class _PostgresStoreBase:
         if revision.revision == 56:
             await postgres_eval_schema._validate_eval_run_scenario_progress_column(cur)
         if revision.revision == 57:
-            await self._validate_session_message_queue_typed_message_column(cur)
+            await postgres_session_schema._validate_session_message_queue_typed_message_column(cur)
         if revision.revision == 83:
-            await self._validate_session_message_lifecycle_columns(cur)
+            await postgres_session_schema._validate_session_message_lifecycle_columns(cur)
         if revision.revision == 58:
             await postgres_verified_work_schema._validate_verified_work_schema(
                 cur,
@@ -1576,7 +1520,7 @@ class _PostgresStoreBase:
             )
         if revision.revision == 59:
             await _reject_populated_pre_result_resolver_database(cur)
-            await self._validate_session_instance_schema(cur)
+            await postgres_session_schema._validate_session_instance_schema(cur)
         if revision.revision == 60:
             await postgres_knowledge_schema._validate_knowledge_change_schema(
                 cur, relation_aware=True
@@ -1631,7 +1575,7 @@ class _PostgresStoreBase:
         if revision.revision == 78:
             await postgres_knowledge_schema._validate_knowledge_semantic_watch_schema(cur)
         if revision.revision == 79:
-            await self._validate_child_session_lifecycle_schema(cur)
+            await postgres_session_schema._validate_child_session_lifecycle_schema(cur)
         if revision.revision == 88:
             await postgres_task_schema._validate_task_closure_guard(
                 cur, expected_guard_sql=postgres_schema_history._MIGRATION_STEPS[88][1]
@@ -1750,960 +1694,6 @@ class _PostgresStoreBase:
             last = receipts[-1]
             cursor = (str(last[0]), last[5], str(last[1]))
         await finalize_active_task()
-
-    async def _validate_child_session_lifecycle_schema(self, cur: Any) -> None:
-        table = "cayu_child_session_lifecycle_candidates"
-        await cur.execute(
-            """
-            SELECT column_name, data_type, is_nullable, collation_name
-            FROM information_schema.columns
-            WHERE table_schema = current_schema()
-              AND table_name = 'cayu_child_session_lifecycle_candidates'
-            ORDER BY ordinal_position
-            """
-        )
-        if tuple(await cur.fetchall()) != (
-            ("child_session_id", "text", "NO", "C"),
-            ("parent_session_id", "text", "NO", "C"),
-            ("priority", "integer", "NO", None),
-            ("sort_at", "timestamp with time zone", "NO", None),
-        ):
-            self._raise_child_session_lifecycle_schema_error(table)
-        await cur.execute(
-            """
-            SELECT constraint_record.contype,
-                   pg_get_constraintdef(constraint_record.oid)
-            FROM pg_catalog.pg_constraint AS constraint_record
-            JOIN pg_catalog.pg_class AS table_record
-              ON table_record.oid = constraint_record.conrelid
-            JOIN pg_catalog.pg_namespace AS namespace
-              ON namespace.oid = table_record.relnamespace
-            WHERE namespace.nspname = current_schema()
-              AND table_record.relname = 'cayu_child_session_lifecycle_candidates'
-            """
-        )
-        constraints = tuple(
-            (str(kind), " ".join(str(definition).lower().split()))
-            for kind, definition in await cur.fetchall()
-        )
-        required_constraints = (
-            ("p", ("primary key (child_session_id)",)),
-            ("c", ("priority", "0", "1", "2")),
-            ("f", ("foreign key (child_session_id)", "cayu_sessions(id)", "on delete cascade")),
-            (
-                "f",
-                ("foreign key (parent_session_id)", "cayu_sessions(id)", "on delete cascade"),
-            ),
-        )
-        if any(
-            not any(
-                actual_kind == expected_kind
-                and all(fragment in definition for fragment in fragments)
-                for actual_kind, definition in constraints
-            )
-            for expected_kind, fragments in required_constraints
-        ):
-            self._raise_child_session_lifecycle_schema_error(table)
-        await cur.execute(
-            """
-            SELECT indexname, indexdef
-            FROM pg_catalog.pg_indexes
-            WHERE schemaname = current_schema()
-              AND indexname = ANY(%s)
-            """,
-            (
-                [
-                    "idx_cayu_child_lifecycle_candidates_page",
-                    "idx_cayu_events_child_lifecycle",
-                    "idx_cayu_transcript_messages_session_role_order",
-                ],
-            ),
-        )
-        indexes = {
-            str(name): " ".join(str(definition).lower().split())
-            for name, definition in await cur.fetchall()
-        }
-        if (
-            "parent_session_id, priority, sort_at, child_session_id"
-            not in indexes.get(
-                "idx_cayu_child_lifecycle_candidates_page",
-                "",
-            )
-            or "session_id, event_type, sequence desc"
-            not in indexes.get(
-                "idx_cayu_events_child_lifecycle",
-                "",
-            )
-            or "where" not in indexes.get("idx_cayu_events_child_lifecycle", "")
-            or not all(
-                fragment in indexes.get("idx_cayu_transcript_messages_session_role_order", "")
-                for fragment in (
-                    "session_id",
-                    "message ->> 'role'::text",
-                    "session_order desc",
-                )
-            )
-        ):
-            self._raise_child_session_lifecycle_schema_error("candidate indexes")
-        expected_triggers = {
-            "cayu_index_child_lifecycle_session",
-            "cayu_index_child_lifecycle_event_insert",
-            "cayu_index_child_lifecycle_event_delete",
-            "cayu_index_child_lifecycle_event_update",
-            "cayu_index_child_lifecycle_consumption_insert",
-            "cayu_index_child_lifecycle_consumption_delete",
-            "cayu_index_child_lifecycle_consumption_update",
-        }
-        await cur.execute(
-            """
-            SELECT trigger_record.tgname
-            FROM pg_catalog.pg_trigger AS trigger_record
-            JOIN pg_catalog.pg_class AS table_record
-              ON table_record.oid = trigger_record.tgrelid
-            JOIN pg_catalog.pg_namespace AS namespace
-              ON namespace.oid = table_record.relnamespace
-            WHERE namespace.nspname = current_schema()
-              AND NOT trigger_record.tgisinternal
-              AND trigger_record.tgname = ANY(%s)
-            """,
-            (list(expected_triggers),),
-        )
-        if {str(row[0]) for row in await cur.fetchall()} != expected_triggers:
-            self._raise_child_session_lifecycle_schema_error("maintenance triggers")
-
-    @staticmethod
-    def _raise_child_session_lifecycle_schema_error(name: str) -> NoReturn:
-        raise RuntimeError(
-            "Postgres schema object "
-            f"{name!r} conflicts with Cayu's bounded child-lifecycle projection. "
-            "Run `cayu storage migrate` to install revision 79 or recreate the database."
-        )
-
-    async def _validate_session_instance_schema(self, cur: Any) -> None:
-        await cur.execute(
-            """
-            SELECT table_name, column_name, data_type, is_nullable
-            FROM information_schema.columns
-            WHERE table_schema = current_schema()
-              AND (
-                (table_name = 'cayu_sessions' AND column_name = 'instance_id')
-                OR (table_name = 'cayu_tasks' AND column_name = 'session_instance_id')
-              )
-            ORDER BY table_name, column_name
-            """
-        )
-        if tuple(await cur.fetchall()) != (
-            ("cayu_sessions", "instance_id", "text", "NO"),
-            ("cayu_tasks", "session_instance_id", "text", "YES"),
-        ):
-            raise RuntimeError("Postgres session-instance authority columns are malformed.")
-        await cur.execute("SELECT EXISTS(SELECT 1 FROM cayu_sessions WHERE instance_id IS NULL)")
-        row = await cur.fetchone()
-        if row is None or row[0] is True:
-            raise RuntimeError("Postgres session-instance authority is incomplete.")
-
-    async def _validate_transcript_search_document_column(self, cur: Any) -> None:
-        await cur.execute(
-            """
-            SELECT data_type, is_nullable, is_generated
-            FROM information_schema.columns
-            WHERE table_schema = current_schema()
-              AND table_name = 'cayu_transcript_messages'
-              AND column_name = 'transcript_search_document'
-            """
-        )
-        if await cur.fetchone() != ("text", "NO", "NEVER"):
-            raise RuntimeError(
-                "Postgres transcript search document column is missing or nullable. "
-                "Recreate or restore a known-good revision-46 Cayu database."
-            )
-        await cur.execute(
-            """
-            SELECT column_name, data_type, is_nullable
-            FROM information_schema.columns
-            WHERE table_schema = current_schema()
-              AND table_name = 'cayu_transcript_search_configuration'
-            ORDER BY ordinal_position
-            """
-        )
-        if tuple(await cur.fetchall()) != (
-            ("singleton", "boolean", "NO"),
-            ("tokenizer_version", "text", "NO"),
-        ):
-            raise RuntimeError(
-                "Postgres transcript search tokenizer configuration is missing or "
-                "malformed. Recreate a revision-46 Cayu database with this runtime."
-            )
-        await cur.execute(
-            """
-            SELECT array_agg(attribute.attname ORDER BY key.ordinality)
-            FROM pg_constraint AS constraint_definition
-            JOIN pg_class AS relation
-              ON relation.oid = constraint_definition.conrelid
-            JOIN pg_namespace AS namespace
-              ON namespace.oid = relation.relnamespace
-            CROSS JOIN LATERAL unnest(constraint_definition.conkey)
-                WITH ORDINALITY AS key(attribute_number, ordinality)
-            JOIN pg_attribute AS attribute
-              ON attribute.attrelid = relation.oid
-             AND attribute.attnum = key.attribute_number
-            WHERE namespace.nspname = current_schema()
-              AND relation.relname = 'cayu_transcript_search_configuration'
-              AND constraint_definition.contype = 'p'
-            """
-        )
-        if await cur.fetchone() != (["singleton"],):
-            raise RuntimeError(
-                "Postgres transcript search tokenizer configuration lacks its "
-                "singleton primary key. Recreate a revision-46 Cayu database."
-            )
-        await cur.execute(
-            """
-            SELECT pg_get_constraintdef(constraint_definition.oid, TRUE)
-            FROM pg_constraint AS constraint_definition
-            JOIN pg_class AS relation
-              ON relation.oid = constraint_definition.conrelid
-            JOIN pg_namespace AS namespace
-              ON namespace.oid = relation.relnamespace
-            WHERE namespace.nspname = current_schema()
-              AND relation.relname = 'cayu_transcript_search_configuration'
-              AND constraint_definition.contype = 'c'
-            ORDER BY constraint_definition.conname
-            """
-        )
-        check_definitions = {"".join(str(row[0]).lower().split()) for row in await cur.fetchall()}
-        if "check(singleton)" not in check_definitions:
-            raise RuntimeError(
-                "Postgres transcript search tokenizer configuration lacks its "
-                "singleton constraint. Recreate a revision-46 Cayu database."
-            )
-        await cur.execute(
-            "SELECT singleton, tokenizer_version "
-            "FROM cayu_transcript_search_configuration ORDER BY singleton"
-        )
-        if tuple(await cur.fetchall()) != ((True, TRANSCRIPT_SEARCH_TOKENIZER_VERSION),):
-            raise RuntimeError(
-                "Postgres transcript search tokenizer identity conflicts with this runtime. "
-                "Recreate a revision-46 Cayu database with this runtime."
-            )
-
-    async def _validate_session_message_lifecycle_columns(self, cur: Any) -> None:
-        await cur.execute(
-            "SELECT indisvalid, indisready, pg_get_indexdef(indexrelid) "
-            "FROM pg_index WHERE indexrelid = to_regclass('idx_cayu_events_queue_acceptance')"
-        )
-        index = await cur.fetchone()
-        definition = "" if index is None else " ".join(index[2].lower().split())
-        if (
-            index is None
-            or not index[0]
-            or not index[1]
-            or "using btree (session_id, ((event #>> '{payload,queue_id}'::text[])))"
-            not in definition
-            or "where (event_type = 'session.message.queued'::text)" not in definition
-        ):
-            raise RuntimeError("Postgres queue acceptance lookup index conflicts with revision 83.")
-        await cur.execute(
-            "SELECT column_name, data_type, is_nullable, column_default "
-            "FROM information_schema.columns WHERE table_schema = current_schema() "
-            "AND table_name = 'cayu_session_message_queue' "
-            "AND column_name IN ('conditions_json', 'terminal_json')"
-        )
-        columns = {row[0]: tuple(row[1:]) for row in await cur.fetchall()}
-        if any(
-            columns.get(name) != ("jsonb", "YES", None)
-            for name in ("conditions_json", "terminal_json")
-        ):
-            raise RuntimeError(
-                "Postgres session-message lifecycle columns conflict with revision 83."
-            )
-        await cur.execute(
-            "SELECT data_type, is_nullable, column_default FROM information_schema.columns "
-            "WHERE table_schema = current_schema() AND table_name = 'cayu_session_message_deliveries' "
-            "AND column_name = 'reject_only'"
-        )
-        if await cur.fetchone() != ("boolean", "NO", "false"):
-            raise RuntimeError("Postgres queue rejection receipt conflicts with revision 83.")
-
-    async def _validate_session_message_queue_typed_message_column(self, cur: Any) -> None:
-        await cur.execute(
-            """
-            SELECT data_type, is_nullable, column_default
-            FROM information_schema.columns
-            WHERE table_schema = current_schema()
-              AND table_name = 'cayu_session_message_queue'
-              AND column_name = 'message_json'
-            """
-        )
-        if await cur.fetchone() != ("jsonb", "YES", None):
-            raise RuntimeError(
-                "Postgres schema object 'cayu_session_message_queue.message_json' "
-                "conflicts with Cayu's revision-57 typed queued-message contract. "
-                "Run `cayu storage migrate` or restore the database from a known-good backup."
-            )
-
-    async def _validate_memory_evidence_schema(self, cur: Any) -> None:
-        expected_columns = {
-            "cayu_recall_receipts": (
-                ("receipt_id", "text", "NO"),
-                ("session_id", "text", "NO"),
-                ("interaction_id", "text", "NO"),
-                ("model_step_id", "text", "NO"),
-                ("created_at", "timestamp with time zone", "NO"),
-                ("receipt_json", "jsonb", "NO"),
-                ("document_bytes", "bigint", "NO"),
-            ),
-            "cayu_context_exposures": (
-                ("exposure_id", "text", "NO"),
-                ("session_id", "text", "NO"),
-                ("interaction_id", "text", "NO"),
-                ("model_step_id", "text", "NO"),
-                ("model_attempt_id", "text", "NO"),
-                ("provider_attempt_id", "text", "NO"),
-                ("state", "text", "NO"),
-                ("state_revision", "integer", "NO"),
-                ("created_at", "timestamp with time zone", "NO"),
-                ("updated_at", "timestamp with time zone", "NO"),
-                ("exposure_json", "jsonb", "NO"),
-                ("document_bytes", "bigint", "NO"),
-            ),
-            "cayu_recall_item_exposures": (
-                ("exposure_id", "text", "NO"),
-                ("ordinal", "integer", "NO"),
-                ("receipt_id", "text", "NO"),
-                ("receipt_item_ordinal", "integer", "NO"),
-                ("item_json", "jsonb", "NO"),
-                ("document_bytes", "bigint", "NO"),
-            ),
-        }
-        for table, expected in expected_columns.items():
-            await cur.execute(
-                """
-                SELECT column_name, data_type, is_nullable
-                FROM information_schema.columns
-                WHERE table_schema = current_schema() AND table_name = %s
-                ORDER BY ordinal_position
-                """,
-                (table,),
-            )
-            if tuple(await cur.fetchall()) != expected:
-                self._raise_memory_evidence_schema_error(table)
-
-        await cur.execute(
-            """
-            SELECT table_name, column_name, collation_name
-            FROM information_schema.columns
-            WHERE table_schema = current_schema()
-              AND (table_name, column_name) IN (
-                  ('cayu_recall_receipts', 'receipt_id'),
-                  ('cayu_recall_receipts', 'session_id'),
-                  ('cayu_recall_receipts', 'interaction_id'),
-                  ('cayu_recall_receipts', 'model_step_id'),
-                  ('cayu_context_exposures', 'exposure_id'),
-                  ('cayu_context_exposures', 'session_id'),
-                  ('cayu_context_exposures', 'interaction_id'),
-                  ('cayu_context_exposures', 'model_step_id'),
-                  ('cayu_context_exposures', 'model_attempt_id'),
-                  ('cayu_context_exposures', 'provider_attempt_id'),
-                  ('cayu_recall_item_exposures', 'exposure_id'),
-                  ('cayu_recall_item_exposures', 'receipt_id')
-              )
-            """
-        )
-        if set(await cur.fetchall()) != {
-            ("cayu_recall_receipts", "receipt_id", "C"),
-            ("cayu_recall_receipts", "session_id", "C"),
-            ("cayu_recall_receipts", "interaction_id", "C"),
-            ("cayu_recall_receipts", "model_step_id", "C"),
-            ("cayu_context_exposures", "exposure_id", "C"),
-            ("cayu_context_exposures", "session_id", "C"),
-            ("cayu_context_exposures", "interaction_id", "C"),
-            ("cayu_context_exposures", "model_step_id", "C"),
-            ("cayu_context_exposures", "model_attempt_id", "C"),
-            ("cayu_context_exposures", "provider_attempt_id", "C"),
-            ("cayu_recall_item_exposures", "exposure_id", "C"),
-            ("cayu_recall_item_exposures", "receipt_id", "C"),
-        }:
-            self._raise_memory_evidence_schema_error("memory evidence identity collation")
-
-        required_constraints = {
-            "cayu_recall_receipts": (
-                ("p", ("primary key (receipt_id)",)),
-                (
-                    "f",
-                    (
-                        "foreign key (session_id)",
-                        "references cayu_sessions(id)",
-                        "on delete cascade",
-                    ),
-                ),
-                ("c", ("document_bytes >= 1", "document_bytes <= 256000")),
-            ),
-            "cayu_context_exposures": (
-                ("p", ("primary key (exposure_id)",)),
-                ("u", ("unique (session_id, model_attempt_id)",)),
-                ("u", ("unique (session_id, provider_attempt_id)",)),
-                (
-                    "f",
-                    (
-                        "foreign key (session_id)",
-                        "references cayu_sessions(id)",
-                        "on delete cascade",
-                    ),
-                ),
-                (
-                    "c",
-                    (
-                        "planned",
-                        "prepared",
-                        "dispatch_started",
-                        "acknowledged",
-                        "completed",
-                        "failed",
-                        "cancelled",
-                        "indeterminate",
-                    ),
-                ),
-                ("c", ("state_revision >= 0", "state_revision < 16")),
-                ("c", ("document_bytes >= 1", "document_bytes <= 128000")),
-            ),
-            "cayu_recall_item_exposures": (
-                ("p", ("primary key (exposure_id, ordinal)",)),
-                (
-                    "u",
-                    ("unique (exposure_id, receipt_id, receipt_item_ordinal)",),
-                ),
-                (
-                    "f",
-                    (
-                        "foreign key (exposure_id)",
-                        "references cayu_context_exposures(exposure_id)",
-                        "on delete cascade",
-                    ),
-                ),
-                (
-                    "f",
-                    (
-                        "foreign key (receipt_id)",
-                        "references cayu_recall_receipts(receipt_id)",
-                        "on delete cascade",
-                    ),
-                ),
-                ("c", ("ordinal >= 0", "ordinal < 64")),
-                (
-                    "c",
-                    ("receipt_item_ordinal >= 0", "receipt_item_ordinal < 64"),
-                ),
-                ("c", ("document_bytes >= 1", "document_bytes <= 16384")),
-            ),
-        }
-        for table, required in required_constraints.items():
-            await cur.execute(
-                """
-                SELECT constraint_record.contype,
-                       pg_get_constraintdef(constraint_record.oid)
-                FROM pg_catalog.pg_constraint AS constraint_record
-                JOIN pg_catalog.pg_class AS table_record
-                  ON table_record.oid = constraint_record.conrelid
-                JOIN pg_catalog.pg_namespace AS namespace
-                  ON namespace.oid = table_record.relnamespace
-                WHERE namespace.nspname = current_schema()
-                  AND table_record.relname = %s
-                  AND constraint_record.contype IN ('p', 'u', 'f', 'c')
-                """,
-                (table,),
-            )
-            candidates = [
-                (str(kind), " ".join(str(definition).lower().split()))
-                for kind, definition in await cur.fetchall()
-            ]
-            if not postgres_catalog._constraint_fragments_match_exactly(candidates, required):
-                self._raise_memory_evidence_schema_error(table)
-
-        await cur.execute(
-            """
-            SELECT table_record.relname, index_record.relname
-            FROM pg_catalog.pg_index AS index_state
-            JOIN pg_catalog.pg_class AS index_record
-              ON index_record.oid = index_state.indexrelid
-            JOIN pg_catalog.pg_class AS table_record
-              ON table_record.oid = index_state.indrelid
-            JOIN pg_catalog.pg_namespace AS namespace
-              ON namespace.oid = table_record.relnamespace
-            LEFT JOIN pg_catalog.pg_constraint AS constraint_record
-              ON constraint_record.conindid = index_state.indexrelid
-             AND constraint_record.contype IN ('p', 'u')
-            WHERE namespace.nspname = current_schema()
-              AND table_record.relname = ANY(%s)
-              AND index_state.indisunique
-              AND constraint_record.oid IS NULL
-            ORDER BY table_record.relname, index_record.relname
-            LIMIT 1
-            """,
-            (list(expected_columns),),
-        )
-        unexpected_unique_index = await cur.fetchone()
-        if unexpected_unique_index is not None:
-            self._raise_memory_evidence_schema_error(str(unexpected_unique_index[1]))
-
-        expected_indexes = {
-            "idx_cayu_recall_receipts_session_page": (
-                "cayu_recall_receipts",
-                "using btree (session_id, created_at, receipt_id)",
-            ),
-            "idx_cayu_recall_receipts_interaction_page": (
-                "cayu_recall_receipts",
-                "using btree (session_id, interaction_id, created_at, receipt_id)",
-            ),
-            "idx_cayu_recall_receipts_step_page": (
-                "cayu_recall_receipts",
-                "using btree (session_id, model_step_id, created_at, receipt_id)",
-            ),
-            "idx_cayu_recall_receipts_interaction_step_page": (
-                "cayu_recall_receipts",
-                "using btree (session_id, interaction_id, model_step_id, created_at, receipt_id)",
-            ),
-            "idx_cayu_context_exposures_session_page": (
-                "cayu_context_exposures",
-                "using btree (session_id, created_at, exposure_id)",
-            ),
-            "idx_cayu_context_exposures_interaction_page": (
-                "cayu_context_exposures",
-                "using btree (session_id, interaction_id, created_at, exposure_id)",
-            ),
-            "idx_cayu_context_exposures_step_page": (
-                "cayu_context_exposures",
-                "using btree (session_id, model_step_id, created_at, exposure_id)",
-            ),
-            "idx_cayu_context_exposures_interaction_step_page": (
-                "cayu_context_exposures",
-                "using btree (session_id, interaction_id, model_step_id, created_at, exposure_id)",
-            ),
-            "idx_cayu_recall_item_exposures_receipt": (
-                "cayu_recall_item_exposures",
-                "using btree (receipt_id, exposure_id, ordinal)",
-            ),
-        }
-        await cur.execute(
-            """
-            SELECT table_record.relname, index_record.relname,
-                   index_state.indisvalid, index_state.indisready,
-                   index_state.indisunique, index_state.indpred IS NULL,
-                   index_state.indexprs IS NULL,
-                   index_state.indnatts = index_state.indnkeyatts,
-                   pg_get_indexdef(index_record.oid)
-            FROM pg_catalog.pg_index AS index_state
-            JOIN pg_catalog.pg_class AS index_record
-              ON index_record.oid = index_state.indexrelid
-            JOIN pg_catalog.pg_class AS table_record
-              ON table_record.oid = index_state.indrelid
-            JOIN pg_catalog.pg_namespace AS namespace
-              ON namespace.oid = table_record.relnamespace
-            WHERE namespace.nspname = current_schema()
-              AND index_record.relname = ANY(%s)
-            """,
-            (list(expected_indexes),),
-        )
-        indexes = {
-            str(index): (
-                str(table),
-                bool(valid),
-                bool(ready),
-                bool(unique),
-                bool(unconditional),
-                bool(plain_columns),
-                bool(key_columns_only),
-                " ".join(str(definition).lower().split()),
-            )
-            for (
-                table,
-                index,
-                valid,
-                ready,
-                unique,
-                unconditional,
-                plain_columns,
-                key_columns_only,
-                definition,
-            ) in await cur.fetchall()
-        }
-        for name, (table, definition_fragment) in expected_indexes.items():
-            value = indexes.get(name)
-            if (
-                value is None
-                or value[0] != table
-                or not value[1]
-                or not value[2]
-                or value[3]
-                or not value[4]
-                or not value[5]
-                or not value[6]
-                or definition_fragment not in value[7]
-            ):
-                self._raise_memory_evidence_schema_error(name)
-
-    @staticmethod
-    def _raise_memory_evidence_schema_error(name: str) -> NoReturn:
-        raise RuntimeError(
-            f"Postgres schema object {name!r} conflicts with Cayu's revision-51 "
-            "memory evidence contract. Recreate the database or restore a known-good "
-            "revision-51 backup."
-        )
-
-    async def _validate_targeted_tool_grant_schema(self, cur: Any) -> None:
-        expected_columns = {
-            "cayu_targeted_tool_grants": (
-                ("grant_id", "text", "NO"),
-                ("session_id", "text", "NO"),
-                ("interaction_id", "text", "NO"),
-                ("request_id", "text", "NO"),
-                ("tool_ref", "text", "NO"),
-                ("generation_id", "text", "NO"),
-                ("tool_id", "text", "NO"),
-                ("tool_name", "text", "NO"),
-                ("catalogue_revision", "text", "NO"),
-                ("descriptor_version", "text", "NO"),
-                ("issued_at", "timestamp with time zone", "NO"),
-                ("expires_at", "timestamp with time zone", "NO"),
-                ("max_calls", "bigint", "NO"),
-                ("used_calls", "bigint", "NO"),
-                ("revoked_at", "timestamp with time zone", "YES"),
-                ("record", "jsonb", "NO"),
-            ),
-            "cayu_targeted_tool_grant_uses": (
-                ("use_id", "text", "NO"),
-                ("grant_id", "text", "NO"),
-                ("session_id", "text", "NO"),
-                ("interaction_id", "text", "NO"),
-                ("model_step_id", "text", "NO"),
-                ("outer_tool_call_id", "text", "NO"),
-                ("arguments_sha256", "text", "NO"),
-                ("invocation_id", "text", "NO"),
-                ("bound_at", "timestamp with time zone", "NO"),
-                ("record", "jsonb", "NO"),
-            ),
-        }
-        for table_name, expected in expected_columns.items():
-            await cur.execute(
-                """
-                SELECT column_name, data_type, is_nullable
-                FROM information_schema.columns
-                WHERE table_schema = current_schema() AND table_name = %s
-                ORDER BY ordinal_position
-                """,
-                (table_name,),
-            )
-            if tuple(await cur.fetchall()) != expected:
-                self._raise_targeted_tool_grant_schema_error(table_name)
-
-        await cur.execute(
-            """
-            SELECT column_default
-            FROM information_schema.columns
-            WHERE table_schema = current_schema()
-              AND table_name = 'cayu_targeted_tool_grants'
-              AND column_name = 'used_calls'
-            """
-        )
-        default_row = await cur.fetchone()
-        if default_row is None or re.sub(r"\s|::bigint", "", str(default_row[0])) != "0":
-            self._raise_targeted_tool_grant_schema_error("cayu_targeted_tool_grants.used_calls")
-
-        expected_constraints = {
-            "cayu_targeted_tool_grants": {
-                ("p", "primarykeygrant_id"),
-                ("u", "uniquesession_id,interaction_id,request_id"),
-                ("u", "uniquesession_id,interaction_id,tool_id"),
-                (
-                    "f",
-                    "foreignkeysession_idreferencescayu_sessionsidondeletecascade",
-                ),
-                ("c", "checkmax_calls>=1andmax_calls<=32"),
-                ("c", "checkused_calls>=0andused_calls<=max_calls"),
-            },
-            "cayu_targeted_tool_grant_uses": {
-                ("p", "primarykeyuse_id"),
-                ("u", "uniquesession_id,interaction_id,invocation_id"),
-                ("u", "uniquesession_id,interaction_id,outer_tool_call_id"),
-                (
-                    "f",
-                    "foreignkeygrant_idreferencescayu_targeted_tool_grantsgrant_idondeletecascade",
-                ),
-                (
-                    "f",
-                    "foreignkeysession_idreferencescayu_sessionsidondeletecascade",
-                ),
-            },
-        }
-        for table_name, expected in expected_constraints.items():
-            await cur.execute(
-                """
-                SELECT constraint_record.contype,
-                       pg_get_constraintdef(constraint_record.oid)
-                FROM pg_catalog.pg_constraint AS constraint_record
-                JOIN pg_catalog.pg_class AS table_record
-                  ON table_record.oid = constraint_record.conrelid
-                JOIN pg_catalog.pg_namespace AS namespace
-                  ON namespace.oid = table_record.relnamespace
-                WHERE namespace.nspname = current_schema()
-                  AND table_record.relname = %s
-                """,
-                (table_name,),
-            )
-            actual = {
-                (
-                    str(row[0]),
-                    re.sub(r'[\s()"]', "", str(row[1]).lower()),
-                )
-                for row in await cur.fetchall()
-            }
-            if actual != expected:
-                self._raise_targeted_tool_grant_schema_error(f"{table_name} constraints")
-
-        required_indexes = {
-            "idx_cayu_targeted_tool_grants_interaction": (
-                "cayu_targeted_tool_grantsusingbtreesession_id,interaction_id,issued_at,grant_id"
-            ),
-            "idx_cayu_targeted_tool_grant_uses_grant": (
-                "cayu_targeted_tool_grant_usesusingbtreegrant_id,bound_at,use_id"
-            ),
-        }
-        for index_name, required_definition in required_indexes.items():
-            await cur.execute(
-                """
-                SELECT indexdef
-                FROM pg_indexes
-                WHERE schemaname = current_schema() AND indexname = %s
-                """,
-                (index_name,),
-            )
-            index_rows = tuple(await cur.fetchall())
-            if len(index_rows) != 1:
-                self._raise_targeted_tool_grant_schema_error(index_name)
-            index_definition = re.sub(r'[\s()"]', "", str(index_rows[0][0]).lower())
-            if (
-                "createindex" not in index_definition
-                or "createuniqueindex" in index_definition
-                or required_definition not in index_definition
-            ):
-                self._raise_targeted_tool_grant_schema_error(index_name)
-
-    @staticmethod
-    def _raise_targeted_tool_grant_schema_error(name: str) -> NoReturn:
-        raise RuntimeError(
-            f"Postgres schema object {name!r} conflicts with Cayu's revision-52 "
-            "targeted-grant durability contract. Run `cayu storage migrate` or "
-            "restore the database from a known-good backup."
-        )
-
-    async def _validate_budget_reservation_identity_registry(
-        self,
-        cur: Any,
-        *,
-        require: bool,
-        verify_event_ownership: bool = False,
-    ) -> bool:
-        table_name = "cayu_budget_reservation_identities"
-        await cur.execute("SELECT to_regclass(%s)", (table_name,))
-        registered = await cur.fetchone()
-        if registered is None or registered[0] is None:
-            if require:
-                raise RuntimeError(
-                    f"Required Cayu Postgres table is missing: {table_name}. "
-                    "Restore the permanent reservation ownership registry from "
-                    "a known-good backup."
-                )
-            return False
-        await cur.execute(
-            """
-            SELECT column_name, data_type, is_nullable
-            FROM information_schema.columns
-            WHERE table_schema = current_schema()
-              AND table_name = %s
-            ORDER BY ordinal_position
-            """,
-            (table_name,),
-        )
-        columns = tuple(await cur.fetchall())
-        await cur.execute(
-            """
-            SELECT pg_get_constraintdef(constraint_record.oid)
-            FROM pg_catalog.pg_constraint AS constraint_record
-            JOIN pg_catalog.pg_class AS table_record
-              ON table_record.oid = constraint_record.conrelid
-            JOIN pg_catalog.pg_namespace AS namespace
-              ON namespace.oid = table_record.relnamespace
-            WHERE namespace.nspname = current_schema()
-              AND table_record.relname = %s
-              AND constraint_record.contype = 'p'
-            """,
-            (table_name,),
-        )
-        primary_keys = tuple(row[0] for row in await cur.fetchall())
-        expected_columns = (
-            ("reservation_id", "text", "NO"),
-            ("publication_session_id", "text", "NO"),
-            ("publication_id", "text", "NO"),
-            ("published", "boolean", "NO"),
-        )
-        if columns != expected_columns or primary_keys != ("PRIMARY KEY (reservation_id)",):
-            raise RuntimeError(
-                f"Postgres schema object {table_name!r} conflicts with Cayu's "
-                "reservation identity contract. Restore the required ownership "
-                "registry from a known-good backup."
-            )
-        if not verify_event_ownership:
-            return True
-        await cur.execute(
-            """
-            SELECT 1
-            FROM cayu_events AS event
-            LEFT JOIN cayu_budget_reservation_identities AS identity
-              ON identity.reservation_id = event.payload ->> 'reservation_id'
-            WHERE event.event_type = 'budget.reserved'
-              AND jsonb_typeof(event.payload -> 'reservation_id') = 'string'
-              AND (
-                  identity.reservation_id IS NULL
-                  OR identity.publication_session_id <> event.session_id
-                  OR identity.publication_id <> event.event_id
-                  OR NOT identity.published
-              )
-            LIMIT 1
-            """
-        )
-        if await cur.fetchone() is not None:
-            raise RuntimeError(
-                "Postgres budget reservation events disagree with the permanent "
-                "reservation ownership registry."
-            )
-        return True
-
-    async def _validate_public_authority_alias_registry(self, cur: Any) -> None:
-        table_name = "cayu_public_authority_aliases"
-        await cur.execute("SELECT to_regclass(%s)", (table_name,))
-        registered = await cur.fetchone()
-        if registered is None or registered[0] is None:
-            raise RuntimeError(
-                f"Required Cayu Postgres table is missing: {table_name}. "
-                "Run `cayu storage migrate` to restore the public authority index."
-            )
-        await cur.execute(
-            """
-            SELECT column_name, data_type, is_nullable
-            FROM information_schema.columns
-            WHERE table_schema = current_schema()
-              AND table_name = %s
-            ORDER BY ordinal_position
-            """,
-            (table_name,),
-        )
-        columns = tuple(await cur.fetchall())
-        await cur.execute(
-            """
-            SELECT pg_get_constraintdef(constraint_record.oid)
-            FROM pg_catalog.pg_constraint AS constraint_record
-            JOIN pg_catalog.pg_class AS table_record
-              ON table_record.oid = constraint_record.conrelid
-            JOIN pg_catalog.pg_namespace AS namespace
-              ON namespace.oid = table_record.relnamespace
-            WHERE namespace.nspname = current_schema()
-              AND table_record.relname = %s
-              AND constraint_record.contype = 'p'
-            """,
-            (table_name,),
-        )
-        primary_keys = tuple(row[0] for row in await cur.fetchall())
-        expected_columns = (
-            ("field_name", "text", "NO"),
-            ("scope_session_id", "text", "NO"),
-            ("public_alias", "text", "NO"),
-            ("private_value", "text", "NO"),
-        )
-        if columns != expected_columns or primary_keys != (
-            "PRIMARY KEY (field_name, scope_session_id, public_alias)",
-        ):
-            raise RuntimeError(
-                f"Postgres schema object {table_name!r} conflicts with Cayu's "
-                "public authority alias contract. Run `cayu storage migrate` "
-                "after repairing the conflicting object."
-            )
-
-        key_table_name = "cayu_public_authority_alias_keys"
-        await cur.execute("SELECT to_regclass(%s)", (key_table_name,))
-        registered = await cur.fetchone()
-        if registered is None or registered[0] is None:
-            raise RuntimeError(
-                f"Required Cayu Postgres table is missing: {key_table_name}. "
-                "Run `cayu storage migrate` to restore the alias key registry."
-            )
-        await cur.execute(
-            """
-            SELECT column_name, data_type, is_nullable
-            FROM information_schema.columns
-            WHERE table_schema = current_schema()
-              AND table_name = %s
-            ORDER BY ordinal_position
-            """,
-            (key_table_name,),
-        )
-        key_columns = tuple(await cur.fetchall())
-        await cur.execute(
-            """
-            SELECT pg_get_constraintdef(constraint_record.oid)
-            FROM pg_catalog.pg_constraint AS constraint_record
-            JOIN pg_catalog.pg_class AS table_record
-              ON table_record.oid = constraint_record.conrelid
-            JOIN pg_catalog.pg_namespace AS namespace
-              ON namespace.oid = table_record.relnamespace
-            WHERE namespace.nspname = current_schema()
-              AND table_record.relname = %s
-              AND constraint_record.contype = 'p'
-            """,
-            (key_table_name,),
-        )
-        key_primary_keys = tuple(row[0] for row in await cur.fetchall())
-        if key_columns != (
-            ("key_id", "text", "NO"),
-            ("fingerprint", "text", "NO"),
-            ("backfill_completed", "boolean", "NO"),
-        ) or key_primary_keys != ("PRIMARY KEY (key_id)",):
-            raise RuntimeError(
-                f"Postgres schema object {key_table_name!r} conflicts with Cayu's "
-                "public authority key-state contract. Run `cayu storage migrate` "
-                "after repairing the conflicting object."
-            )
-
-        config_table_name = "cayu_public_authority_alias_config"
-        await cur.execute("SELECT to_regclass(%s)", (config_table_name,))
-        registered = await cur.fetchone()
-        if registered is None or registered[0] is None:
-            raise RuntimeError(
-                f"Required Cayu Postgres table is missing: {config_table_name}. "
-                "Run `cayu storage migrate` to restore the alias deployment registry."
-            )
-        await cur.execute(
-            """
-            SELECT column_name, data_type, is_nullable
-            FROM information_schema.columns
-            WHERE table_schema = current_schema()
-              AND table_name = %s
-            ORDER BY ordinal_position
-            """,
-            (config_table_name,),
-        )
-        config_columns = tuple(await cur.fetchall())
-        if config_columns != (
-            ("singleton", "boolean", "NO"),
-            ("active_key_id", "text", "NO"),
-            ("keyring_fingerprint", "text", "NO"),
-            ("generation", "bigint", "NO"),
-            ("retired_key_ids", "jsonb", "NO"),
-        ):
-            raise RuntimeError(
-                f"Postgres schema object {config_table_name!r} conflicts with Cayu's "
-                "public authority deployment contract. Run `cayu storage migrate` "
-                "after repairing the conflicting object."
-            )
 
     async def _read_schema_state(self, cur: Any) -> schema.SchemaState:
         return await read_schema_state(cur)

@@ -841,9 +841,15 @@ PostgreSQL baseline and bookkeeping SQL, revision scripts, backfill SQL and conc
 declarations live in `storage/_postgres_schema_history.py`. It imports canonical domain
 DDL and can be used without importing PostgreSQL record codecs or store adapters.
 `storage/_postgres_base.py` owns pool lifecycle, schema locks, transition preflights,
-validation, migration execution and receipts. PostgreSQL adapters inherit that owner
-directly; CLI schema commands use its readers and preflights. JSON record helpers
-remain in `storage/_postgres_support.py`.
+revision dispatch, migration execution and receipts. Current-schema checks live in
+`storage/_postgres_*_schema.py` domain owners for knowledge, work context, tasks,
+verified work, evaluations, sessions, transcripts, memory evidence, producers and
+budget identities. They use the caller's cursor without owning connections or
+transactions, and import neither adapters nor migration history. Orchestration
+passes revision-dependent guard SQL and tokenizer identity explicitly.
+`storage/_postgres_catalog.py` shares constraint matching and index normalization.
+PostgreSQL adapters inherit the base directly; CLI schema commands use its readers
+and preflights. JSON record helpers remain in `storage/_postgres_support.py`.
 `storage/event_watchers_postgres.py` owns watcher claims, lease renewal, settlement
 replay and dead letters. `storage/budget_postgres.py` owns budget reservations,
 binding inventory and settlement receipts. Both adapters use the shared base without

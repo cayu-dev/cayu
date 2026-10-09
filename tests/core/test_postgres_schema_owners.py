@@ -13,10 +13,15 @@ import pytest
 import cayu
 
 _OWNERS = [
+    "_postgres_budget_schema",
     "_postgres_catalog",
     "_postgres_eval_schema",
     "_postgres_knowledge_schema",
+    "_postgres_memory_evidence_schema",
+    "_postgres_producer_schema",
+    "_postgres_session_schema",
     "_postgres_task_schema",
+    "_postgres_transcript_schema",
     "_postgres_verified_work_schema",
     "_postgres_work_context_schema",
 ]
@@ -24,7 +29,11 @@ _OWNERS = [
 
 def _validators(owner):
     module = importlib.import_module("cayu.storage." + owner)
-    return [value for name, value in inspect.getmembers(module) if name.startswith("_validate_")]
+    validators = [
+        value for name, value in inspect.getmembers(module) if name.startswith("_validate_")
+    ]
+    assert validators, owner
+    return validators
 
 
 def _arguments(validator):
@@ -162,5 +171,117 @@ def test_schema_owner_preserves_caller_transaction(current_schema, owner):
                     await validator(cursor, **_arguments(validator))
             assert connection.info.transaction_status == TransactionStatus.INTRANS
             await connection.rollback()
+
+    asyncio.run(run())
+
+
+_CORRUPTION_CASES = [
+    ("eval", "_validate_eval_result_baseline_schema", "cayu_eval_result_records", "target_key"),
+    (
+        "knowledge",
+        "_validate_knowledge_publication_access_snapshot_column",
+        "cayu_knowledge_publication_receipts",
+        "access_snapshot",
+    ),
+    (
+        "work_context",
+        "_validate_agent_work_context_schema",
+        "cayu_agent_work_context_revisions",
+        "content_sha256",
+    ),
+    ("task", "_validate_task_invocation_column", "cayu_tasks", "invocation"),
+    ("verified_work", "_validate_verified_work_schema", "cayu_tasks", "work_contract"),
+    ("session", "_validate_session_invocation_column", "cayu_sessions", "invocation"),
+    ("memory_evidence", "_validate_memory_evidence_schema", "cayu_recall_receipts", "receipt_json"),
+    (
+        "transcript",
+        "_validate_transcript_search_document_column",
+        "cayu_transcript_messages",
+        "transcript_search_document",
+    ),
+    (
+        "producer",
+        "_validate_producer_cleanup_receipts",
+        "cayu_producer_cleanup_receipts",
+        "operation_key",
+    ),
+    (
+        "budget",
+        "_validate_budget_reservation_identity_registry",
+        "cayu_budget_reservation_identities",
+        "reservation_id",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "domain,validator_name,table,column",
+    _CORRUPTION_CASES,
+    ids=[case[0] for case in _CORRUPTION_CASES],
+)
+def test_schema_owner_rejects_corruption_in_callers_transaction(
+    current_schema, domain, validator_name, table, column
+):
+    import psycopg
+    from psycopg import sql
+    from psycopg.pq import TransactionStatus
+
+    validator = getattr(
+        importlib.import_module("cayu.storage._postgres_" + domain + "_schema"), validator_name
+    )
+
+    async def run():
+        async with (
+            await psycopg.AsyncConnection.connect(current_schema) as connection,
+            connection.cursor() as cursor,
+        ):
+            await validator(cursor, **_arguments(validator))
+            await cursor.execute(
+                sql.SQL("ALTER TABLE {} RENAME COLUMN {} TO incompatible_column").format(
+                    sql.Identifier(table), sql.Identifier(column)
+                )
+            )
+            with pytest.raises(RuntimeError):
+                await validator(cursor, **_arguments(validator))
+            assert connection.info.transaction_status == TransactionStatus.INTRANS
+            await connection.rollback()
+            await validator(cursor, **_arguments(validator))
+            await connection.rollback()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "domain,validator_name,argument,value",
+    [
+        ("task", "_validate_task_closure_guard", "expected_guard_sql", "$$ SELECT FALSE; $$"),
+        (
+            "transcript",
+            "_validate_transcript_search_document_column",
+            "tokenizer_version",
+            "incompatible-tokenizer",
+        ),
+    ],
+    ids=["closure-guard", "tokenizer"],
+)
+def test_schema_owner_uses_explicit_identity(
+    current_schema, domain, validator_name, argument, value
+):
+    import psycopg
+
+    validator = getattr(
+        importlib.import_module("cayu.storage._postgres_" + domain + "_schema"), validator_name
+    )
+
+    async def run():
+        async with await psycopg.AsyncConnection.connect(current_schema) as connection:
+            await connection.execute("SET TRANSACTION READ ONLY")
+            async with connection.cursor() as cursor:
+                arguments = _arguments(validator)
+                await validator(cursor, **arguments)
+                arguments[argument] = value
+                with pytest.raises(RuntimeError, match="guard|tokenizer identity"):
+                    await validator(cursor, **arguments)
+                await validator(cursor, **_arguments(validator))
 
     asyncio.run(run())
