@@ -511,6 +511,10 @@ evidence; native stores retain candidate reads, authorization and transactions.
 cursors, cycle checks and response-node allocation. Stores supply bounded records;
 the shared builder preserves branch order and continuation without reading stores.
 
+`sessions/lineage.py` owns minimal direct-child lineage records, origin-event
+identities, detached queries and parent-bound cursors. It reuses topology's bounded
+text validation; fork execution and native lineage reads stay with their owners.
+
 ### Session summaries
 
 `sessions/summaries.py` owns stored-session outcome, event-summary and operational

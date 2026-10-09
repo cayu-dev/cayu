@@ -5,12 +5,10 @@ from pydantic import ValidationError
 
 from cayu.events import Event, EventType
 from cayu.messages import Message
-from cayu.sessions.base import (
+from cayu.sessions.base import RunRequest, SessionIdentity, SessionStore
+from cayu.sessions.lineage import (
     SESSION_LINEAGE_MAX_CHILD_LIMIT,
-    RunRequest,
-    SessionIdentity,
     SessionLineageQuery,
-    SessionStore,
     decode_session_lineage_cursor,
 )
 from cayu.sessions.topology import SessionTopologyQuery, decode_session_topology_cursor

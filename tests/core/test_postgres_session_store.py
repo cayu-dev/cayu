@@ -77,7 +77,6 @@ from cayu.runtime.public_authority import (
 from cayu.sessions.base import (
     RunRequest,
     SessionIdentity,
-    SessionLineageQuery,
     SessionOperationPublication,
     SessionRunFenced,
     _McpManifestBaselineEvidenceInvalid,
@@ -89,6 +88,7 @@ from cayu.sessions.invocation import (
     InvocationOriginTrust,
     SessionExecutionSource,
 )
+from cayu.sessions.lineage import SessionLineageQuery
 from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.queries import SessionDebugState, SessionOrder, SessionQuery
 from cayu.sessions.records import PendingActionKind, Session, SessionStatus

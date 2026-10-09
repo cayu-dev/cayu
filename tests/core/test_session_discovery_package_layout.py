@@ -174,3 +174,58 @@ else:
 """,
         public_module,
     )
+
+
+def test_session_lineage_public_imports_and_historical_pickle_globals():
+    _assert_public_identity(
+        "cayu.sessions.lineage",
+        (
+            "SessionLineageOrigin",
+            "SessionLineageNode",
+            "SessionLineageQuery",
+            "SessionLineageResult",
+        ),
+    )
+
+
+@pytest.mark.parametrize("public_module", ("cayu", "cayu.sessions", "cayu.runtime"))
+def test_session_lineage_bounds_and_cursors_without_stores(public_module):
+    _assert_store_independent(
+        """
+from datetime import UTC, datetime
+from pydantic import ValidationError
+from cayu.sessions.lineage import (
+    SESSION_LINEAGE_MAX_IDENTIFIER_BYTES, copy_session_lineage_query,
+    encode_session_lineage_cursor, decode_session_lineage_cursor,
+)
+
+stamp = datetime(2026, 1, 1, tzinfo=UTC)
+origin = public.SessionLineageOrigin(sequence=1, event_id="event", event_type="session.forked")
+node = public.SessionLineageNode(id="child", parent_session_id="parent",
+    created_at=stamp, origin_events=(origin,))
+assert node.origin_events[0] == origin and node.origin_events[0] is not origin
+cursor = encode_session_lineage_cursor("parent", node)
+assert decode_session_lineage_cursor(cursor, parent_session_id="parent") == (stamp, "child")
+query = public.SessionLineageQuery(parent_session_id="parent", cursor=cursor, limit=1)
+copied = copy_session_lineage_query(query)
+assert copied == query and copied is not query
+result = public.SessionLineageResult(parent_session_id="parent", children=(node,),
+    next_cursor=cursor, has_more=True)
+try:
+    decode_session_lineage_cursor(cursor, parent_session_id="other")
+except ValueError as exc:
+    assert str(exc) == "Invalid session lineage cursor."
+else:
+    raise AssertionError("Cross-parent lineage cursor accepted")
+try:
+    public.SessionLineageQuery(parent_session_id="é" * (SESSION_LINEAGE_MAX_IDENTIFIER_BYTES // 2 + 1))
+except ValidationError:
+    pass
+else:
+    raise AssertionError("Oversized UTF-8 lineage identifier accepted")
+for value in (origin, node, query, result):
+    assert pickle.loads(pickle.dumps(value)) == value
+    assert get_type_hints(type(value)) and type(value).model_json_schema()
+""",
+        public_module,
+    )

@@ -136,13 +136,8 @@ from cayu.providers.operations import (
 )
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._memory_evidence import memory_evidence_key
-from cayu.sessions.base import (
-    InMemorySessionStore,
-    RunRequest,
-    SessionIdentity,
-    SessionLineageNode,
-    SessionLineageOrigin,
-)
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.lineage import SessionLineageNode, SessionLineageOrigin
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.terminal_evidence import (
     TerminalSessionEvidenceError,

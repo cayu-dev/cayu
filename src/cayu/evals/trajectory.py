@@ -36,11 +36,13 @@ from cayu.runtime._memory_evidence import memory_evidence_key
 from cayu.sessions.base import (
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     SessionInputContractEvidence,
+    parse_session_input_contract_evidence,
+)
+from cayu.sessions.lineage import (
     SessionLineageNode,
     SessionLineageOrigin,
     SessionLineageQuery,
     SessionLineageResult,
-    parse_session_input_contract_evidence,
 )
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import RunnerObservedEventIdentity, Session, SessionStatus

@@ -91,10 +91,6 @@ from cayu.sessions.base import SessionForkProfileRelationship as SessionForkProf
 from cayu.sessions.base import SessionIdentity as SessionIdentity
 from cayu.sessions.base import SessionInvocationAdmission as SessionInvocationAdmission
 from cayu.sessions.base import SessionInvocationSnapshot as SessionInvocationSnapshot
-from cayu.sessions.base import SessionLineageNode as SessionLineageNode
-from cayu.sessions.base import SessionLineageOrigin as SessionLineageOrigin
-from cayu.sessions.base import SessionLineageQuery as SessionLineageQuery
-from cayu.sessions.base import SessionLineageResult as SessionLineageResult
 from cayu.sessions.base import SessionMessageDeliveryBatch as SessionMessageDeliveryBatch
 from cayu.sessions.base import SessionMessageDeliveryMode as SessionMessageDeliveryMode
 from cayu.sessions.base import SessionMessageQueueStatus as SessionMessageQueueStatus
@@ -298,6 +294,10 @@ from cayu.sessions.invocation import SessionInvocationBinding as SessionInvocati
 from cayu.sessions.invocation import TaskExecutionSource as TaskExecutionSource
 from cayu.sessions.invocation import TaskInvocation as TaskInvocation
 from cayu.sessions.invocation import session_invocation_from_task as session_invocation_from_task
+from cayu.sessions.lineage import SessionLineageNode as SessionLineageNode
+from cayu.sessions.lineage import SessionLineageOrigin as SessionLineageOrigin
+from cayu.sessions.lineage import SessionLineageQuery as SessionLineageQuery
+from cayu.sessions.lineage import SessionLineageResult as SessionLineageResult
 from cayu.sessions.outcomes import RunOutcome as RunOutcome
 from cayu.sessions.outcomes import StructuredOutputResult as StructuredOutputResult
 from cayu.sessions.outcomes import run_to_completion as run_to_completion

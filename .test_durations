@@ -45276,5 +45276,9 @@
     "tests/core/test_session_discovery_package_layout.py::test_session_topology_pages_and_cursors_without_stores[cayu.runtime]": 0.20335158298257738,
     "tests/core/test_session_discovery_package_layout.py::test_session_topology_pages_and_cursors_without_stores[cayu.sessions]": 0.27540383298764937,
     "tests/core/test_session_discovery_package_layout.py::test_session_topology_pages_and_cursors_without_stores[cayu]": 0.2269567079783883,
-    "tests/core/test_session_discovery_package_layout.py::test_session_topology_public_imports_and_historical_pickle_globals": 1.0147009170032106
+    "tests/core/test_session_discovery_package_layout.py::test_session_topology_public_imports_and_historical_pickle_globals": 1.0147009170032106,
+    "tests/core/test_session_discovery_package_layout.py::test_session_lineage_bounds_and_cursors_without_stores[cayu.runtime]": 0.2117424989992287,
+    "tests/core/test_session_discovery_package_layout.py::test_session_lineage_bounds_and_cursors_without_stores[cayu.sessions]": 0.20824095801799558,
+    "tests/core/test_session_discovery_package_layout.py::test_session_lineage_bounds_and_cursors_without_stores[cayu]": 0.22104120801668614,
+    "tests/core/test_session_discovery_package_layout.py::test_session_lineage_public_imports_and_historical_pickle_globals": 1.022201584011782
 }

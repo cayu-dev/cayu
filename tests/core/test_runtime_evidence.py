@@ -26,15 +26,9 @@ from cayu.runtime.evidence import (
     RuntimeEvidenceWarningCode,
     runtime_evidence,
 )
-from cayu.sessions.base import (
-    InMemorySessionStore,
-    RunRequest,
-    SessionIdentity,
-    SessionLineageNode,
-    SessionLineageResult,
-    SessionStore,
-)
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity, SessionStore
 from cayu.sessions.event_queries import EventQueryResultTooLarge
+from cayu.sessions.lineage import SessionLineageNode, SessionLineageResult
 from cayu.sessions.queries import SessionListResult, SessionQuery
 from cayu.sessions.records import SessionStatus
 from cayu.storage.migrations import SchemaMode

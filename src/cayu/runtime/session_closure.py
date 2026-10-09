@@ -47,7 +47,7 @@ from cayu.runtime._session_closure_records import (
     ClosureRecordsTooLarge,
     validate_closure_records,
 )
-from cayu.sessions.base import SessionLineageQuery
+from cayu.sessions.lineage import SessionLineageQuery
 from cayu.sessions.queries import SessionQuery
 from cayu.storage._knowledge_closure import (
     KnowledgeClosureQuery,
