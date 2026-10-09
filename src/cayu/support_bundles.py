@@ -152,10 +152,10 @@ _SQLITE_SCHEMA_STORE_IDENTITIES = frozenset(
 )
 _POSTGRES_SCHEMA_STORE_IDENTITIES = frozenset(
     {
+        ("cayu.storage.budget_postgres", "PostgresBudgetLedger"),
         ("cayu.storage.evals_postgres", "PostgresEvalStore"),
-        ("cayu.storage.postgres", "PostgresBudgetLedger"),
+        ("cayu.storage.event_watchers_postgres", "PostgresEventWatcherStore"),
         ("cayu.storage.postgres", "PostgresEmbeddingKnowledgeStore"),
-        ("cayu.storage.postgres", "PostgresEventWatcherStore"),
         ("cayu.storage.postgres", "PostgresKnowledgeStore"),
         ("cayu.storage.postgres", "PostgresSessionStore"),
         ("cayu.storage.postgres", "PostgresTaskStore"),
