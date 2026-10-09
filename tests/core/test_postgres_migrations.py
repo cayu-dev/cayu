@@ -24,6 +24,7 @@ from cayu.sessions.base import RunRequest, SessionIdentity
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.transcript_queries import TRANSCRIPT_SEARCH_TOKENIZER_VERSION
 from cayu.storage import _postgres_base as postgres_base
+from cayu.storage import _postgres_catalog as postgres_catalog
 from cayu.storage import _postgres_schema_history as postgres_schema_history
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import migrations as schema
@@ -125,12 +126,12 @@ def test_constraint_fragment_matching_is_catalog_order_independent() -> None:
         ),
     )
 
-    assert postgres_base._constraint_fragments_match_exactly(candidates, required)
-    assert postgres_base._constraint_fragments_match_exactly(
+    assert postgres_catalog._constraint_fragments_match_exactly(candidates, required)
+    assert postgres_catalog._constraint_fragments_match_exactly(
         tuple(reversed(candidates)),
         required,
     )
-    assert not postgres_base._constraint_fragments_match_exactly(
+    assert not postgres_catalog._constraint_fragments_match_exactly(
         candidates[:1],
         required,
     )
