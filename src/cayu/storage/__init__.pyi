@@ -267,7 +267,6 @@ from cayu.storage.knowledge_transition import (
 from cayu.storage.knowledge_transition import (
     require_empty_knowledge_revision_transition as require_empty_knowledge_revision_transition,
 )
-from cayu.storage.postgres import PostgresAgentWorkContextStore as PostgresAgentWorkContextStore
 from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore as PostgresEmbeddingKnowledgeStore
 from cayu.storage.postgres import PostgresKnowledgeStore as PostgresKnowledgeStore
 from cayu.storage.postgres import PostgresSessionStore as PostgresSessionStore
@@ -280,6 +279,9 @@ from cayu.storage.product_operations_sqlite import (
 from cayu.storage.sqlite import SQLiteSessionStore as SQLiteSessionStore
 from cayu.storage.tasks_postgres import PostgresTaskStore as PostgresTaskStore
 from cayu.storage.tasks_sqlite import SQLiteTaskStore as SQLiteTaskStore
+from cayu.storage.work_context_postgres import (
+    PostgresAgentWorkContextStore as PostgresAgentWorkContextStore,
+)
 from cayu.storage.work_context_sqlite import (
     SQLiteAgentWorkContextStore as SQLiteAgentWorkContextStore,
 )

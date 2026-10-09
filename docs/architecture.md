@@ -826,6 +826,8 @@ resolve to the same concrete classes as the canonical modules.
 `storage/tasks_postgres.py` owns task persistence, admission notifications and
 terminal receipts. It composes the shared base and existing task graph, group and
 verified-work components; their native transactions and locks stay with the operation.
+`storage/work_context_postgres.py` owns work-context publication, recall subscriptions,
+lease claims and delivery checkpoints, including their advisory locks and atomic writes.
 
 Files are good source-of-truth for prompts, instructions, workflows, manuals, skills, and human-reviewed memories.
 

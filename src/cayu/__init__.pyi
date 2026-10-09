@@ -4489,7 +4489,6 @@ from cayu.storage.knowledge_indexer import KnowledgeIndexResult as KnowledgeInde
 from cayu.storage.knowledge_memory import InMemoryKnowledgeStore as InMemoryKnowledgeStore
 from cayu.storage.knowledge_review import KnowledgeReviewWorkflow as KnowledgeReviewWorkflow
 from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore as SQLiteKnowledgeStore
-from cayu.storage.postgres import PostgresAgentWorkContextStore as PostgresAgentWorkContextStore
 from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore as PostgresEmbeddingKnowledgeStore
 from cayu.storage.postgres import PostgresKnowledgeStore as PostgresKnowledgeStore
 from cayu.storage.postgres import PostgresSessionStore as PostgresSessionStore
@@ -4503,6 +4502,9 @@ from cayu.storage.sqlite import SQLiteSessionStore as SQLiteSessionStore
 from cayu.storage.targets import configured_database_url as configured_database_url
 from cayu.storage.tasks_postgres import PostgresTaskStore as PostgresTaskStore
 from cayu.storage.tasks_sqlite import SQLiteTaskStore as SQLiteTaskStore
+from cayu.storage.work_context_postgres import (
+    PostgresAgentWorkContextStore as PostgresAgentWorkContextStore,
+)
 from cayu.storage.work_context_sqlite import (
     SQLiteAgentWorkContextStore as SQLiteAgentWorkContextStore,
 )

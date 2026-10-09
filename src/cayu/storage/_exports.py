@@ -289,7 +289,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.knowledge.records",
         "MAX_KNOWLEDGE_REVISION_SEARCH_REFS",
     ),
-    "PostgresAgentWorkContextStore": ("cayu.storage.postgres", "PostgresAgentWorkContextStore"),
+    "PostgresAgentWorkContextStore": (
+        "cayu.storage.work_context_postgres",
+        "PostgresAgentWorkContextStore",
+    ),
     "PostgresBudgetLedger": ("cayu.storage.budget_postgres", "PostgresBudgetLedger"),
     "PostgresEmbeddingKnowledgeStore": ("cayu.storage.postgres", "PostgresEmbeddingKnowledgeStore"),
     "PostgresEvalStore": ("cayu.storage.evals_postgres", "PostgresEvalStore"),

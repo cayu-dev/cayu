@@ -9,6 +9,7 @@ from typing import Any
 # left out of ``from package import *`` so a wildcard import works on a plain install.
 OPTIONAL_EXTRA_MODULES = frozenset(
     {
+        "cayu.storage.work_context_postgres",
         "cayu.storage.tasks_postgres",
         "cayu.storage.budget_postgres",
         "cayu.storage.collaboration_postgres",
