@@ -434,8 +434,13 @@ async def run_tool(
     before_dispatch: Callable[[], Awaitable[None]] | None = None,
     reconcile_result: Callable[[], Awaitable[ToolResult | None]] | None = None,
     inference_scope: AuxiliaryInferenceScope | None = None,
+    on_invoke: Callable[[], None] | None = None,
 ) -> ToolExecutionOutcome:
-    """Execute one tool and seal its evolving secret scope before publication."""
+    """Execute one tool and seal its evolving secret scope before publication.
+
+    ``on_invoke`` is called immediately before the tool body runs, after every
+    dispatch and pre-dispatch check has passed.
+    """
 
     if finalize_publication is not None and not callable(finalize_publication):
         raise TypeError("finalize_publication must be callable or None.")
@@ -443,6 +448,8 @@ async def run_tool(
         raise TypeError("before_dispatch must be callable or None.")
     if reconcile_result is not None and not callable(reconcile_result):
         raise TypeError("reconcile_result must be callable or None.")
+    if on_invoke is not None and not callable(on_invoke):
+        raise TypeError("on_invoke must be callable or None.")
     try:
         outcome = await _run_tool(
             tool=tool,
@@ -455,6 +462,7 @@ async def run_tool(
             timeout_seconds=timeout_seconds,
             before_dispatch=before_dispatch,
             inference_scope=inference_scope,
+            on_invoke=on_invoke,
         )
         # Runtime-owned reconciliation cannot erase timeout, policy, invalid-output,
         # or uncertain-effect controls. Its replacement follows normal validation
@@ -497,6 +505,7 @@ async def _run_tool(
     timeout_seconds: float | None,
     before_dispatch: Callable[[], Awaitable[None]] | None,
     inference_scope: AuxiliaryInferenceScope | None,
+    on_invoke: Callable[[], None] | None = None,
 ) -> ToolExecutionOutcome:
     timer: _ToolTimeoutOwner | None = None
     grouped_failure: BaseExceptionGroup | None = None
@@ -520,6 +529,8 @@ async def _run_tool(
             # Only the tool body uses model-facing store restrictions. Dispatch,
             # reconciliation, and publication retain Runtime-owned bookkeeping access.
             if type(tool) is not ProcessIsolatedTool:
+                if on_invoke is not None:
+                    on_invoke()
                 if inference_scope is not None:
                     async with inference_scope.lifetime():
                         with tool_invocation_lifetime(ctx):
@@ -540,6 +551,8 @@ async def _run_tool(
             )
             if current_execution_contract != registered_execution_contract:
                 raise IsolatedToolPreDispatchFailure("registered_execution_contract_mismatch")
+            if on_invoke is not None:
+                on_invoke()
             async with model_data_access():
                 with phase_scope("execution"):
                     return await execute_process_isolated_tool(

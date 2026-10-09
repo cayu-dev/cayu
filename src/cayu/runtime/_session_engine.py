@@ -6892,6 +6892,7 @@ class SessionEngine:
         session: Session,
         *,
         participant_context: CollaborationAccessContext | None = None,
+        replays_tool_calls: bool = False,
     ) -> tuple[Event, ...]:
         from cayu.runtime._abandoned_session_recovery import recover_abandoned_execution
 
@@ -6904,6 +6905,7 @@ class SessionEngine:
                 request, participant_context=participant_context
             ),
             settle_model_dispatch=self._settle_abandoned_model_dispatch,
+            replays_tool_calls=replays_tool_calls,
         )
 
     async def _settle_abandoned_model_dispatch(self, session: Session) -> tuple[Event, ...]:
@@ -20414,7 +20416,10 @@ class SessionEngine:
             SessionStatus.INTERRUPTING,
         }
         recovery_events = await self.recover_abandoned_execution(
-            loaded_session, participant_context=participant_context
+            loaded_session,
+            participant_context=participant_context,
+            # Resume continues into the run loop, which replays elected calls.
+            replays_tool_calls=True,
         )
         for event in recovery_events:
             yield event
@@ -25506,6 +25511,58 @@ class SessionEngine:
                 finally:
                     del pending_snapshot
                 recovery_tail_message_count = len(messages) - pending_result_position
+            if (
+                has_run_limit_accounting_authority(limits, budget_limits)
+                and run_limit_accounting is None
+            ):
+                run_limit_accounting = capture_run_limit_accounting_context(
+                    session_id=session.id,
+                    run_started_at=run_started_at,
+                    run_baseline=run_baseline,
+                    budget_limits=budget_limits,
+                    now=self._clock(),
+                )
+                run_budget_authorities = run_budget_authorities_from_context(
+                    run_limit_accounting,
+                    budget_limits=budget_limits,
+                )
+            # Recovery may rebind `session` below; the tool-round runner builds its
+            # own gate afterwards, so this one serves only replay admission and is
+            # built only when a replay asks for admission.
+            replay_gate_session = session
+            replay_limit_gate: RunLimitGate | None = None
+            replay_limit_evaluations: list[LimitEvaluation] = []
+
+            async def admit_replay(identity: ModelAttemptIdentity) -> bool:
+                # Replay retains the logical call identity already counted by its
+                # start event, but still obeys current run/session and budget limits,
+                # through the same gate as ordinary tool admission.
+                nonlocal replay_limit_gate
+                if replay_limit_gate is None:
+                    replay_limit_gate = RunLimitGate(
+                        self._run_limit_controller,
+                        session=replay_gate_session,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        limits=limits,
+                        budget_limits=budget_limits,
+                        run_started_at=run_started_at,
+                        run_baseline=run_baseline,
+                        budget_baseline_events=baseline_events,
+                        budget_notify_events=request_budget_notify_events,
+                        run_budget_authorities=run_budget_authorities,
+                        pricing_provider_name=(
+                            registered_provider.provider.billing_provider_name
+                            or registered_provider.name
+                        ),
+                        execution_profile_fingerprint=(
+                            None if execution_profile is None else execution_profile.fingerprint
+                        ),
+                    )
+                evaluation = await replay_limit_gate.evaluate_limits(execution_identity=identity)
+                replay_limit_evaluations.append(evaluation)
+                return evaluation.decision is None
+
             async for event in self._recovery_coordinator.recover_pending_tool_round(
                 session=session,
                 invocation_context=invocation_context,
@@ -25514,6 +25571,7 @@ class SessionEngine:
                 messages=messages,
                 execution_profile=execution_profile,
                 tail_message_count=recovery_tail_message_count,
+                admit_replay=admit_replay,
                 expected_transcript_cursor=recovery_expected_transcript_cursor,
             ):
                 if event.type in {
@@ -25561,6 +25619,23 @@ class SessionEngine:
                     session.id,
                     messages_to_append,
                 )
+            for evaluation in replay_limit_evaluations:
+                async for event in self._apply_limit_evaluation(
+                    evaluation=evaluation,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=environment_name,
+                    messages=messages,
+                    run_started_at=run_started_at,
+                    turn_usage_tracker=turn_usage_tracker,
+                    active_run=active_run,
+                    execution_profile=execution_profile,
+                    invocation_context=invocation_context,
+                ):
+                    yield event
+                if evaluation.decision is not None:
+                    return
             tool_completion_result = (
                 await recorded_tool_completion_result(
                     self.session_store,
@@ -25669,21 +25744,6 @@ class SessionEngine:
                         return
                 else:
                     skip_model_steps = True
-            if (
-                has_run_limit_accounting_authority(limits, budget_limits)
-                and run_limit_accounting is None
-            ):
-                run_limit_accounting = capture_run_limit_accounting_context(
-                    session_id=session.id,
-                    run_started_at=run_started_at,
-                    run_baseline=run_baseline,
-                    budget_limits=budget_limits,
-                    now=self._clock(),
-                )
-                run_budget_authorities = run_budget_authorities_from_context(
-                    run_limit_accounting,
-                    budget_limits=budget_limits,
-                )
             limit_gate = RunLimitGate(
                 self._run_limit_controller,
                 session=session,

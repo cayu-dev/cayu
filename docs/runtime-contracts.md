@@ -5,8 +5,25 @@ This design/maintainer document covers the integrated runtime within Cayu's Pyth
 Interrupted tool rounds publish recovery-safe staged results before closing the
 round. A result staged before cancellation is not rerun or replaced by an
 interruption placeholder merely because its terminal event was not yet appended.
-Unfinished sibling calls retain their interruption results. Interruption and
-ordinary recovery share staged-result validation, hook-state handling, and atomic
+Unfinished sibling calls retain their interruption results, with one exception: a
+`run` or `resume` that takes over an abandoned running execution may replay
+eligible started `NONE` or `IDEMPOTENT` calls once under their original identity,
+including the approval and pause identities recorded on their start events, so the
+idempotency key is unchanged. Unstarted calls, ineligible calls, and calls in rounds
+taken over by an answer, approval or provider-operation resolution keep their
+interruption or unknown-outcome results, as does every call when
+`replay_interrupted_tool_calls` is off. Each replay obeys current policy,
+interruption requests, run/session limits and request budgets; a call that policy
+denies or sends for approval is not replayed and keeps its unknown-outcome result.
+The replay is marked dispatched just before its first call runs, so a crash after
+that point is never replayed again. Staged results remain authoritative if a limit
+prevents replaying later calls. If the taking-over `run` or `resume` fails before the
+replay dispatches, the round stays open with the replay still pending. The session
+is `interrupted` when the failure came before the continuation started running and
+`failed` when it came during the run, for example when a policy check raises. The
+next `run` or `resume` replays the calls, and `recover_incomplete_session` closes
+the round with the unknown-outcome results instead.
+Interruption and ordinary recovery share staged-result validation, hook-state handling, and atomic
 round publication; unsafe or conflicting evidence remains fail-closed.
 
 ## Public imports and optional dependencies

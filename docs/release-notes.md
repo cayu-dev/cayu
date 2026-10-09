@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- When a continuation takes over a session whose process died inside a `NONE` or
+  `IDEMPOTENT` tool call, Cayu now replays that call once before the model
+  continues, with its original arguments and `ToolContext.idempotency_key`, through
+  the current tool policy and hooks. The model gets the real result instead of an
+  unknown outcome. The terminal event of a call the replay ran carries
+  `replayed_after_recovery: true`, and a crash during the replay isn't replayed
+  again. `EXTERNAL` tools, rounds with an
+  environment, task contract or invocation secrets, and tools with their own
+  recovery paths are unchanged. A call that current policy denies or would send for
+  approval isn't replayed and keeps the unknown-outcome result. Replay is on by
+  default; turn it off with
+  `SessionExecutionConfig(replay_interrupted_tool_calls=False)`. See
+  `cayu guide tool-effects`.
 - Describe Cayu as a Python agent framework with a durable runtime built in.
   The README, package metadata, CLI overview and source guides now distinguish
   framework capabilities, the application-specific harness and the execution

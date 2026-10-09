@@ -18,7 +18,7 @@ import contextlib
 import json
 import logging
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import partial
@@ -195,6 +195,7 @@ from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _structured_output_tool_round as structured_output_tool_round
+from cayu.runtime import _tool_call_replay as tool_call_replay
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
@@ -15520,8 +15521,15 @@ class RecoveryCoordinator:
         tail_message_count: int = 0,
         incomplete_recovery_claimed: bool = False,
         expected_transcript_cursor: int | None = None,
+        admit_replay: Callable[[ModelAttemptIdentity], Awaitable[bool]] | None = None,
+        elect_replay: bool = False,
     ) -> AsyncGenerator[Event, None]:
-        """Repair one durable pending round strictly from recorded evidence."""
+        """Repair one durable pending round strictly from recorded evidence.
+
+        ``elect_replay`` lets a takeover of a dead running execution keep the round
+        open for its continuation to replay, raising ``ToolCallReplayRequired``.
+        Only a caller that handles that exception may pass it.
+        """
         if invocation_context is not None:
             if type(invocation_context) is not InvocationContext or not isinstance(
                 invocation_context.binding,
@@ -15842,24 +15850,67 @@ class RecoveryCoordinator:
                 raise RuntimeError(
                     "Pending tool approval must be resolved before recovering its tool round."
                 )
-        lifecycle_events = await self._load_tool_round_lifecycle_events(
-            session_id=session.id,
-            pending_round=pending_round,
-        )
-        recorded_outcomes, started_ids = tool_round_recovery.recorded_tool_outcomes(
-            events=lifecycle_events,
-            pending_round=pending_round,
-        )
         (
-            isolated_dispatched_ids,
-            isolated_call_ids,
-        ) = await self._isolated_tool_dispatch_ids(
+            lifecycle_events,
+            recorded_outcomes,
+            effective_started_ids,
+        ) = await self._recorded_tool_round_evidence(
             session=session,
             pending_round=pending_round,
             registered_agent=registered_agent,
             registered_environment=registered_environment,
         )
-        effective_started_ids = (started_ids - isolated_call_ids) | isolated_dispatched_ids
+        replay_identities = await self._select_tool_call_replay(
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            pending_round=pending_round,
+            recorded_outcomes=recorded_outcomes,
+            effective_started_ids=effective_started_ids,
+            incomplete_recovery_claimed=incomplete_recovery_claimed,
+            elect_replay=elect_replay,
+            invocation_context=invocation_context,
+            admit_replay=admit_replay,
+            lifecycle_events=lifecycle_events,
+        )
+        if replay_identities:
+            assert invocation_context is not None and admit_replay is not None
+            async for event in self._replay_tool_calls(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+                pending_round=pending_round,
+                identities=replay_identities,
+                admit_replay=admit_replay,
+                invocation_context=invocation_context,
+            ):
+                yield event
+            # The replayed terminals are staged on the round; publication below
+            # closes it from them exactly as from any other staged outcome.
+            checkpoint, pending_round = await pending_round_reader.load_pending_tool_round(
+                self._session_store,
+                session.id,
+                redactor=self._secret_redactor,
+                consume_on_rejection=True,
+                runtime_session=session,
+            )
+            if (
+                pending_round is None
+                or pending_rounds.pending_tool_round_identity(pending_round) != tool_round_identity
+            ):
+                raise RuntimeError("Replayed tool round changed before its publication.")
+            # Publication must judge the round by the evidence the replay added.
+            (
+                lifecycle_events,
+                recorded_outcomes,
+                effective_started_ids,
+            ) = await self._recorded_tool_round_evidence(
+                session=session,
+                pending_round=pending_round,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
         subagent_children: dict[str, Session | None] = {}
         subagent_recovery_checkpoint: dict[str, Any] | None = None
         if any(
@@ -15908,6 +15959,285 @@ class RecoveryCoordinator:
             confirmed_native_effect_records=confirmed_native_effect_records,
         ):
             yield event
+
+    async def _recorded_tool_round_evidence(
+        self,
+        *,
+        session: Session,
+        pending_round: pending_rounds.PendingToolRound,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+    ) -> tuple[list[Event], dict[str, runtime_records.ToolCallOutcome], set[str]]:
+        """Return the round's lifecycle events, recorded outcomes and started calls."""
+
+        lifecycle_events = await self._load_tool_round_lifecycle_events(
+            session_id=session.id,
+            pending_round=pending_round,
+        )
+        recorded_outcomes, started_ids = tool_round_recovery.recorded_tool_outcomes(
+            events=lifecycle_events,
+            pending_round=pending_round,
+        )
+        (
+            isolated_dispatched_ids,
+            isolated_call_ids,
+        ) = await self._isolated_tool_dispatch_ids(
+            session=session,
+            pending_round=pending_round,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+        )
+        effective_started_ids = (started_ids - isolated_call_ids) | isolated_dispatched_ids
+        return lifecycle_events, recorded_outcomes, effective_started_ids
+
+    async def _select_tool_call_replay(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        pending_round: pending_rounds.PendingToolRound,
+        recorded_outcomes: Mapping[str, runtime_records.ToolCallOutcome | None],
+        effective_started_ids: set[str],
+        incomplete_recovery_claimed: bool,
+        elect_replay: bool,
+        invocation_context: InvocationContext | None,
+        admit_replay: Callable[[ModelAttemptIdentity], Awaitable[bool]] | None,
+        lifecycle_events: Sequence[Event],
+    ) -> dict[str, tuple[str | None, str | None]]:
+        """Elect a takeover's interrupted calls for replay, or start an elected replay.
+
+        A takeover whose caller opted in keeps the round open and raises; the
+        continuation that follows returns each call's original
+        ``(approval_id, input_id)`` for the replay, which checks current policy per
+        call and marks the record ``dispatched`` just before its first dispatch. Any
+        other recovery, one that finds the replay already dispatched, or one that
+        computes different calls than were elected closes the round as before.
+        """
+        from cayu.runtime._abandoned_session_recovery import abandoned_running_execution
+
+        if not self._session_control.execution_presence.config.replay_interrupted_tool_calls:
+            return {}
+        if incomplete_recovery_claimed:
+            if not elect_replay or not abandoned_running_execution(session):
+                return {}
+        elif (
+            session.status is not SessionStatus.RUNNING
+            or invocation_context is None
+            or admit_replay is None
+        ):
+            return {}
+        staged_ids = {
+            staged.tool_call_id
+            for staged in staged_terminal_reader.staged_terminal_records(pending_round)
+        }
+        unfinished_ids = {
+            call.tool_call_id
+            for call in pending_round.tool_calls
+            if recorded_outcomes.get(call.tool_call_id) is None
+            and call.tool_call_id not in staged_ids
+        }
+        publication = pending_round.assistant_publication
+        call_ids = tool_call_replay.replayable_calls(
+            pending_round=pending_round,
+            registered_agent=registered_agent,
+            secret_resolution_scope=invocation_secrets.continuation_secret_resolution_scope(
+                "unknown" if publication is None else publication.secret_resolution_scope,
+                registered_environment,
+            ),
+            unfinished_call_ids=unfinished_ids,
+            started_call_ids=effective_started_ids,
+        )
+        if not call_ids:
+            return {}
+        identities = tool_call_replay.started_dispatch_identities(
+            lifecycle_events,
+            session_id=session.id,
+            tool_round_id=pending_round.tool_round_id,
+            call_ids=call_ids,
+        )
+        if identities is None:
+            return {}
+        if incomplete_recovery_claimed:
+            record = await tool_call_replay.load_record(
+                self._session_store, session, pending_round.tool_round_id
+            )
+            if record is not None and record[0] == "dispatched":
+                return {}
+            if record is None:
+                await tool_call_replay.elect(
+                    self._session_store, session, pending_round.tool_round_id, call_ids
+                )
+            raise tool_call_replay.ToolCallReplayRequired(
+                "Interrupted NONE/IDEMPOTENT tool calls will be replayed by the continuation."
+            )
+        record = await tool_call_replay.load_record(
+            self._session_store, session, pending_round.tool_round_id
+        )
+        if record is None or record[0] != "elected":
+            return {}
+        if record[1] != call_ids:
+            # The round's evidence changed since the takeover elected it. Spend the
+            # replay so no later takeover elects it again, and close the round.
+            await tool_call_replay.begin_dispatch(
+                self._session_store, session, pending_round.tool_round_id, record[1]
+            )
+            return {}
+        return identities
+
+    async def _replay_tool_calls(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        environment_name: str | None,
+        pending_round: pending_rounds.PendingToolRound,
+        identities: Mapping[str, tuple[str | None, str | None]],
+        admit_replay: Callable[[ModelAttemptIdentity], Awaitable[bool]],
+        invocation_context: InvocationContext,
+    ) -> AsyncGenerator[Event, None]:
+        """Dispatch elected calls that current policy allows and stage their terminals.
+
+        A call that current policy denies or would pause for approval is not replayed:
+        its original attempt started and its outcome stays unknown, so the round
+        closes it with the ordinary unknown-outcome result.
+        """
+
+        identity = pending_rounds.pending_tool_round_identity(pending_round)
+        pending_by_id = {call.tool_call_id: call for call in pending_round.tool_calls}
+        tool_calls = [
+            approval_support.tool_call_request_from_pending(pending_by_id[call_id])
+            for call_id in identities
+        ]
+        # Redaction and payload limits cover the whole round, as in any continuation,
+        # so a replayed result is never redacted less than its siblings.
+        round_tool_calls = [
+            approval_support.tool_call_request_from_pending(call)
+            for call in pending_round.tool_calls
+        ]
+        round_owner = DurableToolRound.for_continuation(
+            session=session,
+            tool_round_identity=identity,
+            session_store=self._session_store,
+            event_writer=self._event_writer,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            environment_name=environment_name,
+            tool_calls=tool_calls,
+            task_id=pending_round.task_id,
+            execution_profile=invocation_context.profile,
+            invocation_context=invocation_context,
+            redactor=self._tool_round_executor.redactor_for_tool_calls(
+                registered_agent=registered_agent,
+                tool_calls=round_tool_calls,
+            ),
+            tool_exposure=pending_round.tool_exposure,
+            publication_governor=self._tool_invocation.terminals.governor,
+            clock=self._clock,
+            emit_result=self._tool_invocation.terminals.publish_result,
+            emit_terminal=self._tool_invocation.terminals.emit_staged,
+            defer_terminals=True,
+            terminal_payload_limits=await _tool_terminal_payload_limits(
+                registered_agent,
+                round_tool_calls,
+                publication_governor=self._tool_invocation.terminals.governor,
+                runtime_hooks=invocation_context.runtime_hooks,
+            ),
+            pause_authority={},
+            idempotency_options={},
+        )
+        await round_owner.admit()
+        # Calls whose tool body the replay actually entered.
+        invoked_ids: set[str] = set()
+
+        async def stage_replayed(
+            event: Event,
+            outcome: runtime_records.ToolCallOutcome,
+            allow_modification: bool,
+            publish_before_hooks: bool,
+            snapshot: invocation_secrets.InvocationPublicationSnapshot,
+        ) -> Event:
+            # Mark only a terminal from a replay that ran the tool, not one that a
+            # hook blocked or short-circuited or that dispatch checks refused.
+            if event.payload.get("tool_call_id") in invoked_ids:
+                event = event.model_copy(
+                    update={"payload": {**event.payload, "replayed_after_recovery": True}}
+                )
+            return await round_owner.stage_terminal(
+                event, outcome, allow_modification, publish_before_hooks, snapshot
+            )
+
+        call_ids = tuple(identities)
+        dispatched = False
+        try:
+            for tool_call in tool_calls:
+                await self._session_control.raise_if_interrupted(session.id)
+                if not await admit_replay(
+                    ModelAttemptIdentity(
+                        model_step_id=identity.model_step_id,
+                        model_attempt_id=identity.model_attempt_id,
+                    )
+                ):
+                    break
+                pending_call = pending_by_id[tool_call.id]
+                decision = await self._tool_invocation.admission.authorize(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    tool_call=tool_call,
+                    request_metadata=pending_round.request_metadata,
+                    taint_labels=approval_support.taint_labels_from_pending_tool_call(pending_call),
+                )
+                if decision.decision is not ToolPolicyDecision.ALLOW:
+                    continue
+                if not dispatched:
+                    # Spent only once a call is about to run: a crash from here on
+                    # never replays again, while an earlier failure keeps the replay.
+                    await tool_call_replay.begin_dispatch(
+                        self._session_store, session, pending_round.tool_round_id, call_ids
+                    )
+                    dispatched = True
+                approval_id, input_id = identities[tool_call.id]
+                async for event, _outcome in round_owner.timed_continuation_dispatch(
+                    self._tool_invocation.execute(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        tool_call=tool_call,
+                        request_metadata=pending_round.request_metadata,
+                        budget_limits=tuple(pending_round.budget_limits or ()),
+                        task_id=pending_round.task_id,
+                        model_step=pending_round.model_step,
+                        execution_profile=invocation_context.profile,
+                        invocation_context=invocation_context,
+                        check_policy=True,
+                        policy_result=decision,
+                        emit_started=False,
+                        approval_id=approval_id,
+                        input_id=input_id,
+                        tool_exposure=pending_round.tool_exposure,
+                        policy_output_secret_resolution_scope="static",
+                        tool_round_identity=identity,
+                        taint_labels=approval_support.taint_labels_from_pending_tool_call(
+                            pending_call
+                        ),
+                        deferred_terminal_stager=stage_replayed,
+                        deferred_terminal_capture_recorder=round_owner.record_workspace_capture,
+                        resolved_redactor_observer=round_owner.record_redactor,
+                        publication_snapshot_observer=round_owner.record_publication_snapshot,
+                        tool_invocation_observer=invoked_ids.add,
+                    )
+                ):
+                    yield event
+            if not dispatched:
+                # Nothing was allowed to run; the round closes below, so spend it.
+                await tool_call_replay.begin_dispatch(
+                    self._session_store, session, pending_round.tool_round_id, call_ids
+                )
+        finally:
+            round_owner.finish_dispatch()
+            round_owner.finish_continuation_timing()
 
     async def _reconcile_recovered_tool_call(
         self,
@@ -22314,9 +22644,38 @@ class RecoveryCoordinator:
                         else execution_profile_snapshot.profile
                     ),
                     incomplete_recovery_claimed=True,
+                    # This caller finishes the takeover when replay is elected.
+                    elect_replay=True,
                     expected_transcript_cursor=expected_transcript_cursor,
                 ):
                     events.append(event)
+            except tool_call_replay.ToolCallReplayRequired as replay:
+                # The continuation that took over replays the interrupted calls,
+                # so finish this owner's interruption with the round still open.
+                session = await self._require_session(session.id)
+                session = await self._finalize_interrupting_for_recovery(
+                    recovery_claim_id=claim_id,
+                    preserve_interaction_id=preserve_interaction_id,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=environment_name,
+                    events=events,
+                    execution_profile=(
+                        None
+                        if execution_profile_snapshot is None
+                        else execution_profile_snapshot.profile
+                    ),
+                    invocation_context=invocation_context,
+                )
+                return IncompleteSessionRecoveryResult(
+                    session_id=session.id,
+                    previous_status=previous_status,
+                    status=session.status,
+                    actions=(*actions, IncompleteSessionRecoveryAction.PENDING_TOOL_EFFECT),
+                    events=tuple(events),
+                    message=str(replay),
+                )
             except ToolEffectReconciliationRequired as unresolved:
                 # Unknown external effects are a retained recovery pause. Finish
                 # this owner's interruption before exposing the next explicit

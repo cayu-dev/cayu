@@ -27,6 +27,9 @@ class SessionExecutionConfig(BaseModel):
     heartbeat_interval_seconds: float = Field(default=15.0, ge=0.05, le=300)
     lease_seconds: float = Field(default=60.0, ge=0.15, le=1200)
     owner_label: str | None = Field(default=None, min_length=1, max_length=128)
+    # A continuation that takes over a dead execution replays its interrupted
+    # NONE/IDEMPOTENT tool calls once, under their original identity and arguments.
+    replay_interrupted_tool_calls: bool = True
 
     @model_validator(mode="after")
     def validate_interval(self):

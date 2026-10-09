@@ -32,8 +32,45 @@ durable artifact snapshot mutates state.
 When behavior is uncertain, use `EXTERNAL` until the application can name and
 test a stable downstream replay contract.
 
-The classification describes replay safety; it does not mean Cayu will
-automatically retry the tool.
+The classification describes replay safety; Cayu does not retry a failed
+tool call. There is one replay: when the process running a session dies inside
+a `NONE` or `IDEMPOTENT` call and the next `run` or `resume` takes over that
+execution, Cayu runs the interrupted call once more before the model continues.
+Answering a question, resolving an approval or a provider operation also takes
+over a dead execution, but closes the round with the unknown-outcome result
+instead of replaying. The replay keeps the call's
+`ToolContext.idempotency_key` and original arguments, and it goes through the
+current tool policy and hooks. A call that current policy now denies or would
+send for approval is not replayed: its first attempt started and its outcome is
+unknown, so it gets the unknown-outcome result. When the replay runs the tool,
+its terminal event carries `replayed_after_recovery: true`. A replay that a
+`before_tool_call` hook blocks or short-circuits, or that policy refuses after a
+hook changed its arguments, records that result like any call, without the flag.
+A crash during the replay is not replayed again; the call then gets the usual
+unknown-outcome result. If the `run` or `resume` that took over fails before the
+replay runs, the round stays open (the session is `interrupted`, or `failed` if
+the failure happened during the run): the next `run` or `resume` replays it, and
+`recover_incomplete_session` closes it with the unknown-outcome result. Calls that never started are not dispatched by recovery. Each replay
+checks the continuation's run/session limits and budgets before dispatch; a
+reached limit closes unfinished calls with their recovery outcomes and stops
+the continuation. `EXTERNAL` tools are never replayed.
+
+Replay covers plain application tools in rounds without an environment, a
+task contract, or invocation secrets (a vault or credential proxy), and only
+when every unfinished call in the round qualifies and current policy allows
+it. Tools with child sessions, workspace mutation, auxiliary inference, an
+effect reconciler or their own durable recovery keep their own recovery paths.
+Pass `SessionExecutionConfig(replay_interrupted_tool_calls=False)` to turn the
+replay off; interrupted calls then get the unknown-outcome result.
+
+The replay runs in a new process, so it sees only durable state. A tool that
+checks state kept in process memory by earlier calls, such as "the order was
+read in this turn", refuses the replay after a crash, and the model gets that
+refusal as the call's result. Keep such preconditions in durable storage, or
+derive them from the call's arguments and `ToolContext`, so the replay can
+return the existing outcome. Deduplicate the write on
+`ToolContext.idempotency_key`, which the replay preserves, rather than on
+anything the crashed process held in memory.
 
 ## Act-once recovery
 

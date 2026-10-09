@@ -54,8 +54,10 @@ class ToolInvocationDispatch:
         strict_common_budget_admission: bool,
         runner_events: list[Event],
         settle_workspace: Callable[[], Awaitable[tuple[Event, ...]]] | None,
+        on_invoke: Callable[[], None] | None = None,
     ) -> None:
         self._call = call
+        self._on_invoke = on_invoke
         self._context = context
         self._secret_scope = secret_scope
         self._session_store = session_store
@@ -250,6 +252,7 @@ class ToolInvocationDispatch:
                 before_dispatch=require_resource_dispatch,
                 reconcile_result=reconcile_child_result,
                 inference_scope=inference_scope,
+                on_invoke=self._on_invoke,
             )
 
         return execution_outcome

@@ -22,6 +22,9 @@ class AbandonedExecution:
     session_id: str
     session_instance_id: str
     run_epoch: int
+    status: SessionStatus
+    # Whether the continuation that follows the takeover replays elected calls.
+    replays_tool_calls: bool = False
 
     def require_matches(self, session: Session) -> None:
         if (session.id, session.instance_id, session.run_epoch) != (
@@ -38,14 +41,39 @@ _ABANDONED_EXECUTION: ContextVar[AbandonedExecution | None] = ContextVar(
 
 
 @contextmanager
-def _abandoned_execution(session: Session) -> Iterator[None]:
+def _abandoned_execution(session: Session, *, replays_tool_calls: bool = False) -> Iterator[None]:
     token = _ABANDONED_EXECUTION.set(
-        AbandonedExecution(session.id, session.instance_id, session.run_epoch)
+        AbandonedExecution(
+            session.id,
+            session.instance_id,
+            session.run_epoch,
+            session.status,
+            replays_tool_calls,
+        )
     )
     try:
         yield
     finally:
         _ABANDONED_EXECUTION.reset(token)
+
+
+def abandoned_running_execution(session: Session) -> bool:
+    """Whether recovering ``session`` takes over its dead running execution to replay.
+
+    Only the session incarnation that was taken over qualifies; its epoch was
+    checked when the recovery reserved it, and that recovery has since fenced it.
+    An execution that was already being interrupted when its owner died is not one,
+    and neither is a takeover by a continuation that can't replay tool calls (an
+    answer, approval or provider-operation resolution): it closes the round instead.
+    """
+
+    current = _ABANDONED_EXECUTION.get()
+    return (
+        current is not None
+        and (session.id, session.instance_id) == (current.session_id, current.session_instance_id)
+        and current.status is SessionStatus.RUNNING
+        and current.replays_tool_calls
+    )
 
 
 def require_abandoned_execution_matches(session: Session) -> None:
@@ -69,6 +97,7 @@ async def recover_abandoned_execution(
         [IncompleteSessionRecoveryRequest], Awaitable[IncompleteSessionRecoveryResult]
     ],
     settle_model_dispatch: Callable[[Session], Awaitable[tuple[Event, ...]]] | None = None,
+    replays_tool_calls: bool = False,
 ) -> tuple[Event, ...]:
     if session.status not in {SessionStatus.RUNNING, SessionStatus.INTERRUPTING}:
         return ()
@@ -77,7 +106,7 @@ async def recover_abandoned_execution(
     execution = await store._inspect_session_execution_owner(session.id)
     if execution.state != "owner_lost" or execution.run_epoch != session.run_epoch:
         raise SessionExecutionInProgress(session.id, session.status)
-    with _abandoned_execution(session):
+    with _abandoned_execution(session, replays_tool_calls=replays_tool_calls):
         # The lost owner may have died with a provider call in flight. Its outcome is
         # unknown, so settle it as interrupted (charging its budget reservations in full)
         # before ordinary recovery fences the run.

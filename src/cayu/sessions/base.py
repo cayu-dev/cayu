@@ -27721,12 +27721,16 @@ def _reject_reserved_runtime_publication_key(
     from cayu.sessions._session_continuation_scope import (
         require_operation_key_access as require_continuation_key_access,
     )
+    from cayu.sessions._tool_call_replay_scope import (
+        require_operation_key_access as require_replay_key_access,
+    )
 
     value = require_clean_nonblank(value, field_name)
     require_operation_key_access(value, read=browser_control_read)
     require_continuation_key_access(value, read=browser_control_read)
     require_producer_key_access(value, read=browser_control_read)
     require_private_key_access(value, read=browser_control_read)
+    require_replay_key_access(value, read=browser_control_read)
     if not browser_control_read:
         require_browser_control_operation_owner(value)
     if value == ZERO_WORK_INTERRUPTION_OPERATION_KEY:

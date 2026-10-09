@@ -280,6 +280,7 @@ class ToolInvocation:
             | None
         ) = None,
         rejoin_targeted_invocation: bool = False,
+        tool_invocation_observer: Callable[[str], None] | None = None,
     ) -> AsyncGenerator[tuple[Event, runtime_records.ToolCallOutcome | None], None]:
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
@@ -1694,6 +1695,11 @@ class ToolInvocation:
             auxiliary_policy=auxiliary_invocation_policy,
             tool_timeout_seconds=self._tool_timeout_seconds,
             strict_common_budget_admission=self._strict_common_budget_admission,
+            on_invoke=(
+                None
+                if tool_invocation_observer is None
+                else lambda: tool_invocation_observer(tool_call.id)
+            ),
             runner_events=runner_events,
             settle_workspace=(
                 close_workspace_mutation_window if workspace_window_id is not None else None

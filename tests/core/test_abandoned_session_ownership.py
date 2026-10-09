@@ -85,7 +85,8 @@ def test_resume_does_not_take_successor_before_its_presence_is_published(
                 release_successor.set()
                 await asyncio.wait_for(winner, 30)
                 assert (await store.load(sid)).status is SessionStatus.COMPLETED
-                assert receipt.read_text() == "committed\n"
+                # Only the winning continuation replays the interrupted call, once.
+                assert receipt.read_text() == "committed\ncommitted\n"
             finally:
                 release_reserve.set()
                 release_successor.set()
