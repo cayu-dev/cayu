@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from types import UnionType
-from typing import Annotated, Literal, TypeVar, Union, get_args, get_origin
+from typing import Annotated, Any, Literal, TypeVar, Union, cast, get_args, get_origin
 
 from cayu._validation import canonical_bounded_durable_json_bytes
 from cayu.collaboration._contracts import (
@@ -89,6 +89,7 @@ def _require_raw_secret_free(
             raise CollaborationContractError("Contract contains a workload secret.")
         return
     if type(value) is dict:
+        value = cast("dict[str, Any]", value)
         # Pydantic's generic models do not retain a free TypeVar inside an
         # ordinary runtime union. The named lookup alias preserves that binding;
         # expand its trusted schema here without invoking receipt validators.

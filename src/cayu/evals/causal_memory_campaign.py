@@ -1488,9 +1488,11 @@ async def _run_causal_memory_reference_campaign(
         )
         published_by_variant[variant_id] = published
         published_results.append(
-            MemoryPublishedResultEvidence(
-                run_id=f"causal-memory-reference-{variant_id}",
-                result=published.model_dump(mode="json"),
+            MemoryPublishedResultEvidence.model_validate(
+                {
+                    "run_id": f"causal-memory-reference-{variant_id}",
+                    "result": published.model_dump(mode="json"),
+                }
             )
         )
     metric_bindings = tuple(

@@ -575,7 +575,7 @@ def runtime_checkpoint_writer_view(
 
     # Decoding already admitted and detached this private snapshot. Projection
     # only consumes it locally; copying and validating it again adds no boundary.
-    projected = current
+    projected: dict[str, Any] = current
     if "session_exports" in projected:
         raise ValueError("Session export authority cannot be represented by an older writer.")
     if MODEL_FAILOVER_CHECKPOINT_KEY in projected:

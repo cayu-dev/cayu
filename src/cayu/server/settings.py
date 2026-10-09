@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, NoReturn, Self, get_args, get_origin
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, Self, cast, get_args, get_origin
 
 try:
     from pydantic_settings import (
@@ -332,7 +332,7 @@ def _raise_for_forbidden_source_fields(
         if field_name not in data:
             continue
         try:
-            TypeAdapter(field.annotation).validate_python(data[field_name])
+            TypeAdapter(cast("Any", field.annotation)).validate_python(data[field_name])
         except ValidationError as exc:
             for error in exc.errors(include_input=False):
                 if error["type"] != "extra_forbidden":

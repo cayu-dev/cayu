@@ -1443,7 +1443,7 @@ class CorpusExecutionResult(BaseModel):
             type(trial) is not ExternalTrialIdentityV1 for trial in external_trials
         ):
             raise TypeError("external_trials must be a tuple of ExternalTrialIdentityV1 values.")
-        document = {
+        document: dict[str, Any] = {
             "schema_version": CORPUS_EXECUTION_RESULT_SCHEMA_VERSION,
             "target": target.model_dump(mode="json"),
             "run": run.model_dump(mode="json"),

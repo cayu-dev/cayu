@@ -3317,9 +3317,11 @@ def _report_from_outcomes(
     published_results = tuple(
         sorted(
             (
-                MemoryPublishedResultEvidence(
-                    run_id=f"{experiment.experiment_id}-{variant_id}",
-                    result=result.model_dump(mode="json"),
+                MemoryPublishedResultEvidence.model_validate(
+                    {
+                        "run_id": f"{experiment.experiment_id}-{variant_id}",
+                        "result": result.model_dump(mode="json"),
+                    }
                 )
                 for variant_id, result in published_by_variant.items()
             ),

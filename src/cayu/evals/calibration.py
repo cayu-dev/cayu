@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field, StrictBool, StrictInt, StrictStr, field_validator, model_validator
 
@@ -145,7 +145,7 @@ class EvalJudgeCalibrationEvidenceV1(_PortableModel):
         final_output: str,
         transcript: str | None,
     ) -> EvalJudgeCalibrationEvidenceV1:
-        material = {
+        material: dict[str, Any] = {
             "schema_version": EVAL_JUDGE_CALIBRATION_SCHEMA_VERSION,
             "provenance": EvalJudgeCalibrationEvidenceProvenanceV1(source_id=source_id).model_dump(
                 mode="json"
@@ -154,9 +154,8 @@ class EvalJudgeCalibrationEvidenceV1(_PortableModel):
             "final_output": final_output,
             "transcript": transcript,
         }
-        return cls(
-            revision=_content_revision(material, "judge calibration evidence"),
-            **material,
+        return cls.model_validate(
+            {"revision": _content_revision(material, "judge calibration evidence"), **material}
         )
 
 
@@ -308,7 +307,7 @@ def compile_eval_judge_calibration_draft(
         criteria=validated.human_criteria,
         aggregate_score=_canonical_unit_decimal(human_aggregate),
     )
-    material = {
+    material: dict[str, Any] = {
         "schema_version": EVAL_JUDGE_CALIBRATION_SCHEMA_VERSION,
         "id": validated.id,
         "target_key": validated.target_key,
@@ -317,9 +316,8 @@ def compile_eval_judge_calibration_draft(
         "human_label": human_label.model_dump(mode="json"),
         "trials": validated.trials,
     }
-    return EvalJudgeCalibrationDefinitionV1(
-        revision=_content_revision(material, "judge calibration definition"),
-        **material,
+    return EvalJudgeCalibrationDefinitionV1.model_validate(
+        {"revision": _content_revision(material, "judge calibration definition"), **material}
     )
 
 

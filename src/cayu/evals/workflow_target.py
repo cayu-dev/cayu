@@ -174,7 +174,7 @@ class WorkflowEvalTargetIdentityV1(BaseModel):
         capture_bounds: SessionTrajectoryBounds | None = None,
     ) -> WorkflowEvalTargetIdentityV1:
         copied = copy_workflow_spec(workflow_spec)
-        material = {
+        material: dict[str, Any] = {
             "schema_version": 1,
             "workflow_name": copied.name,
             "workflow_spec_revision": workflow_spec_revision(copied),

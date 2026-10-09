@@ -1293,7 +1293,7 @@ def _profile_fingerprint(
     schema_version: int,
     runtime_build_provenance: RuntimeBuildProvenance | None = None,
 ) -> str:
-    material = {
+    material: dict[str, Any] = {
         "schema_version": schema_version,
         "components": [component.model_dump(mode="json") for component in components],
     }

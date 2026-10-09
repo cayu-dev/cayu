@@ -336,7 +336,7 @@ class ExternalProcessTargetIdentityV1(_ExternalModel):
     ) -> ExternalProcessTargetIdentityV1:
         if type(body) is not ExternalBodyReleaseV1:
             raise TypeError("body must be an exact ExternalBodyReleaseV1.")
-        material = {
+        material: dict[str, Any] = {
             "schema_version": 1,
             "body": body.model_dump(mode="json"),
             "evaluator_runtime_revision": evaluator_runtime_revision,
@@ -346,9 +346,8 @@ class ExternalProcessTargetIdentityV1(_ExternalModel):
             "reset_contract_revision": reset_contract_revision,
             "evidence_policy_revision": evidence_policy_revision,
         }
-        return cls(
-            revision=_content_revision(material, _EXTERNAL_TARGET_REVISION_DOMAIN),
-            **material,
+        return cls.model_validate(
+            {"revision": _content_revision(material, _EXTERNAL_TARGET_REVISION_DOMAIN), **material}
         )
 
 

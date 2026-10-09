@@ -27938,7 +27938,7 @@ def _interaction_transition_receipt_record(
             else (2 if invocation_active_profile is not None else 1)
         )
     ordered_from_statuses = tuple(sorted(from_statuses, key=str))
-    payload = {
+    payload: dict[str, Any] = {
         "record_type": "cayu.interaction-transition",
         "schema_version": schema_version,
         "session": session.model_dump(mode="json"),
