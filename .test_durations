@@ -45433,5 +45433,8 @@
     "tests/core/test_mcp_manifest_package_layout.py::test_manifest_values_and_hash_evidence_without_stores[cayu.runtime]": 0.10489187398343347,
     "tests/core/test_mcp_manifest_package_layout.py::test_manifest_values_and_hash_evidence_without_stores[cayu.sessions.mcp_manifest_history]": 0.10378987502190284,
     "tests/core/test_mcp_manifest_package_layout.py::test_manifest_values_and_hash_evidence_without_stores[cayu.sessions]": 0.10416679200716317,
-    "tests/core/test_mcp_manifest_package_layout.py::test_manifest_values_and_hash_evidence_without_stores[cayu]": 0.12215775094227865
+    "tests/core/test_mcp_manifest_package_layout.py::test_manifest_values_and_hash_evidence_without_stores[cayu]": 0.12215775094227865,
+    "tests/core/test_mcp_manifest_package_layout.py::test_manifest_publication_state_validation_without_stores": 0.09818429101142101,
+    "tests/core/test_mcp_manifest_package_layout.py::test_stored_manifest_decoding_and_redaction_without_stores[json]": 0.10168100096052513,
+    "tests/core/test_mcp_manifest_package_layout.py::test_stored_manifest_decoding_and_redaction_without_stores[object]": 0.10272174899000674
 }

@@ -20,7 +20,7 @@ from pydantic import (
 
 from cayu._validation import copy_durable_json_value
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
-from cayu.events import EVENT_ID_MAX_CHARS
+from cayu.events import EVENT_ID_MAX_CHARS, Event, EventType
 
 
 class McpManifestHistoryConflict(RuntimeError):
@@ -277,3 +277,140 @@ class McpManifestPublicationResult(BaseModel):
                     "MCP baseline history_key does not match its publication-result key."
                 )
         return self
+
+
+def _validate_mcp_manifest_history_keys(history_keys: tuple[str, ...]) -> tuple[str, ...]:
+    if type(history_keys) is not tuple:
+        raise TypeError("history_keys must be a tuple.")
+    keys = tuple(_require_sha256_identifier(key, "history_keys item") for key in history_keys)
+    if len(keys) != len(set(keys)):
+        raise ValueError("history_keys must be unique.")
+    return keys
+
+
+def _stored_mcp_manifest_baseline(
+    history_key: str,
+    generation: int,
+    value: Any,
+) -> McpManifestBaseline:
+    try:
+        history_key = _require_sha256_identifier(history_key, "stored MCP history_key")
+        if type(generation) is not int or generation < 1:
+            raise ValueError("Stored MCP manifest generation must be a positive integer.")
+        baseline = McpManifestBaseline.model_validate(value)
+        if baseline.history_key != history_key or baseline.generation != generation:
+            raise ValueError("Stored MCP manifest baseline columns disagree with its payload.")
+        return baseline
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        raise _McpManifestBaselineEvidenceInvalid(
+            "Stored MCP manifest baseline evidence is invalid."
+        ) from None
+
+
+def _stored_mcp_manifest_baseline_json(
+    history_key: str,
+    generation: int,
+    value: Any,
+) -> McpManifestBaseline:
+    try:
+        if not isinstance(value, str):
+            raise TypeError("Stored MCP manifest baseline JSON must be text.")
+        decoded = json.loads(value)
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        raise _McpManifestBaselineEvidenceInvalid(
+            "Stored MCP manifest baseline evidence is invalid."
+        ) from None
+    return _stored_mcp_manifest_baseline(history_key, generation, decoded)
+
+
+def _validate_mcp_manifest_publication_state(
+    *,
+    expected_generations: Mapping[str, int | None],
+    current_baselines: Mapping[str, McpManifestBaseline],
+    baseline_updates: Mapping[str, McpManifestBaseline],
+    events: Iterable[Event],
+) -> None:
+    """Validate one fenced publication against its authoritative current state."""
+
+    events_by_history_key: dict[str, list[Event]] = {
+        history_key: [] for history_key in expected_generations
+    }
+    for event in events:
+        history_key = event.payload.get("history_key")
+        if not isinstance(history_key, str) or history_key not in events_by_history_key:
+            raise ValueError("MCP manifest event has no matching history expectation.")
+        events_by_history_key[history_key].append(event)
+
+    if any(len(history_events) != 1 for history_events in events_by_history_key.values()):
+        raise ValueError(
+            "MCP manifest publication must contain exactly one outcome per history key."
+        )
+
+    for history_key, history_events in events_by_history_key.items():
+        event = history_events[0]
+        status = event.payload.get("status")
+        outcome = event.payload.get("outcome")
+        current = current_baselines.get(history_key)
+        update = baseline_updates.get(history_key)
+
+        if status == "first_seen":
+            if current is not None:
+                raise ValueError("An MCP first_seen outcome cannot replace an existing baseline.")
+        elif status in {"changed", "unchanged"}:
+            if current is None:
+                raise ValueError(f"An MCP {status} outcome requires an existing baseline.")
+        else:
+            raise ValueError("MCP manifest publication contains an invalid status.")
+
+        if outcome == "accepted":
+            if event.type != EventType.MCP_MANIFEST_CHECKED:
+                raise ValueError("An accepted MCP manifest outcome must be a checked event.")
+            if status in {"first_seen", "changed"}:
+                if update is None:
+                    raise ValueError("An accepted MCP manifest transition requires an update.")
+            elif update is not None:
+                raise ValueError("An unchanged MCP manifest outcome cannot update its baseline.")
+        elif outcome == "blocked":
+            if event.type != EventType.MCP_MANIFEST_BLOCKED:
+                raise ValueError("A blocked MCP manifest outcome must be a blocked event.")
+            if update is not None:
+                raise ValueError("A blocked MCP manifest outcome cannot update its baseline.")
+        elif outcome == "batch_blocked":
+            if event.type != EventType.MCP_MANIFEST_CHECKED:
+                raise ValueError("A batch-blocked MCP manifest outcome must be a checked event.")
+            if update is not None:
+                raise ValueError("A batch-blocked MCP manifest outcome cannot update its baseline.")
+        else:
+            raise ValueError("MCP manifest publication contains an invalid outcome.")
+
+        event_evidence_values: list[str] = []
+        for field in (
+            "manifest_identity",
+            "manifest_hash",
+            "source_manifest_hash",
+            "server_hash",
+        ):
+            value = event.payload.get(field)
+            if not isinstance(value, str):
+                raise ValueError(f"MCP event {field} must be a SHA-256 identifier.")
+            event_evidence_values.append(_require_sha256_identifier(value, f"MCP event {field}"))
+        event_evidence = tuple(event_evidence_values)
+        if current is not None:
+            current_evidence = (
+                current.manifest_identity,
+                current.manifest_hash,
+                current.source_manifest_hash,
+                current.server_hash,
+            )
+            if event_evidence[0] != current.manifest_identity:
+                raise ValueError(
+                    "MCP manifest identity cannot change within one durable history key."
+                )
+            if status == "unchanged" and event_evidence != current_evidence:
+                raise ValueError(
+                    "An unchanged MCP manifest event must match the current baseline exactly."
+                )
+            if status == "changed" and event_evidence == current_evidence:
+                raise ValueError(
+                    "A changed MCP manifest event must differ from the current baseline."
+                )

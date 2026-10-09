@@ -108,3 +108,83 @@ assert type(pickle.loads(pickle.dumps(error))) is type(error)
 """,
         public_module,
     )
+
+
+@pytest.mark.parametrize("encoding", ("object", "json"))
+def test_stored_manifest_decoding_and_redaction_without_stores(encoding):
+    _without_stores(
+        f"encoding = {encoding!r}\n"
+        + """
+import json
+import traceback
+
+decode = (history._stored_mcp_manifest_baseline_json if encoding == "json"
+          else history._stored_mcp_manifest_baseline)
+def encode(value):
+    return json.dumps(value) if encoding == "json" else value
+payload = baseline.model_dump(mode="json")
+restored = decode(baseline.history_key, 1, encode(payload))
+assert restored == baseline
+payload["tools"][0]["contract_hash"] = "sensitive-invalid-evidence"
+assert restored.tools == baseline.tools
+for key, generation, value in (
+    (baseline.history_key, 1, payload),
+    (baseline.history_key, True, baseline.model_dump(mode="json")),
+    ("sha256:" + "9" * 64, 1, baseline.model_dump(mode="json")),
+):
+    try:
+        decode(key, generation, encode(value))
+    except history._McpManifestBaselineEvidenceInvalid as error:
+        assert str(error) == "Stored MCP manifest baseline evidence is invalid."
+        assert "sensitive-invalid-evidence" not in "".join(traceback.format_exception(error))
+    else:
+        raise AssertionError("Invalid stored evidence was accepted")
+keys = (baseline.history_key,)
+assert history._validate_mcp_manifest_history_keys(keys) == keys
+try:
+    history._validate_mcp_manifest_history_keys(keys + keys)
+except ValueError:
+    pass
+else:
+    raise AssertionError("Duplicate history keys were accepted")
+""",
+        "cayu.sessions.mcp_manifest_history",
+    )
+
+
+def test_manifest_publication_state_validation_without_stores():
+    _without_stores(
+        """
+from cayu.events import Event, EventType
+
+key = baseline.history_key
+payload = {field: getattr(baseline, field) for field in (
+    "history_key", "manifest_identity", "manifest_hash", "source_manifest_hash", "server_hash",
+)}
+payload.update(status="first_seen", outcome="accepted")
+event = Event(id=baseline.accepted_event_id, session_id="session",
+    timestamp=baseline.accepted_at, type=EventType.MCP_MANIFEST_CHECKED, payload=payload)
+validate = history._validate_mcp_manifest_publication_state
+validate(expected_generations={key: None}, current_baselines={},
+    baseline_updates={key: baseline}, events=[event])
+unchanged = event.model_copy(update={"payload": {**payload, "status": "unchanged"}})
+validate(expected_generations={key: 1}, current_baselines={key: baseline},
+    baseline_updates={}, events=[unchanged])
+for updates, events in (
+    ({}, [event]),
+    ({key: baseline}, [unchanged]),
+    ({}, [unchanged, unchanged]),
+    ({}, [event.model_copy(update={"payload": {**payload, "status": "changed"}})]),
+):
+    try:
+        validate(expected_generations={key: 1}, current_baselines={key: baseline},
+            baseline_updates=updates, events=events)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Inconsistent manifest publication was accepted")
+assert event.payload == payload
+assert baseline.generation == 1
+""",
+        "cayu.sessions.mcp_manifest_history",
+    )

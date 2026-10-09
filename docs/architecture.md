@@ -532,9 +532,12 @@ pickle references.
 ### MCP manifest history
 
 `sessions/mcp_manifest_history.py` owns accepted MCP manifest records, bounded
-hashed tool evidence and baseline/publication results. These contracts are usable
-without session stores or runtime execution. Runtime manifest policy decisions
-and native atomic publication remain with their existing owners.
+hashed tool evidence, baseline/publication results, stored-baseline decoding and
+publication-state consistency checks. These contracts and pure rules are usable
+without session stores or runtime execution. Store preparation retains event
+sanitation; runtime policy decisions and native atomic publication remain with
+their existing owners. Each backend applies the shared checks inside its existing
+lock or transaction, together with generation fencing and event persistence.
 
 ### Session control contracts
 
