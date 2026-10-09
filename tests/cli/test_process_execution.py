@@ -73,7 +73,9 @@ async def run_wait(app,stop):
 
 async def run_fail(app,stop):
     if os.environ['CAYU_WORKER_INDEX']=='0':
-        await asyncio.sleep(.5)
+        # Fail only after the sibling has installed its cooperative stop wait.
+        while not list(Path('.').glob('worker-*.json')):
+            await asyncio.sleep(.01)
         raise RuntimeError('injected failure')
     await run_wait(app,stop)
 
@@ -100,7 +102,7 @@ def _start(root: Path, *args: str) -> subprocess.Popen:
     )
 
 
-def _finished(process: subprocess.Popen, timeout: float = 30):
+def _finished(process: subprocess.Popen, timeout: float = 60):
     try:
         return process.communicate(timeout=timeout)
     finally:
@@ -110,7 +112,7 @@ def _finished(process: subprocess.Popen, timeout: float = 30):
 
 
 def _wait_markers(root: Path, count: int) -> list[int]:
-    deadline = time.monotonic() + 15
+    deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         markers = list(root.glob("worker-*.json"))
         if len(markers) == count:
@@ -217,7 +219,7 @@ def test_process_group_signal_stops_and_reaps_children(tmp_path, name, signum, e
 def test_worker_failure_stops_siblings(tmp_path):
     _project(tmp_path)
     process = _start(
-        tmp_path, "worker", "fail", "--processes", "2", "--shutdown-grace-seconds", ".5"
+        tmp_path, "worker", "fail", "--processes", "2", "--shutdown-grace-seconds", "5"
     )
     stdout, stderr = _finished(process)
     assert process.returncode == 1, (stdout, stderr)

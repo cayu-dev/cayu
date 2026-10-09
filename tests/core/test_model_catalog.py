@@ -514,6 +514,45 @@ def test_september_catalog_prices_new_models_at_context_and_date_boundaries(
     assert summary.line_items[0].total_cost == Decimal(expected)
 
 
+@pytest.mark.parametrize("provider", ["anthropic", "vertex"])
+@pytest.mark.parametrize("day, expected", [(8, "0.192"), (9, "0.191")])
+def test_sonnet_55_cache_price_refresh_preserves_historical_cost(provider, day, expected):
+    event = _completed(
+        provider_name=provider,
+        model="claude-sonnet-5-5",
+        input_tokens=100_000,
+        cache_read_input_tokens=10_000,
+        output_tokens=1_000,
+    ).model_copy(update={"timestamp": datetime(2026, 10, day, tzinfo=UTC)})
+    summary = estimate_session_cost(
+        session_id="session-1", events=[event], pricing=default_price_book()
+    )
+    assert summary.priced_model_steps == 1
+    assert summary.total_cost == Decimal(expected)
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "vertex"])
+@pytest.mark.parametrize(
+    ("tokens", "expected"),
+    [(100_000, "0.009725"), (100_001, "0.0486255")],
+)
+def test_haiku_55_prices_total_prompt_at_context_boundary(provider, tokens, expected):
+    event = _completed(
+        provider_name=provider,
+        model="claude-haiku-5-5",
+        input_tokens=tokens,
+        cache_read_input_tokens=10_000,
+        cache_write_input_tokens=5_000,
+        output_tokens=1_000,
+    ).model_copy(update={"timestamp": datetime(2026, 10, 9, tzinfo=UTC)})
+    summary = estimate_session_cost(
+        session_id="session-1", events=[event], pricing=default_price_book()
+    )
+    assert summary.priced_model_steps == 1
+    assert summary.unpriced_model_steps == 0
+    assert summary.total_cost == Decimal(expected)
+
+
 @pytest.mark.parametrize(
     ("model", "expected"),
     [("gpt-6-astra", "0.025"), ("gpt-6-sol", "0.013"), ("gpt-6-luna", "0.01015")],

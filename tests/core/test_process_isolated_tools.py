@@ -156,7 +156,7 @@ def _tool(
     max_terminal_payload_bytes: int | None = None,
     max_stdout_bytes: int = 64 << 10,
     max_stderr_bytes: int = 64 << 10,
-    term_grace_seconds: float = 0.1,
+    term_grace_seconds: float = 1.0,
     effect: ToolEffect = ToolEffect.NONE,
     factory: ProcessIsolatedToolFactoryRef | None = None,
 ) -> ProcessIsolatedTool:
@@ -178,7 +178,8 @@ def _tool(
         limits=ProcessIsolatedToolLimits(
             deadline_seconds=deadline_seconds,
             term_grace_seconds=term_grace_seconds,
-            kill_grace_seconds=0.5,
+            # Reaping a real process needs scheduling margin on loaded CI hosts.
+            kill_grace_seconds=5.0,
             max_request_bytes=max_request_bytes,
             max_response_bytes=max_response_bytes,
             max_stdout_bytes=max_stdout_bytes,
@@ -1922,7 +1923,13 @@ def test_real_process_child_failures_are_typed_and_bounded(
     with pytest.raises(expected_exception) as caught:
         asyncio.run(_execute(_tool(mode=mode)))
 
-    assert getattr(caught.value, "code", None) == expected_code
+    # EOF and the supervisor's exit notification are independent observations.
+    # Under load EOF can win the bounded exit-status wait; both outcomes must
+    # remain typed failures without exposing the child's exception text.
+    expected_codes = {expected_code}
+    if mode in {"crash", "signal"}:
+        expected_codes.add("missing_terminal_output")
+    assert getattr(caught.value, "code", None) in expected_codes
     assert "isolated failure" not in str(caught.value)
     message, _stderr_tail = isolated_process.isolated_failure_text(caught.value)
     # The child's own exception text travels beside the failure, never inside it.

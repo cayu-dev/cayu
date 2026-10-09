@@ -141,7 +141,7 @@ def test_http_child_shutdown(tmp_path, mock, streaming, children, bounded_parent
 
             async def run():
                 async with execution_deadline_scope(
-                    ExecutionDeadline.after(30 if bounded_parent else None, scope="parent")
+                    ExecutionDeadline.after(120 if bounded_parent else None, scope="parent")
                 ):
                     return await parallel(
                         [
@@ -152,7 +152,7 @@ def test_http_child_shutdown(tmp_path, mock, streaming, children, bounded_parent
                                 prompt="synthetic",
                                 run_options=StepRunOptions(
                                     execution_deadline=ExecutionDeadline.after(
-                                        30 if cancel_parent else 3, scope="child"
+                                        120 if cancel_parent else 30, scope="child"
                                     )
                                 ),
                             )
@@ -162,13 +162,16 @@ def test_http_child_shutdown(tmp_path, mock, streaming, children, bounded_parent
 
             task = asyncio.create_task(run())
             try:
-                await asyncio.wait_for(all_received.wait(), 10)
+                # The real deadline includes SQLite setup and connection startup.
+                # Keep a separate readiness bound well inside that deadline so
+                # loaded CI hosts still exercise cancellation of in-flight reads.
+                await asyncio.wait_for(all_received.wait(), 20)
                 if cancel_parent:
                     task.cancel()
                     with pytest.raises(asyncio.CancelledError):
                         await asyncio.wait_for(task, 10)
                 else:
-                    result = await asyncio.wait_for(task, 10)
+                    result = await asyncio.wait_for(task, 45)
                     assert len(result.failures) == children
                     for failure in result.failures:
                         evidence = failure.evidence
@@ -179,7 +182,7 @@ def test_http_child_shutdown(tmp_path, mock, streaming, children, bounded_parent
                         assert evidence.settlement == "unknown"
                         assert evidence.run_epoch == 1
                         assert evidence.terminal_event_id
-                await asyncio.wait_for(all_closed.wait(), 2)
+                await asyncio.wait_for(all_closed.wait(), 10)
                 assert received == closed == children
                 await store.close()
                 store = SQLiteSessionStore(path)

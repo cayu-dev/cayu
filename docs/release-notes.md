@@ -1,61 +1,39 @@
 # Release notes
 
-## Unreleased
+## v0.10.1
 
-- Built-in providers now send only the leading run of system messages as the
-  system prompt. A system message later in the conversation, such as per-turn
-  controller or memory state, stays at its position: as a `developer` input item
-  on OpenAI Responses (API key and subscription), a `system` message on Chat
-  Completions, and a `<system>`-delimited user-side text block on Anthropic,
-  Vertex and Bedrock, placed after any pending tool results. Before, every
-  system message was moved into the leading system or instructions field, so a
-  changing late system message rewrote the start of every request and defeated
-  prompt caching for the whole history. Requests whose system messages all lead
-  the conversation are unchanged. See
-  [system message placement](runtime-contracts.md#system-message-placement).
-- Agent model requests now carry a stable prompt-cache affinity key
-  (`ModelRequest.cache_affinity_key`), a digest of the session's fork-lineage
-  root. OpenAI Responses (API key and subscription) send it as
-  `prompt_cache_key`, so a conversation and its forks reach the same prompt
-  cache and, behind quota-pooling proxies, the same account. A delegated child
-  session gets its own key. A caller-supplied `prompt_cache_key` option still
-  wins, and other providers do not send the key. See
-  [prompt-cache affinity](runtime-contracts.md#prompt-cache-affinity).
-- Anthropic prompt caching is on by default. `AnthropicProvider()` and
-  `VertexProvider(...)` now apply `CachePolicy()`, which marks the system
-  prompt, the tool definitions and the conversation before the newest message
-  (`CachePolicy()` itself now includes `CONVERSATION_PREFIX`). Before, the
-  default sent no `cache_control` markers, so Anthropic never cached anything
-  and every turn paid full input price for the whole history. `BedrockProvider`
-  gains `cache_policy=` and places Converse `cachePoint` blocks by default for
-  the Claude families Bedrock documents as cacheable. The conversation marker
-  never ends on a later system message. Opt out with
-  `cache_policy=CachePolicy(breakpoints=())`. Cache writes cost more than
-  ordinary input, so very short one-off requests can cost slightly more; the
-  [measured results](late-system-message-caching-results.md) show the
-  multi-turn savings. Anthropic and Bedrock execution-profile material changes
-  with this default, as it does on any runtime upgrade.
-- When a continuation takes over a session whose process died inside a `NONE` or
-  `IDEMPOTENT` tool call, Cayu now replays that call once before the model
-  continues, with its original arguments and `ToolContext.idempotency_key`, through
-  the current tool policy and hooks. The model gets the real result instead of an
-  unknown outcome. The terminal event of a call the replay ran carries
-  `replayed_after_recovery: true`, and a crash during the replay isn't replayed
-  again. `EXTERNAL` tools, rounds with an
-  environment, task contract or invocation secrets, and tools with their own
-  recovery paths are unchanged. A call that current policy denies or would send for
-  approval isn't replayed and keeps the unknown-outcome result. Replay is on by
-  default; turn it off with
-  `SessionExecutionConfig(replay_interrupted_tool_calls=False)`. See
-  `cayu guide tool-effects`.
-- Describe Cayu as a Python agent framework with a durable runtime built in.
-  The README, package metadata, CLI overview and source guides now distinguish
-  framework capabilities, the application-specific harness and the execution
-  subsystem.
+Cayu preserves prompt-cache prefixes, improves interrupted tool-call recovery,
+and keeps no-progress compaction out of model-facing context.
 
-- Raise the PDF and OIDC dependency minimums to pypdf 6.19.0 and PyJWT
-  2.15.0, and update the locked urllib3 to 2.8.0, addressing dependency
-  denial-of-service and proxy TLS configuration advisories.
+- Providers keep later system messages in conversation order instead of moving
+  them into the leading prompt. OpenAI Responses uses developer messages; Chat
+  Completions retains system messages; Anthropic, Vertex and Bedrock use
+  delimited user-side notes after pending tool results. OpenAI requests also
+  retain a stable cache-affinity key across session forks; caller overrides win.
+- Anthropic and Vertex enable prompt caching by default. Bedrock enables it for
+  supported Claude models. The default marks system, tools and conversation
+  history. Opt out with `CachePolicy(breakpoints=())`. Cache writes carry a
+  premium, so short one-off requests can cost more. Existing sessions observe
+  the updated execution-profile material on upgrade.
+- After process loss, continuation can replay an interrupted `NONE` or
+  `IDEMPOTENT` tool call once with its original arguments and idempotency key,
+  subject to current policy and hooks. External tools, secret-bearing or
+  contracted rounds, and tools with dedicated recovery paths retain their
+  existing behavior. Disable replay with
+  `SessionExecutionConfig(replay_interrupted_tool_calls=False)`.
+- Compaction that represents no source preserves its exhaustion state without
+  adding a placeholder summary to subsequent requests. The compaction example
+  now checks source coverage and request-derived input sizes.
+- Update pydantic to 2.14 and refresh the dashboard schema and packaged assets.
+  Raise dependency security floors to pypdf 6.19.0 and PyJWT 2.15.0, and update
+  the locked urllib3 to 2.8.0.
+- Improve deployment recovery when an unchanged release has no running service,
+  and refresh rejected login tokens once before retrying a CLI request.
+- Clarify framework terminology and cost-accounting boundaries in the guides.
+- Add Claude Haiku 5.5 to the Anthropic and Vertex model catalogs with
+  context-tiered Standard pricing, and correct Claude Sonnet 5.5 cache-read
+  pricing. Haiku 5.5 Batch and one-hour cache-write prices are omitted because
+  the price book cannot represent their context-dependent rates.
 
 ## v0.10.0
 
@@ -63,17 +41,6 @@ Cayu adds provider-backed completion verification and independent completion
 evaluations, improves crash recovery, and supports explicit Cloud storage
 migration acknowledgements.
 
-- `cayu cloud deploy` of unchanged source no longer waits until `--wait-seconds`
-  expires when Cloud reuses an earlier promoted Release whose service isn't running.
-  If that Release is still selected, the deploy starts its service, as `rollback`
-  does, and reports `service_publication_requested`. If the Agent has selected
-  another Release, it exits at once with category `release_not_selected` and the
-  `rollback` command to run. See
-  [Cayu Cloud](cayu-cloud.md).
-- A Cloud CLI call that Cayu Cloud rejects with HTTP 401 while signed in with
-  `cayu cloud login` now refreshes the login once and retries the call, instead of
-  failing a long `deploy --wait` when the local clock disagrees with Cloud's or the
-  token is rejected before its expiry.
 - After recovery closes a tool call that started but never finished, the model now
   sees that call's redacted arguments when the round resolved no invocation secrets
   (no vault or credential proxy) and the tool permits argument publication. The

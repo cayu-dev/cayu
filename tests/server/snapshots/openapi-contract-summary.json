@@ -202,7 +202,6 @@
           "type": "array"
         },
         "total_cost": {
-          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
           "title": "Total Cost",
           "type": "string"
         },
@@ -1273,7 +1272,6 @@
         "confidence": {
           "anyOf": [
             {
-              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
               "type": "string"
             },
             {
@@ -1315,7 +1313,6 @@
         "importance": {
           "anyOf": [
             {
-              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
               "type": "string"
             },
             {
@@ -1859,7 +1856,6 @@
         "confidence": {
           "anyOf": [
             {
-              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
               "type": "string"
             },
             {
@@ -1901,7 +1897,6 @@
         "importance": {
           "anyOf": [
             {
-              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
               "type": "string"
             },
             {
@@ -3205,7 +3200,6 @@
         "max_estimated_cost": {
           "anyOf": [
             {
-              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
               "type": "string"
             },
             {
@@ -3259,7 +3253,6 @@
           "type": "string"
         },
         "cumulative_estimated_cost": {
-          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
           "title": "Cumulative Estimated Cost",
           "type": "string"
         },
@@ -3285,7 +3278,6 @@
         "estimated_cost_remaining": {
           "anyOf": [
             {
-              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
               "type": "string"
             },
             {
@@ -4314,7 +4306,6 @@
               "type": "number"
             },
             {
-              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
               "type": "string"
             }
           ],
@@ -4550,7 +4541,6 @@
           "type": "array"
         },
         "total_cost": {
-          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
           "title": "Total Cost",
           "type": "string"
         },
@@ -5199,7 +5189,6 @@
           ]
         },
         "cache_read_input_cost": {
-          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
           "title": "Cache Read Input Cost",
           "type": "string"
         },
@@ -5221,7 +5210,6 @@
           "type": "integer"
         },
         "cache_write_input_cost": {
-          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
           "title": "Cache Write Input Cost",
           "type": "string"
         },
@@ -5253,7 +5241,6 @@
           "title": "Execution Profile Fingerprint"
         },
         "input_cost": {
-          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
           "title": "Input Cost",
           "type": "string"
         },
@@ -5290,7 +5277,6 @@
           "type": "integer"
         },
         "output_cost": {
-          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
           "title": "Output Cost",
           "type": "string"
         },
@@ -5409,7 +5395,6 @@
           "title": "Requested Model"
         },
         "total_cost": {
-          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
           "title": "Total Cost",
           "type": "string"
         },
@@ -5442,7 +5427,6 @@
         },
         "web_search_cost": {
           "default": "0",
-          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
           "title": "Web Search Cost",
           "type": "string"
         },
@@ -7287,7 +7271,6 @@
         "confidence": {
           "anyOf": [
             {
-              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
               "type": "string"
             },
             {
@@ -7340,7 +7323,6 @@
         "importance": {
           "anyOf": [
             {
-              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
               "type": "string"
             },
             {
@@ -7922,7 +7904,6 @@
               "type": "number"
             },
             {
-              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
               "type": "string"
             },
             {
@@ -7938,7 +7919,6 @@
               "type": "number"
             },
             {
-              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
               "type": "string"
             },
             {
@@ -7954,7 +7934,6 @@
               "type": "number"
             },
             {
-              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
               "type": "string"
             }
           ],
@@ -7979,7 +7958,6 @@
               "type": "number"
             },
             {
-              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
               "type": "string"
             }
           ],
@@ -9477,7 +9455,6 @@
           "type": "string"
         },
         "total_cost": {
-          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
           "title": "Total Cost",
           "type": "string"
         },
@@ -12045,7 +12022,6 @@
               "type": "number"
             },
             {
-              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
               "type": "string"
             },
             {
@@ -12061,7 +12037,6 @@
               "type": "number"
             },
             {
-              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
               "type": "string"
             },
             {
@@ -12090,7 +12065,6 @@
               "type": "number"
             },
             {
-              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
               "type": "string"
             },
             {
@@ -13288,7 +13262,6 @@
           "title": "Pricing Provider Name"
         },
         "total_cost": {
-          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
           "title": "Total Cost",
           "type": "string"
         }
@@ -13553,7 +13526,6 @@
           "type": "string"
         },
         "total_cost": {
-          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
           "title": "Total Cost",
           "type": "string"
         }

@@ -89,6 +89,7 @@ authoritative only where a maintained guide points to the implementation or the
 
 ## Measured cost evidence
 
+- [Late system message caching results](late-system-message-caching-results.md)
 - [Live Anthropic Haiku cost-savings results](anthropic-haiku-cost-savings-results.md):
   paired live measurements of prompt-cache compaction and compacted research forks
 - [Anthropic prompt-cache compactor A/B observation](anthropic-prompt-cache-compactor-ab-results.md)

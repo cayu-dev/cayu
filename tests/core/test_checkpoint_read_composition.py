@@ -166,7 +166,7 @@ def test_runtime_round_read_rechecks_context_and_clears_rejected_tracebacks(
         assert source == before and store.reads == ["session"] * 2
         traceback = caught.value.__traceback__
         while traceback is not None:
-            if "/cayu/" in traceback.tb_frame.f_code.co_filename:
+            if traceback.tb_frame.f_globals.get("__name__", "").startswith("cayu."):
                 assert not any(
                     secret in repr(value) for value in traceback.tb_frame.f_locals.values()
                 )

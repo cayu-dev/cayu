@@ -1,6 +1,7 @@
 """Exact recovery selection is restrictive input, never a serialized grant."""
 
 import asyncio
+import gc
 import warnings
 
 import pytest
@@ -83,6 +84,8 @@ def test_nested_recovery_selection_rejects_before_copy_or_serialization(
             field_name = field
         request = request.model_copy(update={field_name: malformed})
         execution = RecoveryExecutionRequest(plan=baseline, execution_id="test-selection")
+        # Finalize resources from earlier tests before observing this rejection.
+        gc.collect()
         with warnings.catch_warnings(record=True) as observed:
             warnings.simplefilter("always")
             with pytest.raises(CollaborationContractError) as caught:

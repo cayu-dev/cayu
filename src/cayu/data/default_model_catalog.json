@@ -1,6 +1,6 @@
 {
-  "catalog_version": "2026-10-01",
-  "generated_at": "2026-10-01",
+  "catalog_version": "2026-10-09",
+  "generated_at": "2026-10-09",
   "models": [
     {
       "aliases": [],
@@ -25,9 +25,9 @@
       "model": "claude-fable-5",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-09-24",
+        "as_of": "2026-10-09",
         "source": "official",
-        "url": "https://platform.claude.com/docs/en/models/fable-5/introducing-claude-fable-5-and-claude-mythos-5"
+        "url": "https://platform.claude.com/docs/en/models/fable-5/introducing-claude-fable-5-and-claude-mythos-5.md"
       },
       "provider_name": "anthropic",
       "reasoning": true,
@@ -56,7 +56,7 @@
       "model": "claude-fable-5-1",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-09-24",
+        "as_of": "2026-10-09",
         "source": "official",
         "url": "https://platform.claude.com/docs/en/models/fable-5-1/overview.md"
       },
@@ -105,6 +105,37 @@
       "aliases": [],
       "context_window": 1000000,
       "deprecated": false,
+      "family": "claude-haiku",
+      "hosted_web_search": false,
+      "knowledge_cutoff": null,
+      "match": "exact",
+      "match_prefixes": [],
+      "max_output_tokens": 128000,
+      "modalities_in": [
+        "text",
+        "image"
+      ],
+      "modalities_out": [
+        "text"
+      ],
+      "model": "claude-haiku-5-5",
+      "prompt_caching": true,
+      "provenance": {
+        "as_of": "2026-10-09",
+        "source": "official",
+        "url": "https://platform.claude.com/docs/en/models/haiku-5-5/overview"
+      },
+      "provider_name": "anthropic",
+      "reasoning": true,
+      "release_date": "2026-10-07",
+      "retirement_date": null,
+      "structured_output": true,
+      "tool_calling": true
+    },
+    {
+      "aliases": [],
+      "context_window": 1000000,
+      "deprecated": false,
       "family": "claude-opus",
       "hosted_web_search": false,
       "knowledge_cutoff": null,
@@ -124,9 +155,9 @@
       "model": "claude-opus-4-8",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-09-24",
+        "as_of": "2026-10-09",
         "source": "official",
-        "url": "https://platform.claude.com/docs/en/build-with-claude/context-windows"
+        "url": "https://platform.claude.com/docs/en/build-with-claude/context-windows.md"
       },
       "provider_name": "anthropic",
       "reasoning": true,
@@ -156,9 +187,9 @@
       "model": "claude-opus-5",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-09-09",
+        "as_of": "2026-10-09",
         "source": "official",
-        "url": "https://platform.claude.com/docs/en/about-claude/models/overview"
+        "url": "https://platform.claude.com/docs/en/models/opus-5/overview.md"
       },
       "provider_name": "anthropic",
       "reasoning": true,
@@ -187,9 +218,9 @@
       "model": "claude-opus-5-5",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-10-01",
+        "as_of": "2026-10-09",
         "source": "official",
-        "url": "https://platform.claude.com/docs/en/models/opus-5-5/overview"
+        "url": "https://platform.claude.com/docs/en/models/opus-5-5/overview.md"
       },
       "provider_name": "anthropic",
       "reasoning": true,
@@ -221,9 +252,9 @@
       "model": "claude-sonnet-4-6",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-09-24",
+        "as_of": "2026-10-09",
         "source": "official",
-        "url": "https://platform.claude.com/docs/en/build-with-claude/context-windows"
+        "url": "https://platform.claude.com/docs/en/models/sonnet-4-6/overview.md"
       },
       "provider_name": "anthropic",
       "reasoning": true,
@@ -255,9 +286,9 @@
       "model": "claude-sonnet-5",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-09-24",
+        "as_of": "2026-10-09",
         "source": "official",
-        "url": "https://platform.claude.com/docs/en/models/sonnet-5/whats-new-sonnet-5.md"
+        "url": "https://platform.claude.com/docs/en/models/sonnet-5/overview.md"
       },
       "provider_name": "anthropic",
       "reasoning": true,
@@ -286,9 +317,9 @@
       "model": "claude-sonnet-5-5",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-10-01",
+        "as_of": "2026-10-09",
         "source": "official",
-        "url": "https://platform.claude.com/docs/en/models/sonnet-5-5/overview"
+        "url": "https://platform.claude.com/docs/en/models/sonnet-5-5/overview.md"
       },
       "provider_name": "anthropic",
       "reasoning": true,
@@ -849,9 +880,9 @@
       "model": "gpt-6-astra",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-10-01",
+        "as_of": "2026-10-09",
         "source": "official",
-        "url": "https://developers.openai.com/api/docs/models/gpt-6-astra"
+        "url": "https://developers.openai.com/api/docs/models/gpt-6-astra.md"
       },
       "provider_name": "openai",
       "reasoning": true,
@@ -880,9 +911,9 @@
       "model": "gpt-6-luna",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-10-01",
+        "as_of": "2026-10-09",
         "source": "official",
-        "url": "https://developers.openai.com/api/docs/models/gpt-6-luna"
+        "url": "https://developers.openai.com/api/docs/models/gpt-6-luna.md"
       },
       "provider_name": "openai",
       "reasoning": true,
@@ -911,9 +942,9 @@
       "model": "gpt-6-sol",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-10-01",
+        "as_of": "2026-10-09",
         "source": "official",
-        "url": "https://developers.openai.com/api/docs/models/gpt-6-sol"
+        "url": "https://developers.openai.com/api/docs/models/gpt-6-sol.md"
       },
       "provider_name": "openai",
       "reasoning": true,
@@ -942,9 +973,9 @@
       "model": "gpt-6.1-sol",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-10-01",
+        "as_of": "2026-10-09",
         "source": "official",
-        "url": "https://developers.openai.com/api/docs/models/gpt-6.1-sol"
+        "url": "https://developers.openai.com/api/docs/models/gpt-6.1-sol.md"
       },
       "provider_name": "openai",
       "reasoning": true,
@@ -984,6 +1015,38 @@
       "provider_name": "vertex",
       "reasoning": true,
       "release_date": "2026-06-09",
+      "retirement_date": null,
+      "structured_output": true,
+      "tool_calling": true
+    },
+    {
+      "aliases": [],
+      "context_window": 1000000,
+      "deprecated": false,
+      "family": "claude-haiku",
+      "hosted_web_search": false,
+      "knowledge_cutoff": null,
+      "match": "exact",
+      "match_prefixes": [],
+      "max_output_tokens": 128000,
+      "modalities_in": [
+        "text",
+        "image",
+        "pdf"
+      ],
+      "modalities_out": [
+        "text"
+      ],
+      "model": "claude-haiku-5-5",
+      "prompt_caching": true,
+      "provenance": {
+        "as_of": "2026-10-09",
+        "source": "official",
+        "url": "https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/haiku-5-5"
+      },
+      "provider_name": "vertex",
+      "reasoning": true,
+      "release_date": "2026-10-07",
       "retirement_date": null,
       "structured_output": true,
       "tool_calling": true
