@@ -26,8 +26,8 @@ from cayu.sessions.invocation import (
     SessionExecutionSource,
 )
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresTaskStore
 from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.storage.tasks_postgres import PostgresTaskStore
 from cayu.tasks.contracts import (
     CompletionResultResolverRef,
     CompletionVerifierRef,

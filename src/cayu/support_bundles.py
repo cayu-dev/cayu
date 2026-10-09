@@ -158,7 +158,7 @@ _POSTGRES_SCHEMA_STORE_IDENTITIES = frozenset(
         ("cayu.storage.postgres", "PostgresEmbeddingKnowledgeStore"),
         ("cayu.storage.postgres", "PostgresKnowledgeStore"),
         ("cayu.storage.postgres", "PostgresSessionStore"),
-        ("cayu.storage.postgres", "PostgresTaskStore"),
+        ("cayu.storage.tasks_postgres", "PostgresTaskStore"),
     }
 )
 _SCHEMALESS_STORE_IDENTITIES = frozenset(

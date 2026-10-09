@@ -21,8 +21,8 @@ from cayu import (
     TaskTerminalKind,
 )
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresTaskStore
 from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.storage.tasks_postgres import PostgresTaskStore
 from cayu.tasks.scheduling import (
     TaskMisfirePolicy,
     TaskRescheduleRequest,
@@ -793,7 +793,7 @@ def test_worker_wakes_at_persisted_due_time_before_long_poll(tmp_path, persisten
 
 def test_postgres_task_projections_have_identical_column_order():
     from cayu.storage import _postgres_support
-    from cayu.storage.postgres import _TASK_RETURNING_COLUMNS
+    from cayu.storage.tasks_postgres import _TASK_RETURNING_COLUMNS
 
     assert _TASK_RETURNING_COLUMNS.split(", ") == [
         f"task.{column}" for column in _postgres_support.TASK_COLUMNS.split(", ")

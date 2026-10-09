@@ -16,8 +16,9 @@ from cayu.sessions.base import InMemorySessionStore, SessionStore
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.budget_postgres import PostgresBudgetLedger
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresSessionStore, PostgresTaskStore
+from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
+from cayu.storage.tasks_postgres import PostgresTaskStore
 from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.store import TaskStore
 

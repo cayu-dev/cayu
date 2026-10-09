@@ -23,7 +23,8 @@ def test_public_closure_retains_task_claim_after_caller_cancellation(tmp_path, r
     if backend == "postgres":
         from psycopg.errors import CheckViolation
 
-        from cayu.storage.postgres import PostgresSessionStore, PostgresTaskStore
+        from cayu.storage.postgres import PostgresSessionStore
+        from cayu.storage.tasks_postgres import PostgresTaskStore
 
         dsn = request.getfixturevalue("postgres_dsn")
         guard_error = CheckViolation
@@ -134,7 +135,7 @@ def test_persistent_task_closure_claim_survives_reopen(tmp_path, request, backen
     else:
         from psycopg.errors import CheckViolation
 
-        from cayu.storage.postgres import PostgresTaskStore
+        from cayu.storage.tasks_postgres import PostgresTaskStore
 
         dsn = request.getfixturevalue("postgres_dsn")
 
@@ -300,7 +301,7 @@ def test_sqlite_task_closure_requires_database_guards(tmp_path, guard):
 def test_postgres_task_closure_requires_enabled_database_guard(postgres_dsn, schema_mode):
     import psycopg
 
-    from cayu.storage.postgres import PostgresTaskStore
+    from cayu.storage.tasks_postgres import PostgresTaskStore
 
     async def run():
         store = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.CREATE)

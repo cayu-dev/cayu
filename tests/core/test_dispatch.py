@@ -7460,7 +7460,7 @@ def test_concurrent_workers_claim_distinct_dispatch_tasks(postgres_dsn: str) -> 
     # claim distinct dispatch tasks through the actual FOR UPDATE SKIP LOCKED path. A
     # per-process-unique task type isolates this run from any leftover rows.
     from cayu.storage.migrations import SchemaMode
-    from cayu.storage.postgres import PostgresTaskStore
+    from cayu.storage.tasks_postgres import PostgresTaskStore
     from cayu.tasks._execution_settlement import TaskExecutionSettlementPending
 
     task_type = f"cayu.dispatch.test.{os.getpid()}"
@@ -7528,7 +7528,8 @@ def test_postgres_restart_preserves_queued_profile_and_executes_once(
     postgres_dsn: str,
 ) -> None:
     from cayu.storage.migrations import SchemaMode
-    from cayu.storage.postgres import PostgresSessionStore, PostgresTaskStore
+    from cayu.storage.postgres import PostgresSessionStore
+    from cayu.storage.tasks_postgres import PostgresTaskStore
 
     suffix = uuid4().hex
     session_id = f"dispatch-profile-{suffix}"

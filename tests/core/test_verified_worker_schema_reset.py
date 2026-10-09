@@ -8,7 +8,7 @@ import importlib
 import pytest
 
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresTaskStore
+from cayu.storage.tasks_postgres import PostgresTaskStore
 
 
 @pytest.mark.parametrize(

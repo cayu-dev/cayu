@@ -9,7 +9,7 @@ from uuid import uuid4
 import pytest
 
 from cayu import CayuApp
-from cayu.storage import postgres, tasks_sqlite
+from cayu.storage import tasks_postgres, tasks_sqlite
 from cayu.storage.migrations import SchemaMode
 from cayu.tasks import memory
 from cayu.tasks.creation import TaskCreate
@@ -35,7 +35,9 @@ def store_factory(request, tmp_path):
                 clock=lambda: now,
                 ownership_clock=lambda: now,
             )
-        return postgres.PostgresTaskStore(dsn, schema_mode=SchemaMode.CREATE, clock=lambda: now)
+        return tasks_postgres.PostgresTaskStore(
+            dsn, schema_mode=SchemaMode.CREATE, clock=lambda: now
+        )
 
     return open_store, now
 
@@ -189,7 +191,7 @@ def test_dependency_skip_schedule_publication_failure_rolls_back(
                 if isinstance(store, InMemoryTaskStore)
                 else tasks_sqlite
                 if isinstance(store, tasks_sqlite.SQLiteTaskStore)
-                else postgres
+                else tasks_postgres
             )
             original = module.schedule_transition_events
             prepared = []

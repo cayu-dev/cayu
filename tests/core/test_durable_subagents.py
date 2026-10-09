@@ -63,8 +63,9 @@ from cayu.sessions.base import (
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionStatus
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresSessionStore, PostgresTaskStore
+from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
+from cayu.storage.tasks_postgres import PostgresTaskStore
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.dispatch import (
     DispatchRequest,

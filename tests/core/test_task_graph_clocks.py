@@ -10,8 +10,8 @@ import pytest
 
 from cayu import CayuApp
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresTaskStore
 from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.storage.tasks_postgres import PostgresTaskStore
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.graphs import TaskGraphCreate, TaskGraphEventType, TaskGraphNode
 from cayu.tasks.memory import InMemoryTaskStore

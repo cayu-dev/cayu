@@ -11,8 +11,8 @@ from cayu.external_wait_scheduler import EXTERNAL_WAIT_TASK_TYPE, TaskStoreWaitS
 from cayu.external_waits import ExternalEventWaits
 from cayu.sessions.external_waits import ExternalEventDelivery, ExternalWaitConflict
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresTaskStore
 from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.storage.tasks_postgres import PostgresTaskStore
 from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.queries import TaskQuery
 

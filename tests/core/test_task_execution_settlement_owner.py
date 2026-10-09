@@ -128,8 +128,8 @@ async def test_exact_settlement_retry_survives_permitted_task_deletion(store, mo
     from tests.core.task_invocation_fixtures import task_backed_session_invocation
     from tests.core.test_task_group_quiescence import _postgres_address
 
-    from cayu.storage.postgres import PostgresTaskStore
     from cayu.storage.sqlite import SQLiteTaskStore
+    from cayu.storage.tasks_postgres import PostgresTaskStore
     from cayu.tasks.graphs import TaskGraphConflict
     from cayu.tasks.groups import TaskGroupConflict, TaskGroupEventType
     from cayu.tasks.records import TaskSessionClosureClaim

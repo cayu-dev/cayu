@@ -278,7 +278,8 @@ async def test_queued_child_retains_policy_target_and_provenance(
             return SQLiteSessionStore(tmp_path / "sessions.db"), SQLiteTaskStore(
                 tmp_path / "tasks.db"
             )
-        from cayu.storage.postgres import PostgresSessionStore, PostgresTaskStore
+        from cayu.storage.postgres import PostgresSessionStore
+        from cayu.storage.tasks_postgres import PostgresTaskStore
 
         dsn = request.getfixturevalue("postgres_dsn")
         return (

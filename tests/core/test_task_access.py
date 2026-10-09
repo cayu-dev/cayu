@@ -151,7 +151,7 @@ def test_task_access(backend, tmp_path):
 
 def test_postgres_task_access(postgres_dsn):
     from cayu.storage.migrations import SchemaMode
-    from cayu.storage.postgres import PostgresTaskStore
+    from cayu.storage.tasks_postgres import PostgresTaskStore
 
     async def run():
         store = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.CREATE)

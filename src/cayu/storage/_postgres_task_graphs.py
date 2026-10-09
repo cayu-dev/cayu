@@ -40,7 +40,7 @@ from cayu.tasks.groups import TaskGroupCreate, TaskGroupInvocationObligation
 from cayu.tasks.records import Task
 
 if TYPE_CHECKING:
-    from cayu.storage.postgres import PostgresTaskStore
+    from cayu.storage.tasks_postgres import PostgresTaskStore
 
 
 async def lock_graph(cur: Any, graph_id: str) -> None:
@@ -171,7 +171,7 @@ async def insert_events(cur: Any, events: tuple[TaskGraphEvent, ...]) -> None:
 
 
 async def notify_readiness(cur: Any) -> None:
-    from cayu.storage.postgres import _TASK_ADMISSION_NOTIFY_CHANNEL
+    from cayu.storage.tasks_postgres import _TASK_ADMISSION_NOTIFY_CHANNEL
 
     # PostgreSQL delivers this only after commit. It contains no task payload.
     await cur.execute("SELECT pg_notify(%s, %s)", (_TASK_ADMISSION_NOTIFY_CHANNEL, ""))

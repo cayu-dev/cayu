@@ -22,8 +22,8 @@ from cayu import (
 )
 from cayu._validation import canonical_durable_json_bytes
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresTaskStore
 from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.storage.tasks_postgres import PostgresTaskStore
 from cayu.tasks.graphs import TASK_GRAPH_MAX_BYTES
 from cayu.tasks.groups import TaskGroupConflict, TaskGroupEventType, task_group_request_sha256
 from cayu.tasks.memory import InMemoryTaskStore

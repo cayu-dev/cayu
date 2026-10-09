@@ -28,8 +28,10 @@ from cayu.storage import _postgres_schema_history as postgres_schema_history
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import migrations as schema
 from cayu.storage import postgres as postgres_storage
+from cayu.storage import tasks_postgres as tasks_postgres
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresSessionStore, PostgresTaskStore
+from cayu.storage.postgres import PostgresSessionStore
+from cayu.storage.tasks_postgres import PostgresTaskStore
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.handoff import interrupted_task_handoff_request
 from cayu.tasks.queries import TaskQuery
@@ -599,7 +601,7 @@ def test_postgres_task_store_validation_requires_current_minimum(
         try:
             with pytest.raises(
                 schema.SchemaTooOld,
-                match=rf"requires >= {postgres_storage._POSTGRES_TASK_MIN_REQUIRED_REVISION}",
+                match=rf"requires >= {tasks_postgres._POSTGRES_TASK_MIN_REQUIRED_REVISION}",
             ):
                 await validator.ensure_schema()
         finally:
@@ -2070,7 +2072,7 @@ def test_task_store_validate_rejects_pre_handoff_generation_schema(
         try:
             with pytest.raises(
                 schema.SchemaTooOld,
-                match=rf"requires >= {postgres_storage._POSTGRES_TASK_MIN_REQUIRED_REVISION}",
+                match=rf"requires >= {tasks_postgres._POSTGRES_TASK_MIN_REQUIRED_REVISION}",
             ):
                 await validator.ensure_schema()
         finally:
@@ -2323,7 +2325,7 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
         try:
             with pytest.raises(
                 schema.SchemaTooOld,
-                match=rf"requires >= {postgres_storage._POSTGRES_TASK_MIN_REQUIRED_REVISION}",
+                match=rf"requires >= {tasks_postgres._POSTGRES_TASK_MIN_REQUIRED_REVISION}",
             ):
                 await task_validator.ensure_schema()
         finally:

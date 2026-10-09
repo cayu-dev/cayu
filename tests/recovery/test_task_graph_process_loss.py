@@ -8,8 +8,8 @@ from uuid import uuid4
 
 import pytest
 
-from cayu.storage.postgres import PostgresTaskStore
 from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.storage.tasks_postgres import PostgresTaskStore
 from cayu.tasks.graphs import TaskGraphEventType
 from cayu.tasks.records import TaskStatus
 

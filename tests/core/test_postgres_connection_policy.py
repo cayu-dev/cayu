@@ -14,8 +14,8 @@ from cayu.storage.postgres import (
     PostgresAgentWorkContextStore,
     PostgresKnowledgeStore,
     PostgresSessionStore,
-    PostgresTaskStore,
 )
+from cayu.storage.tasks_postgres import PostgresTaskStore
 
 
 class _RecordingConnection:

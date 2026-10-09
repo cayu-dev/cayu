@@ -4193,7 +4193,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "PostgresProductOperationStore",
     ),
     "PostgresSessionStore": ("cayu.storage.postgres", "PostgresSessionStore"),
-    "PostgresTaskStore": ("cayu.storage.postgres", "PostgresTaskStore"),
+    "PostgresTaskStore": ("cayu.storage.tasks_postgres", "PostgresTaskStore"),
     "PreparedEvalJudgeCalibration": ("cayu.evals.calibration", "PreparedEvalJudgeCalibration"),
     "PriceBook": ("cayu.budgets.pricing", "PriceBook"),
     "PriceSchedule": ("cayu.budgets.pricing", "PriceSchedule"),

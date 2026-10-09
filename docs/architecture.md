@@ -823,6 +823,9 @@ replay and dead letters. `storage/budget_postgres.py` owns budget reservations,
 binding inventory and settlement receipts. Both adapters use the shared base without
 loading the session, task or knowledge adapters. Existing public store imports
 resolve to the same concrete classes as the canonical modules.
+`storage/tasks_postgres.py` owns task persistence, admission notifications and
+terminal receipts. It composes the shared base and existing task graph, group and
+verified-work components; their native transactions and locks stay with the operation.
 
 Files are good source-of-truth for prompts, instructions, workflows, manuals, skills, and human-reviewed memories.
 

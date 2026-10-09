@@ -3109,7 +3109,8 @@ def test_postgres_session_usage_breakdown_bounds_only_retained_identity(
 
 def test_postgres_aggregates_match_in_memory_reference(postgres_dsn: str) -> None:
     from cayu.storage.migrations import SchemaMode
-    from cayu.storage.postgres import PostgresSessionStore, PostgresTaskStore
+    from cayu.storage.postgres import PostgresSessionStore
+    from cayu.storage.tasks_postgres import PostgresTaskStore
 
     async def run() -> None:
         memory_sessions = InMemorySessionStore()

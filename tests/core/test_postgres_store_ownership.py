@@ -23,6 +23,7 @@ from cayu.support_bundles import _store_schema_readiness
     [
         ("event_watchers_postgres", "PostgresEventWatcherStore"),
         ("budget_postgres", "PostgresBudgetLedger"),
+        ("tasks_postgres", "PostgresTaskStore"),
     ],
 )
 def test_postgres_owner_preserves_public_imports_and_pickled_class(module_name, class_name):
@@ -42,7 +43,8 @@ def test_postgres_owner_preserves_public_imports_and_pickled_class(module_name, 
 
 
 @pytest.mark.parametrize(
-    "module_name", ["_postgres_base", "budget_postgres", "event_watchers_postgres", "postgres"]
+    "module_name",
+    ["_postgres_base", "budget_postgres", "event_watchers_postgres", "tasks_postgres", "postgres"],
 )
 def test_postgres_owner_preserves_optional_dependency_error(module_name):
     result = subprocess.run(

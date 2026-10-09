@@ -19,6 +19,7 @@ from cayu.storage.migrations import SchemaMode
     [
         ("_postgres_base", "_PostgresStoreBase"),
         ("budget_postgres", "PostgresBudgetLedger"),
+        ("tasks_postgres", "PostgresTaskStore"),
         ("event_watchers_postgres", "PostgresEventWatcherStore"),
         ("evals_postgres", "PostgresEvalStore"),
         ("collaboration_postgres", "PostgresCollaborationStore"),

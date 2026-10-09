@@ -17,8 +17,8 @@ from cayu import (
     TaskGroupStatus,
 )
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresTaskStore
 from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.storage.tasks_postgres import PostgresTaskStore
 from cayu.tasks.groups import TaskGroupConflict, TaskGroupEventType
 from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.records import TaskStatus

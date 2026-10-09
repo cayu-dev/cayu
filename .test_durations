@@ -1,4 +1,7 @@
 {
+    "tests/core/test_postgres_base_ownership.py::test_postgres_subclass_import_does_not_load_monolithic_stores[tasks_postgres-PostgresTaskStore]": 0.977598166995449,
+    "tests/core/test_postgres_store_ownership.py::test_postgres_owner_preserves_optional_dependency_error[tasks_postgres]": 1.0232584169716574,
+    "tests/core/test_postgres_store_ownership.py::test_postgres_owner_preserves_public_imports_and_pickled_class[tasks_postgres-PostgresTaskStore]": 0.000759749993449077,
     "tests/core/test_postgres_store_ownership.py::test_postgres_schema_readiness_preserves_validation_boundary[cancelled-PostgresBudgetLedger]": 0.00039812398608773947,
     "tests/core/test_postgres_store_ownership.py::test_postgres_schema_readiness_preserves_validation_boundary[cancelled-PostgresEmbeddingKnowledgeStore]": 0.0003838750417344272,
     "tests/core/test_postgres_store_ownership.py::test_postgres_schema_readiness_preserves_validation_boundary[cancelled-PostgresEvalStore]": 0.0003573330177459866,

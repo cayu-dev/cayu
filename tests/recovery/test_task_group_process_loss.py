@@ -10,8 +10,8 @@ from tests.core.test_task_groups import group_request
 
 from cayu import CayuApp
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresTaskStore
 from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.storage.tasks_postgres import PostgresTaskStore
 
 pytestmark = pytest.mark.process
 

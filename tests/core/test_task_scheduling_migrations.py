@@ -8,8 +8,8 @@ import pytest
 
 from cayu import TaskCreate, TaskQuery, TaskSchedulePolicy
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresTaskStore
 from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.storage.tasks_postgres import PostgresTaskStore
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "postgres"])

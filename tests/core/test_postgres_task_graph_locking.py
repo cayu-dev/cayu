@@ -8,7 +8,7 @@ from uuid import uuid4
 import pytest
 
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresTaskStore
+from cayu.storage.tasks_postgres import PostgresTaskStore
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.graphs import TaskGraphCreate, TaskGraphEventType, TaskGraphNode
 from cayu.tasks.records import TaskSessionClosureClaim, TaskStatus

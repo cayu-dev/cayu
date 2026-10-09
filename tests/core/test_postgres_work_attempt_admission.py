@@ -29,7 +29,8 @@ from cayu.sessions.base import INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY, RunReq
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import SessionStatus
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresSessionStore, PostgresTaskStore
+from cayu.storage.postgres import PostgresSessionStore
+from cayu.storage.tasks_postgres import PostgresTaskStore
 from cayu.tasks.admission import (
     AdmittedCompletionProposalRequest,
     WorkAttemptAdmission,

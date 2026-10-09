@@ -30,8 +30,8 @@ from cayu.runtime.work_attempt_lifecycle import (
 from cayu.runtime.work_attempt_semantics import WorkAttemptRunSemantics
 from cayu.sessions.invocation import TaskExecutionSource
 from cayu.storage.migrations import LATEST_REVISION, SchemaMode
-from cayu.storage.postgres import PostgresTaskStore
 from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.storage.tasks_postgres import PostgresTaskStore
 from cayu.tasks.admission import (
     AdmittedCompletionProposalRequest,
     WorkAttemptAdmissionActivate,

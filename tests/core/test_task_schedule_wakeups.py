@@ -7,8 +7,8 @@ import pytest
 
 from cayu import CayuApp, TaskCreate, TaskQuery, TaskRescheduleRequest, TaskStatus
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresTaskStore
 from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.storage.tasks_postgres import PostgresTaskStore
 from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.scheduling import TaskScheduleEventType, TaskSchedulePolicy
 from cayu.tasks.worker import complete_managed_task, run_task_worker

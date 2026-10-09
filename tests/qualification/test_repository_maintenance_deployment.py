@@ -10,7 +10,8 @@ import pytest
 from cayu.cli.project import project_context
 from cayu.runners.docker_workload import DockerImageIdentity
 from cayu.storage.budget_postgres import PostgresBudgetLedger
-from cayu.storage.postgres import PostgresKnowledgeStore, PostgresSessionStore, PostgresTaskStore
+from cayu.storage.postgres import PostgresKnowledgeStore, PostgresSessionStore
+from cayu.storage.tasks_postgres import PostgresTaskStore
 from tests.cli.test_scaffold_coding_budget import denial_policy
 from tests.core.test_queued_session_messages import RecordingOneShotProvider
 from tests.qualification.repository_maintenance_case import materialize_seed_repository

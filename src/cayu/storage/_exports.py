@@ -303,7 +303,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "PostgresProductOperationStore",
     ),
     "PostgresSessionStore": ("cayu.storage.postgres", "PostgresSessionStore"),
-    "PostgresTaskStore": ("cayu.storage.postgres", "PostgresTaskStore"),
+    "PostgresTaskStore": ("cayu.storage.tasks_postgres", "PostgresTaskStore"),
     "SQLiteAgentWorkContextStore": (
         "cayu.storage.work_context_sqlite",
         "SQLiteAgentWorkContextStore",

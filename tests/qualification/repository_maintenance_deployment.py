@@ -14,7 +14,8 @@ from cayu import configured_database_url
 from cayu.environments.docker_coding import DockerCodingEnvironmentFactory
 from cayu.storage.budget_postgres import PostgresBudgetLedger
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresKnowledgeStore, PostgresSessionStore, PostgresTaskStore
+from cayu.storage.postgres import PostgresKnowledgeStore, PostgresSessionStore
+from cayu.storage.tasks_postgres import PostgresTaskStore
 from cayu.tools.subagents import SubagentTool
 from cayu.workspaces.local import LocalWorkspace
 from tests.qualification.repository_maintenance_budget import require_maintenance_budget

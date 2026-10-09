@@ -118,7 +118,7 @@ from cayu.sessions.invocation import (
     TaskExecutionSource,
     TaskInvocation,
 )
-from cayu.storage.postgres import PostgresTaskStore
+from cayu.storage.tasks_postgres import PostgresTaskStore
 from cayu.tasks._terminalization import terminalize_task_with_retry
 from cayu.tasks.cancellation import (
     TaskRetryCancellationReconciliationConflict,
@@ -877,7 +877,7 @@ def test_postgres_downgraded_verified_work_records_fail_closed_before_migration(
         import psycopg
 
         from cayu.storage.migrations import SchemaMode
-        from cayu.storage.postgres import PostgresTaskStore
+        from cayu.storage.tasks_postgres import PostgresTaskStore
 
         await _truncate(postgres_dsn)
         store = _new_store(postgres_dsn)
@@ -1240,7 +1240,7 @@ def test_postgres_cancelled_worker_claim_aborts_close_return_pool_connection(
 
         from cayu.storage import _postgres_verified_work as postgres_verified_work
         from cayu.storage.migrations import SchemaMode
-        from cayu.storage.postgres import PostgresTaskStore
+        from cayu.storage.tasks_postgres import PostgresTaskStore
 
         await _truncate(postgres_dsn)
         monkeypatch.setattr(
@@ -1311,7 +1311,7 @@ def test_postgres_rollback_failure_physically_discards_close_return_connection(
         from psycopg_pool import AsyncConnectionPool
 
         from cayu.storage.migrations import SchemaMode
-        from cayu.storage.postgres import PostgresTaskStore
+        from cayu.storage.tasks_postgres import PostgresTaskStore
 
         await _truncate(postgres_dsn)
         pool = AsyncConnectionPool(
@@ -3438,7 +3438,7 @@ class _MutableClock:
 
 def _new_store(dsn: str, *, clock=None):
     from cayu.storage.migrations import SchemaMode
-    from cayu.storage.postgres import PostgresTaskStore
+    from cayu.storage.tasks_postgres import PostgresTaskStore
 
     # Tests own a throwaway database and (re)create the schema each run.
     return PostgresTaskStore(
@@ -3819,7 +3819,7 @@ def test_postgres_claim_rechecks_retry_deadline_after_retry_fence_wait(postgres_
 
 def test_postgres_reclaim_ignores_a_fast_process_clock(postgres_dsn, monkeypatch):
     async def run() -> None:
-        from cayu.storage import postgres as postgres_module
+        from cayu.storage import tasks_postgres as postgres_module
 
         await _truncate(postgres_dsn)
         store = _new_store(postgres_dsn)
@@ -5824,7 +5824,7 @@ def test_postgres_task_admission_notification_is_content_free_and_cross_store(
     async def run() -> None:
         import psycopg
 
-        from cayu.storage.postgres import _TASK_ADMISSION_NOTIFY_CHANNEL
+        from cayu.storage.tasks_postgres import _TASK_ADMISSION_NOTIFY_CHANNEL
 
         await _truncate(postgres_dsn)
         producer = _new_store(postgres_dsn)

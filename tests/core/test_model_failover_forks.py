@@ -241,7 +241,8 @@ def test_selected_fallback_survives_fork_and_reconstruction(
     task_database = tmp_path / "selected-fork-tasks.sqlite"
     if backend == "postgres":
         from cayu.storage.migrations import SchemaMode
-        from cayu.storage.postgres import PostgresSessionStore, PostgresTaskStore
+        from cayu.storage.postgres import PostgresSessionStore
+        from cayu.storage.tasks_postgres import PostgresTaskStore
 
         dsn = request.getfixturevalue("postgres_dsn")
 

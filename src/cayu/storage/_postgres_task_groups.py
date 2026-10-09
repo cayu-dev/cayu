@@ -21,7 +21,7 @@ from cayu.tasks.groups import (
 )
 
 if TYPE_CHECKING:
-    from cayu.storage.postgres import PostgresTaskStore
+    from cayu.storage.tasks_postgres import PostgresTaskStore
     from cayu.tasks.records import Task
 
 

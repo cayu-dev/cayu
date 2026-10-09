@@ -50,7 +50,8 @@ def _stores(backend: str, tmp_path: Path, request: pytest.FixtureRequest):
             SQLiteSessionStore(tmp_path / "closure.sqlite"),
             SQLiteTaskStore(tmp_path / "closure.sqlite"),
         )
-    from cayu.storage.postgres import PostgresSessionStore, PostgresTaskStore
+    from cayu.storage.postgres import PostgresSessionStore
+    from cayu.storage.tasks_postgres import PostgresTaskStore
 
     dsn = request.getfixturevalue("postgres_dsn")
     return (

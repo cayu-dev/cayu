@@ -844,7 +844,7 @@ def _task_store(backend: BackendConfig):
         if backend.dsn is None:
             raise ValueError("Postgres backend requires dsn")
         from cayu.storage.migrations import SchemaMode
-        from cayu.storage.postgres import PostgresTaskStore
+        from cayu.storage.tasks_postgres import PostgresTaskStore
 
         return PostgresTaskStore(backend.dsn, schema_mode=SchemaMode.CREATE)
     raise ValueError(f"Unknown backend: {backend.kind}")

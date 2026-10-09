@@ -326,11 +326,8 @@ def _open_postgres_stores(
         from psycopg_pool import AsyncConnectionPool
 
         from cayu.storage.migrations import SchemaMode
-        from cayu.storage.postgres import (
-            PostgresKnowledgeStore,
-            PostgresSessionStore,
-            PostgresTaskStore,
-        )
+        from cayu.storage.postgres import PostgresKnowledgeStore, PostgresSessionStore
+        from cayu.storage.tasks_postgres import PostgresTaskStore
     except ModuleNotFoundError as exc:
         if (exc.name or "").partition(".")[0] not in {"psycopg", "psycopg_pool"}:
             raise

@@ -335,7 +335,7 @@ def store_factory(request: pytest.FixtureRequest, tmp_path: Path) -> StoreFactor
         path = tmp_path / "tasks.db"
         return lambda: SQLiteTaskStore(path)
     from cayu.storage.migrations import SchemaMode
-    from cayu.storage.postgres import PostgresTaskStore
+    from cayu.storage.tasks_postgres import PostgresTaskStore
 
     dsn = request.getfixturevalue("postgres_dsn")
     return lambda: PostgresTaskStore(dsn, min_size=1, max_size=2, schema_mode=SchemaMode.MIGRATE)

@@ -6,8 +6,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresTaskStore
 from cayu.storage.sqlite import SQLiteTaskStore
+from cayu.storage.tasks_postgres import PostgresTaskStore
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.graphs import (
     TaskGraphConflict,
@@ -1224,13 +1224,13 @@ async def test_late_member_event_failure_leaves_no_partial_admission(
     store: TaskStore,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from cayu.storage import postgres, tasks_sqlite
+    from cayu.storage import tasks_postgres, tasks_sqlite
     from cayu.tasks import memory
 
     module = (
         memory
         if isinstance(store, InMemoryTaskStore)
-        else postgres
+        else tasks_postgres
         if isinstance(store, PostgresTaskStore)
         else tasks_sqlite
     )

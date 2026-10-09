@@ -23,7 +23,8 @@ def test_public_closure_preserves_application_references(backend, table_prefix, 
             sessions = SQLiteSessionStore(tmp_path / "ownership.db")
             tasks = SQLiteTaskStore(tmp_path / "ownership.db")
         else:
-            from cayu.storage.postgres import PostgresSessionStore, PostgresTaskStore
+            from cayu.storage.postgres import PostgresSessionStore
+            from cayu.storage.tasks_postgres import PostgresTaskStore
 
             sessions = PostgresSessionStore(dsn, schema_mode=SchemaMode.CREATE)
             tasks = PostgresTaskStore(dsn, schema_mode=SchemaMode.CREATE)
