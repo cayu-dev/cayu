@@ -448,7 +448,16 @@ handling and failure settlement remain distinct. Both hand off through
 `SessionEngine.continue_run`; the application retains participant, task and
 resource checks before that entrance.
 
-The owner reads fresh checkpoint state for each observation and uses the same
+`ContinuationEnvironment` composes the existing environment lifecycle for both
+paused continuations and manual approval/input recovery. Reconnection and binding
+are separate phases, so each entrance keeps its resolution checks and resume
+publication in the required order. The component retains the returned environment
+before rebinding invocation authority and exposing result events; failure and
+abandonment cleanup use that current state. Typed callers retain their error
+settlement rules. After exact pause closure, approval and input share construction
+of the engine handoff while keeping ownership of the returned event stream.
+
+`DurableToolRound` reads fresh checkpoint state for each observation and uses the same
 source snapshot when preparing final publication. It does not cache validation
 across checkpoint writes. Shared staging, projection and receipt algorithms keep
 their existing authority and cancellation checks. The recovery coordinator no

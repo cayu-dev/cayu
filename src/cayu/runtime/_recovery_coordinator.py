@@ -26,6 +26,7 @@ from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, cast
 from uuid import UUID, uuid4, uuid5
 
+from cayu.runtime._continuation_environment import ContinuationEnvironment
 from cayu.runtime._durable_tool_round import (
     DeferredInputMaterialization as DeferredInputMaterialization,
 )
@@ -8691,6 +8692,72 @@ class RecoveryCoordinator:
             raise cancellation
         return expected
 
+    def _continue_closed_tool_round(
+        self,
+        *,
+        session: Session,
+        environment: ContinuationEnvironment,
+        registered_provider: runtime_records.RegisteredProvider,
+        execution_profile_snapshot: ActiveInvocationExecutionProfile,
+        budget_policy: BudgetPolicy | None,
+        transcript: list[Message],
+        semantics: _RecoveryInvocationSemantics,
+        resolution: ToolApprovalRequest | UserInputResponse,
+        task_id: str | None,
+        model_step: int | None,
+        tool_exposure: ResolvedToolExposureAuthority | None,
+        run_limit_accounting: RunLimitAccountingContext | None,
+        participant_context: CollaborationAccessContext | None,
+    ) -> AsyncGenerator[Event, None]:
+        """Hand an exactly closed human-gated round back to the admitted engine.
+
+        Callers commit their typed closure and propagate its cancellation before
+        entering here. They retain ownership of the returned stream and fence.
+        """
+        session_stream = self._run_session(
+            RecoverySessionRunRequest(
+                session=session,
+                messages=transcript,
+                messages_to_append=[],
+                max_steps=semantics.max_steps,
+                limits=semantics.limits,
+                budget_limits=semantics.budget_limits,
+                retry_policy=semantics.retry_policy,
+                structured_output=semantics.structured_output,
+                thinking=semantics.thinking,
+                request_metadata=resolution.metadata,
+                participant_context=participant_context,
+                task_id=task_id,
+                task_worker_id=resolution.task_worker_id,
+                task_handoff_id=resolution.task_handoff_id,
+                start_event_type=None,
+                start_event_payload={},
+                start_task_on_enter=False,
+                release_run_fence_on_exit=False,
+                run_limit_accounting=run_limit_accounting,
+                completed_tool_round_model_step=_completed_tool_round_model_step(
+                    model_step, max_steps=semantics.max_steps
+                ),
+                previous_tool_exposure_profile_id=_continued_tool_exposure_profile_id(
+                    tool_exposure
+                ),
+                invocation_context=(
+                    environment.invocation_context
+                    if environment.invocation_context is not None
+                    else self._reconstruct_invocation_context(
+                        session=session,
+                        execution_profile_snapshot=execution_profile_snapshot,
+                        registered_agent=environment.agent,
+                        registered_provider=registered_provider,
+                        registered_environment=environment.registered_environment,
+                        budget_policy=copy_budget_policy(budget_policy),
+                        request_loop_policies=resolution.loop_policies,
+                    )
+                ),
+            )
+        )
+        return self._session_control.stream_with_out_of_band_events(session.id, session_stream)
+
     async def continue_user_input_resolution(
         self,
         *,
@@ -8735,7 +8802,6 @@ class RecoveryCoordinator:
             resolution_stage=resolution_stage,
             resolution_request_digest=closure_request_digest,
         )
-        environment_name = _environment_name(registered_environment)
         tool_round_identity = ToolRoundIdentity(
             tool_round_id=pending.tool_round_id,
             model_step_id=pending.model_step_id,
@@ -8774,6 +8840,14 @@ class RecoveryCoordinator:
             )
         )
         effect_settlement: _ReconciledToolEffectReplay | _ToolEffectObservationReplay | None = None
+        environment = ContinuationEnvironment(
+            lifecycle=self._environment_lifecycle,
+            session=session,
+            agent=registered_agent,
+            profile=execution_profile_snapshot.profile,
+            registered_environment=registered_environment,
+            invocation_context=invocation_context,
+        )
         try:
             resolution_intent = await self._admit_user_input_resolution_execution(
                 session=session,
@@ -8821,45 +8895,21 @@ class RecoveryCoordinator:
                     reset_budgets=False,
                     now=self._clock(),
                 )
-            factory_started_event = await self._environment_lifecycle.emit_factory_started(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                execution_profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
-            )
-            if factory_started_event is not None:
-                yield factory_started_event
-            factory_resolution = await self._environment_lifecycle.resolve_factory(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                started_event=factory_started_event,
-                operation=EnvironmentFactoryOperation.RECONNECT,
-                execution_profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
-            )
-            registered_environment = factory_resolution.registered_environment
-            if registered_environment is not None and invocation_context is not None:
-                invocation_context = invocation_context.with_registered_environment(
-                    registered_environment,
-                    validated_profile=execution_profile_snapshot.profile,
-                )
-            environment_name = _environment_name(registered_environment)
-            for event in factory_resolution.events:
-                yield event
+            async with contextlib.aclosing(environment.reconnect()) as preparation:
+                async for event in preparation:
+                    yield event
 
-            if factory_resolution.error is not None:
-                raise factory_resolution.error
+            if environment.error is not None:
+                raise environment.error
             if effect_reconciliation is not None:
-                if invocation_context is None:
+                if environment.invocation_context is None:
                     raise RuntimeError("Receipt recovery has no user-input invocation authority.")
                 async with contextlib.aclosing(
                     self._settle_tool_effect_reconciliation(
                         request=effect_reconciliation,
                         source_run_epoch=effect_reconciliation.expected_run_epoch,
                         session=session,
-                        invocation_context=invocation_context,
+                        invocation_context=environment.invocation_context,
                     )
                 ) as settlement_stream:
                     async for item in settlement_stream:
@@ -8876,9 +8926,9 @@ class RecoveryCoordinator:
                         record=effect_settlement.record,
                         session=session,
                         registered_agent=registered_agent,
-                        registered_environment=registered_environment,
+                        registered_environment=environment.registered_environment,
                         execution_profile=execution_profile_snapshot.profile,
-                        invocation_context=invocation_context,
+                        invocation_context=environment.invocation_context,
                     ):
                         yield event
                     return
@@ -8892,7 +8942,7 @@ class RecoveryCoordinator:
                     session=session,
                     tool_event=effect_settlement.terminal_event,
                     registered_agent=registered_agent,
-                    registered_environment=registered_environment,
+                    registered_environment=environment.registered_environment,
                     tool_call=approval_support.tool_call_request_from_pending(
                         recovered_call, arguments={}
                     ),
@@ -8901,7 +8951,7 @@ class RecoveryCoordinator:
                     ),
                     task_id=pending.task_id,
                     execution_profile=execution_profile_snapshot.profile,
-                    invocation_context=invocation_context,
+                    invocation_context=environment.invocation_context,
                     redactor=self._secret_redactor,
                     output_redactor=self._secret_redactor,
                     allow_modification=False,
@@ -8916,7 +8966,7 @@ class RecoveryCoordinator:
                                 type=EventType.SESSION_RESUMED,
                                 session_id=session.id,
                                 agent_name=registered_agent.spec.name,
-                                environment_name=environment_name,
+                                environment_name=environment.name,
                                 payload={
                                     **tool_round_identity.payload(),
                                     "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
@@ -8933,33 +8983,11 @@ class RecoveryCoordinator:
                         execution_profile_snapshot.profile,
                     )
                 )
-            binding_started_event = await self._environment_lifecycle.emit_binding_started(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                execution_profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
-            )
-            if binding_started_event is not None:
-                yield binding_started_event
-            binding_result = await self._environment_lifecycle.bind(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                started_event=binding_started_event,
-                execution_profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
-            )
-            registered_environment = binding_result.registered_environment
-            if registered_environment is not None and invocation_context is not None:
-                invocation_context = invocation_context.with_registered_environment(
-                    registered_environment,
-                    validated_profile=execution_profile_snapshot.profile,
-                )
-            for event in binding_result.events:
-                yield event
-            if binding_result.error is not None:
-                raise binding_result.error
+            async with contextlib.aclosing(environment.bind()) as preparation:
+                async for event in preparation:
+                    yield event
+            if environment.error is not None:
+                raise environment.error
 
             round_tool_calls = [
                 approval_support.tool_call_request_from_pending(pending_call)
@@ -8980,7 +9008,7 @@ class RecoveryCoordinator:
             )
             pause_secret_resolution_scope = invocation_secrets.continuation_secret_resolution_scope(
                 persisted_secret_resolution_scope,
-                registered_environment,
+                environment.registered_environment,
             )
             paused_round = await PausedToolRound.prepare(
                 session_store=self._session_store,
@@ -8989,10 +9017,10 @@ class RecoveryCoordinator:
                 clock=self._clock,
                 session=session,
                 agent=registered_agent,
-                environment=registered_environment,
-                environment_name=environment_name,
+                environment=environment.registered_environment,
+                environment_name=environment.name,
                 profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
+                invocation_context=environment.invocation_context,
                 identity=tool_round_identity,
                 task_id=pending.task_id,
                 tool_calls=round_tool_calls,
@@ -9014,9 +9042,9 @@ class RecoveryCoordinator:
                 session=session,
                 pending=pending,
                 registered_agent=registered_agent,
-                registered_environment=registered_environment,
+                registered_environment=environment.registered_environment,
                 execution_profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
+                invocation_context=environment.invocation_context,
             )
             resume_events.extend(native_events)
             for native_event in native_events:
@@ -9070,10 +9098,10 @@ class RecoveryCoordinator:
                     ) in await self._tool_invocation.admission.rejoin_targeted_call(
                         session=session,
                         registered_agent=registered_agent,
-                        registered_environment=registered_environment,
+                        registered_environment=environment.registered_environment,
                         tool_call=tool_call,
                         task_id=pending.task_id,
-                        invocation_context=invocation_context,
+                        invocation_context=environment.invocation_context,
                     ):
                         yield rejoined_event
                     idempotency_key = tool_execution.tool_idempotency_key(
@@ -9105,7 +9133,7 @@ class RecoveryCoordinator:
                                     type=EventType.TOOL_CALL_STARTED,
                                     session_id=session.id,
                                     agent_name=registered_agent.spec.name,
-                                    environment_name=environment_name,
+                                    environment_name=environment.name,
                                     tool_name=tool_call.name,
                                     payload=started_payload,
                                 ),
@@ -9125,7 +9153,7 @@ class RecoveryCoordinator:
                             type=EventType.TOOL_CALL_COMPLETED,
                             session_id=session.id,
                             agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
+                            environment_name=environment.name,
                             tool_name=tool_call.name,
                             payload={
                                 **tool_round_identity.payload(),
@@ -9183,7 +9211,7 @@ class RecoveryCoordinator:
                             type=EventType.TOOL_CALL_BLOCKED,
                             session_id=session.id,
                             agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
+                            environment_name=environment.name,
                             tool_name=tool_call.name,
                             payload={
                                 **tool_round_identity.payload(),
@@ -9366,7 +9394,7 @@ class RecoveryCoordinator:
                             session_id=session.id,
                             interaction_id=pending.source_interaction_id,
                             agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
+                            environment_name=environment.name,
                             payload={
                                 "checkpoint": PENDING_USER_INPUT_CHECKPOINT_KEY,
                                 "transition": "answered",
@@ -9446,51 +9474,20 @@ class RecoveryCoordinator:
             if close_cancellation is not None:
                 raise close_cancellation
 
-            session_stream = self._run_session(
-                RecoverySessionRunRequest(
-                    session=session,
-                    messages=transcript,
-                    messages_to_append=[],
-                    max_steps=effective_max_steps,
-                    limits=effective_limits,
-                    budget_limits=effective_budget_limits,
-                    retry_policy=effective_retry_policy,
-                    structured_output=invocation_semantics.structured_output,
-                    thinking=invocation_semantics.thinking,
-                    request_metadata=response.metadata,
-                    participant_context=participant_context,
-                    task_id=pending.task_id,
-                    task_worker_id=response.task_worker_id,
-                    task_handoff_id=response.task_handoff_id,
-                    start_event_type=None,
-                    start_event_payload={},
-                    start_task_on_enter=False,
-                    release_run_fence_on_exit=False,
-                    run_limit_accounting=continued_run_limit_accounting,
-                    completed_tool_round_model_step=_completed_tool_round_model_step(
-                        pending.model_step, max_steps=effective_max_steps
-                    ),
-                    previous_tool_exposure_profile_id=(
-                        _continued_tool_exposure_profile_id(pending.tool_exposure)
-                    ),
-                    invocation_context=(
-                        invocation_context
-                        if invocation_context is not None
-                        else self._reconstruct_invocation_context(
-                            session=session,
-                            execution_profile_snapshot=execution_profile_snapshot,
-                            registered_agent=registered_agent,
-                            registered_provider=registered_provider,
-                            registered_environment=registered_environment,
-                            budget_policy=copy_budget_policy(budget_policy),
-                            request_loop_policies=response.loop_policies,
-                        )
-                    ),
-                )
-            )
-            forwarded_stream = self._session_control.stream_with_out_of_band_events(
-                session.id,
-                session_stream,
+            forwarded_stream = self._continue_closed_tool_round(
+                session=session,
+                environment=environment,
+                registered_provider=registered_provider,
+                execution_profile_snapshot=execution_profile_snapshot,
+                budget_policy=budget_policy,
+                transcript=transcript,
+                semantics=invocation_semantics,
+                resolution=response,
+                task_id=pending.task_id,
+                model_step=pending.model_step,
+                tool_exposure=pending.tool_exposure,
+                run_limit_accounting=continued_run_limit_accounting,
+                participant_context=participant_context,
             )
             try:
                 async for event in forwarded_stream:
@@ -9508,9 +9505,9 @@ class RecoveryCoordinator:
                 exc,
                 session=session,
                 registered_agent=registered_agent,
-                registered_environment=registered_environment,
+                registered_environment=environment.registered_environment,
                 execution_profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
+                invocation_context=environment.invocation_context,
             ):
                 yield event
         except Exception as exc:
@@ -9577,7 +9574,7 @@ class RecoveryCoordinator:
                     type=EventType.SESSION_INTERRUPTED,
                     session_id=session.id,
                     agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
+                    environment_name=environment.name,
                     payload=payload,
                 )
                 interrupted_event = event_with_execution_profile_authority(
@@ -9608,9 +9605,9 @@ class RecoveryCoordinator:
                         phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
                         session=session,
                         registered_agent=registered_agent,
-                        registered_environment=registered_environment,
+                        registered_environment=environment.registered_environment,
                         execution_profile=execution_profile_snapshot.profile,
-                        invocation_context=invocation_context,
+                        invocation_context=environment.invocation_context,
                     )
                 ):
                     yield event
@@ -9653,7 +9650,6 @@ class RecoveryCoordinator:
             or invocation_context.budget_policy is not budget_policy
         ):
             raise RuntimeError("Tool-approval recovery lost frozen invocation authority.")
-        environment_name = _environment_name(registered_environment)
         tool_round_identity = ToolRoundIdentity(
             tool_round_id=pending_approval.tool_round_id,
             model_step_id=pending_approval.model_step_id,
@@ -9697,6 +9693,14 @@ class RecoveryCoordinator:
                 pending_approval.run_limit_accounting,
                 resolved_at=claimed_resolution_intent.pause_resolved_at,
             )
+        )
+        environment = ContinuationEnvironment(
+            lifecycle=self._environment_lifecycle,
+            session=session,
+            agent=registered_agent,
+            profile=execution_profile_snapshot.profile,
+            registered_environment=registered_environment,
+            invocation_context=invocation_context,
         )
         try:
             transcript_snapshot = await self._session_store.load_transcript_snapshot(session.id)
@@ -9866,9 +9870,9 @@ class RecoveryCoordinator:
                 session=session,
                 pending=pending_approval,
                 registered_agent=registered_agent,
-                registered_environment=registered_environment,
+                registered_environment=environment.registered_environment,
                 execution_profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
+                invocation_context=environment.invocation_context,
             )
             approval_events.extend(native_events)
             for native_event in native_events:
@@ -9893,41 +9897,17 @@ class RecoveryCoordinator:
                         "execution; retry the exact original approval request."
                     )
                 resolution_request_digest = claimed_resolution_intent.resolution_request_digest
-            factory_started_event = await self._environment_lifecycle.emit_factory_started(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                execution_profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
-            )
-            if factory_started_event is not None:
-                yield factory_started_event
-            factory_resolution = await self._environment_lifecycle.resolve_factory(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                started_event=factory_started_event,
-                operation=EnvironmentFactoryOperation.RECONNECT,
-                execution_profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
-            )
-            registered_environment = factory_resolution.registered_environment
-            if registered_environment is not None and invocation_context is not None:
-                invocation_context = invocation_context.with_registered_environment(
-                    registered_environment,
-                    validated_profile=execution_profile_snapshot.profile,
-                )
-            environment_name = _environment_name(registered_environment)
-            for event in factory_resolution.events:
-                yield event
-            if factory_resolution.error is not None:
-                raise factory_resolution.error
+            async with contextlib.aclosing(environment.reconnect()) as preparation:
+                async for event in preparation:
+                    yield event
+            if environment.error is not None:
+                raise environment.error
             if emit_resume_event:
                 yield await self._event_writer.emit(
                     approval_support.resumed_event(
                         session=session,
                         agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
+                        environment_name=environment.name,
                         approval=pending_approval,
                         decision=request.decision,
                         resolved_by=request.resolved_by,
@@ -9941,7 +9921,7 @@ class RecoveryCoordinator:
                             type=EventType.TOOL_CALL_APPROVAL_EXPIRED,
                             session_id=session.id,
                             agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
+                            environment_name=environment.name,
                             tool_name=pending_approval.tool_name,
                             payload={
                                 **tool_round_identity.payload(),
@@ -9980,33 +9960,11 @@ class RecoveryCoordinator:
             }:
                 raise ValueError(f"Unsupported tool approval decision: {request.decision}")
 
-            binding_started_event = await self._environment_lifecycle.emit_binding_started(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                execution_profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
-            )
-            if binding_started_event is not None:
-                yield binding_started_event
-            binding_result = await self._environment_lifecycle.bind(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                started_event=binding_started_event,
-                execution_profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
-            )
-            registered_environment = binding_result.registered_environment
-            if registered_environment is not None and invocation_context is not None:
-                invocation_context = invocation_context.with_registered_environment(
-                    registered_environment,
-                    validated_profile=execution_profile_snapshot.profile,
-                )
-            for event in binding_result.events:
-                yield event
-            if binding_result.error is not None:
-                raise binding_result.error
+            async with contextlib.aclosing(environment.bind()) as preparation:
+                async for event in preparation:
+                    yield event
+            if environment.error is not None:
+                raise environment.error
 
             if request.decision == ToolApprovalDecision.APPROVE:
                 run_started_at = time.monotonic()
@@ -10058,7 +10016,7 @@ class RecoveryCoordinator:
                 limit_evaluation = await self._run_limit_controller.evaluate_request_limits(
                     session=session,
                     agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
+                    environment_name=environment.name,
                     limits=limits,
                     budget_limits=budget_limits,
                     run_started_at=run_started_at,
@@ -10084,8 +10042,8 @@ class RecoveryCoordinator:
                         RecoveryLimitStopRequest(
                             session=session,
                             registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                            environment_name=environment_name,
+                            registered_environment=environment.registered_environment,
+                            environment_name=environment.name,
                             decision=limit_evaluation.decision,
                             usage_summary=limit_evaluation.usage_summary,
                             cost_summary=limit_evaluation.cost_summary,
@@ -10097,7 +10055,7 @@ class RecoveryCoordinator:
                             requested_approval_decision=original_resolution_decision,
                             approval_resolution_request_digest=resolution_request_digest,
                             execution_profile=execution_profile_snapshot.profile,
-                            invocation_context=invocation_context,
+                            invocation_context=environment.invocation_context,
                         )
                     ):
                         yield event
@@ -10118,7 +10076,7 @@ class RecoveryCoordinator:
             )
             pause_secret_resolution_scope = invocation_secrets.continuation_secret_resolution_scope(
                 pending_approval.secret_resolution_scope,
-                registered_environment,
+                environment.registered_environment,
             )
             paused_round = await PausedToolRound.prepare(
                 session_store=self._session_store,
@@ -10127,10 +10085,10 @@ class RecoveryCoordinator:
                 clock=self._clock,
                 session=session,
                 agent=registered_agent,
-                environment=registered_environment,
-                environment_name=environment_name,
+                environment=environment.registered_environment,
+                environment_name=environment.name,
                 profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
+                invocation_context=environment.invocation_context,
                 identity=tool_round_identity,
                 task_id=pending_approval.task_id,
                 tool_calls=round_tool_calls,
@@ -10223,7 +10181,7 @@ class RecoveryCoordinator:
                             type=EventType.TOOL_CALL_BLOCKED,
                             session_id=session.id,
                             agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
+                            environment_name=environment.name,
                             tool_name=tool_call.name,
                             payload={
                                 **tool_round_identity.payload(),
@@ -10257,7 +10215,7 @@ class RecoveryCoordinator:
                     yield await self._publish_tool_approval_granted_once(
                         session=session,
                         registered_agent=registered_agent,
-                        environment_name=environment_name,
+                        environment_name=environment.name,
                         pending_approval=pending_approval,
                         tool_call=tool_call,
                         tool_round_identity=tool_round_identity,
@@ -10297,7 +10255,7 @@ class RecoveryCoordinator:
                             type=EventType.TOOL_CALL_APPROVAL_DENIED,
                             session_id=session.id,
                             agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
+                            environment_name=environment.name,
                             tool_name=tool_call.name,
                             payload={
                                 **tool_round_identity.payload(),
@@ -10467,7 +10425,7 @@ class RecoveryCoordinator:
             clear_event = approval_support.cleared_event(
                 session=session,
                 agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
+                environment_name=environment.name,
                 approval=pending_approval,
             )
             prepared_close = approval_publication.prepare_approval_publication(
@@ -10540,51 +10498,20 @@ class RecoveryCoordinator:
             if close_cancellation is not None:
                 raise close_cancellation
 
-            session_stream = self._run_session(
-                RecoverySessionRunRequest(
-                    session=session,
-                    messages=transcript,
-                    messages_to_append=[],
-                    max_steps=effective_max_steps,
-                    limits=effective_limits,
-                    budget_limits=effective_budget_limits,
-                    retry_policy=effective_retry_policy,
-                    structured_output=invocation_semantics.structured_output,
-                    thinking=invocation_semantics.thinking,
-                    request_metadata=request.metadata,
-                    participant_context=participant_context,
-                    task_id=pending_approval.task_id,
-                    task_worker_id=request.task_worker_id,
-                    task_handoff_id=request.task_handoff_id,
-                    start_event_type=None,
-                    start_event_payload={},
-                    start_task_on_enter=False,
-                    release_run_fence_on_exit=False,
-                    run_limit_accounting=continued_run_limit_accounting,
-                    completed_tool_round_model_step=_completed_tool_round_model_step(
-                        durable_round.model_step, max_steps=effective_max_steps
-                    ),
-                    previous_tool_exposure_profile_id=(
-                        _continued_tool_exposure_profile_id(durable_round.tool_exposure)
-                    ),
-                    invocation_context=(
-                        invocation_context
-                        if invocation_context is not None
-                        else self._reconstruct_invocation_context(
-                            session=session,
-                            execution_profile_snapshot=execution_profile_snapshot,
-                            registered_agent=registered_agent,
-                            registered_provider=registered_provider,
-                            registered_environment=registered_environment,
-                            budget_policy=copy_budget_policy(budget_policy),
-                            request_loop_policies=request.loop_policies,
-                        )
-                    ),
-                )
-            )
-            forwarded_stream = self._session_control.stream_with_out_of_band_events(
-                session.id,
-                session_stream,
+            forwarded_stream = self._continue_closed_tool_round(
+                session=session,
+                environment=environment,
+                registered_provider=registered_provider,
+                execution_profile_snapshot=execution_profile_snapshot,
+                budget_policy=budget_policy,
+                transcript=transcript,
+                semantics=invocation_semantics,
+                resolution=request,
+                task_id=pending_approval.task_id,
+                model_step=durable_round.model_step,
+                tool_exposure=durable_round.tool_exposure,
+                run_limit_accounting=continued_run_limit_accounting,
+                participant_context=participant_context,
             )
             try:
                 async for event in forwarded_stream:
@@ -10599,9 +10526,9 @@ class RecoveryCoordinator:
             await self.finalize_abandoned_session_by_id(
                 session.id,
                 registered_agent=registered_agent,
-                registered_environment=registered_environment,
+                registered_environment=environment.registered_environment,
                 execution_profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
+                invocation_context=environment.invocation_context,
             )
             raise
         except ForegroundChildActionRequired as exc:
@@ -10609,9 +10536,9 @@ class RecoveryCoordinator:
                 exc,
                 session=session,
                 registered_agent=registered_agent,
-                registered_environment=registered_environment,
+                registered_environment=environment.registered_environment,
                 execution_profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
+                invocation_context=environment.invocation_context,
             ):
                 yield event
         except Exception as exc:
@@ -10626,7 +10553,7 @@ class RecoveryCoordinator:
                             type=EventType.SESSION_INTERRUPTED,
                             session_id=session.id,
                             agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
+                            environment_name=environment.name,
                             payload={
                                 **_continuation_failure_payload(
                                     exc,
@@ -10648,9 +10575,9 @@ class RecoveryCoordinator:
                         phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
                         session=session,
                         registered_agent=registered_agent,
-                        registered_environment=registered_environment,
+                        registered_environment=environment.registered_environment,
                         execution_profile=execution_profile_snapshot.profile,
-                        invocation_context=invocation_context,
+                        invocation_context=environment.invocation_context,
                     )
                 ):
                     yield event
@@ -10683,7 +10610,7 @@ class RecoveryCoordinator:
                             type=EventType.SESSION_INTERRUPTED,
                             session_id=session.id,
                             agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
+                            environment_name=environment.name,
                             payload={
                                 **_continuation_failure_payload(
                                     exc,
@@ -10708,9 +10635,9 @@ class RecoveryCoordinator:
                         phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
                         session=session,
                         registered_agent=registered_agent,
-                        registered_environment=registered_environment,
+                        registered_environment=environment.registered_environment,
                         execution_profile=execution_profile_snapshot.profile,
-                        invocation_context=invocation_context,
+                        invocation_context=environment.invocation_context,
                     )
                 ):
                     yield event
@@ -10726,9 +10653,9 @@ class RecoveryCoordinator:
                 session=session,
                 closure_event=clear_event,
                 registered_agent=registered_agent,
-                registered_environment=registered_environment,
+                registered_environment=environment.registered_environment,
                 execution_profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
+                invocation_context=environment.invocation_context,
             ):
                 yield event
         finally:
@@ -11307,6 +11234,14 @@ class RecoveryCoordinator:
         recovery_event_to_reconcile: Event | None = None
         authoritative_failure: BaseException | None = None
         abandoned = False
+        environment = ContinuationEnvironment(
+            lifecycle=self._environment_lifecycle,
+            session=session,
+            agent=registered_agent,
+            profile=execution_profile_snapshot.profile,
+            registered_environment=registered_environment,
+            invocation_context=invocation_context,
+        )
         try:
             await ToolEffectStateOwner(self._session_store).require_unverified_recovery_allowed(
                 session,
@@ -11346,34 +11281,10 @@ class RecoveryCoordinator:
                 input_id=pending.input_id,
                 tool_round_identity=tool_round_identity,
             )
-            factory_started_event = await self._environment_lifecycle.emit_factory_started(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                execution_profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
-            )
-            if factory_started_event is not None:
-                yield factory_started_event
-            factory_resolution = await self._environment_lifecycle.resolve_factory(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                started_event=factory_started_event,
-                operation=EnvironmentFactoryOperation.RECONNECT,
-                execution_profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
-            )
-            registered_environment = factory_resolution.registered_environment
-            if registered_environment is not None and invocation_context is not None:
-                invocation_context = invocation_context.with_registered_environment(
-                    registered_environment,
-                    validated_profile=execution_profile_snapshot.profile,
-                )
-            environment_name = _environment_name(registered_environment)
-            for event in factory_resolution.events:
-                yield event
-            if factory_resolution.error is not None:
+            async with contextlib.aclosing(environment.reconnect()) as preparation:
+                async for event in preparation:
+                    yield event
+            if environment.error is not None:
                 session = await self._session_store.update_status(
                     session.id,
                     SessionStatus.INTERRUPTED,
@@ -11385,13 +11296,13 @@ class RecoveryCoordinator:
                                 type=EventType.SESSION_INTERRUPTED,
                                 session_id=session.id,
                                 agent_name=registered_agent.spec.name,
-                                environment_name=environment_name,
+                                environment_name=environment.name,
                                 payload={
                                     **tool_round_identity.payload(),
                                     "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
                                     **pending_user_input_interruption_payload(pending),
                                     **_environment_factory_resolution_error_payload(
-                                        factory_resolution.error,
+                                        environment.error,
                                         redactor=self._secret_redactor,
                                     ),
                                 },
@@ -11401,9 +11312,9 @@ class RecoveryCoordinator:
                         phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
                         session=session,
                         registered_agent=registered_agent,
-                        registered_environment=registered_environment,
+                        registered_environment=environment.registered_environment,
                         execution_profile=execution_profile_snapshot.profile,
-                        invocation_context=invocation_context,
+                        invocation_context=environment.invocation_context,
                     )
                 ):
                     yield event
@@ -11413,7 +11324,7 @@ class RecoveryCoordinator:
                     type=event_type,
                     session_id=session.id,
                     agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
+                    environment_name=environment.name,
                     tool_name=pending_tool_call.tool_name,
                     payload={
                         **tool_round_identity.payload(),
@@ -11456,7 +11367,7 @@ class RecoveryCoordinator:
                         type=EventType.SESSION_RESUMED,
                         session_id=session.id,
                         agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
+                        environment_name=environment.name,
                         payload={
                             **tool_round_identity.payload(),
                             "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
@@ -11487,12 +11398,12 @@ class RecoveryCoordinator:
                 session=session,
                 tool_event=tool_event,
                 registered_agent=registered_agent,
-                registered_environment=registered_environment,
+                registered_environment=environment.registered_environment,
                 tool_call=tool_call,
                 result=public_recovered_result,
                 task_id=pending.task_id,
                 execution_profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
+                invocation_context=environment.invocation_context,
                 redactor=self._secret_redactor,
                 output_redactor=self._secret_redactor,
                 allow_modification=False,
@@ -11553,9 +11464,9 @@ class RecoveryCoordinator:
                     async for event in self._interrupt_for_resumable_manual_recovery(
                         session=session,
                         registered_agent=registered_agent,
-                        registered_environment=registered_environment,
+                        registered_environment=environment.registered_environment,
                         execution_profile=execution_profile_snapshot.profile,
-                        invocation_context=invocation_context,
+                        invocation_context=environment.invocation_context,
                         payload={
                             **tool_round_identity.payload(),
                             "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
@@ -11595,10 +11506,10 @@ class RecoveryCoordinator:
                     RecoveryInterruptionRequest(
                         session=current_session,
                         registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        environment_name=_environment_name(registered_environment),
+                        registered_environment=environment.registered_environment,
+                        environment_name=_environment_name(environment.registered_environment),
                         execution_profile=execution_profile_snapshot.profile,
-                        invocation_context=invocation_context,
+                        invocation_context=environment.invocation_context,
                     )
                 ):
                     yield event
@@ -11620,10 +11531,10 @@ class RecoveryCoordinator:
                     RecoveryInterruptionRequest(
                         session=session,
                         registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        environment_name=_environment_name(registered_environment),
+                        registered_environment=environment.registered_environment,
+                        environment_name=_environment_name(environment.registered_environment),
                         execution_profile=execution_profile_snapshot.profile,
-                        invocation_context=invocation_context,
+                        invocation_context=environment.invocation_context,
                     )
                 ):
                     yield event
@@ -11634,12 +11545,12 @@ class RecoveryCoordinator:
                     stream=None,
                     session_id=session.id,
                     registered_agent=registered_agent,
-                    registered_environment=registered_environment,
+                    registered_environment=environment.registered_environment,
                     authoritative_failure=authoritative_failure,
                     finalize_abandoned=abandoned,
                     release_run_fence=True,
                     execution_profile=execution_profile_snapshot.profile,
-                    invocation_context=invocation_context,
+                    invocation_context=environment.invocation_context,
                 )
 
         continuation_stream: AsyncGenerator[Event, None] | None = None
@@ -11659,10 +11570,10 @@ class RecoveryCoordinator:
                 closure_request_digest=closure_request_digest,
                 registered_agent=registered_agent,
                 registered_provider=registered_provider,
-                registered_environment=registered_environment,
+                registered_environment=environment.registered_environment,
                 execution_profile_snapshot=execution_profile_snapshot,
                 budget_policy=budget_policy,
-                invocation_context=invocation_context,
+                invocation_context=environment.invocation_context,
                 emit_resume_event=False,
             )
             async for event in continuation_stream:
@@ -11682,12 +11593,12 @@ class RecoveryCoordinator:
                 stream=continuation_stream,
                 session_id=session.id,
                 registered_agent=registered_agent,
-                registered_environment=registered_environment,
+                registered_environment=environment.registered_environment,
                 authoritative_failure=authoritative_failure,
                 finalize_abandoned=abandoned,
                 release_run_fence=True,
                 execution_profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
+                invocation_context=environment.invocation_context,
             )
 
     async def recover_tool_approval(
@@ -11728,6 +11639,14 @@ class RecoveryCoordinator:
         recovery_event_to_reconcile: Event | None = None
         authoritative_failure: BaseException | None = None
         abandoned = False
+        environment = ContinuationEnvironment(
+            lifecycle=self._environment_lifecycle,
+            session=session,
+            agent=registered_agent,
+            profile=execution_profile_snapshot.profile,
+            registered_environment=registered_environment,
+            invocation_context=invocation_context,
+        )
         try:
             if type(request) is ToolApprovalRecoveryRequest:
                 await ToolEffectStateOwner(self._session_store).require_unverified_recovery_allowed(
@@ -11769,34 +11688,10 @@ class RecoveryCoordinator:
                     approval=pending_approval,
                     tool_call_id=request.tool_call_id,
                 )
-            factory_started_event = await self._environment_lifecycle.emit_factory_started(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                execution_profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
-            )
-            if factory_started_event is not None:
-                yield factory_started_event
-            factory_resolution = await self._environment_lifecycle.resolve_factory(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                started_event=factory_started_event,
-                operation=EnvironmentFactoryOperation.RECONNECT,
-                execution_profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
-            )
-            registered_environment = factory_resolution.registered_environment
-            if registered_environment is not None and invocation_context is not None:
-                invocation_context = invocation_context.with_registered_environment(
-                    registered_environment,
-                    validated_profile=execution_profile_snapshot.profile,
-                )
-            environment_name = _environment_name(registered_environment)
-            for event in factory_resolution.events:
-                yield event
-            if factory_resolution.error is not None:
+            async with contextlib.aclosing(environment.reconnect()) as preparation:
+                async for event in preparation:
+                    yield event
+            if environment.error is not None:
                 session = await self._session_store.update_status(
                     session.id,
                     SessionStatus.INTERRUPTED,
@@ -11807,7 +11702,7 @@ class RecoveryCoordinator:
                             type=EventType.SESSION_INTERRUPTED,
                             session_id=session.id,
                             agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
+                            environment_name=environment.name,
                             payload={
                                 **tool_round_identity.payload(),
                                 "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
@@ -11816,7 +11711,7 @@ class RecoveryCoordinator:
                                     redactor=self._secret_redactor,
                                 ),
                                 **_environment_factory_resolution_error_payload(
-                                    factory_resolution.error,
+                                    environment.error,
                                     redactor=self._secret_redactor,
                                 ),
                                 "approval_id": pending_approval.approval_id,
@@ -11825,15 +11720,15 @@ class RecoveryCoordinator:
                         phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
                         session=session,
                         registered_agent=registered_agent,
-                        registered_environment=registered_environment,
+                        registered_environment=environment.registered_environment,
                         execution_profile=execution_profile_snapshot.profile,
-                        invocation_context=invocation_context,
+                        invocation_context=environment.invocation_context,
                     )
                 ):
                     yield event
                 return
             if type(request) is ToolEffectReconciliationRequest:
-                if invocation_context is None:
+                if environment.invocation_context is None:
                     raise RuntimeError(
                         "Approval receipt recovery has no claimed invocation authority."
                     )
@@ -11842,7 +11737,7 @@ class RecoveryCoordinator:
                     request=request,
                     source_run_epoch=loaded_session.run_epoch,
                     session=session,
-                    invocation_context=invocation_context,
+                    invocation_context=environment.invocation_context,
                 )
                 async with contextlib.aclosing(settlement_stream) as owned_settlement:
                     async for item in owned_settlement:
@@ -11861,9 +11756,9 @@ class RecoveryCoordinator:
                         record=settlement.record,
                         session=session,
                         registered_agent=registered_agent,
-                        registered_environment=registered_environment,
+                        registered_environment=environment.registered_environment,
                         execution_profile=execution_profile_snapshot.profile,
-                        invocation_context=invocation_context,
+                        invocation_context=environment.invocation_context,
                     ):
                         yield event
                     return
@@ -11881,7 +11776,7 @@ class RecoveryCoordinator:
                             type=event_type,
                             session_id=session.id,
                             agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
+                            environment_name=environment.name,
                             tool_name=pending_tool_call.tool_name,
                             payload={
                                 **tool_round_identity.payload(),
@@ -11919,7 +11814,7 @@ class RecoveryCoordinator:
                     approval_support.resumed_event(
                         session=session,
                         agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
+                        environment_name=environment.name,
                         approval=pending_approval,
                         decision=ToolApprovalDecision.APPROVE,
                         resolved_by=request.resolved_by,
@@ -11945,12 +11840,12 @@ class RecoveryCoordinator:
                 session=session,
                 tool_event=tool_event,
                 registered_agent=registered_agent,
-                registered_environment=registered_environment,
+                registered_environment=environment.registered_environment,
                 tool_call=tool_call,
                 result=public_recovered_result,
                 task_id=pending_approval.task_id,
                 execution_profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
+                invocation_context=environment.invocation_context,
                 redactor=self._secret_redactor,
                 output_redactor=self._secret_redactor,
                 allow_modification=False,
@@ -12015,9 +11910,9 @@ class RecoveryCoordinator:
                     async for event in self._interrupt_for_resumable_manual_recovery(
                         session=session,
                         registered_agent=registered_agent,
-                        registered_environment=registered_environment,
+                        registered_environment=environment.registered_environment,
                         execution_profile=execution_profile_snapshot.profile,
-                        invocation_context=invocation_context,
+                        invocation_context=environment.invocation_context,
                         payload={
                             **tool_round_identity.payload(),
                             "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
@@ -12062,10 +11957,10 @@ class RecoveryCoordinator:
                     RecoveryInterruptionRequest(
                         session=session,
                         registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        environment_name=_environment_name(registered_environment),
+                        registered_environment=environment.registered_environment,
+                        environment_name=_environment_name(environment.registered_environment),
                         execution_profile=execution_profile_snapshot.profile,
-                        invocation_context=invocation_context,
+                        invocation_context=environment.invocation_context,
                     )
                 ):
                     yield event
@@ -12076,12 +11971,12 @@ class RecoveryCoordinator:
                     stream=None,
                     session_id=session.id,
                     registered_agent=registered_agent,
-                    registered_environment=registered_environment,
+                    registered_environment=environment.registered_environment,
                     authoritative_failure=authoritative_failure,
                     finalize_abandoned=abandoned,
                     release_run_fence=True,
                     execution_profile=execution_profile_snapshot.profile,
-                    invocation_context=invocation_context,
+                    invocation_context=environment.invocation_context,
                 )
 
         continuation_stream: AsyncGenerator[Event, None] | None = None
@@ -12127,10 +12022,10 @@ class RecoveryCoordinator:
                 pending_approval=pending_approval,
                 registered_agent=registered_agent,
                 registered_provider=registered_provider,
-                registered_environment=registered_environment,
+                registered_environment=environment.registered_environment,
                 execution_profile_snapshot=execution_profile_snapshot,
                 budget_policy=budget_policy,
-                invocation_context=invocation_context,
+                invocation_context=environment.invocation_context,
                 deferred_messages=deferred_messages,
                 emit_resume_event=False,
                 enforce_expiry=False,
@@ -12155,12 +12050,12 @@ class RecoveryCoordinator:
                 stream=continuation_stream,
                 session_id=session.id,
                 registered_agent=registered_agent,
-                registered_environment=registered_environment,
+                registered_environment=environment.registered_environment,
                 authoritative_failure=authoritative_failure,
                 finalize_abandoned=abandoned,
                 release_run_fence=True,
                 execution_profile=execution_profile_snapshot.profile,
-                invocation_context=invocation_context,
+                invocation_context=environment.invocation_context,
             )
 
     async def _claim_manual_tool_round_recovery(

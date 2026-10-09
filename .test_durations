@@ -1,4 +1,12 @@
 {
+    "tests/core/test_continuation_environment.py::test_cancelled_environment_operation_keeps_prior_invocation_authority[bind]": 0.001173083990579471,
+    "tests/core/test_continuation_environment.py::test_cancelled_environment_operation_keeps_prior_invocation_authority[reconnect]": 0.0013974170142319053,
+    "tests/core/test_continuation_environment.py::test_environment_authority_is_retained_before_result_publication[False-bind]": 0.0040973750001285225,
+    "tests/core/test_continuation_environment.py::test_environment_authority_is_retained_before_result_publication[False-reconnect]": 0.00157125000259839,
+    "tests/core/test_continuation_environment.py::test_environment_authority_is_retained_before_result_publication[True-bind]": 0.001121626002714038,
+    "tests/core/test_continuation_environment.py::test_environment_authority_is_retained_before_result_publication[True-reconnect]": 0.0012433750089257956,
+    "tests/core/test_continuation_environment.py::test_rebinding_failure_retains_returned_environment_for_cleanup[bind]": 0.0013812919787596911,
+    "tests/core/test_continuation_environment.py::test_rebinding_failure_retains_returned_environment_for_cleanup[reconnect]": 0.004067083034897223,
     "tests/core/test_postgres_base_ownership.py::test_postgres_subclass_import_does_not_load_monolithic_stores[knowledge_embedding_postgres-PostgresEmbeddingKnowledgeStore]": 1.3148016259947326,
     "tests/core/test_postgres_base_ownership.py::test_postgres_subclass_import_does_not_load_monolithic_stores[knowledge_postgres-PostgresKnowledgeStore]": 3.62483404201339,
     "tests/core/test_postgres_base_ownership.py::test_postgres_subclass_import_does_not_load_monolithic_stores[tasks_postgres-PostgresTaskStore]": 0.977598166995449,
