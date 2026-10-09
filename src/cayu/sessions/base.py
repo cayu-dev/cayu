@@ -241,9 +241,13 @@ from cayu.sessions.records import PendingActionKind as PendingActionKind
 from cayu.sessions.records import PendingActionSession as PendingActionSession
 from cayu.sessions.records import RunnerObservedEventIdentity as RunnerObservedEventIdentity
 from cayu.sessions.records import Session as Session
+from cayu.sessions.records import SessionIdentity as SessionIdentity
+from cayu.sessions.records import SessionRuntimeIdentity as SessionRuntimeIdentity
 from cayu.sessions.records import SessionStatus as SessionStatus
 from cayu.sessions.records import TranscriptRecord as TranscriptRecord
 from cayu.sessions.records import copy_session as copy_session
+from cayu.sessions.records import copy_session_identity as copy_session_identity
+from cayu.sessions.records import copy_session_runtime_identity as copy_session_runtime_identity
 from cayu.sessions.records import (
     runtime_build_provenance_from_session_metadata as runtime_build_provenance_from_session_metadata,
 )
@@ -713,8 +717,6 @@ from cayu.runtime._model_target import project_portable_transcript
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot
 from cayu.runtime.build_provenance import (
     RuntimeBuildProvenance,
-    copy_runtime_build_provenance,
-    runtime_build_provenance_identity,
 )
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.public_authority import (
@@ -4168,152 +4170,6 @@ def apply_fork_system_prompt_replacement(
     messages.clear()
     interaction_ids.clear()
     return retained_messages, retained_interaction_ids
-
-
-class SessionRuntimeIdentity(BaseModel):
-    """Exact Cayu runtime identity adopted at an invocation safe boundary."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
-
-    runtime_name: str = "cayu"
-    runtime_version: str | None = None
-    runtime_build_provenance: RuntimeBuildProvenance
-
-    @field_validator("runtime_name")
-    @classmethod
-    def validate_runtime_name(cls, value: str) -> str:
-        return require_clean_nonblank(value, "runtime_name")
-
-    @field_validator("runtime_version")
-    @classmethod
-    def validate_runtime_version(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return require_clean_nonblank(value, "runtime_version")
-
-    @field_validator("runtime_build_provenance", mode="before")
-    @classmethod
-    def validate_runtime_build_provenance(cls, value: object) -> RuntimeBuildProvenance:
-        if isinstance(value, RuntimeBuildProvenance):
-            value = value.model_dump(mode="json")
-        return RuntimeBuildProvenance.model_validate(value)
-
-
-def copy_session_runtime_identity(identity: SessionRuntimeIdentity) -> SessionRuntimeIdentity:
-    if type(identity) is not SessionRuntimeIdentity:
-        raise TypeError("identity must be a SessionRuntimeIdentity.")
-    return SessionRuntimeIdentity.model_validate(identity.model_dump(mode="json"))
-
-
-class SessionIdentity(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    provider_name: str
-    model: str
-    runtime_name: str = "cayu"
-    runtime_version: str | None = None
-    runtime_build_provenance: RuntimeBuildProvenance = Field(
-        default_factory=lambda: RuntimeBuildProvenance.unavailable("caller_unspecified")
-    )
-    execution_profile: ExecutionProfileIdentity | None = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def inherit_profile_build_provenance(cls, value: object) -> object:
-        if not isinstance(value, Mapping) or "runtime_build_provenance" in value:
-            return value
-        mapping = cast("Mapping[str, object]", value)
-        raw_profile = mapping.get("execution_profile")
-        if raw_profile is None:
-            return value
-        profile = ExecutionProfileIdentity.model_validate(raw_profile)
-        copied = dict(mapping)
-        copied["runtime_build_provenance"] = profile.runtime_build_provenance.model_dump(
-            mode="json"
-        )
-        return copied
-
-    @field_validator("provider_name", "model", "runtime_name")
-    @classmethod
-    def validate_nonblank_fields(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("runtime_version")
-    @classmethod
-    def validate_optional_runtime_version(
-        cls,
-        value: str | None,
-        info,
-    ) -> str | None:
-        if value is None:
-            return None
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("runtime_build_provenance", mode="before")
-    @classmethod
-    def validate_runtime_build_provenance(cls, value: object) -> RuntimeBuildProvenance:
-        if isinstance(value, RuntimeBuildProvenance):
-            value = value.model_dump(mode="json")
-        return RuntimeBuildProvenance.model_validate(value)
-
-    @model_validator(mode="after")
-    def validate_profile_build_provenance(self) -> SessionIdentity:
-        if self.execution_profile is not None and (
-            self.execution_profile.runtime_build_provenance
-            != runtime_build_provenance_identity(self.runtime_build_provenance)
-        ):
-            raise ValueError(
-                "Session runtime build provenance conflicts with its execution profile."
-            )
-        return self
-
-    @property
-    def runtime_build_fingerprint(self) -> str | None:
-        return self.runtime_build_provenance.fingerprint
-
-    @property
-    def runtime_source_revision(self) -> str | None:
-        return self.runtime_build_provenance.source_revision
-
-
-def _queued_dispatch_session_instance_fingerprint(session: Session) -> str:
-    """Identify one durable session creation without exposing invocation origin data."""
-
-    if type(session) is not Session:
-        raise TypeError("Queued dispatch session identity requires a Session.")
-    created_at = session.created_at
-    if created_at.tzinfo is None or created_at.utcoffset() is None:
-        raise ValueError("Queued dispatch session creation time must be timezone-aware.")
-    material = {
-        "record_type": "cayu.queued-dispatch-session-instance",
-        "schema_version": 1,
-        "session_id": session.id,
-        "parent_session_id": session.parent_session_id,
-        "causal_budget_id": session.causal_budget_id,
-        "created_at": created_at.astimezone(UTC).isoformat(),
-        "root_invocation_id": session.invocation.root_invocation_id,
-        "root_session_id": session.invocation.root_session_id,
-        "source": session.invocation.source.value,
-    }
-    return sha256(
-        canonical_durable_json_bytes(material, "queued_dispatch.session_instance")
-    ).hexdigest()
-
-
-def _fork_source_session_instance_fingerprint(session: Session) -> str:
-    """Identify one exact fork-source incarnation without exposing its private UUID."""
-
-    if type(session) is not Session:
-        raise TypeError("Fork source session identity requires a Session.")
-    material = {
-        "record_type": "cayu.fork-source-session-instance",
-        "schema_version": 1,
-        "session_id": session.id,
-        "instance_id": session.instance_id,
-    }
-    return sha256(
-        canonical_durable_json_bytes(material, "fork_source.session_instance")
-    ).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -25015,25 +24871,6 @@ def session_fork_profile_relationship(
     if baseline != relationship.selected_profile:
         raise ValueError("Session fork execution-profile metadata conflicts with its baseline.")
     return relationship
-
-
-def copy_session_identity(identity: SessionIdentity) -> SessionIdentity:
-    if type(identity) is not SessionIdentity:
-        raise TypeError("Session creation requires a SessionIdentity.")
-    return SessionIdentity(
-        provider_name=identity.provider_name,
-        model=identity.model,
-        runtime_name=identity.runtime_name,
-        runtime_version=identity.runtime_version,
-        runtime_build_provenance=copy_runtime_build_provenance(identity.runtime_build_provenance),
-        execution_profile=(
-            None
-            if identity.execution_profile is None
-            else ExecutionProfileIdentity.model_validate(
-                identity.execution_profile.model_dump(mode="json")
-            )
-        ),
-    )
 
 
 _PREPARED_WORK_ATTEMPT_CREATION_TOKEN = object()

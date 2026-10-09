@@ -5763,7 +5763,8 @@ def test_postgres_knowledge_schema_migrates_and_coexists_with_session_store(
         import psycopg
 
         from cayu.messages import Message
-        from cayu.sessions.base import RunRequest, SessionIdentity
+        from cayu.sessions.base import RunRequest
+        from cayu.sessions.records import SessionIdentity
         from cayu.storage.knowledge_postgres import PostgresKnowledgeStore
         from cayu.storage.postgres import PostgresSessionStore
 

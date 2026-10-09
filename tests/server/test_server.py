@@ -115,7 +115,6 @@ from cayu.sessions.base import (
     ModelTarget,
     ResumeRequest,
     RunRequest,
-    SessionIdentity,
     run_request_with_runtime_generated_authority,
 )
 from cayu.sessions.checkpoints import CURRENT_CHECKPOINT_SCHEMA_VERSION
@@ -128,7 +127,7 @@ from cayu.sessions.pending_action_contracts import (
     PendingActionQuery,
 )
 from cayu.sessions.queries import SessionListResult
-from cayu.sessions.records import EventRecord, SessionStatus
+from cayu.sessions.records import EventRecord, SessionIdentity, SessionStatus
 from cayu.sessions.recovery import RecoveryExecutionRequest, RecoveryPlan
 from cayu.storage.memory import (
     InMemoryKnowledgeStore,

@@ -26,7 +26,6 @@ from cayu.sessions.base import (
     RuntimePublicationCheckpointOperation,
     RuntimePublicationMutation,
     RuntimePublicationRequest,
-    SessionIdentity,
     SessionStore,
     runtime_publication_checkpoint_value_digest,
 )
@@ -40,7 +39,7 @@ from cayu.sessions.checkpoints import (
     CheckpointCompatibilityError,
 )
 from cayu.sessions.pending_action_contracts import PendingActionQuery
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
 from cayu.tools.exposure import ToolCapabilityCeiling
 from cayu.tools.user_input import UserInputTool

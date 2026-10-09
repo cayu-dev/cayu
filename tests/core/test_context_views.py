@@ -21,7 +21,6 @@ from cayu.sessions.base import (
     Message,
     ResumeRequest,
     RunRequest,
-    SessionIdentity,
     SessionRunFenced,
     SessionStatusConflict,
 )
@@ -44,6 +43,7 @@ from cayu.sessions.context_views import (
     project_context_view_extensions,
 )
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.records import SessionIdentity
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

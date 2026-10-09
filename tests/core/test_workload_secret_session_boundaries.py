@@ -42,13 +42,12 @@ from cayu.sessions.base import (
     ModelTarget,
     ResumeRequest,
     RunRequest,
-    SessionIdentity,
     fork_session_invocation,
     run_request_with_runtime_generated_authority,
 )
 from cayu.sessions.invocation import InvocationOriginClaim
 from cayu.sessions.queries import SessionQuery
-from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.records import Session, SessionIdentity, SessionStatus
 from cayu.storage import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling

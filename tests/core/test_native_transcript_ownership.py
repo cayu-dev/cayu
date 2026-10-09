@@ -13,7 +13,8 @@ from uuid import uuid4
 
 import cayu
 from cayu.messages import Message, MessageRole
-from cayu.sessions.base import RunRequest, SessionIdentity
+from cayu.sessions.base import RunRequest
+from cayu.sessions.records import SessionIdentity
 from cayu.sessions.transcript_queries import TranscriptQuery, TranscriptSearchQuery
 
 

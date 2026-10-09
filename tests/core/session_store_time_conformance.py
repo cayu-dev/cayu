@@ -12,14 +12,13 @@ from cayu.events import Event
 from cayu.messages import Message
 from cayu.sessions.base import (
     RunRequest,
-    SessionIdentity,
     SessionOperationPublication,
     SessionRunFenced,
     SessionStore,
 )
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.queries import SessionQuery
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import SessionIdentity, SessionStatus
 
 
 async def assert_session_store_time_conformance(

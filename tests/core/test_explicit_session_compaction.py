@@ -71,7 +71,6 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     ResumeRequest,
     RunRequest,
-    SessionIdentity,
     SessionRunFenced,
 )
 from cayu.sessions.checkpoints import (
@@ -79,7 +78,7 @@ from cayu.sessions.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
 from cayu.sessions.event_queries import EventQuery
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling

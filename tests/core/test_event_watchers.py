@@ -24,9 +24,9 @@ from cayu.observability.watchers import (
     event_query_after_cursor,
 )
 from cayu.runtime._event_projection import REDACTED_CUSTOM_EVENT_TYPE, public_event_id
-from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity, SessionStore
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionStore
 from cayu.sessions.event_queries import EventQuery
-from cayu.sessions.records import EventRecord
+from cayu.sessions.records import EventRecord, SessionIdentity
 from cayu.storage.event_watchers import SQLiteEventWatcherStore
 from cayu.storage.migrations import SchemaMode
 from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor

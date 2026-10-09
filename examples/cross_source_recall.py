@@ -25,7 +25,8 @@ from cayu import (
 )
 from cayu.memory.base import AutomaticRecallContributor, AutomaticRecallPolicy
 from cayu.messages import Message, MessageRole
-from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.records import SessionIdentity
 
 
 async def main() -> None:

@@ -67,12 +67,11 @@ from cayu.sessions.base import (
     InteractionTransitionSpec,
     ResumeRequest,
     RunRequest,
-    SessionIdentity,
     SessionInvocationAdmission,
     SessionRunFenced,
 )
 from cayu.sessions.event_queries import EventQuery
-from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.records import Session, SessionIdentity, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec

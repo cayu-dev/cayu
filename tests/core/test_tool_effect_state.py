@@ -24,8 +24,8 @@ from cayu.sessions.base import (
     RunRequest,
     RuntimePublicationCheckpointOperation,
     RuntimePublicationMutation,
-    SessionIdentity,
 )
+from cayu.sessions.records import SessionIdentity
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

@@ -29,12 +29,13 @@ from cayu.environments.snapshots import (
     ExecutionSnapshotPolicy,
 )
 from cayu.runtime._runtime_records import RegisteredEnvironment
-from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity, SessionStatus
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionStatus
 from cayu.sessions.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     decode_runtime_checkpoint,
     runtime_checkpoint_writer_view,
 )
+from cayu.sessions.records import SessionIdentity
 
 
 class FakeAdapter(ExecutionSnapshotAdapter):

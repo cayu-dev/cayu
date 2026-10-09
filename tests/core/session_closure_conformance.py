@@ -13,7 +13,6 @@ from cayu.runtime.session_closure import SessionClosureRecord
 from cayu.sessions.base import (
     RunRequest,
     RuntimePublicationRequest,
-    SessionIdentity,
     SessionOperationPublication,
     _checkpoint_with_session_run_operation,
     runtime_publication_checkpoint_mutation,
@@ -23,7 +22,7 @@ from cayu.sessions.messaging import (
     SessionMessageActionRequest,
     SessionMessageQuery,
 )
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import SessionIdentity, SessionStatus
 
 
 async def create_closure_session(store, session_id, parent=None):

@@ -13,14 +13,13 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     ModelTarget,
     RunRequest,
-    SessionIdentity,
     SessionModelTransition,
     SessionStatusConflict,
     SessionStore,
     session_input_messages_sha256,
 )
 from cayu.sessions.event_queries import EventQuery
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import SessionIdentity, SessionStatus
 
 
 async def _close_store(store: SessionStore) -> None:

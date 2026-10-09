@@ -84,9 +84,9 @@ from cayu.server import (
     create_server,
 )
 from cayu.server.static import dashboard_content_security_policy
-from cayu.sessions.base import InMemorySessionStore, SessionIdentity
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQuery
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import SessionIdentity, SessionStatus
 
 if TYPE_CHECKING:
     from starlette.types import ASGIApp, Receive, Scope, Send

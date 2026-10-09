@@ -268,7 +268,8 @@ def test_decision_revision_expiry_outage_and_family_separation(tmp_path):
     from datetime import UTC, datetime, timedelta
 
     from cayu.resource_access import ResourceAccessDecision, ResourceAccessGrant
-    from cayu.sessions.base import RunRequest, SessionIdentity
+    from cayu.sessions.base import RunRequest
+    from cayu.sessions.records import SessionIdentity
 
     async def run():
         store = SQLiteSessionStore(tmp_path / "decisions.db")
@@ -303,7 +304,10 @@ def test_decision_revision_expiry_outage_and_family_separation(tmp_path):
 def test_stream_revocation_stops_producer_and_recovery_allows_only_settlement():
     from cayu._resource_access_binding import ResourceExecutionBinding
     from cayu.resource_access import encode_scope, guard_stream, recovery_access, require_dispatch
-    from cayu.sessions.base import InMemorySessionStore, SessionIdentity
+    from cayu.sessions.base import (
+        InMemorySessionStore,
+    )
+    from cayu.sessions.records import SessionIdentity
 
     async def run():
         policy = Policy()

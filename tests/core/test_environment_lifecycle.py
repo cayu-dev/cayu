@@ -57,14 +57,8 @@ from cayu.runtime._environment_lifecycle import (
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._invocation_lifecycle import InvocationContext
-from cayu.sessions.base import (
-    CheckpointTransform,
-    InMemorySessionStore,
-    ResumeRequest,
-    RunRequest,
-    SessionIdentity,
-)
-from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.base import CheckpointTransform, InMemorySessionStore, ResumeRequest, RunRequest
+from cayu.sessions.records import Session, SessionIdentity, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
 from cayu.workspaces.base import Workspace
 from cayu.workspaces.local import LocalWorkspace

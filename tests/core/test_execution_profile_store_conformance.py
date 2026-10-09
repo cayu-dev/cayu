@@ -37,14 +37,13 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     InteractionTransitionSpec,
     RunRequest,
-    SessionIdentity,
     SessionInvocationAdmission,
     SessionRunFenced,
     SessionStatusConflict,
     SessionStore,
     run_request_with_runtime_session_instance_authority,
 )
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.tools.exposure import ToolCapabilityCeiling
 
 

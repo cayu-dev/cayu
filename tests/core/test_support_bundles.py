@@ -31,13 +31,14 @@ from cayu.events import Event, EventType
 from cayu.mcp.base import McpServerSpec
 from cayu.runtime.checks import check_manifest
 from cayu.runtime.mcp_manifest_policy import McpManifestPolicy
-from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.base import InMemorySessionStore, RunRequest
 from cayu.sessions.cleanup import (
     RecoveryCleanupDeadlineScope,
     RecoveryCleanupPolicy,
     RecoveryCleanupRetainedTaskSnapshot,
     RecoveryCleanupSupervisorSnapshot,
 )
+from cayu.sessions.records import SessionIdentity
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.support_bundles import (
     ArtifactAvailabilityEvidence,

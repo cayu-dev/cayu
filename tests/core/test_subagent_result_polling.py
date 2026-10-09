@@ -8,8 +8,8 @@ from types import SimpleNamespace
 
 from cayu.events import Event, EventType
 from cayu.messages import Message
-from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.tools.base import ToolContext
 from cayu.tools.subagents import (
     SUBAGENT_RESULT_POLL_MAX_INTERVAL_S,

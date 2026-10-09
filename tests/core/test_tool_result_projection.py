@@ -57,9 +57,8 @@ from cayu.sessions.base import (
     RunRequest,
     RuntimePublicationRequest,
     RuntimePublicationResult,
-    SessionIdentity,
 )
-from cayu.sessions.records import EventRecord, SessionStatus
+from cayu.sessions.records import EventRecord, SessionIdentity, SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.files import ReadFileTool

@@ -20,8 +20,8 @@ from cayu import (
     ToolEffect,
 )
 from cayu.sessions import _process_liveness as processes
-from cayu.sessions.base import SessionIdentity
 from cayu.sessions.execution import _ExecutionOwner
+from cayu.sessions.records import SessionIdentity
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "postgres"])

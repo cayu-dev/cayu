@@ -17,7 +17,8 @@ from cayu.context.base import (
     copy_context_compaction_telemetry,
 )
 from cayu.events import EventType
-from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.records import SessionIdentity
 
 
 class GrowingSummary(ContextCompactor):

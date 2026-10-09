@@ -12,9 +12,9 @@ from cayu.runtime._session_control import (
     SessionControl,
     SessionInterruptedByRequest,
 )
-from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.base import InMemorySessionStore, RunRequest
 from cayu.sessions.event_queries import EventOrder, EventQuery
-from cayu.sessions.records import EventRecord, SessionStatus
+from cayu.sessions.records import EventRecord, SessionIdentity, SessionStatus
 
 
 class _CountingSessionStore(InMemorySessionStore):

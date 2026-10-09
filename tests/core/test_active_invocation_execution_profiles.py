@@ -102,7 +102,6 @@ from cayu.sessions.base import (
     ModelTarget,
     ResumeRequest,
     RunRequest,
-    SessionIdentity,
     SessionRunFenced,
     SessionStatusConflict,
     SessionStore,
@@ -117,7 +116,7 @@ from cayu.sessions.checkpoints import (
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 from cayu.sessions.queries import SessionQuery
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.recovery import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,

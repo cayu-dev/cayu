@@ -23,7 +23,8 @@ from cayu import (
     session_invocation_from_task,
     task_create_with_execution_source,
 )
-from cayu.sessions.base import SessionIdentity, run_request_with_task_invocation
+from cayu.sessions.base import run_request_with_task_invocation
+from cayu.sessions.records import SessionIdentity
 from cayu.storage import migrations
 from cayu.vaults import SecretRedactor
 

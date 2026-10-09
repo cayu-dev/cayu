@@ -15,7 +15,8 @@ from cayu.runtime.session_closure import (
     SessionClosurePolicy,
     SessionClosureRecord,
 )
-from cayu.sessions.base import SessionIdentity, fork_session_invocation
+from cayu.sessions.base import fork_session_invocation
+from cayu.sessions.records import SessionIdentity
 
 
 class RecordingDependent:

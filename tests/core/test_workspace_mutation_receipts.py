@@ -82,11 +82,10 @@ from cayu.sessions.base import (
     RunRequest,
     RuntimePublicationRequest,
     RuntimePublicationResult,
-    SessionIdentity,
     runtime_publication_request_digest,
 )
 from cayu.sessions.event_queries import EventQuery
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.commands import ExecCommandTool

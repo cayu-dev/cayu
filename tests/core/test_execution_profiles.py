@@ -149,12 +149,11 @@ from cayu.sessions.base import (
     ModelTarget,
     ResumeRequest,
     RunRequest,
-    SessionIdentity,
     _runtime_resume_transport_metadata,
     _with_runtime_resume_transport_metadata,
     execution_profile_adoption_request_fingerprint,
 )
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tasks.dispatch import DispatchRequest

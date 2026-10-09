@@ -84,7 +84,6 @@ from cayu.sessions.base import (
     RunRequest,
     RuntimePublicationCheckpointOperation,
     RuntimePublicationMutation,
-    SessionIdentity,
     SessionInvocationAdmission,
     SessionRunFenced,
     SessionStore,
@@ -99,7 +98,7 @@ from cayu.sessions.checkpoints import (
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     CheckpointCompatibilityError,
 )
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.exposure import TOOL_CAPABILITY_CEILING_METADATA_KEY, ToolCapabilityCeiling

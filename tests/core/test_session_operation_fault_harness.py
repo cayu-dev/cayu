@@ -33,10 +33,10 @@ from cayu.events import Event, EventType
 from cayu.sessions.base import (
     InMemorySessionStore,
     RunRequest,
-    SessionIdentity,
     SessionOperationPublication,
     SessionStore,
 )
+from cayu.sessions.records import SessionIdentity
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

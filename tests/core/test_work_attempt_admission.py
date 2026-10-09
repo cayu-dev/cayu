@@ -66,7 +66,6 @@ from cayu.sessions.base import (
     InteractionTransitionSpec,
     ResumeRequest,
     RunRequest,
-    SessionIdentity,
     SessionStore,
 )
 from cayu.sessions.checkpoints import (
@@ -75,7 +74,7 @@ from cayu.sessions.checkpoints import (
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
 from cayu.sessions.event_queries import EventQuery
-from cayu.sessions.records import EventRecord, Session, SessionStatus
+from cayu.sessions.records import EventRecord, Session, SessionIdentity, SessionStatus
 from cayu.sessions.transcript_input import DeferredInteractionInput
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage.migrations import SchemaMode

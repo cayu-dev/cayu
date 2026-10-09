@@ -14,7 +14,8 @@ from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime._child_session_identity import ChildSessionKind, generate_child_session_id
-from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.records import SessionIdentity
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.tools.subagents import (

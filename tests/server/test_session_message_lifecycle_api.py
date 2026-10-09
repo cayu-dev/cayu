@@ -26,7 +26,7 @@ from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.server import AuthContext, ServerConfig, create_server
-from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.base import InMemorySessionStore, RunRequest
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.messaging import (
     EnqueueSessionMessageRequest,
@@ -40,7 +40,7 @@ from cayu.sessions.messaging import (
     SessionMessageQuery,
     SessionMessageTarget,
 )
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.vaults.redaction import SecretRedactor
 

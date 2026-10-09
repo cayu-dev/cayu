@@ -72,12 +72,8 @@ from cayu.providers import (
     completed_bedrock_billing_identity,
 )
 from cayu.runtime.stop_policy import StopDecision, StopLimit, first_reached_limit
-from cayu.sessions.base import (
-    BudgetReservationIdentityConflict,
-    InMemorySessionStore,
-    RunRequest,
-    SessionIdentity,
-)
+from cayu.sessions.base import BudgetReservationIdentityConflict, InMemorySessionStore, RunRequest
+from cayu.sessions.records import SessionIdentity
 from cayu.storage import SQLiteBudgetLedger, SQLiteSessionStore
 from cayu.storage import migrations as schema_migrations
 from cayu.vaults import REDACTED_SECRET, SecretRedactor

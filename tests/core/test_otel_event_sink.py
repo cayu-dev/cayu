@@ -42,7 +42,8 @@ from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent, UsageD
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._event_projection import public_event_id
 from cayu.runtime._event_writer import RuntimeEventWriter, _emit_event_sink
-from cayu.sessions.base import InMemorySessionStore, SessionIdentity
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.records import SessionIdentity
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 REMOTE_TRACE_ID = "11111111111111111111111111111111"

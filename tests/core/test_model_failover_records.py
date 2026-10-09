@@ -21,7 +21,6 @@ from cayu.sessions.base import (
     RunRequest,
     RuntimePublicationCheckpointOperation,
     RuntimePublicationMutation,
-    SessionIdentity,
     apply_runtime_publication_checkpoint_mutation,
 )
 from cayu.sessions.checkpoints import (
@@ -30,6 +29,7 @@ from cayu.sessions.checkpoints import (
     decode_runtime_checkpoint,
     runtime_checkpoint_writer_view,
 )
+from cayu.sessions.records import SessionIdentity
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

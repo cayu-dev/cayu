@@ -257,7 +257,7 @@ def test_publication_uses_one_historical_boundary(
                     result = await original_capture(session_id)
                     await sessions.delete_session(session_id)
                     if scenario == "replaced_source":
-                        from cayu.sessions.base import SessionIdentity
+                        from cayu.sessions.records import SessionIdentity
 
                         replacement = await sessions.create(
                             RunRequest(agent_name="reviewer", session_id=session_id, messages=[]),

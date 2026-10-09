@@ -48,8 +48,9 @@ from cayu.memory.retrieval import (
     WeightedReciprocalRankFusionConfig,
 )
 from cayu.messages import Message, MessageRole
-from cayu.sessions.base import RunRequest, SessionIdentity, SessionStore
+from cayu.sessions.base import RunRequest, SessionStore
 from cayu.sessions.queries import SessionQuery
+from cayu.sessions.records import SessionIdentity
 from cayu.sessions.transcript_queries import (
     TRANSCRIPT_SEARCH_MAX_BYTES,
     TRANSCRIPT_SEARCH_MAX_SCAN_LIMIT,

@@ -175,7 +175,8 @@ def test_environment_checkpoint_replacement_preserves_pending_completion_evidenc
 
     from tests.core.test_environment_lifecycle import _lifecycle
 
-    from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+    from cayu.sessions.base import InMemorySessionStore, RunRequest
+    from cayu.sessions.records import SessionIdentity
 
     async def scenario():
         store = InMemorySessionStore()

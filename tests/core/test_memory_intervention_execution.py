@@ -120,7 +120,6 @@ from cayu.sessions.base import (
     InterruptSessionRequest,
     RunRequest,
     RuntimeSessionCreateClaimReference,
-    SessionIdentity,
     SessionStore,
     run_request_with_runtime_invocation,
 )
@@ -129,7 +128,7 @@ from cayu.sessions.invocation import (
     InvocationOriginTrust,
     SessionExecutionSource,
 )
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.terminal_evidence import (
     TerminalSessionEvidence,
     TerminalSessionEvidenceError,

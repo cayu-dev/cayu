@@ -12,7 +12,6 @@ from cayu._validation import copy_durable_json_object, copy_label_map
 from cayu.events import Event
 from cayu.sessions.base import (
     RunRequest,
-    SessionIdentity,
     restore_persisted_event_authority,
     session_instance_id_for_run_request,
     session_invocation_for_run_request,
@@ -25,6 +24,7 @@ from cayu.sessions.records import (
     EventRecord,
     PendingActionSession,
     Session,
+    SessionIdentity,
     SessionStatus,
     runtime_build_provenance_from_session_metadata,
 )

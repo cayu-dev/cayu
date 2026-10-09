@@ -19,14 +19,10 @@ import pytest
 
 from cayu.events import Event, EventType
 from cayu.messages import Message
-from cayu.sessions.base import (
-    MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
-    RunRequest,
-    SessionIdentity,
-)
+from cayu.sessions.base import MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY, RunRequest
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.execution import _ExecutionOwner
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.storage.retention import (
     RetentionAuditState,
     RetentionDisposition,

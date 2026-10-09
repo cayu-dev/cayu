@@ -73,7 +73,6 @@ from cayu.sessions.base import (
     QueuedDispatchTerminalReceipt,
     ResumeRequest,
     RunRequest,
-    SessionIdentity,
     SessionModelTransition,
     SessionRunFenced,
     SessionStatusConflict,
@@ -93,7 +92,7 @@ from cayu.sessions.invocation import (
     SessionInvocationBinding,
     TaskExecutionSource,
 )
-from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.records import Session, SessionIdentity, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction
 from cayu.sessions.transcript_queries import fork_source_transcript_sha256
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore

@@ -10,8 +10,8 @@ import pytest
 from cayu.applications import CayuApp
 from cayu.events import Event, EventType
 from cayu.messages import Message
-from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.records import SessionIdentity, SessionStatus
 
 
 class _ClosableSessionStore(InMemorySessionStore):

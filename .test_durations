@@ -45950,5 +45950,14 @@
     "tests/artifacts/test_artifact_retention_concurrency.py::test_postgres_late_reference_and_publication_fence": 2.856231208948884,
     "tests/artifacts/test_artifact_retention_concurrency.py::test_unknown_reference_source_fails_closed": 0.1827301669982262,
     "tests/core/test_session_retention.py::test_postgres_session_retention_conformance[assert_same_size_eval_reference_update_protects]": 3.707326334028039,
-    "tests/core/test_session_retention.py::test_sqlite_session_retention_conformance[assert_same_size_eval_reference_update_protects]": 0.20702020899625495
+    "tests/core/test_session_retention.py::test_sqlite_session_retention_conformance[assert_same_size_eval_reference_update_protects]": 0.20702020899625495,
+    "tests/core/test_session_identity_package_layout.py::test_identity_historical_imports_and_pickle_globals[SessionIdentity]": 0.6109549169777893,
+    "tests/core/test_session_identity_package_layout.py::test_identity_historical_imports_and_pickle_globals[SessionRuntimeIdentity]": 0.00020895805209875107,
+    "tests/core/test_session_identity_package_layout.py::test_identity_historical_imports_and_pickle_globals[copy_session_identity]": 0.00015466701006516814,
+    "tests/core/test_session_identity_package_layout.py::test_identity_historical_imports_and_pickle_globals[copy_session_runtime_identity]": 0.0001528340217191726,
+    "tests/core/test_session_identity_package_layout.py::test_session_identity_copy_and_validation_without_implementations[cayu.runtime]": 0.18415916699450463,
+    "tests/core/test_session_identity_package_layout.py::test_session_identity_copy_and_validation_without_implementations[cayu.sessions.records]": 0.1819477080134675,
+    "tests/core/test_session_identity_package_layout.py::test_session_identity_copy_and_validation_without_implementations[cayu.sessions]": 0.1902448339969851,
+    "tests/core/test_session_identity_package_layout.py::test_session_identity_copy_and_validation_without_implementations[cayu]": 0.18947395798750222,
+    "tests/core/test_session_identity_package_layout.py::test_session_instance_fingerprints_without_implementations": 0.17625683199730702
 }

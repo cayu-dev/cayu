@@ -29,10 +29,10 @@ from cayu.sessions.base import (
     MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX,
     RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX,
     RunRequest,
-    SessionIdentity,
     SessionOperationPublication,
     SessionStore,
 )
+from cayu.sessions.records import SessionIdentity
 from cayu.tools.base import DurableToolOperationConflict
 
 

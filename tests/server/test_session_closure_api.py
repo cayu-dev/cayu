@@ -7,7 +7,8 @@ from fastapi.testclient import TestClient
 from cayu import CayuApp, RunRequest
 from cayu.runtime.session_closure import SessionClosureDisposition, SessionClosureRecord
 from cayu.server import ServerConfig, create_server
-from cayu.sessions.base import InMemorySessionStore, SessionIdentity
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.records import SessionIdentity
 
 
 def test_http_delete_retries_dependent_failure_before_native_deletion():

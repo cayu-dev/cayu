@@ -23,14 +23,8 @@ from cayu.failure_evidence import FailureEvidence
 from cayu.messages import Message
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime._invocation_lifecycle import SettleInvocationCommand
-from cayu.sessions.base import (
-    InMemorySessionStore,
-    ResumeRequest,
-    RunRequest,
-    SessionIdentity,
-    SessionRunFenced,
-)
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest, SessionRunFenced
+from cayu.sessions.records import SessionIdentity, SessionStatus
 
 
 class FakeProvider(ModelProvider):

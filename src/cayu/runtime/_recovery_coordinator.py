@@ -457,7 +457,6 @@ from cayu.sessions.base import (
     _incomplete_recovery_claim_from_checkpoint,
     _initial_transcript_pending_interaction_id,
     _model_completion_stage_promotion_statuses,
-    _queued_dispatch_session_instance_fingerprint,
     copy_interaction_transition_spec,
     runtime_publication_checkpoint_value_digest,
 )
@@ -484,7 +483,12 @@ from cayu.sessions.invocation import (
     inherited_session_invocation,
 )
 from cayu.sessions.queries import MAX_SESSION_LIST_CURSOR_BYTES, SessionOrder, SessionQuery
-from cayu.sessions.records import EventRecord, Session, SessionStatus
+from cayu.sessions.records import (
+    EventRecord,
+    Session,
+    SessionStatus,
+    _queued_dispatch_session_instance_fingerprint,
+)
 from cayu.sessions.recovery import (
     MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES,
     IncompleteSessionRecoveryAction,

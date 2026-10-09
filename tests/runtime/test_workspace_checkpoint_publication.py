@@ -114,7 +114,7 @@ def _registered_checkpoint_environment(tmp_path, generation="first"):
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
 def test_unknown_mutation_blocks_fresh_environment_and_cas_rejects_stale_epoch(tmp_path, backend):
-    from cayu.sessions.base import SessionIdentity
+    from cayu.sessions.records import SessionIdentity
     from cayu.storage.sqlite import SQLiteSessionStore
     from cayu.workspaces.checkpoint_lifecycle import (
         begin_workspace_checkpoint_mutation,
@@ -155,7 +155,7 @@ def test_unknown_mutation_blocks_fresh_environment_and_cas_rejects_stale_epoch(t
 
 
 def test_live_drift_is_not_silently_rolled_back_and_fresh_restore_is_verified(tmp_path):
-    from cayu.sessions.base import SessionIdentity
+    from cayu.sessions.records import SessionIdentity
     from cayu.workspaces.checkpoint_lifecycle import ensure_workspace_checkpoint
     from cayu.workspaces.checkpoints import WorkspaceCheckpointError
 
@@ -182,7 +182,7 @@ def test_live_drift_is_not_silently_rolled_back_and_fresh_restore_is_verified(tm
 
 
 def test_checkpoint_timeout_retains_environment_until_write_settles(tmp_path):
-    from cayu.sessions.base import SessionIdentity
+    from cayu.sessions.records import SessionIdentity
     from cayu.workspaces.checkpoint_lifecycle import ensure_workspace_checkpoint
     from cayu.workspaces.checkpoints import WorkspaceCheckpointError
 
@@ -241,7 +241,7 @@ def test_checkpoint_authority_is_not_imported_from_old_schema_or_generic_writes(
 def test_postgres_checkpoint_publication_recovers_and_rejects_stale_owner(tmp_path, postgres_dsn):
     from uuid import uuid4
 
-    from cayu.sessions.base import SessionIdentity
+    from cayu.sessions.records import SessionIdentity
     from cayu.storage.migrations import SchemaMode
     from cayu.storage.postgres import PostgresSessionStore
     from cayu.workspaces.checkpoint_lifecycle import (
@@ -287,7 +287,7 @@ def test_postgres_checkpoint_publication_recovers_and_rejects_stale_owner(tmp_pa
 
 
 def test_reacquired_exclusive_lease_can_mutate_the_verified_revision(tmp_path):
-    from cayu.sessions.base import SessionIdentity
+    from cayu.sessions.records import SessionIdentity
     from cayu.workspaces.checkpoint_lifecycle import (
         begin_workspace_checkpoint_mutation,
         complete_workspace_checkpoint_mutation,
@@ -327,7 +327,7 @@ def test_reacquired_exclusive_lease_can_mutate_the_verified_revision(tmp_path):
 
 
 def test_durable_directory_replacement_recovers_into_seeded_binding(tmp_path):
-    from cayu.sessions.base import SessionIdentity
+    from cayu.sessions.records import SessionIdentity
     from cayu.workspaces.checkpoint_lifecycle import (
         begin_workspace_checkpoint_mutation,
         complete_workspace_checkpoint_mutation,

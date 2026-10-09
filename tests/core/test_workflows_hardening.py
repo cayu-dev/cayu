@@ -66,11 +66,10 @@ from cayu.sessions.base import (
     ModelCompletionStageDisposition,
     ModelTarget,
     RunRequest,
-    SessionIdentity,
 )
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.invocation import InvocationOriginTrust, SessionExecutionSource
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionsRecoveryRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec

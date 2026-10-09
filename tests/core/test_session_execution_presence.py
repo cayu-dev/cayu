@@ -37,7 +37,8 @@ from cayu import (
     UserInputTool,
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import SessionIdentity, _activate_session_run_fence
+from cayu.sessions.base import _activate_session_run_fence
+from cayu.sessions.records import SessionIdentity
 from cayu.storage.migrations import SchemaMode
 from cayu.tasks.worker import run_task_worker
 

@@ -61,7 +61,6 @@ from cayu.sessions.base import (
     ModelCompletionStageDisposition,
     ResumeRequest,
     RunRequest,
-    SessionIdentity,
     SessionMessageQueueStatus,
     SessionRunFenced,
     SessionStore,
@@ -71,7 +70,7 @@ from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.invocation import TaskExecutionSource
 from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageDeliveryMode
 from cayu.sessions.pending_action_contracts import PendingActionQuery
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.recovery import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,

@@ -39,12 +39,15 @@ from cayu.sessions.base import (
     SessionRunFenced,
     SessionStore,
     _checkpoint_after_queued_dispatch_acknowledgement,
-    _queued_dispatch_session_instance_fingerprint,
     _queued_dispatch_terminal_receipts_from_checkpoint,
     session_fork_profile_relationship,
 )
 from cayu.sessions.event_queries import EventQuery
-from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.records import (
+    Session,
+    SessionStatus,
+    _queued_dispatch_session_instance_fingerprint,
+)
 from cayu.tasks.contracts import TaskCompletionDecisionRequired
 from cayu.tasks.dispatch import (
     DispatchRequest,

@@ -261,7 +261,6 @@ from cayu.sessions.base import (
     RuntimePublicationMutation,
     RuntimePublicationOperationRecordMutation,
     RuntimePublicationRequest,
-    SessionIdentity,
     SessionModelCompletionStageConflict,
     SessionModelCompletionStageIncomplete,
     SessionOperationPublication,
@@ -309,7 +308,7 @@ from cayu.sessions.messaging import (
     SessionQueuedMessagesPending,
 )
 from cayu.sessions.queries import SessionOrder, SessionQuery
-from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.records import Session, SessionIdentity, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
 from cayu.sessions.terminal_evidence import (
     TerminalSessionEvidenceError,

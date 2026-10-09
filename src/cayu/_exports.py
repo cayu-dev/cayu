@@ -4954,7 +4954,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "SessionExportTooLarge": ("cayu.sessions.exports", "SessionExportTooLarge"),
     "SessionFailed": ("cayu.evals.assertions", "SessionFailed"),
     "SessionForkProfileRelationship": ("cayu.sessions.base", "SessionForkProfileRelationship"),
-    "SessionIdentity": ("cayu.sessions.base", "SessionIdentity"),
+    "SessionIdentity": ("cayu.sessions.records", "SessionIdentity"),
     "SessionInspectionIdentity": ("cayu.sessions.inspection", "SessionInspectionIdentity"),
     "SessionInspectionSummary": ("cayu.sessions.inspection", "SessionInspectionSummary"),
     "SessionInspectionUsageSummary": ("cayu.sessions.inspection", "SessionInspectionUsageSummary"),

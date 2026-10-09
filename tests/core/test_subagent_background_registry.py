@@ -9,7 +9,8 @@ import pytest
 
 from cayu.events import Event, EventType
 from cayu.messages import Message
-from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.records import SessionIdentity
 from cayu.tools.base import ToolContext
 from cayu.tools.subagents import (
     BACKGROUND_SUBAGENT_FAILURE_ARTIFACT_TYPE,

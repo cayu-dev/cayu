@@ -19,7 +19,6 @@ from cayu.sessions.base import (
     RuntimeSessionCreateClaimReference,
     RuntimeSessionCreateClaimReferenceKey,
     SessionExecutionSource,
-    SessionIdentity,
     authenticate_runtime_session_create_claim_reference,
     bind_runtime_session_create_claim,
     copy_run_request,
@@ -28,7 +27,7 @@ from cayu.sessions.base import (
     run_request_with_runtime_session_create_claim_reference,
     runtime_session_create_claim_reference,
 )
-from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.records import Session, SessionIdentity, SessionStatus
 from cayu.sessions.transcript_input import DeferredInteractionInput
 from cayu.vaults import SecretRedactor
 

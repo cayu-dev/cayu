@@ -13,7 +13,8 @@ from cayu.context.base import CheckpointCompactionContextPolicy, CompactionReque
 from cayu.messages import Message
 from cayu.providers.base import ModelCompletion, ModelProvider, ModelProviderError, ModelStreamEvent
 from cayu.providers.retry_policy import RetryPolicy
-from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest, SessionIdentity
+from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest
+from cayu.sessions.records import SessionIdentity
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

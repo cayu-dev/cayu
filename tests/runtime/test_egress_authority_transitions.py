@@ -57,7 +57,8 @@ from cayu.runtime.execution_profiles import (
     execution_profile_egress_authority_change,
     execution_profile_with_egress_authority,
 )
-from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.base import InMemorySessionStore, RunRequest
+from cayu.sessions.records import SessionIdentity
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.vaults import SecretRedactor, SecretRef, StaticVault
 

@@ -17,7 +17,7 @@ from cayu import (
     SQLiteTaskStore,
 )
 from cayu.cli import main
-from cayu.sessions.base import SessionIdentity
+from cayu.sessions.records import SessionIdentity
 from cayu.storage._diagnostic_inspection import diagnostic_store_inspection
 from cayu.support_bundles import (
     SupportBundleOutcome,

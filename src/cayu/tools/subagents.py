@@ -1881,7 +1881,7 @@ async def _validated_durable_subagent_session_authority(
     idempotency_key: str,
 ) -> tuple[DurableSubagentSubmissionIntent, Session] | None:
     try:
-        from cayu.sessions.base import _queued_dispatch_session_instance_fingerprint
+        from cayu.sessions.records import _queued_dispatch_session_instance_fingerprint
 
         parent = await session_store.load(child.parent_session_id or "")
         if parent is None:
@@ -1980,7 +1980,7 @@ def _task_matches_durable_subagent_child(
     if type(envelope) is not dict:
         return False
     try:
-        from cayu.sessions.base import _queued_dispatch_session_instance_fingerprint
+        from cayu.sessions.records import _queued_dispatch_session_instance_fingerprint
         from cayu.tasks.dispatch import (
             _new_prepared_subagent_dispatch_envelope,
             _QueuedDispatchEnvelope,

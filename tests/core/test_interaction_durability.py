@@ -43,7 +43,6 @@ from cayu.sessions.base import (
     InterruptSessionRequest,
     ResumeRequest,
     RunRequest,
-    SessionIdentity,
     SessionRunFenced,
     SessionStatusConflict,
 )
@@ -54,7 +53,7 @@ from cayu.sessions.interactions import (
     InteractionSummaryEvidence,
 )
 from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageDeliveryMode
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.recovery import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,

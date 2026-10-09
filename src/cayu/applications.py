@@ -581,7 +581,6 @@ from cayu.sessions.base import (
     SessionRunFenced,
     SessionStatusConflict,
     SessionStore,
-    _fork_source_session_instance_fingerprint,
     copy_fork_session_request,
     copy_interrupt_session_request,
     copy_model_completion_manual_recovery_request,
@@ -643,7 +642,13 @@ from cayu.sessions.messaging import (
 )
 from cayu.sessions.pending_action_contracts import PendingActionQuery, PendingActionResultTooLarge
 from cayu.sessions.queries import SessionQuery
-from cayu.sessions.records import EventRecord, Session, SessionStatus, copy_session
+from cayu.sessions.records import (
+    EventRecord,
+    Session,
+    SessionStatus,
+    _fork_source_session_instance_fingerprint,
+    copy_session,
+)
 from cayu.sessions.recovery import (
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,

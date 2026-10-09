@@ -48,7 +48,6 @@ from cayu.sessions.base import (
     QueuedInteractionProfileHandoff,
     ResumeRequest,
     RunRequest,
-    SessionIdentity,
     SessionModelCompletionStageConflict,
     SessionRunFenced,
     _canonical_runtime_publication_digest,
@@ -61,7 +60,7 @@ from cayu.sessions.messaging import (
     SessionMessageDeliveryBatch,
     SessionMessageDeliveryMode,
 )
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.transcript_queries import TranscriptQuery
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tasks.creation import TaskCreate

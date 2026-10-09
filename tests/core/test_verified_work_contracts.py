@@ -64,7 +64,6 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     ResumeRequest,
     RunRequest,
-    SessionIdentity,
     run_request_with_runtime_invocation,
 )
 from cayu.sessions.invocation import (
@@ -75,7 +74,7 @@ from cayu.sessions.invocation import (
     TaskExecutionSource,
     TaskInvocation,
 )
-from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.records import Session, SessionIdentity, SessionStatus
 from cayu.sessions.recovery import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,

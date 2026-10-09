@@ -13,7 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from cayu.sessions.base import RunRequest, SessionIdentity
+from cayu.sessions.base import RunRequest
+from cayu.sessions.records import SessionIdentity
 from cayu.storage import _sqlite_catalog as sqlite_catalog
 from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_knowledge_schema as sqlite_knowledge_schema

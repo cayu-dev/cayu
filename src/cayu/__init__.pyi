@@ -3954,7 +3954,6 @@ from cayu.sessions.base import ResumeRequest as ResumeRequest
 from cayu.sessions.base import RunRequest as RunRequest
 from cayu.sessions.base import SessionExecutionInProgress as SessionExecutionInProgress
 from cayu.sessions.base import SessionForkProfileRelationship as SessionForkProfileRelationship
-from cayu.sessions.base import SessionIdentity as SessionIdentity
 from cayu.sessions.base import SessionInvocationAdmission as SessionInvocationAdmission
 from cayu.sessions.base import SessionInvocationSnapshot as SessionInvocationSnapshot
 from cayu.sessions.base import SessionModelTransition as SessionModelTransition
@@ -4193,6 +4192,7 @@ from cayu.sessions.records import PendingActionKind as PendingActionKind
 from cayu.sessions.records import PendingActionSession as PendingActionSession
 from cayu.sessions.records import RunnerObservedEventIdentity as RunnerObservedEventIdentity
 from cayu.sessions.records import Session as Session
+from cayu.sessions.records import SessionIdentity as SessionIdentity
 from cayu.sessions.records import SessionStatus as SessionStatus
 from cayu.sessions.records import TranscriptRecord as TranscriptRecord
 from cayu.sessions.recovery import (

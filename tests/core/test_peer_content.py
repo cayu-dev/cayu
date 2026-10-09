@@ -1327,10 +1327,13 @@ def test_peer_attempt_generation_bounds(generation):
 def test_store_append_replay_and_conflict(tmp_path, backend, request):
     from cayu.collaboration._contracts import OwnerRef
     from cayu.collaboration.participants import ParticipantRef
-    from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+    from cayu.sessions.base import (
+        InMemorySessionStore,
+        RunRequest,
+    )
     from cayu.sessions.context_views import ParticipantSessionBinding
     from cayu.sessions.messaging import SessionMessageQuery
-    from cayu.sessions.records import SessionStatus
+    from cayu.sessions.records import SessionIdentity, SessionStatus
 
     async def run():
         store = InMemorySessionStore()

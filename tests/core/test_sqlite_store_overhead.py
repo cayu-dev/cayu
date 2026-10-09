@@ -101,7 +101,8 @@ def test_read_pool_parallelism_and_cancelled_lease(sqlite_resources):
 
 
 def test_session_cache_tracks_external_updates_without_timestamp_change(sqlite_resources):
-    from cayu.sessions.base import RunRequest, SessionIdentity
+    from cayu.sessions.base import RunRequest
+    from cayu.sessions.records import SessionIdentity
 
     async def scenario():
         async with sqlite_resources as resources:
@@ -162,7 +163,8 @@ def test_event_scans_avoid_redundant_copies_and_revalidate_content(
 ):
     from cayu._validation import MAX_DURABLE_JSON_INTEGER
     from cayu.events import Event
-    from cayu.sessions.base import RunRequest, SessionIdentity
+    from cayu.sessions.base import RunRequest
+    from cayu.sessions.records import SessionIdentity
 
     async def scenario():
         async with sqlite_resources as resources:

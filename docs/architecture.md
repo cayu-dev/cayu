@@ -499,7 +499,8 @@ directly to it without calling back into `SessionEngine`.
 
 `sessions/records.py` owns session, event and transcript records, session status,
 runner-observed event identities, the pending-action session projection, session ID
-bounds, and session copy and provenance readers.
+bounds, session creation and runtime identities, instance fingerprints, and session
+copy and provenance readers.
 Applications can construct and validate these values without loading concrete
 stores. Existing public imports resolve to these same definitions.
 

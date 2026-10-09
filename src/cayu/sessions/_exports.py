@@ -388,7 +388,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "SessionExportSnapshot": ("cayu.sessions.exports", "SessionExportSnapshot"),
     "SessionExportTooLarge": ("cayu.sessions.exports", "SessionExportTooLarge"),
     "SessionForkProfileRelationship": ("cayu.sessions.base", "SessionForkProfileRelationship"),
-    "SessionIdentity": ("cayu.sessions.base", "SessionIdentity"),
+    "SessionIdentity": ("cayu.sessions.records", "SessionIdentity"),
     "SessionInspectionIdentity": ("cayu.sessions.inspection", "SessionInspectionIdentity"),
     "SessionInspectionSummary": ("cayu.sessions.inspection", "SessionInspectionSummary"),
     "SessionInspectionUsageSummary": ("cayu.sessions.inspection", "SessionInspectionUsageSummary"),

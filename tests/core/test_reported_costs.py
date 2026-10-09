@@ -5,8 +5,9 @@ import pytest
 
 from cayu import Event, EventType, Message, RunRequest
 from cayu.budgets.reported import ReportedCostObservation, reported_cost_observation
-from cayu.sessions.base import InMemorySessionStore, SessionIdentity
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.queries import SessionAggregateFilter
+from cayu.sessions.records import SessionIdentity
 from cayu.sessions.usage import UsageRollupQuery
 from cayu.storage.sqlite import SQLiteSessionStore
 
