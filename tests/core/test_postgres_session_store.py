@@ -3562,7 +3562,7 @@ def test_postgres_session_store_summarize_events(postgres_dsn):
 
 
 def test_postgres_session_store_batches_large_event_session_id_queries(postgres_dsn, monkeypatch):
-    import cayu.storage.postgres as postgres_module
+    import cayu.storage._postgres_session_queries as postgres_module
 
     monkeypatch.setattr(postgres_module, "_EVENT_QUERY_SESSION_IDS_BATCH_SIZE", 2)
 

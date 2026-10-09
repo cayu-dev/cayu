@@ -24,7 +24,7 @@ from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.queries import SessionQuery
 
 
-@pytest.mark.parametrize("backend", ["sqlite"])
+@pytest.mark.parametrize("backend", ["sqlite", "postgres"])
 def test_native_session_queries_import_without_store_adapters(backend):
     result = subprocess.run(
         [
@@ -55,7 +55,7 @@ assert callable(owner.list_sessions)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("backend", ["sqlite"])
+@pytest.mark.parametrize("backend", ["sqlite", "postgres"])
 def test_native_session_queries_compose_with_direct_connections(backend, tmp_path, request):
     from cayu.storage.migrations import SchemaMode
     from cayu.storage.postgres import PostgresSessionStore

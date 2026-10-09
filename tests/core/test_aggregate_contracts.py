@@ -3404,9 +3404,9 @@ def test_postgres_aggregates_match_in_memory_reference(postgres_dsn: str) -> Non
 
         from cayu.sessions.queries import session_query_from_aggregate_filter
         from cayu.storage import _postgres_aggregates, _session_store_sql
-        from cayu.storage.postgres import _SQL_DIALECT
+        from cayu.storage._postgres_session_queries import SQL_DIALECT
 
-        plan = _session_store_sql.build_session_query_sql(None, dialect=_SQL_DIALECT)
+        plan = _session_store_sql.build_session_query_sql(None, dialect=SQL_DIALECT)
         sql, params = _postgres_aggregates.usage_rollup_statement(
             session_plan=plan,
             query=query.model_copy(update={"sessions": SessionAggregateFilter()}),
@@ -3440,7 +3440,7 @@ def test_postgres_aggregates_match_in_memory_reference(postgres_dsn: str) -> Non
         )
         edge_plan = _session_store_sql.build_session_query_sql(
             session_query_from_aggregate_filter(canonical_query.sessions),
-            dialect=_SQL_DIALECT,
+            dialect=SQL_DIALECT,
         )
         bounded_pricing_sql, bounded_pricing_params = _postgres_aggregates.pricing_input_statement(
             session_plan=edge_plan,

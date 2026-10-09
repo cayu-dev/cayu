@@ -26,6 +26,7 @@ from cayu.sessions.transcript_queries import TRANSCRIPT_SEARCH_TOKENIZER_VERSION
 from cayu.storage import _postgres_base as postgres_base
 from cayu.storage import _postgres_catalog as postgres_catalog
 from cayu.storage import _postgres_schema_history as postgres_schema_history
+from cayu.storage import _postgres_session_queries as postgres_queries
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import migrations as schema
 from cayu.storage import postgres as postgres_storage
@@ -958,7 +959,7 @@ def test_postgres_workflow_replay_is_fenced_atomic_and_indexed(postgres_dsn: str
 
             plan = session_store_sql.build_event_query_sql(
                 fenced_query,
-                dialect=postgres_storage._SQL_DIALECT,
+                dialect=postgres_queries.SQL_DIALECT,
             )
             exact_query = fenced_query.model_copy(
                 update={
@@ -968,7 +969,7 @@ def test_postgres_workflow_replay_is_fenced_atomic_and_indexed(postgres_dsn: str
             )
             exact_plan = session_store_sql.build_event_query_sql(
                 exact_query,
-                dialect=postgres_storage._SQL_DIALECT,
+                dialect=postgres_queries.SQL_DIALECT,
             )
             async with (
                 await psycopg.AsyncConnection.connect(postgres_dsn) as conn,

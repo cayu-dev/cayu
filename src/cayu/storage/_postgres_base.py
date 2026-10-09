@@ -717,6 +717,13 @@ class _PostgresStoreBase:
                 await conn.execute("SET TRANSACTION READ ONLY")
             yield conn
 
+    @asynccontextmanager
+    async def _ready_connection(self) -> AsyncIterator[Any]:
+        """Acquire an operation connection after opening and validating the store."""
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            yield conn
+
     async def ensure_schema(self) -> None:
         """Open the pool and reconcile the schema now (per ``schema_mode``).
 

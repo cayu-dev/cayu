@@ -891,14 +891,15 @@ backend-specific durable vector indexes later
 
 The local durable session store is `SQLiteSessionStore`. New projects conventionally share `data/cayu.db` across Cayu's SQLite-backed runtime stores; applications may select another path explicitly. It keeps the event log append-only, but stores indexed identity columns beside the JSON event payload so dashboards and replay tools do not have to scan transcript files. Session records also persist provider, active model, runtime, agent, environment, and a redacted typed execution-profile identity so resume cannot silently adopt changed runtime, provider target or adapter, durable instructions, context selection, knowledge injection, compaction, provider request controls, application or invocation budgets, structured output, finalization, direct-tool schema, application-declared implementation behavior, registered or invocation policy order, hook order, environment/runner semantics, grant baseline, or effect authority. New sessions start from the agent's default model and freeze that profile in the creation transaction. Resume compares the candidate again inside its status/checkpoint transaction; mismatch evidence contains fingerprints and changed component classes, never raw prompts, schemas, code, policy bodies, or credentials. Model-attempt, usage, cost, structured-result, compaction, budget, tool, approval, runner, hook, environment, workspace, credential-proxy, and virtual-egress evidence references the immutable invocation-profile fingerprint that governed it. An explicit clean-boundary `ModelTarget` adoption atomically updates provider/model identity and the expected profile with its run epoch, checkpoint, interaction admission, portable-projection marker, and `session.model.switched` event; generic retry never changes targets silently. The store keeps the immutable transcript used by resume and checkpoint-backed context compaction, while the projection marker excludes pre-switch provider and thinking state only from later model-facing requests. Storage APIs support filtered session listing, filtered event queries with durable sequence cursors, transcript loading, atomic status/checkpoint/target transitions, and atomic batched event appends. JSONL is better treated as an export/debug format than as Cayu's primary runtime store.
 
-SQLite session event queries, session listing/inspection, topology/lineage,
+Native session event queries, session listing/inspection, topology/lineage,
 child lifecycle reads, summaries and accounting reads live in
-`storage/_sqlite_session_queries.py`. The public store delegates to complete
-operations with an explicit read capability and accounting state. The read runner
-retains connection leases, off-thread execution and cancellation handling. Query
-operations retain authorization and projection in the same native snapshot.
-Shared SQLite row decoding and cursor-bound session/label reads live in
-`storage/_sqlite_records.py`.
+`storage/_sqlite_session_queries.py` and `storage/_postgres_session_queries.py`.
+The public stores delegate to complete operations with explicit read or connection
+capabilities and accounting state. SQLite keeps its connection leases, off-thread
+execution and cancellation handling in the read runner; PostgreSQL keeps readiness
+and connection acquisition in `storage/_postgres_base.py`. Query owners retain
+authorization and projection in the same native snapshot. Shared SQLite row
+decoding and cursor-bound session/label reads live in `storage/_sqlite_records.py`.
 
 Context policies are runtime projections over transcript messages, not storage. They let applications customize the model-facing conversation history by trimming, compacting, replacing bulky tool results, or injecting retrieved context while preserving the raw durable transcript for audit, debugging, resume, and future compaction.
 
