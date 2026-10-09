@@ -1,4 +1,6 @@
 {
+    "tests/core/test_native_transcript_ownership.py::test_postgres_transcript_imports_without_store_adapters": 0.75,
+    "tests/core/test_native_transcript_ownership.py::test_postgres_transcript_composes_with_direct_connection": 1.585,
     "tests/core/test_native_transcript_ownership.py::test_sqlite_transcript_imports_without_store_adapters": 0.815,
     "tests/core/test_native_transcript_ownership.py::test_sqlite_transcript_composes_with_direct_connection": 0.177,
     "tests/cli/test_cloud_session_choice.py::test_a_preflight_that_is_not_waiting_does_not_hold_the_wait[None]": 0.0002375420299358666,

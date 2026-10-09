@@ -931,11 +931,12 @@ and connection acquisition in `storage/_postgres_base.py`. Query owners retain
 authorization and projection in the same native snapshot. Shared SQLite row
 decoding and cursor-bound session/label reads live in `storage/_sqlite_records.py`.
 
-SQLite transcript persistence lives in `storage/_sqlite_transcript.py`: reads,
-search, appends, deferred-input publication and retention. Operations receive
-explicit execution and supporting storage capabilities. Combined transcript and
-checkpoint writes retain one native transaction. The connection owner provides
-the shared `SQLiteOperationRunner` protocol used by native read and write owners.
+Native transcript persistence lives in `storage/_sqlite_transcript.py` and
+`storage/_postgres_transcript.py`: reads, search, appends, deferred-input publication
+and SQLite retention. Operations receive explicit execution and supporting storage
+capabilities. Combined transcript and checkpoint writes retain one native transaction.
+The SQLite connection owner provides the shared `SQLiteOperationRunner` protocol;
+PostgreSQL operations use ready connections and cursor-bound supporting capabilities.
 
 Context policies are runtime projections over transcript messages, not storage. They let applications customize the model-facing conversation history by trimming, compacting, replacing bulky tool results, or injecting retrieved context while preserving the raw durable transcript for audit, debugging, resume, and future compaction.
 
