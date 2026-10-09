@@ -15,8 +15,6 @@ from cayu.sessions._terminal_evidence import (
     require_interruption_event_matches_pending_marker,
 )
 from cayu.sessions.base import (
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     RunRequest,
     SessionIdentity,
@@ -29,6 +27,7 @@ from cayu.sessions.checkpoints import (
 )
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
 from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 

@@ -120,9 +120,6 @@ from cayu.sessions._invocation_terminal_decision import (
 )
 from cayu.sessions.base import (
     ForkSessionRequest,
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
-    IncompleteSessionsRecoveryRequest,
     InMemorySessionStore,
     InterruptSessionRequest,
     ModelCompletionStageRequest,
@@ -136,6 +133,11 @@ from cayu.sessions.base import (
 )
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.recovery import (
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    IncompleteSessionsRecoveryRequest,
+)
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.creation import TaskCreate

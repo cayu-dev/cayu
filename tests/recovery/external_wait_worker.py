@@ -85,7 +85,7 @@ async def main():
 
     if setup.get("boundary") == "recovery_admission":
         from cayu.runtime import _invocation_lifecycle
-        from cayu.sessions.base import IncompleteSessionRecoveryRequest
+        from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 
         original_apply = _invocation_lifecycle.apply_invocation_lifecycle_command
 

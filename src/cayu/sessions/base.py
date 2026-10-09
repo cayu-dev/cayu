@@ -228,6 +228,28 @@ from cayu.sessions.records import copy_session as copy_session
 from cayu.sessions.records import (
     runtime_build_provenance_from_session_metadata as runtime_build_provenance_from_session_metadata,
 )
+from cayu.sessions.recovery import (
+    MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES as MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES,
+)
+from cayu.sessions.recovery import (
+    IncompleteSessionRecoveryAction as IncompleteSessionRecoveryAction,
+)
+from cayu.sessions.recovery import (
+    IncompleteSessionRecoveryRequest as IncompleteSessionRecoveryRequest,
+)
+from cayu.sessions.recovery import (
+    IncompleteSessionRecoveryResult as IncompleteSessionRecoveryResult,
+)
+from cayu.sessions.recovery import IncompleteSessionsRecoveryPage as IncompleteSessionsRecoveryPage
+from cayu.sessions.recovery import (
+    IncompleteSessionsRecoveryRequest as IncompleteSessionsRecoveryRequest,
+)
+from cayu.sessions.recovery import (
+    copy_incomplete_session_recovery_request as copy_incomplete_session_recovery_request,
+)
+from cayu.sessions.recovery import (
+    copy_incomplete_sessions_recovery_request as copy_incomplete_sessions_recovery_request,
+)
 from cayu.sessions.summaries import EventSummary as EventSummary
 from cayu.sessions.summaries import SessionOperationalSnapshot as SessionOperationalSnapshot
 from cayu.sessions.summaries import SessionOutcome as SessionOutcome
@@ -885,12 +907,6 @@ class McpManifestHistoryConflict(RuntimeError):
 
 class _McpManifestBaselineEvidenceInvalid(ValueError):
     """Stored MCP baseline evidence could not be decoded or validated safely."""
-
-
-# These budgets are nested deliberately. A maximum-size session ID is
-# base64-encoded into a list cursor that fits 4 KiB; a maximum-size custom-store
-# list cursor is base64-encoded into a recovery cursor that fits 8 KiB.
-MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES = 8192
 
 
 class SessionRuntimePublicationConflict(ValueError):
@@ -6638,197 +6654,6 @@ def _copy_failed_first_delivery_retirement(
     ):
         raise ValueError("Retirement requires an unclaimed failed first delivery.")
     return copied
-
-
-class IncompleteSessionRecoveryAction(StrEnum):
-    TERMINALIZED_ZERO_WORK = "terminalized_zero_work"
-    SKIPPED_ACTIVE = "skipped_active"
-    SKIPPED_EXECUTION_OWNER = "skipped_execution_owner"
-    SKIPPED_TERMINAL = "skipped_terminal"
-    SKIPPED_UNREGISTERED_AGENT = "skipped_unregistered_agent"
-    REPAIRED_TERMINAL_OWNERSHIP = "repaired_terminal_ownership"
-    REPAIRED_TERMINAL_EVIDENCE = "repaired_terminal_evidence"
-    PENDING_APPROVAL = "pending_approval"
-    PENDING_USER_INPUT = "pending_user_input"
-    PENDING_TOOL_EFFECT = "pending_tool_effect"
-    PENDING_SUBAGENT = "pending_subagent"
-    AMBIGUOUS_PENDING_USER_INPUT = "ambiguous_pending_user_input"
-    REPAIRED_TOOL_ROUND = "repaired_tool_round"
-    REPAIRED_WORKSPACE_OBSERVATION = "repaired_workspace_observation"
-    REPAIRED_WORKSPACE_FINALIZATION = "repaired_workspace_finalization"
-    RECONCILED_ENVIRONMENT_LIFECYCLE = "reconciled_environment_lifecycle"
-    REAPED_ALLOCATION = "reaped_allocation"
-    PENDING_ALLOCATION_CLEANUP = "pending_allocation_cleanup"
-    REPAIRED_PROVIDER_OPERATION_RESOLUTION = "repaired_provider_operation_resolution"
-    INTERRUPTED_ABANDONED = "interrupted_abandoned"
-    FINALIZED_INTERRUPT = "finalized_interrupt"
-    FAILED = "failed"
-
-
-class IncompleteSessionRecoveryRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
-
-    session_id: str
-    inactive_for_seconds: StrictInt | None = Field(
-        default=None,
-        ge=0,
-        le=MAX_DURABLE_JSON_INTEGER,
-    )
-    reason: str = "worker_recovered_incomplete_session"
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-    @field_validator("session_id", "reason")
-    @classmethod
-    def validate_nonblank_fields(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("metadata", mode="before")
-    @classmethod
-    def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_metadata(value)
-
-
-class IncompleteSessionsRecoveryRequest(BaseModel):
-    """Select and bound one resumable incomplete-session recovery page."""
-
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
-
-    statuses: set[SessionStatus]
-    limit: StrictInt = Field(default=100, ge=1, le=1000)
-    inspection_limit: StrictInt = Field(default=1000, ge=1, le=10_000)
-    cursor: str | None = None
-    inactive_for_seconds: StrictInt | None = Field(
-        default=None,
-        ge=0,
-        le=MAX_DURABLE_JSON_INTEGER,
-    )
-    reason: str = "worker_recovered_incomplete_session"
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-    @field_validator("statuses", mode="before")
-    @classmethod
-    def copy_statuses(cls, value) -> set[SessionStatus]:
-        if value is None:
-            raise ValueError("statuses is required for batch incomplete-session recovery.")
-        if not isinstance(value, (set, list, tuple)):
-            raise ValueError("statuses must be a set of SessionStatus values.")
-        statuses: set[SessionStatus] = set()
-        for status in value:
-            if not isinstance(status, SessionStatus):
-                status = SessionStatus(status)
-            statuses.add(status)
-        if not statuses:
-            raise ValueError("statuses must not be empty.")
-        recoverable_statuses = {
-            SessionStatus.PENDING,
-            SessionStatus.RUNNING,
-            SessionStatus.INTERRUPTING,
-            SessionStatus.COMPLETED,
-            SessionStatus.FAILED,
-            SessionStatus.INTERRUPTED,
-        }
-        unsupported_statuses = statuses - recoverable_statuses
-        if unsupported_statuses:
-            unsupported = ", ".join(sorted(status.value for status in unsupported_statuses))
-            supported = ", ".join(sorted(status.value for status in recoverable_statuses))
-            raise ValueError(
-                f"statuses contains unsupported recovery status values: {unsupported}. "
-                f"Supported values are: {supported}."
-            )
-        return statuses
-
-    @field_validator("reason")
-    @classmethod
-    def validate_reason(cls, value: str) -> str:
-        return require_clean_nonblank(value, "reason")
-
-    @field_validator("cursor")
-    @classmethod
-    def validate_cursor(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        value = require_clean_nonblank(value, "cursor")
-        if len(value.encode("utf-8")) > MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES:
-            raise ValueError(
-                f"cursor exceeds its {MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES}-byte limit."
-            )
-        return value
-
-    @field_validator("metadata", mode="before")
-    @classmethod
-    def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_metadata(value)
-
-
-class IncompleteSessionRecoveryResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    session_id: str
-    previous_status: SessionStatus
-    status: SessionStatus
-    actions: tuple[IncompleteSessionRecoveryAction, ...]
-    events: tuple[Event, ...] = Field(default_factory=tuple)
-    pending_approval_id: str | None = None
-    pending_user_input_id: str | None = None
-    pending_subagent_session_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=1000)
-    message: str
-    execution_lease_expires_at: datetime | None = None
-
-    @field_validator("pending_subagent_session_ids")
-    @classmethod
-    def validate_pending_subagent_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        for session_id in value:
-            session_record_rules._require_bounded_session_id(
-                session_id, "pending_subagent_session_ids"
-            )
-        if len(set(value)) != len(value):
-            raise ValueError("Pending subagent session identifiers must be unique.")
-        return value
-
-    @field_validator("session_id", "message")
-    @classmethod
-    def validate_nonblank_fields(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("events")
-    @classmethod
-    def copy_events(cls, value) -> tuple[Event, ...]:
-        return tuple(copy_event(event) for event in value)
-
-
-class IncompleteSessionsRecoveryPage(BaseModel):
-    """One bounded batch-recovery page and its continuation position."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    results: tuple[IncompleteSessionRecoveryResult, ...] = Field(
-        default_factory=tuple,
-        max_length=1000,
-    )
-    inspected_session_count: StrictInt = Field(
-        default=0,
-        ge=0,
-        le=MAX_DURABLE_JSON_INTEGER,
-    )
-    next_cursor: str | None = None
-
-    @field_validator("results")
-    @classmethod
-    def copy_results(cls, value) -> tuple[IncompleteSessionRecoveryResult, ...]:
-        return tuple(result.model_copy(deep=True) for result in value)
-
-    @field_validator("next_cursor")
-    @classmethod
-    def validate_next_cursor(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        value = require_clean_nonblank(value, "next_cursor")
-        if len(value.encode("utf-8")) > MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES:
-            raise ValueError(
-                "next_cursor exceeds its "
-                f"{MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES}-byte limit."
-            )
-        return value
 
 
 LATEST_TRANSCRIPT_TEXT_MAX_CHARS = 32_000
@@ -25449,37 +25274,6 @@ def copy_interrupt_session_request(request: InterruptSessionRequest) -> Interrup
         reason=request.reason,
         metadata=copy_durable_metadata(request.metadata),
         requested_by=copy_resolution_actor(request.requested_by),
-    )
-
-
-def copy_incomplete_session_recovery_request(
-    request: IncompleteSessionRecoveryRequest,
-) -> IncompleteSessionRecoveryRequest:
-    if type(request) is not IncompleteSessionRecoveryRequest:
-        raise TypeError("Incomplete session recovery requires an IncompleteSessionRecoveryRequest.")
-    return IncompleteSessionRecoveryRequest(
-        session_id=request.session_id,
-        inactive_for_seconds=request.inactive_for_seconds,
-        reason=request.reason,
-        metadata=copy_durable_metadata(request.metadata),
-    )
-
-
-def copy_incomplete_sessions_recovery_request(
-    request: IncompleteSessionsRecoveryRequest,
-) -> IncompleteSessionsRecoveryRequest:
-    if type(request) is not IncompleteSessionsRecoveryRequest:
-        raise TypeError(
-            "Incomplete sessions recovery requires an IncompleteSessionsRecoveryRequest."
-        )
-    return IncompleteSessionsRecoveryRequest(
-        statuses=set(request.statuses),
-        limit=request.limit,
-        inspection_limit=request.inspection_limit,
-        cursor=request.cursor,
-        inactive_for_seconds=request.inactive_for_seconds,
-        reason=request.reason,
-        metadata=copy_durable_metadata(request.metadata),
     )
 
 

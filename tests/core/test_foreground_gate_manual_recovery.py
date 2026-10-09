@@ -23,13 +23,9 @@ from cayu.approvals.user_input import (
 )
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import (
-    IncompleteSessionRecoveryRequest,
-    InMemorySessionStore,
-    RunRequest,
-    SessionRuntimePublicationConflict,
-)
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionRuntimePublicationConflict
 from cayu.sessions.pending_action_contracts import PendingActionQuery
+from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import ToolEffect
 from cayu.tools.subagents import SubagentSpec, SubagentTool

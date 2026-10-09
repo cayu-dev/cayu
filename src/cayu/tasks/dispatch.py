@@ -91,8 +91,6 @@ from cayu.sessions._terminal_evidence import (
     queued_dispatch_terminal_event_id as _queued_dispatch_terminal_event_id,
 )
 from cayu.sessions.base import (
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
     ModelTarget,
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
@@ -105,6 +103,7 @@ from cayu.sessions.invocation import (
     TaskExecutionSource,
     copy_session_invocation_binding,
 )
+from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
 from cayu.tasks._cancellation import _task_cancellation_terminalization_request
 from cayu.tasks._execution_settlement import (
     TaskExecutionSettlement,

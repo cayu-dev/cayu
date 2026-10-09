@@ -47,8 +47,8 @@ from cayu.server.contracts import (
     SERVER_API_PREFIX,
     validate_usage_rollup_price_book,
 )
-from cayu.sessions.base import IncompleteSessionsRecoveryRequest
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.recovery import IncompleteSessionsRecoveryRequest
 
 DEFAULT_SERVER_DEPLOYMENT_NAME = "development"
 DEFAULT_SERVER_TITLE = "Cayu"

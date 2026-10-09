@@ -1052,7 +1052,7 @@ def test_failed_presence_claim_does_not_abort_run(monkeypatch):
 def test_recovery_reports_live_owner_expiry_in_single_and_batch_results(
     backend, request, sqlite_resources
 ):
-    from cayu.sessions.base import (
+    from cayu.sessions.recovery import (
         IncompleteSessionRecoveryAction,
         IncompleteSessionRecoveryRequest,
         IncompleteSessionsRecoveryRequest,

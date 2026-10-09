@@ -673,11 +673,6 @@ from cayu.sessions.base import (
     ForkSessionRequest,
     ForkSystemPromptPolicy,
     ForkSystemPromptReplacement,
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
-    IncompleteSessionRecoveryResult,
-    IncompleteSessionsRecoveryPage,
-    IncompleteSessionsRecoveryRequest,
     InteractionTransitionResult,
     InteractionTransitionSpec,
     InterruptSessionRequest,
@@ -743,8 +738,6 @@ from cayu.sessions.base import (
     bind_runtime_session_create_claim,
     copy_compact_session_request,
     copy_fork_session_request,
-    copy_incomplete_session_recovery_request,
-    copy_incomplete_sessions_recovery_request,
     copy_interaction_transition_spec,
     copy_model_completion_manual_recovery_request,
     copy_profiled_session_fork_result,
@@ -812,9 +805,16 @@ from cayu.sessions.messaging import (
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import RUNTIME_BUILD_PROVENANCE_METADATA_KEY, Session, SessionStatus
 from cayu.sessions.recovery import (
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    IncompleteSessionRecoveryResult,
+    IncompleteSessionsRecoveryPage,
+    IncompleteSessionsRecoveryRequest,
     RecoveryBlockerCode,
     StartupRecoveryBlockedSession,
     StartupRecoveryResult,
+    copy_incomplete_session_recovery_request,
+    copy_incomplete_sessions_recovery_request,
 )
 from cayu.sessions.transcript_queries import TranscriptQuery
 from cayu.tasks._terminalization import _terminalize_claimed_task

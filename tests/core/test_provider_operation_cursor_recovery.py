@@ -50,8 +50,6 @@ from cayu.runtime.provider_operations import (
     provider_operation_progress_payload,
 )
 from cayu.sessions.base import (
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     ModelCompletionStage,
     ModelCompletionStageRequest,
@@ -61,6 +59,7 @@ from cayu.sessions.base import (
     SessionStore,
 )
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling, resolved_tool_exposure_authority
 from cayu.tools.policy import AllowAllToolPolicy

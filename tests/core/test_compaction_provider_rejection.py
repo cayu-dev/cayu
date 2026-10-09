@@ -26,7 +26,8 @@ from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent, OpenAI
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import IncompleteSessionRecoveryRequest, RunRequest, SessionStore
+from cayu.sessions.base import RunRequest, SessionStore
+from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.storage import SQLiteSessionStore
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.memory import InMemoryTaskStore

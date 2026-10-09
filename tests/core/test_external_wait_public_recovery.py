@@ -518,7 +518,7 @@ def _process_death_scenario(
                 await waits.aclose()
                 return
             if boundary == "before_ticket":
-                from cayu.sessions.base import IncompleteSessionRecoveryRequest
+                from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 
                 await restored_waits.cancel(correlation, operation_key="cancel", context=CONTEXT)
                 with pytest.raises(ExternalWaitUnavailable, match="native writer release"):
@@ -727,7 +727,7 @@ def test_cancelled_park_recovers_failed_writer_release(
             restored = application(restored_store)
             adapter = SessionExternalWaitAdapter(restored, restored_waits)
             if before_park == "before_ticket":
-                from cayu.sessions.base import IncompleteSessionRecoveryRequest
+                from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 
                 with pytest.raises(ExternalWaitUnavailable, match="native writer release"):
                     await adapter.exclude_prepared_execution(registered, context=CONTEXT)

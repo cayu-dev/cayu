@@ -24,10 +24,11 @@ from cayu.approvals.tools import (
 from cayu.approvals.user_input import UserInputResponse
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import IncompleteSessionRecoveryRequest, RunRequest
+from cayu.sessions.base import RunRequest
 from cayu.sessions.invocation import InvocationOriginClaim
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.policy import ToolPolicy, ToolPolicyDecision, ToolPolicyResult
 from cayu.tools.subagents import SubagentSpec, SubagentTool

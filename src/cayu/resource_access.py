@@ -382,7 +382,7 @@ class ScopedCayuAccess:
                 yield event
 
     async def recover(self, request):
-        from cayu.sessions.base import IncompleteSessionRecoveryRequest
+        from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 
         if type(request) is not IncompleteSessionRecoveryRequest:
             raise TypeError("Scoped recovery requires IncompleteSessionRecoveryRequest.")

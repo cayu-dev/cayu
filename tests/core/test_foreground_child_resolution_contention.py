@@ -19,7 +19,6 @@ from cayu.runtime._invocation_lifecycle import (
     RebindInvocationCommand,
 )
 from cayu.sessions.base import (
-    IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     RunRequest,
     SessionRuntimePublicationConflict,
@@ -28,6 +27,7 @@ from cayu.sessions.base import (
 from cayu.sessions.event_delivery import PersistedEventSideEffectStatus
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.sqlite import SQLiteSessionStore

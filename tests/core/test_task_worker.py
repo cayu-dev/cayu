@@ -56,9 +56,6 @@ from cayu.sessions._invocation_terminal_decision import (
 )
 from cayu.sessions._terminal_evidence import interruption_request_id_from_payload
 from cayu.sessions.base import (
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
-    IncompleteSessionsRecoveryRequest,
     InMemorySessionStore,
     InterruptSessionRequest,
     ModelCompletionStageDisposition,
@@ -75,6 +72,11 @@ from cayu.sessions.invocation import TaskExecutionSource
 from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageDeliveryMode
 from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.recovery import (
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    IncompleteSessionsRecoveryRequest,
+)
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.creation import (
     TaskCreate,

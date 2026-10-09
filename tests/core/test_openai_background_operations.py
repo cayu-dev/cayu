@@ -51,13 +51,9 @@ from cayu.runtime.provider_operations import (
     ProviderOperationUnavailableReason,
     inspect_provider_operation,
 )
-from cayu.sessions.base import (
-    IncompleteSessionRecoveryRequest,
-    InMemorySessionStore,
-    ResumeRequest,
-    RunRequest,
-)
+from cayu.sessions.base import InMemorySessionStore, ResumeRequest, RunRequest
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.catalogue import CALL_TOOL_NAME

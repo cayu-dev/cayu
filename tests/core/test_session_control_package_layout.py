@@ -198,3 +198,57 @@ assert type(claim).model_json_schema()["title"] == "PersistedEventSideEffectClai
 """,
         public_module,
     )
+
+
+def test_incomplete_recovery_public_imports_and_historical_pickle_globals():
+    _assert_public_identity(
+        "cayu.sessions.recovery",
+        "cayu.sessions.base",
+        (
+            "IncompleteSessionRecoveryAction",
+            "IncompleteSessionRecoveryRequest",
+            "IncompleteSessionsRecoveryRequest",
+            "IncompleteSessionRecoveryResult",
+            "IncompleteSessionsRecoveryPage",
+        ),
+        public_modules=("cayu", "cayu.sessions", "cayu.runtime"),
+    )
+
+
+@pytest.mark.parametrize("public_module", ("cayu", "cayu.sessions", "cayu.runtime"))
+def test_incomplete_recovery_composes_with_plans_without_stores(public_module):
+    _assert_store_independent(
+        """
+from pydantic import ValidationError
+from cayu.sessions.recovery import (
+    MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES, RecoveryItemReceipt,
+    copy_incomplete_session_recovery_request, copy_incomplete_sessions_recovery_request,
+)
+metadata = {"nested": {"value": 1}}
+request = public.IncompleteSessionRecoveryRequest(session_id="session", metadata=metadata)
+metadata["nested"]["value"] = 2
+copied = copy_incomplete_session_recovery_request(request)
+request.metadata["nested"]["value"] = 3
+assert copied.metadata == {"nested": {"value": 1}}
+batch = public.IncompleteSessionsRecoveryRequest(statuses={"running"}, metadata=copied.metadata)
+cloned = copy_incomplete_sessions_recovery_request(batch)
+batch.statuses.clear()
+assert {str(status) for status in cloned.statuses} == {"running"}
+receipt = RecoveryItemReceipt(plan_id="plan", item_id="item", execution_id="execution",
+    session_id="session", action="leave_intact", status="left_intact",
+    final_session_status="running", final_run_epoch=1, recovery_actions=["skipped_active"])
+assert receipt.recovery_actions == (public.IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,)
+assert RecoveryItemReceipt.model_validate_json(receipt.model_dump_json()) == receipt
+assert get_type_hints(copy_incomplete_session_recovery_request)["return"] is type(request)
+assert pickle.loads(pickle.dumps(cloned)) == cloned
+assert "IncompleteSessionRecoveryAction" in RecoveryItemReceipt.model_json_schema()["$defs"]
+try:
+    public.IncompleteSessionsRecoveryRequest(statuses={"running"},
+        cursor="é" * (MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES // 2 + 1))
+except ValidationError:
+    pass
+else:
+    raise AssertionError("Encoded recovery cursor bound was not enforced")
+""",
+        public_module,
+    )

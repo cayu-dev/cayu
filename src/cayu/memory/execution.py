@@ -114,7 +114,6 @@ from cayu.sessions._durable_operation_ownership import (
 )
 from cayu.sessions.base import (
     CompactSessionRequest,
-    IncompleteSessionRecoveryRequest,
     ResumeRequest,
     RunRequest,
     RuntimeSessionCreateClaimAuthenticationDisposition,
@@ -128,6 +127,7 @@ from cayu.sessions.base import (
     runtime_session_create_claim_reference,
 )
 from cayu.sessions.records import RunnerObservedEventIdentity, Session, SessionStatus, copy_session
+from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.sessions.terminal_evidence import (
     TerminalSessionEvidence,
     TerminalSessionEvidenceError,

@@ -97,9 +97,6 @@ from cayu.sessions.base import (
     ForkExecutionProfileSelection,
     ForkSessionRequest,
     ForkSystemPromptPolicy,
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
-    IncompleteSessionsRecoveryRequest,
     InMemorySessionStore,
     InteractionTransitionSpec,
     ModelTarget,
@@ -121,6 +118,11 @@ from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.recovery import (
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    IncompleteSessionsRecoveryRequest,
+)
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling

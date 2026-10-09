@@ -42,7 +42,7 @@ from cayu.runtime._phase_timing import (
     current_store_counters,
 )
 from cayu.sessions import _pending_tool_round as pending_rounds
-from cayu.sessions.base import IncompleteSessionRecoveryRequest
+from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.storage import _sqlite_connection
 from cayu.storage.migrations import SchemaMode
 from cayu.tools.base import ToolEffect

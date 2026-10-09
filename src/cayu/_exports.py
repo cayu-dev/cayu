@@ -2757,12 +2757,21 @@ EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "InMemorySessionStore": ("cayu.sessions.base", "InMemorySessionStore"),
     "InMemoryTaskStore": ("cayu.tasks.memory", "InMemoryTaskStore"),
-    "IncompleteSessionRecoveryAction": ("cayu.sessions.base", "IncompleteSessionRecoveryAction"),
-    "IncompleteSessionRecoveryRequest": ("cayu.sessions.base", "IncompleteSessionRecoveryRequest"),
-    "IncompleteSessionRecoveryResult": ("cayu.sessions.base", "IncompleteSessionRecoveryResult"),
-    "IncompleteSessionsRecoveryPage": ("cayu.sessions.base", "IncompleteSessionsRecoveryPage"),
+    "IncompleteSessionRecoveryAction": (
+        "cayu.sessions.recovery",
+        "IncompleteSessionRecoveryAction",
+    ),
+    "IncompleteSessionRecoveryRequest": (
+        "cayu.sessions.recovery",
+        "IncompleteSessionRecoveryRequest",
+    ),
+    "IncompleteSessionRecoveryResult": (
+        "cayu.sessions.recovery",
+        "IncompleteSessionRecoveryResult",
+    ),
+    "IncompleteSessionsRecoveryPage": ("cayu.sessions.recovery", "IncompleteSessionsRecoveryPage"),
     "IncompleteSessionsRecoveryRequest": (
-        "cayu.sessions.base",
+        "cayu.sessions.recovery",
         "IncompleteSessionsRecoveryRequest",
     ),
     "IncrementalCaptureProgress": ("cayu.evals.incremental_recovery", "IncrementalCaptureProgress"),
@@ -3523,7 +3532,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "MAX_ENVIRONMENT_PROGRESS_COUNTER",
     ),
     "MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES": (
-        "cayu.sessions.base",
+        "cayu.sessions.recovery",
         "MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES",
     ),
     "MAX_KNOWLEDGE_ACTIVATION_ANNOTATION_BYTES": (

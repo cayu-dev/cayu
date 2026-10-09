@@ -77,7 +77,6 @@ from cayu.sessions import _invocation_lifecycle as invocation_contracts_module
 from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
 from cayu.sessions.base import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
-    IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     InteractionTransitionSpec,
     ModelTarget,
@@ -101,6 +100,7 @@ from cayu.sessions.checkpoints import (
     CheckpointCompatibilityError,
 )
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.exposure import TOOL_CAPABILITY_CEILING_METADATA_KEY, ToolCapabilityCeiling
 from cayu.vaults.redaction import SecretRedactor

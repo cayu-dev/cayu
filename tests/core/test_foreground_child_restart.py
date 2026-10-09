@@ -25,11 +25,15 @@ from cayu.providers.base import ModelStreamEvent
 from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.sessions.base import IncompleteSessionRecoveryRequest, InterruptSessionRequest, RunRequest
+from cayu.sessions.base import InterruptSessionRequest, RunRequest
 from cayu.sessions.execution import SessionExecutionConfig
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionStatus
-from cayu.sessions.recovery import RecoveryPlanRequest, RecoveryPlanSelection
+from cayu.sessions.recovery import (
+    IncompleteSessionRecoveryRequest,
+    RecoveryPlanRequest,
+    RecoveryPlanSelection,
+)
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
 from cayu.tools.subagents import SubagentSpec, SubagentTool
@@ -47,7 +51,7 @@ class _RestartRecordingTool(_RecordingTool):
 
 
 async def _recover_after_owner_expiry(app, request):
-    from cayu.sessions.base import IncompleteSessionRecoveryAction
+    from cayu.sessions.recovery import IncompleteSessionRecoveryAction
 
     deadline = asyncio.get_running_loop().time() + 15
     while True:

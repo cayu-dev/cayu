@@ -16,8 +16,8 @@ from cayu.external_waits import ExternalEventWaits
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.session_external_waits import SessionExternalWaitAdapter
 from cayu.sessions import _invocation_lifecycle
-from cayu.sessions.base import IncompleteSessionRecoveryRequest
 from cayu.sessions.external_waits import ExternalEventDelivery, ExternalWaitUnavailable
+from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "postgres"])

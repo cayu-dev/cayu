@@ -22,7 +22,8 @@ from cayu.providers.base import ModelProvider, ModelStreamEvent
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.tool_effects import ToolEffectReconciliationRequest
-from cayu.sessions.base import IncompleteSessionRecoveryRequest, ResumeRequest, RunRequest
+from cayu.sessions.base import ResumeRequest, RunRequest
+from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
 

@@ -6,22 +6,20 @@ import pytest
 from pydantic import ValidationError
 from tests.core._session_store_test_doubles import RecordingListSessionsStore
 
-import cayu.sessions.base as sessions_module
+import cayu.sessions.recovery as recovery_contracts
 from cayu.applications import CayuApp
 from cayu.events import Event, EventType
 from cayu.messages import Message
-from cayu.sessions.base import (
+from cayu.sessions.base import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.sessions.event_queries import EventOrder, EventQuery
+from cayu.sessions.queries import MAX_SESSION_LIST_CURSOR_BYTES, SessionListResult, SessionQuery
+from cayu.sessions.records import EventRecord, SessionStatus
+from cayu.sessions.recovery import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
     IncompleteSessionsRecoveryRequest,
-    InMemorySessionStore,
-    RunRequest,
-    SessionIdentity,
 )
-from cayu.sessions.event_queries import EventOrder, EventQuery
-from cayu.sessions.queries import MAX_SESSION_LIST_CURSOR_BYTES, SessionListResult, SessionQuery
-from cayu.sessions.records import EventRecord, SessionStatus
 
 
 def test_committed_recovery_survives_bounded_public_linkage_lookup_miss() -> None:
@@ -434,7 +432,7 @@ def test_incomplete_session_recovery_preserves_opaque_store_cursor() -> None:
         assert first.next_cursor is not None
         assert (
             len(first.next_cursor.encode("utf-8"))
-            <= sessions_module.MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES
+            <= recovery_contracts.MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES
         )
 
         second = await app.recover_incomplete_sessions(

@@ -520,6 +520,11 @@ portable error bounds and operational health projections. Its shared SQL builder
 preserve the same classification as the in-memory projections. Stores own lease
 mutations and transactions; delivery workers own invocation and retry scheduling.
 
+`sessions/recovery.py` owns incomplete-session recovery requests, results and
+copy rules alongside the registered-application recovery planning contracts.
+Callers can construct bounded requests and interpret recovery actions without
+loading stores. Claim acquisition, repair and execution remain in runtime owners.
+
 ### Session discovery
 
 `sessions/pending_action_contracts.py` owns bounded pending-action queries,

@@ -36,7 +36,6 @@ from cayu.sessions._model_completion_publication import (
     model_step_publication_from_checkpoint,
 )
 from cayu.sessions.base import (
-    IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     InterruptSessionRequest,
     ResumeRequest,
@@ -50,6 +49,7 @@ from cayu.sessions.checkpoints import (
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor

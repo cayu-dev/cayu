@@ -21,8 +21,6 @@ from cayu.runtime.execution_profiles import (
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import (
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
     InterruptSessionRequest,
     RunRequest,
     RuntimePublicationCheckpointOperation,
@@ -43,6 +41,7 @@ from cayu.sessions.checkpoints import (
 )
 from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
 from cayu.tools.exposure import ToolCapabilityCeiling
 from cayu.tools.user_input import UserInputTool
 from cayu.vaults import SecretRedactor

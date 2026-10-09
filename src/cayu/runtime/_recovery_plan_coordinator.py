@@ -65,9 +65,6 @@ from cayu.sessions._invocation_lifecycle import (
 )
 from cayu.sessions._terminal_evidence import _session_run_operation_from_checkpoint
 from cayu.sessions.base import (
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
-    IncompleteSessionRecoveryResult,
     ModelCompletionManualRecoveryRequest,
     ModelCompletionManualRecoveryResult,
     SessionStore,
@@ -90,6 +87,9 @@ from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import PendingActionKind, PendingActionSession, Session, SessionStatus
 from cayu.sessions.recovery import (
     RECOVERY_PLAN_MAX_CURSOR_BYTES,
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    IncompleteSessionRecoveryResult,
     RecoveryBlockerCode,
     RecoveryClaimEvidence,
     RecoveryDecision,

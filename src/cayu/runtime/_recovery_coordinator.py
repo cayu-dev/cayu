@@ -430,15 +430,9 @@ from cayu.sessions._terminal_evidence import (
 )
 from cayu.sessions.base import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
-    MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES,
     RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS,
     ActiveModelCompletionStage,
     CheckpointTransform,
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
-    IncompleteSessionRecoveryResult,
-    IncompleteSessionsRecoveryPage,
-    IncompleteSessionsRecoveryRequest,
     InteractionTransitionReceiptResult,
     InteractionTransitionSpec,
     ModelCompletionStage,
@@ -487,6 +481,14 @@ from cayu.sessions.invocation import (
 )
 from cayu.sessions.queries import MAX_SESSION_LIST_CURSOR_BYTES, SessionOrder, SessionQuery
 from cayu.sessions.records import EventRecord, Session, SessionStatus
+from cayu.sessions.recovery import (
+    MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES,
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    IncompleteSessionRecoveryResult,
+    IncompleteSessionsRecoveryPage,
+    IncompleteSessionsRecoveryRequest,
+)
 from cayu.tasks._terminalization import _terminalize_claimed_task
 from cayu.tasks.dispatch import (
     _new_prepared_subagent_dispatch_envelope,

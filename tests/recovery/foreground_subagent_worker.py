@@ -14,8 +14,9 @@ from cayu.messages import Message, ToolResultPart
 from cayu.providers.base import ModelProvider, ModelStreamEvent
 from cayu.runtime.authority import SessionRunFenced
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import IncompleteSessionRecoveryRequest, ResumeRequest, RunRequest
+from cayu.sessions.base import ResumeRequest, RunRequest
 from cayu.sessions.recovery import (
+    IncompleteSessionRecoveryRequest,
     RecoveryDecision,
     RecoveryExecutionRequest,
     RecoveryPlanAction,

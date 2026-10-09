@@ -27,7 +27,6 @@ from cayu.runtime._environment_lifecycle import EnvironmentLifecycle
 from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
 from cayu.sessions.base import (
     PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
-    IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     RunRequest,
 )
@@ -40,6 +39,7 @@ from cayu.sessions.messaging import (
     SessionMessageTarget,
 )
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.records import TaskStatus

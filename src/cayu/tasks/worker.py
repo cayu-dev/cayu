@@ -103,8 +103,8 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_matches_active_profile,
 )
 from cayu.sessions.authority import SessionRunFenced
-from cayu.sessions.base import IncompleteSessionRecoveryRequest
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.tasks._cancellation import _task_cancellation_terminalization_request
 from cayu.tasks._execution_settlement import TaskExecutionSettlement
 from cayu.tasks._schedule_wakeup import next_schedule_wake_at

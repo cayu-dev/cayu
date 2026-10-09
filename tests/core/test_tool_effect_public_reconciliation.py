@@ -887,11 +887,9 @@ def test_public_reconciliation_consumes_verified_outcome_without_external_replay
             # fresh decision and must neither revalidate nor redispatch.
             app = build_app()
             if fault_phase == "validation-plan-repair":
-                from cayu.sessions.base import (
+                from cayu.sessions.recovery import (
                     IncompleteSessionRecoveryAction,
                     IncompleteSessionRecoveryRequest,
-                )
-                from cayu.sessions.recovery import (
                     RecoveryBlockerCode,
                     RecoveryPlanAction,
                     RecoveryPlanRequest,

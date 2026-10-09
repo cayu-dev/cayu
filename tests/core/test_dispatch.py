@@ -68,7 +68,6 @@ from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authori
 from cayu.sessions.base import (
     ForkSessionRequest,
     ForkSourceSnapshot,
-    IncompleteSessionRecoveryAction,
     InMemorySessionStore,
     ModelTarget,
     QueuedDispatchTerminalReceipt,
@@ -96,6 +95,7 @@ from cayu.sessions.invocation import (
     TaskExecutionSource,
 )
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.recovery import IncompleteSessionRecoveryAction
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.creation import TaskCreate, task_create_with_runtime_invocation
 from cayu.tasks.dispatch import (

@@ -49,8 +49,6 @@ from cayu.runtime.execution_profiles import (
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions.base import (
     ForkSessionRequest,
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     InterruptSessionRequest,
     ResumeRequest,
@@ -66,6 +64,7 @@ from cayu.sessions.checkpoints import (
 )
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling

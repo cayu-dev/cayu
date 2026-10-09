@@ -118,7 +118,7 @@ def _cancelled_created_writer_scenario(
                     _InvocationLifecycleCommandReceipt,
                     _InvocationLifecycleReceiptLedger,
                 )
-                from cayu.sessions.base import IncompleteSessionRecoveryRequest
+                from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 
                 runtime_store = runtime_checkpoint_session_store(store)
                 original = _invocation_lifecycle_receipt_ledger_from_checkpoint(

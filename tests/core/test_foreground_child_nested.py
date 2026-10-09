@@ -21,14 +21,10 @@ from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_is_released,
 )
-from cayu.sessions.base import (
-    IncompleteSessionRecoveryRequest,
-    InMemorySessionStore,
-    InterruptSessionRequest,
-    RunRequest,
-)
+from cayu.sessions.base import InMemorySessionStore, InterruptSessionRequest, RunRequest
 from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.queries import SessionQuery
+from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy
 from cayu.tools.subagents import SubagentSpec, SubagentTool

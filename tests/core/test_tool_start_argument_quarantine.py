@@ -55,7 +55,6 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import (
-    IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     InterruptSessionRequest,
     ResumeRequest,
@@ -64,6 +63,7 @@ from cayu.sessions.base import (
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.storage.jsonl_export import export_sessions
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import PostgresSessionStore

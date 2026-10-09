@@ -28,8 +28,6 @@ from cayu.sessions import _model_completion_publication as model_completion_publ
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions.base import (
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     ModelCompletionStageRequest,
     ResumeRequest,
@@ -40,6 +38,7 @@ from cayu.sessions.base import (
     runtime_publication_checkpoint_mutation,
 )
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.tools.exposure import ToolCapabilityCeiling
 from cayu.vaults import REDACTED_SECRET, SecretRedactor

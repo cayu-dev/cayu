@@ -247,8 +247,6 @@ from cayu.sessions.base import (
     ForkExecutionProfileSelection,
     ForkSessionRequest,
     ForkSystemPromptReplacement,
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     InteractionTransitionSpec,
     InterruptSessionRequest,
@@ -311,6 +309,7 @@ from cayu.sessions.messaging import (
 )
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
 from cayu.sessions.terminal_evidence import (
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,

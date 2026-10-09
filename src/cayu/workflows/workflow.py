@@ -74,7 +74,6 @@ from cayu.runtime._child_session_identity import (
 from cayu.runtime._session_request_boundary import prepare_run_request
 from cayu.sessions._model_failover import ModelFailoverPolicy, copy_optional_model_failover_policy
 from cayu.sessions.base import (
-    IncompleteSessionRecoveryRequest,
     ModelTarget,
     RunRequest,
     RuntimeSessionCreateClaimAuthenticationDisposition,
@@ -88,6 +87,7 @@ from cayu.sessions.base import (
 )
 from cayu.sessions.invocation import SessionExecutionSource
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.vaults.redaction import contains_redacted_secret
 from cayu.workflows._step_identity import (
     GATED_LOOP_STEP_ID_PREFIX,

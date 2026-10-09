@@ -61,9 +61,6 @@ from cayu.sessions.base import (
     ForkExecutionProfileSelection,
     ForkSessionRequest,
     ForkSystemPromptPolicy,
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
-    IncompleteSessionsRecoveryRequest,
     InMemorySessionStore,
     ResumeRequest,
     RunRequest,
@@ -79,6 +76,11 @@ from cayu.sessions.invocation import (
     TaskInvocation,
 )
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.recovery import (
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    IncompleteSessionsRecoveryRequest,
+)
 from cayu.storage import migrations as schema_migrations
 from cayu.storage.sqlite import SQLiteTaskStore
 from cayu.tasks.contracts import (

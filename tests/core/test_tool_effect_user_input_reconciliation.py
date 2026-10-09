@@ -326,11 +326,9 @@ def test_user_input_sibling_receipt_recovers_without_repeating_external_effect(
             )
             app = await rebuild_app()
             if lookup_control == "abandon_validated_recovery":
-                from cayu.sessions.base import (
+                from cayu.sessions.recovery import (
                     IncompleteSessionRecoveryAction,
                     IncompleteSessionRecoveryRequest,
-                )
-                from cayu.sessions.recovery import (
                     RecoveryBlockerCode,
                     RecoveryPlanAction,
                     RecoveryPlanRequest,

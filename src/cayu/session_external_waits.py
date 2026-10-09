@@ -65,7 +65,7 @@ class SessionExternalWaitAdapter:
         inactive_for_seconds: int = 60,
     ) -> SessionExternalWaitReceipt:
         """Recover an admitted unfinished turn through the native recovery owner."""
-        from cayu.sessions.base import IncompleteSessionRecoveryRequest
+        from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 
         if type(inactive_for_seconds) is not int or inactive_for_seconds < 0:
             raise ValueError("External recovery requires a nonnegative inactivity interval.")

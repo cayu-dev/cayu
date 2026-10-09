@@ -52,9 +52,6 @@ from cayu.sessions._invocation_terminal_decision import (
     settled_invocation_terminal_decision_from_checkpoint,
 )
 from cayu.sessions.base import (
-    IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
-    IncompleteSessionRecoveryResult,
     ResumeRequest,
     RunRequest,
     SessionRunFenced,
@@ -67,6 +64,11 @@ from cayu.sessions.base import (
 )
 from cayu.sessions.invocation import SessionInvocationBinding
 from cayu.sessions.records import Session, SessionStatus, copy_session
+from cayu.sessions.recovery import (
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    IncompleteSessionRecoveryResult,
+)
 from cayu.tasks.admission import (
     WORK_ATTEMPT_RECOVERY_CHECKPOINT_KEY,
     WORK_ATTEMPT_RENEWABLE_STATES,
