@@ -133,6 +133,10 @@ _DEFAULT_CHECKPOINT_COMPACTION_SUMMARY_PREFIX = "Previous session context summar
 _COMPACTION_PROGRESS_STATE_KEY = "progress"
 _COMPACTION_PROGRESS_EXHAUSTED_KEY = "exhausted"
 _COMPACTION_PROGRESS_KEY = "key"
+# A checkpoint whose first compaction represented no source stores this typed
+# flag instead of a summary. It keeps the exhaustion marker without placing a
+# summary that represents nothing into model-facing context.
+_COMPACTION_NO_PROGRESS_KEY = "no_progress"
 _CONTEXT_CHECKPOINT_EVENT_STRUCTURE_KEYS = frozenset(
     {
         "checkpoint",
@@ -2708,10 +2712,11 @@ class ContextCompactor(ABC):
         request: ContextRequest,
         *,
         previous_summary: str | None,
+        after_no_progress: bool = False,
     ) -> str | None:
         """Identify the no-progress configuration selected for this policy build."""
 
-        del request, previous_summary
+        del request, previous_summary, after_no_progress
         return self._progress_key()
 
     def _bounded_input_for_request(self, request: CompactionRequest) -> bool | None:
@@ -3841,10 +3846,16 @@ def _prompt_cache_compaction_mode(
     request: ContextRequest,
     compactor: PromptCacheCompactor,
     previous_summary: str | None,
+    after_no_progress: bool = False,
 ) -> _PromptCacheCompactionMode:
-    """Choose the first-checkpoint cache path from one auditable decision."""
+    """Choose the first-checkpoint cache path from one auditable decision.
 
-    if previous_summary is not None or request.force_bounded_compaction:
+    ``after_no_progress`` marks a follow-up to a recorded first compaction that
+    represented no source. Like a follow-up to a summary, it uses bounded input
+    rather than repeating the exhausted first-checkpoint path.
+    """
+
+    if previous_summary is not None or after_no_progress or request.force_bounded_compaction:
         return _PromptCacheCompactionMode.BOUNDED
     if any(
         (
@@ -4021,6 +4032,7 @@ class PromptCacheCompactor(ContextCompactor):
         request: ContextRequest,
         *,
         previous_summary: str | None,
+        after_no_progress: bool = False,
     ) -> str | None:
         if type(self).compact is not PromptCacheCompactor.compact:
             return self._progress_key()
@@ -4028,6 +4040,7 @@ class PromptCacheCompactor(ContextCompactor):
             request=request,
             compactor=self,
             previous_summary=previous_summary,
+            after_no_progress=after_no_progress,
         )
         if mode == _PromptCacheCompactionMode.FALLBACK or (
             mode == _PromptCacheCompactionMode.EXACT
@@ -4036,6 +4049,7 @@ class PromptCacheCompactor(ContextCompactor):
             return self._fallback._progress_key_for_context_request(
                 request,
                 previous_summary=previous_summary,
+                after_no_progress=after_no_progress,
             )
         return self._progress_key()
 
@@ -5795,6 +5809,10 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
     best-effort. The estimated window trigger (including output reservation)
     remains a strict bound after size-triggered compaction; no evidence is
     dropped to meet the target. The default retains strict target enforcement.
+    A first compaction that represents no source records typed ``no_progress``
+    checkpoint state with its exhaustion marker instead of a summary, so the
+    model receives exactly the uncompacted context and the same configuration is
+    not retried on every turn.
     """
 
     def __init__(
@@ -6008,9 +6026,11 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
         previous_cursor = (
             previous.get("compacted_transcript_cursor") if previous is not None else None
         )
+        previous_no_progress = _is_no_progress_compaction_checkpoint(previous)
         if type(previous_summary) is not str:
             previous_summary = None
-            previous_cursor = None
+            if not previous_no_progress:
+                previous_cursor = None
 
         system_prefix, _ = _split_system_prefix(request.messages, True)
         if self.compact_after_estimated_context_tokens is not None:
@@ -6018,7 +6038,14 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
         first_compactable_cursor = len(system_prefix)
         size_selection_triggered = False
         size_selection_target_satisfied = True
-        if (
+        if previous_no_progress:
+            # No source is represented, so build exactly as if no compaction
+            # had happened. Keep the exhaustion marker only while it still
+            # describes the same uncompacted start of this transcript.
+            if previous_cursor != first_compactable_cursor:
+                previous_progress = {}
+            previous_cursor = first_compactable_cursor
+        elif (
             previous_summary is None
             or type(previous_cursor) is not int
             or previous_cursor < first_compactable_cursor
@@ -6084,6 +6111,7 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
         current_progress_key = self.compactor._progress_key_for_context_request(
             request,
             previous_summary=previous_summary,
+            after_no_progress=previous_no_progress,
         )
         if (
             should_compact
@@ -6144,6 +6172,7 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                         request=request,
                         compactor=self.compactor,
                         previous_summary=previous_summary,
+                        after_no_progress=previous_no_progress,
                     )
                     force_bounded_compaction = (
                         prompt_cache_mode == _PromptCacheCompactionMode.BOUNDED
@@ -6268,12 +6297,18 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                             "represented_existing_summary_sha256 to the exact existing "
                             "summary."
                         )
+                    # By the result contract, a zero-coverage summary without an
+                    # existing summary represents no source. Record that typed
+                    # state rather than a summary the model would receive.
+                    represents_no_source = covered_message_count == 0 and previous_summary is None
                     compaction_checkpoint = {
                         "version": _COMPACTION_CHECKPOINT_VERSION,
-                        "summary": result.summary,
+                        **({} if represents_no_source else {"summary": result.summary}),
                         "compacted_transcript_cursor": previous_cursor + covered_message_count,
                         "metadata": copy_durable_metadata(result.metadata),
                     }
+                    if represents_no_source:
+                        compaction_checkpoint[_COMPACTION_NO_PROGRESS_KEY] = True
                     if result.progress_exhausted:
                         compaction_checkpoint[_COMPACTION_PROGRESS_STATE_KEY] = {
                             _COMPACTION_PROGRESS_EXHAUSTED_KEY: True,
@@ -6297,7 +6332,7 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                         compaction_checkpoint.clear()
                         result = None
                         raise
-                    summary = result.summary
+                    summary = None if represents_no_source else result.summary
                     represented_cursor = previous_cursor + covered_message_count
                 finally:
                     _COMPACTION_COMPLETION_LEDGER.reset(completion_ledger_token)
@@ -6378,7 +6413,7 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                     newly_compacted_message_count=covered_message_count,
                     recent_message_count=len(recent_messages),
                     payload={
-                        "summary_chars": len(summary),
+                        "summary_chars": 0 if summary is None else len(summary),
                         "requested_source_start": previous_cursor,
                         "requested_source_end": compactable_cursor,
                         "represented_source_start": previous_cursor,
@@ -7227,6 +7262,17 @@ def _preserve_original_user_task(
             copy_message(messages[cursor]),
         ]
     return [copy_message(message) for message in system_prefix]
+
+
+def _is_no_progress_compaction_checkpoint(compaction: dict[str, Any] | None) -> bool:
+    """Return whether a compaction checkpoint records no represented source."""
+
+    return (
+        compaction is not None
+        and compaction.get(_COMPACTION_NO_PROGRESS_KEY) is True
+        and "summary" not in compaction
+        and type(compaction.get("compacted_transcript_cursor")) is int
+    )
 
 
 def _compaction_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any] | None:

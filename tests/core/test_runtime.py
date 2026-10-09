@@ -47211,7 +47211,8 @@ def test_digest_compactor_keeps_oversized_uncovered_source_in_every_projection()
     )
     assert first.checkpoint is not None
     assert first.checkpoint["context_compaction"]["compacted_transcript_cursor"] == 0
-    assert first.checkpoint["context_compaction"]["summary"] == ("No source history was compacted.")
+    assert "summary" not in first.checkpoint["context_compaction"]
+    assert first.checkpoint["context_compaction"]["no_progress"] is True
     assert first.checkpoint["context_compaction"]["progress"] == {
         "exhausted": True,
         "key": policy.compactor._progress_key(),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -1437,6 +1438,11 @@ def test_prompt_cache_digest_exhaustion_can_progress_on_bounded_followup() -> No
     assert first.checkpoint is not None
     assert first.checkpoint["context_compaction"]["compacted_transcript_cursor"] == 0
     assert first.checkpoint["context_compaction"]["progress"]["exhausted"] is True
+    assert first.checkpoint["context_compaction"]["no_progress"] is True
+    assert "summary" not in first.checkpoint["context_compaction"]
+    assert [message.model_dump(mode="json") for message in first.messages] == [
+        message.model_dump(mode="json") for message in messages
+    ]
     assert provider.requests == []
 
     second = asyncio.run(
@@ -1461,6 +1467,13 @@ def test_prompt_cache_digest_exhaustion_can_progress_on_bounded_followup() -> No
     assert second.checkpoint["context_compaction"]["summary"] == "provider summary"
     assert "progress" not in second.checkpoint["context_compaction"]
     assert len(provider.requests) == 1
+    # The follow-up is bounded because a first attempt was recorded, but it is
+    # not handed a summary that represents no source.
+    bounded_prompt = json.dumps(
+        [message.model_dump(mode="json") for message in provider.requests[0].messages]
+    )
+    assert "No source history was compacted." not in bounded_prompt
+    assert "Previous summary" not in bounded_prompt
 
 
 @pytest.mark.parametrize("last_transcript_cursor", [None, 0, 3])

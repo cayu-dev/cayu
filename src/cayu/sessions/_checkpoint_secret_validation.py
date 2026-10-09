@@ -360,6 +360,7 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "operation_id",
     "manifest",
     "manifest_truncated",
+    "no_progress",
     "progress",
     "provider_count_context_window_tokens",
     "provider_count_input_tokens",
