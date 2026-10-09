@@ -162,7 +162,7 @@ assert not {
 
 
 def test_search_scoring_has_one_owner_and_resolvable_annotations():
-    from cayu.storage import memory, postgres
+    from cayu.storage import knowledge_embedding_postgres, memory
 
     for name in (
         "_score_entry",
@@ -176,4 +176,4 @@ def test_search_scoring_has_one_owner_and_resolvable_annotations():
         assert canonical.__module__ == rules.__name__
         assert not hasattr(memory, name)
         get_type_hints(canonical)
-    assert postgres._score_entry is rules._score_entry
+    assert knowledge_embedding_postgres._score_entry is rules._score_entry

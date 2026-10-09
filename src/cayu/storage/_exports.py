@@ -294,7 +294,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "PostgresAgentWorkContextStore",
     ),
     "PostgresBudgetLedger": ("cayu.storage.budget_postgres", "PostgresBudgetLedger"),
-    "PostgresEmbeddingKnowledgeStore": ("cayu.storage.postgres", "PostgresEmbeddingKnowledgeStore"),
+    "PostgresEmbeddingKnowledgeStore": (
+        "cayu.storage.knowledge_embedding_postgres",
+        "PostgresEmbeddingKnowledgeStore",
+    ),
     "PostgresEvalStore": ("cayu.storage.evals_postgres", "PostgresEvalStore"),
     "PostgresEventWatcherStore": (
         "cayu.storage.event_watchers_postgres",

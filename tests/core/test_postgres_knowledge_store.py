@@ -1628,7 +1628,7 @@ def _new_embedding_store(
     max_size: int = 4,
     access_scope: KnowledgeAccessScope | None = _ACCESS_SCOPE,
 ):
-    from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
+    from cayu.storage.knowledge_embedding_postgres import PostgresEmbeddingKnowledgeStore
 
     return PostgresEmbeddingKnowledgeStore(
         dsn,
@@ -2419,7 +2419,7 @@ def test_postgres_semantic_candidate_hydration_uses_one_read_snapshot(
     postgres_dsn: str,
 ) -> None:
     async def run() -> None:
-        from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
+        from cayu.storage.knowledge_embedding_postgres import PostgresEmbeddingKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _skip_if_pgvector_unavailable(postgres_dsn)
@@ -2529,7 +2529,7 @@ def test_postgres_semantic_candidate_hydration_uses_one_read_snapshot(
 
 def test_postgres_hybrid_lanes_share_one_read_snapshot(postgres_dsn: str) -> None:
     async def run() -> None:
-        from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
+        from cayu.storage.knowledge_embedding_postgres import PostgresEmbeddingKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _skip_if_pgvector_unavailable(postgres_dsn)
@@ -2805,7 +2805,7 @@ def test_postgres_embedding_worker_fences_superseded_attempt_vector_write(
 def test_postgres_hard_delete_cannot_remove_same_id_republication_embeddings(
     postgres_dsn: str,
 ) -> None:
-    from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
+    from cayu.storage.knowledge_embedding_postgres import PostgresEmbeddingKnowledgeStore
 
     class DelayedDeleteCleanupStore(PostgresEmbeddingKnowledgeStore):
         def __init__(self, *args, **kwargs) -> None:
@@ -3494,7 +3494,7 @@ def test_postgres_embedding_worker_pages_stale_cleanup_within_record_budget(
 def test_postgres_embedding_worker_repairs_committed_vector_after_restart(
     postgres_dsn: str,
 ) -> None:
-    from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
+    from cayu.storage.knowledge_embedding_postgres import PostgresEmbeddingKnowledgeStore
 
     class CrashAfterVectorStore(PostgresEmbeddingKnowledgeStore):
         fail_ready_once = True
@@ -3638,7 +3638,7 @@ def test_postgres_embedding_knowledge_store_skips_hnsw_for_large_dimensions(
     postgres_dsn: str,
 ) -> None:
     async def ops():
-        from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
+        from cayu.storage.knowledge_embedding_postgres import PostgresEmbeddingKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _skip_if_pgvector_unavailable(postgres_dsn)
@@ -3690,7 +3690,7 @@ def test_postgres_embedding_knowledge_store_reports_dimension_mismatch_before_in
     postgres_dsn: str,
 ) -> None:
     async def ops():
-        from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
+        from cayu.storage.knowledge_embedding_postgres import PostgresEmbeddingKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _skip_if_pgvector_unavailable(postgres_dsn)
@@ -3757,7 +3757,7 @@ def test_postgres_embedding_schema_rejects_missing_declared_constraints(
         import psycopg
         from psycopg import sql
 
-        from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
+        from cayu.storage.knowledge_embedding_postgres import PostgresEmbeddingKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _skip_if_pgvector_unavailable(postgres_dsn)
@@ -3896,7 +3896,7 @@ def test_postgres_embedding_schema_rejects_cross_space_hnsw_index(
     async def ops() -> None:
         import psycopg
 
-        from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
+        from cayu.storage.knowledge_embedding_postgres import PostgresEmbeddingKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _skip_if_pgvector_unavailable(postgres_dsn)
@@ -3951,6 +3951,7 @@ def test_postgres_embedding_schema_rejects_restricted_current_hnsw_index(
         import psycopg
         from psycopg import sql
 
+        from cayu.storage.knowledge_embedding_postgres import PostgresEmbeddingKnowledgeStore
         from cayu.storage.memory import (
             KNOWLEDGE_CHUNK_TEXT_GENERATOR,
             KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION,
@@ -3958,7 +3959,6 @@ def test_postgres_embedding_schema_rejects_restricted_current_hnsw_index(
             KNOWLEDGE_CHUNK_TEXT_PROJECTION,
             KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION,
         )
-        from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _skip_if_pgvector_unavailable(postgres_dsn)
@@ -4177,7 +4177,7 @@ def test_postgres_embedding_failure_is_visible_until_explicit_backfill_recovers(
         await _drop_all(postgres_dsn)
         await _skip_if_pgvector_unavailable(postgres_dsn)
         provider = FlakyEmbeddingProvider()
-        from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
+        from cayu.storage.knowledge_embedding_postgres import PostgresEmbeddingKnowledgeStore
 
         store = PostgresEmbeddingKnowledgeStore(
             postgres_dsn,
@@ -4493,7 +4493,7 @@ def test_postgres_concurrent_projection_writers_cannot_replace_one_attempt_vecto
 def test_postgres_projection_store_serializes_readiness_and_keeps_one_current_attempt(
     postgres_dsn: str,
 ) -> None:
-    from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
+    from cayu.storage.knowledge_embedding_postgres import PostgresEmbeddingKnowledgeStore
 
     class BlockingProjectionStore(PostgresEmbeddingKnowledgeStore):
         def __init__(self, *args, **kwargs) -> None:
@@ -4955,6 +4955,10 @@ def test_postgres_embedding_none_terms_do_not_consume_semantic_candidate_limit(
     postgres_dsn: str,
 ) -> None:
     async def ops() -> tuple[list[str], int | None, bool]:
+        from cayu.storage.knowledge_embedding_postgres import (
+            _PGVECTOR_SEMANTIC_CANDIDATE_MULTIPLIER,
+            _postgres_vector_literal,
+        )
         from cayu.storage.knowledge_postgres import (
             _postgres_knowledge_filter_sql,
             _postgres_knowledge_none_filter_sql,
@@ -4965,10 +4969,6 @@ def test_postgres_embedding_none_terms_do_not_consume_semantic_candidate_limit(
             KNOWLEDGE_CHUNK_TEXT_PREPROCESSING_VERSION,
             KNOWLEDGE_CHUNK_TEXT_PROJECTION,
             KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION,
-        )
-        from cayu.storage.postgres import (
-            _PGVECTOR_SEMANTIC_CANDIDATE_MULTIPLIER,
-            _postgres_vector_literal,
         )
 
         await _drop_all(postgres_dsn)
@@ -5102,7 +5102,7 @@ def test_postgres_embedding_access_filters_cannot_hide_ready_hnsw_candidates(
     postgres_dsn: str,
 ) -> None:
     async def ops():
-        from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
+        from cayu.storage.knowledge_embedding_postgres import PostgresEmbeddingKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _skip_if_pgvector_unavailable(postgres_dsn)
@@ -6035,7 +6035,7 @@ def test_postgres_embedding_store_segregates_models_until_explicit_reindex(
     postgres_dsn: str,
 ) -> None:
     async def ops():
-        from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
+        from cayu.storage.knowledge_embedding_postgres import PostgresEmbeddingKnowledgeStore
 
         await _drop_all(postgres_dsn)
         await _skip_if_pgvector_unavailable(postgres_dsn)

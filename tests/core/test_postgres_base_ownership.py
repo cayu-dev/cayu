@@ -22,6 +22,7 @@ from cayu.storage.migrations import SchemaMode
         ("tasks_postgres", "PostgresTaskStore"),
         ("work_context_postgres", "PostgresAgentWorkContextStore"),
         ("knowledge_postgres", "PostgresKnowledgeStore"),
+        ("knowledge_embedding_postgres", "PostgresEmbeddingKnowledgeStore"),
         ("event_watchers_postgres", "PostgresEventWatcherStore"),
         ("evals_postgres", "PostgresEvalStore"),
         ("collaboration_postgres", "PostgresCollaborationStore"),
@@ -40,21 +41,41 @@ import importlib
 import importlib.abc
 import sys
 
+blocked = {"cayu.storage.postgres"}
+if sys.argv[1] != "knowledge_embedding_postgres":
+    blocked.add("cayu.storage.knowledge_embedding_postgres")
+
 class NoMonolithicStores(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname == "cayu.storage.postgres":
+        if fullname in blocked:
             raise AssertionError("standalone owner imported monolithic stores")
 
 sys.meta_path.insert(0, NoMonolithicStores())
 owner = importlib.import_module("cayu.storage." + sys.argv[1])
 store_type = getattr(owner, sys.argv[2])
-if sys.argv[2] in {"PostgresBudgetLedger", "PostgresEventWatcherStore"}:
+if sys.argv[2] in {
+    "PostgresBudgetLedger", "PostgresEventWatcherStore", "PostgresTaskStore",
+    "PostgresAgentWorkContextStore", "PostgresKnowledgeStore",
+    "PostgresEmbeddingKnowledgeStore",
+}:
     import cayu
     import cayu.storage
     for public in (cayu, cayu.storage):
         assert getattr(public, sys.argv[2]) is store_type
         assert sys.argv[2] not in public.__all__
-store = store_type("postgresql://example/cayu")
+options = {}
+if sys.argv[2] == "PostgresEmbeddingKnowledgeStore":
+    from cayu.embeddings import TextEmbeddingProvider
+    class UnusedEmbeddingProvider(TextEmbeddingProvider):
+        name = "independent-construction"
+        async def embed_texts(self, request):
+            raise AssertionError("construction must not call the embedding provider")
+    options = {
+        "embedding_provider": UnusedEmbeddingProvider(),
+        "embedding_model": "independent-construction",
+        "embedding_dimensions": 3,
+    }
+store = store_type("postgresql://example/cayu", **options)
 assert not store._opened
 assert store._owns_pool
 asyncio.run(store.close())

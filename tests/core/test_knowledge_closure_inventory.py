@@ -627,9 +627,9 @@ def test_knowledge_closure_includes_real_embedding_projection_once():
 
 
 def test_postgres_plain_handle_inventories_persisted_embedding_projection(postgres_dsn):
+    from cayu.storage.knowledge_embedding_postgres import PostgresEmbeddingKnowledgeStore
     from cayu.storage.knowledge_postgres import PostgresKnowledgeStore
     from cayu.storage.migrations import SchemaMode
-    from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
 
     async def run():
         provider = KeywordEmbeddingProvider()

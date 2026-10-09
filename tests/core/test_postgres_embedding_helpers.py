@@ -7,7 +7,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from cayu.storage import KnowledgeAccessScope, KnowledgeQuery, KnowledgeSearchMode
-from cayu.storage.postgres import (
+from cayu.storage.knowledge_embedding_postgres import (
     _PGVECTOR_HNSW_VECTOR_MAX_DIMENSIONS,
     PostgresEmbeddingKnowledgeStore,
     _warn_if_embedding_dims_exceed_hnsw,

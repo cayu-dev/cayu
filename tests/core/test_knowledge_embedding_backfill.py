@@ -224,7 +224,7 @@ assert not {
 
 
 def test_backfill_rules_have_one_owner_and_resolvable_annotations():
-    from cayu.storage import memory, postgres
+    from cayu.storage import knowledge_embedding_postgres, memory
 
     for name in (
         "_KnowledgeEmbeddingBackfillCursor",
@@ -241,7 +241,7 @@ def test_backfill_rules_have_one_owner_and_resolvable_annotations():
             "_KnowledgeEmbeddingBackfillCursor",
             "_knowledge_embedding_backfill_sort_key",
         ):
-            assert getattr(postgres, name) is canonical
+            assert getattr(knowledge_embedding_postgres, name) is canonical
 
 
 _GOLDEN_FINGERPRINT = "41b2f8fe481bda6140b79aa8c1cd2c43134dbc7011eb13c7acf2b4a14d97f3d3"

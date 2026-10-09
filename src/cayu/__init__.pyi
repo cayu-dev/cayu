@@ -4474,6 +4474,9 @@ from cayu.storage.event_watchers_postgres import (
 from cayu.storage.knowledge_embedding_memory import (
     InMemoryEmbeddingKnowledgeStore as InMemoryEmbeddingKnowledgeStore,
 )
+from cayu.storage.knowledge_embedding_postgres import (
+    PostgresEmbeddingKnowledgeStore as PostgresEmbeddingKnowledgeStore,
+)
 from cayu.storage.knowledge_indexer import (
     DEFAULT_KNOWLEDGE_CHUNK_OVERLAP_BYTES as DEFAULT_KNOWLEDGE_CHUNK_OVERLAP_BYTES,
 )
@@ -4490,7 +4493,6 @@ from cayu.storage.knowledge_memory import InMemoryKnowledgeStore as InMemoryKnow
 from cayu.storage.knowledge_postgres import PostgresKnowledgeStore as PostgresKnowledgeStore
 from cayu.storage.knowledge_review import KnowledgeReviewWorkflow as KnowledgeReviewWorkflow
 from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore as SQLiteKnowledgeStore
-from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore as PostgresEmbeddingKnowledgeStore
 from cayu.storage.postgres import PostgresSessionStore as PostgresSessionStore
 from cayu.storage.product_operations_postgres import (
     PostgresProductOperationStore as PostgresProductOperationStore,

@@ -830,6 +830,9 @@ verified-work components; their native transactions and locks stay with the oper
 lease claims and delivery checkpoints, including their advisory locks and atomic writes.
 `storage/knowledge_postgres.py` owns ordinary knowledge persistence, revision and
 publication receipts, access-filtered queries, row conversion and ordered knowledge locks.
+`storage/knowledge_embedding_postgres.py` extends that adapter with embedding projection,
+pgvector schema/index reconciliation and semantic search. Ordinary knowledge and the other
+adapters can be constructed without loading embedding or session-store implementations.
 
 Files are good source-of-truth for prompts, instructions, workflows, manuals, skills, and human-reviewed memories.
 

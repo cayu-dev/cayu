@@ -91,9 +91,9 @@ def test_knowledge_store_preserves_import_identity_subclasses_and_annotations():
     import cayu.storage as storage
     import cayu.storage.memory as legacy
     from cayu.storage._knowledge_closure import KnowledgeClosureQuery
+    from cayu.storage.knowledge_embedding_postgres import PostgresEmbeddingKnowledgeStore
     from cayu.storage.knowledge_postgres import PostgresKnowledgeStore
     from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore
-    from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
 
     assert legacy.KnowledgeStore is KnowledgeStore
     assert pickle.loads(b"ccayu.storage.memory\nKnowledgeStore\n.") is KnowledgeStore

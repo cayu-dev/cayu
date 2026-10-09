@@ -142,7 +142,7 @@ def test_postgres_knowledge_resource_access(postgres_dsn, embedding):
         if embedding:
             from tests.core.test_knowledge_store import KeywordEmbeddingProvider
 
-            from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
+            from cayu.storage.knowledge_embedding_postgres import PostgresEmbeddingKnowledgeStore
 
             store = PostgresEmbeddingKnowledgeStore(
                 postgres_dsn,
@@ -166,9 +166,9 @@ def test_postgres_embedding_bound_scope_keyword_fallback(postgres_dsn, mode):
     from tests.core.test_knowledge_store import KeywordEmbeddingProvider
 
     from cayu.knowledge.access import ScopedKnowledgeAccess
+    from cayu.storage.knowledge_embedding_postgres import PostgresEmbeddingKnowledgeStore
     from cayu.storage.memory import KnowledgeAccessDenied, KnowledgeRevisionRef
     from cayu.storage.migrations import SchemaMode
-    from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
 
     async def run():
         namespace = uuid4().hex
