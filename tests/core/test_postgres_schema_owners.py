@@ -16,6 +16,8 @@ _OWNERS = [
     "_postgres_catalog",
     "_postgres_eval_schema",
     "_postgres_knowledge_schema",
+    "_postgres_task_schema",
+    "_postgres_verified_work_schema",
     "_postgres_work_context_schema",
 ]
 
