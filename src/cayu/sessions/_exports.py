@@ -149,7 +149,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.sessions.cleanup",
         "DEFAULT_RECOVERY_CLEANUP_STEP_TIMEOUT_SECONDS",
     ),
-    "DeferredInteractionInput": ("cayu.sessions.base", "DeferredInteractionInput"),
+    "DeferredInteractionInput": ("cayu.sessions.transcript_input", "DeferredInteractionInput"),
     "DelegatedActionReference": (
         "cayu.sessions.pending_action_contracts",
         "DelegatedActionReference",

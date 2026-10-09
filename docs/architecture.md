@@ -510,6 +510,13 @@ hashing. These values and rules compose without loading session stores.
 Native stores compose these rules with their existing transcript queries and
 indexes; index maintenance, schema validation and atomic reads remain store-owned.
 
+`sessions/transcript_input.py` owns deferred input, its durable payload codecs,
+authenticated replacement checks, detached message copying and initial-transcript
+prefix validation. Runtime admission retains the authority that binds a request to
+its session; stores compose these pure rules inside their existing publication
+transactions. Public transcript contracts retain their supported imports and saved
+pickle references.
+
 ### Session control contracts
 
 `sessions/messaging.py` owns queued-message requests, inspection and delivery

@@ -45406,5 +45406,11 @@
     "tests/core/test_transcript_package_layout.py::test_transcript_snapshot_and_fork_validation_without_stores[cayu.sessions.transcript_queries]": 0.3258115420176182,
     "tests/core/test_transcript_package_layout.py::test_transcript_snapshot_and_fork_validation_without_stores[cayu.sessions]": 0.1975632089888677,
     "tests/core/test_transcript_package_layout.py::test_transcript_snapshot_and_fork_validation_without_stores[cayu]": 0.21027512397267856,
-    "tests/core/test_transcript_package_layout.py::test_transcript_snapshot_public_imports_and_historical_pickle_global": 1.4136690000013914
+    "tests/core/test_transcript_package_layout.py::test_transcript_snapshot_public_imports_and_historical_pickle_global": 1.4136690000013914,
+    "tests/core/test_transcript_package_layout.py::test_deferred_input_payload_and_replacement_without_stores[cayu.runtime]": 0.12835245797759853,
+    "tests/core/test_transcript_package_layout.py::test_deferred_input_payload_and_replacement_without_stores[cayu.sessions.transcript_input]": 0.12158325099153444,
+    "tests/core/test_transcript_package_layout.py::test_deferred_input_payload_and_replacement_without_stores[cayu.sessions]": 0.11623300000792369,
+    "tests/core/test_transcript_package_layout.py::test_deferred_input_payload_and_replacement_without_stores[cayu]": 0.1299198739870917,
+    "tests/core/test_transcript_package_layout.py::test_deferred_input_public_imports_and_historical_pickle_global": 0.0003100830072071403,
+    "tests/core/test_transcript_package_layout.py::test_transcript_input_copy_and_prefix_rules_without_stores": 0.11401979200309142
 }

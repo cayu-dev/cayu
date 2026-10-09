@@ -12,9 +12,9 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, canonical_durable_json_bytes
 from cayu.events import EventType
 from cayu.sessions._model_completion_publication import model_step_publication_from_checkpoint
-from cayu.sessions.base import DeferredInteractionInput
 from cayu.sessions.checkpoints import decode_runtime_checkpoint
 from cayu.sessions.records import EventRecord, Session, TranscriptRecord
+from cayu.sessions.transcript_input import DeferredInteractionInput
 from cayu.tools.grants import TargetedToolGrantStateSnapshot
 
 SESSION_EXPORT_PAGE_SIZE = 256

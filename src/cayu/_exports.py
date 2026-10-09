@@ -1864,7 +1864,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "DOCKER_CODING_TOOLCHAIN_PROFILE_SCHEMA",
     ),
     "DefaultContextPolicy": ("cayu.context.base", "DefaultContextPolicy"),
-    "DeferredInteractionInput": ("cayu.sessions.base", "DeferredInteractionInput"),
+    "DeferredInteractionInput": ("cayu.sessions.transcript_input", "DeferredInteractionInput"),
     "DeferredMaterialization": ("cayu.environments.deferred", "DeferredMaterialization"),
     "DeferredRunner": ("cayu.environments.deferred", "DeferredRunner"),
     "DeferredWorkspaceBinding": ("cayu.environments.deferred", "DeferredWorkspaceBinding"),

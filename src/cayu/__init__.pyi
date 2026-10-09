@@ -3894,7 +3894,6 @@ from cayu.sessions.base import SESSION_RUNTIME_METADATA_PREFIX as SESSION_RUNTIM
 from cayu.sessions.base import CheckpointRootFieldGuard as CheckpointRootFieldGuard
 from cayu.sessions.base import CheckpointRootFieldProjection as CheckpointRootFieldProjection
 from cayu.sessions.base import CompactSessionRequest as CompactSessionRequest
-from cayu.sessions.base import DeferredInteractionInput as DeferredInteractionInput
 from cayu.sessions.base import (
     ForkExecutionProfileDecisionRecord as ForkExecutionProfileDecisionRecord,
 )
@@ -4256,6 +4255,7 @@ from cayu.sessions.topology import SessionTopologyDepthExceeded as SessionTopolo
 from cayu.sessions.topology import SessionTopologyNode as SessionTopologyNode
 from cayu.sessions.topology import SessionTopologyQuery as SessionTopologyQuery
 from cayu.sessions.topology import SessionTopologyStoreResult as SessionTopologyStoreResult
+from cayu.sessions.transcript_input import DeferredInteractionInput as DeferredInteractionInput
 from cayu.sessions.transcript_queries import TranscriptPage as TranscriptPage
 from cayu.sessions.transcript_queries import TranscriptQuery as TranscriptQuery
 from cayu.sessions.transcript_queries import TranscriptSearchHit as TranscriptSearchHit

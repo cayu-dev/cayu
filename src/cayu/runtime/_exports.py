@@ -447,7 +447,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "DEFAULT_TOOL_RESULT_PREVIEW_BYTES",
     ),
     "DefaultContextPolicy": ("cayu.context.base", "DefaultContextPolicy"),
-    "DeferredInteractionInput": ("cayu.sessions.base", "DeferredInteractionInput"),
+    "DeferredInteractionInput": ("cayu.sessions.transcript_input", "DeferredInteractionInput"),
     "DelegatedActionReference": (
         "cayu.sessions.pending_action_contracts",
         "DelegatedActionReference",

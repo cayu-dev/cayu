@@ -13,7 +13,6 @@ from cayu.messages import Message
 from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.sessions.base import (
     SESSION_CREATE_CLAIM_METADATA_KEY,
-    DeferredInteractionInput,
     InMemorySessionStore,
     RunRequest,
     RuntimeSessionCreateClaimAuthenticationDisposition,
@@ -30,6 +29,7 @@ from cayu.sessions.base import (
     runtime_session_create_claim_reference,
 )
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.transcript_input import DeferredInteractionInput
 from cayu.vaults import SecretRedactor
 
 _REFERENCE_KEY = RuntimeSessionCreateClaimReferenceKey(

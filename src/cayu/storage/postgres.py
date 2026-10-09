@@ -196,7 +196,6 @@ from cayu.sessions.base import (
     BudgetReservationIdentityConflict,
     CheckpointRootFieldGuard,
     CheckpointTransform,
-    DeferredInteractionInput,
     ForkCheckpointAuthorityDecoder,
     ForkSystemPromptReplacement,
     InteractionAttribution,
@@ -284,7 +283,6 @@ from cayu.sessions.base import (
     _historical_queued_handoff_stage_from_records,
     _incomplete_recovery_claim_from_checkpoint,
     _initial_transcript_pending_checkpoint,
-    _initial_transcript_prefix_count,
     _interaction_transition_receipt_record,
     _interaction_transition_spec_from_receipt,
     _interaction_transition_storage_key,
@@ -399,12 +397,8 @@ from cayu.sessions.base import (
     copy_session_identity,
     copy_session_runtime_identity,
     copy_session_user_metadata,
-    copy_transcript_messages,
     deferred_interaction_input_for_run_request,
-    deferred_interaction_input_from_storage_payload,
-    deferred_interaction_input_storage_payload,
     replace_session_user_metadata,
-    require_deferred_initial_transcript_replacement,
     resolve_interaction_attribution,
     restore_persisted_event_authority,
     session_instance_id_for_run_request,
@@ -508,6 +502,14 @@ from cayu.sessions.topology import (
     SessionTopologyStoreResult,
     build_session_topology_result,
     decode_session_topology_cursor,
+)
+from cayu.sessions.transcript_input import (
+    DeferredInteractionInput,
+    _initial_transcript_prefix_count,
+    copy_transcript_messages,
+    deferred_interaction_input_from_storage_payload,
+    deferred_interaction_input_storage_payload,
+    require_deferred_initial_transcript_replacement,
 )
 from cayu.sessions.transcript_queries import (
     LATEST_TRANSCRIPT_TEXT_MAX_CHARS,
