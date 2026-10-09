@@ -79,7 +79,6 @@ from cayu.sessions.base import (
     SessionIdentity,
     SessionOperationPublication,
     SessionRunFenced,
-    _McpManifestBaselineEvidenceInvalid,
     fork_session_invocation,
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery, EventQueryResultTooLarge
@@ -89,6 +88,9 @@ from cayu.sessions.invocation import (
     SessionExecutionSource,
 )
 from cayu.sessions.lineage import SessionLineageQuery
+from cayu.sessions.mcp_manifest_history import (
+    _McpManifestBaselineEvidenceInvalid,
+)
 from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.queries import SessionDebugState, SessionOrder, SessionQuery
 from cayu.sessions.records import PendingActionKind, Session, SessionStatus

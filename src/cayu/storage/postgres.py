@@ -201,9 +201,6 @@ from cayu.sessions.base import (
     InteractionTransitionReceiptResult,
     InteractionTransitionResult,
     InteractionTransitionSpec,
-    McpManifestBaseline,
-    McpManifestBaselineLoadResult,
-    McpManifestPublicationResult,
     ModelCompletionStage,
     ModelCompletionStageAbandonmentResult,
     ModelCompletionStageDispatch,
@@ -418,6 +415,11 @@ from cayu.sessions.invocation import SessionInvocation
 from cayu.sessions.lineage import (
     SessionLineageQuery,
     SessionLineageResult,
+)
+from cayu.sessions.mcp_manifest_history import (
+    McpManifestBaseline,
+    McpManifestBaselineLoadResult,
+    McpManifestPublicationResult,
 )
 from cayu.sessions.messaging import (
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,

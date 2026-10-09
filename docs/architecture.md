@@ -529,6 +529,13 @@ its session; stores compose these pure rules inside their existing publication
 transactions. Public transcript contracts retain their supported imports and saved
 pickle references.
 
+### MCP manifest history
+
+`sessions/mcp_manifest_history.py` owns accepted MCP manifest records, bounded
+hashed tool evidence and baseline/publication results. These contracts are usable
+without session stores or runtime execution. Runtime manifest policy decisions
+and native atomic publication remain with their existing owners.
+
 ### Session control contracts
 
 `sessions/messaging.py` owns queued-message requests, inspection and delivery

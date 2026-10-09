@@ -250,7 +250,6 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     InteractionTransitionSpec,
     InterruptSessionRequest,
-    McpManifestBaseline,
     ModelCompletionStageDisposition,
     ModelCompletionStageRequest,
     ModelTarget,
@@ -271,8 +270,6 @@ from cayu.sessions.base import (
     SessionStore,
     _checkpoint_with_session_run_operation,
     _deactivate_session_run_fence,
-    _mcp_authoritative_manifest_hash,
-    _mcp_manifest_session_ref,
     fork_session_invocation,
     queued_interaction_profile_handoff_evidence,
     runtime_publication_checkpoint_mutation,
@@ -298,6 +295,11 @@ from cayu.sessions.invocation import (
     InvocationOriginClaim,
     InvocationOriginTrust,
     SessionExecutionSource,
+)
+from cayu.sessions.mcp_manifest_history import (
+    McpManifestBaseline,
+    _mcp_authoritative_manifest_hash,
+    _mcp_manifest_session_ref,
 )
 from cayu.sessions.messaging import (
     EnqueueSessionMessageRequest,

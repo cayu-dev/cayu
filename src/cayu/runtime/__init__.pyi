@@ -876,10 +876,6 @@ from cayu.sessions.base import (
 from cayu.sessions.base import InteractionTransitionResult as InteractionTransitionResult
 from cayu.sessions.base import InteractionTransitionSpec as InteractionTransitionSpec
 from cayu.sessions.base import InterruptSessionRequest as InterruptSessionRequest
-from cayu.sessions.base import McpManifestBaseline as McpManifestBaseline
-from cayu.sessions.base import McpManifestBaselineLoadResult as McpManifestBaselineLoadResult
-from cayu.sessions.base import McpManifestHistoryConflict as McpManifestHistoryConflict
-from cayu.sessions.base import McpManifestPublicationResult as McpManifestPublicationResult
 from cayu.sessions.base import (
     ModelCompletionManualRecoveryRequest as ModelCompletionManualRecoveryRequest,
 )
@@ -1104,6 +1100,18 @@ from cayu.sessions.lineage import SessionLineageNode as SessionLineageNode
 from cayu.sessions.lineage import SessionLineageOrigin as SessionLineageOrigin
 from cayu.sessions.lineage import SessionLineageQuery as SessionLineageQuery
 from cayu.sessions.lineage import SessionLineageResult as SessionLineageResult
+from cayu.sessions.mcp_manifest_history import (
+    McpManifestBaseline as McpManifestBaseline,
+)
+from cayu.sessions.mcp_manifest_history import (
+    McpManifestBaselineLoadResult as McpManifestBaselineLoadResult,
+)
+from cayu.sessions.mcp_manifest_history import (
+    McpManifestHistoryConflict as McpManifestHistoryConflict,
+)
+from cayu.sessions.mcp_manifest_history import (
+    McpManifestPublicationResult as McpManifestPublicationResult,
+)
 from cayu.sessions.messaging import EnqueueSessionMessageRequest as EnqueueSessionMessageRequest
 from cayu.sessions.messaging import EnqueueSessionMessageResult as EnqueueSessionMessageResult
 from cayu.sessions.messaging import SessionMessageAccessContext as SessionMessageAccessContext

@@ -104,13 +104,15 @@ from cayu.providers.base import (
 from cayu.runtime._event_projection import public_event_sequence
 from cayu.sessions.base import (
     InMemorySessionStore,
-    _mcp_authoritative_manifest_hash,
-    _mcp_manifest_session_ref,
 )
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+)
+from cayu.sessions.mcp_manifest_history import (
+    _mcp_authoritative_manifest_hash,
+    _mcp_manifest_session_ref,
 )
 from cayu.storage import migrations as schema_migrations
 from cayu.tools.policy import ToolPolicy, ToolPolicyDecision, ToolPolicyRequest, ToolPolicyResult

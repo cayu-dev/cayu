@@ -45425,5 +45425,13 @@
     "tests/core/test_transcript_package_layout.py::test_deferred_input_payload_and_replacement_without_stores[cayu.sessions]": 0.11623300000792369,
     "tests/core/test_transcript_package_layout.py::test_deferred_input_payload_and_replacement_without_stores[cayu]": 0.1299198739870917,
     "tests/core/test_transcript_package_layout.py::test_deferred_input_public_imports_and_historical_pickle_global": 0.0003100830072071403,
-    "tests/core/test_transcript_package_layout.py::test_transcript_input_copy_and_prefix_rules_without_stores": 0.11401979200309142
+    "tests/core/test_transcript_package_layout.py::test_transcript_input_copy_and_prefix_rules_without_stores": 0.11401979200309142,
+    "tests/core/test_mcp_manifest_package_layout.py::test_manifest_public_imports_and_historical_pickle_globals[McpManifestBaselineLoadResult]": 0.0002531670033931732,
+    "tests/core/test_mcp_manifest_package_layout.py::test_manifest_public_imports_and_historical_pickle_globals[McpManifestBaseline]": 1.48061145900283,
+    "tests/core/test_mcp_manifest_package_layout.py::test_manifest_public_imports_and_historical_pickle_globals[McpManifestHistoryConflict]": 0.0001669169869273901,
+    "tests/core/test_mcp_manifest_package_layout.py::test_manifest_public_imports_and_historical_pickle_globals[McpManifestPublicationResult]": 0.00017145901801995933,
+    "tests/core/test_mcp_manifest_package_layout.py::test_manifest_values_and_hash_evidence_without_stores[cayu.runtime]": 0.10489187398343347,
+    "tests/core/test_mcp_manifest_package_layout.py::test_manifest_values_and_hash_evidence_without_stores[cayu.sessions.mcp_manifest_history]": 0.10378987502190284,
+    "tests/core/test_mcp_manifest_package_layout.py::test_manifest_values_and_hash_evidence_without_stores[cayu.sessions]": 0.10416679200716317,
+    "tests/core/test_mcp_manifest_package_layout.py::test_manifest_values_and_hash_evidence_without_stores[cayu]": 0.12215775094227865
 }

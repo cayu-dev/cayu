@@ -225,10 +225,19 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.sessions.checkpoints",
         "MIN_SUPPORTED_CHECKPOINT_SCHEMA_VERSION",
     ),
-    "McpManifestBaseline": ("cayu.sessions.base", "McpManifestBaseline"),
-    "McpManifestBaselineLoadResult": ("cayu.sessions.base", "McpManifestBaselineLoadResult"),
-    "McpManifestHistoryConflict": ("cayu.sessions.base", "McpManifestHistoryConflict"),
-    "McpManifestPublicationResult": ("cayu.sessions.base", "McpManifestPublicationResult"),
+    "McpManifestBaseline": ("cayu.sessions.mcp_manifest_history", "McpManifestBaseline"),
+    "McpManifestBaselineLoadResult": (
+        "cayu.sessions.mcp_manifest_history",
+        "McpManifestBaselineLoadResult",
+    ),
+    "McpManifestHistoryConflict": (
+        "cayu.sessions.mcp_manifest_history",
+        "McpManifestHistoryConflict",
+    ),
+    "McpManifestPublicationResult": (
+        "cayu.sessions.mcp_manifest_history",
+        "McpManifestPublicationResult",
+    ),
     "ModelCompletionManualRecoveryRequest": (
         "cayu.sessions.base",
         "ModelCompletionManualRecoveryRequest",
