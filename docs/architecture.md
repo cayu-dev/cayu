@@ -828,6 +828,8 @@ terminal receipts. It composes the shared base and existing task graph, group an
 verified-work components; their native transactions and locks stay with the operation.
 `storage/work_context_postgres.py` owns work-context publication, recall subscriptions,
 lease claims and delivery checkpoints, including their advisory locks and atomic writes.
+`storage/knowledge_postgres.py` owns ordinary knowledge persistence, revision and
+publication receipts, access-filtered queries, row conversion and ordered knowledge locks.
 
 Files are good source-of-truth for prompts, instructions, workflows, manuals, skills, and human-reviewed memories.
 

@@ -115,7 +115,7 @@ assert not {
 
 
 def test_relation_queries_have_one_owner_and_resolvable_annotations():
-    from cayu.storage import knowledge_sqlite, memory, postgres
+    from cayu.storage import knowledge_postgres, knowledge_sqlite, memory
 
     names = (
         "_KnowledgeRelationCursor",
@@ -140,7 +140,7 @@ def test_relation_queries_have_one_owner_and_resolvable_annotations():
             "_knowledge_relation_query_fingerprint",
             "_knowledge_lineage_query_fingerprint",
         ):
-            assert getattr(knowledge_sqlite, name) is getattr(postgres, name) is canonical
+            assert getattr(knowledge_sqlite, name) is getattr(knowledge_postgres, name) is canonical
 
 
 @pytest.mark.parametrize("kind", list(KnowledgeRelationKind))

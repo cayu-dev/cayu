@@ -1090,7 +1090,7 @@ def test_postgres_revision_78_adds_empty_watch_storage_without_inference(
     async def run() -> None:
         import psycopg
 
-        from cayu.storage.postgres import PostgresKnowledgeStore
+        from cayu.storage.knowledge_postgres import PostgresKnowledgeStore
 
         await _drop_postgres_schema(postgres_dsn)
         creator = PostgresKnowledgeStore(
@@ -1146,7 +1146,7 @@ def test_postgres_revision_78_rejects_malformed_watch_storage(
     async def run() -> None:
         import psycopg
 
-        from cayu.storage.postgres import PostgresKnowledgeStore
+        from cayu.storage.knowledge_postgres import PostgresKnowledgeStore
 
         await _drop_postgres_schema(postgres_dsn)
         creator = PostgresKnowledgeStore(

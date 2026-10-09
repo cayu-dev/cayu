@@ -135,8 +135,8 @@ def test_knowledge_resource_access(backend, tmp_path):
 
 @pytest.mark.parametrize("embedding", [False, True])
 def test_postgres_knowledge_resource_access(postgres_dsn, embedding):
+    from cayu.storage.knowledge_postgres import PostgresKnowledgeStore
     from cayu.storage.migrations import SchemaMode
-    from cayu.storage.postgres import PostgresKnowledgeStore
 
     async def run():
         if embedding:

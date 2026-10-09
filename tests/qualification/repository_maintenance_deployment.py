@@ -13,8 +13,9 @@ from workflows.coding_product import CodingProductApplication  # ty: ignore[unre
 from cayu import configured_database_url
 from cayu.environments.docker_coding import DockerCodingEnvironmentFactory
 from cayu.storage.budget_postgres import PostgresBudgetLedger
+from cayu.storage.knowledge_postgres import PostgresKnowledgeStore
 from cayu.storage.migrations import SchemaMode
-from cayu.storage.postgres import PostgresKnowledgeStore, PostgresSessionStore
+from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.tasks_postgres import PostgresTaskStore
 from cayu.tools.subagents import SubagentTool
 from cayu.workspaces.local import LocalWorkspace

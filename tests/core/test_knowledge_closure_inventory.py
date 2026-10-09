@@ -139,8 +139,9 @@ def test_public_closure_exports_and_retains_knowledge_sources(tmp_path, request,
             sessions = SQLiteSessionStore(tmp_path / "sessions.sqlite")
             knowledge = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=scope)
         else:
+            from cayu.storage.knowledge_postgres import PostgresKnowledgeStore
             from cayu.storage.migrations import SchemaMode
-            from cayu.storage.postgres import PostgresKnowledgeStore, PostgresSessionStore
+            from cayu.storage.postgres import PostgresSessionStore
 
             sessions = PostgresSessionStore(dsn, schema_mode=SchemaMode.CREATE)
             knowledge = PostgresKnowledgeStore(
@@ -238,8 +239,8 @@ def test_closure_inventories_exact_sources_without_shared_content(tmp_path, requ
             return SQLiteKnowledgeStore(
                 tmp_path / "knowledge.sqlite", access_scope=KnowledgeAccessScope.privileged()
             )
+        from cayu.storage.knowledge_postgres import PostgresKnowledgeStore
         from cayu.storage.migrations import SchemaMode
-        from cayu.storage.postgres import PostgresKnowledgeStore
 
         return PostgresKnowledgeStore(
             dsn, schema_mode=SchemaMode.CREATE, access_scope=KnowledgeAccessScope.privileged()
@@ -411,8 +412,8 @@ def test_knowledge_closure_counts_across_source_batches(tmp_path, request, backe
                 access_scope=KnowledgeAccessScope.privileged(),
             )
         else:
+            from cayu.storage.knowledge_postgres import PostgresKnowledgeStore
             from cayu.storage.migrations import SchemaMode
-            from cayu.storage.postgres import PostgresKnowledgeStore
 
             store = PostgresKnowledgeStore(
                 dsn, schema_mode=SchemaMode.CREATE, access_scope=KnowledgeAccessScope.privileged()
@@ -480,7 +481,7 @@ def test_knowledge_closure_rejects_large_evidence_before_reconstruction(
             )
             converter = "_evidence_from_row"
         else:
-            from cayu.storage import postgres as module
+            from cayu.storage import knowledge_postgres as module
             from cayu.storage.migrations import SchemaMode
 
             store = module.PostgresKnowledgeStore(
@@ -626,8 +627,9 @@ def test_knowledge_closure_includes_real_embedding_projection_once():
 
 
 def test_postgres_plain_handle_inventories_persisted_embedding_projection(postgres_dsn):
+    from cayu.storage.knowledge_postgres import PostgresKnowledgeStore
     from cayu.storage.migrations import SchemaMode
-    from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore, PostgresKnowledgeStore
+    from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore
 
     async def run():
         provider = KeywordEmbeddingProvider()

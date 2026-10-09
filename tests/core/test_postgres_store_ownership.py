@@ -25,6 +25,7 @@ from cayu.support_bundles import _store_schema_readiness
         ("budget_postgres", "PostgresBudgetLedger"),
         ("tasks_postgres", "PostgresTaskStore"),
         ("work_context_postgres", "PostgresAgentWorkContextStore"),
+        ("knowledge_postgres", "PostgresKnowledgeStore"),
     ],
 )
 def test_postgres_owner_preserves_public_imports_and_pickled_class(module_name, class_name):
@@ -51,6 +52,7 @@ def test_postgres_owner_preserves_public_imports_and_pickled_class(module_name, 
         "event_watchers_postgres",
         "tasks_postgres",
         "work_context_postgres",
+        "knowledge_postgres",
         "postgres",
     ],
 )

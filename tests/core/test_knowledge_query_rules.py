@@ -308,6 +308,7 @@ def test_query_rules_have_one_owner_and_resolvable_annotations():
     from cayu.storage import (
         knowledge_embedding_memory,
         knowledge_memory,
+        knowledge_postgres,
         knowledge_sqlite,
         memory,
         postgres,
@@ -331,5 +332,9 @@ def test_query_rules_have_one_owner_and_resolvable_annotations():
         knowledge_sqlite._validate_knowledge_search_frontier
         is rules._validate_knowledge_search_frontier
     )
-    assert postgres._validate_knowledge_search_frontier is rules._validate_knowledge_search_frontier
+    assert (
+        knowledge_postgres._validate_knowledge_search_frontier
+        is postgres._validate_knowledge_search_frontier
+        is rules._validate_knowledge_search_frontier
+    )
     assert postgres._semantic_query_text is rules._semantic_query_text

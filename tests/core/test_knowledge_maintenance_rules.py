@@ -133,7 +133,7 @@ assert not {
 
 
 def test_maintenance_rules_have_one_owner_and_resolvable_annotations():
-    from cayu.storage import knowledge_sqlite, memory, postgres
+    from cayu.storage import knowledge_postgres, knowledge_sqlite, memory
 
     for name in (
         "_require_knowledge_maintenance_current_entries",
@@ -145,7 +145,7 @@ def test_maintenance_rules_have_one_owner_and_resolvable_annotations():
         canonical = getattr(rules, name)
         assert canonical.__module__ == rules.__name__
         assert not hasattr(memory, name)
-        assert getattr(knowledge_sqlite, name) is getattr(postgres, name) is canonical
+        assert getattr(knowledge_sqlite, name) is getattr(knowledge_postgres, name) is canonical
         get_type_hints(canonical)
 
 

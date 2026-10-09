@@ -10,7 +10,8 @@ from cayu.storage._postgres_base import _configure_store_connection, _PostgresSt
 from cayu.storage.budget_postgres import PostgresBudgetLedger
 from cayu.storage.evals_postgres import PostgresEvalStore
 from cayu.storage.event_watchers_postgres import PostgresEventWatcherStore
-from cayu.storage.postgres import PostgresKnowledgeStore, PostgresSessionStore
+from cayu.storage.knowledge_postgres import PostgresKnowledgeStore
+from cayu.storage.postgres import PostgresSessionStore
 from cayu.storage.tasks_postgres import PostgresTaskStore
 from cayu.storage.work_context_postgres import PostgresAgentWorkContextStore
 

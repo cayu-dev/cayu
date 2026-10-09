@@ -247,6 +247,7 @@ from cayu.storage.knowledge_indexer import KnowledgeIndexer as KnowledgeIndexer
 from cayu.storage.knowledge_indexer import KnowledgeIndexRequest as KnowledgeIndexRequest
 from cayu.storage.knowledge_indexer import KnowledgeIndexResult as KnowledgeIndexResult
 from cayu.storage.knowledge_memory import InMemoryKnowledgeStore as InMemoryKnowledgeStore
+from cayu.storage.knowledge_postgres import PostgresKnowledgeStore as PostgresKnowledgeStore
 from cayu.storage.knowledge_review import KnowledgeReviewWorkflow as KnowledgeReviewWorkflow
 from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore as SQLiteKnowledgeStore
 from cayu.storage.knowledge_transition import (
@@ -268,7 +269,6 @@ from cayu.storage.knowledge_transition import (
     require_empty_knowledge_revision_transition as require_empty_knowledge_revision_transition,
 )
 from cayu.storage.postgres import PostgresEmbeddingKnowledgeStore as PostgresEmbeddingKnowledgeStore
-from cayu.storage.postgres import PostgresKnowledgeStore as PostgresKnowledgeStore
 from cayu.storage.postgres import PostgresSessionStore as PostgresSessionStore
 from cayu.storage.product_operations_postgres import (
     PostgresProductOperationStore as PostgresProductOperationStore,

@@ -155,8 +155,8 @@ _POSTGRES_SCHEMA_STORE_IDENTITIES = frozenset(
         ("cayu.storage.budget_postgres", "PostgresBudgetLedger"),
         ("cayu.storage.evals_postgres", "PostgresEvalStore"),
         ("cayu.storage.event_watchers_postgres", "PostgresEventWatcherStore"),
+        ("cayu.storage.knowledge_postgres", "PostgresKnowledgeStore"),
         ("cayu.storage.postgres", "PostgresEmbeddingKnowledgeStore"),
-        ("cayu.storage.postgres", "PostgresKnowledgeStore"),
         ("cayu.storage.postgres", "PostgresSessionStore"),
         ("cayu.storage.tasks_postgres", "PostgresTaskStore"),
     }

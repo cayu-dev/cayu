@@ -4190,7 +4190,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.storage.event_watchers_postgres",
         "PostgresEventWatcherStore",
     ),
-    "PostgresKnowledgeStore": ("cayu.storage.postgres", "PostgresKnowledgeStore"),
+    "PostgresKnowledgeStore": ("cayu.storage.knowledge_postgres", "PostgresKnowledgeStore"),
     "PostgresProductOperationStore": (
         "cayu.storage.product_operations_postgres",
         "PostgresProductOperationStore",

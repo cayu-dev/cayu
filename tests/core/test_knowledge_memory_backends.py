@@ -157,7 +157,12 @@ def _check_import_process(script):
 
 def test_memory_backend_declarations_have_one_owner():
     from cayu.knowledge import changes, maintenance_contracts, records
-    from cayu.storage import knowledge_embedding_memory, knowledge_memory, memory, postgres
+    from cayu.storage import (
+        knowledge_embedding_memory,
+        knowledge_memory,
+        knowledge_postgres,
+        memory,
+    )
 
     assert knowledge_memory.InMemoryKnowledgeStore.__module__ == knowledge_memory.__name__
     assert (
@@ -176,8 +181,11 @@ def test_memory_backend_declarations_have_one_owner():
         for name in names:
             assert getattr(owner, name).__module__ == owner.__name__
             assert not hasattr(memory, name)
-    assert postgres._knowledge_change_now is changes._knowledge_change_now
-    assert postgres._knowledge_semantic_watch_identity is records._knowledge_semantic_watch_identity
+    assert knowledge_postgres._knowledge_change_now is changes._knowledge_change_now
+    assert (
+        knowledge_postgres._knowledge_semantic_watch_identity
+        is records._knowledge_semantic_watch_identity
+    )
     assert (
         memory.KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY
         is maintenance_contracts.KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY

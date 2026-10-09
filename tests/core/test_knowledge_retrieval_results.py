@@ -276,7 +276,12 @@ assert not {"cayu.storage.memory", "cayu.storage.knowledge_sqlite", "cayu.storag
 
 
 def test_retrieval_results_have_one_owner_and_resolvable_annotations():
-    from cayu.storage import knowledge_sqlite, memory, postgres
+    from cayu.storage import (
+        knowledge_postgres,
+        knowledge_sqlite,
+        memory,
+        postgres,
+    )
 
     for name in (
         "_center_chunk_window",
@@ -293,7 +298,7 @@ def test_retrieval_results_have_one_owner_and_resolvable_annotations():
     for name in ("_center_chunk_window", "_truncate_text_to_bytes", "_bounded_knowledge_evidence"):
         assert not hasattr(knowledge_sqlite, name)
     assert knowledge_sqlite._retrieval_results is rules
-    assert postgres._bounded_knowledge_evidence is rules._bounded_knowledge_evidence
+    assert knowledge_postgres._bounded_knowledge_evidence is rules._bounded_knowledge_evidence
     assert (
         postgres._search_result_from_scored_embeddings
         is rules._search_result_from_scored_embeddings
