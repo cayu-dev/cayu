@@ -25,6 +25,32 @@ Google AI Studio automatically uses Gemini usage accounting. For Gemini through
 another OpenAI-compatible Vertex or gateway endpoint, pass
 `usage_dialect=UsageDialect.GEMINI` explicitly.
 
+## Prompt caching
+
+Prompt caching is on by default where the provider needs explicit markers.
+`AnthropicProvider()` and `VertexProvider(...)` mark the system prompt, the tool
+definitions and the conversation before the newest message with `cache_control`
+(three of Anthropic's four markers), so a growing conversation reuses its
+history. `BedrockProvider()` places the same three Converse `cachePoint` blocks
+for the Claude families Bedrock documents as cacheable (Claude 3.5 Haiku,
+3.7 Sonnet, and Sonnet, Opus and Haiku 4 and later); other Bedrock models get
+no markers unless you pass `cache_policy=` explicitly, because Converse rejects
+cache points for models without prompt caching. Bedrock uses its default TTL;
+`CachePolicy(ttl="extended")` is rejected there.
+
+Opt out with `cache_policy=CachePolicy(breakpoints=())`, or per request with
+`options={"cache_policy": {"breakpoints": []}}`. A per-request
+`options["cache_policy"]` mapping merges field by field onto the provider's
+policy. Cache writes cost more than ordinary input (1.25x on Anthropic for the
+standard TTL); prefixes below the model's minimum cacheable length are not
+cached and are not an error.
+
+OpenAI Responses caches prefixes automatically; Cayu also sends a stable
+`prompt_cache_key` per conversation lineage (forks share it), described under
+"Prompt-cache affinity" in `docs/runtime-contracts.md`. Chat Completions
+endpoints follow their own provider's caching rules. Measured before/after
+numbers are in `docs/late-system-message-caching-results.md`.
+
 ## OpenAI subscription
 
 `OpenAISubscriptionProvider` experimentally runs agents against the Codex backend

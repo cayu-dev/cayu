@@ -109,6 +109,10 @@ from cayu.providers._stream_lifecycle import (
     StreamTransitionKind,
     StreamViolation,
 )
+from cayu.providers._system_messages import (
+    leading_system_text,
+    placed_conversation_messages,
+)
 from cayu.providers._thinking import preflight_thinking_effort, validate_thinking_effort
 from cayu.providers.base import (
     EXACT_MODEL_STREAM_RECOVERY_DISPOSITION,
@@ -1894,7 +1898,9 @@ def build_openai_payload(
         "input": [],
         "store": reasoning_state == "server",
     }
-    instructions = _system_text(request.messages)
+    # Only the leading system run is instructions; later system messages stay
+    # in place as developer items so the request prefix stays append-only.
+    instructions = leading_system_text(request.messages)
     if instructions:
         payload["instructions"] = instructions
 
@@ -1937,8 +1943,14 @@ def build_openai_payload(
             "A targeted additional_tools function cannot also be a direct request tool."
         )
 
+    first_sent_index = len(request.messages) - len(messages_to_send)
     input_items: list[dict[str, Any]] = []
-    for message in messages_to_send:
+    for index, message, late_system in placed_conversation_messages(request.messages):
+        if index < first_sent_index:
+            continue
+        if late_system:
+            input_items.append(_openai_developer_input_item(message))
+            continue
         input_items.extend(
             _openai_input_items(
                 message,
@@ -1976,6 +1988,10 @@ def build_openai_payload(
     if stream:
         payload["stream"] = True
     payload.update(options)
+    # The runtime's per-lineage cache affinity becomes prompt_cache_key; an
+    # explicit caller prompt_cache_key option always wins.
+    if request.cache_affinity_key is not None and "prompt_cache_key" not in payload:
+        payload["prompt_cache_key"] = request.cache_affinity_key
     return copy_json_value(payload, "openai_payload")
 
 
@@ -6385,15 +6401,17 @@ def _openai_structured_output_format(options: Mapping[str, Any]) -> dict[str, An
     }
 
 
-def _system_text(messages: list[Message]) -> str:
-    system_parts: list[str] = []
-    for message in messages:
-        if message.role != MessageRole.SYSTEM:
-            continue
-        for part in message.content:
-            if type(part) is TextPart:
-                system_parts.append(part.text)
-    return "\n\n".join(system_parts)
+def _openai_developer_input_item(message: Message) -> dict[str, Any]:
+    """Send a non-leading system message in place with system-level authority."""
+
+    return {
+        "role": "developer",
+        "content": [
+            {"type": "input_text", "text": part.text}
+            for part in message.content
+            if type(part) is TextPart
+        ],
+    }
 
 
 def _openai_input_items(

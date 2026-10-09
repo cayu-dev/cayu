@@ -3567,6 +3567,7 @@ def _execution_profile_provider_options(
         effective_cache_policy, cache_policy_is_authoritative = (
             _execution_profile_effective_cache_policy(
                 provider,
+                model=model,
                 options=detached_request.options,
             )
         )
@@ -3646,15 +3647,20 @@ def _execution_profile_cache_policy(
 def _execution_profile_effective_cache_policy(
     provider: ModelProvider,
     *,
+    model: str,
     options: dict[str, Any],
 ) -> tuple[CachePolicy | None, bool]:
     """Resolve cache configuration only for an adapter whose complete contract is known."""
 
     from cayu.providers.anthropic import AnthropicProvider
+    from cayu.providers.bedrock import BedrockProvider
     from cayu.providers.cache import resolve_cache_policy
+    from cayu.providers.vertex import VertexProvider
 
-    if type(provider) is AnthropicProvider:
+    if type(provider) is AnthropicProvider or type(provider) is VertexProvider:
         return resolve_cache_policy(provider.cache_policy, options), True
+    if type(provider) is BedrockProvider:
+        return provider._resolved_cache_policy(model, options), True
     provider_type = type(provider)
     uses_default_cache_contract = (
         provider_type.request_cache_policy is ModelProvider.request_cache_policy

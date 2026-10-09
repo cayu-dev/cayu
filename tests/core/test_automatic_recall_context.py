@@ -361,6 +361,7 @@ class _RecordingCountScriptedProvider(ScriptedModelProvider):
                 tools=request.tools,
                 hosted_tools=request.hosted_tools,
                 options=request.options,
+                cache_affinity_key=request.cache_affinity_key,
             )
         )
         return None

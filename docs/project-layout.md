@@ -39,6 +39,7 @@ examples/
   asynchronous_session_forks/
   cache_aware_research_council/
   counterfactual_approval/
+  late_system_message_caching/
   prompt_cache_compaction/
   repo_maintainer_tournament/
   tainted_incident_response/

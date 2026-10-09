@@ -2411,3 +2411,245 @@ def test_prompt_contribution_attribution_requires_matching_keyed_final_system() 
     assert "Review code" not in serialized
     assert "Follow repository policy" not in serialized
     assert "p" * 32 not in json.dumps(config.model_dump(mode="json"), default=str)
+
+
+def test_conversation_prefix_keeps_late_system_messages_in_place() -> None:
+    config = RequestFootprintConfig(
+        fingerprint_key_id="late-system-key",
+        fingerprint_key=SecretStr("l" * 32),
+    )
+
+    def request_for(mid_note: str, turn_note: str) -> ModelRequest:
+        return ModelRequest(
+            model="model-a",
+            messages=[
+                Message.text("system", "Stable rules."),
+                Message.text("user", "First question."),
+                Message.text("system", mid_note),
+                Message.text("assistant", "First answer."),
+                Message.text("user", "Second question."),
+                Message.text("system", turn_note),
+            ],
+        )
+
+    baseline = _build(request_for("Mid note.", "Turn 1 state."), config=config)
+    changed_tail = _build(request_for("Mid note.", "Turn 2 state."), config=config)
+    changed_history = _build(request_for("Other mid note.", "Turn 1 state."), config=config)
+
+    # Providers send only the leading system run as the system prompt. A system
+    # message inside the history is part of the cacheable conversation prefix;
+    # the trailing per-turn system message is the changing tail.
+    assert baseline.fingerprints.conversation_prefix.value == (
+        changed_tail.fingerprints.conversation_prefix.value
+    )
+    assert baseline.fingerprints.conversation_prefix.value != (
+        changed_history.fingerprints.conversation_prefix.value
+    )
+
+
+@pytest.mark.parametrize("provider_projection", [False, True], ids=["fallback", "anthropic"])
+def test_cache_breakpoints_exclude_late_system_notes_outside_the_prefix(
+    provider_projection: bool,
+) -> None:
+    config = RequestFootprintConfig(
+        fingerprint_key_id="late-system-breakpoints",
+        fingerprint_key=SecretStr("b" * 32),
+    )
+    provider = AnthropicProvider(
+        api_key="test-key",
+        cache_policy=CachePolicy(breakpoints=tuple(CacheBreakpoint)),
+    )
+
+    def observe(*, leading: str = "Rules", middle: str = "History", tail: str = "State"):
+        request = ModelRequest(
+            model="claude-test",
+            messages=[
+                Message.text("system", leading),
+                Message.text("user", "Question"),
+                Message.text("system", middle),
+                Message.text("assistant", "Answer"),
+                Message.text("system", tail),
+            ],
+            tools=[{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}],
+        )
+        if not provider_projection:
+            return _build(request, config=config)
+        return analyze_request_footprint(
+            request,
+            provider=provider,
+            provider_name="anthropic",
+            step=1,
+            attempt=1,
+            max_attempts=1,
+            request_variant=RequestVariant.INITIAL,
+            observation_id="observation-1",
+            model_step_id="mstep_00000000000000000000000000000001",
+            model_attempt_id="matt_00000000000000000000000000000002",
+            config=config,
+        )
+
+    baseline = observe()
+    changed_tail = observe(tail="New state")
+    changed_middle = observe(middle="New history")
+    changed_leading = observe(leading="New rules")
+    assert baseline.fingerprints.provider_neutral_request.value != (
+        changed_tail.fingerprints.provider_neutral_request.value
+    )
+    assert {item.kind for item in baseline.cache_breakpoints} == set(CacheBreakpoint)
+    for original, tail, middle, leading in zip(
+        baseline.cache_breakpoints,
+        changed_tail.cache_breakpoints,
+        changed_middle.cache_breakpoints,
+        changed_leading.cache_breakpoints,
+        strict=True,
+    ):
+        assert original.fingerprint.value is not None
+        assert original.fingerprint.value == tail.fingerprint.value
+        assert original.fingerprint.value != leading.fingerprint.value
+        if original.kind is CacheBreakpoint.CONVERSATION_PREFIX:
+            assert original.fingerprint.value != middle.fingerprint.value
+        else:
+            assert original.fingerprint.value == middle.fingerprint.value
+
+
+@pytest.mark.parametrize("provider_projection", [False, True], ids=["fallback", "anthropic"])
+@pytest.mark.parametrize("note_position", [0, 1], ids=["before-results", "between-results"])
+def test_cache_prefix_defers_system_notes_until_after_tool_results(
+    provider_projection: bool,
+    note_position: int,
+) -> None:
+    config = RequestFootprintConfig(
+        fingerprint_key_id="deferred-system-note",
+        fingerprint_key=SecretStr("d" * 32),
+    )
+    provider = AnthropicProvider(
+        api_key="test-key",
+        cache_policy=CachePolicy(breakpoints=tuple(CacheBreakpoint)),
+    )
+
+    def observe(*, note: str = "State", result: str = "Result", position: int = note_position):
+        results = [
+            Message.tool_result(tool_call_id=f"call-{index}", tool_name="lookup", content=result)
+            for index in range(2)
+        ]
+        results.insert(position, Message.text("system", note))
+        request = ModelRequest(
+            model="claude-test",
+            messages=[
+                Message.text("system", "Rules"),
+                Message.text("user", "Question"),
+                Message(
+                    role="assistant",
+                    content=[
+                        ToolCallPart(tool_call_id=f"call-{index}", tool_name="lookup", arguments={})
+                        for index in range(2)
+                    ],
+                ),
+                *results,
+            ],
+            tools=[{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}],
+        )
+        if not provider_projection:
+            return _build(request, config=config)
+        return analyze_request_footprint(
+            request,
+            provider=provider,
+            provider_name="anthropic",
+            step=1,
+            attempt=1,
+            max_attempts=1,
+            request_variant=RequestVariant.INITIAL,
+            observation_id="observation-1",
+            model_step_id="mstep_00000000000000000000000000000001",
+            model_attempt_id="matt_00000000000000000000000000000002",
+            config=config,
+        )
+
+    baseline = observe()
+    changed_note = observe(note="New state")
+    changed_result = observe(result="New result")
+    already_placed = observe(position=2)
+    assert baseline.fingerprints.provider_neutral_request.value != (
+        changed_note.fingerprints.provider_neutral_request.value
+    )
+    assert (
+        baseline.fingerprints.conversation_prefix.value
+        == (changed_note.fingerprints.conversation_prefix.value)
+        == already_placed.fingerprints.conversation_prefix.value
+    )
+    assert baseline.fingerprints.conversation_prefix.value != (
+        changed_result.fingerprints.conversation_prefix.value
+    )
+    for original, note, result, placed in zip(
+        baseline.cache_breakpoints,
+        changed_note.cache_breakpoints,
+        changed_result.cache_breakpoints,
+        already_placed.cache_breakpoints,
+        strict=True,
+    ):
+        assert original.fingerprint.value is not None
+        assert original.fingerprint.value == note.fingerprint.value == placed.fingerprint.value
+        if original.kind is CacheBreakpoint.CONVERSATION_PREFIX:
+            assert original.fingerprint.value != result.fingerprint.value
+        else:
+            assert original.fingerprint.value == result.fingerprint.value
+
+
+def _late_note_cache_provider(name: str) -> ModelProvider:
+    from cayu.providers import BedrockProvider, VertexProvider
+
+    if name == "bedrock":
+        return BedrockProvider(client=object(), region_name="us-east-1")
+    if name == "vertex":
+        return VertexProvider(project_id="test-project", credentials=object())
+    return AnthropicProvider(api_key="test-key")
+
+
+@pytest.mark.parametrize("provider_name", ["anthropic", "vertex", "bedrock"])
+def test_cache_prefix_fingerprint_follows_the_wire_with_a_trailing_note(
+    provider_name: str,
+) -> None:
+    config = RequestFootprintConfig(
+        fingerprint_key_id="wire-cache-prefix",
+        fingerprint_key=SecretStr("w" * 32),
+    )
+    provider = _late_note_cache_provider(provider_name)
+
+    def prefix(*, history: str = "First answer.", newest: str = "Second question.", note="A"):
+        request = ModelRequest(
+            model="us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            messages=[
+                Message.text("system", "Stable rules."),
+                Message.text("user", "First question."),
+                Message.text("assistant", history),
+                Message.text("user", newest),
+                Message.text("system", f"Controller state {note}."),
+            ],
+        )
+        footprint = analyze_request_footprint(
+            request,
+            provider=provider,
+            provider_name=provider_name,
+            step=1,
+            attempt=1,
+            max_attempts=1,
+            request_variant=RequestVariant.INITIAL,
+            observation_id="observation-1",
+            model_step_id="mstep_00000000000000000000000000000001",
+            model_attempt_id="matt_00000000000000000000000000000002",
+            config=config,
+        )
+        assert footprint.fingerprints.conversation_prefix.value is not None
+        return footprint.fingerprints.conversation_prefix.value
+
+    baseline = prefix()
+    assert prefix(note="B") == baseline
+    assert prefix(history="Another answer.") != baseline
+    if provider_name == "bedrock":
+        # Converse merges the note into the newest user turn, so its cache point
+        # ends on the previous assistant turn: the newest message is not cached.
+        assert prefix(newest="Different question.") == baseline
+    else:
+        # Anthropic keeps the note as its own user turn and marks the newest
+        # user message, which is part of the cached prefix.
+        assert prefix(newest="Different question.") != baseline

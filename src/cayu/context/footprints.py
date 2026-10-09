@@ -43,6 +43,7 @@ from cayu.context.base import (
 )
 from cayu.context.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.messages import FilePart, Message, MessageRole, ToolCallPart, ToolResultPart
+from cayu.providers._system_messages import leading_system_count, placed_conversation_messages
 from cayu.providers.base import (
     CALL_TOOL_CORE_CALLABLE_OPTION,
     OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
@@ -1551,7 +1552,9 @@ def build_request_footprint(
         fingerprints=fingerprints,
         cache_breakpoints=_cache_breakpoint_footprints(
             model_request=model_request,
-            system_payloads=system_payloads,
+            # Late system messages are conversation content on the wire. Keep
+            # them in the full request evidence, but not in every cache prefix.
+            system_payloads=system_payloads[: leading_system_count(model_request.messages)],
             conversation_prefix=conversation_prefix,
             cache_policy=cache_policy,
             config=resolved_config,
@@ -2195,14 +2198,11 @@ def _conversation_prefix_payload(
             list(provider_conversation_prefix),
             "provider conversation prefix",
         )
+    # Match provider placement before selecting the prefix: deferred system
+    # notes follow the tool results, so the changing tail is excluded correctly.
     messages = [
-        payload
-        for message, payload in zip(
-            model_request.messages,
-            message_payloads,
-            strict=True,
-        )
-        if message.role != MessageRole.SYSTEM
+        message_payloads[index]
+        for index, _message, _late_system in placed_conversation_messages(model_request.messages)
     ]
     skip = (
         cache_policy.conversation_prefix_n

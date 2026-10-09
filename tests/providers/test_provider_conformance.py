@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import itertools
+import json
 import warnings
 from collections.abc import AsyncIterator
 from typing import Any, get_args
@@ -21,6 +23,7 @@ from cayu import (
     Message,
     RunRequest,
     TextPart,
+    ToolCallPart,
     file_attachment,
 )
 from cayu.budgets.usage import normalize_usage_metrics
@@ -1428,3 +1431,257 @@ async def test_cache_conformance_allows_scheduling_delay(registration, monkeypat
     )
     assert usage is not None
     assert usage.cache.read_tokens == usage.cache.cached_input_tokens == 3
+
+
+# Providers send only the leading system run in their system/instructions
+# field. A later system message stays in place, so a request whose trailing
+# system message changes on every turn keeps an append-only prefix (#2289).
+_BLOCK_TURN_REGISTRATIONS = {
+    registrations_module.ANTHROPIC,
+    registrations_module.VERTEX,
+    registrations_module.BEDROCK,
+}
+_PREFIX_TOOLS = [
+    {
+        "name": "read_file",
+        "description": "Read a file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    }
+]
+
+
+def _wire_view(
+    registration: ProviderConformanceRegistration,
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], list[Any]]:
+    """Split a sent payload into its non-conversation fields and ordered items.
+
+    Block-turn APIs combine consecutive user turns, so their conversation is
+    compared as the ordered sequence of (role, content block) pairs.
+    """
+
+    head = _without_cache_markers(copy.deepcopy(payload))
+    items = head.pop("input", None)
+    if items is None:
+        items = head.pop("messages")
+    if registration in _BLOCK_TURN_REGISTRATIONS:
+        items = [(message["role"], block) for message in items for block in message["content"]]
+    return head, items
+
+
+def _without_cache_markers(value: Any) -> Any:
+    """Drop prompt-cache markers, which move forward each turn by design."""
+
+    if isinstance(value, dict):
+        return {
+            key: _without_cache_markers(item)
+            for key, item in value.items()
+            if key != "cache_control"
+        }
+    if isinstance(value, list):
+        return [
+            _without_cache_markers(item)
+            for item in value
+            if not (isinstance(item, dict) and set(item) == {"cachePoint"})
+        ]
+    return value
+
+
+def _late_note_carries_cache_marker(payload: dict[str, Any]) -> bool:
+    """Whether a cache marker ends on, or follows, the changing late system note."""
+
+    for message in payload.get("messages", ()):
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        rendered = json.dumps(content, sort_keys=True, default=str)
+        if "Controller state" not in rendered:
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if "cachePoint" in block:
+                return True
+            if "cache_control" in block and "Controller state" in json.dumps(block, default=str):
+                return True
+    return False
+
+
+async def _sent_payload(
+    registration: ProviderConformanceRegistration,
+    request_messages: list[Message],
+    *,
+    tools: list[dict[str, Any]] | None = None,
+    options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    harness = await registration.factory("text")
+    assert harness.sent_payloads is not None
+    try:
+        events = await harness.collect(
+            ModelRequest(
+                model=harness.model,
+                messages=request_messages,
+                tools=tools or [],
+                options=options or {},
+            )
+        )
+        sent = harness.sent_payloads()
+    finally:
+        await harness.aclose()
+    assert events[-1].type is ModelStreamEventType.COMPLETED, events
+    assert len(sent) == 1
+    return dict(sent[0])
+
+
+def _prefix_turn_messages(turn: int) -> list[Message]:
+    messages = [
+        Message.text("system", "Stable system prompt."),
+        Message.text("user", "Start the task."),
+    ]
+    for step in range(turn):
+        messages.extend(
+            [
+                Message(
+                    role="assistant",
+                    content=[
+                        ToolCallPart(
+                            tool_call_id=f"call-{step}",
+                            tool_name="read_file",
+                            arguments={"path": f"FILE-{step}.md"},
+                        )
+                    ],
+                ),
+                Message.tool_result(
+                    tool_call_id=f"call-{step}",
+                    tool_name="read_file",
+                    content=f"contents {step}",
+                ),
+            ]
+        )
+    messages.append(Message.text("system", f"Controller state for turn {turn}."))
+    return messages
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("registration", REGISTRATIONS, ids=lambda item: item.name)
+async def test_provider_conformance_late_system_message_keeps_request_prefix_append_only(
+    registration: ProviderConformanceRegistration,
+) -> None:
+    payloads = [
+        await _sent_payload(registration, _prefix_turn_messages(turn), tools=_PREFIX_TOOLS)
+        for turn in range(3)
+    ]
+    # Default prompt-cache markers stay on the stable history, never on the note.
+    assert not any(_late_note_carries_cache_marker(payload) for payload in payloads)
+    views = [_wire_view(registration, payload) for payload in payloads]
+
+    for turn, (head, items) in enumerate(views):
+        # Chat Completions carries the leading system run as its first message.
+        rendered_head = json.dumps(head, sort_keys=True, default=str)
+        rendered_prefix = json.dumps([head, items[0]], sort_keys=True, default=str)
+        assert "Stable system prompt." in rendered_prefix
+        assert "Controller state" not in rendered_head
+        tail = json.dumps(items[-1], sort_keys=True, default=str)
+        assert f"Controller state for turn {turn}." in tail
+        assert all(
+            "Controller state" not in json.dumps(item, sort_keys=True, default=str)
+            for item in items[:-1]
+        )
+    for (previous_head, previous_items), (head, items) in itertools.pairwise(views):
+        require_conformance(
+            head == previous_head
+            and len(items) > len(previous_items)
+            and items[: len(previous_items) - 1] == previous_items[:-1],
+            registration=registration,
+            scenario="text",
+            capability="prefix_stability",
+            observed={"previous": previous_items, "current": items},
+        )
+
+
+_LEADING_SYSTEM_FIELDS: dict[str, tuple[str, Any]] = {
+    registrations_module.OPENAI.name: ("instructions", "First rule.\n\nSecond rule."),
+    registrations_module.OPENAI_SUBSCRIPTION.name: (
+        "instructions",
+        "First rule.\n\nSecond rule.",
+    ),
+    registrations_module.ANTHROPIC.name: ("system", "First rule.\n\nSecond rule."),
+    registrations_module.VERTEX.name: ("system", "First rule.\n\nSecond rule."),
+    registrations_module.BEDROCK.name: (
+        "system",
+        [{"text": "First rule."}, {"text": "Second rule."}],
+    ),
+    registrations_module.CHAT_COMPLETIONS.name: (
+        "messages[0]",
+        {"role": "system", "content": "First rule.\n\nSecond rule."},
+    ),
+    registrations_module.GATEWAY.name: (
+        "messages[0]",
+        {"role": "system", "content": "First rule.\n\nSecond rule."},
+    ),
+}
+
+
+def test_leading_system_golden_fields_cover_every_registration() -> None:
+    assert set(_LEADING_SYSTEM_FIELDS) == {registration.name for registration in REGISTRATIONS}
+
+
+_CACHED_LEADING_SYSTEM = [
+    {
+        "type": "text",
+        "text": "First rule.\n\nSecond rule.",
+        "cache_control": {"type": "ephemeral"},
+    }
+]
+# With default prompt caching, Anthropic-shaped providers send the leading
+# system run as one marked text block instead of a plain string (by design).
+_DEFAULT_CACHED_SYSTEM_FIELDS: dict[str, Any] = {
+    registrations_module.ANTHROPIC.name: _CACHED_LEADING_SYSTEM,
+    registrations_module.VERTEX.name: _CACHED_LEADING_SYSTEM,
+}
+# Turns prompt caching off for providers that apply a cache policy; other
+# adapters ignore this runtime-level option.
+_NO_CACHE_OPTIONS = {"cache_policy": {"breakpoints": []}}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("registration", REGISTRATIONS, ids=lambda item: item.name)
+@pytest.mark.parametrize("caching", ["disabled", "default"])
+async def test_provider_conformance_leading_only_system_prompt_serializes_unchanged(
+    registration: ProviderConformanceRegistration,
+    caching: str,
+) -> None:
+    options = _NO_CACHE_OPTIONS if caching == "disabled" else None
+    conversation = [
+        Message.text("user", "First question."),
+        Message.text("assistant", "First answer."),
+        Message.text("user", "Second question."),
+    ]
+    with_system = await _sent_payload(
+        registration,
+        [
+            Message.text("system", "First rule."),
+            Message.text("system", "Second rule."),
+            *conversation,
+        ],
+        options=options,
+    )
+    without_system = await _sent_payload(registration, conversation, options=options)
+
+    field, expected = _LEADING_SYSTEM_FIELDS[registration.name]
+    if caching == "default":
+        expected = _DEFAULT_CACHED_SYSTEM_FIELDS.get(registration.name, expected)
+    if field == "messages[0]":
+        assert with_system["messages"][0] == expected
+        assert with_system["messages"][1:] == without_system["messages"]
+        assert {key: value for key, value in with_system.items() if key != "messages"} == {
+            key: value for key, value in without_system.items() if key != "messages"
+        }
+        return
+    assert with_system.pop(field) == expected
+    assert field not in without_system
+    assert with_system == without_system

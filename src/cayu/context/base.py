@@ -4194,6 +4194,7 @@ class PromptCacheCompactor(ContextCompactor):
             targeted_tool_projection=cached_request.targeted_tool_projection,
             tool_discovery_projection=cached_request.tool_discovery_projection,
             options=options,
+            cache_affinity_key=cached_request.cache_affinity_key,
         )
 
         terminal_observation_error: ModelProviderError | None = None
@@ -4557,6 +4558,7 @@ def _detach_compaction_model_request(request: ModelRequest) -> ModelRequest:
         targeted_tool_projection=request.targeted_tool_projection,
         tool_discovery_projection=request.tool_discovery_projection,
         options=request.options,
+        cache_affinity_key=request.cache_affinity_key,
     )
 
 

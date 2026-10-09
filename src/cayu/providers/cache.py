@@ -16,12 +16,17 @@ class CacheBreakpoint(StrEnum):
 
 
 class CachePolicy(BaseModel):
-    """Controls prompt ``cache_control`` marker placement for the Anthropic provider.
+    """Controls prompt-cache marker placement for Anthropic-shaped providers.
 
-    A breakpoint marks the end of a stable, cacheable prefix. The default caches the
-    system prompt and tool definitions, the two blocks that stay constant across the
-    turns of a session. The model and marker format are Anthropic-Messages-shaped, so a
-    future Bedrock/Vertex provider can reuse this policy when it lands.
+    A breakpoint marks the end of a stable, cacheable prefix. The default marks the
+    system prompt, the tool definitions and the conversation history before the
+    newest message, so a growing conversation reuses everything it already sent.
+    That is three of the four markers Anthropic allows per request.
+    ``AnthropicProvider`` and ``VertexProvider`` apply it as ``cache_control``;
+    ``BedrockProvider`` applies it as Converse ``cachePoint`` blocks.
+
+    Disable caching with ``CachePolicy(breakpoints=())``, or per request with
+    ``options["cache_policy"] = {"breakpoints": []}``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -29,6 +34,7 @@ class CachePolicy(BaseModel):
     breakpoints: tuple[CacheBreakpoint, ...] = (
         CacheBreakpoint.SYSTEM_PROMPT,
         CacheBreakpoint.TOOL_DEFINITIONS,
+        CacheBreakpoint.CONVERSATION_PREFIX,
     )
     conversation_prefix_strategy: Literal["all_but_last", "all_but_last_n", "none"] = "all_but_last"
     conversation_prefix_n: StrictInt = Field(default=1, ge=1)

@@ -34,9 +34,9 @@ research-branch savings figure is invalid: the compactor of that time silently
 dropped most of the source context. See [Live Anthropic Haiku cost-savings results](anthropic-haiku-cost-savings-results.md)
 for the paired denominators, the correction, pricing provenance, and run IDs.
 
-Cayu currently has six advanced runtime product stories plus two deterministic
-measurement fixtures. Two product stories and both fixtures deliberately cover
-cost optimization:
+Cayu currently has six advanced runtime product stories plus three
+measurement fixtures. Two product stories and all three fixtures deliberately
+cover cost optimization:
 
 - [Prompt-cache compaction](../examples/prompt_cache_compaction/) runs a
   cache-aware candidate and a bounded `ModelCompactor` control from the same
@@ -56,6 +56,13 @@ cost optimization:
   identities, provider cache categories, an exact quality outcome, and
   fixture-priced whole-session cost. It explicitly makes no provider benchmark
   or universal savings claim.
+- [Late system message caching](../examples/late_system_message_caching/)
+  runs one growing conversation with and without a trailing system message
+  that changes every turn. It reports provider cache reads, writes and
+  uncached input per turn, priced with `default_price_book()`. The
+  [measured results](late-system-message-caching-results.md) show both
+  providers caching 99.4–99.7% of turns 2–6 after the change, up from 0% for
+  OpenAI with a late system message and 0% for Anthropic's default provider.
 - [Tool-discovery validation](../examples/tool_discovery_validation/) compares a
   fixed direct-catalogue workload with the provider-neutral two-tool discovery
   core. Its versioned report includes ranking, unnecessary searches, invalid

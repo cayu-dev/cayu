@@ -887,6 +887,12 @@ async def record_peer_serialization(request: ModelRequest) -> None:
         raise PeerContentUnavailable("Peer serialization requires current runtime authority.")
 
 
+MAX_CACHE_AFFINITY_KEY_CHARS = 64
+_CACHE_AFFINITY_KEY_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+)
+
+
 class ModelRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
     _peer_serialization_observer: Callable[[ModelRequest], Awaitable[None]] | None = PrivateAttr(
@@ -900,6 +906,30 @@ class ModelRequest(BaseModel):
     targeted_tool_projection: TargetedToolProjectionRequest | None = None
     tool_discovery_projection: ToolDiscoveryProjectionRequest | None = None
     options: dict[str, Any] = Field(default_factory=dict)
+    cache_affinity_key: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    """Non-secret prompt-cache routing token for one conversation lineage.
+
+    The runtime sets it to a digest of the session's fork-lineage root; direct
+    callers may supply their own. Adapters whose API accepts a cache routing key
+    send it (OpenAI Responses maps it to ``prompt_cache_key`` unless the caller
+    set that option); other adapters ignore it.
+    """
+
+    @field_validator("cache_affinity_key")
+    @classmethod
+    def validate_cache_affinity_key(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if (
+            type(value) is not str
+            or not 1 <= len(value) <= MAX_CACHE_AFFINITY_KEY_CHARS
+            or any(character not in _CACHE_AFFINITY_KEY_CHARACTERS for character in value)
+        ):
+            raise ValueError("cache_affinity_key must be 1-64 ASCII letters, digits, '-' or '_'.")
+        return value
 
     @field_validator("targeted_tool_projection", mode="before")
     @classmethod

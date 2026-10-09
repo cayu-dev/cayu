@@ -2,7 +2,7 @@
 
 Start here when you are evaluating, extending, or asking an agent to work on
 Cayu's advanced examples. The suite contains five provider-portable product
-stories, one deterministic Runtime tracer, and two deterministic measurement
+stories, one deterministic Runtime tracer, and three measurement
 fixtures. Together they serve two
 purposes:
 
@@ -34,6 +34,7 @@ cost strategy and governance map, see
 | Fixture | Measurement purpose | Stable runtime evidence | Entry point |
 | --- | --- | --- | --- |
 | `tool_exposure_economics` | Compare stable broad and changing narrow direct-tool profiles without assuming that smaller schemas always reduce whole-session cost. | Exposure profiles and transitions, keyed tool-manifest and cache-prefix identities, request/retry counts, provider-style cache categories, exact quality, and fixture-priced cost with no universal savings claim. | [README](tool_exposure_economics/README.md) · [deterministic](tool_exposure_economics/deterministic.py) |
+| `late_system_message_caching` | Measure provider prompt caching for a growing conversation with and without a per-turn trailing system message. | Append-only serialized prefixes, default Anthropic cache markers on the stable history, one OpenAI `prompt_cache_key`, and live provider-reported cache reads/writes priced with `default_price_book()`. | [README](late_system_message_caching/README.md) · [app](late_system_message_caching/app.py) |
 | `tool_discovery_validation` | Prove branch-local discovery and measure one bounded direct-catalogue versus stable-core workload without treating the fixture as a benchmark. | Parent resume preservation, empty fork generation, copied-reference rejection, child rediscovery, stable provider prefix, deterministic ranking, unnecessary searches, invalid arguments, model steps, token/cache categories, latency, effects, approvals, exact quality, and fixture-priced cost. | [README](tool_discovery_validation/README.md) · [deterministic](tool_discovery_validation/deterministic.py) |
 
 ## Where agents and developers should look

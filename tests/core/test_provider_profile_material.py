@@ -42,9 +42,11 @@ def cases():
 # Fixed fingerprints include 300-second idle defaults, text progress v2,
 # semantic cleanup policy v1, and HTTP cleanup observation policy v1.
 # Captured against current main before checking the concept migration.
+# The Anthropic entries changed deliberately when prompt caching became the
+# default (AnthropicProvider().cache_policy is now CachePolicy(), #2289).
 _BASE_MATERIAL_SHA256 = {
-    "anthropic": "cc868ed1d23c846c0ca4eb2662b46fdea1ef8388fa1e9805b03e750fdcc992b8",
-    "anthropic-tokens": "725b7e11c5a592e9e53ece501a973e4d7c2cb4eb2badcef88651234f75de5ac8",
+    "anthropic": "d2bc2f91061bd0d31bb3890a4fb03ce04d99b43d5ccede5f1ecba103544e821c",
+    "anthropic-tokens": "f1a60f8a16d81c7d815562030f4ed4b98b8780ad51db2c3ae111b7066bc5bbf2",
     "bedrock": "369bf7120cf10c9212db958362187d33b99808531a11d3c564b97d27ae902390",
     "bedrock-route": "3527dc6dba95186eb5a71bc8e76b400945959c4aa5e937d6ada8bb757732ab85",
     "chat": "d50e4dab344cc06426827e645bf50e85bdb39ca8b3c99d8930c7178b8db029ef",

@@ -8384,7 +8384,11 @@ its own `options` as recursive overrides. OpenAI prompt caching is mostly automa
 `prompt_cache_key` / `prompt_cache_retention` as provider options. Anthropic
 automatic prompt caching uses top-level `cache_control`; explicit block-level
 cache breakpoints are intentionally not modeled in Cayu's provider-neutral
-message contract yet.
+message contract yet. Adapter-level `CachePolicy` markers are on by default:
+`AnthropicProvider` and `VertexProvider` mark the system prompt, tool
+definitions and the conversation before the newest message, and
+`BedrockProvider` places the same Converse `cachePoint` blocks for the Claude
+families Bedrock documents as cacheable. `CachePolicy(breakpoints=())` opts out.
 
 `CayuApp.get_session_usage(session_id)` derives totals from durable session
 events. The optional FastAPI server exposes the same value at
@@ -8474,6 +8478,69 @@ budget. The optional server exposes this at
 `causal_budget_id`, `session_ids`, `session_count`, and the same estimated-cost
 fields as per-session cost summaries, plus `session_costs` for per-session
 breakdown.
+
+### System message placement
+
+Built-in providers keep request prefixes append-only. Only the leading
+contiguous run of system messages becomes the provider's system prompt
+(`instructions` on OpenAI Responses, `system` on Anthropic, Vertex and Bedrock,
+and one merged leading `system` message on Chat Completions). A system message
+anywhere later in `ModelRequest.messages` is conversation content and is sent
+at its position:
+
+| Provider | Later system message on the wire |
+| --- | --- |
+| OpenAI Responses (API key, background and subscription) | `{"role": "developer", "content": [{"type": "input_text", ...}]}` input item |
+| Chat Completions and Gateway | `{"role": "system", "content": ...}` message |
+| Anthropic and Vertex | its own user turn with one text block `<system>\n...\n</system>`; Anthropic combines consecutive user turns |
+| Bedrock Converse | a `<system>\n...\n</system>` text block appended to the adjacent user turn, keeping turns alternating |
+
+A later system message that sits between an assistant tool-call turn and the
+tool results answering it is sent immediately after those tool results, so tool
+protocols stay valid. Under OpenAI server-side chaining (`previous_response_id`),
+a later system message that precedes the chained response is already part of the
+stored conversation and is not resent. An agent that appends per-turn state as a
+trailing system message therefore changes only the tail of each request, and
+providers can reuse the cached history. The Anthropic system-prompt cache marker
+covers only the leading run, and the conversation-prefix marker lands on the
+history before a trailing system note. Requests whose only system messages are
+the leading run keep the same message mapping as before, and token-count
+requests use the same mapping. Anthropic and Vertex payloads now also carry the
+default cache markers (see Usage Metrics above); with
+`CachePolicy(breakpoints=())` they serialize exactly as before.
+
+### Prompt-cache affinity
+
+`ModelRequest.cache_affinity_key` is an optional, non-secret routing token
+(1-64 ASCII letters, digits, `-` or `_`) that tells a provider which requests
+belong to one cacheable conversation. The runtime sets it on every agent model
+request to `cayu-` plus 32 hex characters of a domain-separated SHA-256 digest
+of the session's fork-lineage root. The lineage root is found by following
+durable fork provenance (`ForkSessionRequest`, under either system-prompt
+policy) back to the original session whose transcript the forks copied:
+
+- the original session and all of its forks, including forks of forks, share
+  one key, so sibling branches that send the same prefix reach the same cache;
+- a delegated or child session that starts its own transcript (for example
+  `RunRequest(parent_session_id=...)`) is its own lineage root and gets its own
+  key;
+- the key is derived only from durable records, so it is identical after a
+  process restart, during recovery and when the session is resumed elsewhere.
+  If an intermediate fork ancestor has been deleted, the walk stops at the
+  last source id it can read.
+
+No raw session identifier is sent. `PromptCacheCompactor` extends the warm
+request and keeps its key; `ModelCompactor`, auxiliary inference and
+completion verifiers send their own prompts and carry no key.
+
+| Provider | `cache_affinity_key` on the wire |
+| --- | --- |
+| OpenAI Responses (`OpenAIProvider`, including background, and `OpenAISubscriptionProvider`) | `prompt_cache_key`, unless the caller set `options["openai"]["prompt_cache_key"]` (or `AgentSpec.provider_options`), which always wins. The Responses token-count request omits it. |
+| Chat Completions, Gateway, Anthropic, Vertex, Bedrock | not sent; these adapters cache by prefix only and have no matching field |
+
+The key is a routing hint derived from session identity, like the session id,
+so it is not part of the execution profile or of the provider-neutral request
+fingerprint. A replay in a new session therefore still compares equal.
 
 ### Paired cost-and-quality comparisons
 

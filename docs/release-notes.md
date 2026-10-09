@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+- Built-in providers now send only the leading run of system messages as the
+  system prompt. A system message later in the conversation, such as per-turn
+  controller or memory state, stays at its position: as a `developer` input item
+  on OpenAI Responses (API key and subscription), a `system` message on Chat
+  Completions, and a `<system>`-delimited user-side text block on Anthropic,
+  Vertex and Bedrock, placed after any pending tool results. Before, every
+  system message was moved into the leading system or instructions field, so a
+  changing late system message rewrote the start of every request and defeated
+  prompt caching for the whole history. Requests whose system messages all lead
+  the conversation are unchanged. See
+  [system message placement](runtime-contracts.md#system-message-placement).
+- Agent model requests now carry a stable prompt-cache affinity key
+  (`ModelRequest.cache_affinity_key`), a digest of the session's fork-lineage
+  root. OpenAI Responses (API key and subscription) send it as
+  `prompt_cache_key`, so a conversation and its forks reach the same prompt
+  cache and, behind quota-pooling proxies, the same account. A delegated child
+  session gets its own key. A caller-supplied `prompt_cache_key` option still
+  wins, and other providers do not send the key. See
+  [prompt-cache affinity](runtime-contracts.md#prompt-cache-affinity).
+- Anthropic prompt caching is on by default. `AnthropicProvider()` and
+  `VertexProvider(...)` now apply `CachePolicy()`, which marks the system
+  prompt, the tool definitions and the conversation before the newest message
+  (`CachePolicy()` itself now includes `CONVERSATION_PREFIX`). Before, the
+  default sent no `cache_control` markers, so Anthropic never cached anything
+  and every turn paid full input price for the whole history. `BedrockProvider`
+  gains `cache_policy=` and places Converse `cachePoint` blocks by default for
+  the Claude families Bedrock documents as cacheable. The conversation marker
+  never ends on a later system message. Opt out with
+  `cache_policy=CachePolicy(breakpoints=())`. Cache writes cost more than
+  ordinary input, so very short one-off requests can cost slightly more; the
+  [measured results](late-system-message-caching-results.md) show the
+  multi-turn savings. Anthropic and Bedrock execution-profile material changes
+  with this default, as it does on any runtime upgrade.
 - When a continuation takes over a session whose process died inside a `NONE` or
   `IDEMPOTENT` tool call, Cayu now replays that call once before the model
   continues, with its original arguments and `ToolContext.idempotency_key`, through

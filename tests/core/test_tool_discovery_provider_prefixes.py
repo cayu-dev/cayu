@@ -136,7 +136,12 @@ async def _vertex_tools(request: ModelRequest) -> list[dict[str, Any]]:
     )
     _ = [event async for event in provider.stream(request)]
     [payload] = transport.payloads
-    return payload["tools"]
+    # The default cache policy marks the last tool; the marker follows the end
+    # of the tool list, so compare the definitions without it.
+    return [
+        {key: value for key, value in tool.items() if key != "cache_control"}
+        for tool in payload["tools"]
+    ]
 
 
 _ToolProjector = Callable[[ModelRequest], Awaitable[list[dict[str, Any]]]]

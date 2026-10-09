@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
 import importlib
 import json
 import math
@@ -58,6 +59,11 @@ from cayu.providers._stream_lifecycle import (
     StreamTransitionKind,
     StreamViolation,
 )
+from cayu.providers._system_messages import (
+    late_system_note_text,
+    leading_system_count,
+    placed_conversation_messages,
+)
 from cayu.providers._thinking import preflight_thinking_effort, validate_thinking_effort
 from cayu.providers.base import (
     InputTokenCountConfidence,
@@ -73,6 +79,12 @@ from cayu.providers.base import (
     UsageDialect,
     _preflight_provider_portable_messages,
     _terminal_preserving_provider_stream,
+)
+from cayu.providers.cache import (
+    CacheBreakpoint,
+    CachePolicy,
+    RequestCacheProjection,
+    resolve_cache_policy,
 )
 from cayu.providers.deadlines import (
     ProviderDeadlineKind,
@@ -248,6 +260,14 @@ def completed_bedrock_billing_identity(
 BEDROCK_STREAM_QUEUE_SIZE = 32
 
 _RESERVED_BEDROCK_OPTIONS = frozenset({"modelId", "messages", "system", "toolConfig"})
+_BEDROCK_CROSS_REGION_PREFIXES = frozenset({"us", "eu", "apac", "jp", "au", "ca", "global"})
+_BEDROCK_PROMPT_CACHE_MODEL_PREFIXES = (
+    "anthropic.claude-3-5-haiku",
+    "anthropic.claude-3-7-sonnet",
+    "anthropic.claude-sonnet-4",
+    "anthropic.claude-opus-4",
+    "anthropic.claude-haiku-4",
+)
 _STREAM_ERROR_STATUS = {
     "internalServerException": 500,
     "modelStreamErrorException": 424,
@@ -399,6 +419,61 @@ class BedrockProvider(ModelProvider):
         )
         return {"bedrock": {"inferenceConfig": inference, **options}}
 
+    def _resolved_cache_policy(
+        self,
+        model: str,
+        options: Mapping[str, Any],
+    ) -> CachePolicy | None:
+        default = self.cache_policy
+        if default is None and bedrock_model_supports_default_prompt_caching(model):
+            default = CachePolicy()
+        return resolve_cache_policy(default, options)
+
+    def request_cache_policy(self, request: ModelRequest) -> CachePolicy | None:
+        projection = self._request_cache_projection(request, include_conversation_prefix=False)
+        return None if projection is None else projection.policy.model_copy(deep=True)
+
+    def request_cache_projection(self, request: ModelRequest) -> RequestCacheProjection | None:
+        return self._request_cache_projection(request, include_conversation_prefix=True)
+
+    def _request_cache_projection(
+        self,
+        request: ModelRequest,
+        *,
+        include_conversation_prefix: bool,
+    ) -> RequestCacheProjection | None:
+        """Project the cache points and cached conversation prefix Converse receives.
+
+        Converse merges a later system note into the adjacent user turn, so the
+        cached prefix must come from the wire messages rather than from the
+        provider-neutral message list.
+        """
+
+        policy = self._resolved_cache_policy(request.model, request.options)
+        if policy is None:
+            return None
+        payload = build_bedrock_converse_payload(
+            request,
+            default_max_tokens=self.max_tokens,
+            cache_policy=policy,
+        )
+        applied: list[CacheBreakpoint] = []
+        if any("cachePoint" in block for block in payload.get("system", ())):
+            applied.append(CacheBreakpoint.SYSTEM_PROMPT)
+        if any("cachePoint" in tool for tool in payload.get("toolConfig", {}).get("tools", ())):
+            applied.append(CacheBreakpoint.TOOL_DEFINITIONS)
+        conversation_prefix = _bedrock_cached_conversation_prefix(payload["messages"])
+        if conversation_prefix is not None:
+            applied.append(CacheBreakpoint.CONVERSATION_PREFIX)
+        return RequestCacheProjection(
+            policy=policy.model_copy(update={"breakpoints": tuple(applied)}, deep=True),
+            conversation_prefix=(
+                tuple(conversation_prefix)
+                if include_conversation_prefix and conversation_prefix is not None
+                else None
+            ),
+        )
+
     def __init__(
         self,
         *,
@@ -410,8 +485,18 @@ class BedrockProvider(ModelProvider):
         max_tokens: int = DEFAULT_BEDROCK_MAX_TOKENS,
         stream_deadlines: ProviderStreamDeadlines | None = None,
         stream_close_timeout_s: float = DEFAULT_BEDROCK_STREAM_CLOSE_TIMEOUT_SECONDS,
+        cache_policy: CachePolicy | None = None,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
+        if cache_policy is not None and type(cache_policy) is not CachePolicy:
+            raise TypeError("cache_policy must be a CachePolicy.")
+        if cache_policy is not None:
+            cache_policy = CachePolicy.model_validate(cache_policy.model_dump(mode="python"))
+            _bedrock_cache_point(cache_policy)
+        # None applies the default policy to models in the documented cacheable
+        # families; an explicit policy (CachePolicy(breakpoints=()) opts out)
+        # applies to every model.
+        self.cache_policy = cache_policy
         self.region_name = _optional_clean_string(region_name, "region_name")
         self.profile_name = _optional_clean_string(profile_name, "profile_name")
         self.endpoint_url = _optional_clean_string(endpoint_url, "endpoint_url")
@@ -528,7 +613,11 @@ class BedrockProvider(ModelProvider):
         deadline_controller: ProviderStreamDeadlineController | None = None
         owns_deadline_controller = False
         try:
-            payload = build_bedrock_converse_payload(request, default_max_tokens=self.max_tokens)
+            payload = build_bedrock_converse_payload(
+                request,
+                default_max_tokens=self.max_tokens,
+                cache_policy=self._resolved_cache_policy(request.model, request.options),
+            )
             from cayu.providers.base import record_peer_serialization
 
             await record_peer_serialization(request)
@@ -743,6 +832,7 @@ def build_bedrock_converse_payload(
     request: ModelRequest,
     *,
     default_max_tokens: int = DEFAULT_BEDROCK_MAX_TOKENS,
+    cache_policy: CachePolicy | None = None,
 ) -> dict[str, Any]:
     if type(request) is not ModelRequest:
         raise TypeError("request must be a ModelRequest.")
@@ -753,10 +843,24 @@ def build_bedrock_converse_payload(
 
     resolved_attachments = resolved_file_attachments_from_options(request.options)
     system: list[dict[str, Any]] = []
+    for message in request.messages[: leading_system_count(request.messages)]:
+        system.extend(_bedrock_system_content(message.content))
+    # Converse has no mid-conversation system role and requires alternating
+    # turns, so a later system message is appended in place to the user side as
+    # a delimited text block (after any tool results), and a user turn that
+    # directly follows such a note joins the note's turn.
     messages: list[dict[str, Any]] = []
-    for message in request.messages:
-        if message.role == MessageRole.SYSTEM:
-            system.extend(_bedrock_system_content(message.content))
+    note_turn: dict[str, Any] | None = None
+    note_turn_indexes: set[int] = set()
+    for _index, message, late_system in placed_conversation_messages(request.messages):
+        if late_system:
+            note = {"text": late_system_note_text(message)}
+            if messages and messages[-1]["role"] == "user":
+                messages[-1]["content"].append(note)
+            else:
+                messages.append({"role": "user", "content": [note]})
+            note_turn = messages[-1]
+            note_turn_indexes.add(len(messages) - 1)
             continue
         content = _bedrock_message_content(
             message.content,
@@ -765,7 +869,11 @@ def build_bedrock_converse_payload(
         )
         if content:
             role = "user" if message.role == MessageRole.TOOL else str(message.role)
-            messages.append({"role": role, "content": content})
+            if role == "user" and messages and messages[-1] is note_turn:
+                note_turn["content"].extend(content)
+            else:
+                messages.append({"role": role, "content": content})
+            note_turn = None
     if not messages:
         raise ValueError("Bedrock requests require at least one non-system message.")
 
@@ -779,10 +887,121 @@ def build_bedrock_converse_payload(
     if request.tools:
         payload["toolConfig"] = {"tools": [_bedrock_tool(tool) for tool in request.tools]}
     payload.update(copied_options)
+    if cache_policy is not None:
+        _apply_bedrock_cache_points(payload, cache_policy, note_turn_indexes=note_turn_indexes)
     # Boto3 accepts attachment bodies as bytes. Every non-byte value above was
     # already copied through Cayu's JSON-safe request/options contracts, and
     # decoded attachment bytes are newly allocated for this payload.
     return payload
+
+
+def _bedrock_cache_point(policy: CachePolicy) -> dict[str, Any]:
+    if policy.uses_extended_ttl:
+        raise ValueError("BedrockProvider does not map an extended cache TTL; use the default TTL.")
+    return {"cachePoint": {"type": "default"}}
+
+
+def _apply_bedrock_cache_points(
+    payload: dict[str, Any],
+    policy: CachePolicy,
+    *,
+    note_turn_indexes: set[int],
+) -> None:
+    """Place Converse cachePoint blocks at the ends of the stable prefixes."""
+
+    breakpoints = set(policy.breakpoints)
+    if not breakpoints:
+        return
+    cache_point = _bedrock_cache_point(policy)
+    system = payload.get("system")
+    if CacheBreakpoint.SYSTEM_PROMPT in breakpoints and system:
+        system.append(dict(cache_point))
+    tool_config = payload.get("toolConfig")
+    if CacheBreakpoint.TOOL_DEFINITIONS in breakpoints and tool_config and tool_config["tools"]:
+        tool_config["tools"].append(dict(cache_point))
+    if (
+        CacheBreakpoint.CONVERSATION_PREFIX not in breakpoints
+        or policy.conversation_prefix_strategy == "none"
+    ):
+        return
+    messages = payload["messages"]
+    skip = (
+        policy.conversation_prefix_n
+        if policy.conversation_prefix_strategy == "all_but_last_n"
+        else 1
+    )
+    boundary = len(messages) - 1 - skip
+    # Never end the cached prefix on a turn that carries a later system note.
+    while boundary >= 0 and boundary in note_turn_indexes:
+        boundary -= 1
+    if boundary < 0:
+        return
+    content = messages[boundary]["content"]
+    if content and "reasoningContent" in content[-1]:
+        return  # mirror Anthropic: a think-only boundary turn cannot be marked
+    content.append(dict(cache_point))
+
+
+def _bedrock_cached_conversation_prefix(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]] | None:
+    """Copy the wire messages through the conversation cachePoint, without markers.
+
+    Attachment and redacted-reasoning bytes become content digests so the
+    ephemeral projection stays JSON while still identifying the cached content.
+    """
+
+    for index, message in enumerate(messages):
+        content = message["content"]
+        position = next(
+            (offset for offset, block in enumerate(content) if "cachePoint" in block), None
+        )
+        if position is None:
+            continue
+        prefix = [
+            {
+                "role": earlier["role"],
+                "content": [
+                    _json_safe_bedrock_value(block)
+                    for block in earlier["content"]
+                    if "cachePoint" not in block
+                ],
+            }
+            for earlier in messages[:index]
+        ]
+        prefix.append(
+            {
+                "role": message["role"],
+                "content": [_json_safe_bedrock_value(block) for block in content[:position]],
+            }
+        )
+        return prefix
+    return None
+
+
+def _json_safe_bedrock_value(value: Any) -> Any:
+    if isinstance(value, bytes | bytearray):
+        return {"bytes_sha256": hashlib.sha256(bytes(value)).hexdigest(), "bytes": len(value)}
+    if isinstance(value, Mapping):
+        return {key: _json_safe_bedrock_value(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_json_safe_bedrock_value(item) for item in value]
+    return value
+
+
+def bedrock_model_supports_default_prompt_caching(model: str) -> bool:
+    """Whether the default cache policy applies to this Bedrock model ID.
+
+    Converse rejects ``cachePoint`` blocks for models without prompt caching, so the
+    default is limited to Claude families Bedrock documents as cacheable. Any
+    explicit ``cache_policy`` applies to every model.
+    """
+
+    base = model.rsplit("/", 1)[-1]
+    head, separator, rest = base.partition(".")
+    if separator and head in _BEDROCK_CROSS_REGION_PREFIXES:
+        base = rest
+    return base.startswith(_BEDROCK_PROMPT_CACHE_MODEL_PREFIXES)
 
 
 def _bedrock_request_options(
@@ -1602,7 +1821,7 @@ def _execution_profile_material(provider: BedrockProvider) -> dict[str, Any] | N
     """Bounded configuration material for runtime exact-type identity selection."""
     if any((not provider._owns_client, provider.region_name is None)):
         return None
-    return {
+    material: dict[str, Any] = {
         "region_name": provider.region_name,
         "profile_name": provider.profile_name,
         "endpoint_url": provider.endpoint_url,
@@ -1610,3 +1829,8 @@ def _execution_profile_material(provider: BedrockProvider) -> dict[str, Any] | N
         "stream_deadlines": _provider_deadline_material(provider.stream_deadlines),
         "stream_close_timeout_s": provider.stream_close_timeout_s,
     }
+    # The model-gated default is captured by the profile's cache-policy
+    # component; only an explicit policy is adapter configuration.
+    if provider.cache_policy is not None:
+        material["cache_policy"] = provider.cache_policy.model_dump(mode="json")
+    return material

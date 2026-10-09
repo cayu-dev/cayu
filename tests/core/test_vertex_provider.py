@@ -234,7 +234,8 @@ async def test_vertex_replays_only_its_matching_anthropic_protocol_state() -> No
 
     assert transport.calls[1]["payload"]["messages"][1]["content"] == [
         {"type": "thinking", "thinking": "vertex thought", "signature": "vertex-sig"},
-        {"type": "text", "text": "first answer"},
+        # Vertex applies the same default cache policy as AnthropicProvider.
+        {"type": "text", "text": "first answer", "cache_control": {"type": "ephemeral"}},
     ]
 
 

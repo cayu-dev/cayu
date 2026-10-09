@@ -298,7 +298,8 @@ def test_bedrock_provider_streams_text_and_usage_through_converse() -> None:
     assert client.converse_calls == [
         {
             "modelId": "us.anthropic.claude-sonnet-4-6-v1",
-            "system": [{"text": "Be concise."}],
+            # Claude Sonnet 4 models cache by default on Bedrock.
+            "system": [{"text": "Be concise."}, {"cachePoint": {"type": "default"}}],
             "messages": [{"role": "user", "content": [{"text": "Say hello."}]}],
             "inferenceConfig": {"maxTokens": 4096},
         }

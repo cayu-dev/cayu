@@ -57,6 +57,7 @@ from cayu.providers import (
     ProviderStreamDeadlineEvidence,
     ProviderStreamDeadlines,
 )
+from cayu.runtime._cache_affinity import cache_affinity_key_for_lineage_root
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions.base import InMemorySessionStore
 from cayu.storage import SQLiteBudgetLedger
@@ -1918,6 +1919,14 @@ def test_cayu_app_uses_cache_prefix_then_bounded_delta_and_accounts_for_both() -
     )
     assert cached_compaction.messages[: len(initial_request.messages)] == initial_request.messages
     assert cached_compaction.tools == initial_request.tools
+    # The cache-aware compaction extends the warm request, so it keeps the
+    # session's cache affinity; the bounded compactor sends its own prompt.
+    assert initial_request.cache_affinity_key == cache_affinity_key_for_lineage_root(
+        "app-cache-prefix"
+    )
+    assert cached_compaction.cache_affinity_key == initial_request.cache_affinity_key
+    assert second_request.cache_affinity_key == initial_request.cache_affinity_key
+    assert delta_compaction.cache_affinity_key is None
     assert cached_compaction.options["thinking"] == initial_request.options["thinking"]
     assert (
         second_request.messages[1]

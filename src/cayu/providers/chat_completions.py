@@ -74,6 +74,11 @@ from cayu.providers._stream_lifecycle import (
     StreamTransitionKind,
     StreamViolation,
 )
+from cayu.providers._system_messages import (
+    leading_system_text,
+    placed_conversation_messages,
+    system_message_text,
+)
 from cayu.providers._thinking import preflight_thinking_effort, validate_thinking_effort
 from cayu.providers.base import (
     ModelContextOverflowError,
@@ -808,10 +813,15 @@ def build_chat_completions_payload(
     resolved_attachments = resolved_file_attachments_from_options(request.options)
 
     messages: list[dict[str, Any]] = []
-    system_text = _system_text(request.messages)
+    # The leading system run is merged into one leading system message; later
+    # system messages stay in place so the request prefix stays append-only.
+    system_text = leading_system_text(request.messages)
     if system_text:
         messages.append({"role": "system", "content": system_text})
-    for message in request.messages:
+    for _index, message, late_system in placed_conversation_messages(request.messages):
+        if late_system:
+            messages.append({"role": "system", "content": system_message_text(message)})
+            continue
         messages.extend(
             _chat_completions_messages(
                 message,
@@ -1779,17 +1789,6 @@ class _ToolCallAccumulator:
                 }
             )
         return items
-
-
-def _system_text(messages: list[Message]) -> str:
-    system_parts: list[str] = []
-    for message in messages:
-        if message.role != MessageRole.SYSTEM:
-            continue
-        for part in message.content:
-            if type(part) is TextPart:
-                system_parts.append(part.text)
-    return "\n\n".join(system_parts)
 
 
 def _chat_completions_messages(

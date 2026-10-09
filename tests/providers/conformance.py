@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from cayu import Message
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
@@ -117,6 +117,7 @@ class ProviderHarness:
     wait_started: Callable[[], Awaitable[None]] | None = None
     wait_stopped: Callable[[], Awaitable[None]] | None = None
     is_closed: Callable[[], bool] | None = None
+    sent_payloads: Callable[[], list[dict[str, Any]]] | None = None
 
     async def collect(self, request: ModelRequest | None = None) -> list[ModelStreamEvent]:
         if request is None:

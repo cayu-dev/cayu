@@ -579,9 +579,10 @@ async def test_anthropic_replays_only_its_configured_protocol_version() -> None:
 
     _ = [event async for event in provider.stream(continuation)]
 
+    # The default cache policy marks the history before the newest message.
     assert transport.calls[1]["payload"]["messages"][1]["content"] == [
         {"type": "thinking", "thinking": "custom thought", "signature": "custom-sig"},
-        {"type": "text", "text": "first answer"},
+        {"type": "text", "text": "first answer", "cache_control": {"type": "ephemeral"}},
     ]
 
 
@@ -764,6 +765,9 @@ async def test_anthropic_provider_round_trips_runtime_tool_results() -> None:
                     "id": "toolu_1",
                     "name": "echo",
                     "input": {"text": "hello from claude"},
+                    # The default cache policy marks the history before the
+                    # newest message.
+                    "cache_control": {"type": "ephemeral"},
                 }
             ],
         },
@@ -1559,16 +1563,36 @@ def _cache_request() -> ModelRequest:
     )
 
 
-def test_cache_policy_marks_system_and_tools_by_default() -> None:
+def test_cache_policy_marks_system_tools_and_history_by_default() -> None:
     payload = build_anthropic_payload(_cache_request(), cache_policy=CachePolicy())
     assert payload["system"] == [
         {"type": "text", "text": "You are helpful.", "cache_control": {"type": "ephemeral"}}
     ]
     assert payload["tools"][-1]["cache_control"] == {"type": "ephemeral"}
-    # default policy has no CONVERSATION_PREFIX breakpoint
-    assert not any(
-        "cache_control" in block for message in payload["messages"] for block in message["content"]
-    )
+    # The default also marks the conversation before the newest message:
+    # [user, assistant, user] -> the assistant turn. Three of four markers.
+    marked = [
+        index
+        for index, message in enumerate(payload["messages"])
+        for block in message["content"]
+        if "cache_control" in block
+    ]
+    assert marked == [1]
+
+
+def test_anthropic_provider_caches_by_default_and_opts_out_explicitly() -> None:
+    request = _cache_request()
+    default = AnthropicProvider(api_key="test-key")
+    disabled = AnthropicProvider(api_key="test-key", cache_policy=CachePolicy(breakpoints=()))
+
+    assert default.cache_policy == CachePolicy()
+    assert default.request_cache_policy(request) == CachePolicy()
+    assert disabled.request_cache_policy(request) == CachePolicy(breakpoints=())
+    per_request_off = request.model_copy(update={"options": {"cache_policy": {"breakpoints": []}}})
+    assert default.request_cache_policy(per_request_off) == CachePolicy(breakpoints=())
+    assert build_anthropic_payload(
+        request, cache_policy=CachePolicy(breakpoints=())
+    ) == build_anthropic_payload(request)
 
 
 def test_cache_policy_none_is_byte_identical_to_no_caching() -> None:

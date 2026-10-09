@@ -76,6 +76,11 @@ from cayu.providers._stream_lifecycle import (
     StreamTransitionKind,
     StreamViolation,
 )
+from cayu.providers._system_messages import (
+    late_system_note_text,
+    leading_system_text,
+    placed_conversation_messages,
+)
 from cayu.providers._thinking import preflight_thinking_effort, validate_thinking_effort
 from cayu.providers.base import (
     InputTokenCountConfidence,
@@ -432,50 +437,12 @@ class AnthropicProvider(ModelProvider):
         *,
         include_conversation_prefix: bool,
     ) -> RequestCacheProjection | None:
-        policy = resolve_cache_policy(self.cache_policy, request.options)
-        if policy is None:
-            return None
-        payload = build_anthropic_payload(
+        return _anthropic_request_cache_projection(
             request,
+            cache_policy=self.cache_policy,
             default_max_tokens=self.max_tokens,
-            cache_policy=policy,
             reasoning_provenance=self._reasoning_state_provenance,
-        )
-        applied: list[CacheBreakpoint] = []
-        system = payload.get("system")
-        if (
-            CacheBreakpoint.SYSTEM_PROMPT in policy.breakpoints
-            and isinstance(system, list)
-            and any(isinstance(block, dict) and "cache_control" in block for block in system)
-        ):
-            applied.append(CacheBreakpoint.SYSTEM_PROMPT)
-        tools = payload.get("tools")
-        if (
-            CacheBreakpoint.TOOL_DEFINITIONS in policy.breakpoints
-            and isinstance(tools, list)
-            and any(isinstance(tool, dict) and "cache_control" in tool for tool in tools)
-        ):
-            applied.append(CacheBreakpoint.TOOL_DEFINITIONS)
-        messages = payload.get("messages")
-        conversation_prefix = None
-        if (
-            CacheBreakpoint.CONVERSATION_PREFIX in policy.breakpoints
-            and isinstance(messages, list)
-            and any(
-                isinstance(block, dict) and "cache_control" in block
-                for message in messages
-                if isinstance(message, dict) and isinstance(message.get("content"), list)
-                for block in message["content"]
-            )
-        ):
-            applied.append(CacheBreakpoint.CONVERSATION_PREFIX)
-            if include_conversation_prefix:
-                conversation_prefix = _marked_anthropic_conversation_prefix(payload)
-                if conversation_prefix is None:  # pragma: no cover - shared marker detection.
-                    raise ValueError("Anthropic cache prefix marker could not be projected.")
-        return RequestCacheProjection(
-            policy=policy.model_copy(update={"breakpoints": tuple(applied)}, deep=True),
-            conversation_prefix=conversation_prefix,
+            include_conversation_prefix=include_conversation_prefix,
         )
 
     def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
@@ -567,8 +534,9 @@ class AnthropicProvider(ModelProvider):
         self.extra_headers = _copy_headers(extra_headers)
         if cache_policy is not None and type(cache_policy) is not CachePolicy:
             raise TypeError("cache_policy must be a CachePolicy.")
+        # Prompt caching is on by default; CachePolicy(breakpoints=()) opts out.
         self.cache_policy = (
-            None
+            CachePolicy()
             if cache_policy is None
             else CachePolicy.model_validate(cache_policy.model_dump(mode="python"))
         )
@@ -879,20 +847,37 @@ def build_anthropic_payload(
         "model": request.model,
         "messages": [],
     }
-    system = _system_text(request.messages)
+    # Only the leading system run is the system prompt (and carries the system
+    # cache breakpoint). Anthropic has no mid-conversation system role, so a
+    # later system message is sent in place as its own delimited user-side text
+    # turn; Anthropic combines consecutive user turns, and placement keeps tool
+    # results first. The conversation-prefix marker then lands on the stable
+    # history before a changing trailing note.
+    system = leading_system_text(request.messages)
     if system:
         payload["system"] = system
 
     resolved_attachments = resolved_file_attachments_from_options(request.options)
-    messages = [
-        _anthropic_message(
+    messages: list[dict[str, Any]] = []
+    late_note_indexes: set[int] = set()
+    for _index, message, late_system in placed_conversation_messages(request.messages):
+        if late_system:
+            late_note_indexes.add(len(messages))
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": late_system_note_text(message)}],
+                }
+            )
+            continue
+        anthropic_message = _anthropic_message(
             message,
             resolved_attachments=resolved_attachments,
             reasoning_provenance=reasoning_provenance,
         )
-        for message in request.messages
-    ]
-    payload["messages"] = [message for message in messages if message is not None]
+        if anthropic_message is not None:
+            messages.append(anthropic_message)
+    payload["messages"] = messages
     if not payload["messages"]:
         raise ValueError("Anthropic requests require at least one non-system message.")
     tools = [_anthropic_tool(tool) for tool in request.tools]
@@ -900,8 +885,65 @@ def build_anthropic_payload(
         payload["tools"] = tools
     payload.update(options)
     if cache_policy is not None:
-        _apply_cache_breakpoints(payload, cache_policy)
+        _apply_cache_breakpoints(payload, cache_policy, late_note_indexes=late_note_indexes)
     return copy_json_value(payload, "anthropic_payload")
+
+
+def _anthropic_request_cache_projection(
+    request: ModelRequest,
+    *,
+    cache_policy: CachePolicy | None,
+    default_max_tokens: int,
+    reasoning_provenance: ReasoningStateProvenance,
+    include_conversation_prefix: bool,
+) -> RequestCacheProjection | None:
+    """Project the cache markers an Anthropic Messages payload actually carries."""
+
+    policy = resolve_cache_policy(cache_policy, request.options)
+    if policy is None:
+        return None
+    payload = build_anthropic_payload(
+        request,
+        default_max_tokens=default_max_tokens,
+        cache_policy=policy,
+        reasoning_provenance=reasoning_provenance,
+    )
+    applied: list[CacheBreakpoint] = []
+    system = payload.get("system")
+    if (
+        CacheBreakpoint.SYSTEM_PROMPT in policy.breakpoints
+        and isinstance(system, list)
+        and any(isinstance(block, dict) and "cache_control" in block for block in system)
+    ):
+        applied.append(CacheBreakpoint.SYSTEM_PROMPT)
+    tools = payload.get("tools")
+    if (
+        CacheBreakpoint.TOOL_DEFINITIONS in policy.breakpoints
+        and isinstance(tools, list)
+        and any(isinstance(tool, dict) and "cache_control" in tool for tool in tools)
+    ):
+        applied.append(CacheBreakpoint.TOOL_DEFINITIONS)
+    messages = payload.get("messages")
+    conversation_prefix = None
+    if (
+        CacheBreakpoint.CONVERSATION_PREFIX in policy.breakpoints
+        and isinstance(messages, list)
+        and any(
+            isinstance(block, dict) and "cache_control" in block
+            for message in messages
+            if isinstance(message, dict) and isinstance(message.get("content"), list)
+            for block in message["content"]
+        )
+    ):
+        applied.append(CacheBreakpoint.CONVERSATION_PREFIX)
+        if include_conversation_prefix:
+            conversation_prefix = _marked_anthropic_conversation_prefix(payload)
+            if conversation_prefix is None:  # pragma: no cover - shared marker detection.
+                raise ValueError("Anthropic cache prefix marker could not be projected.")
+    return RequestCacheProjection(
+        policy=policy.model_copy(update={"breakpoints": tuple(applied)}, deep=True),
+        conversation_prefix=conversation_prefix,
+    )
 
 
 def build_anthropic_token_count_payload(
@@ -980,9 +1022,14 @@ def _reconcile_thinking_budget(payload: dict[str, Any], *, default_max_tokens: i
         payload["max_tokens"] = budget + default_max_tokens
 
 
-def _apply_cache_breakpoints(payload: dict[str, Any], policy: CachePolicy) -> None:
+def _apply_cache_breakpoints(
+    payload: dict[str, Any],
+    policy: CachePolicy,
+    *,
+    late_note_indexes: set[int] | frozenset[int] = frozenset(),
+) -> None:
     if CacheBreakpoint.SYSTEM_PROMPT in policy.breakpoints:
-        # `_system_text` emits a flat string today; if a future structured-system-prompt
+        # `leading_system_text` emits a flat string today; if a future structured-system-prompt
         # feature makes it a block list, this guard skips it (no marker) rather than crash.
         system = payload.get("system")
         if isinstance(system, str) and system:
@@ -992,10 +1039,15 @@ def _apply_cache_breakpoints(payload: dict[str, Any], policy: CachePolicy) -> No
         if tools:
             tools[-1]["cache_control"] = policy.marker()
     if CacheBreakpoint.CONVERSATION_PREFIX in policy.breakpoints:
-        _mark_conversation_prefix(payload, policy)
+        _mark_conversation_prefix(payload, policy, late_note_indexes=late_note_indexes)
 
 
-def _mark_conversation_prefix(payload: dict[str, Any], policy: CachePolicy) -> None:
+def _mark_conversation_prefix(
+    payload: dict[str, Any],
+    policy: CachePolicy,
+    *,
+    late_note_indexes: set[int] | frozenset[int] = frozenset(),
+) -> None:
     if policy.conversation_prefix_strategy == "none":
         return
     messages = payload.get("messages")
@@ -1007,6 +1059,10 @@ def _mark_conversation_prefix(payload: dict[str, Any], policy: CachePolicy) -> N
         else 1
     )
     boundary = len(messages) - 1 - skip
+    # A later system message usually carries per-turn state; never end the
+    # cached prefix on one, so the marker stays on the stable history.
+    while boundary >= 0 and boundary in late_note_indexes:
+        boundary -= 1
     if boundary < 0:
         return  # too few messages for a stable cacheable prefix
     content = messages[boundary].get("content")
@@ -1630,17 +1686,6 @@ def _effective_anthropic_request_options(
     _apply_thinking_options(effective, options.get("thinking"))
     _reconcile_thinking_budget(effective, default_max_tokens=default_max_tokens)
     return effective
-
-
-def _system_text(messages: list[Message]) -> str:
-    system_parts: list[str] = []
-    for message in messages:
-        if message.role != MessageRole.SYSTEM:
-            continue
-        for part in message.content:
-            if type(part) is TextPart:
-                system_parts.append(part.text)
-    return "\n\n".join(system_parts)
 
 
 def _anthropic_message(

@@ -211,6 +211,7 @@ from cayu.providers.operations import (
 from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.runtime._cache_affinity import SessionCacheAffinity
 from cayu.runtime._child_session_notifications import (
     CHILD_SESSION_NOTIFICATION_INTENT_KEY,
     ChildSessionNotificationStageBinding,
@@ -1186,6 +1187,7 @@ class ModelStepExecutor:
         | None = None,
     ) -> None:
         self._session_store = session_store
+        self._cache_affinity = SessionCacheAffinity(session_store)
         self._recovery_cleanup_supervisor = recovery_cleanup_supervisor
         self._event_writer = event_writer
         self._session_control = session_control
@@ -1759,6 +1761,7 @@ class ModelStepExecutor:
                 else None
             ),
             options=redacted_options,
+            cache_affinity_key=await self._cache_affinity.key_for(session),
         )
 
     async def run_with_retries(
@@ -9370,6 +9373,7 @@ def _detach_model_request(request: ModelRequest) -> ModelRequest:
         targeted_tool_projection=request.targeted_tool_projection,
         tool_discovery_projection=request.tool_discovery_projection,
         options=request.options,
+        cache_affinity_key=request.cache_affinity_key,
     )
 
 

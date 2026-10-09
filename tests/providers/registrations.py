@@ -62,6 +62,7 @@ class _AsyncTransport:
         self.started = asyncio.Event()
         self.stopped = asyncio.Event()
         self._release = asyncio.Event()
+        self.calls: list[dict[str, Any]] = []
 
     async def aclose(self) -> None:
         self.closed = True
@@ -707,6 +708,7 @@ async def _bedrock_factory(scenario: ProviderScenario) -> ProviderHarness:
         wait_started=wait_started,
         wait_stopped=wait_stopped,
         is_closed=lambda: client.closed,
+        sent_payloads=lambda: list(client.calls),
     )
 
 
@@ -727,6 +729,7 @@ def _async_transport_harness(
         wait_started=transport.started.wait,
         wait_stopped=transport.stopped.wait,
         is_closed=lambda: transport.closed,
+        sent_payloads=lambda: list(transport.calls),
     )
 
 

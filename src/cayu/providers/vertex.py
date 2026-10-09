@@ -43,6 +43,7 @@ from cayu.providers._rejection_diagnostics import (
 from cayu.providers._thinking import preflight_thinking_effort, validate_thinking_effort
 from cayu.providers.anthropic import (
     _anthropic_overflow_message,
+    _anthropic_request_cache_projection,
     _anthropic_tool,
     _effective_anthropic_request_options,
     _validate_anthropic_tool_name,
@@ -66,6 +67,7 @@ from cayu.providers.base import (
     _terminal_preserving_provider_stream,
     privacy_safe_provider_option_projection,
 )
+from cayu.providers.cache import CachePolicy, RequestCacheProjection, resolve_cache_policy
 from cayu.providers.deadlines import (
     ProviderStreamDeadlines,
     _resolve_provider_stream_deadlines,
@@ -360,6 +362,25 @@ class VertexProvider(ModelProvider):
 
         return self._reasoning_state_provenance.protocol_version
 
+    def request_cache_policy(self, request: ModelRequest) -> CachePolicy | None:
+        projection = _anthropic_request_cache_projection(
+            request,
+            cache_policy=self.cache_policy,
+            default_max_tokens=self.max_tokens,
+            reasoning_provenance=self._reasoning_state_provenance,
+            include_conversation_prefix=False,
+        )
+        return None if projection is None else projection.policy.model_copy(deep=True)
+
+    def request_cache_projection(self, request: ModelRequest) -> RequestCacheProjection | None:
+        return _anthropic_request_cache_projection(
+            request,
+            cache_policy=self.cache_policy,
+            default_max_tokens=self.max_tokens,
+            reasoning_provenance=self._reasoning_state_provenance,
+            include_conversation_prefix=True,
+        )
+
     def __init__(
         self,
         *,
@@ -375,8 +396,17 @@ class VertexProvider(ModelProvider):
         timeout_s: float = DEFAULT_VERTEX_TIMEOUT_SECONDS,
         stream_deadlines: ProviderStreamDeadlines | None = None,
         transport: VertexTransport | None = None,
+        cache_policy: CachePolicy | None = None,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
+        if cache_policy is not None and type(cache_policy) is not CachePolicy:
+            raise TypeError("cache_policy must be a CachePolicy.")
+        # Prompt caching is on by default; CachePolicy(breakpoints=()) opts out.
+        self.cache_policy = (
+            CachePolicy()
+            if cache_policy is None
+            else CachePolicy.model_validate(cache_policy.model_dump(mode="python"))
+        )
         self.project_id = require_clean_nonblank(project_id, "project_id")
         self.region = require_clean_nonblank(region, "region")
         validated_anthropic_version = require_clean_nonblank(
@@ -427,6 +457,7 @@ class VertexProvider(ModelProvider):
             payload = build_anthropic_payload(
                 request,
                 default_max_tokens=self.max_tokens,
+                cache_policy=resolve_cache_policy(self.cache_policy, request.options),
                 reasoning_provenance=self._reasoning_state_provenance,
             )
             from cayu.providers.base import record_peer_serialization
@@ -562,6 +593,7 @@ class VertexProvider(ModelProvider):
         payload = build_anthropic_token_count_payload(
             request,
             default_max_tokens=self.max_tokens,
+            cache_policy=resolve_cache_policy(self.cache_policy, request.options),
             reasoning_provenance=self._reasoning_state_provenance,
         )
         payload["anthropic_version"] = self.anthropic_version
