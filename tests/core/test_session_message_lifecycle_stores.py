@@ -20,7 +20,7 @@ from tests.core.test_session_store_shared_conformance import (
 
 from cayu.events import Event, EventType
 from cayu.messages import Message
-from cayu.sessions.base import RunRequest, TranscriptSnapshot, fork_source_transcript_sha256
+from cayu.sessions.base import RunRequest
 from cayu.sessions.messaging import (
     SESSION_MESSAGE_CONTENT_MAX_BYTES,
     SESSION_MESSAGE_QUEUE_STORAGE_VALUE_MAX_BYTES,
@@ -35,6 +35,7 @@ from cayu.sessions.messaging import (
     SessionQueuedMessagesPending,
 )
 from cayu.sessions.records import SessionStatus, TranscriptRecord
+from cayu.sessions.transcript_queries import TranscriptSnapshot, fork_source_transcript_sha256
 
 
 @pytest.fixture(params=["memory", "sqlite", "postgres"])

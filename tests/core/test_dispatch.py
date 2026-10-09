@@ -80,7 +80,6 @@ from cayu.sessions.base import (
     _checkpoint_with_session_run_operation,
     _fork_initial_invocation_request_sha256,
     fork_source_state_sha256,
-    fork_source_transcript_sha256,
     session_fork_profile_relationship,
     session_input_messages_sha256,
     validate_profiled_fork_evidence,
@@ -96,6 +95,7 @@ from cayu.sessions.invocation import (
 )
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction
+from cayu.sessions.transcript_queries import fork_source_transcript_sha256
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.creation import TaskCreate, task_create_with_runtime_invocation
 from cayu.tasks.dispatch import (

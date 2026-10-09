@@ -23,11 +23,7 @@ from cayu.runtime._child_session_notifications import (
     ChildSessionLifecycleState,
     child_session_notification_occurrence_id,
 )
-from cayu.sessions.base import (
-    LATEST_TRANSCRIPT_TEXT_MAX_CHARS,
-    SessionStore,
-    TranscriptTextReadLimitExceeded,
-)
+from cayu.sessions.base import SessionStore
 from cayu.sessions.child_context import (
     CHILD_SESSION_PUBLIC_ALIAS_MAX_CHARS,
     CHILD_SESSION_PUBLIC_OCCURRENCE_ID_MAX_CHARS,
@@ -36,6 +32,10 @@ from cayu.sessions.child_context import (
     _require_public_session_alias,
 )
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.transcript_queries import (
+    LATEST_TRANSCRIPT_TEXT_MAX_CHARS,
+    TranscriptTextReadLimitExceeded,
+)
 
 CHILD_SESSION_RESULT_PROJECTION_VERSION = "cayu.child-session-result.v1"
 DEFAULT_CHILD_SESSION_RESULT_MAX_CHARS = 12_000

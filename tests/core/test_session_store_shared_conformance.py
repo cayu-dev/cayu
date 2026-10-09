@@ -269,7 +269,6 @@ from cayu.sessions.base import (
     SessionRuntimePublicationConflict,
     SessionStatusConflict,
     SessionStore,
-    TranscriptSnapshot,
     _checkpoint_with_session_run_operation,
     _deactivate_session_run_fence,
     _mcp_authoritative_manifest_hash,
@@ -314,7 +313,7 @@ from cayu.sessions.terminal_evidence import (
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,
 )
-from cayu.sessions.transcript_queries import TranscriptQuery
+from cayu.sessions.transcript_queries import TranscriptQuery, TranscriptSnapshot
 from cayu.sessions.usage import UsageRollupQuery
 from cayu.storage.jsonl_export import export_sessions, import_sessions
 from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry

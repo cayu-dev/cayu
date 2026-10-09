@@ -58,6 +58,7 @@ from cayu.sessions import queries as session_query_rules
 from cayu.sessions import records as session_record_rules
 from cayu.sessions import summaries as session_summary_rules
 from cayu.sessions import terminal_evidence as terminal_session_evidence
+from cayu.sessions import transcript_queries as session_transcript_queries
 from cayu.sessions import usage as session_usage_rules
 from cayu.sessions._argument_continuity import ArgumentContinuity
 from cayu.sessions._completion_finalization import (
@@ -326,6 +327,15 @@ from cayu.sessions.topology import build_session_topology_result as build_sessio
 from cayu.sessions.topology import decode_session_topology_cursor as decode_session_topology_cursor
 from cayu.sessions.topology import encode_session_topology_cursor as encode_session_topology_cursor
 from cayu.sessions.transcript_queries import (
+    LATEST_TRANSCRIPT_TEXT_MAX_CHARS as LATEST_TRANSCRIPT_TEXT_MAX_CHARS,
+)
+from cayu.sessions.transcript_queries import (
+    LATEST_TRANSCRIPT_TEXT_MAX_PARTS as LATEST_TRANSCRIPT_TEXT_MAX_PARTS,
+)
+from cayu.sessions.transcript_queries import (
+    LATEST_TRANSCRIPT_TEXT_MAX_SOURCE_BYTES as LATEST_TRANSCRIPT_TEXT_MAX_SOURCE_BYTES,
+)
+from cayu.sessions.transcript_queries import (
     TRANSCRIPT_SEARCH_DEFAULT_LIMIT as TRANSCRIPT_SEARCH_DEFAULT_LIMIT,
 )
 from cayu.sessions.transcript_queries import (
@@ -361,11 +371,16 @@ from cayu.sessions.transcript_queries import (
 from cayu.sessions.transcript_queries import (
     TRANSCRIPT_SEARCH_TOKENIZER_VERSION as TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
 )
+from cayu.sessions.transcript_queries import ForkTranscriptValidator as ForkTranscriptValidator
 from cayu.sessions.transcript_queries import TranscriptPage as TranscriptPage
 from cayu.sessions.transcript_queries import TranscriptQuery as TranscriptQuery
 from cayu.sessions.transcript_queries import TranscriptSearchHit as TranscriptSearchHit
 from cayu.sessions.transcript_queries import TranscriptSearchQuery as TranscriptSearchQuery
 from cayu.sessions.transcript_queries import TranscriptSearchResult as TranscriptSearchResult
+from cayu.sessions.transcript_queries import TranscriptSnapshot as TranscriptSnapshot
+from cayu.sessions.transcript_queries import (
+    TranscriptTextReadLimitExceeded as TranscriptTextReadLimitExceeded,
+)
 from cayu.sessions.transcript_queries import copy_transcript_query as copy_transcript_query
 from cayu.sessions.transcript_queries import (
     copy_transcript_search_hit as copy_transcript_search_hit,
@@ -380,6 +395,12 @@ from cayu.sessions.transcript_queries import (
     encode_transcript_search_cursor as encode_transcript_search_cursor,
 )
 from cayu.sessions.transcript_queries import filter_transcript_records as filter_transcript_records
+from cayu.sessions.transcript_queries import (
+    fork_source_transcript_sha256 as fork_source_transcript_sha256,
+)
+from cayu.sessions.transcript_queries import (
+    fork_transcript_is_accepted as fork_transcript_is_accepted,
+)
 from cayu.sessions.transcript_queries import (
     transcript_search_document as transcript_search_document,
 )
@@ -627,7 +648,6 @@ from cayu.messages import (
     MessageRole,
     PeerContentPart,
     ProviderStatePart,
-    TextPart,
     ThinkingPart,
     ToolCallPart,
     ToolResultPart,
@@ -6656,41 +6676,6 @@ def _copy_failed_first_delivery_retirement(
     return copied
 
 
-LATEST_TRANSCRIPT_TEXT_MAX_CHARS = 32_000
-LATEST_TRANSCRIPT_TEXT_MAX_PARTS = 4_096
-LATEST_TRANSCRIPT_TEXT_MAX_SOURCE_BYTES = 2 * 1024 * 1024
-
-
-class TranscriptTextReadLimitExceeded(RuntimeError):
-    """A bounded text projection cannot safely inspect its source message."""
-
-
-def _bounded_transcript_message_text(
-    message: Message,
-    *,
-    max_chars: int,
-) -> tuple[str, bool]:
-    """Project text with bounded part visits and at most one look-ahead character."""
-
-    pieces: list[str] = []
-    retained_chars = 0
-    for part_index, part in enumerate(message.content):
-        if part_index >= LATEST_TRANSCRIPT_TEXT_MAX_PARTS:
-            raise TranscriptTextReadLimitExceeded(
-                "Transcript message exceeds the bounded content-part inspection limit."
-            )
-        if type(part) is not TextPart:
-            continue
-        remaining = max_chars + 1 - retained_chars
-        if remaining <= 0:
-            break
-        piece = part.text[:remaining]
-        pieces.append(piece)
-        retained_chars += len(piece)
-    text = "".join(pieces)
-    return text[:max_chars], len(text) > max_chars
-
-
 class DeferredInteractionInput(BaseModel):
     """Source messages durably admitted but not yet visible in the transcript."""
 
@@ -6780,100 +6765,6 @@ def require_deferred_initial_transcript_replacement(
         raise RuntimeError(
             "Initial transcript replacement conflicts with its authenticated projection."
         )
-
-
-class TranscriptSnapshot(BaseModel):
-    """Retained transcript records plus the permanent append cursor."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    records: list[TranscriptRecord] = Field(default_factory=list)
-    cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-
-    @model_validator(mode="after")
-    def validate_record_order(self) -> TranscriptSnapshot:
-        indices = [record.index for record in self.records]
-        if indices != sorted(indices) or len(indices) != len(set(indices)):
-            raise ValueError("Transcript snapshot records must have unique ascending indices.")
-        if indices and indices[-1] >= self.cursor:
-            raise ValueError("Transcript snapshot records must precede its append cursor.")
-        return self
-
-    def retained_position(self, cursor: int) -> int:
-        """Map an exact absolute cursor to this snapshot's retained positions.
-
-        A removed cursor raises ValueError, even if later records survive.
-        The snapshot's append cursor maps to the end, including empty retention.
-        Unlike ``load_transcript_window``, this does not skip missing history.
-        """
-
-        if type(cursor) is not int:
-            raise TypeError("Transcript cursor must be an integer.")
-        if not 0 <= cursor <= self.cursor:
-            raise ValueError("Transcript cursor exceeds the snapshot append cursor.")
-        indices = [record.index for record in self.records]
-        position = bisect_left(indices, cursor)
-        if position < len(indices):
-            if indices[position] != cursor:
-                raise ValueError("Transcript cursor is not available in retained history.")
-        elif cursor != self.cursor:
-            raise ValueError("Transcript cursor is not available in retained history.")
-        return position
-
-
-ForkTranscriptValidator = Callable[[tuple[Message, ...], TranscriptSnapshot], bool]
-
-
-def fork_source_transcript_sha256(snapshot: TranscriptSnapshot) -> str:
-    """Hash the permanent cursor and absolute positions of retained source messages."""
-
-    if type(snapshot) is not TranscriptSnapshot:
-        raise TypeError("snapshot must be a TranscriptSnapshot.")
-    return sha256(
-        canonical_durable_json_bytes(
-            {
-                "record_type": "cayu.fork-source-transcript",
-                "schema_version": 1,
-                "cursor": snapshot.cursor,
-                "records": [
-                    {
-                        "index": record.index,
-                        "message": record.message.model_dump(mode="json", warnings=False),
-                    }
-                    for record in snapshot.records
-                ],
-            },
-            "fork_source.transcript",
-        )
-    ).hexdigest()
-
-
-def fork_transcript_is_accepted(
-    messages: list[Message],
-    source_snapshot: TranscriptSnapshot | None,
-    validator: ForkTranscriptValidator | None,
-) -> bool:
-    """Require explicit positive validation for one atomic source/copy snapshot."""
-
-    if validator is None:
-        return True
-    if type(source_snapshot) is not TranscriptSnapshot:
-        raise TypeError("source_snapshot must be a TranscriptSnapshot.")
-    # A validator is an external callback. Give it isolated projections so
-    # mutation cannot alter the source transcript, its absolute indexes, or the
-    # messages that will be committed to the child.
-    validation_messages = tuple(detach_message(message) for message in messages)
-    validation_source_snapshot: TranscriptSnapshot | None = TranscriptSnapshot.model_validate(
-        source_snapshot.model_dump(mode="json", warnings=False)
-    )
-    try:
-        accepted = validator(validation_messages, validation_source_snapshot)
-    except Exception:
-        return False
-    finally:
-        validation_messages = ()
-        validation_source_snapshot = None
-    return type(accepted) is bool and accepted
 
 
 def _public_authority_alias_store_key(
@@ -22975,7 +22866,7 @@ class InMemorySessionStore(
             index = self._latest_transcript_indexes_by_role.get(session_id, {}).get(role)
             if index is None:
                 return None
-            return _bounded_transcript_message_text(
+            return session_transcript_queries._bounded_transcript_message_text(
                 self._transcripts[session_id][index],
                 max_chars=max_chars,
             )

@@ -5462,7 +5462,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "TranscriptSearchHit": ("cayu.sessions.transcript_queries", "TranscriptSearchHit"),
     "TranscriptSearchQuery": ("cayu.sessions.transcript_queries", "TranscriptSearchQuery"),
     "TranscriptSearchResult": ("cayu.sessions.transcript_queries", "TranscriptSearchResult"),
-    "TranscriptSnapshot": ("cayu.sessions.base", "TranscriptSnapshot"),
+    "TranscriptSnapshot": ("cayu.sessions.transcript_queries", "TranscriptSnapshot"),
     "TrialRequestSpec": ("cayu.evals.corpus", "TrialRequestSpec"),
     "UnresolvedBillingIdentity": ("cayu.budgets.billing", "UnresolvedBillingIdentity"),
     "UsageAccountingSnapshot": ("cayu.runtime._usage_accounting", "UsageAccountingSnapshot"),

@@ -3935,7 +3935,6 @@ from cayu.sessions.base import SessionModelTransition as SessionModelTransition
 from cayu.sessions.base import SessionStateSnapshot as SessionStateSnapshot
 from cayu.sessions.base import SessionStatusConflict as SessionStatusConflict
 from cayu.sessions.base import SessionStore as SessionStore
-from cayu.sessions.base import TranscriptSnapshot as TranscriptSnapshot
 from cayu.sessions.base import (
     checkpoint_root_field_projection_from_storage as checkpoint_root_field_projection_from_storage,
 )
@@ -4262,6 +4261,7 @@ from cayu.sessions.transcript_queries import TranscriptQuery as TranscriptQuery
 from cayu.sessions.transcript_queries import TranscriptSearchHit as TranscriptSearchHit
 from cayu.sessions.transcript_queries import TranscriptSearchQuery as TranscriptSearchQuery
 from cayu.sessions.transcript_queries import TranscriptSearchResult as TranscriptSearchResult
+from cayu.sessions.transcript_queries import TranscriptSnapshot as TranscriptSnapshot
 from cayu.sessions.usage import UsageRollupQuery as UsageRollupQuery
 from cayu.snapshots.base import AGENT_SNAPSHOT_MAX_BYTES as AGENT_SNAPSHOT_MAX_BYTES
 from cayu.snapshots.base import AGENT_SNAPSHOT_NODE_RECORD_TYPE as AGENT_SNAPSHOT_NODE_RECORD_TYPE

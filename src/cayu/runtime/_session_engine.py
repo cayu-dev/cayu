@@ -704,7 +704,6 @@ from cayu.sessions.base import (
     SessionRuntimePublicationConflict,
     SessionStatusConflict,
     SessionStore,
-    TranscriptSnapshot,
     _activate_session_interaction,
     _activate_session_run_fence,
     _authenticated_session_instance_id_for_run_request,
@@ -746,7 +745,6 @@ from cayu.sessions.base import (
     execution_profile_adoption_request_fingerprint,
     fork_session_invocation,
     fork_source_state_sha256,
-    fork_source_transcript_sha256,
     model_completion_stage_settlement_request,
     queued_interaction_profile_handoff_evidence,
     run_request_authority_is_runtime_generated,
@@ -816,7 +814,11 @@ from cayu.sessions.recovery import (
     copy_incomplete_session_recovery_request,
     copy_incomplete_sessions_recovery_request,
 )
-from cayu.sessions.transcript_queries import TranscriptQuery
+from cayu.sessions.transcript_queries import (
+    TranscriptQuery,
+    TranscriptSnapshot,
+    fork_source_transcript_sha256,
+)
 from cayu.tasks._terminalization import _terminalize_claimed_task
 from cayu.tasks.admission import (
     WORK_ATTEMPT_RECOVERY_CHECKPOINT_KEY,

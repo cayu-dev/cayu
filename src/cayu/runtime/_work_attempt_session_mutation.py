@@ -30,11 +30,11 @@ from cayu.sessions._checkpoint_secret_validation import durable_value_contains_s
 from cayu.sessions.base import (
     DeferredInteractionInput,
     SessionStore,
-    TranscriptSnapshot,
     _initial_transcript_pending_interaction_id,
 )
 from cayu.sessions.invocation import SessionInvocationBinding
 from cayu.sessions.records import EventRecord, Session, copy_session
+from cayu.sessions.transcript_queries import TranscriptSnapshot
 from cayu.tasks.admission import (
     WorkAttemptAdmission,
     WorkAttemptAdmissionState,

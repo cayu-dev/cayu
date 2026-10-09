@@ -495,7 +495,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "TranscriptSearchHit": ("cayu.sessions.transcript_queries", "TranscriptSearchHit"),
     "TranscriptSearchQuery": ("cayu.sessions.transcript_queries", "TranscriptSearchQuery"),
     "TranscriptSearchResult": ("cayu.sessions.transcript_queries", "TranscriptSearchResult"),
-    "TranscriptSnapshot": ("cayu.sessions.base", "TranscriptSnapshot"),
+    "TranscriptSnapshot": ("cayu.sessions.transcript_queries", "TranscriptSnapshot"),
     "UsageRollupQuery": ("cayu.sessions.usage", "UsageRollupQuery"),
     "checkpoint_root_field_projection_from_storage": (
         "cayu.sessions.base",

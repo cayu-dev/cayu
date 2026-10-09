@@ -383,7 +383,7 @@ def source_snapshot(
     checkpoint: Any = None,
     include_checkpoint_digest: bool = False,
 ) -> SessionMessageSource:
-    from cayu.sessions.base import fork_source_transcript_sha256
+    from cayu.sessions.transcript_queries import fork_source_transcript_sha256
 
     checkpoint_digest = None
     if include_checkpoint_digest:

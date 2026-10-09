@@ -28,7 +28,6 @@ from cayu.runtime.public_authority import (
     PublicAuthorityAliasKeyring,
 )
 from cayu.sessions.base import (
-    LATEST_TRANSCRIPT_TEXT_MAX_PARTS,
     ChildSessionLifecycleQuery,
     InMemorySessionStore,
     ModelCompletionStageRequest,
@@ -38,7 +37,6 @@ from cayu.sessions.base import (
     SessionModelCompletionStageConflict,
     SessionRunFenced,
     SessionStore,
-    TranscriptTextReadLimitExceeded,
 )
 from cayu.sessions.child_context import (
     ChildSessionContextContribution,
@@ -57,6 +55,10 @@ from cayu.sessions.child_results import (
     project_terminal_child_session_result,
 )
 from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.transcript_queries import (
+    LATEST_TRANSCRIPT_TEXT_MAX_PARTS,
+    TranscriptTextReadLimitExceeded,
+)
 from cayu.storage import migrations as schema_migrations
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec

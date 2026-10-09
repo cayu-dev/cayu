@@ -574,13 +574,11 @@ from cayu.sessions.base import (
     SessionRunFenced,
     SessionStatusConflict,
     SessionStore,
-    TranscriptSnapshot,
     _fork_source_session_instance_fingerprint,
     copy_fork_session_request,
     copy_interrupt_session_request,
     copy_model_completion_manual_recovery_request,
     copy_resume_request,
-    fork_source_transcript_sha256,
     system_prompt_messages_sha256,
 )
 from cayu.sessions.child_context import ChildSessionContextContributor
@@ -652,6 +650,7 @@ from cayu.sessions.recovery import (
     copy_incomplete_session_recovery_request,
     copy_incomplete_sessions_recovery_request,
 )
+from cayu.sessions.transcript_queries import TranscriptSnapshot, fork_source_transcript_sha256
 from cayu.tasks.admission import (
     WorkAttemptAdmission,
     WorkAttemptClaimRenewalRequest,

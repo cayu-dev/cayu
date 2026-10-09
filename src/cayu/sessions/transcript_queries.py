@@ -9,7 +9,8 @@ import math
 import re
 import secrets
 import unicodedata
-from collections.abc import Mapping
+from bisect import bisect_left
+from collections.abc import Callable, Mapping
 from hashlib import sha256
 from itertools import islice
 
@@ -32,7 +33,7 @@ from cayu._validation import (
 )
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu._validation import require_durable_nonblank as require_nonblank
-from cayu.messages import Message, MessageRole, TextPart, ThinkingPart
+from cayu.messages import Message, MessageRole, TextPart, ThinkingPart, detach_message
 from cayu.sessions.records import MAX_SESSION_ID_BYTES, TranscriptRecord
 
 
@@ -777,3 +778,136 @@ def _contains_token_sequence(haystack: tuple[str, ...], needle: tuple[str, ...])
             if matched == len(needle):
                 return True
     return False
+
+
+LATEST_TRANSCRIPT_TEXT_MAX_CHARS = 32_000
+
+
+LATEST_TRANSCRIPT_TEXT_MAX_PARTS = 4_096
+
+
+LATEST_TRANSCRIPT_TEXT_MAX_SOURCE_BYTES = 2 * 1024 * 1024
+
+
+class TranscriptTextReadLimitExceeded(RuntimeError):
+    """A bounded text projection cannot safely inspect its source message."""
+
+
+def _bounded_transcript_message_text(
+    message: Message,
+    *,
+    max_chars: int,
+) -> tuple[str, bool]:
+    """Project text with bounded part visits and at most one look-ahead character."""
+
+    pieces: list[str] = []
+    retained_chars = 0
+    for part_index, part in enumerate(message.content):
+        if part_index >= LATEST_TRANSCRIPT_TEXT_MAX_PARTS:
+            raise TranscriptTextReadLimitExceeded(
+                "Transcript message exceeds the bounded content-part inspection limit."
+            )
+        if type(part) is not TextPart:
+            continue
+        remaining = max_chars + 1 - retained_chars
+        if remaining <= 0:
+            break
+        piece = part.text[:remaining]
+        pieces.append(piece)
+        retained_chars += len(piece)
+    text = "".join(pieces)
+    return text[:max_chars], len(text) > max_chars
+
+
+class TranscriptSnapshot(BaseModel):
+    """Retained transcript records plus the permanent append cursor."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    records: list[TranscriptRecord] = Field(default_factory=list)
+    cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+
+    @model_validator(mode="after")
+    def validate_record_order(self) -> TranscriptSnapshot:
+        indices = [record.index for record in self.records]
+        if indices != sorted(indices) or len(indices) != len(set(indices)):
+            raise ValueError("Transcript snapshot records must have unique ascending indices.")
+        if indices and indices[-1] >= self.cursor:
+            raise ValueError("Transcript snapshot records must precede its append cursor.")
+        return self
+
+    def retained_position(self, cursor: int) -> int:
+        """Map an exact absolute cursor to this snapshot's retained positions.
+
+        A removed cursor raises ValueError, even if later records survive.
+        The snapshot's append cursor maps to the end, including empty retention.
+        Unlike ``load_transcript_window``, this does not skip missing history.
+        """
+
+        if type(cursor) is not int:
+            raise TypeError("Transcript cursor must be an integer.")
+        if not 0 <= cursor <= self.cursor:
+            raise ValueError("Transcript cursor exceeds the snapshot append cursor.")
+        indices = [record.index for record in self.records]
+        position = bisect_left(indices, cursor)
+        if position < len(indices):
+            if indices[position] != cursor:
+                raise ValueError("Transcript cursor is not available in retained history.")
+        elif cursor != self.cursor:
+            raise ValueError("Transcript cursor is not available in retained history.")
+        return position
+
+
+ForkTranscriptValidator = Callable[[tuple[Message, ...], TranscriptSnapshot], bool]
+
+
+def fork_source_transcript_sha256(snapshot: TranscriptSnapshot) -> str:
+    """Hash the permanent cursor and absolute positions of retained source messages."""
+
+    if type(snapshot) is not TranscriptSnapshot:
+        raise TypeError("snapshot must be a TranscriptSnapshot.")
+    return sha256(
+        canonical_durable_json_bytes(
+            {
+                "record_type": "cayu.fork-source-transcript",
+                "schema_version": 1,
+                "cursor": snapshot.cursor,
+                "records": [
+                    {
+                        "index": record.index,
+                        "message": record.message.model_dump(mode="json", warnings=False),
+                    }
+                    for record in snapshot.records
+                ],
+            },
+            "fork_source.transcript",
+        )
+    ).hexdigest()
+
+
+def fork_transcript_is_accepted(
+    messages: list[Message],
+    source_snapshot: TranscriptSnapshot | None,
+    validator: ForkTranscriptValidator | None,
+) -> bool:
+    """Require explicit positive validation for one atomic source/copy snapshot."""
+
+    if validator is None:
+        return True
+    if type(source_snapshot) is not TranscriptSnapshot:
+        raise TypeError("source_snapshot must be a TranscriptSnapshot.")
+    # A validator is an external callback. Give it isolated projections so
+    # mutation cannot alter the source transcript, its absolute indexes, or the
+    # messages that will be committed to the child.
+    validation_messages = tuple(detach_message(message) for message in messages)
+    validation_source_snapshot: TranscriptSnapshot | None = TranscriptSnapshot.model_validate(
+        source_snapshot.model_dump(mode="json", warnings=False)
+    )
+    try:
+        accepted = validator(validation_messages, validation_source_snapshot)
+    except Exception:
+        return False
+    finally:
+        validation_messages = ()
+        validation_source_snapshot = None
+    return type(accepted) is bool and accepted

@@ -45400,5 +45400,11 @@
     "tests/core/test_session_control_package_layout.py::test_incomplete_recovery_composes_with_plans_without_stores[cayu.runtime]": 0.5119879590056371,
     "tests/core/test_session_control_package_layout.py::test_incomplete_recovery_composes_with_plans_without_stores[cayu.sessions]": 0.5072256669809576,
     "tests/core/test_session_control_package_layout.py::test_incomplete_recovery_composes_with_plans_without_stores[cayu]": 0.5311355000012554,
-    "tests/core/test_session_control_package_layout.py::test_incomplete_recovery_public_imports_and_historical_pickle_globals": 0.0004702489823102951
+    "tests/core/test_session_control_package_layout.py::test_incomplete_recovery_public_imports_and_historical_pickle_globals": 0.0004702489823102951,
+    "tests/core/test_transcript_package_layout.py::test_bounded_transcript_text_without_stores": 0.19587024897919036,
+    "tests/core/test_transcript_package_layout.py::test_transcript_snapshot_and_fork_validation_without_stores[cayu.runtime]": 0.19173895902349614,
+    "tests/core/test_transcript_package_layout.py::test_transcript_snapshot_and_fork_validation_without_stores[cayu.sessions.transcript_queries]": 0.3258115420176182,
+    "tests/core/test_transcript_package_layout.py::test_transcript_snapshot_and_fork_validation_without_stores[cayu.sessions]": 0.1975632089888677,
+    "tests/core/test_transcript_package_layout.py::test_transcript_snapshot_and_fork_validation_without_stores[cayu]": 0.21027512397267856,
+    "tests/core/test_transcript_package_layout.py::test_transcript_snapshot_public_imports_and_historical_pickle_global": 1.4136690000013914
 }
