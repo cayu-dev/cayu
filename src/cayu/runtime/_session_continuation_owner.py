@@ -1328,34 +1328,13 @@ class SessionContinuationOwner:
                     if consumption.admission_claimed:
                         with consumption_scope(consumption):
                             await self.store._release_continuation_admission_claim(consumption)
-                # Re-enter normal gates with the exact retained command identity.
-                # If the gates now refuse, responsibility remains unclaimed and
-                # can be explicitly excluded rather than stranded as in-flight.
-                handoff = _ContinuationResumeHandoff(self, native_service, service_digest)
-                stream = app._resume_private(
-                    copied_request,
-                    store_resolved_session_id=service.ticket.session_id,
-                    continuation_handoff=handoff,
-                    participant_context=participant_context,
-                )
-                try:
-                    async for _ in stream:
-                        pass
-                finally:
-                    await stream.aclose()
-                result = await self.store.load_continuation_ticket(
-                    service.ticket.session_id,
-                    registration_key=service.ticket.registration_key,
-                    session_instance_id=service.ticket.session_instance_id,
-                )
-                if result is None:
-                    raise ContinuationUnavailable("Continuation service readback is unavailable.")
-                return _ContinuationServiceResult(result, True)
-            if (
+            elif (
                 retained.ticket.state != "WAITING"
                 or retained.ticket.revision != service.ticket.revision
             ):
                 raise ContinuationConflict("Continuation is no longer eligible for service.")
+            # Fresh service and a retained, unclaimed handoff enter the same gates.
+            # A refusal leaves responsibility available for explicit exclusion.
             handoff = _ContinuationResumeHandoff(self, native_service, service_digest)
             stream = app._resume_private(
                 copied_request,

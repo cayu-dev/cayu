@@ -686,6 +686,10 @@ loading runtime or store implementations; admission-command validation composes
 the shared invocation contracts. Existing runtime imports and public exports
 resolve to the same definitions. Runtime retains admission and dispatch, and
 checkpoint publication; native stores retain their transaction boundaries.
+The runtime continuation owner sends fresh service and retained unclaimed
+handoffs through one resume/drain/readback sequence. Temporary service keeps its
+foreign-permit authentication, side-session responsibility and foreign settlement
+checks around the existing shared operation observer.
 
 `sessions/_session_continuation_scope.py` and `_temporary_continuation_scope.py`
 own the shared authority contexts and store-facing checks. Runtime producers and
