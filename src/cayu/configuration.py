@@ -1,4 +1,4 @@
-"""Cohesive application-owned defaults for the Cayu Runtime.
+"""Cohesive application-owned defaults for the Cayu agent framework.
 
 This module contains the small public configuration surface that callers may
 reasonably tune for an application. Protocol constants, durable schema

@@ -70,7 +70,7 @@ def _command_specs() -> tuple[
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cayu",
-        description="Developer/admin CLI for Cayu agent projects.",
+        description="Build, evaluate and operate agents with the Cayu Python framework.",
     )
     parser.add_argument("--version", action="version", version=f"cayu {_version()}")
     subparsers = parser.add_subparsers(dest="command")

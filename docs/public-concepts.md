@@ -1,5 +1,24 @@
 # Public concepts and source ownership
 
+Cayu is an open-source Python framework for building and running domain-specific long-horizon agents, with a durable runtime built in.
+
+## Framework, harness, runtime and agent
+
+| Term | Responsibility |
+| --- | --- |
+| Framework | Cayu's Python APIs, components and defaults for building and running agents |
+| Harness | The application-specific context, tools, memory, policies, domain logic and verification assembled with those components |
+| Runtime | The integrated execution subsystem for sessions, state, tool authority, workers, budgets and recovery |
+| Agent | The resulting application that performs a defined job |
+| Cloud | Optional deployment and shared operation of Cayu agents |
+
+The public capability packages below belong to the framework. `cayu.runtime`
+owns execution coordination; model providers, knowledge, tools, workspaces and
+evals have their own public packages. Applications own their user experience,
+authentication, business authorization and completion criteria.
+
+## Choose a public capability
+
 Import Cayu capabilities by the concept you are working with. The public
 packages own their implementations; the former flat and core/runtime module
 paths have been removed in this prerelease migration.

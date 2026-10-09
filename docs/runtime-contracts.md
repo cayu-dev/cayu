@@ -1,6 +1,6 @@
 # Runtime Contracts
 
-This is a design/maintainer document for Cayu's production agent runtime. It names contracts that must stay stable as the runtime evolves.
+This design/maintainer document covers the integrated runtime within Cayu's Python agent framework. It names execution contracts that must stay stable as the runtime evolves.
 
 Interrupted tool rounds publish recovery-safe staged results before closing the
 round. A result staged before cancellation is not rerun or replaced by an

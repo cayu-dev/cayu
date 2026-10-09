@@ -1,8 +1,13 @@
 # Cayu Architecture
 
-This is a design/maintainer document for Cayu's production agent runtime. It records architecture decisions and intended direction; it is not a complete end-user guide.
+This design/maintainer document covers Cayu's Python agent framework and its integrated runtime. It records architecture decisions and intended direction; it is not a complete end-user guide.
 
-Cayu is a production agent runtime for building long-horizon agents, multi-agent workflows, and sandboxed tool runtimes.
+Cayu is an open-source Python framework for building and running domain-specific long-horizon agents, with a durable runtime built in.
+
+The framework provides model adapters, context and memory, tools, integrations,
+workspaces, multi-agent coordination, verification and evals. Applications
+assemble these components into a domain-specific harness. The integrated runtime
+executes that harness, records progress and governs continuation and recovery.
 
 The runtime should run locally, on a VPS, in Docker, in ECS, or in any other standard execution environment. Hosted deployments should be adapters around the runtime, not a requirement for using it.
 

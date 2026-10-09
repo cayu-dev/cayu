@@ -1,4 +1,4 @@
-"""Cayu public API."""
+"""Public API for the Cayu Python agent framework."""
 
 from typing import Any as _Any
 

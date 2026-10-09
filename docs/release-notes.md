@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Describe Cayu as a Python agent framework with a durable runtime built in.
+  The README, package metadata, CLI overview and source guides now distinguish
+  framework capabilities, the application-specific harness and the execution
+  subsystem.
+
 - Raise the PDF and OIDC dependency minimums to pypdf 6.19.0 and PyJWT
   2.15.0, and update the locked urllib3 to 2.8.0, addressing dependency
   denial-of-service and proxy TLS configuration advisories.

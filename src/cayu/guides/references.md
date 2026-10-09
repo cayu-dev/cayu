@@ -1,5 +1,9 @@
 # Cayu offline capability references
 
+Cayu is a Python agent framework with an integrated durable runtime. These
+capabilities let you assemble the domain-specific harness around your model;
+sessions, authority, budgets and recovery govern its execution.
+
 These compact references are shipped in the Cayu package. They describe the
 public seam to start from and the proof boundary to preserve. Use the smallest
 section that matches the requested behavior. For an end-to-end operational

@@ -1,6 +1,6 @@
 # Project Layout
 
-This is a design/maintainer document for Cayu's production agent runtime. It describes the intended repo and generated-project structure; it is not a complete end-user guide.
+This design/maintainer document covers the Cayu Python framework's repository and generated-project structure; it is not a complete end-user guide. The runtime is one execution subsystem within the framework.
 
 The Cayu repository and user-created agent projects should use different structures.
 

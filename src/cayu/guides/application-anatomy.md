@@ -1,5 +1,9 @@
 # Cayu application anatomy
 
+Build your domain-specific harness with Cayu's Python framework: compose model
+providers, context, tools, policies, memory and verification. Its integrated
+runtime executes the resulting agent and coordinates its durable state.
+
 A Cayu application has one explicit boot contract: a project declares an
 application factory, and every process calls that factory to construct its own
 application graph. The Python object is process-local. Configured durable stores

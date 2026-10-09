@@ -3,31 +3,39 @@
 [Find public concepts](https://github.com/cayu-dev/cayu/blob/main/docs/public-concepts.md) ·
 [Run the example](https://github.com/cayu-dev/cayu/blob/main/examples/application/README.md)
 
-Cayu is a production agent runtime for building and operating AI agents in
-Python.
+Cayu is an open-source Python framework for building and running domain-specific
+long-horizon agents, with a durable runtime built in.
 
-A harness turns a model into an agent by supplying its context, tools,
-permissions, and execution logic. Cayu gives applications control of the full
-agent execution lifecycle: how context is assembled, models and tools are
-invoked, where agent code runs, how state is persisted, authority is governed,
-failures are recovered, and behavior is observed and evaluated.
+Build your agent's harness from Python components and defaults: model providers,
+context, tools, integrations, knowledge, memory, policies, domain logic and
+verification. Choose the capabilities your job needs, then evaluate and operate
+the resulting agent on your infrastructure or with optional Cayu Cloud.
 
-Cayu provides durable agent-runtime primitives including sessions, task
-dispatch, leased workers, resumable workflow steps, approvals, and recovery.
-Applications can use them directly without a separate workflow engine.
+The integrated runtime carries that work through model and tool calls, durable
+sessions, task dispatch, leased workers, resumable workflow steps, approvals and
+recovery. Applications can use those execution capabilities directly without a
+separate workflow engine.
 
-Applications retain control of their UI, authentication, domain logic, and
-business workflows.
+## Framework, harness, runtime and agent
 
-Cayu is designed for agents that do consequential or long-horizon work. You
-compose its runtime primitives directly in your application.
+| Term | Role |
+| --- | --- |
+| Framework | Cayu's Python APIs, components and defaults for building and running agents |
+| Harness | The domain-specific system you assemble: context, tools, memory, policies, domain logic and verification |
+| Runtime | The framework's execution machinery for sessions, state, authority, workers, budgets and recovery |
+| Agent | The resulting application that performs a defined job |
+| Cloud | Optional deployment and shared operation of agents built with the framework |
+
+Applications own their user interface, authentication, business authorization,
+domain rules and completion criteria. See the [public concepts and source
+map](https://github.com/cayu-dev/cayu/blob/main/docs/public-concepts.md) for the
+components to build with.
 
 ## Why we built Cayu
 
-Cayu was extracted from the production runtime behind an agent-operated
-software factory that built and deployed thousands of business applications.
-Specialized agents worked together as the AI SRE, AI product manager, AI coder,
-and FDE assistant behind that delivery process.
+We built Cayu while developing domain-specific agents that needed to carry
+consequential work through model calls, tools, human decisions and failures.
+Those applications needed both a configurable harness and dependable execution.
 
 We began by building agents with SDKs and frameworks including the Claude Agent
 SDK, Mastra, and LangGraph. They helped us implement the model-and-tool loop
@@ -60,24 +68,41 @@ deployments.
 
 ## What Cayu provides
 
-| Need | Cayu primitive |
+| Need | Framework components |
 | --- | --- |
-| Long-horizon work | Durable sessions, transcripts, events, resume, fork, interruption |
-| Safe effects | Typed tools, effect declarations, policies, approvals, idempotency keys |
-| Human interaction | User-input checkpoints, approval resolution, manual recovery |
-| Context pressure | Token counting, projection, compaction, overflow recovery |
-| Cost control | Usage events, run limits, budgets, pricing, causal-budget summaries |
-| Execution boundaries | Environments, workspaces, runners, artifacts, vaults, egress |
-| Reviewed knowledge | Durable entries, approval state, keyword/vector retrieval, recall tools |
-| Long-term recall | Bounded knowledge/transcript sources, deterministic fusion, exact locators and coverage |
+| Models and the agent loop | Provider adapters, reasoning controls, structured output, validation and bounded repair |
 | Provider flexibility | OpenAI API, experimental OpenAI subscription login, Anthropic, Bedrock, Vertex, OpenAI-compatible APIs |
-| Agent operations | Tasks, dispatchers, event watchers, subagents, runtime hooks |
-| Behavioral proof | Runtime tests, production-session promotion, durable evals, comparison, and CI reports |
-| Operations | FastAPI control plane and a packaged dashboard for sessions, workflows, usage, and evals |
+| Tools and integrations | Typed Python tools, MCP, capability discovery, application services and workflow composition |
+| Web research and browsers | Search/fetch adapters, stateful browser tools and application-selected execution backends |
+| Context and memory | Token counting, projection, compaction, overflow recovery and prompt-cache-aware strategies |
+| Reviewed knowledge | Durable entries, approval state, keyword/vector retrieval and recall tools |
+| Long-term recall | Bounded knowledge/transcript sources, deterministic fusion, exact locators and coverage |
+| Multi-agent work | Subagents, delegation, forks, participants and durable peer requests |
+| Workspaces and artifacts | Files, execution runners, workspace lifecycle, durable artifacts, vaults and egress |
+| Verified completion | Work contracts, proposal evidence, independent acceptance and repair decisions |
+| Evals and improvement | Runtime tests, production-session promotion, durable evals, replay, comparison and CI reports |
+| Git and GitHub delivery | Governed repository changes, commits, pull requests and delivery receipts |
+| Development and deployment | Project scaffolding, application factories, process roles and optional Cloud deployment |
+| Operations | FastAPI control plane and a packaged dashboard for sessions, workflows, usage and evals |
+
+### The integrated durable runtime
+
+The same framework provides the execution contracts behind those capabilities:
+
+- durable sessions, transcripts, events, checkpoints, resume and interruption;
+- controlled tool effects, policies, approvals and idempotency identities;
+- human-input checkpoints, approval resolution and manual recovery;
+- task dispatch, worker ownership, resumable workflows and child-session lineage;
+- usage accounting, run limits, budgets, pricing and causal attribution; and
+- execution admission, recovery and reconciliation of uncertain external effects.
+
+Configure the stores, adapters, policies and execution boundaries for your job.
+Native Python tools are trusted application code; configured isolation and
+external receipts determine the guarantees at the application boundary.
 
 ## Verify the runtime
 
-Want executable evidence before adopting Cayu? The [runtime qualification guide](https://github.com/cayu-tech/cayu/blob/main/docs/runtime-qualification.md)
+Want executable evidence before adopting Cayu? The [runtime qualification guide](https://github.com/cayu-dev/cayu/blob/main/docs/runtime-qualification.md)
 maps tool roundtrips, durable continuation, approval gating, and reviewed-proposal
 binding to existing tests. It provides a pinned installed-wheel setup, a small
 credential-free acceptance plan, the restartable support integration, and broader
@@ -495,7 +520,7 @@ the [package guide](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/p
 for exact setup.
 
 For native Choice, Score, and Noul decisions, explicitly register the experimental
-[`TypeSafeProvider`](https://github.com/cayu-tech/cayu/blob/main/docs/typesafe.md). It uses TypeSafe's System One API through
+[`TypeSafeProvider`](https://github.com/cayu-dev/cayu/blob/main/docs/typesafe.md). It uses TypeSafe's System One API through
 Cayu sessions and events; it does not support chat tools or multimodal inputs.
 
 For local development without separate OpenAI API billing, users can sign in
