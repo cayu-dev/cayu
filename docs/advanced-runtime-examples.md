@@ -193,15 +193,52 @@ ordinary tool once, and checks replay ordering. It establishes adapter and
 runtime composition only: it neither certifies a production model nor measures
 OpenAI prompt-cache behavior.
 
-## Interpreting cost measurements
+## Observed live evidence
 
-Measure both first-request input reduction and total branch usage after retries.
-A smaller first request can still lead to greater total usage when additional
-attempts are needed.
+The following observations were recorded during credentialed verification on
+July 11, 2026. They are evidence that the examples exercised real provider and
+external boundaries; they are not universal benchmarks or pricing guarantees.
 
-That distinction is why Cayu records provider-reported total usage instead of
-marketing a context-size estimate as realized savings. Dollar savings require a
-price book and must include source, evaluator, repair, and retry overhead.
+| Scenario | Provider and model | Trials | Observed result |
+| --- | --- | ---: | --- |
+| Research council | Gemini `gemini-3.1-flash-lite` | 1 | Invalid as a cost observation (see below). Recorded: uncompacted branches 25,853 input tokens, compacted branches 11,228. |
+| Research council | OpenAI `gpt-5.4-mini` | 1 | Invalid as a cost observation (see below). Recorded: first-attempt input 18,146 uncompacted against 10,151 compacted; total 17,487 after two extra model steps. |
+| Counterfactual approval | OpenAI `gpt-5.4-mini` | 1 | All nine assertions passed across eight model requests; one protected mutation and one recovery receipt were recorded. |
+| Repository maintainer | OpenAI `gpt-5.4-mini` plus a private disposable GitHub repository | 1 | All twelve fake-and-real boundary assertions passed across five model requests; three real worktrees were gated, one commit was pushed, and one PR was created and recovered idempotently. |
+| Tainted incident response | OpenAI `gpt-5.4-mini` | 1 | All six assertions passed across nine model requests; the runtime blocked the protected mutation after `CayuApp` reconstruction, executed it zero times, and sent one sanitized notification. |
+
+Anthropic support is wired through the same scenario and credential-gated
+nightly registrations, but this dated observation set does not claim a live
+Anthropic result because an authorized key was not available for the run.
+
+### Why the research-council rows are withdrawn
+
+On July 11 the research example compacted its source session with
+`TranscriptDigestCompactor(max_summary_chars=2_000)`. At the time that compactor
+cut its summary to 2,000 of the 15,242-character research context while claiming
+to cover all of it, so the compacted branches silently lost most of their source.
+The smaller compacted requests above therefore measure dropped context, not
+compaction. The compactor was corrected in late July to claim only the messages it
+represents. The example now compacts with `PromptCacheCompactor`, which covers the
+full source. Its current live Haiku runs put compacted branches at about 0.6x of
+baseline input. With prompt caching enabled, the dollar saving on those branches
+measured 5–28%.
+
+### Reading cost observations correctly
+
+Measure two different questions:
+
+1. **Did compaction make the first candidate request smaller, while representing
+   the whole source?** Check the compaction's reported coverage, not only the
+   request size.
+2. **Did the whole candidate branch cost less after retries and caching?** Extra
+   attempts can consume a first-request reduction, and prompt caching can make an
+   uncompacted branch cheap enough that compaction saves little.
+
+That is why Cayu records provider-reported total usage and compaction coverage
+instead of marketing a context-size estimate as realized savings. Dollar savings
+require a price book and must include source, evaluator, repair, retry and cache
+overhead.
 The [cost optimization and governance guide](cost-optimization.md) applies the
 same evidence standard across Cayu's optimization and budget-control options.
 

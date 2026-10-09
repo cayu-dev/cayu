@@ -87,6 +87,12 @@ authoritative only where a maintained guide points to the implementation or the
 - [Session-operation fault harness](session-operation-fault-harness.md)
 - [SQLite store performance](sqlite-store-performance.md)
 
+## Measured cost evidence
+
+- [Live Anthropic Haiku cost-savings results](anthropic-haiku-cost-savings-results.md):
+  paired live measurements of prompt-cache compaction and compacted research forks
+- [Anthropic prompt-cache compactor A/B observation](anthropic-prompt-cache-compactor-ab-results.md)
+
 ## Architecture and implemented design records
 
 - [Architecture](architecture.md)
