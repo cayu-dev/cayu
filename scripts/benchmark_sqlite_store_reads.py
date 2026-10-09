@@ -15,8 +15,9 @@ from collections.abc import Callable
 from contextlib import closing
 
 from cayu._validation import copy_durable_json_object
+from cayu.storage._sqlite_records import event_from_row
 from cayu.storage._validated_cache import validated_row_cache
-from cayu.storage.sqlite import _checkpoint_from_json, _event_from_row
+from cayu.storage.sqlite import _checkpoint_from_json
 
 
 def _measure(operation: Callable[[], object], *, samples: int) -> dict[str, float | int]:
@@ -82,8 +83,8 @@ def _event_scan_measurements() -> dict[str, object]:
     # reproducible alongside the checkpoint cache's favorable warm-read case.
     measurements = {}
     for name, decode in (
-        ("validate_each_event", _event_from_row),
-        ("cached_event_scan", validated_row_cache(_event_from_row)),
+        ("validate_each_event", event_from_row),
+        ("cached_event_scan", validated_row_cache(event_from_row)),
     ):
         measurements[name] = _measure(
             lambda decode=decode: [decode(row) for row in rows], samples=5

@@ -2630,7 +2630,7 @@ def test_sqlite_usage_rollup_handles_malformed_normalized_usage_like_memory(tmp_
 def test_sqlite_usage_rollup_plan_bounds_the_index_by_type_and_time(tmp_path) -> None:
     from cayu.storage import _session_store_sql, _sqlite_aggregates
     from cayu.storage import _sqlite_connection as sqlite_connection
-    from cayu.storage.sqlite import _SQL_DIALECT
+    from cayu.storage._sqlite_session_queries import SQL_DIALECT
 
     database_path = tmp_path / "aggregate-plan.sqlite"
     store = SQLiteSessionStore(database_path)
@@ -2639,7 +2639,7 @@ def test_sqlite_usage_rollup_plan_bounds_the_index_by_type_and_time(tmp_path) ->
         end_at=datetime(2026, 7, 2, tzinfo=UTC),
         session_group_limit=10,
     )
-    plan = _session_store_sql.build_session_query_sql(None, dialect=_SQL_DIALECT)
+    plan = _session_store_sql.build_session_query_sql(None, dialect=SQL_DIALECT)
     sql, params = _sqlite_aggregates.usage_rollup_statement(
         session_plan=plan,
         query=query,
@@ -2716,7 +2716,7 @@ def test_sqlite_usage_rollup_plan_bounds_the_index_by_type_and_time(tmp_path) ->
 def test_sqlite_pricing_projection_rejects_oversized_rows_before_transfer(tmp_path) -> None:
     from cayu.storage import _session_store_sql, _sqlite_aggregates
     from cayu.storage import _sqlite_connection as sqlite_connection
-    from cayu.storage.sqlite import _SQL_DIALECT
+    from cayu.storage._sqlite_session_queries import SQL_DIALECT
 
     database_path = tmp_path / "aggregate-pricing-bound.sqlite"
     store = SQLiteSessionStore(database_path)
@@ -2738,7 +2738,7 @@ def test_sqlite_pricing_projection_rejects_oversized_rows_before_transfer(tmp_pa
         )
 
     asyncio.run(seed())
-    plan = _session_store_sql.build_session_query_sql(None, dialect=_SQL_DIALECT)
+    plan = _session_store_sql.build_session_query_sql(None, dialect=SQL_DIALECT)
     query = UsageRollupQuery(start_at=start, end_at=start + timedelta(days=1))
     sql, params = _sqlite_aggregates.pricing_input_statement(
         session_plan=plan,
@@ -2768,7 +2768,7 @@ def test_sqlite_pricing_projection_discards_unclean_bedrock_evidence_before_boun
 ) -> None:
     from cayu.storage import _session_store_sql, _sqlite_aggregates
     from cayu.storage import _sqlite_connection as sqlite_connection
-    from cayu.storage.sqlite import _SQL_DIALECT
+    from cayu.storage._sqlite_session_queries import SQL_DIALECT
 
     database_path = tmp_path / "aggregate-clean-evidence.sqlite"
     store = SQLiteSessionStore(database_path)
@@ -2787,7 +2787,7 @@ def test_sqlite_pricing_projection_discards_unclean_bedrock_evidence_before_boun
         )
 
     asyncio.run(seed())
-    plan = _session_store_sql.build_session_query_sql(None, dialect=_SQL_DIALECT)
+    plan = _session_store_sql.build_session_query_sql(None, dialect=SQL_DIALECT)
     query = UsageRollupQuery(start_at=start, end_at=start + timedelta(days=1))
     sql, params = _sqlite_aggregates.pricing_input_statement(
         session_plan=plan,

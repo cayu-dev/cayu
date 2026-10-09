@@ -58,6 +58,7 @@ from cayu.sessions.messaging import (
     session_message_rejection,
 )
 from cayu.storage import _creation_fence
+from cayu.storage import _sqlite_session_queries as session_queries
 from cayu.storage._context_selection_fence import SQLiteContextSelectionFenceMixin
 from cayu.storage._creation_fence import SQLiteCreationFenceMixin
 from cayu.storage._external_wait_sqlite import SQLiteExternalWaitMixin
@@ -90,7 +91,6 @@ from cayu._validation import (
 from cayu.approvals.tools import ResolutionActor, resolution_actor_payload
 from cayu.budgets.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
 from cayu.events import (
-    EVENT_ID_MAX_CHARS,
     Event,
     EventType,
     event_with_runtime_payload_authority,
@@ -100,7 +100,7 @@ from cayu.execution_profiles import (
     ExecutionProfileIdentity,
     ExecutionProfileRejectionResult,
 )
-from cayu.execution_units import ToolRoundIdentity, copy_tool_round_identity
+from cayu.execution_units import ToolRoundIdentity
 from cayu.memory.evidence import (
     MAX_RECALL_RECEIPT_ITEMS,
     ContextExposure,
@@ -224,9 +224,6 @@ from cayu.sessions.base import (
     _checkpoint_after_exact_invocation_terminal_decision,
     _checkpoint_after_initial_transcript_publication,
     _checkpoint_after_queued_interaction_profile_handoff,
-    _child_session_lifecycle_entry,
-    _child_session_lifecycle_entry_sort_key,
-    _child_session_lifecycle_occurrence,
     _child_session_notification_consumption_record,
     _child_session_notification_consumption_replays,
     _completion_result_event_publication_delete_block_reason,
@@ -327,7 +324,6 @@ from cayu.sessions.base import (
     _validate_execution_profile_admission,
     _validate_execution_profile_rejection_session,
     _validate_inactive_for_seconds,
-    _validate_interaction_page,
     _validate_interaction_transition_invocation_authority_parameters,
     _validate_interaction_transition_receipt_authority,
     _validate_interaction_transition_receipt_recovery_authority,
@@ -359,7 +355,6 @@ from cayu.sessions.base import (
     _validate_session_model_transition,
     _validate_session_operation_record_keys,
     _validate_status_set,
-    _validate_tool_round_call_ids,
     _validate_tool_round_checkpoint_mutation,
     _validate_tool_round_publication,
     _validate_user_input_checkpoint_mutation,
@@ -372,7 +367,6 @@ from cayu.sessions.base import (
     deferred_interaction_input_for_run_request,
     replace_session_user_metadata,
     resolve_interaction_attribution,
-    restore_persisted_event_authority,
     session_messages_input_contract_evidence,
     transform_fork_checkpoint,
 )
@@ -383,25 +377,16 @@ from cayu.sessions.event_delivery import (
     PersistedEventSideEffectStatus,
     validate_persisted_event_side_effect_error,
 )
-from cayu.sessions.event_queries import EventQuery, EventQueryResultTooLarge, copy_event_query
-from cayu.sessions.inspection import SESSION_INSPECTION_LABEL_LIMIT, SessionInspectionIdentity
+from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.inspection import SessionInspectionIdentity
 from cayu.sessions.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
     INTERACTION_TERMINAL_EVENT_TYPES,
 )
 from cayu.sessions.invocation import SessionInvocation
 from cayu.sessions.lineage import (
-    SESSION_LINEAGE_MAX_EVENT_ID_BYTES,
-    SESSION_LINEAGE_MAX_IDENTIFIER_BYTES,
-    SESSION_LINEAGE_MAX_ORIGIN_EVENTS,
-    SESSION_LINEAGE_MAX_TIMESTAMP_BYTES,
-    SessionLineageNode,
-    SessionLineageOrigin,
     SessionLineageQuery,
     SessionLineageResult,
-    copy_session_lineage_query,
-    decode_session_lineage_cursor,
-    encode_session_lineage_cursor,
 )
 from cayu.sessions.messaging import (
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
@@ -434,11 +419,9 @@ from cayu.sessions.queries import (
     copy_session_query,
     decode_session_cursor,
     encode_session_cursor,
-    session_next_cursor,
     session_query_from_aggregate_filter,
 )
 from cayu.sessions.records import (
-    RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     EventRecord,
     PendingActionKind,
     PendingActionSession,
@@ -446,7 +429,6 @@ from cayu.sessions.records import (
     Session,
     SessionStatus,
     TranscriptRecord,
-    runtime_build_provenance_from_session_metadata,
 )
 from cayu.sessions.summaries import (
     EventSummary,
@@ -469,13 +451,8 @@ from cayu.sessions.terminal_evidence import (
     _validate_runner_observed_event_identity_snapshot,
 )
 from cayu.sessions.topology import (
-    SessionTopologyCycle,
-    SessionTopologyDepthExceeded,
-    SessionTopologyNode,
     SessionTopologyQuery,
     SessionTopologyStoreResult,
-    build_session_topology_result,
-    decode_session_topology_cursor,
 )
 from cayu.sessions.transcript_input import (
     DeferredInteractionInput,
@@ -510,9 +487,8 @@ from cayu.sessions.transcript_queries import (
     transcript_search_query_document,
     transcript_search_session_token,
 )
-from cayu.sessions.usage import UsageRollupQuery, copy_usage_rollup_query
+from cayu.sessions.usage import UsageRollupQuery
 from cayu.storage import _session_store_sql as session_store_sql
-from cayu.storage import _sqlite_aggregates as sqlite_aggregates
 from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_support as sqlite_support
@@ -568,14 +544,8 @@ from cayu.tools.grants import (
 )
 from cayu.workflows.base import WORKFLOW_ATTEMPT_EVENT_TYPE
 
-_EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
 _SQLITE_SESSION_MIN_REQUIRED_REVISION = 113
-_SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
-    placeholder="?",
-    contains_style="sqlite_nocase_like",
-    datetime_param=sqlite_records.format_datetime,
-)
 _T = TypeVar("_T")
 
 
@@ -666,14 +636,6 @@ def _alias_key_fingerprint_matches(value: object, expected: str) -> bool:
     except UnicodeEncodeError:
         return False
     return hmac.compare_digest(encoded, expected.encode("ascii"))
-
-
-def _session_exists(connection: sqlite3.Connection, session_id: str) -> bool:
-    row = connection.execute(
-        "SELECT 1 FROM cayu_sessions WHERE id = ?",
-        (session_id,),
-    ).fetchone()
-    return row is not None
 
 
 def _transcript_cursor(connection: sqlite3.Connection, session_id: str) -> int:
@@ -833,82 +795,6 @@ def _touch_session_activity(
     )
     if cursor.rowcount != 1:
         _raise_session_write_conflict(connection, session_id, expected_run_epoch)
-
-
-def _load_labels(connection: sqlite3.Connection, session_id: str) -> dict[str, str]:
-    rows = connection.execute(
-        """
-        SELECT key, value
-        FROM cayu_session_labels
-        WHERE session_id = ?
-        ORDER BY key ASC
-        """,
-        (session_id,),
-    ).fetchall()
-    return {row["key"]: row["value"] for row in rows}
-
-
-def _load_session(connection: sqlite3.Connection, session_id: str) -> Session | None:
-    row = connection.execute(
-        """
-        SELECT id, instance_id, agent_name, provider_name, model, parent_session_id,
-               causal_budget_id, runtime_name, runtime_version, environment_name,
-               status, created_at, updated_at, last_activity_at, run_epoch,
-               invocation_json, metadata_json
-        FROM cayu_sessions
-        WHERE id = ?
-        """,
-        (session_id,),
-    ).fetchone()
-    if row is None:
-        return None
-    return sqlite_records.session_from_row(
-        row,
-        labels=_load_labels(connection, session_id),
-    )
-
-
-_SESSION_TOPOLOGY_COLUMNS = """
-    id, agent_name, provider_name, model, parent_session_id,
-    causal_budget_id, runtime_name, runtime_version, environment_name,
-    status, created_at, updated_at, last_activity_at,
-    json_extract(metadata_json, '$."cayu:runtime_build_provenance"')
-        AS runtime_build_provenance_json
-"""
-
-_SESSION_TOPOLOGY_PROJECTED_COLUMNS = """
-    id, agent_name, provider_name, model, parent_session_id,
-    causal_budget_id, runtime_name, runtime_version, environment_name,
-    status, created_at, updated_at, last_activity_at,
-    runtime_build_provenance_json
-"""
-
-
-def _session_topology_node_from_sqlite_row(row: sqlite3.Row) -> SessionTopologyNode:
-    return SessionTopologyNode(
-        id=row["id"],
-        agent_name=row["agent_name"],
-        provider_name=row["provider_name"],
-        model=row["model"],
-        parent_session_id=row["parent_session_id"],
-        causal_budget_id=row["causal_budget_id"],
-        runtime_name=row["runtime_name"],
-        runtime_version=row["runtime_version"],
-        runtime_build_provenance=runtime_build_provenance_from_session_metadata(
-            {}
-            if row["runtime_build_provenance_json"] is None
-            else {
-                RUNTIME_BUILD_PROVENANCE_METADATA_KEY: json.loads(
-                    row["runtime_build_provenance_json"]
-                )
-            }
-        ),
-        environment_name=row["environment_name"],
-        status=SessionStatus(row["status"]),
-        created_at=sqlite_records.parse_datetime(row["created_at"]),
-        updated_at=sqlite_records.parse_datetime(row["updated_at"]),
-        last_activity_at=sqlite_records.parse_datetime(row["last_activity_at"]),
-    )
 
 
 @validated_row_cache
@@ -1136,94 +1022,6 @@ def _decode_model_completion_stage_record(value: str) -> dict[str, Any]:
             "The durable model-completion stage record is malformed."
         )
     return decoded
-
-
-def _event_query_session_id_batches(
-    session_ids: tuple[str, ...],
-) -> list[tuple[str, ...]]:
-    return [
-        session_ids[index : index + _EVENT_QUERY_SESSION_IDS_BATCH_SIZE]
-        for index in range(0, len(session_ids), _EVENT_QUERY_SESSION_IDS_BATCH_SIZE)
-    ]
-
-
-# Columns needed to reconstruct an Event, in a stable order. The formerly-stored
-# event_json blob duplicated exactly these (plus payload_json), so the store now
-# rebuilds Events from the individual columns instead of parsing a redundant copy.
-_EVENT_COLUMN_NAMES: tuple[str, ...] = (
-    "session_id",
-    "event_id",
-    "interaction_id",
-    "event_type",
-    "timestamp",
-    "agent_name",
-    "environment_name",
-    "workflow_name",
-    "tool_name",
-    "payload_json",
-    "input_contract_runtime_owned",
-    "file_attachment_attestations_runtime_owned",
-)
-
-# Keep this predicate text aligned with the revision-17 partial index. SQLite
-# can prove a parameterized lifecycle subset is covered by that index only when
-# the query also carries the index's literal predicate.
-_PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL = """
-    event_type IN (
-        'tool.call.approval_requested',
-        'session.awaiting_user_input',
-        'session.interrupted',
-        'session.delegated_action.updated',
-        'tool.call.started',
-        'tool.call.completed',
-        'tool.call.failed',
-        'tool.call.blocked',
-        'tool.call.approval_denied'
-    )
-    AND pending_action_lookup_key IS NOT NULL
-"""
-
-
-def _event_from_row(row: sqlite3.Row) -> Event:
-    """Validate an owned Event without adding cache-copy work to history scans."""
-    input_contract_runtime_owned = row["input_contract_runtime_owned"]
-    if type(input_contract_runtime_owned) is not int or input_contract_runtime_owned not in {
-        0,
-        1,
-    }:
-        raise ValueError("Stored input-contract authority proof is malformed.")
-    file_attachment_attestations_runtime_owned = row["file_attachment_attestations_runtime_owned"]
-    if type(
-        file_attachment_attestations_runtime_owned
-    ) is not int or file_attachment_attestations_runtime_owned not in {0, 1}:
-        raise ValueError("Stored file-attachment attestation proof is malformed.")
-    return restore_persisted_event_authority(
-        Event(
-            type=row["event_type"],
-            session_id=row["session_id"],
-            interaction_id=row["interaction_id"],
-            id=row["event_id"],
-            timestamp=row["timestamp"],
-            agent_name=row["agent_name"],
-            environment_name=row["environment_name"],
-            workflow_name=row["workflow_name"],
-            tool_name=row["tool_name"],
-            payload=json.loads(row["payload_json"]),
-        ),
-        input_contract_runtime_owned=input_contract_runtime_owned == 1,
-        file_attachment_attestations_runtime_owned=(
-            file_attachment_attestations_runtime_owned == 1
-        ),
-    )
-
-
-def _event_record_from_row(row: sqlite3.Row | None) -> EventRecord | None:
-    if row is None:
-        return None
-    return EventRecord(
-        sequence=row["sequence"],
-        event=_event_from_row(row),
-    )
 
 
 def _targeted_tool_grant_from_json(value: object) -> TargetedToolGrantRecord:
@@ -1486,7 +1284,7 @@ def _record_invocation_terminal_event_receipts(
         }
     )
     if terminal_events:
-        session = _load_session(connection, session_id)
+        session = sqlite_records.load_session(connection, session_id)
         if session is None:  # pragma: no cover - activity update already authenticated it
             raise KeyError(f"Session not found: {session_id}")
         checkpoint = _load_checkpoint_state(connection, session_id)
@@ -1531,7 +1329,7 @@ def _append_event_once_in_transaction(
         (event.session_id, event.id),
     ).fetchone()
     if row is not None:
-        return _event_from_row(row)
+        return sqlite_records.event_from_row(row)
     _append_events_in_transaction(
         connection,
         event.session_id,
@@ -1743,8 +1541,12 @@ class SQLiteSessionStore(
     async def _access_list_sessions(
         self, bounds: _SessionAccessBounds, query: SessionQuery
     ) -> SessionListResult:
-        return await self._list_sessions(
-            query, pending_interruption_cascade_only=False, access_bounds=bounds
+        return await session_queries.list_sessions(
+            self._run_read,
+            ownership_clock=self._ownership_clock,
+            query=query,
+            pending_interruption_cascade_only=False,
+            access_bounds=bounds,
         )
 
     async def _access_update_labels(
@@ -1756,7 +1558,9 @@ class SQLiteSessionStore(
         from cayu.sessions.access import SessionAccessDenied
 
         session_id = require_clean_nonblank(session_id, "session_id")
-        clause = session_store_sql.session_access_clause(bounds, dialect=_SQL_DIALECT)
+        clause = session_store_sql.session_access_clause(
+            bounds, dialect=session_queries.SQL_DIALECT
+        )
 
         def read(connection):
             row = connection.execute(
@@ -1765,7 +1569,7 @@ class SQLiteSessionStore(
             ).fetchone()
             if row is None:
                 raise SessionAccessDenied()
-            labels = self._load_labels_for_sessions_unlocked([session_id], connection=connection)
+            labels = sqlite_records.load_session_labels_batch(connection, [session_id])
             return bounds.require_read(
                 sqlite_records.session_from_row(row, labels=labels[session_id])
             )
@@ -2544,7 +2348,7 @@ class SQLiteSessionStore(
                         raise RuntimeError("Targeted grant issuance lost interaction admission.")
                     validate_targeted_tool_grant_batch_evidence(
                         copied_records,
-                        _event_from_row(interaction_started_row),
+                        sqlite_records.event_from_row(interaction_started_row),
                     )
                 invocation = SessionInvocation.model_validate_json(session_row["invocation_json"])
                 resolved: list[TargetedToolGrantRecord] = []
@@ -2592,7 +2396,7 @@ class SQLiteSessionStore(
                             raise RuntimeError("Targeted grant lost its durable issuance evidence.")
                         validate_targeted_tool_grant_issuance_evidence(
                             existing,
-                            _event_from_row(issued_row),
+                            sqlite_records.event_from_row(issued_row),
                         )
                         reused_event = targeted_tool_grant_event(
                             existing,
@@ -2713,7 +2517,7 @@ class SQLiteSessionStore(
         def query(connection: sqlite3.Connection) -> tuple[TargetedToolGrantRecord, ...]:
             with connection:
                 connection.execute("BEGIN")
-                if not _session_exists(connection, session_id):
+                if not sqlite_records.session_exists(connection, session_id):
                     raise KeyError(f"Session not found: {session_id}")
                 if interaction_id is None:
                     rows = connection.execute(
@@ -2756,7 +2560,7 @@ class SQLiteSessionStore(
         def query(connection: sqlite3.Connection) -> TargetedToolGrantStateSnapshot:
             with connection:
                 connection.execute("BEGIN")
-                if not _session_exists(connection, session_id):
+                if not sqlite_records.session_exists(connection, session_id):
                     raise KeyError(f"Session not found: {session_id}")
                 grant_rows = connection.execute(
                     "SELECT * FROM cayu_targeted_tool_grants "
@@ -3005,7 +2809,7 @@ class SQLiteSessionStore(
                         raise RuntimeError("Targeted tool use lost its durable event evidence.")
                     validate_targeted_tool_grant_lifecycle_event(
                         record,
-                        _event_from_row(event_row),
+                        sqlite_records.event_from_row(event_row),
                         event_type=EventType.TARGETED_TOOL_REFERENCE_CONSUMED,
                         outcome=TargetedToolUseDisposition.BOUND.value,
                         event_id_suffix=f"use:{binding.use_id}",
@@ -3205,7 +3009,7 @@ class SQLiteSessionStore(
                         raise RuntimeError(
                             "Targeted grant revocation lost its durable event evidence."
                         )
-                    persisted_event = _event_from_row(event_row)
+                    persisted_event = sqlite_records.event_from_row(event_row)
                     validate_targeted_tool_grant_revocation_evidence(
                         record,
                         persisted_event,
@@ -3322,7 +3126,7 @@ class SQLiteSessionStore(
                     raise RuntimeError("Targeted grant reconstruction lost interaction admission.")
                 validate_targeted_tool_grant_batch_evidence(
                     records,
-                    _event_from_row(interaction_started_row),
+                    sqlite_records.event_from_row(interaction_started_row),
                 )
                 placeholders = ", ".join("?" for _ in INTERACTION_TERMINAL_EVENT_TYPES)
                 interaction_ended = (
@@ -3522,7 +3326,9 @@ class SQLiteSessionStore(
                     parent_session = (
                         None
                         if request.parent_session_id is None
-                        else _load_session(self._connection, request.parent_session_id)
+                        else sqlite_records.load_session(
+                            self._connection, request.parent_session_id
+                        )
                     )
                     if request.parent_session_id is not None and parent_session is None:
                         raise ValueError(f"Parent session not found: {request.parent_session_id}")
@@ -3978,7 +3784,7 @@ class SQLiteSessionStore(
                 return None
             if row["request_commitment"] != creation_request.request_commitment:
                 raise ValueError("Participant creation key conflicts with the request.")
-            session = _load_session(self._connection, row["session_id"])
+            session = sqlite_records.load_session(self._connection, row["session_id"])
             receipt = reconstruct(dict(row), session)
             assert session is not None
             return session.model_copy(deep=True), receipt
@@ -4006,7 +3812,10 @@ class SQLiteSessionStore(
                 ).fetchall()
                 return tuple(
                     reference(
-                        reconstruct(dict(row), _load_session(connection, row["session_id"])), query
+                        reconstruct(
+                            dict(row), sqlite_records.load_session(connection, row["session_id"])
+                        ),
+                        query,
                     )
                     for row in rows
                 )
@@ -4023,7 +3832,7 @@ class SQLiteSessionStore(
             ).fetchone()
             if row is None:
                 return None
-            session = _load_session(self._connection, session_id)
+            session = sqlite_records.load_session(self._connection, session_id)
             return reconstruct(dict(row), session)
 
     async def capture_context_view_publication_source(self, session_id):
@@ -4042,7 +3851,7 @@ class SQLiteSessionStore(
         def query(connection):
             with connection:
                 connection.execute("BEGIN")
-                session = _load_session(connection, session_id)
+                session = sqlite_records.load_session(connection, session_id)
                 row = connection.execute(
                     "SELECT * FROM cayu_participant_session_bindings WHERE session_id = ?",
                     (session_id,),
@@ -4071,7 +3880,7 @@ class SQLiteSessionStore(
                             ),
                         ).fetchall()
                         publication_id = closed_round_publication_id(
-                            pointer, tuple(_event_from_row(item) for item in closures)
+                            pointer, tuple(sqlite_records.event_from_row(item) for item in closures)
                         )
                         key = _runtime_publication_storage_key(publication_id)
                         row = connection.execute(
@@ -4093,7 +3902,7 @@ class SQLiteSessionStore(
                     "SELECT * FROM cayu_events WHERE session_id = ? AND event_id = ?",
                     (session_id, pointer.completion_event_id),
                 ).fetchone()
-                completion = None if row is None else _event_from_row(row)
+                completion = None if row is None else sqlite_records.event_from_row(row)
                 rows = connection.execute(
                     "SELECT session_order, interaction_id, message_json FROM cayu_transcript_messages "
                     "WHERE session_id = ? AND session_order > ? AND session_order <= ? "
@@ -4181,7 +3990,7 @@ class SQLiteSessionStore(
             ).fetchone()
             if existing_view is not None:
                 raise ValueError("Context-view ID is already bound to another manifest.")
-            source = _load_session(self._connection, manifest.source_session_id)
+            source = sqlite_records.load_session(self._connection, manifest.source_session_id)
             if source is None or source.instance_id != manifest.source_session_instance_id:
                 raise LookupError("The source session incarnation is unavailable.")
             publication_count = self._connection.execute(
@@ -4419,7 +4228,7 @@ class SQLiteSessionStore(
                 if receipt.state == "selected" and receipt.expires_at_ms <= now_ms:
                     raise ValueError("Expired context-view selection lacks cleanup evidence.")
                 return receipt
-            source = _load_session(self._connection, request.source_session_id)
+            source = sqlite_records.load_session(self._connection, request.source_session_id)
             if source is None or source.instance_id != request.source_session_instance_id:
                 raise LookupError("Context-view source session incarnation is unavailable.")
             if target is not None:
@@ -5367,7 +5176,9 @@ class SQLiteSessionStore(
             except ResourceAccessDenied:
                 return None
         session_id = require_clean_nonblank(session_id, "session_id")
-        return await self._run_read(lambda connection: _load_session(connection, session_id))
+        return await self._run_read(
+            lambda connection: sqlite_records.load_session(connection, session_id)
+        )
 
     async def load_state(self, session_id: str) -> SessionStateSnapshot | None:
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -5926,69 +5737,7 @@ class SQLiteSessionStore(
         return copy_context_exposure(await self._run_write(statement))
 
     async def inspect_identity(self, session_id: str) -> SessionInspectionIdentity:
-        session_id = require_clean_nonblank(session_id, "session_id")
-
-        def query(connection: sqlite3.Connection) -> SessionInspectionIdentity:
-            row = connection.execute(
-                """
-                SELECT id, agent_name, provider_name, model, parent_session_id,
-                       causal_budget_id, runtime_name, runtime_version, environment_name,
-                       status, created_at, updated_at, last_activity_at, run_epoch,
-                       json_extract(
-                           metadata_json,
-                           '$."cayu:runtime_build_provenance"'
-                       ) AS runtime_build_provenance_json
-                FROM cayu_sessions
-                WHERE id = ?
-                """,
-                (session_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(session_id)
-            label_rows = connection.execute(
-                """
-                SELECT key, value,
-                       (SELECT COUNT(*)
-                        FROM cayu_session_labels
-                        WHERE session_id = ?) AS label_count
-                FROM cayu_session_labels
-                WHERE session_id = ?
-                ORDER BY key ASC
-                LIMIT ?
-                """,
-                (session_id, session_id, SESSION_INSPECTION_LABEL_LIMIT),
-            ).fetchall()
-            label_count = 0 if not label_rows else label_rows[0]["label_count"]
-            return SessionInspectionIdentity(
-                id=row["id"],
-                agent_name=row["agent_name"],
-                provider_name=row["provider_name"],
-                model=row["model"],
-                parent_session_id=row["parent_session_id"],
-                causal_budget_id=row["causal_budget_id"],
-                runtime_name=row["runtime_name"],
-                runtime_version=row["runtime_version"],
-                runtime_build_provenance=runtime_build_provenance_from_session_metadata(
-                    {}
-                    if row["runtime_build_provenance_json"] is None
-                    else {
-                        RUNTIME_BUILD_PROVENANCE_METADATA_KEY: json.loads(
-                            row["runtime_build_provenance_json"]
-                        )
-                    }
-                ),
-                environment_name=row["environment_name"],
-                status=SessionStatus(row["status"]),
-                created_at=sqlite_records.parse_datetime(row["created_at"]),
-                updated_at=sqlite_records.parse_datetime(row["updated_at"]),
-                last_activity_at=sqlite_records.parse_datetime(row["last_activity_at"]),
-                run_epoch=row["run_epoch"],
-                labels={label_row["key"]: label_row["value"] for label_row in label_rows},
-                label_count=label_count,
-                labels_truncated=label_count > len(label_rows),
-            )
-
-        return await self._run_read(query)
+        return await session_queries.inspect_identity(self._run_read, session_id)
 
     async def update_status(self, session_id: str, status: SessionStatus) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -6325,7 +6074,7 @@ class SQLiteSessionStore(
                 f"acknowledgement is incomplete: {session_id}"
             )
         terminal_evidence_rows = self._connection.execute(
-            f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
+            f"SELECT {', '.join(sqlite_records.EVENT_COLUMN_NAMES)} FROM cayu_events "
             "WHERE session_id = ? "
             f"AND event_type IN ({', '.join('?' for _ in _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES)}) "
             "ORDER BY sequence DESC LIMIT ?",
@@ -6338,7 +6087,7 @@ class SQLiteSessionStore(
         terminal_publication_block = _terminal_publication_delete_block_reason(
             session=session,
             checkpoint=checkpoint,
-            evidence_events=[_event_from_row(row) for row in terminal_evidence_rows],
+            evidence_events=[sqlite_records.event_from_row(row) for row in terminal_evidence_rows],
         )
         if terminal_publication_block is not None:
             raise ValueError(
@@ -7386,7 +7135,7 @@ class SQLiteSessionStore(
                     (session_id, copied_event.id),
                 ).fetchone()
                 if existing_row is not None:
-                    existing = _event_from_row(existing_row)
+                    existing = sqlite_records.event_from_row(existing_row)
                     if not _execution_profile_rejection_events_equivalent(
                         existing,
                         copied_event,
@@ -7845,7 +7594,7 @@ class SQLiteSessionStore(
         def statement(connection: sqlite3.Connection) -> InteractionTransitionResult:
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                loaded = _load_session(connection, session_id)
+                loaded = sqlite_records.load_session(connection, session_id)
                 if loaded is None:
                     raise KeyError(f"Session not found: {session_id}")
                 if expected_active_invocation_profile is None:
@@ -7856,7 +7605,7 @@ class SQLiteSessionStore(
                     (session_id, receipt_storage_key),
                 ).fetchone()
                 existing_row = connection.execute(
-                    f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
+                    f"SELECT {', '.join(sqlite_records.EVENT_COLUMN_NAMES)} FROM cayu_events "
                     "WHERE session_id = ? AND event_id = ?",
                     (session_id, copied_event.id),
                 ).fetchone()
@@ -7864,7 +7613,7 @@ class SQLiteSessionStore(
                     None
                     if copied_terminal_event is None
                     else connection.execute(
-                        f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
+                        f"SELECT {', '.join(sqlite_records.EVENT_COLUMN_NAMES)} FROM cayu_events "
                         "WHERE session_id = ? AND event_id = ?",
                         (session_id, copied_terminal_event.id),
                     ).fetchone()
@@ -7886,7 +7635,10 @@ class SQLiteSessionStore(
                         expected_invocation_authority_state=(expected_invocation_authority_state),
                         expected_recovery_claim_id=expected_recovery_claim_id,
                     )
-                    if existing_row is not None and _event_from_row(existing_row) != receipt.event:
+                    if (
+                        existing_row is not None
+                        and sqlite_records.event_from_row(existing_row) != receipt.event
+                    ):
                         raise RuntimeError(
                             "Interaction transition receipt conflicts with retained event history."
                         )
@@ -7894,7 +7646,8 @@ class SQLiteSessionStore(
                         receipt.terminal_event != copied_terminal_event
                         or (
                             existing_terminal_row is not None
-                            and _event_from_row(existing_terminal_row) != receipt.terminal_event
+                            and sqlite_records.event_from_row(existing_terminal_row)
+                            != receipt.terminal_event
                         )
                     ):
                         raise RuntimeError(
@@ -8247,7 +8000,7 @@ class SQLiteSessionStore(
                             updated_at,
                         ),
                     )
-                transitioned = _load_session(connection, session_id)
+                transitioned = sqlite_records.load_session(connection, session_id)
                 if transitioned is None:
                     raise KeyError(f"Session not found: {session_id}")
                 receipt_record = _interaction_transition_receipt_record(
@@ -8358,7 +8111,7 @@ class SQLiteSessionStore(
             connection: sqlite3.Connection,
         ) -> InteractionTransitionReceiptResult | None:
             selected_event_columns = ", ".join(
-                f"retained.{column} AS {column}" for column in _EVENT_COLUMN_NAMES
+                f"retained.{column} AS {column}" for column in sqlite_records.EVENT_COLUMN_NAMES
             )
             row = connection.execute(
                 f"SELECT operation.record_json AS receipt_record_json, "
@@ -8393,7 +8146,7 @@ class SQLiteSessionStore(
                 current_checkpoint=_load_checkpoint_state(connection, session_id),
                 expected_recovery_claim_id=expected_recovery_claim_id,
             )
-            if retained_event_exists and _event_from_row(row) != receipt.event:
+            if retained_event_exists and sqlite_records.event_from_row(row) != receipt.event:
                 raise RuntimeError(
                     "Interaction transition receipt conflicts with retained event history."
                 )
@@ -8440,7 +8193,7 @@ class SQLiteSessionStore(
             connection: sqlite3.Connection,
         ) -> InteractionTransitionReceiptResult | None:
             selected_event_columns = ", ".join(
-                f"retained.{column} AS {column}" for column in _EVENT_COLUMN_NAMES
+                f"retained.{column} AS {column}" for column in sqlite_records.EVENT_COLUMN_NAMES
             )
             row = connection.execute(
                 f"SELECT operation.record_json AS receipt_record_json, "
@@ -8469,7 +8222,7 @@ class SQLiteSessionStore(
                     "interaction transition receipt",
                 )
             )
-            current_session = _load_session(connection, session_id)
+            current_session = sqlite_records.load_session(connection, session_id)
             if current_session is None:  # pragma: no cover - selected above
                 raise KeyError(f"Session not found: {session_id}")
             _validate_invocation_release_settlement_receipt_authority(
@@ -8480,7 +8233,7 @@ class SQLiteSessionStore(
             )
             if receipt.event.id != event_id:
                 raise RuntimeError("Interaction transition receipt has a conflicting event ID.")
-            if retained_event_exists and _event_from_row(row) != receipt.event:
+            if retained_event_exists and sqlite_records.event_from_row(row) != receipt.event:
                 raise RuntimeError(
                     "Interaction transition receipt conflicts with retained event history."
                 )
@@ -8531,7 +8284,7 @@ class SQLiteSessionStore(
 
         def statement(connection: sqlite3.Connection) -> Any:
             with sqlite_connection._transaction(connection):
-                session = _load_session(connection, copied.session_id)
+                session = sqlite_records.load_session(connection, copied.session_id)
                 if session is None:
                     raise KeyError(f"Session not found: {copied.session_id}")
                 checkpoint = _load_checkpoint_state(connection, copied.session_id)
@@ -8574,7 +8327,7 @@ class SQLiteSessionStore(
                         (
                             None
                             if terminal_event_row is None
-                            else _event_from_row(terminal_event_row)
+                            else sqlite_records.event_from_row(terminal_event_row)
                         ),
                         current_session=session,
                         expected_event=copied.terminal_session_event,
@@ -8735,13 +8488,13 @@ class SQLiteSessionStore(
 
         def statement(connection: sqlite3.Connection) -> None:
             if not copied_events:
-                if not _session_exists(connection, session_id):
+                if not sqlite_records.session_exists(connection, session_id):
                     raise KeyError(f"Session not found: {session_id}")
                 return
 
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                if not _session_exists(connection, session_id):
+                if not sqlite_records.session_exists(connection, session_id):
                     raise KeyError(f"Session not found: {session_id}")
                 activity_at = self._ownership_clock()
                 for owner in self._closure_lineage_owners_unlocked((session_id,)):
@@ -8802,7 +8555,9 @@ class SQLiteSessionStore(
                     (session_id, event.id),
                 ).fetchone()
                 if existing is not None:
-                    event = reconcile_tool_effect_conflict_event(event, _event_from_row(existing))
+                    event = reconcile_tool_effect_conflict_event(
+                        event, sqlite_records.event_from_row(existing)
+                    )
                 else:
                     for owner in self._closure_lineage_owners_unlocked(
                         (session_id,), connection=connection
@@ -8841,7 +8596,7 @@ class SQLiteSessionStore(
         def statement(connection: sqlite3.Connection) -> bool:
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                if not _session_exists(connection, session_id):
+                if not sqlite_records.session_exists(connection, session_id):
                     raise KeyError(f"Session not found: {session_id}")
                 row = connection.execute(
                     """
@@ -8972,7 +8727,7 @@ class SQLiteSessionStore(
         def statement(connection: sqlite3.Connection) -> McpManifestPublicationResult:
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                session = _load_session(connection, session_id)
+                session = sqlite_records.load_session(connection, session_id)
                 if session is None:
                     raise KeyError(f"Session not found: {session_id}")
                 _assert_session_run_epoch(session_id, session)
@@ -9185,7 +8940,7 @@ class SQLiteSessionStore(
                     ),
                 )
                 event_row = connection.execute(
-                    f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
+                    f"SELECT {', '.join(sqlite_records.EVENT_COLUMN_NAMES)} FROM cayu_events "
                     "WHERE session_id = ? AND event_id = ?",
                     (delivery_row["session_id"], delivery_row["event_id"]),
                 ).fetchone()
@@ -9196,7 +8951,7 @@ class SQLiteSessionStore(
                     session_id=delivery_row["session_id"],
                     event_id=delivery_row["event_id"],
                     event_sequence=delivery_row["event_sequence"],
-                    event=_event_from_row(event_row),
+                    event=sqlite_records.event_from_row(event_row),
                     attempt=attempt,
                     claim_id=claim_id,
                     lease_expires_at=lease_expires_at,
@@ -9570,7 +9325,7 @@ class SQLiteSessionStore(
         def query(connection: sqlite3.Connection) -> SessionMessageSource:
             connection.execute("BEGIN")
             try:
-                session = _load_session(connection, session_id)
+                session = sqlite_records.load_session(connection, session_id)
                 require_resource_session(session, "read")
                 if session is None:
                     raise KeyError("Session not found.")
@@ -9603,7 +9358,7 @@ class SQLiteSessionStore(
         def read(connection: sqlite3.Connection) -> SessionMessageInspection:
             connection.execute("BEGIN")
             try:
-                session = _load_session(connection, query.session_id)
+                session = sqlite_records.load_session(connection, query.session_id)
                 require_resource_session(session, "read")
                 if session is None:
                     raise KeyError("Session not found.")
@@ -9805,7 +9560,7 @@ class SQLiteSessionStore(
                     existing = _queued_session_message_from_row(existing_row)
                     _validate_equivalent_queued_session_message(existing, request)
                     event_row = connection.execute(
-                        f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
+                        f"SELECT {', '.join(sqlite_records.EVENT_COLUMN_NAMES)} FROM cayu_events "
                         "WHERE session_id = ? AND event_id = ?",
                         (request.session_id, existing.accepted_event_id),
                     ).fetchone()
@@ -9816,7 +9571,7 @@ class SQLiteSessionStore(
                     connection.commit()
                     return EnqueueSessionMessageResult(
                         message=existing,
-                        event=_event_from_row(event_row),
+                        event=sqlite_records.event_from_row(event_row),
                         replayed=True,
                     )
                 for owner in self._closure_lineage_owners_unlocked((request.session_id,)):
@@ -10856,7 +10611,7 @@ class SQLiteSessionStore(
         def query(connection: sqlite3.Connection) -> dict[str, Any] | None:
             connection.execute("BEGIN")
             try:
-                if not _session_exists(connection, session_id):
+                if not sqlite_records.session_exists(connection, session_id):
                     raise KeyError(f"Session not found: {session_id}")
                 row = connection.execute(
                     "SELECT record_json FROM cayu_session_operations "
@@ -10908,11 +10663,11 @@ class SQLiteSessionStore(
             if requested_event_ids:
                 placeholders = ", ".join("?" for _ in requested_event_ids)
                 rows = connection.execute(
-                    f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
+                    f"SELECT {', '.join(sqlite_records.EVENT_COLUMN_NAMES)} FROM cayu_events "
                     f"WHERE session_id = ? AND event_id IN ({placeholders})",
                     (receipt.session_id, *requested_event_ids),
                 ).fetchall()
-                events_by_id = {row["event_id"]: _event_from_row(row) for row in rows}
+                events_by_id = {row["event_id"]: sqlite_records.event_from_row(row) for row in rows}
             _validate_runtime_publication_durable_material(
                 receipt,
                 transcript_messages=transcript,
@@ -10944,7 +10699,7 @@ class SQLiteSessionStore(
         def query(
             connection: sqlite3.Connection,
         ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-            if not _session_exists(connection, session_id):
+            if not sqlite_records.session_exists(connection, session_id):
                 raise KeyError(f"Session not found: {session_id}")
             rows = connection.execute(
                 "SELECT idempotency_key, record_json FROM cayu_session_operations "
@@ -10965,7 +10720,7 @@ class SQLiteSessionStore(
         settlement_storage_key: str,
     ) -> dict[str, Any] | None:
         def query(connection: sqlite3.Connection) -> dict[str, Any] | None:
-            if not _session_exists(connection, session_id):
+            if not sqlite_records.session_exists(connection, session_id):
                 raise KeyError(f"Session not found: {session_id}")
             row = connection.execute(
                 "SELECT record_json FROM cayu_session_operations "
@@ -10984,7 +10739,7 @@ class SQLiteSessionStore(
         dispatch_storage_key: str,
     ) -> dict[str, Any] | None:
         def query(connection: sqlite3.Connection) -> dict[str, Any] | None:
-            if not _session_exists(connection, session_id):
+            if not sqlite_records.session_exists(connection, session_id):
                 raise KeyError(f"Session not found: {session_id}")
             row = connection.execute(
                 "SELECT record_json FROM cayu_session_operations "
@@ -11006,7 +10761,7 @@ class SQLiteSessionStore(
         ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
             try:
                 connection.execute("BEGIN")
-                if not _session_exists(connection, session_id):
+                if not sqlite_records.session_exists(connection, session_id):
                     raise KeyError(f"Session not found: {session_id}")
                 row = connection.execute(
                     "SELECT record_json FROM cayu_session_operations "
@@ -11125,7 +10880,7 @@ class SQLiteSessionStore(
                 binding = child_session_notification_stage_binding(stage.intent)
                 if binding is not None:
                     for claim in binding.claims:
-                        child = _load_session(connection, claim.child_session_id)
+                        child = sqlite_records.load_session(connection, claim.child_session_id)
                         event_row = (
                             None
                             if child is None
@@ -11145,7 +10900,7 @@ class SQLiteSessionStore(
                                 ),
                             ).fetchone()
                         )
-                        event_record = _event_record_from_row(event_row)
+                        event_record = sqlite_records.event_record_from_row(event_row)
                         if child is None or event_record is None:
                             raise SessionModelCompletionStageConflict(
                                 "Child-session notification occurrence is no longer canonical."
@@ -11342,7 +11097,7 @@ class SQLiteSessionStore(
                         ).fetchone()
                         _validate_model_failover_selection_replay(
                             expected_selection,
-                            None if event_row is None else _event_from_row(event_row),
+                            None if event_row is None else sqlite_records.event_from_row(event_row),
                         )
                     connection.rollback()
                     return ModelCompletionStageResult(
@@ -12133,12 +11888,12 @@ class SQLiteSessionStore(
                 if referenced_event_ids:
                     placeholders = ", ".join("?" for _ in referenced_event_ids)
                     rows = connection.execute(
-                        f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
+                        f"SELECT {', '.join(sqlite_records.EVENT_COLUMN_NAMES)} FROM cayu_events "
                         f"WHERE session_id = ? AND event_id IN ({placeholders})",
                         (session_id, *referenced_event_ids),
                     ).fetchall()
                     durable_referenced_events = {
-                        row["event_id"]: _event_from_row(row) for row in rows
+                        row["event_id"]: sqlite_records.event_from_row(row) for row in rows
                     }
                 _validate_runtime_publication_event_references(
                     request.referenced_events,
@@ -12175,12 +11930,12 @@ class SQLiteSessionStore(
                     )
                     event_type_placeholders = ", ".join("?" for _ in lifecycle_event_types)
                     rows = connection.execute(
-                        f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
+                        f"SELECT {', '.join(sqlite_records.EVENT_COLUMN_NAMES)} FROM cayu_events "
                         "INDEXED BY idx_cayu_events_pending_action_lookup "
                         f"WHERE session_id = ? AND pending_action_lookup_key IN "
                         "(SELECT value FROM json_each(?)) AND event_type IN "
                         f"({event_type_placeholders}) AND "
-                        f"({_PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL}) "
+                        f"({session_queries.PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL}) "
                         "AND (json_extract(payload_json, '$.tool_round_id') = ? "
                         "OR (json_extract(payload_json, '$.model_step_id') = ? "
                         "AND json_extract(payload_json, '$.model_attempt_id') = ?) "
@@ -12205,7 +11960,7 @@ class SQLiteSessionStore(
                         raise ValueError(
                             "Tool-round lifecycle evidence exceeds the publication limit."
                         )
-                    durable_tool_events = [_event_from_row(row) for row in rows]
+                    durable_tool_events = [sqlite_records.event_from_row(row) for row in rows]
                 _validate_tool_round_publication(
                     request,
                     durable_referenced_events,
@@ -12993,7 +12748,7 @@ class SQLiteSessionStore(
         ).fetchone()
         if count > max_records or size > max_bytes:
             raise ClosureRecordsTooLarge()
-        session = _load_session(connection, session_id)
+        session = sqlite_records.load_session(connection, session_id)
         builder.add_class(
             "session",
             ()
@@ -13052,7 +12807,7 @@ class SQLiteSessionStore(
         builder.add_class(
             "events",
             (
-                EventRecord(sequence=row["sequence"], event=_event_from_row(row))
+                EventRecord(sequence=row["sequence"], event=sqlite_records.event_from_row(row))
                 for row in connection.execute(
                     "SELECT * FROM cayu_events WHERE session_id = ? ORDER BY sequence LIMIT ?",
                     (session_id, max_records + 1),
@@ -13242,7 +12997,7 @@ class SQLiteSessionStore(
                 statement, parameter_count = export_size_statement(postgres=False)
                 sizes = connection.execute(statement, (session_id,) * parameter_count).fetchone()
                 builder.preflight_bytes(int(sizes[0]), int(sizes[1]))
-                session = _load_session(connection, session_id)
+                session = sqlite_records.load_session(connection, session_id)
                 if session is None:
                     return None
                 cursor = _transcript_cursor(connection, session_id)
@@ -13254,7 +13009,9 @@ class SQLiteSessionStore(
                 while page := rows.fetchmany(SESSION_EXPORT_PAGE_SIZE):
                     for row in page:
                         builder.event(
-                            EventRecord(sequence=row["sequence"], event=_event_from_row(row))
+                            EventRecord(
+                                sequence=row["sequence"], event=sqlite_records.event_from_row(row)
+                            )
                         )
                 rows = connection.execute(
                     "SELECT session_order, interaction_id, message_json FROM cayu_transcript_messages "
@@ -13322,104 +13079,25 @@ class SQLiteSessionStore(
         return await self._run_read(query)
 
     async def load_events(self, session_id: str) -> list[Event]:
-        from cayu.resource_access import current_data_bounds
-
-        access_bounds = await current_data_bounds()
-        session_id = require_clean_nonblank(session_id, "session_id")
-
-        def query(connection: sqlite3.Connection) -> list[sqlite3.Row]:
-            if not _session_exists(connection, session_id):
-                raise KeyError(f"Session not found: {session_id}")
-            rows = connection.execute(
-                f"""
-                SELECT {", ".join(_EVENT_COLUMN_NAMES)}
-                FROM cayu_events
-                WHERE session_id = ?
-                ORDER BY sequence ASC
-                """,
-                (session_id,),
-            ).fetchall()
-            return rows
-
-        from cayu.storage._session_access_records import sqlite_owner_read
-
-        rows = await self._run_read(
-            lambda connection: sqlite_owner_read(connection, access_bounds, session_id, query)
-        )
-        return await asyncio.to_thread(lambda: [_event_from_row(row) for row in rows])
+        return await session_queries.load_events(self._run_read, session_id)
 
     async def load_user_input_supersession_events(
         self,
         session_id: str,
         input_id: str,
     ) -> list[Event]:
-        from cayu.sessions.pending_actions import pending_action_lookup_key
-
-        session_id = require_clean_nonblank(session_id, "session_id")
-        input_id = require_clean_nonblank(input_id, "input_id")
-        lookup_key = pending_action_lookup_key(input_id)
-
-        def query(connection: sqlite3.Connection) -> list[Event]:
-            if not _session_exists(connection, session_id):
-                raise KeyError(f"Session not found: {session_id}")
-            rows = connection.execute(
-                f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
-                "INDEXED BY idx_cayu_events_pending_action_lookup "
-                "WHERE session_id = ? AND pending_action_lookup_key = ? "
-                "AND event_type = ? AND "
-                f"({_PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL}) "
-                "AND json_extract(payload_json, "
-                "'$.user_input_supersession_intent.input_id') = ? "
-                "ORDER BY sequence ASC LIMIT 2",
-                (
-                    session_id,
-                    lookup_key,
-                    str(EventType.SESSION_INTERRUPTED),
-                    input_id,
-                ),
-            ).fetchall()
-            return [_event_from_row(row) for row in rows]
-
-        return await self._run_read(query)
+        return await session_queries.load_user_input_supersession_events(
+            self._run_read, session_id, input_id
+        )
 
     async def load_tool_round_lifecycle_events(
         self,
         session_id: str,
         tool_call_ids: list[str] | tuple[str, ...],
     ) -> list[Event]:
-        from cayu.sessions.pending_actions import pending_action_lookup_key
-
-        session_id = require_clean_nonblank(session_id, "session_id")
-        copied_ids = _validate_tool_round_call_ids(tool_call_ids, "tool_call_ids")
-        lookup_keys = tuple(pending_action_lookup_key(call_id) for call_id in copied_ids)
-        lifecycle_event_types = tuple(
-            sorted(str(event_type) for event_type in _TOOL_ROUND_LIFECYCLE_EVENT_TYPES)
+        return await session_queries.load_tool_round_lifecycle_events(
+            self._run_read, session_id, tool_call_ids
         )
-
-        def query(connection: sqlite3.Connection) -> list[Event]:
-            if not _session_exists(connection, session_id):
-                raise KeyError(f"Session not found: {session_id}")
-            event_type_placeholders = ", ".join("?" for _ in lifecycle_event_types)
-            rows = connection.execute(
-                f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
-                "INDEXED BY idx_cayu_events_pending_action_lookup "
-                f"WHERE session_id = ? AND pending_action_lookup_key IN "
-                "(SELECT value FROM json_each(?)) AND event_type IN "
-                f"({event_type_placeholders}) AND "
-                f"({_PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL}) "
-                "ORDER BY sequence ASC LIMIT ?",
-                (
-                    session_id,
-                    json.dumps(lookup_keys),
-                    *lifecycle_event_types,
-                    _tool_round_lifecycle_event_limit(copied_ids) + 1,
-                ),
-            ).fetchall()
-            if len(rows) > _tool_round_lifecycle_event_limit(copied_ids):
-                raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
-            return [_event_from_row(row) for row in rows]
-
-        return await self._run_read(query)
 
     async def load_tool_round_lifecycle_events_for_round(
         self,
@@ -13428,165 +13106,24 @@ class SQLiteSessionStore(
         *,
         tool_round_identity: ToolRoundIdentity,
     ) -> list[Event]:
-        from cayu.sessions.pending_actions import pending_action_lookup_key
-
-        session_id = require_clean_nonblank(session_id, "session_id")
-        copied_ids = _validate_tool_round_call_ids(tool_call_ids, "tool_call_ids")
-        tool_round_identity = copy_tool_round_identity(tool_round_identity)
-        lookup_keys = tuple(pending_action_lookup_key(call_id) for call_id in copied_ids)
-        lifecycle_event_types = tuple(
-            sorted(str(event_type) for event_type in _TOOL_ROUND_LIFECYCLE_EVENT_TYPES)
+        return await session_queries.load_tool_round_lifecycle_events_for_round(
+            self._run_read, session_id, tool_call_ids, tool_round_identity=tool_round_identity
         )
 
-        def query(connection: sqlite3.Connection) -> list[Event]:
-            if not _session_exists(connection, session_id):
-                raise KeyError(f"Session not found: {session_id}")
-            event_type_placeholders = ", ".join("?" for _ in lifecycle_event_types)
-            rows = connection.execute(
-                f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
-                "INDEXED BY idx_cayu_events_pending_action_lookup "
-                f"WHERE session_id = ? AND pending_action_lookup_key IN "
-                "(SELECT value FROM json_each(?)) AND event_type IN "
-                f"({event_type_placeholders}) AND "
-                f"({_PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL}) "
-                "AND (json_extract(payload_json, '$.tool_round_id') = ? "
-                "OR (json_extract(payload_json, '$.model_step_id') = ? "
-                "AND json_extract(payload_json, '$.model_attempt_id') = ?) "
-                "OR cayu_is_execution_unit_id("
-                "json_extract(payload_json, '$.tool_round_id'), 'tool_round_id') = 0 "
-                "OR cayu_is_execution_unit_id("
-                "json_extract(payload_json, '$.model_step_id'), 'model_step_id') = 0 "
-                "OR cayu_is_execution_unit_id("
-                "json_extract(payload_json, '$.model_attempt_id'), 'model_attempt_id') = 0) "
-                "ORDER BY sequence ASC LIMIT ?",
-                (
-                    session_id,
-                    json.dumps(lookup_keys),
-                    *lifecycle_event_types,
-                    tool_round_identity.tool_round_id,
-                    tool_round_identity.model_step_id,
-                    tool_round_identity.model_attempt_id,
-                    _tool_round_lifecycle_event_limit(copied_ids) + 1,
-                ),
-            ).fetchall()
-            if len(rows) > _tool_round_lifecycle_event_limit(copied_ids):
-                raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
-            return [_event_from_row(row) for row in rows]
-
-        return await self._run_read(query)
-
-    @runtime_session_query
     async def query_events(self, query: EventQuery | None = None) -> list[EventRecord]:
-        query = copy_event_query(query)
-        if len(query.session_ids) > _EVENT_QUERY_SESSION_IDS_BATCH_SIZE:
-            return await self._query_events_by_session_id_batches(query)
+        return await session_queries.query_events(self._run_read, query)
 
-        plan = session_store_sql.build_event_query_sql(query, dialect=_SQL_DIALECT)
-        params = [*plan.params, query.limit]
-
-        def run_query(connection: sqlite3.Connection) -> list[EventRecord]:
-            event_columns = ", ".join(f"cayu_events.{name}" for name in _EVENT_COLUMN_NAMES)
-            rows = connection.execute(
-                f"""
-                SELECT cayu_events.sequence, {event_columns}
-                FROM cayu_events
-                JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
-                {plan.where_sql}
-                ORDER BY cayu_events.sequence {plan.order_direction}
-                LIMIT ?
-                """,
-                params,
-            ).fetchall()
-            return [
-                EventRecord(sequence=row["sequence"], event=_event_from_row(row)) for row in rows
-            ]
-
-        return await self._run_read(run_query)
-
-    @runtime_session_query
     async def read_usage_accounting(
         self, query: EventQuery, *, by_session: bool = False, by_identity: bool = False
     ) -> UsageAccountingSnapshot:
-        from cayu.runtime._usage_accounting import (
-            USAGE_ACCOUNTING_PAGE_SIZE,
-            SessionUsageCache,
-            UsageAccountingReducer,
-            usage_accounting_query,
+        return await session_queries.read_usage_accounting(
+            self._run_read,
+            query,
+            by_session=by_session,
+            by_identity=by_identity,
+            usage_cache=self._session_usage_cache,
         )
 
-        query = usage_accounting_query(query)
-        plan = session_store_sql.build_accounting_event_query_sql(query, dialect=_SQL_DIALECT)
-        cached_session_id = SessionUsageCache.session_scope(
-            query, by_session=by_session, by_identity=by_identity
-        )
-
-        def read(connection: sqlite3.Connection) -> UsageAccountingSnapshot:
-            with connection:
-                connection.execute("BEGIN")
-                generation_row = connection.execute(
-                    "SELECT generation FROM cayu_accounting_state WHERE singleton = 1"
-                ).fetchone()
-                if generation_row is None:
-                    raise RuntimeError("Accounting deletion revision is missing.")
-                generation = generation_row[0]
-                read_query = query
-                read_plan = plan
-                prior = None
-                boundary = 0
-                if cached_session_id is not None:
-                    prior = self._session_usage_cache.resume_after(cached_session_id, generation)
-                    if prior is not None:
-                        # A cached scope carries no access bounds, so this plan
-                        # adds only the sequence cursor to the one built above.
-                        read_query = copy_event_query(
-                            query, update={"after_sequence": prior.scanned_through}
-                        )
-                        read_plan = session_store_sql.build_accounting_event_query_sql(
-                            read_query, dialect=_SQL_DIALECT
-                        )
-                    # SQLite serializes writers, so later commits land above this.
-                    boundary = (
-                        connection.execute(
-                            "SELECT MAX(sequence) FROM cayu_events WHERE session_id = ?",
-                            (cached_session_id,),
-                        ).fetchone()[0]
-                        or 0
-                    )
-                reducer = UsageAccountingReducer(
-                    read_query, by_session=by_session, by_identity=by_identity
-                )
-                event_columns = ", ".join(f"cayu_events.{name}" for name in _EVENT_COLUMN_NAMES)
-                # One statement holds one read snapshot. fetchmany bounds hydration;
-                # query.limit is a page size, never a cap on authoritative history.
-                cursor = connection.execute(
-                    f"SELECT cayu_events.sequence, {event_columns} FROM cayu_events "
-                    "JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id "
-                    f"{read_plan.where_sql} ORDER BY cayu_events.sequence ASC",
-                    read_plan.params,
-                )
-                try:
-                    while rows := cursor.fetchmany(USAGE_ACCOUNTING_PAGE_SIZE):
-                        reducer.add_page(
-                            [
-                                EventRecord(sequence=row["sequence"], event=_event_from_row(row))
-                                for row in rows
-                            ]
-                        )
-                finally:
-                    cursor.close()
-                if cached_session_id is not None:
-                    return self._session_usage_cache.settle(
-                        cached_session_id,
-                        generation,
-                        prior,
-                        reducer.snapshot(),
-                        boundary=boundary,
-                    )
-                return reducer.snapshot().model_copy(update={"generation": generation})
-
-        return await self._run_read(read)
-
-    @runtime_session_query
     async def read_cost_accounting(
         self,
         query: EventQuery,
@@ -13599,205 +13136,31 @@ class SQLiteSessionStore(
         max_detail_bytes: int | None = None,
         previous: CostAccountingSnapshot | None = None,
     ) -> CostAccountingSnapshot:
-        from cayu.runtime._cost_accounting import (
-            COST_ACCOUNTING_PAGE_SIZE,
-            cost_accounting_query,
-            cost_pending_events,
+        return await session_queries.read_cost_accounting(
+            self._run_read,
+            query,
+            pricing,
+            currency=currency,
+            details=details,
+            by_session=by_session,
+            additional_events=additional_events,
+            max_detail_bytes=max_detail_bytes,
+            previous=previous,
+            cost_authority=self._cost_accounting_authority,
         )
-        from cayu.runtime._cost_accounting_refresh import CostAccountingRead
-        from cayu.storage._cost_accounting_sql import (
-            changed_cost_groups_statement,
-            cost_boundary_statement,
-            cost_group_lookup_statement,
-            cost_group_statement,
-        )
 
-        query = cost_accounting_query(query)
-        pending = cost_pending_events(query, additional_events)
-        plan = session_store_sql.build_accounting_event_query_sql(query, dialect=_SQL_DIALECT)
-
-        def read(connection: sqlite3.Connection) -> CostAccountingSnapshot:
-            with connection:
-                connection.execute("BEGIN")
-                generation_row = connection.execute(
-                    "SELECT generation FROM cayu_accounting_state WHERE singleton = 1"
-                ).fetchone()
-                if generation_row is None:
-                    raise RuntimeError("Accounting deletion revision is missing.")
-                generation = generation_row[0]
-                scoped_pending = pending
-                if query.causal_budget_id is not None and pending:
-                    allowed_sessions = {
-                        row[0]
-                        for row in connection.execute(
-                            "SELECT id FROM cayu_sessions WHERE causal_budget_id = ? "
-                            "AND id IN (SELECT value FROM json_each(?))",
-                            (
-                                query.causal_budget_id,
-                                json.dumps([event.session_id for event in pending]),
-                            ),
-                        )
-                    }
-                    scoped_pending = tuple(
-                        event for event in pending if event.session_id in allowed_sessions
-                    )
-                scoped_pending = tuple(
-                    event
-                    for event in scoped_pending
-                    if connection.execute(
-                        "SELECT 1 FROM cayu_events "
-                        "JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id "
-                        f"{plan.where_sql} AND cayu_events.session_id = ? AND cayu_events.event_id = ? LIMIT 1",
-                        (*plan.params, event.session_id, event.id),
-                    ).fetchone()
-                    is None
-                )
-                boundary_sql, boundary_params = cost_boundary_statement(query, dialect=_SQL_DIALECT)
-                boundary = connection.execute(boundary_sql, boundary_params).fetchone()[0] or 0
-                reducer = CostAccountingRead(
-                    query,
-                    pricing,
-                    currency=currency,
-                    details=details,
-                    max_detail_bytes=max_detail_bytes,
-                    previous=previous,
-                    generation=generation,
-                    through_sequence=boundary,
-                    authority=self._cost_accounting_authority,
-                    by_session=by_session,
-                    additional_events=scoped_pending,
-                )
-                source_plan = session_store_sql.build_accounting_event_query_sql(
-                    reducer.source_query, dialect=_SQL_DIALECT
-                )
-                event_columns = ", ".join(f"cayu_events.{name}" for name in _EVENT_COLUMN_NAMES)
-                columns = f"cayu_events.sequence, {event_columns}"
-
-                def add_group(key: tuple[str, bool, str]) -> None:
-                    statement, params = cost_group_lookup_statement(
-                        columns=columns, plan=source_plan, key=key, postgres=False
-                    )
-                    cursor = connection.execute(statement, params)
-                    try:
-                        while rows := cursor.fetchmany(COST_ACCOUNTING_PAGE_SIZE):
-                            for row in rows:
-                                reducer.add(row["sequence"], _event_from_row(row))
-                    finally:
-                        cursor.close()
-
-                if reducer.incremental:
-                    statement, params = changed_cost_groups_statement(reducer, dialect=_SQL_DIALECT)
-                    cursor = connection.execute(statement, params)
-                    try:
-                        while groups := cursor.fetchmany(COST_ACCOUNTING_PAGE_SIZE):
-                            for group in groups:
-                                add_group(
-                                    (
-                                        group[0],
-                                        group[1] is not None,
-                                        group[1] if group[1] is not None else group[2],
-                                    )
-                                )
-                    finally:
-                        cursor.close()
-                    for key in reducer.remaining_pending_keys:
-                        add_group(key)
-                else:
-                    statement, group_params = cost_group_statement(
-                        columns=columns, where_sql=source_plan.where_sql, postgres=False
-                    )
-                    cursor = connection.execute(statement, (*group_params, *source_plan.params))
-                    try:
-                        while rows := cursor.fetchmany(COST_ACCOUNTING_PAGE_SIZE):
-                            for row in rows:
-                                reducer.add(row["sequence"], _event_from_row(row))
-                    finally:
-                        cursor.close()
-                return reducer.snapshot()
-
-        return await self._run_read(read)
-
-    @runtime_session_query
     async def event_exists(self, query: EventQuery) -> bool:
-        plan = session_store_sql.build_accounting_event_query_sql(query, dialect=_SQL_DIALECT)
+        return await session_queries.event_exists(self._run_read, query)
 
-        def read(connection: sqlite3.Connection) -> bool:
-            return (
-                connection.execute(
-                    "SELECT EXISTS(SELECT 1 FROM cayu_events "
-                    "JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id "
-                    f"{plan.where_sql})",
-                    plan.params,
-                ).fetchone()[0]
-                == 1
-            )
-
-        return await self._run_read(read)
-
-    @runtime_session_query
     async def query_events_bounded(
         self,
         query: EventQuery,
         *,
         max_bytes: int,
     ) -> list[EventRecord]:
-        query = copy_event_query(query)
-        if type(max_bytes) is not int or max_bytes < 1:
-            raise ValueError("max_bytes must be a positive integer.")
-        if len(query.session_ids) > _EVENT_QUERY_SESSION_IDS_BATCH_SIZE:
-            raise ValueError("Byte-bounded event queries require one bounded SQL batch.")
-        plan = session_store_sql.build_event_query_sql(query, dialect=_SQL_DIALECT)
-        params = [*plan.params, query.limit]
-
-        def run_query(connection: sqlite3.Connection) -> list[EventRecord]:
-            event_columns = ", ".join(f"cayu_events.{name}" for name in _EVENT_COLUMN_NAMES)
-            serialized_bytes = " + ".join(
-                [
-                    "256",
-                    *(
-                        f"COALESCE(length(CAST(cayu_events.{name} AS BLOB)), 0)"
-                        for name in _EVENT_COLUMN_NAMES
-                    ),
-                ]
-            )
-            connection.execute("BEGIN")
-            try:
-                size_row = connection.execute(
-                    f"""
-                    WITH bounded_candidates AS (
-                        SELECT {serialized_bytes} AS serialized_bytes
-                        FROM cayu_events
-                        JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
-                        {plan.where_sql}
-                        ORDER BY cayu_events.sequence {plan.order_direction}
-                        LIMIT ?
-                    )
-                    SELECT COALESCE(SUM(serialized_bytes), 0)
-                    FROM bounded_candidates
-                    """,
-                    params,
-                ).fetchone()
-                if size_row is None or int(size_row[0]) > max_bytes:
-                    raise EventQueryResultTooLarge(max_bytes)
-                rows = connection.execute(
-                    f"""
-                    SELECT cayu_events.sequence, {event_columns}
-                    FROM cayu_events
-                    JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
-                    {plan.where_sql}
-                    ORDER BY cayu_events.sequence {plan.order_direction}
-                    LIMIT ?
-                    """,
-                    params,
-                ).fetchall()
-                return [
-                    EventRecord(sequence=row["sequence"], event=_event_from_row(row))
-                    for row in rows
-                ]
-            finally:
-                connection.rollback()
-
-        return await self._run_read(run_query)
+        return await session_queries.query_events_bounded(
+            self._run_read, query, max_bytes=max_bytes
+        )
 
     async def load_terminal_session_evidence(
         self,
@@ -13855,7 +13218,7 @@ class SQLiteSessionStore(
                     raise TerminalSessionEvidenceError(
                         TerminalSessionEvidenceErrorCode.RECORD_BYTES_EXCEEDED, limit=max_bytes
                     )
-                session = _load_session(connection, session_id)
+                session = sqlite_records.load_session(connection, session_id)
                 if (
                     session is not None
                     and compact_json_utf8_size(session.model_dump(mode="json")) > max_bytes
@@ -13914,11 +13277,14 @@ class SQLiteSessionStore(
             str(event_type) for event_type in _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES
         )
         evidence_type_placeholders = ", ".join("?" for _ in evidence_event_types)
-        event_columns = ", ".join(_EVENT_COLUMN_NAMES)
+        event_columns = ", ".join(sqlite_records.EVENT_COLUMN_NAMES)
         event_stored_bytes = " + ".join(
             [
                 "length(CAST(sequence AS TEXT))",
-                *(f"COALESCE(length(CAST({column} AS BLOB)), 0)" for column in _EVENT_COLUMN_NAMES),
+                *(
+                    f"COALESCE(length(CAST({column} AS BLOB)), 0)"
+                    for column in sqlite_records.EVENT_COLUMN_NAMES
+                ),
             ]
         )
         session_stored_bytes = " + ".join(
@@ -14358,7 +13724,7 @@ class SQLiteSessionStore(
                         limit=limits.max_total_bytes,
                     )
 
-                session = _load_session(connection, session_id)
+                session = sqlite_records.load_session(connection, session_id)
                 if session is None:
                     raise TerminalSessionEvidenceError(
                         TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
@@ -14381,7 +13747,10 @@ class SQLiteSessionStore(
                         for row in rows:
                             spool.append(
                                 "event",
-                                EventRecord(sequence=row["sequence"], event=_event_from_row(row)),
+                                EventRecord(
+                                    sequence=row["sequence"],
+                                    event=sqlite_records.event_from_row(row),
+                                ),
                             )
                     cursor.close()
                     cursor = connection.execute(
@@ -14435,7 +13804,7 @@ class SQLiteSessionStore(
                         TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
                     )
                 events = tuple(
-                    EventRecord(sequence=row["sequence"], event=_event_from_row(row))
+                    EventRecord(sequence=row["sequence"], event=sqlite_records.event_from_row(row))
                     for row in event_rows
                 )
                 transcript = tuple(
@@ -14475,104 +13844,12 @@ class SQLiteSessionStore(
         before_sequence: int | None = None,
         limit: int = 100,
     ) -> list[EventRecord]:
-        session_id = require_clean_nonblank(session_id, "session_id")
-        before_sequence, limit = _validate_interaction_page(before_sequence, limit)
-        cursor_clause = "" if before_sequence is None else "AND latest.latest_event_sequence < ?"
-        params: list[object] = [session_id]
-        if before_sequence is not None:
-            params.append(before_sequence)
-        params.append(limit)
-
-        def run_query(connection: sqlite3.Connection) -> list[EventRecord]:
-            if not _session_exists(connection, session_id):
-                raise KeyError(f"Session not found: {session_id}")
-            event_columns = ", ".join(f"event.{name}" for name in _EVENT_COLUMN_NAMES)
-            rows = connection.execute(
-                f"""
-                SELECT event.sequence, {event_columns}
-                FROM cayu_interaction_latest_events AS latest
-                JOIN cayu_events AS event
-                  ON event.sequence = latest.latest_event_sequence
-                WHERE latest.session_id = ? {cursor_clause}
-                ORDER BY latest.latest_event_sequence DESC
-                LIMIT ?
-                """,
-                params,
-            ).fetchall()
-            return [
-                EventRecord(sequence=row["sequence"], event=_event_from_row(row)) for row in rows
-            ]
-
-        return await self._run_read(run_query)
-
-    async def _query_events_by_session_id_batches(self, query: EventQuery) -> list[EventRecord]:
-        records: list[EventRecord] = []
-        for batch in _event_query_session_id_batches(query.session_ids):
-            records.extend(
-                await self.query_events(
-                    session_store_sql.event_query_with_session_ids(
-                        query,
-                        session_ids=batch,
-                    ),
-                )
-            )
-        records.sort(
-            key=lambda record: record.sequence,
-            reverse=query.order_by.value == "sequence_desc",
+        return await session_queries.query_latest_interaction_events(
+            self._run_read, session_id, before_sequence=before_sequence, limit=limit
         )
-        return records[: query.limit]
 
     async def summarize_events(self, session_id: str) -> EventSummary:
-        from cayu.resource_access import current_data_bounds
-
-        access_bounds = await current_data_bounds()
-        session_id = require_clean_nonblank(session_id, "session_id")
-
-        def query(connection: sqlite3.Connection) -> EventSummary:
-            if not _session_exists(connection, session_id):
-                raise KeyError(f"Session not found: {session_id}")
-
-            total_row = connection.execute(
-                """
-                SELECT COUNT(*) AS total_events
-                FROM cayu_events
-                WHERE session_id = ?
-                """,
-                (session_id,),
-            ).fetchone()
-            count_rows = connection.execute(
-                """
-                SELECT event_type, COUNT(*) AS count
-                FROM cayu_events
-                WHERE session_id = ?
-                GROUP BY event_type
-                ORDER BY event_type ASC
-                """,
-                (session_id,),
-            ).fetchall()
-            latest_row = connection.execute(
-                f"""
-                SELECT sequence, {", ".join(_EVENT_COLUMN_NAMES)}
-                FROM cayu_events
-                WHERE session_id = ?
-                ORDER BY sequence DESC
-                LIMIT 1
-                """,
-                (session_id,),
-            ).fetchone()
-
-            return EventSummary(
-                session_id=session_id,
-                total_events=int(total_row["total_events"]),
-                counts_by_type={row["event_type"]: int(row["count"]) for row in count_rows},
-                latest_event=_event_record_from_row(latest_row),
-            )
-
-        from cayu.storage._session_access_records import sqlite_owner_read
-
-        return await self._run_read(
-            lambda connection: sqlite_owner_read(connection, access_bounds, session_id, query)
-        )
+        return await session_queries.summarize_events(self._run_read, session_id)
 
     async def summarize_outcome(self, session_id: str) -> SessionOutcome:
         from cayu.resource_access import current_data_bounds
@@ -14581,13 +13858,13 @@ class SQLiteSessionStore(
         session_id = require_clean_nonblank(session_id, "session_id")
 
         def query(connection: sqlite3.Connection) -> SessionOutcome:
-            session = _load_session(connection, session_id)
+            session = sqlite_records.load_session(connection, session_id)
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
 
             terminal_row = connection.execute(
                 f"""
-                SELECT sequence, {", ".join(_EVENT_COLUMN_NAMES)}
+                SELECT sequence, {", ".join(sqlite_records.EVENT_COLUMN_NAMES)}
                 FROM cayu_events
                 WHERE session_id = ?
                   AND event_type IN ('session.completed', 'session.failed', 'session.interrupted')
@@ -14607,7 +13884,7 @@ class SQLiteSessionStore(
             ).fetchone()
             retry_row = connection.execute(
                 f"""
-                SELECT sequence, {", ".join(_EVENT_COLUMN_NAMES)}
+                SELECT sequence, {", ".join(sqlite_records.EVENT_COLUMN_NAMES)}
                 FROM cayu_events
                 WHERE session_id = ?
                   AND event_type = 'model.retry'
@@ -14628,8 +13905,8 @@ class SQLiteSessionStore(
 
             return session_outcome(
                 session,
-                terminal_event=_event_record_from_row(terminal_row),
-                latest_retry_event=_event_record_from_row(retry_row),
+                terminal_event=sqlite_records.event_record_from_row(terminal_row),
+                latest_retry_event=sqlite_records.event_record_from_row(retry_row),
             )
 
         from cayu.storage._session_access_records import sqlite_owner_read
@@ -14671,7 +13948,7 @@ class SQLiteSessionStore(
             session_id = require_clean_nonblank(session_id, "session_id")
 
         def statement(connection: sqlite3.Connection) -> int:
-            if session_id is not None and not _session_exists(connection, session_id):
+            if session_id is not None and not sqlite_records.session_exists(connection, session_id):
                 raise KeyError(f"Session not found: {session_id}")
             publication_key_pattern = RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX + "*"
             with connection:
@@ -14918,7 +14195,7 @@ class SQLiteSessionStore(
         session_id = require_clean_nonblank(session_id, "session_id")
 
         def statement(connection: sqlite3.Connection) -> int:
-            if not _session_exists(connection, session_id):
+            if not sqlite_records.session_exists(connection, session_id):
                 raise KeyError(f"Session not found: {session_id}")
             with connection:
                 durability_guard = connection.execute(
@@ -14982,405 +14259,30 @@ class SQLiteSessionStore(
         access_bounds = await current_data_bounds()
         if access_bounds is not None:
             return await self._access_list_sessions(access_bounds, copy_session_query(query))
-        return await self._list_sessions(query, pending_interruption_cascade_only=False)
+        return await session_queries.list_sessions(
+            self._run_read,
+            ownership_clock=self._ownership_clock,
+            query=query,
+            pending_interruption_cascade_only=False,
+        )
 
     async def query_session_topology(
         self,
         query: SessionTopologyQuery,
     ) -> SessionTopologyStoreResult:
-        if type(query) is not SessionTopologyQuery:
-            raise TypeError("Session topology queries must be SessionTopologyQuery instances.")
-        query = query.model_copy(deep=True)
-
-        def read_topology_snapshot(
-            connection: sqlite3.Connection,
-        ) -> SessionTopologyStoreResult:
-            focus_row = connection.execute(
-                f"""
-                SELECT {_SESSION_TOPOLOGY_COLUMNS}
-                FROM cayu_sessions
-                WHERE id = ?
-                """,
-                (query.focus_session_id,),
-            ).fetchone()
-            if focus_row is None:
-                raise KeyError(f"Session not found: {query.focus_session_id}")
-            focus = _session_topology_node_from_sqlite_row(focus_row)
-
-            ancestors: list[SessionTopologyNode] = []
-            seen_ids = {focus.id}
-            parent_session_id = focus.parent_session_id
-            while parent_session_id is not None:
-                if parent_session_id in seen_ids:
-                    raise SessionTopologyCycle(
-                        f"Session topology contains a parent cycle at {parent_session_id}."
-                    )
-                if len(ancestors) >= query.ancestor_depth_limit:
-                    raise SessionTopologyDepthExceeded(
-                        f"Session topology exceeds the {query.ancestor_depth_limit}-ancestor limit."
-                    )
-                parent_row = connection.execute(
-                    f"""
-                    SELECT {_SESSION_TOPOLOGY_COLUMNS}
-                    FROM cayu_sessions
-                    WHERE id = ?
-                    """,
-                    (parent_session_id,),
-                ).fetchone()
-                if parent_row is None:
-                    raise ValueError(
-                        f"Session topology references missing parent {parent_session_id}."
-                    )
-                parent = _session_topology_node_from_sqlite_row(parent_row)
-                ancestors.append(parent)
-                seen_ids.add(parent.id)
-                parent_session_id = parent.parent_session_id
-            ancestors.reverse()
-
-            expanded_parents: list[SessionTopologyNode] = []
-            if query.expanded_parent_ids:
-                placeholders = ", ".join("?" for _ in query.expanded_parent_ids)
-                parent_rows = connection.execute(
-                    f"""
-                    SELECT {_SESSION_TOPOLOGY_COLUMNS}
-                    FROM cayu_sessions
-                    WHERE id IN ({placeholders})
-                    """,
-                    query.expanded_parent_ids,
-                ).fetchall()
-                parents_by_id = {
-                    row["id"]: _session_topology_node_from_sqlite_row(row) for row in parent_rows
-                }
-                for parent_id in query.expanded_parent_ids:
-                    parent = parents_by_id.get(parent_id)
-                    if parent is None:
-                        raise KeyError(f"Session not found: {parent_id}")
-                    expanded_parents.append(parent)
-
-            candidates_by_parent: dict[str, list[SessionTopologyNode]] = {
-                parent.id: [] for parent in expanded_parents
-            }
-            if expanded_parents:
-                branch_queries: list[str] = []
-                branch_params: list[object] = []
-                for branch_order, parent in enumerate(expanded_parents):
-                    cursor = query.child_cursors.get(parent.id)
-                    if cursor is None:
-                        cursor_clause = ""
-                        cursor_params: list[object] = []
-                    else:
-                        cursor_created_at, cursor_id = decode_session_topology_cursor(
-                            cursor,
-                            parent_session_id=parent.id,
-                        )
-                        cursor_clause = "AND (created_at > ? OR (created_at = ? AND id > ?))"
-                        formatted_cursor = sqlite_records.format_datetime(cursor_created_at)
-                        cursor_params = [formatted_cursor, formatted_cursor, cursor_id]
-                    branch_queries.append(
-                        f"""
-                        SELECT branch_order, {_SESSION_TOPOLOGY_PROJECTED_COLUMNS}
-                        FROM (
-                            SELECT ? AS branch_order, {_SESSION_TOPOLOGY_COLUMNS}
-                            FROM cayu_sessions
-                            WHERE parent_session_id = ?
-                              {cursor_clause}
-                            ORDER BY created_at ASC, id ASC
-                            LIMIT ?
-                        )
-                        """
-                    )
-                    branch_params.extend(
-                        [
-                            branch_order,
-                            parent.id,
-                            *cursor_params,
-                            query.child_limit + 1,
-                        ]
-                    )
-                candidate_rows = connection.execute(
-                    f"""
-                    {" UNION ALL ".join(branch_queries)}
-                    ORDER BY branch_order ASC, created_at ASC, id ASC
-                    """,
-                    branch_params,
-                ).fetchall()
-                for row in candidate_rows:
-                    candidates_by_parent[row["parent_session_id"]].append(
-                        _session_topology_node_from_sqlite_row(row)
-                    )
-
-            result = build_session_topology_result(
-                focus=focus,
-                ancestors=ancestors,
-                expanded_parents=expanded_parents,
-                branch_candidates=(candidates_by_parent[parent.id] for parent in expanded_parents),
-                child_limit=query.child_limit,
-            )
-            return result
-
-        def read_topology(connection: sqlite3.Connection) -> SessionTopologyStoreResult:
-            # Multiple point reads plus the batched child query must describe one
-            # SQLite snapshot. A plain sequence of SELECT statements in Python's
-            # legacy transaction mode would otherwise observe commits made
-            # between statements.
-            connection.execute("BEGIN")
-            try:
-                return read_topology_snapshot(connection)
-            finally:
-                connection.rollback()
-
-        return await self._run_read(read_topology)
+        return await session_queries.query_session_topology(self._run_read, query)
 
     async def query_session_lineage(
         self,
         query: SessionLineageQuery,
     ) -> SessionLineageResult:
-        query = copy_session_lineage_query(query)
-
-        def read_lineage_snapshot(connection: sqlite3.Connection) -> SessionLineageResult:
-            parent_exists = connection.execute(
-                "SELECT 1 FROM cayu_sessions WHERE id = ?",
-                (query.parent_session_id,),
-            ).fetchone()
-            if parent_exists is None:
-                raise KeyError(f"Session not found: {query.parent_session_id}")
-
-            cursor_clause = ""
-            params: list[object] = [
-                SESSION_LINEAGE_MAX_IDENTIFIER_BYTES,
-                SESSION_LINEAGE_MAX_TIMESTAMP_BYTES,
-                query.parent_session_id,
-            ]
-            if query.cursor is not None:
-                cursor_created_at, cursor_id = decode_session_lineage_cursor(
-                    query.cursor,
-                    parent_session_id=query.parent_session_id,
-                )
-                formatted_cursor = sqlite_records.format_datetime(cursor_created_at)
-                cursor_clause = "AND (created_at > ? OR (created_at = ? AND id > ?))"
-                params.extend((formatted_cursor, formatted_cursor, cursor_id))
-            params.append(query.limit + 1)
-            rows = connection.execute(
-                f"""
-                SELECT CASE
-                           WHEN length(CAST(id AS BLOB)) <= ? THEN id
-                       END AS id,
-                       CASE
-                           WHEN length(CAST(created_at AS BLOB)) <= ? THEN created_at
-                       END AS created_at
-                FROM cayu_sessions
-                WHERE parent_session_id = ?
-                  {cursor_clause}
-                ORDER BY created_at ASC, id ASC
-                LIMIT ?
-                """,
-                params,
-            ).fetchall()
-            retained_rows = rows[: query.limit]
-            children: list[SessionLineageNode] = []
-            for row in retained_rows:
-                base = SessionLineageNode(
-                    id=row["id"],
-                    parent_session_id=query.parent_session_id,
-                    created_at=sqlite_records.parse_datetime(row["created_at"]),
-                )
-                origin_rows = connection.execute(
-                    """
-                    SELECT sequence,
-                           CASE
-                               WHEN length(event_id) <= ?
-                                AND length(CAST(event_id AS BLOB)) <= ?
-                               THEN event_id
-                           END AS event_id,
-                           event_type
-                    FROM cayu_events
-                    WHERE session_id = ?
-                      AND event_type IN (?, ?)
-                    ORDER BY sequence ASC
-                    LIMIT ?
-                    """,
-                    (
-                        EVENT_ID_MAX_CHARS,
-                        SESSION_LINEAGE_MAX_EVENT_ID_BYTES,
-                        base.id,
-                        str(EventType.SESSION_STARTED),
-                        str(EventType.SESSION_FORKED),
-                        SESSION_LINEAGE_MAX_ORIGIN_EVENTS,
-                    ),
-                ).fetchall()
-                children.append(
-                    SessionLineageNode(
-                        id=base.id,
-                        parent_session_id=base.parent_session_id,
-                        created_at=base.created_at,
-                        origin_events=tuple(
-                            SessionLineageOrigin(
-                                sequence=origin_row["sequence"],
-                                event_id=origin_row["event_id"],
-                                event_type=EventType(origin_row["event_type"]),
-                            )
-                            for origin_row in origin_rows
-                        ),
-                    )
-                )
-            has_more = len(rows) > len(retained_rows)
-            return SessionLineageResult(
-                parent_session_id=query.parent_session_id,
-                children=tuple(children),
-                next_cursor=(
-                    encode_session_lineage_cursor(query.parent_session_id, children[-1])
-                    if has_more and children
-                    else None
-                ),
-                has_more=has_more,
-            )
-
-        def read_lineage(connection: sqlite3.Connection) -> SessionLineageResult:
-            connection.execute("BEGIN")
-            try:
-                return read_lineage_snapshot(connection)
-            finally:
-                connection.rollback()
-
-        return await self._run_read(read_lineage)
+        return await session_queries.query_session_lineage(self._run_read, query)
 
     async def query_child_session_lifecycle(
         self,
         query: ChildSessionLifecycleQuery,
     ) -> ChildSessionLifecyclePage:
-        query = ChildSessionLifecycleQuery.model_validate(query)
-
-        def read_snapshot(connection: sqlite3.Connection) -> ChildSessionLifecyclePage:
-            parent = _load_session(connection, query.parent_session_id)
-            if parent is None:
-                raise KeyError(f"Session not found: {query.parent_session_id}")
-            rows = connection.execute(
-                "SELECT child_session_id FROM cayu_child_session_lifecycle_candidates "
-                "WHERE parent_session_id = ? "
-                "ORDER BY priority, sort_at, child_session_id "
-                "LIMIT ?",
-                (parent.id, query.max_children_inspected + 1),
-            ).fetchall()
-            retained_rows = rows[: query.max_children_inspected]
-            retained_ids = [str(row["child_session_id"]) for row in retained_rows]
-            entries = []
-            unavailable_count = 0
-            lifecycle_types = (
-                str(EventType.SESSION_STARTED),
-                str(EventType.SESSION_RESUMED),
-                str(EventType.SESSION_FORKED),
-                str(EventType.SESSION_COMPLETED),
-                str(EventType.SESSION_FAILED),
-                str(EventType.SESSION_INTERRUPTED),
-            )
-            children_by_id: dict[str, Session] = {}
-            records_by_child: dict[str, dict[EventType, EventRecord]] = {
-                child_id: {} for child_id in retained_ids
-            }
-            if retained_ids:
-                placeholders = ", ".join("?" for _child_id in retained_ids)
-                child_rows = connection.execute(
-                    "SELECT id, instance_id, agent_name, provider_name, model, "
-                    "parent_session_id, causal_budget_id, runtime_name, runtime_version, "
-                    "environment_name, status, created_at, updated_at, last_activity_at, "
-                    "run_epoch, invocation_json, metadata_json FROM cayu_sessions "
-                    f"WHERE id IN ({placeholders})",
-                    retained_ids,
-                ).fetchall()
-                children_by_id = {
-                    str(child_row["id"]): sqlite_records.session_from_row(
-                        child_row,
-                        labels={},
-                    )
-                    for child_row in child_rows
-                }
-                event_rows = connection.execute(
-                    """
-                    SELECT event.*
-                    FROM cayu_events AS event
-                    JOIN (
-                        SELECT session_id, event_type, MAX(sequence) AS sequence
-                        FROM cayu_events
-                        WHERE session_id IN ("""
-                    + placeholders
-                    + """)
-                          AND event_type IN (?, ?, ?, ?, ?, ?)
-                        GROUP BY session_id, event_type
-                    ) AS latest ON latest.sequence = event.sequence
-                    ORDER BY event.session_id, event.sequence ASC
-                    """,
-                    (*retained_ids, *lifecycle_types),
-                ).fetchall()
-                for event_row in event_rows:
-                    event_record = _event_record_from_row(event_row)
-                    if event_record is None:  # pragma: no cover - row is present
-                        raise RuntimeError("SQLite lifecycle event row disappeared.")
-                    records_by_child[str(event_row["session_id"])][
-                        EventType(event_row["event_type"])
-                    ] = event_record
-
-            consumption_key_by_child: dict[str, str] = {}
-            for child_id in retained_ids:
-                child = children_by_id.get(child_id)
-                if child is None or child.parent_session_id != parent.id:
-                    raise RuntimeError("SQLite child-session lifecycle index is inconsistent.")
-                occurrence_source = _child_session_lifecycle_occurrence(
-                    child,
-                    records_by_child[child_id],
-                )
-                if occurrence_source is not None:
-                    _relationship, occurrence = occurrence_source
-                    consumption_key_by_child[child_id] = child_session_notification_storage_key(
-                        child.instance_id,
-                        occurrence.source_id,
-                    )
-            consumption_by_key: dict[str, dict[str, Any]] = {}
-            if consumption_key_by_child:
-                consumption_keys = tuple(consumption_key_by_child.values())
-                placeholders = ", ".join("?" for _key in consumption_keys)
-                operation_rows = connection.execute(
-                    "SELECT idempotency_key, record_json FROM cayu_session_operations "
-                    f"WHERE session_id = ? AND idempotency_key IN ({placeholders})",
-                    (parent.id, *consumption_keys),
-                ).fetchall()
-                consumption_by_key = {
-                    str(operation_row["idempotency_key"]): json.loads(operation_row["record_json"])
-                    for operation_row in operation_rows
-                }
-
-            for child_id in retained_ids:
-                child = children_by_id[child_id]
-                consumption_key = consumption_key_by_child.get(child_id)
-                entry = _child_session_lifecycle_entry(
-                    parent=parent,
-                    child=child,
-                    records_by_type=records_by_child[child_id],
-                    consumption_record=(
-                        None if consumption_key is None else consumption_by_key.get(consumption_key)
-                    ),
-                )
-                if entry is None:
-                    unavailable_count += 1
-                else:
-                    entries.append(entry)
-            entries.sort(key=_child_session_lifecycle_entry_sort_key)
-            return ChildSessionLifecyclePage(
-                parent_session_id=parent.id,
-                parent_session_instance_id=parent.instance_id,
-                entries=tuple(entries),
-                inspected_child_count=len(retained_rows),
-                unavailable_child_count=unavailable_count,
-                has_more=len(rows) > len(retained_rows),
-            )
-
-        def read(connection: sqlite3.Connection) -> ChildSessionLifecyclePage:
-            connection.execute("BEGIN")
-            try:
-                return read_snapshot(connection)
-            finally:
-                connection.rollback()
-
-        return await self._run_read(read)
+        return await session_queries.query_child_session_lifecycle(self._run_read, query)
 
     async def aggregate_operational_snapshot(
         self,
@@ -15389,7 +14291,7 @@ class SQLiteSessionStore(
         filters = copy_session_aggregate_filter(filters)
         plan = session_store_sql.build_session_query_sql(
             session_query_from_aggregate_filter(filters),
-            dialect=_SQL_DIALECT,
+            dialect=session_queries.SQL_DIALECT,
         )
 
         def query_snapshot(connection: sqlite3.Connection) -> SessionOperationalSnapshot:
@@ -15426,26 +14328,18 @@ class SQLiteSessionStore(
         return await self._run_read(query_snapshot)
 
     async def aggregate_usage(self, query: UsageRollupQuery) -> UsageRollupStoreResult:
-        query = copy_usage_rollup_query(query)
-        plan = session_store_sql.build_session_query_sql(
-            session_query_from_aggregate_filter(query.sessions),
-            dialect=_SQL_DIALECT,
-        )
-
-        def query_aggregate(connection: sqlite3.Connection) -> UsageRollupStoreResult:
-            return sqlite_aggregates.aggregate_session_usage(
-                connection,
-                session_plan=plan,
-                query=query,
-            )
-
-        return await self._run_read(query_aggregate)
+        return await session_queries.aggregate_usage(self._run_read, query)
 
     async def list_sessions_with_pending_interruption_cascade(
         self,
         query: SessionQuery | None = None,
     ) -> SessionListResult:
-        return await self._list_sessions(query, pending_interruption_cascade_only=True)
+        return await session_queries.list_sessions(
+            self._run_read,
+            ownership_clock=self._ownership_clock,
+            query=query,
+            pending_interruption_cascade_only=True,
+        )
 
     async def list_queued_dispatch_terminal_receipts(
         self,
@@ -16358,9 +15252,8 @@ class SQLiteSessionStore(
                             records,
                         )
 
-                labels_by_session_id = self._load_labels_for_sessions_unlocked(
-                    materializable_ids,
-                    connection=connection,
+                labels_by_session_id = sqlite_records.load_session_labels_batch(
+                    connection, materializable_ids
                 )
                 actions = []
                 issues: list[PendingActionIssue] = []
@@ -16472,114 +15365,6 @@ class SQLiteSessionStore(
 
         return await self._run_read(run_query)
 
-    async def _list_sessions(
-        self,
-        query: SessionQuery | None,
-        *,
-        pending_interruption_cascade_only: bool,
-        access_bounds: _SessionAccessBounds | None = None,
-    ) -> SessionListResult:
-        query = copy_session_query(query)
-        session_source_sql = (
-            """
-            (
-                SELECT session_id
-                FROM cayu_checkpoints
-                    INDEXED BY idx_cayu_checkpoints_pending_interruption_cascade
-                WHERE json_type(
-                    state_json,
-                    '$.pending_interruption_cascade'
-                ) IS NOT NULL
-            ) AS pending_interruption_cascades
-            CROSS JOIN cayu_sessions
-                ON cayu_sessions.id = pending_interruption_cascades.session_id
-            """
-            if pending_interruption_cascade_only
-            else "cayu_sessions"
-        )
-
-        def run_query(connection: sqlite3.Connection) -> SessionListResult:
-            inactive_before = (
-                query.last_activity_before
-                if query.inactive_for_seconds is None
-                else utc_duration_cutoff(
-                    self._ownership_clock(),
-                    query.inactive_for_seconds,
-                )
-            )
-            if query.inactive_for_seconds is not None and inactive_before is None:
-                return SessionListResult(
-                    sessions=[],
-                    next_cursor=None,
-                    total_count=0 if query.include_total_count else None,
-                )
-            resolved_query = query.model_copy(
-                update={
-                    "last_activity_before": inactive_before,
-                    "inactive_for_seconds": None,
-                }
-            )
-            plan = session_store_sql.build_session_query_sql(
-                resolved_query,
-                dialect=_SQL_DIALECT,
-                access_clause=(
-                    None
-                    if access_bounds is None
-                    else session_store_sql.session_access_clause(
-                        access_bounds, dialect=_SQL_DIALECT
-                    )
-                ),
-            )
-            total_count: int | None = None
-            if query.include_total_count:
-                total_count = connection.execute(
-                    f"SELECT COUNT(*) FROM {session_source_sql} {plan.filter_where_sql}",
-                    plan.filter_params,
-                ).fetchone()[0]
-            rows = connection.execute(
-                f"""
-                SELECT id, instance_id, agent_name, provider_name, model, parent_session_id,
-                       causal_budget_id, runtime_name, runtime_version, environment_name,
-                       status, created_at, updated_at, last_activity_at, run_epoch,
-                       invocation_json, metadata_json
-                FROM {session_source_sql}
-                {plan.page_where_sql}
-                ORDER BY {plan.order_sql}
-                {plan.pagination_sql}
-                """,
-                plan.page_params,
-            ).fetchall()
-            has_more = len(rows) > query.limit
-            rows = rows[: query.limit]
-            labels_by_session_id = self._load_labels_for_sessions_unlocked(
-                [row["id"] for row in rows],
-                connection=connection,
-            )
-            sessions = [
-                sqlite_records.session_from_row(
-                    row,
-                    labels=labels_by_session_id.get(row["id"], {}),
-                )
-                for row in rows
-            ]
-            next_cursor = session_next_cursor(sessions, has_more, query.order_by)
-            return SessionListResult(
-                sessions=sessions,
-                next_cursor=next_cursor,
-                total_count=total_count,
-            )
-
-        def snapshot(connection):
-            if access_bounds is None:
-                return run_query(connection)
-            connection.execute("BEGIN")
-            try:
-                return run_query(connection)
-            finally:
-                connection.rollback()
-
-        return await self._run_read(snapshot)
-
     async def append_transcript_messages(
         self,
         session_id: str,
@@ -16593,12 +15378,12 @@ class SQLiteSessionStore(
 
         def statement(connection: sqlite3.Connection) -> None:
             if not copied_messages:
-                if not _session_exists(connection, session_id):
+                if not sqlite_records.session_exists(connection, session_id):
                     raise KeyError(f"Session not found: {session_id}")
                 return
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                if not _session_exists(connection, session_id):
+                if not sqlite_records.session_exists(connection, session_id):
                     raise KeyError(f"Session not found: {session_id}")
                 activity_at = self._ownership_clock()
                 for owner in self._closure_lineage_owners_unlocked((session_id,)):
@@ -17707,7 +16492,7 @@ class SQLiteSessionStore(
         session_id = require_clean_nonblank(session_id, "session_id")
 
         def query(connection: sqlite3.Connection) -> list[Message]:
-            if not _session_exists(connection, session_id):
+            if not sqlite_records.session_exists(connection, session_id):
                 raise KeyError(f"Session not found: {session_id}")
             rows = connection.execute(
                 """
@@ -17772,7 +16557,7 @@ class SQLiteSessionStore(
         session_id = require_clean_nonblank(session_id, "session_id")
 
         def query(connection: sqlite3.Connection) -> int:
-            if not _session_exists(connection, session_id):
+            if not sqlite_records.session_exists(connection, session_id):
                 raise KeyError(f"Session not found: {session_id}")
             return _transcript_cursor(connection, session_id)
 
@@ -17789,7 +16574,7 @@ class SQLiteSessionStore(
             raise TypeError("role must be a MessageRole.")
 
         def query_latest(connection: sqlite3.Connection) -> TranscriptRecord | None:
-            if not _session_exists(connection, session_id):
+            if not sqlite_records.session_exists(connection, session_id):
                 raise KeyError(f"Session not found: {session_id}")
             row = connection.execute(
                 "SELECT session_order - 1 AS transcript_index, interaction_id, message_json "
@@ -18002,7 +16787,7 @@ class SQLiteSessionStore(
         filter_clause = " AND " + " AND ".join(filters) if filters else ""
 
         def run_query(connection: sqlite3.Connection) -> TranscriptPage:
-            if not _session_exists(connection, query.session_id):
+            if not sqlite_records.session_exists(connection, query.session_id):
                 raise KeyError(f"Session not found: {query.session_id}")
 
             total_row = connection.execute(
@@ -18201,7 +16986,7 @@ class SQLiteSessionStore(
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 updated_at = self._ownership_clock()
-                if not _session_exists(connection, session_id):
+                if not sqlite_records.session_exists(connection, session_id):
                     raise KeyError(f"Session not found: {session_id}")
                 for owner in self._closure_lineage_owners_unlocked((session_id,)):
                     _check_closure_lineage_owner(owner, (session_id,))
@@ -18435,39 +17220,13 @@ class SQLiteSessionStore(
             )
 
     def _load_unlocked(self, session_id: str) -> Session | None:
-        return _load_session(self._connection, session_id)
+        return sqlite_records.load_session(self._connection, session_id)
 
     def _load_labels_unlocked(self, session_id: str) -> dict[str, str]:
-        return _load_labels(self._connection, session_id)
-
-    def _load_labels_for_sessions_unlocked(
-        self,
-        session_ids: list[str],
-        *,
-        connection: sqlite3.Connection | None = None,
-    ) -> dict[str, dict[str, str]]:
-        if not session_ids:
-            return {}
-        source = self._connection if connection is None else connection
-        placeholders = ", ".join("?" for _ in session_ids)
-        rows = source.execute(
-            f"""
-            SELECT session_id, key, value
-            FROM cayu_session_labels
-            WHERE session_id IN ({placeholders})
-            ORDER BY session_id ASC, key ASC
-            """,
-            session_ids,
-        ).fetchall()
-        labels_by_session_id: dict[str, dict[str, str]] = {
-            session_id: {} for session_id in session_ids
-        }
-        for row in rows:
-            labels_by_session_id[row["session_id"]][row["key"]] = row["value"]
-        return labels_by_session_id
+        return sqlite_records.load_session_labels(self._connection, session_id)
 
     def _session_exists_unlocked(self, session_id: str) -> bool:
-        return _session_exists(self._connection, session_id)
+        return sqlite_records.session_exists(self._connection, session_id)
 
     def _first_existing_event_id_unlocked(
         self,

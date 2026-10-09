@@ -492,8 +492,8 @@ def test_cost_group_lookup_uses_index_and_keeps_full_attempt_identity(backend, t
     from cayu.sessions.base import RunRequest, SessionIdentity
     from cayu.storage import PostgresSessionStore, SQLiteSessionStore
     from cayu.storage import _session_store_sql as sql
+    from cayu.storage import _sqlite_session_queries as sqlite_queries
     from cayu.storage import postgres as postgres_module
-    from cayu.storage import sqlite as sqlite_module
     from cayu.storage._cost_accounting_sql import cost_group_lookup_statement
     from cayu.storage.migrations import SchemaMode
 
@@ -527,7 +527,7 @@ def test_cost_group_lookup_uses_index_and_keeps_full_attempt_identity(backend, t
             )
             await store.append_events(session_id, events)
             dialect = (
-                sqlite_module._SQL_DIALECT if backend == "sqlite" else postgres_module._SQL_DIALECT
+                sqlite_queries.SQL_DIALECT if backend == "sqlite" else postgres_module._SQL_DIALECT
             )
             plan = sql.build_accounting_event_query_sql(
                 cost_accounting_query(EventQuery(session_id=session_id)), dialect=dialect

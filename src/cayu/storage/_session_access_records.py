@@ -77,9 +77,14 @@ def _sql(kind, *, postgres):
     if kind == "events":
         if postgres:
             return "cayu_events", "event", "sequence", "event"
-        from cayu.storage.sqlite import _EVENT_COLUMN_NAMES
+        from cayu.storage import _sqlite_records as sqlite_records
 
-        return "cayu_events", ", ".join(_EVENT_COLUMN_NAMES), "sequence", "payload_json"
+        return (
+            "cayu_events",
+            ", ".join(sqlite_records.EVENT_COLUMN_NAMES),
+            "sequence",
+            "payload_json",
+        )
     if kind == "transcript":
         return (
             "cayu_transcript_messages",
@@ -98,7 +103,7 @@ def _sql(kind, *, postgres):
 async def sqlite_read(
     store, bounds: _SessionAccessBounds, session_id, kind, offset, limit, max_bytes
 ):
-    from cayu.storage.sqlite import _event_from_row, _load_session
+    from cayu.storage import _sqlite_records as sqlite_records
 
     session_id = validate_page(session_id, kind, offset, limit, max_bytes)
     table, columns, order, payload = _sql(kind, postgres=False)
@@ -107,7 +112,7 @@ async def sqlite_read(
     def read(connection):
         connection.execute("BEGIN")
         try:
-            session = bounds.require_read(_load_session(connection, session_id))
+            session = bounds.require_read(sqlite_records.load_session(connection, session_id))
             if kind == "checkpoint":
                 bounds.require_action(session, "inspect_state")
             sizes = connection.execute(
@@ -121,7 +126,7 @@ async def sqlite_read(
                 (session_id, limit + 1, offset),
             ).fetchall()
             records = [
-                _event_from_row(row).model_dump(mode="json")
+                sqlite_records.event_from_row(row).model_dump(mode="json")
                 if kind == "events"
                 else json.loads(row[0])
                 for row in rows
@@ -163,11 +168,11 @@ def sqlite_owner_read(connection, bounds, session_id, operation, *, action="read
     """Keep native projections and their owner classification in one snapshot."""
     if bounds is None:
         return operation(connection)
-    from cayu.storage.sqlite import _load_session
+    from cayu.storage import _sqlite_records as sqlite_records
 
     connection.execute("BEGIN")
     try:
-        bounds.require_action(_load_session(connection, session_id), action)
+        bounds.require_action(sqlite_records.load_session(connection, session_id), action)
         return operation(connection)
     finally:
         connection.rollback()

@@ -64,7 +64,7 @@ async def sqlite_terminalize(
     store: SQLiteSessionStore, request: ZeroWorkInterruptionRequest
 ) -> ZeroWorkInterruptionPublication | None:
     from cayu.storage import _sqlite_records as sqlite_records
-    from cayu.storage.sqlite import _append_events_in_transaction, _event_from_row
+    from cayu.storage.sqlite import _append_events_in_transaction
 
     sid = request.session.id
 
@@ -89,7 +89,7 @@ async def sqlite_terminalize(
                 session=session,
                 checkpoint=store._load_checkpoint_unlocked(sid),
                 events=[
-                    _event_from_row(r)
+                    sqlite_records.event_from_row(r)
                     for r in conn.execute(
                         "SELECT * FROM cayu_events WHERE session_id = ? ORDER BY sequence LIMIT ?",
                         (sid, MAX_EVIDENCE_ITEMS + 1),

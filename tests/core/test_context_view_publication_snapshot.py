@@ -194,14 +194,14 @@ def test_publication_uses_one_historical_boundary(
                 read_entered = threading.Event()
                 continuation = value
                 if backend == "sqlite":
-                    import cayu.storage.sqlite as sqlite_module
+                    import cayu.storage._sqlite_records as sqlite_module
 
                     extra_sessions = SQLiteSessionStore(tmp_path / "snapshot.sqlite")
                     continuation = app(collaboration, reg, session_store=extra_sessions)
                     continuation.register_provider(provider, default=True)
                     continuation.register_agent(AgentSpec(name="reviewer", model="model"))
                     await continuation.initialize_collaboration()
-                    original_load = sqlite_module._load_session
+                    original_load = sqlite_module.load_session
                     armed = True
 
                     def load(connection, session_id):
@@ -213,7 +213,7 @@ def test_publication_uses_one_historical_boundary(
                             assert release_read.wait(30)
                         return result
 
-                    monkeypatch.setattr(sqlite_module, "_load_session", load)
+                    monkeypatch.setattr(sqlite_module, "load_session", load)
                 elif backend == "postgres":
                     original_load = sessions._load
 

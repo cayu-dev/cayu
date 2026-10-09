@@ -9,7 +9,7 @@ from tests._session_provenance import fixture_session_invocation
 from tests.core.postgres_contention_support import drop_cayu_tables
 
 import cayu.sessions.terminal_evidence as terminal_evidence_module
-import cayu.storage.sqlite as sqlite_store_module
+import cayu.storage._sqlite_records as sqlite_records
 from cayu import (
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_RECORD_BYTES,
@@ -1639,14 +1639,14 @@ def test_sqlite_terminal_evidence_rejects_an_oversized_terminal_before_hydration
                 terminal_payload={"diagnostic": "x" * 2048},
             )
             hydrated_rows = 0
-            original = sqlite_store_module._event_from_row
+            original = sqlite_records.event_from_row
 
             def spy(row):
                 nonlocal hydrated_rows
                 hydrated_rows += 1
                 return original(row)
 
-            monkeypatch.setattr(sqlite_store_module, "_event_from_row", spy)
+            monkeypatch.setattr(sqlite_records, "event_from_row", spy)
             with pytest.raises(TerminalSessionEvidenceError) as captured:
                 await store.load_terminal_session_evidence(
                     session_id,
@@ -1675,14 +1675,14 @@ def test_sqlite_runner_interrupted_evidence_rejects_oversized_data_before_hydrat
                 terminal_payload={"diagnostic": "x" * 2048},
             )
             hydrated_rows = 0
-            original = sqlite_store_module._event_from_row
+            original = sqlite_records.event_from_row
 
             def spy(row):
                 nonlocal hydrated_rows
                 hydrated_rows += 1
                 return original(row)
 
-            monkeypatch.setattr(sqlite_store_module, "_event_from_row", spy)
+            monkeypatch.setattr(sqlite_records, "event_from_row", spy)
             with pytest.raises(TerminalSessionEvidenceError) as captured:
                 await store.load_runner_owned_interrupted_evidence(
                     session_id,

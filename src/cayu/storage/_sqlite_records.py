@@ -1,4 +1,4 @@
-"""SQLite record representations shared by stores and schema migrations."""
+"""SQLite record codecs and cursor-bound row readers shared by native operations."""
 
 from __future__ import annotations
 
@@ -9,9 +9,11 @@ from typing import Any
 from uuid import uuid4
 
 from cayu._validation import copy_durable_json_object, copy_label_map
+from cayu.events import Event
 from cayu.sessions.base import (
     RunRequest,
     SessionIdentity,
+    restore_persisted_event_authority,
     session_instance_id_for_run_request,
     session_invocation_for_run_request,
     session_metadata_for_creation,
@@ -20,6 +22,7 @@ from cayu.sessions.invocation import SessionInvocation, TaskInvocation
 from cayu.sessions.queries import SessionOrder
 from cayu.sessions.records import (
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
+    EventRecord,
     PendingActionSession,
     Session,
     SessionStatus,
@@ -430,3 +433,126 @@ def task_order_sql(order_by: TaskOrder) -> str:
     if order_by == TaskOrder.UPDATED_AT_ASC:
         return "updated_at ASC"
     return "updated_at DESC"
+
+
+def load_session(connection: sqlite3.Connection, session_id: str) -> Session | None:
+    row = connection.execute(
+        """
+        SELECT id, instance_id, agent_name, provider_name, model, parent_session_id,
+               causal_budget_id, runtime_name, runtime_version, environment_name,
+               status, created_at, updated_at, last_activity_at, run_epoch,
+               invocation_json, metadata_json
+        FROM cayu_sessions
+        WHERE id = ?
+        """,
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return session_from_row(
+        row,
+        labels=load_session_labels(connection, session_id),
+    )
+
+
+def load_session_labels(connection: sqlite3.Connection, session_id: str) -> dict[str, str]:
+    rows = connection.execute(
+        """
+        SELECT key, value
+        FROM cayu_session_labels
+        WHERE session_id = ?
+        ORDER BY key ASC
+        """,
+        (session_id,),
+    ).fetchall()
+    return {row["key"]: row["value"] for row in rows}
+
+
+def session_exists(connection: sqlite3.Connection, session_id: str) -> bool:
+    row = connection.execute(
+        "SELECT 1 FROM cayu_sessions WHERE id = ?",
+        (session_id,),
+    ).fetchone()
+    return row is not None
+
+
+# Columns needed to reconstruct an Event, in a stable order. The formerly-stored
+# event_json blob duplicated exactly these (plus payload_json), so the store now
+# rebuilds Events from the individual columns instead of parsing a redundant copy.
+EVENT_COLUMN_NAMES: tuple[str, ...] = (
+    "session_id",
+    "event_id",
+    "interaction_id",
+    "event_type",
+    "timestamp",
+    "agent_name",
+    "environment_name",
+    "workflow_name",
+    "tool_name",
+    "payload_json",
+    "input_contract_runtime_owned",
+    "file_attachment_attestations_runtime_owned",
+)
+
+
+def event_from_row(row: sqlite3.Row) -> Event:
+    """Validate an owned Event without adding cache-copy work to history scans."""
+    input_contract_runtime_owned = row["input_contract_runtime_owned"]
+    if type(input_contract_runtime_owned) is not int or input_contract_runtime_owned not in {
+        0,
+        1,
+    }:
+        raise ValueError("Stored input-contract authority proof is malformed.")
+    file_attachment_attestations_runtime_owned = row["file_attachment_attestations_runtime_owned"]
+    if type(
+        file_attachment_attestations_runtime_owned
+    ) is not int or file_attachment_attestations_runtime_owned not in {0, 1}:
+        raise ValueError("Stored file-attachment attestation proof is malformed.")
+    return restore_persisted_event_authority(
+        Event(
+            type=row["event_type"],
+            session_id=row["session_id"],
+            interaction_id=row["interaction_id"],
+            id=row["event_id"],
+            timestamp=row["timestamp"],
+            agent_name=row["agent_name"],
+            environment_name=row["environment_name"],
+            workflow_name=row["workflow_name"],
+            tool_name=row["tool_name"],
+            payload=json.loads(row["payload_json"]),
+        ),
+        input_contract_runtime_owned=input_contract_runtime_owned == 1,
+        file_attachment_attestations_runtime_owned=(
+            file_attachment_attestations_runtime_owned == 1
+        ),
+    )
+
+
+def event_record_from_row(row: sqlite3.Row | None) -> EventRecord | None:
+    if row is None:
+        return None
+    return EventRecord(
+        sequence=row["sequence"],
+        event=event_from_row(row),
+    )
+
+
+def load_session_labels_batch(
+    connection: sqlite3.Connection, session_ids: list[str]
+) -> dict[str, dict[str, str]]:
+    if not session_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in session_ids)
+    rows = connection.execute(
+        f"""
+        SELECT session_id, key, value
+        FROM cayu_session_labels
+        WHERE session_id IN ({placeholders})
+        ORDER BY session_id ASC, key ASC
+        """,
+        session_ids,
+    ).fetchall()
+    labels_by_session_id: dict[str, dict[str, str]] = {session_id: {} for session_id in session_ids}
+    for row in rows:
+        labels_by_session_id[row["session_id"]][row["key"]] = row["value"]
+    return labels_by_session_id

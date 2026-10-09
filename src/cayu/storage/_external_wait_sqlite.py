@@ -88,7 +88,8 @@ class SQLiteExternalWaitMixin:
                     and command.execution_intent.mode == "resume"
                 ):
                     from cayu.runtime._external_wait_admission import require_resume_preparation
-                    from cayu.storage.sqlite import _load_checkpoint_state, _load_session
+                    from cayu.storage import _sqlite_records as sqlite_records
+                    from cayu.storage.sqlite import _load_checkpoint_state
 
                     session_id = command.execution_intent.session_id
                     if (
@@ -101,7 +102,7 @@ class SQLiteExternalWaitMixin:
                         raise PermissionError(
                             "External waits do not support participant-owned sessions."
                         )
-                    session = _load_session(self._connection, session_id)
+                    session = sqlite_records.load_session(self._connection, session_id)
                     require_resume_preparation(
                         command,
                         current,
@@ -112,12 +113,15 @@ class SQLiteExternalWaitMixin:
                         self._require_external_wait_admission_unlocked(session)
                 if command.kind == "exclude_execution":
                     from cayu.runtime._external_wait_creation import require_execution_exclusion
-                    from cayu.storage.sqlite import _load_checkpoint_state, _load_session
+                    from cayu.storage import _sqlite_records as sqlite_records
+                    from cayu.storage.sqlite import _load_checkpoint_state
 
                     session = (
                         None
                         if current is None or current.execution is None
-                        else _load_session(self._connection, current.execution.intent.session_id)
+                        else sqlite_records.load_session(
+                            self._connection, current.execution.intent.session_id
+                        )
                     )
                     require_execution_exclusion(
                         command,
@@ -133,7 +137,8 @@ class SQLiteExternalWaitMixin:
                         require_binding_writer,
                     )
                     from cayu.sessions._session_continuation import continuation_operation_key
-                    from cayu.storage.sqlite import _load_checkpoint_state, _load_session
+                    from cayu.storage import _sqlite_records as sqlite_records
+                    from cayu.storage.sqlite import _load_checkpoint_state
 
                     require_binding_scope(command)
                     if current is None or current.continuation is None:
@@ -155,7 +160,7 @@ class SQLiteExternalWaitMixin:
                         ).fetchone()
                         require_binding_writer(
                             command,
-                            _load_session(self._connection, session_id),
+                            sqlite_records.load_session(self._connection, session_id),
                             _load_checkpoint_state(self._connection, session_id),
                             None if native is None else native[0],
                             execution=None if current is None else current.execution,

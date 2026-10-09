@@ -325,7 +325,7 @@ def test_exact_aggregate_and_root_bounds(tmp_path):
 def test_root_read_cancellation_retains_admission_until_worker_settles(tmp_path, monkeypatch):
     import threading
 
-    import cayu.storage.sqlite as sqlite_adapter
+    import cayu.storage._sqlite_records as sqlite_records
 
     async def exercise():
         store = SQLiteSessionStore(tmp_path / "source.sqlite3")
@@ -334,14 +334,14 @@ def test_root_read_cancellation_retains_admission_until_worker_settles(tmp_path,
         try:
             _, target, _, source, messages, output = await _setup(store)
             admission = IncrementalEvidenceAdmission()
-            original_load = sqlite_adapter._load_session
+            original_load = sqlite_records.load_session
 
             def blocked(connection, session_id):
                 entered.set()
                 assert released.wait(5)
                 return original_load(connection, session_id)
 
-            monkeypatch.setattr(sqlite_adapter, "_load_session", blocked)
+            monkeypatch.setattr(sqlite_records, "load_session", blocked)
             task = asyncio.create_task(
                 capture_incremental_workflow_eval_attempt(
                     target,

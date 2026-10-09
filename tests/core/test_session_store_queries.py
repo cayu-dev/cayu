@@ -2123,7 +2123,7 @@ def test_event_query_event_types_validation() -> None:
 
 
 def test_sqlite_session_store_batches_large_event_session_id_queries(tmp_path, monkeypatch):
-    import cayu.storage.sqlite as sqlite_module
+    import cayu.storage._sqlite_session_queries as sqlite_module
 
     monkeypatch.setattr(sqlite_module, "_EVENT_QUERY_SESSION_IDS_BATCH_SIZE", 2)
     store = SQLiteSessionStore(tmp_path / "sessions.sqlite")

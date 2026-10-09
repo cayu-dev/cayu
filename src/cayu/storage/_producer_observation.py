@@ -35,14 +35,15 @@ async def memory_observation(store, command, *, kind=None, attachment_only=False
 async def sqlite_observation(store, command, *, kind=None, attachment_only=False):
     if kind == "published":
         return await published_progress(store, command)
-    from cayu.storage.sqlite import _load_checkpoint_state, _load_session
+    from cayu.storage import _sqlite_records as sqlite_records
+    from cayu.storage.sqlite import _load_checkpoint_state
 
     command, sid, key = release_read_target(command)
 
     def query(connection):
         with connection:
             connection.execute("BEGIN")
-            session = _load_session(connection, sid)
+            session = sqlite_records.load_session(connection, sid)
             checkpoint = _load_checkpoint_state(connection, sid)
             row = connection.execute(
                 "SELECT record_json FROM cayu_session_operations "
