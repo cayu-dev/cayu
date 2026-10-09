@@ -231,11 +231,6 @@ from cayu.sessions.base import (
     SessionStateSnapshot,
     SessionStatusConflict,
     SessionStore,
-    SessionTopologyCycle,
-    SessionTopologyDepthExceeded,
-    SessionTopologyNode,
-    SessionTopologyQuery,
-    SessionTopologyStoreResult,
     StoreTimeCheckpointTransform,
     StoreTimeSessionOperationTransform,
     TranscriptSnapshot,
@@ -397,7 +392,6 @@ from cayu.sessions.base import (
     _validate_tool_round_publication,
     _validate_user_input_checkpoint_mutation,
     apply_fork_system_prompt_replacement,
-    build_session_topology_result,
     checkpoint_root_field_projection_from_storage,
     copy_enqueue_session_message_request,
     copy_run_request,
@@ -407,7 +401,6 @@ from cayu.sessions.base import (
     copy_session_user_metadata,
     copy_transcript_messages,
     decode_session_lineage_cursor,
-    decode_session_topology_cursor,
     deferred_interaction_input_for_run_request,
     deferred_interaction_input_from_storage_payload,
     deferred_interaction_input_storage_payload,
@@ -481,6 +474,15 @@ from cayu.sessions.terminal_evidence import (
     _copy_terminal_session_evidence_limits,
     _terminal_session_evidence_expected_event_type,
     _validate_runner_observed_event_identity_snapshot,
+)
+from cayu.sessions.topology import (
+    SessionTopologyCycle,
+    SessionTopologyDepthExceeded,
+    SessionTopologyNode,
+    SessionTopologyQuery,
+    SessionTopologyStoreResult,
+    build_session_topology_result,
+    decode_session_topology_cursor,
 )
 from cayu.sessions.transcript_queries import (
     TranscriptPage,

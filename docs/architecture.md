@@ -507,6 +507,10 @@ records without importing stores or approval-resolution machinery. The existing
 `sessions/pending_actions.py` classifier derives actions from checkpoint and event
 evidence; native stores retain candidate reads, authorization and transactions.
 
+`sessions/topology.py` owns bounded ancestry and child-branch contracts, parent-bound
+cursors, cycle checks and response-node allocation. Stores supply bounded records;
+the shared builder preserves branch order and continuation without reading stores.
+
 ### Session summaries
 
 `sessions/summaries.py` owns stored-session outcome, event-summary and operational

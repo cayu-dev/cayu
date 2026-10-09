@@ -14,13 +14,17 @@ from cayu import SQLiteSessionStore
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.sessions.base import (
-    SESSION_TOPOLOGY_MAX_NODES,
     InMemorySessionStore,
     RunRequest,
     SessionIdentity,
     SessionLineageNode,
     SessionLineageResult,
     SessionStore,
+)
+from cayu.sessions.event_queries import EventQuery, EventQueryResultTooLarge
+from cayu.sessions.records import SessionStatus
+from cayu.sessions.topology import (
+    SESSION_TOPOLOGY_MAX_NODES,
     SessionTopologyBranch,
     SessionTopologyCycle,
     SessionTopologyNode,
@@ -29,8 +33,6 @@ from cayu.sessions.base import (
     build_session_topology_result,
     decode_session_topology_cursor,
 )
-from cayu.sessions.event_queries import EventQuery, EventQueryResultTooLarge
-from cayu.sessions.records import SessionStatus
 
 
 def test_session_lineage_page_requires_portable_identifier_order() -> None:

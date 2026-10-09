@@ -3993,12 +3993,6 @@ from cayu.sessions.base import SessionQueuedMessagesPending as SessionQueuedMess
 from cayu.sessions.base import SessionStateSnapshot as SessionStateSnapshot
 from cayu.sessions.base import SessionStatusConflict as SessionStatusConflict
 from cayu.sessions.base import SessionStore as SessionStore
-from cayu.sessions.base import SessionTopologyBranch as SessionTopologyBranch
-from cayu.sessions.base import SessionTopologyCycle as SessionTopologyCycle
-from cayu.sessions.base import SessionTopologyDepthExceeded as SessionTopologyDepthExceeded
-from cayu.sessions.base import SessionTopologyNode as SessionTopologyNode
-from cayu.sessions.base import SessionTopologyQuery as SessionTopologyQuery
-from cayu.sessions.base import SessionTopologyStoreResult as SessionTopologyStoreResult
 from cayu.sessions.base import TranscriptSnapshot as TranscriptSnapshot
 from cayu.sessions.base import (
     checkpoint_root_field_projection_from_storage as checkpoint_root_field_projection_from_storage,
@@ -4263,6 +4257,12 @@ from cayu.sessions.terminal_evidence import (
 from cayu.sessions.terminal_evidence import (
     TerminalSessionEvidenceLimits as TerminalSessionEvidenceLimits,
 )
+from cayu.sessions.topology import SessionTopologyBranch as SessionTopologyBranch
+from cayu.sessions.topology import SessionTopologyCycle as SessionTopologyCycle
+from cayu.sessions.topology import SessionTopologyDepthExceeded as SessionTopologyDepthExceeded
+from cayu.sessions.topology import SessionTopologyNode as SessionTopologyNode
+from cayu.sessions.topology import SessionTopologyQuery as SessionTopologyQuery
+from cayu.sessions.topology import SessionTopologyStoreResult as SessionTopologyStoreResult
 from cayu.sessions.transcript_queries import TranscriptPage as TranscriptPage
 from cayu.sessions.transcript_queries import TranscriptQuery as TranscriptQuery
 from cayu.sessions.transcript_queries import TranscriptSearchHit as TranscriptSearchHit

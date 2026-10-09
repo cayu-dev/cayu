@@ -116,3 +116,61 @@ for value in (public.PendingActionQuery(session_id="session"), action, delegated
 """,
         public_module,
     )
+
+
+def test_session_topology_public_imports_and_historical_pickle_globals():
+    _assert_public_identity(
+        "cayu.sessions.topology",
+        (
+            "SessionTopologyNode",
+            "SessionTopologyQuery",
+            "SessionTopologyBranch",
+            "SessionTopologyStoreResult",
+            "SessionTopologyCycle",
+            "SessionTopologyDepthExceeded",
+        ),
+    )
+
+
+@pytest.mark.parametrize("public_module", ("cayu", "cayu.sessions", "cayu.runtime"))
+def test_session_topology_pages_and_cursors_without_stores(public_module):
+    _assert_store_independent(
+        """
+from datetime import UTC, datetime
+from cayu.sessions.topology import build_session_topology_result, decode_session_topology_cursor
+
+stamp = datetime(2026, 1, 1, tzinfo=UTC)
+def node(id, parent=None):
+    return public.SessionTopologyNode(id=id, parent_session_id=parent, agent_name="agent",
+        provider_name="provider", model="model", causal_budget_id="root", runtime_name="cayu",
+        runtime_version=None, environment_name=None, status="completed", created_at=stamp,
+        updated_at=stamp, last_activity_at=stamp)
+root = node("root")
+children = (node("a", "root"), node("b", "root"))
+def bounded_candidates():
+    yield from children
+    raise AssertionError("Topology consumed beyond its page lookahead")
+result = build_session_topology_result(focus=root, ancestors=(), expanded_parents=(root,),
+    branch_candidates=(bounded_candidates(),), child_limit=1)
+branch, = result.branches
+assert branch.children == children[:1] and branch.has_more
+assert decode_session_topology_cursor(branch.next_cursor, parent_session_id="root") == (stamp, "a")
+try:
+    decode_session_topology_cursor(branch.next_cursor, parent_session_id="other")
+except ValueError as exc:
+    assert str(exc) == "Invalid session topology cursor."
+else:
+    raise AssertionError("Cross-parent topology cursor accepted")
+for value in (public.SessionTopologyQuery(focus_session_id="root"), root, result):
+    assert pickle.loads(pickle.dumps(value)) == value
+    assert get_type_hints(type(value)) and type(value).model_json_schema()
+try:
+    build_session_topology_result(focus=node("a", "b"), ancestors=(),
+        expanded_parents=(node("b", "a"),), branch_candidates=((),), child_limit=1)
+except public.SessionTopologyCycle:
+    pass
+else:
+    raise AssertionError("Loaded topology cycle accepted")
+""",
+        public_module,
+    )

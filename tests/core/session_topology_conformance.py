@@ -11,10 +11,9 @@ from cayu.sessions.base import (
     SessionIdentity,
     SessionLineageQuery,
     SessionStore,
-    SessionTopologyQuery,
     decode_session_lineage_cursor,
-    decode_session_topology_cursor,
 )
+from cayu.sessions.topology import SessionTopologyQuery, decode_session_topology_cursor
 
 
 def _identity() -> SessionIdentity:

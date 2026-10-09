@@ -315,13 +315,7 @@ from cayu.sessions.base import (
     SessionMessageDeliveryMode,
     SessionMessageInspection,
     SessionStore,
-    SessionTopologyCycle,
-    SessionTopologyDepthExceeded,
-    SessionTopologyNode,
-    SessionTopologyQuery,
-    SessionTopologyStoreResult,
     _with_runtime_resume_transport_metadata,
-    decode_session_topology_cursor,
     run_request_with_runtime_generated_authority,
     run_request_with_runtime_invocation,
 )
@@ -361,6 +355,14 @@ from cayu.sessions.records import (
 )
 from cayu.sessions.recovery import StartupRecoveryResult
 from cayu.sessions.summaries import SessionOutcome
+from cayu.sessions.topology import (
+    SessionTopologyCycle,
+    SessionTopologyDepthExceeded,
+    SessionTopologyNode,
+    SessionTopologyQuery,
+    SessionTopologyStoreResult,
+    decode_session_topology_cursor,
+)
 from cayu.sessions.transcript_queries import TranscriptQuery
 from cayu.sessions.usage import UsageRollupQuery
 from cayu.storage.knowledge_review import KnowledgeReviewWorkflow

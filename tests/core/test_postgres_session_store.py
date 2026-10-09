@@ -80,8 +80,6 @@ from cayu.sessions.base import (
     SessionLineageQuery,
     SessionOperationPublication,
     SessionRunFenced,
-    SessionTopologyCycle,
-    SessionTopologyQuery,
     _McpManifestBaselineEvidenceInvalid,
     fork_session_invocation,
 )
@@ -94,6 +92,7 @@ from cayu.sessions.invocation import (
 from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.queries import SessionDebugState, SessionOrder, SessionQuery
 from cayu.sessions.records import PendingActionKind, Session, SessionStatus
+from cayu.sessions.topology import SessionTopologyCycle, SessionTopologyQuery
 from cayu.sessions.transcript_queries import TranscriptQuery
 from cayu.support_bundles import (
     CollectorDisposition,
