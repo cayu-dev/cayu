@@ -1646,3 +1646,15 @@ def _runtime_resume_transport_metadata(request: ResumeRequest) -> dict[str, str]
     ):
         return {}
     return dict(authority.values)
+
+
+def _fork_initial_invocation_request_sha256(request: ResumeRequest) -> str:
+    """Hash one exact, already-prepared first invocation for a session fork."""
+
+    copied = copy_resume_request(request)
+    return sha256(
+        canonical_durable_json_bytes(
+            copied.model_dump(mode="json", warnings=False),
+            "fork_initial_invocation",
+        )
+    ).hexdigest()

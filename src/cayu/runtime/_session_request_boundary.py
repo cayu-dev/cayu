@@ -29,7 +29,6 @@ from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
 )
 from cayu.sessions._model_failover import MODEL_TARGET_PROJECTION_METADATA_KEY, ModelFailoverPolicy
-from cayu.sessions.base import effective_fork_source_execution_profile
 from cayu.sessions.creation_claims import (
     apply_runtime_session_create_claim,
     strip_runtime_session_create_claim_before_redaction,
@@ -39,6 +38,7 @@ from cayu.sessions.forks import (
     FORK_SOURCE_SNAPSHOT_METADATA_KEY,
     PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
     ForkExecutionProfileSource,
+    effective_fork_source_execution_profile,
 )
 from cayu.sessions.messaging import (
     EnqueueSessionMessageRequest,

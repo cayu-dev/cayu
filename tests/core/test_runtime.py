@@ -285,7 +285,6 @@ from cayu.sessions.base import (
     SessionStore,
     _checkpoint_with_session_run_operation,
     _reserve_completion_result_event_publication,
-    fork_session_invocation,
 )
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
@@ -301,6 +300,7 @@ from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.forks import (
     ForkExecutionProfileSelection,
     ForkSystemPromptPolicy,
+    fork_session_invocation,
     session_prompt_anatomy_transition,
 )
 from cayu.sessions.invocation import InvocationOriginTrust, SessionExecutionSource

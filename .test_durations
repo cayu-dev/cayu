@@ -46123,5 +46123,12 @@
     "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[_execution_profile_rules-execution_profile_adoption_request_fingerprint]": 0.00042812502942979336,
     "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[_execution_profile_rules-session_model_projection_cursor]": 0.0006503749755211174,
     "tests/core/test_session_creation_rules_layout.py::test_profile_admission_and_projection_without_implementations": 2.50490054290276,
-    "tests/core/test_session_creation_rules_layout.py::test_profile_adoption_fingerprint_preserves_semantic_authority": 2.925074875005521
+    "tests/core/test_session_creation_rules_layout.py::test_profile_adoption_fingerprint_preserves_semantic_authority": 2.925074875005521,
+    "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[forks-SessionForkActiveModelStageConflict]": 0.0007521259831264615,
+    "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[forks-SessionForkSourceNotFound]": 0.0006835000240243971,
+    "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[forks-effective_fork_source_execution_profile]": 0.0002899589599110186,
+    "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[forks-fork_session_invocation]": 0.0003287490108050406,
+    "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[forks-validate_profiled_fork_evidence]": 0.000335542019456625,
+    "tests/core/test_session_creation_rules_layout.py::test_fork_profile_and_model_selection_without_execution": 0.5996532079880126,
+    "tests/core/test_session_creation_rules_layout.py::test_fork_source_validation_without_implementations": 0.7179176660720259
 }

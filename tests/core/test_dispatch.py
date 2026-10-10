@@ -72,14 +72,13 @@ from cayu.sessions.base import (
     QueuedDispatchTerminalReceipt,
     SessionRunFenced,
     _checkpoint_with_session_run_operation,
-    _fork_initial_invocation_request_sha256,
-    validate_profiled_fork_evidence,
 )
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.forks import (
     ForkSourceSnapshot,
     fork_source_state_sha256,
     session_fork_profile_relationship,
+    validate_profiled_fork_evidence,
 )
 from cayu.sessions.invocation import (
     InvocationOrigin,
@@ -91,7 +90,12 @@ from cayu.sessions.invocation import (
 )
 from cayu.sessions.records import Session, SessionIdentity, SessionStatus, SessionStatusConflict
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction
-from cayu.sessions.requests import ForkSessionRequest, ResumeRequest, RunRequest
+from cayu.sessions.requests import (
+    ForkSessionRequest,
+    ResumeRequest,
+    RunRequest,
+    _fork_initial_invocation_request_sha256,
+)
 from cayu.sessions.transcript_input import session_input_messages_sha256
 from cayu.sessions.transcript_queries import fork_source_transcript_sha256
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore

@@ -33,10 +33,11 @@ from cayu.runtime._session_request_boundary import (
 )
 from cayu.runtime.execution_profiles import ExecutionProfileAdoptionIntent
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.sessions.base import InMemorySessionStore, ModelTarget, fork_session_invocation
+from cayu.sessions.base import InMemorySessionStore, ModelTarget
 from cayu.sessions.forks import (
     ForkExecutionProfileSelection,
     ForkSourceSnapshot,
+    fork_session_invocation,
 )
 from cayu.sessions.invocation import InvocationOriginClaim
 from cayu.sessions.queries import SessionQuery

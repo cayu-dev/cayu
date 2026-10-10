@@ -389,10 +389,7 @@ from cayu.runtime._model_errors import (
     detach_billing_identity_cancellation,
     detach_billing_identity_cancellation_group,
 )
-from cayu.runtime._model_execution_selection import (
-    ModelExecutionSelection,
-    model_failover_progress_for_session,
-)
+from cayu.runtime._model_execution_selection import ModelExecutionSelection
 from cayu.runtime._model_step_executor import (
     ModelStepExecutor,
     ModelStepFlowOutcome,
@@ -534,6 +531,7 @@ from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_matches_session_epoch,
     execution_profile_from_session_metadata,
     execution_profile_session_metadata,
+    model_failover_progress_for_session,
 )
 from cayu.sessions._execution_profile_rules import (
     SessionModelTransition,
@@ -595,8 +593,6 @@ from cayu.sessions.base import (
     ModelFailoverPolicy,
     ModelTarget,
     QueuedInteractionProfileHandoff,
-    SessionForkActiveModelStageConflict,
-    SessionForkSourceNotFound,
     SessionModelCompletionDispatchAlreadyAuthorized,
     SessionModelCompletionStageConflict,
     SessionOperationInitializer,
@@ -611,18 +607,15 @@ from cayu.sessions.base import (
     _current_session_invocation_terminal_event,
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
-    _fork_initial_invocation_request_sha256,
     _incomplete_recovery_claim_from_checkpoint,
     _initial_transcript_pending_interaction_id,
     _latest_session_invocation_interaction_is_settled,
     _mark_session_invocation_terminal_event,
     copy_model_completion_manual_recovery_request,
-    fork_session_invocation,
     model_completion_stage_settlement_request,
     queued_interaction_profile_handoff_evidence,
     runtime_publication_checkpoint_mutation,
     session_invocation_for_run_request,
-    validate_profiled_fork_evidence,
 )
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
@@ -653,13 +646,17 @@ from cayu.sessions.forks import (
     ForkSystemPromptReplacement,
     ProfiledSessionForkResult,
     PromptAnatomyTransitionReceipt,
+    SessionForkActiveModelStageConflict,
     SessionForkEnvironmentAllocationOwner,
     SessionForkProfileRelationship,
+    SessionForkSourceNotFound,
     apply_fork_system_prompt_replacement,
     copy_profiled_session_fork_result,
+    fork_session_invocation,
     fork_source_state_sha256,
     session_fork_profile_relationship,
     session_prompt_anatomy_transition,
+    validate_profiled_fork_evidence,
 )
 from cayu.sessions.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
@@ -700,6 +697,7 @@ from cayu.sessions.requests import (
     ResumeRequest,
     RunRequest,
     _authenticated_session_instance_id_for_run_request,
+    _fork_initial_invocation_request_sha256,
     _runtime_resume_transport_metadata,
     copy_fork_session_request,
     copy_run_request,

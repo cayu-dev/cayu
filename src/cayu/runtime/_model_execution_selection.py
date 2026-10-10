@@ -8,7 +8,6 @@ still required to consume an exact attempt and advance durable route progress.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any
 
 from cayu._validation import copy_durable_metadata, copy_json_value
 from cayu.agents import AgentSpec
@@ -42,41 +41,7 @@ from cayu.sessions._model_failover import (
     copy_model_failover_state,
 )
 from cayu.sessions.base import ModelCompletionStage
-from cayu.sessions.checkpoints import decode_runtime_checkpoint
 from cayu.sessions.records import Session
-
-
-def model_failover_progress_for_session(
-    *,
-    session: Session,
-    execution_profile: ExecutionProfileIdentity,
-    checkpoint: dict[str, Any] | None,
-) -> ModelFailoverProgress | ModelFailoverSelection | None:
-    """Resolve stored selection, not permission to resume or repeat a dispatch.
-
-    The caller owns snapshot provenance and invocation admission. The stage
-    transaction must still prove the exact predecessor and its settlement.
-    """
-
-    if checkpoint is None or MODEL_FAILOVER_CHECKPOINT_KEY not in checkpoint:
-        return None
-    current = decode_runtime_checkpoint(checkpoint, session_id=session.id)
-    if current is None or MODEL_FAILOVER_CHECKPOINT_KEY not in current:
-        return None
-    progress = copy_model_failover_state(current[MODEL_FAILOVER_CHECKPOINT_KEY])
-    binding = execution_profile.model_failover
-    if (
-        binding is None
-        or progress.session_id != session.id
-        or progress.session_instance_id != session.instance_id
-        or progress.execution_profile_fingerprint != execution_profile.fingerprint
-        or progress.plan != binding.plan
-        or progress.source_run_epoch > session.run_epoch
-        or progress.plan.candidates[0].provider_name != session.provider_name
-        or progress.plan.candidates[0].model != session.model
-    ):
-        raise ValueError("Stored model selection conflicts with its session/profile authority.")
-    return progress
 
 
 @dataclass(frozen=True, slots=True, repr=False)

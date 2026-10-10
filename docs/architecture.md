@@ -570,6 +570,9 @@ bounds, session creation and runtime identities, instance fingerprints, bounded
 state and invocation snapshots, and session copy and provenance readers.
 Applications can construct and validate these values without loading concrete
 stores. Existing public imports resolve to these same definitions.
+Status-conflict errors, allowed-status validation, checkpoint transform contracts
+and user metadata copying/replacement share this owner. Replacement preserves
+runtime-owned metadata inside the caller's existing locked store operation.
 
 `sessions/terminal_evidence.py` owns bounded terminal-session snapshot contracts,
 limits, error codes, classification, copying and exact byte accounting. It composes
@@ -587,6 +590,10 @@ replacement rules compose with session records, message values and profile
 contracts without loading concrete stores or runtime execution. Fork admission,
 checkpoint authorization and atomic child creation remain with their existing
 runtime and backend owners.
+Shared fork source, profile, event-evidence and copied-checkpoint validation also
+live in this owner. Stored model-selection reads compose the existing
+`sessions/_execution_profile_checkpoint.py` rules; they do not authorize dispatch.
+The initial-invocation request fingerprint belongs to `sessions/requests.py`.
 
 ### Session request contracts
 
@@ -614,6 +621,14 @@ the prerequisite request attestation, prepared-authority inspection and private
 lifecycle fingerprint. The existing `sessions/authority.py` owns shared raw digest
 validation, preserving the same checks used by durable record readers. Callers
 retain atomic creation, native transactions and recovery sequencing.
+
+`sessions/creation.py` owns prepared work-attempt creation attestation and assembly
+of deadline, profile, build-provenance and tool-ceiling metadata. Shared profile
+admission/rejection, runtime identity adoption and model-transition validation live
+in `sessions/_execution_profile_rules.py`. These owners return checked, detached
+material; the memory and native stores retain the complete atomic operation.
+Their event preparation uses `sessions/event_delivery.py` for authority stripping,
+trusted restoration and batch validation, preserving the export-publication gate.
 
 ### Session query contracts
 

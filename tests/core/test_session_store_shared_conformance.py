@@ -263,7 +263,6 @@ from cayu.sessions.base import (
     SessionStore,
     _checkpoint_with_session_run_operation,
     _deactivate_session_run_fence,
-    fork_session_invocation,
     queued_interaction_profile_handoff_evidence,
     runtime_publication_checkpoint_mutation,
     runtime_publication_checkpoint_value_digest,
@@ -286,6 +285,7 @@ from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.forks import (
     ForkExecutionProfileSelection,
     ForkSystemPromptReplacement,
+    fork_session_invocation,
 )
 from cayu.sessions.interactions import INTERACTION_LIFECYCLE_EVENT_TYPES
 from cayu.sessions.invocation import (

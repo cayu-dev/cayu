@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import traceback as traceback_module
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from hashlib import sha256
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 from pydantic import (
     BaseModel,
@@ -21,11 +22,12 @@ from pydantic import (
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     canonical_durable_json_bytes,
+    copy_durable_json_object,
     copy_durable_json_value,
 )
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
-from cayu.approvals.actors import ResolutionActor, copy_resolution_actor
-from cayu.events import Event, copy_event
+from cayu.approvals.actors import ResolutionActor, copy_resolution_actor, resolution_actor_payload
+from cayu.events import Event, EventType, copy_event
 from cayu.execution_profiles import (
     EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS,
     EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS,
@@ -34,13 +36,32 @@ from cayu.execution_profiles import (
     ExecutionProfileDecisionKind,
     ExecutionProfileIdentity,
     changed_execution_profile_components,
+    direct_tool_capability_ceiling_component,
     inherited_execution_profile_component_changes,
 )
 from cayu.messages import Message, MessageRole, detach_message
+from cayu.sessions import event_delivery as session_event_rules
+from cayu.sessions import records as session_record_rules
 from cayu.sessions._execution_profile_checkpoint import (
+    ActiveInvocationExecutionProfile,
+    active_invocation_execution_profile_from_checkpoint,
+    active_invocation_execution_profile_matches_session_epoch,
     execution_profile_baseline_from_session_metadata,
+    execution_profile_from_session_metadata,
 )
-from cayu.sessions.records import Session, SessionStatus, copy_session
+from cayu.sessions._model_failover import MODEL_FAILOVER_CHECKPOINT_KEY, ModelFailoverSelection
+from cayu.sessions.checkpoints import (
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
+)
+from cayu.sessions.invocation import (
+    SessionExecutionSource,
+    SessionInvocation,
+    inherited_session_invocation,
+)
+from cayu.sessions.records import CheckpointTransform, Session, SessionStatus, copy_session
+from cayu.sessions.transcript_queries import ForkTranscriptValidator
+from cayu.tools.exposure import tool_capability_ceiling_from_session_metadata
 
 FORK_EXECUTION_PROFILE_METADATA_KEY = "cayu:fork_execution_profile"
 FORK_SOURCE_SNAPSHOT_METADATA_KEY = "cayu:fork_source_snapshot"
@@ -792,3 +813,443 @@ def apply_fork_system_prompt_replacement(
     messages.clear()
     interaction_ids.clear()
     return retained_messages, retained_interaction_ids
+
+
+class SessionForkSourceNotFound(KeyError):
+    """A fork's source disappeared before the atomic child-creation boundary."""
+
+
+class SessionForkActiveModelStageConflict(ValueError):
+    """A fork was rejected because its source still owns an active model stage."""
+
+
+def fork_session_invocation(source_session: Session) -> SessionInvocation:
+    """Build the only valid invocation provenance for a direct session fork."""
+
+    if type(source_session) is not Session:
+        raise TypeError("Fork invocation provenance requires a Session.")
+    return inherited_session_invocation(
+        source_session.invocation,
+        source=SessionExecutionSource.FORK,
+    )
+
+
+def _prepare_session_fork_request(
+    *,
+    source_session_id: str,
+    fork: Session,
+    source_statuses: set[SessionStatus],
+    transcript_cursor: int | None,
+) -> tuple[str, Session, set[SessionStatus], int | None]:
+    source_session_id = require_clean_nonblank(source_session_id, "source_session_id")
+    fork = copy_session(fork)
+    allowed_statuses = session_record_rules._validate_status_set(source_statuses, "source_statuses")
+    if fork.parent_session_id != source_session_id:
+        raise ValueError("Fork parent_session_id must match source_session_id.")
+    if transcript_cursor is not None and transcript_cursor < 0:
+        raise ValueError("transcript_cursor must be greater than or equal to 0.")
+    return source_session_id, fork, allowed_statuses, transcript_cursor
+
+
+def _validate_session_fork_source(
+    *,
+    source_session: Session | None,
+    source_session_id: str,
+    fork: Session,
+    allowed_statuses: set[SessionStatus],
+    expected_source_run_epoch: int,
+    profile_relationship: SessionForkProfileRelationship | None = None,
+) -> Session:
+    from cayu._resource_access_errors import ResourceAccessDenied
+    from cayu.resource_access import current_binding, current_creation_bounds
+
+    access_bounds = current_creation_bounds()
+    if access_bounds is not None:
+        source_session = access_bounds.require_read(source_session)
+        if not access_bounds.matches(fork.labels, "create") or not access_bounds.matches(
+            fork.labels
+        ):
+            raise ResourceAccessDenied()
+        if source_session.invocation.resource_access != current_binding():
+            raise ResourceAccessDenied()
+    if source_session is None:
+        raise SessionForkSourceNotFound("Fork source session was not found.")
+    if source_session.status not in allowed_statuses:
+        raise ValueError(f"Source session status is not forkable: {source_session.status}")
+    if source_session.run_epoch != expected_source_run_epoch:
+        raise ValueError(
+            "Source session changed while the fork was being prepared: "
+            f"run_epoch {source_session.run_epoch} != {expected_source_run_epoch}"
+        )
+    if fork.status != source_session.status:
+        raise ValueError(
+            "Fork status must match source session status: "
+            f"{fork.status} != {source_session.status}"
+        )
+    provider_changed = fork.provider_name != source_session.provider_name
+    profiled_provider_change = (
+        profile_relationship is not None
+        and profile_relationship.selection is ForkExecutionProfileSelection.CURRENT_CHILD
+    )
+    if provider_changed and not profiled_provider_change:
+        raise ValueError(
+            "Fork provider_name must match source session provider_name: "
+            f"{fork.provider_name} != {source_session.provider_name}"
+        )
+    if fork.invocation != fork_session_invocation(source_session):
+        raise ValueError("Fork invocation provenance conflicts with its source session.")
+    return source_session
+
+
+def effective_fork_source_execution_profile(
+    source_session: Session,
+    source_checkpoint: Mapping[str, Any] | None,
+) -> tuple[
+    ForkExecutionProfileSource,
+    ExecutionProfileIdentity,
+    ActiveInvocationExecutionProfile | None,
+]:
+    """Resolve the exact parent profile authority visible at the fork boundary."""
+
+    source_session = copy_session(source_session)
+    active = active_invocation_execution_profile_from_checkpoint(source_checkpoint)
+    if active is not None:
+        if not active_invocation_execution_profile_matches_session_epoch(
+            active,
+            session_id=source_session.id,
+            run_epoch=source_session.run_epoch,
+        ):
+            raise ValueError(
+                "Source active invocation execution profile conflicts with its run epoch."
+            )
+        return ForkExecutionProfileSource.ACTIVE_INVOCATION, active.profile, active
+    return (
+        ForkExecutionProfileSource.SESSION_EXPECTED,
+        execution_profile_from_session_metadata(source_session.metadata),
+        None,
+    )
+
+
+def _copy_profiled_fork_authority(
+    *,
+    fork: Session,
+    relationship: SessionForkProfileRelationship,
+    events: list[Event],
+) -> tuple[SessionForkProfileRelationship, list[Event]]:
+    if type(relationship) is not SessionForkProfileRelationship:
+        raise TypeError("relationship must be a SessionForkProfileRelationship.")
+    copied_relationship = SessionForkProfileRelationship.model_validate(
+        relationship.model_dump(mode="json")
+    )
+    _, copied_events = session_event_rules._copy_session_event_batch(fork.id, events)
+    if not copied_events:
+        raise ValueError("A profiled fork requires durable fork evidence.")
+    return copied_relationship, copied_events
+
+
+def _validate_profiled_fork_authority(
+    *,
+    source_session: Session,
+    source_checkpoint: Mapping[str, Any] | None,
+    fork: Session,
+    relationship: SessionForkProfileRelationship,
+    events: Sequence[Event],
+    transcript_cursor: int | None,
+    checkpoint_transform: CheckpointTransform | None,
+    system_prompt_replacement: ForkSystemPromptReplacement | None,
+    transcript_validator: ForkTranscriptValidator | None,
+) -> None:
+    source_ceiling = tool_capability_ceiling_from_session_metadata(source_session.metadata)
+    fork_ceiling = tool_capability_ceiling_from_session_metadata(fork.metadata)
+    if not frozenset(fork_ceiling.tool_names) <= frozenset(source_ceiling.tool_names):
+        raise ValueError("A fork cannot widen its source tool capability ceiling.")
+    source_kind, source_profile, active = effective_fork_source_execution_profile(
+        source_session,
+        source_checkpoint,
+    )
+    if relationship.selected_profile.model_failover is not None:
+        from cayu.sessions._execution_profile_checkpoint import model_failover_progress_for_session
+
+        source_selection = model_failover_progress_for_session(
+            session=source_session,
+            execution_profile=source_profile,
+            checkpoint=(
+                None
+                if source_checkpoint is None
+                else copy_durable_json_object(source_checkpoint, "checkpoint")
+            ),
+        )
+        expected_index = (
+            source_selection.candidate_index
+            if relationship.selection is ForkExecutionProfileSelection.INHERIT_PARENT
+            and source_selection is not None
+            else 0
+        )
+        if relationship.model_failover_candidate_index != expected_index:
+            raise ValueError("Fork routing origin conflicts with its exact source selection.")
+    if source_profile.component(
+        ExecutionProfileComponentClass.TOOL_VIEW_GRANTS
+    ) != direct_tool_capability_ceiling_component(source_ceiling.tool_names):
+        raise ValueError("Fork source profile conflicts with its tool capability ceiling.")
+    if relationship.selected_profile.component(
+        ExecutionProfileComponentClass.TOOL_VIEW_GRANTS
+    ) != direct_tool_capability_ceiling_component(fork_ceiling.tool_names):
+        raise ValueError("Fork child profile conflicts with its tool capability ceiling.")
+    if (
+        relationship.source_session_id != source_session.id
+        or relationship.child_session_id != fork.id
+        or relationship.child_agent_name != fork.agent_name
+        or relationship.child_provider_name != fork.provider_name
+        or relationship.child_model != fork.model
+        or relationship.child_environment_name != fork.environment_name
+        or relationship.source_status != source_session.status
+        or relationship.source_run_epoch != source_session.run_epoch
+        or relationship.source_profile_source != source_kind
+        or relationship.source_profile != source_profile
+        or relationship.source_active_interaction_id
+        != (None if active is None else active.interaction_id)
+        or relationship.source_active_run_epoch != (None if active is None else active.run_epoch)
+        or relationship.transcript_cursor != transcript_cursor
+    ):
+        raise ValueError("Fork execution-profile relationship conflicts with its source.")
+    current_agent_prompt = relationship.system_prompt_policy is ForkSystemPromptPolicy.CURRENT_AGENT
+    if current_agent_prompt != (system_prompt_replacement is not None):
+        raise ValueError("Fork prompt operation conflicts with its profile relationship.")
+    if checkpoint_transform is None:
+        raise ValueError("A profiled fork requires live checkpoint validation.")
+    if transcript_validator is None:
+        raise ValueError("A profiled fork requires atomic transcript validation.")
+    validate_profiled_fork_evidence(
+        fork=fork,
+        relationship=relationship,
+        events=events,
+    )
+
+
+def _profiled_fork_authority_validation_error(error: Exception) -> ValueError:
+    """Detach a failed transactional profile check from private checkpoint state."""
+
+    if error.__traceback__ is not None:
+        traceback_module.clear_frames(error.__traceback__)
+    return ValueError("Fork source no longer has the expected durable execution-profile identity.")
+
+
+def _prepare_profiled_fork_checkpoint_result(
+    *,
+    supports_model_failover: bool,
+    fork: Session,
+    transcript_cursor: int,
+    relationship: SessionForkProfileRelationship,
+    source_checkpoint_present: bool,
+    copied_checkpoint: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Validate copied state and initialize the child's own routing origin."""
+
+    if not relationship.copy_checkpoint:
+        if copied_checkpoint is not None:
+            raise ValueError("Fork copied checkpoint state contrary to its profile relationship.")
+    elif source_checkpoint_present and copied_checkpoint is None:
+        raise ValueError("Fork discarded checkpoint state contrary to its profile relationship.")
+    checkpoint = (
+        None
+        if copied_checkpoint is None
+        else copy_durable_json_object(copied_checkpoint, "checkpoint")
+    )
+    binding = relationship.selected_profile.model_failover
+    if binding is None:
+        return checkpoint
+    if supports_model_failover is not True:
+        raise NotImplementedError("Store does not attest atomic model failover forks.")
+    if checkpoint is not None and MODEL_FAILOVER_CHECKPOINT_KEY in checkpoint:
+        raise ValueError("Fork checkpoint cannot copy source routing authority.")
+    index = relationship.model_failover_candidate_index
+    if index is None or fork.run_epoch != 0:
+        raise ValueError("Fork routing origin lost its creation authority.")
+    origin = ModelFailoverSelection(
+        session_id=fork.id,
+        session_instance_id=fork.instance_id,
+        execution_profile_fingerprint=relationship.selected_profile.fingerprint,
+        plan=binding.plan,
+        candidate_index=index,
+        origin_id=relationship.request_sha256,
+        source_run_epoch=0,
+        source_transcript_cursor=transcript_cursor,
+        projection_cursor=0,
+    )
+    updated = {} if checkpoint is None else checkpoint
+    updated[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION
+    updated[MODEL_FAILOVER_CHECKPOINT_KEY] = origin.payload()
+    return updated
+
+
+def validate_profiled_fork_evidence(
+    *,
+    fork: Session,
+    relationship: SessionForkProfileRelationship,
+    events: Sequence[Event],
+) -> None:
+    """Validate immutable child baseline, relationship, and ordered evidence."""
+
+    if type(fork) is not Session:
+        raise TypeError("fork must be a Session.")
+    if type(relationship) is not SessionForkProfileRelationship:
+        raise TypeError("relationship must be a SessionForkProfileRelationship.")
+    fork_ceiling = tool_capability_ceiling_from_session_metadata(fork.metadata)
+    if relationship.selected_profile.component(
+        ExecutionProfileComponentClass.TOOL_VIEW_GRANTS
+    ) != direct_tool_capability_ceiling_component(fork_ceiling.tool_names):
+        raise ValueError("Fork child profile conflicts with its tool capability ceiling.")
+    stored_relationship = session_fork_profile_relationship(fork)
+    if (
+        stored_relationship != relationship
+        or relationship.child_session_id != fork.id
+        or (
+            fork.parent_session_id is not None
+            and relationship.source_session_id != fork.parent_session_id
+        )
+    ):
+        raise ValueError("Fork execution-profile relationship conflicts with child metadata.")
+    if relationship.selection is ForkExecutionProfileSelection.CURRENT_CHILD:
+        if len(events) != 3 or relationship.decision is None:
+            raise ValueError(
+                "Current-child fork evidence requires decision, fork, and grant-reset events."
+            )
+        decision_event, fork_event, grant_reset_event = events
+        if (
+            decision_event.type != EventType.SESSION_EXECUTION_PROFILE_DECIDED
+            or decision_event.id != relationship.decision.event_id
+            or decision_event.payload.get("decision") != relationship.decision.kind.value
+            or decision_event.payload.get("expected_profile")
+            != relationship.source_profile.model_dump(mode="json")
+            or decision_event.payload.get("candidate_profile")
+            != relationship.selected_profile.model_dump(mode="json")
+            or decision_event.payload.get("changed_component_classes")
+            != [
+                component.value
+                for component in changed_execution_profile_components(
+                    relationship.source_profile,
+                    relationship.selected_profile,
+                )
+            ]
+            or decision_event.payload.get("policy_identity")
+            != relationship.decision.policy_identity
+            or decision_event.payload.get("policy_reason") != relationship.decision.policy_reason
+            or decision_event.payload.get("authority_decision")
+            != relationship.decision.authority_decision.value
+            or decision_event.payload.get("idempotency_identity")
+            != relationship.decision.idempotency_identity
+            or decision_event.payload.get("actor")
+            != resolution_actor_payload(relationship.decision.actor)
+            or decision_event.payload.get("reason") != relationship.decision.reason
+            or decision_event.payload.get("adoption_request_fingerprint")
+            != relationship.decision.adoption_request_fingerprint
+        ):
+            raise ValueError("Fork profile decision event conflicts with its relationship.")
+    else:
+        if len(events) != 2:
+            raise ValueError("Inherited fork evidence requires fork and grant-reset events.")
+        fork_event, grant_reset_event = events
+    if (
+        fork_event.type != EventType.SESSION_FORKED
+        or fork_event.id != relationship.fork_event_id
+        or fork_event.timestamp != fork.created_at
+        or any(event.session_id != fork.id for event in events)
+    ):
+        raise ValueError("Fork event evidence conflicts with its relationship.")
+    if (
+        grant_reset_event.type is not EventType.TARGETED_TOOL_GRANT_FORK_RESET
+        or grant_reset_event.timestamp != fork.created_at
+        or grant_reset_event.payload.get("schema_version") != 1
+        or grant_reset_event.payload.get("source_session_id") != relationship.source_session_id
+        or grant_reset_event.payload.get("source_interaction_id")
+        != relationship.source_active_interaction_id
+        or grant_reset_event.payload.get("inherited_grant_count") != 0
+        or grant_reset_event.payload.get("inherited_reference_count") != 0
+    ):
+        raise ValueError("Fork targeted-grant reset evidence is inconsistent.")
+    payload = fork_event.payload
+    selected_index = relationship.model_failover_candidate_index
+    if payload.get("model_failover_candidate_index") != selected_index or (
+        selected_index is not None
+        and type(payload.get("model_failover_candidate_index")) is not int
+    ):
+        raise ValueError("Fork event conflicts with its initial model selection.")
+    exact_source_snapshot_event_fields = {
+        "source_instance_fingerprint",
+        "source_run_epoch",
+        "source_transcript_cursor",
+        "source_transcript_sha256",
+        "source_checkpoint_sha256",
+        "source_execution_profile_fingerprint",
+    }
+    exact_source_event_fields = exact_source_snapshot_event_fields | {
+        "source_environment_allocation_owners"
+    }
+    source_environment_allocation_owners = [
+        owner.model_dump(mode="json") for owner in relationship.source_environment_allocation_owners
+    ]
+    raw_source_snapshot = fork.metadata.get(FORK_SOURCE_SNAPSHOT_METADATA_KEY)
+    if raw_source_snapshot is None:
+        if (
+            relationship.source_state_sha256 is not None
+            or exact_source_snapshot_event_fields.intersection(payload)
+        ):
+            raise ValueError("Fork event exact-source evidence conflicts with child metadata.")
+    else:
+        try:
+            source_snapshot = ForkSourceSnapshot.model_validate(
+                copy_durable_json_value(raw_source_snapshot, "fork_source_snapshot")
+            )
+        except (TypeError, ValueError):
+            raise ValueError("Fork source snapshot metadata is malformed.") from None
+        if (
+            not exact_source_event_fields.issubset(payload)
+            or relationship.source_state_sha256 is None
+            or fork_source_state_sha256(source_snapshot) != relationship.source_state_sha256
+            or source_snapshot.source_session_id != relationship.source_session_id
+            or source_snapshot.status is not relationship.source_status
+            or source_snapshot.run_epoch != relationship.source_run_epoch
+            or source_snapshot.execution_profile_fingerprint
+            != relationship.source_profile.fingerprint
+            or source_snapshot.causal_budget_id != fork.causal_budget_id
+            or payload.get("source_instance_fingerprint")
+            != source_snapshot.source_instance_fingerprint
+            or payload.get("source_run_epoch") != source_snapshot.run_epoch
+            or payload.get("source_transcript_cursor") != source_snapshot.transcript_cursor
+            or payload.get("source_transcript_sha256") != source_snapshot.transcript_sha256
+            or payload.get("source_checkpoint_sha256") != source_snapshot.checkpoint_sha256
+            or payload.get("source_execution_profile_fingerprint")
+            != source_snapshot.execution_profile_fingerprint
+            or payload.get("source_environment_allocation_owners")
+            != source_environment_allocation_owners
+        ):
+            raise ValueError("Fork event exact-source evidence conflicts with child metadata.")
+    if (
+        payload.get("source_session_id") != relationship.source_session_id
+        or payload.get("source_status") != relationship.source_status.value
+        or payload.get("parent_session_id") != relationship.source_session_id
+        or payload.get("causal_budget_id") != fork.causal_budget_id
+        or payload.get("agent_name") != relationship.child_agent_name
+        or payload.get("provider_name") != relationship.child_provider_name
+        or payload.get("model") != relationship.child_model
+        or payload.get("environment_name") != relationship.child_environment_name
+        or payload.get("transcript_cursor") != relationship.transcript_cursor
+        or payload.get("copy_checkpoint") is not relationship.copy_checkpoint
+        or payload.get("system_prompt_policy") != relationship.system_prompt_policy.value
+        or payload.get("execution_profile_selection") != relationship.selection.value
+        or payload.get("selected_profile_fingerprint") != relationship.selected_profile.fingerprint
+        or payload.get("source_profile_fingerprint") != relationship.source_profile.fingerprint
+        or payload.get("source_environment_allocation_owners")
+        != source_environment_allocation_owners
+        or payload.get("fork_request_sha256") != relationship.request_sha256
+        or payload.get("initial_invocation_request_sha256")
+        != relationship.initial_invocation_request_sha256
+        or payload.get("initial_dispatch_id") != relationship.initial_dispatch_id
+        or payload.get("initial_invocation_profile_fingerprint")
+        != (
+            None
+            if relationship.initial_invocation_profile is None
+            else relationship.initial_invocation_profile.fingerprint
+        )
+    ):
+        raise ValueError("Fork event payload conflicts with its profile relationship.")

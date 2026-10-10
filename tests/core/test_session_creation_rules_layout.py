@@ -28,6 +28,11 @@ import cayu
         ("_execution_profile_rules", "SessionModelTransition"),
         ("_execution_profile_rules", "session_model_projection_cursor"),
         ("_execution_profile_rules", "execution_profile_adoption_request_fingerprint"),
+        ("forks", "SessionForkSourceNotFound"),
+        ("forks", "SessionForkActiveModelStageConflict"),
+        ("forks", "fork_session_invocation"),
+        ("forks", "effective_fork_source_execution_profile"),
+        ("forks", "validate_profiled_fork_evidence"),
     ),
 )
 def test_creation_prerequisites_preserve_public_identity(module, name):
@@ -249,5 +254,70 @@ assert fingerprint != rules.execution_profile_adoption_request_fingerprint(chang
 rejected(lambda: rules.execution_profile_adoption_request_fingerprint(
     requests.ResumeRequest(session_id="session", messages=messages), redactor=redactor))
 rejected(lambda: rules.execution_profile_adoption_request_fingerprint(request, redactor=object()))
+"""
+    )
+
+
+def test_fork_source_validation_without_implementations():
+    _without_implementations(
+        """
+from cayu.sessions import forks, records
+from cayu.sessions.invocation import InvocationOrigin, SessionInvocation
+
+source = records.Session(id="source", agent_name="agent", provider_name="fake", model="model",
+    causal_budget_id="source", status=records.SessionStatus.COMPLETED,
+    invocation=SessionInvocation(origin=InvocationOrigin(trust="unattributed"),
+        root_invocation_id="12345678-1234-4234-8234-123456789abc", root_session_id="source", source="sdk_run"))
+child = source.model_copy(update={"id": "child", "parent_session_id": "source",
+                                  "invocation": forks.fork_session_invocation(source)})
+source_id, detached, statuses, cursor = forks._prepare_session_fork_request(
+    source_session_id="source", fork=child, source_statuses={source.status}, transcript_cursor=0)
+assert source_id == source.id and detached == child and detached is not child
+assert cursor == 0
+assert forks._validate_session_fork_source(source_session=source, source_session_id=source_id,
+    fork=detached, allowed_statuses=statuses, expected_source_run_epoch=source.run_epoch) is source
+rejected(lambda: forks._validate_session_fork_source(source_session=source,
+    source_session_id=source_id, fork=detached, allowed_statuses=statuses,
+    expected_source_run_epoch=source.run_epoch + 1))
+rejected(lambda: forks._prepare_session_fork_request(source_session_id="foreign", fork=child,
+    source_statuses=statuses, transcript_cursor=cursor))
+try:
+    forks._validate_session_fork_source(source_session=None, source_session_id=source_id,
+        fork=detached, allowed_statuses=statuses, expected_source_run_epoch=0)
+except forks.SessionForkSourceNotFound:
+    pass
+else:
+    raise AssertionError("Missing fork source was accepted")
+"""
+    )
+
+
+def test_fork_profile_and_model_selection_without_execution():
+    _without_implementations(
+        """
+from cayu.build_provenance import RuntimeBuildProvenance
+from cayu.runtime.execution_profiles import build_execution_profile_identity
+from cayu.sessions import forks, records
+from cayu.sessions._execution_profile_checkpoint import (
+    execution_profile_session_metadata, model_failover_progress_for_session,
+)
+from cayu.sessions.invocation import InvocationOrigin, SessionInvocation
+
+profile = build_execution_profile_identity(runtime_name="cayu", runtime_version="test",
+    provider_name="fake", model="model", durable_system_prompt="instructions", direct_tools=(),
+    tool_catalogue_revision="sha256:" + "a" * 64,
+    runtime_build_provenance=RuntimeBuildProvenance.unavailable("test_fixture"))
+source = records.Session(id="source", agent_name="agent", provider_name="fake", model="model",
+    runtime_version="test", causal_budget_id="source", metadata={
+        "cayu:execution_profile": execution_profile_session_metadata(profile),
+        records.RUNTIME_BUILD_PROVENANCE_METADATA_KEY: profile.runtime_build_provenance.model_dump(mode="json")},
+    invocation=SessionInvocation(origin=InvocationOrigin(trust="unattributed"),
+        root_invocation_id="12345678-1234-4234-8234-123456789abc", root_session_id="source", source="sdk_run"))
+kind, selected, active = forks.effective_fork_source_execution_profile(source, None)
+assert kind is forks.ForkExecutionProfileSource.SESSION_EXPECTED
+assert selected == profile and active is None
+for checkpoint in (None, {"custom": {"value": 1}}):
+    assert model_failover_progress_for_session(session=source, execution_profile=profile,
+                                              checkpoint=checkpoint) is None
 """
     )
