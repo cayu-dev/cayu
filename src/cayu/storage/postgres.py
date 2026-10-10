@@ -261,6 +261,7 @@ from cayu.sessions._tool_round_publication_rules import (
     _validate_tool_round_checkpoint_mutation,
     _validate_tool_round_publication,
 )
+from cayu.sessions._user_input_publication import _validate_user_input_checkpoint_mutation
 from cayu.sessions.authority import (
     CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS,
     CheckpointRootFieldGuard,
@@ -354,7 +355,6 @@ from cayu.sessions.base import (
     _validate_model_completion_stage_repreparation,
     _validate_model_completion_stage_terminal_replay,
     _validate_model_failover_selection_replay,
-    _validate_user_input_checkpoint_mutation,
     transform_fork_checkpoint,
 )
 from cayu.sessions.creation import session_invocation_for_run_request, session_metadata_for_creation

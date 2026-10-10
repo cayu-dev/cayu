@@ -669,6 +669,29 @@ scopes. `sessions/access.py` composes those rules with a store through
 same scope rules inside the caller's atomic create operation. Policy validation
 and provenance derivation can be used without importing a store implementation.
 
+### Runtime publication contracts and validation
+
+`sessions/_runtime_publication.py` owns publication requests, receipts, results,
+bounded event references and their content identities. Protected operation-record
+keys and compare-and-set mutations live in `sessions/_operation_records.py`.
+`sessions/_checkpoint_mutations.py` builds and applies checkpoint diffs; bounded
+root-field evidence and run-fence values use `sessions/authority.py`.
+
+`sessions/_runtime_publication_rules.py` prepares detached publication material,
+captures the caller's checkpoint codec, builds and reconstructs exact receipts,
+and validates replay against durable transcript and event material. The codec
+scope, schema stamping and writer projection belong to
+`sessions/_checkpoint_publication.py`.
+
+Domain validation remains separate: `sessions/_tool_round_publication_rules.py`
+checks tool lifecycle, grouped results, structured output and pending-round
+authority; `sessions/_user_input_publication.py` checks pause/open/close authority;
+`sessions/_workspace_observation_publication.py` checks workspace lifecycle,
+artifact and checkpoint evidence. These rules can be exercised without a concrete
+session store. Runtime callers retain sequencing, while each store keeps the
+complete authorization, snapshot, validation and publication operation inside
+its existing lock or transaction.
+
 ### Session query contracts
 
 `sessions/queries.py` owns session listing and aggregate filters, label selectors,

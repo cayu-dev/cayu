@@ -13,6 +13,7 @@ from cayu.events import Event, EventType
 from cayu.execution_profiles import (
     ExecutionProfileIdentity,
 )
+from cayu.messages import ToolCallPart, ToolResultPart
 from cayu.sessions._execution_profile_checkpoint import (
     execution_profile_from_session_metadata,
 )
@@ -21,7 +22,6 @@ from cayu.sessions._model_completion_publication import (
     model_step_publication_from_checkpoint,
 )
 from cayu.sessions._runtime_publication import RuntimePublicationReceipt
-from cayu.sessions.base import ToolCallPart, ToolResultPart
 from cayu.sessions.context_views import CONTEXT_VIEW_MAX_MESSAGES, ParticipantSessionBinding
 from cayu.sessions.records import Session, TranscriptRecord
 

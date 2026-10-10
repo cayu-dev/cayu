@@ -321,3 +321,63 @@ event.payload["result"]["content"] = "forged"
 rejected(lambda: rules._validate_tool_round_publication(request, {event.id: event}))
 """
     )
+
+
+def test_user_input_publication_requires_exact_pause_and_run_authority_without_stores():
+    _without_stores(
+        """
+from cayu.approvals.tools import PendingToolCallApproval
+from cayu.approvals.user_input import PendingUserInput, pending_user_input_identity
+from cayu.build_provenance import RuntimeBuildProvenance
+from cayu.events import Event, EventType
+from cayu.runtime.execution_profiles import build_execution_profile_identity
+from cayu.sessions._checkpoint_mutations import (
+    RuntimePublicationCheckpointOperation, RuntimePublicationMutation, SessionRuntimePublicationConflict,
+    runtime_publication_checkpoint_value_digest,
+)
+from cayu.sessions._execution_profile_checkpoint import ActiveInvocationExecutionProfile
+from cayu.sessions._pending_tool_round import PendingToolRound, pending_tool_round_identity
+from cayu.sessions._runtime_publication import RuntimePublicationRequest
+from cayu.sessions._user_input_publication import _validate_user_input_checkpoint_mutation
+from cayu.sessions.checkpoints import ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
+
+profile = build_execution_profile_identity(runtime_name="cayu", runtime_version="test",
+    provider_name="fake", model="fake", durable_system_prompt="instructions", direct_tools=(),
+    tool_catalogue_revision="sha256:" + "a" * 64,
+    runtime_build_provenance=RuntimeBuildProvenance.unavailable("test_fixture"))
+call = PendingToolCallApproval(tool_call_id="call", tool_name="ask_user", arguments={})
+pending_round = PendingToolRound(model_step_id="mstep_" + "1" * 32, model_attempt_id="matt_" + "2" * 32,
+    tool_round_id="tround_" + "3" * 32, agent_name="agent", environment_name=None, task_id=None,
+    tool_calls=[call], source_run_epoch=3, execution_profile_fingerprint=profile.fingerprint)
+pending = PendingUserInput(session_id="session", session_instance_id="12345678-1234-4234-8234-123456789abc",
+    source_interaction_id="interaction", source_run_epoch=3, input_id="input", tool_call_id="call",
+    tool_name="ask_user", question="Continue?", agent_name="agent", tool_calls=[call],
+    execution_profile_fingerprint=profile.fingerprint, **pending_tool_round_identity(pending_round).payload())
+identity = pending_user_input_identity(pending)
+events = [Event(type=kind, session_id="session", interaction_id="interaction",
+    payload={**identity, "checkpoint": "pending_user_input"}) for kind in (
+        EventType.SESSION_CHECKPOINTED, EventType.SESSION_AWAITING_USER_INPUT)]
+marker = pending_round.model_dump(mode="json")
+request = RuntimePublicationRequest(publication_id="user-input-open:input", kind="user-input-open",
+    interaction_id="interaction", intent={**identity, "event_ids": [e.id for e in events],
+        "source_round_digest": runtime_publication_checkpoint_value_digest(marker)},
+    mutation=RuntimePublicationMutation(operations=[
+        RuntimePublicationCheckpointOperation(key="pending_tool_round", action="delete",
+            expected_value_digest=runtime_publication_checkpoint_value_digest(marker)),
+        RuntimePublicationCheckpointOperation(key="pending_user_input", action="set",
+            expected_value_digest=None, value=pending.model_dump(mode="json"))]),
+    transcript_messages=[], events=events)
+active = ActiveInvocationExecutionProfile(session_id="session", interaction_id="interaction",
+    run_epoch=3, profile=profile)
+checkpoint = {"pending_tool_round": marker,
+    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY: active.model_dump(mode="json")}
+authority = dict(session_id="session", session_instance_id=pending.session_instance_id, current_run_epoch=3)
+_validate_user_input_checkpoint_mutation(request, checkpoint, **authority)
+rejected(lambda: _validate_user_input_checkpoint_mutation(request, checkpoint,
+    **{**authority, "current_run_epoch": 5}), SessionRuntimePublicationConflict)
+rejected(lambda: _validate_user_input_checkpoint_mutation(request, checkpoint,
+    **{**authority, "current_run_epoch": 4}))
+rejected(lambda: _validate_user_input_checkpoint_mutation(request, checkpoint,
+    **{**authority, "session_instance_id": "replacement"}))
+"""
+    )

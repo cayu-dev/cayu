@@ -12,7 +12,7 @@ from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from pydantic import (
     BaseModel,
@@ -41,7 +41,6 @@ from cayu.artifacts.base import (
     copy_artifact_read_result,
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import SessionOperationPublication, SessionStore
 from cayu.sessions.invocation import InvocationOrigin, SessionExecutionSource, SessionInvocation
 from cayu.tools._redaction import (
     active_secret_redactor_snapshot,
@@ -59,6 +58,9 @@ from cayu.tools.base import (
     _runtime_tool_invocation_authority,
 )
 from cayu.workspaces.base import Workspace, WorkspaceRevisionMismatchError
+
+if TYPE_CHECKING:
+    from cayu.sessions.base import SessionOperationPublication, SessionStore
 
 SHARED_ARTIFACT_SCHEMA_VERSION = 1
 SHARED_ARTIFACT_REFERENCE_PREFIX = "cayu-shared-artifact-v1."
@@ -477,6 +479,8 @@ async def revoke_shared_artifact_grant(
         checkpoint: dict[str, Any] | None,
         current: dict[str, Any] | None,
     ) -> SessionOperationPublication:
+        from cayu.sessions.base import SessionOperationPublication
+
         try:
             grant = SharedArtifactGrant.model_validate(current)
         except Exception as exc:
