@@ -254,7 +254,7 @@ async def main(material):
             # observes the legitimately blocked native recovery plan. This is
             # a read-only preflight, not a replacement claim or profile bypass.
             selected_session = await sessions.load(target.target_session_id)
-            await app._session_engine._recovery_coordinator.preflight_incomplete_session(
+            await app._incomplete_recovery.preflight_incomplete_session(
                 session=selected_session,
                 inactive_for_seconds=1,
                 participant_context=example.ACCESS,

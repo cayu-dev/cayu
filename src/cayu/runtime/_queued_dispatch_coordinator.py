@@ -66,7 +66,7 @@ from cayu.vaults.redaction import SecretRedactor
 class QueuedDispatchEngine(Protocol):
     """Session profile resolution and contracted-task admission."""
 
-    async def _verifier_aware_task_execution_outcome(
+    async def verifier_aware_task_execution_outcome(
         self,
         task_id: str | None,
         *,
@@ -223,7 +223,7 @@ class QueuedDispatchCoordinator:
         (
             contract_rejected,
             admission_failure,
-        ) = await self._engine._verifier_aware_task_execution_outcome(
+        ) = await self._engine.verifier_aware_task_execution_outcome(
             request.task_id,
             session_id=private_session_id,
             admit_session=False,
@@ -326,7 +326,7 @@ class QueuedDispatchCoordinator:
         (
             contract_rejected,
             admission_failure,
-        ) = await self._engine._verifier_aware_task_execution_outcome(
+        ) = await self._engine.verifier_aware_task_execution_outcome(
             request.task_id,
             session_id=private_session_id,
         )

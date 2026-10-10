@@ -44,7 +44,7 @@ def test_worker_receipts_elapsed_preparation_without_dispatch(
         provider = _RecordingProvider()
         holds = []
         original_hold = type(tasks).hold_work_attempt_preparation
-        original_prepare = SessionEngine._prepare_initial_run
+        original_prepare = SessionEngine.prepare_initial_run
 
         async def observe_hold(store, request):
             receipt = await original_hold(store, request)
@@ -63,7 +63,7 @@ def test_worker_receipts_elapsed_preparation_without_dispatch(
                 return await super().prepare(context)
 
         monkeypatch.setattr(type(tasks), "hold_work_attempt_preparation", observe_hold)
-        monkeypatch.setattr(SessionEngine, "_prepare_initial_run", delayed_admission)
+        monkeypatch.setattr(SessionEngine, "prepare_initial_run", delayed_admission)
         try:
             app = CayuApp(session_store=sessions, task_store=tasks, enable_logging=False)
             app.register_provider(provider, default=True)

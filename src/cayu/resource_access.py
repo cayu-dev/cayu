@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
@@ -617,3 +618,35 @@ async def restore_session_stream(stream, *, session, policy, store):
     finally:
         async with recovery_access(session, policy, store):
             await iterator.aclose()
+
+
+class ResourceSessionStream:
+    """Restore current application resource authority before advancing a stream."""
+
+    def __init__(
+        self,
+        *,
+        get_store: Callable[[], SessionStore],
+        get_policy: Callable[[], ResourceAccessPolicy | None],
+    ) -> None:
+        self._get_store = get_store
+        self._get_policy = get_policy
+
+    async def restore(self, stream, session_id):
+        store = self._get_store()
+        session = await store.load(session_id)
+        binding = None if session is None else session.invocation.resource_access
+        if binding is None:
+            if current_binding() is not None:
+                await stream.aclose()
+                raise ResourceAccessDenied()
+            return stream
+        assert session is not None
+        return guard_stream(
+            stream,
+            binding=binding,
+            policy=self._get_policy(),
+            labels=session.labels,
+            store=self._get_store(),
+            session_id=session.id,
+        )

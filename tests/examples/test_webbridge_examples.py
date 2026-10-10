@@ -487,7 +487,7 @@ def test_daily_recipe_does_not_recover_expired_attached_task_from_stale_evidence
             lease_seconds=1,
         )
         assert claimed is not None
-        prepared = await first_app._session_engine._prepare_initial_run(
+        prepared = await first_app._session_engine.prepare_initial_run(
             RunRequest(
                 agent_name="daily_web_checker",
                 session_id=f"session_{created.id}",
@@ -626,7 +626,7 @@ def test_daily_recipe_settles_ownerless_terminal_session_after_restart(
             TaskQuery(type="webbridge_daily_public_page"),
         )
         assert claimed is not None
-        prepared = await first_app._session_engine._prepare_initial_run(
+        prepared = await first_app._session_engine.prepare_initial_run(
             RunRequest(
                 agent_name="daily_web_checker",
                 session_id=f"session_{created.id}",
@@ -898,7 +898,7 @@ def test_daily_recipe_reconciles_a_terminal_session_before_recreating_it() -> No
             TaskQuery(type="webbridge_daily_public_page"),
         )
         assert claimed is not None
-        prepared = await app._session_engine._prepare_initial_run(
+        prepared = await app._session_engine.prepare_initial_run(
             RunRequest(
                 agent_name="daily_web_checker",
                 session_id=f"session_{created.id}",
@@ -970,7 +970,7 @@ def test_daily_recipe_rejects_unrelated_terminal_session_before_task_settlement(
         )
         assert claimed is not None
         session_id = f"session_{created.id}"
-        unrelated = await app._session_engine._prepare_initial_run(
+        unrelated = await app._session_engine.prepare_initial_run(
             RunRequest(
                 agent_name="daily_web_checker",
                 session_id=session_id,

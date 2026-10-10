@@ -68,14 +68,12 @@ async def _worker(path: str, action: str, phase: str) -> None:
     redacted_ids = action.endswith("-redacted")
     action = action.removesuffix("-redacted")
     if phase in {"child-stop-claim", "claim-action-close", "dispatch-action-close"}:
-
         # Keep the real store-clock lease and wait for expiry after SIGKILL.
         # The test must not steal a claim merely because its process disappeared.
         recovery_ownership_module._INCOMPLETE_RECOVERY_CLAIM_LEASE = timedelta(
             seconds=_TEST_TERMINAL_CLAIM_LEASE_SECONDS
         )
         if phase in {"claim-action-close", "dispatch-action-close"}:
-
             recovery_ownership_module._INCOMPLETE_RECOVERY_CLAIM_LEASE = timedelta(
                 seconds=_TEST_TERMINAL_CLAIM_LEASE_SECONDS
             )

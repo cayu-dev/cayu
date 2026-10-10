@@ -61,9 +61,7 @@ from cayu.runtime._durable_tool_round import (
     DeferredInteractionInput,
     DurableToolRound,
     InterruptedToolRoundRequest,
-)
-from cayu.runtime._durable_tool_round import (
-    _interrupted_tool_round_results as _interrupted_tool_round_results,
+    _interrupted_tool_round_results,
 )
 from cayu.runtime._environment_lifecycle import (
     EnvironmentLifecycle,

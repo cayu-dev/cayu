@@ -186,6 +186,7 @@ from cayu.runtime._event_projection import (
     public_event_sequence,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._interruption_coordinator import suppress_interruption_cascade
 from cayu.runtime._invocation_lifecycle import (
     ReleaseInvocationCommand,
     _release_invocation_command_with_cleanup_authority,
@@ -7714,7 +7715,7 @@ def test_session_store_conformance_supersedes_fully_paused_user_input(
                 session_id=session_id,
                 reason="operator supersedes fully published pause",
             )
-            with session_engine_module.suppress_interruption_cascade():
+            with suppress_interruption_cascade():
                 interrupted = await _collect_events(app.interrupt_session(request))
             assert interrupted[-1].type is EventType.SESSION_INTERRUPTED
             assert interrupted[-1].payload["interruption_type"] == "operator_requested"
@@ -7745,7 +7746,7 @@ def test_session_store_conformance_supersedes_fully_paused_user_input(
                 AgentSpec(name="assistant", model="fake-model"),
                 tools=[UserInputTool()],
             )
-            with session_engine_module.suppress_interruption_cascade():
+            with suppress_interruption_cascade():
                 replayed = await _collect_events(replay_app.interrupt_session(request))
             assert replayed[-1].id == interrupted[-1].id
             with pytest.raises(
@@ -7815,7 +7816,7 @@ def test_session_store_conformance_recovers_user_input_supersession_after_proces
                 reason="operator supersedes the paused question",
             )
             with (
-                session_engine_module.suppress_interruption_cascade(),
+                suppress_interruption_cascade(),
                 pytest.raises(
                     _SimulatedProcessLoss,
                     match="after user-input supersession committed",
@@ -7842,7 +7843,7 @@ def test_session_store_conformance_recovers_user_input_supersession_after_proces
                 AgentSpec(name="assistant", model="fake-model"),
                 tools=[UserInputTool()],
             )
-            with session_engine_module.suppress_interruption_cascade():
+            with suppress_interruption_cascade():
                 recovered = await _collect_events(recovery_app.interrupt_session(request))
             assert recovered[-1].type is EventType.SESSION_INTERRUPTED
             assert recovered[-1].payload["interruption_type"] == "operator_requested"
@@ -7869,7 +7870,7 @@ def test_session_store_conformance_recovers_user_input_supersession_after_proces
                 == (await _private_event_for_public_event(store, recovered[-1])).id
             )
 
-            with session_engine_module.suppress_interruption_cascade():
+            with suppress_interruption_cascade():
                 replayed = await _collect_events(recovery_app.interrupt_session(request))
             assert replayed[-1].id == recovered[-1].id
         finally:
@@ -7930,9 +7931,8 @@ def test_session_store_conformance_releases_offline_supersession_claim_after_pre
                 session_id=session_id,
                 reason="operator supersedes the paused question",
             )
-            recovery = app._session_engine._recovery_coordinator
             original_cancel_provider = (
-                recovery._model_completion_recovery.cancel_provider_operation_for_interruption
+                app._model_completion_recovery.cancel_provider_operation_for_interruption
             )
 
             async def fail_after_terminal_claim(*args, **kwargs):
@@ -7941,15 +7941,15 @@ def test_session_store_conformance_releases_offline_supersession_claim_after_pre
                 assert "incomplete_session_recovery_claim" in checkpoint
                 raise preparation_failure_type("provider cancellation preparation failed")
 
-            recovery._model_completion_recovery.cancel_provider_operation_for_interruption = (  # type: ignore[method-assign]
+            app._model_completion_recovery.cancel_provider_operation_for_interruption = (  # type: ignore[method-assign]
                 fail_after_terminal_claim
             )
             with (
-                session_engine_module.suppress_interruption_cascade(),
+                suppress_interruption_cascade(),
                 pytest.raises(expected_failure_type, match=expected_message),
             ):
                 await _collect_events(app.interrupt_session(request))
-            recovery._model_completion_recovery.cancel_provider_operation_for_interruption = (  # type: ignore[method-assign]
+            app._model_completion_recovery.cancel_provider_operation_for_interruption = (  # type: ignore[method-assign]
                 original_cancel_provider
             )
 
@@ -7957,7 +7957,7 @@ def test_session_store_conformance_releases_offline_supersession_claim_after_pre
             assert retained is not None
             assert "pending_session_interrupt" in retained
             assert "incomplete_session_recovery_claim" not in retained
-            with session_engine_module.suppress_interruption_cascade():
+            with suppress_interruption_cascade():
                 events = await _collect_events(app.interrupt_session(request))
             assert events[-1].type is EventType.SESSION_INTERRUPTED
             final_checkpoint = await store.load_checkpoint(session_id)
@@ -7999,11 +7999,11 @@ def test_session_store_conformance_claim_loss_does_not_run_unclaimed_abandonment
                 session_id=session_id,
                 reason="operator supersedes the paused question",
             )
-            recovery = app._session_engine._recovery_coordinator
+            recovery = app._recovery_coordinator
             original_heartbeat = recovery._recovery_ownership.heartbeat
             original_publish = store.publish_interaction_transition
             original_status_transition = store.transition_status_and_checkpoint
-            original_finalize_abandoned = recovery.finalize_abandoned_session_run
+            original_finalize_abandoned = app._session_finalization.finalize_abandoned_session_run
             abandoned_finalization_calls = 0
 
             async def block_claimed_transition(*args, **kwargs):
@@ -8055,7 +8055,7 @@ def test_session_store_conformance_claim_loss_does_not_run_unclaimed_abandonment
             store.transition_status_and_checkpoint = (  # type: ignore[method-assign]
                 block_claimed_status_transition
             )
-            recovery.finalize_abandoned_session_run = (  # type: ignore[method-assign]
+            app._session_finalization.finalize_abandoned_session_run = (  # type: ignore[method-assign]
                 observe_abandoned_finalization
             )
             monkeypatch.setattr(
@@ -8065,7 +8065,7 @@ def test_session_store_conformance_claim_loss_does_not_run_unclaimed_abandonment
             )
 
             with (
-                session_engine_module.suppress_interruption_cascade(),
+                suppress_interruption_cascade(),
                 pytest.raises(
                     recovery_coordinator_module._IncompleteRecoveryClaimLost,
                     match="peer replaced",
@@ -8107,7 +8107,7 @@ def test_session_store_conformance_claim_loss_does_not_run_unclaimed_abandonment
             store.transition_status_and_checkpoint = (  # type: ignore[method-assign]
                 original_status_transition
             )
-            recovery.finalize_abandoned_session_run = (  # type: ignore[method-assign]
+            app._session_finalization.finalize_abandoned_session_run = (  # type: ignore[method-assign]
                 original_finalize_abandoned
             )
             monkeypatch.setattr(
@@ -8115,7 +8115,7 @@ def test_session_store_conformance_claim_loss_does_not_run_unclaimed_abandonment
                 "heartbeat",
                 original_heartbeat,
             )
-            with session_engine_module.suppress_interruption_cascade():
+            with suppress_interruption_cascade():
                 retried = await _collect_events(app.interrupt_session(request))
             assert retried[-1].type is EventType.SESSION_INTERRUPTED
             assert retried[-1].payload["interruption_type"] == "operator_requested"
@@ -8267,7 +8267,7 @@ def test_session_store_conformance_reconciles_terminal_finalization_claim_transf
                 commit_supersession_then_stop
             )
             with (
-                session_engine_module.suppress_interruption_cascade(),
+                suppress_interruption_cascade(),
                 pytest.raises(_SimulatedProcessLoss, match="supersession transition"),
             ):
                 await _collect_events(app.interrupt_session(request))
@@ -8369,12 +8369,12 @@ def test_session_store_conformance_reconciles_terminal_finalization_claim_transf
                 interrupt_claim_acknowledgement
             )
             if claim_boundary == "ack-loss":
-                with session_engine_module.suppress_interruption_cascade():
+                with suppress_interruption_cascade():
                     events = await _collect_events(app.interrupt_session(request))
                 assert events[-1].type is EventType.SESSION_INTERRUPTED
             elif claim_boundary == "payload-conflict":
                 with (
-                    session_engine_module.suppress_interruption_cascade(),
+                    suppress_interruption_cascade(),
                     pytest.raises(
                         SessionRuntimePublicationConflict,
                         match="interrupt identity changed",
@@ -8403,7 +8403,7 @@ def test_session_store_conformance_reconciles_terminal_finalization_claim_transf
                 "grouped-control",
             }:
                 with (
-                    session_engine_module.suppress_interruption_cascade(),
+                    suppress_interruption_cascade(),
                     pytest.raises(
                         GeneratorExit,
                         match="terminal claim transfer stopped",
@@ -8442,11 +8442,11 @@ def test_session_store_conformance_reconciles_terminal_finalization_claim_transf
                     )
                 store.load_checkpoint = original_load_checkpoint  # type: ignore[method-assign]
                 store.transform_checkpoint_with_store_time = original_transform  # type: ignore[method-assign]
-                with session_engine_module.suppress_interruption_cascade():
+                with suppress_interruption_cascade():
                     events = await _collect_events(app.interrupt_session(request))
                 assert events[-1].type is EventType.SESSION_INTERRUPTED
             else:
-                with session_engine_module.suppress_interruption_cascade():
+                with suppress_interruption_cascade():
                     retrying = asyncio.create_task(_collect_events(app.interrupt_session(request)))
                     await asyncio.wait_for(claim_committed.wait(), timeout=5)
                     retrying.cancel("cancel terminal claim acknowledgement")
@@ -8487,7 +8487,7 @@ def test_session_store_conformance_reconciles_terminal_finalization_claim_transf
                     AgentSpec(name="assistant", model="fake-model"),
                     tools=[UserInputTool()],
                 )
-                with session_engine_module.suppress_interruption_cascade():
+                with suppress_interruption_cascade():
                     events = await _collect_events(recovery_app.interrupt_session(request))
                 assert events[-1].type is EventType.SESSION_INTERRUPTED
 
@@ -8553,7 +8553,7 @@ def test_session_store_conformance_settles_replacement_claim_when_terminal_event
                 commit_supersession_then_stop
             )
             with (
-                session_engine_module.suppress_interruption_cascade(),
+                suppress_interruption_cascade(),
                 pytest.raises(_SimulatedProcessLoss, match="supersession transition"),
             ):
                 await _collect_events(app.interrupt_session(request))
@@ -8574,7 +8574,7 @@ def test_session_store_conformance_settles_replacement_claim_when_terminal_event
             expected_payload = checkpoint["pending_session_interrupt"]
             assert "incomplete_session_recovery_claim" not in checkpoint
 
-            recovery = engine._recovery_coordinator
+            recovery = app._recovery_coordinator
             original_renewal = recovery.terminal_finalization.renew_claim
             persisted_event: Event | None = None
 
@@ -8607,7 +8607,7 @@ def test_session_store_conformance_settles_replacement_claim_when_terminal_event
                 lambda _session_id: True
             )
             try:
-                with session_engine_module.suppress_interruption_cascade():
+                with suppress_interruption_cascade():
                     replayed = await _collect_events(app.interrupt_session(request))
             finally:
                 recovery.terminal_finalization.renew_claim = (  # type: ignore[method-assign]
@@ -8680,7 +8680,7 @@ def test_session_store_conformance_user_input_supersession_retry_joins_live_fina
                 session_id=session_id,
                 reason="operator supersedes the paused question",
             )
-            with session_engine_module.suppress_interruption_cascade():
+            with suppress_interruption_cascade():
                 owner_task = asyncio.create_task(_collect_events(app.interrupt_session(request)))
                 tasks.append(owner_task)
                 await asyncio.wait_for(owner_started.wait(), timeout=10)
@@ -8703,8 +8703,7 @@ def test_session_store_conformance_user_input_supersession_retry_joins_live_fina
                 )
                 peer_claim_finished = False
                 join_read_started = asyncio.Event()
-                peer_recovery = peer_app._session_engine._recovery_coordinator
-                original_peer_claim = peer_recovery._claim_incomplete_recovery
+                original_peer_claim = peer_app._recovery_ownership.claim
                 original_peer_load_checkpoint = peer_store.load_checkpoint
 
                 async def observe_live_owner(*args, **kwargs):
@@ -8740,7 +8739,7 @@ def test_session_store_conformance_user_input_supersession_retry_joins_live_fina
                         raise TimeoutError("Live terminal finalizer did not clear its marker.")
                     return checkpoint_before_handoff
 
-                peer_recovery._claim_incomplete_recovery = (  # type: ignore[method-assign]
+                peer_app._recovery_ownership.claim = (  # type: ignore[method-assign]
                     observe_live_owner
                 )
                 peer_store.load_checkpoint = (  # type: ignore[method-assign]
@@ -8891,7 +8890,7 @@ def test_session_store_conformance_replays_user_input_supersession_after_termina
                 reason="operator supersedes the paused question",
             )
             with (
-                session_engine_module.suppress_interruption_cascade(),
+                suppress_interruption_cascade(),
                 pytest.raises(_SimulatedProcessLoss),
             ):
                 await _collect_events(app.interrupt_session(request))
@@ -9013,7 +9012,7 @@ def test_session_store_conformance_replays_user_input_supersession_after_termina
                 replay_engine._session_finalization.clear_pending_session_interrupt = (  # type: ignore[method-assign]
                     hold_repair_before_marker_clear
                 )
-                with session_engine_module.suppress_interruption_cascade():
+                with suppress_interruption_cascade():
                     first_retry = asyncio.create_task(
                         _collect_events(replay_app.interrupt_session(request))
                     )
@@ -9073,7 +9072,7 @@ def test_session_store_conformance_replays_user_input_supersession_after_termina
                     assert (
                         await _private_event_for_public_event(store, returned_terminals[0])
                     ).id == before_replay[0].event.id
-                with session_engine_module.suppress_interruption_cascade():
+                with suppress_interruption_cascade():
                     replayed = await _collect_events(replay_app.interrupt_session(request))
             assert replayed[-1].type is EventType.SESSION_INTERRUPTED
             final_checkpoint = await store.load_checkpoint(session_id)
@@ -9099,7 +9098,7 @@ def test_session_store_conformance_replays_user_input_supersession_after_termina
                 == (await _private_event_for_public_event(store, replayed[-1])).id
             )
 
-            with session_engine_module.suppress_interruption_cascade():
+            with suppress_interruption_cascade():
                 exact_retry = await _collect_events(replay_app.interrupt_session(request))
             assert exact_retry[-1].id == replayed[-1].id
             with pytest.raises(
@@ -9314,7 +9313,7 @@ def test_session_store_conformance_reconstructs_active_user_input_supersession(
                 session_id=session_id,
                 reason="operator supersedes active pause",
             )
-            with session_engine_module.suppress_interruption_cascade():
+            with suppress_interruption_cascade():
                 interrupting = asyncio.create_task(_collect_events(app.interrupt_session(request)))
                 await asyncio.wait_for(handler_entered.wait(), timeout=10)
                 claimed_checkpoint = await store.load_checkpoint(session_id)
@@ -9646,7 +9645,7 @@ def test_session_store_conformance_releases_live_supersession_handoff_after_read
                 session_id=session_id,
                 reason="operator supersedes active pause",
             )
-            with session_engine_module.suppress_interruption_cascade():
+            with suppress_interruption_cascade():
                 interrupting = asyncio.create_task(_collect_events(app.interrupt_session(request)))
                 await asyncio.wait_for(handler_finished.wait(), timeout=5)
             assert read_failure_injected is True
@@ -9674,7 +9673,7 @@ def test_session_store_conformance_releases_live_supersession_handoff_after_read
             app._session_finalization.handle_session_interrupted = (  # type: ignore[method-assign]
                 original_handler
             )
-            with session_engine_module.suppress_interruption_cascade():
+            with suppress_interruption_cascade():
                 retried = await _collect_events(app.interrupt_session(request))
             assert retried[-1].type is EventType.SESSION_INTERRUPTED
             final_checkpoint = await store.load_checkpoint(session_id)
@@ -9786,7 +9785,7 @@ def test_session_store_conformance_reclaims_unaccepted_live_supersession_handoff
                 session_id=session_id,
                 reason="operator supersedes active pause",
             )
-            with session_engine_module.suppress_interruption_cascade():
+            with suppress_interruption_cascade():
                 interrupting = asyncio.create_task(_collect_events(app.interrupt_session(request)))
                 await asyncio.wait_for(rejected_before_take.wait(), timeout=5)
                 await asyncio.wait_for(
@@ -9825,7 +9824,7 @@ def test_session_store_conformance_reclaims_unaccepted_live_supersession_handoff
                 original_side_effect_claim
             )
             release_fan_out.set()
-            with session_engine_module.suppress_interruption_cascade():
+            with suppress_interruption_cascade():
                 retried = await _collect_events(app.interrupt_session(request))
             assert retried[-1].type is EventType.SESSION_INTERRUPTED
         finally:
@@ -9906,7 +9905,7 @@ def test_session_store_conformance_does_not_dispatch_expired_terminal_finalizati
                 expire_claim_after_atomic_transition
             )
             with (
-                session_engine_module.suppress_interruption_cascade(),
+                suppress_interruption_cascade(),
                 pytest.raises(
                     recovery_coordinator_module._IncompleteRecoveryClaimLost,
                     match=(
@@ -9948,7 +9947,7 @@ def test_session_store_conformance_does_not_dispatch_expired_terminal_finalizati
                 "_INCOMPLETE_RECOVERY_CLAIM_LEASE",
                 timedelta(minutes=5),
             )
-            with session_engine_module.suppress_interruption_cascade():
+            with suppress_interruption_cascade():
                 retried = await _collect_events(app.interrupt_session(request))
             assert retried[-1].type is EventType.SESSION_INTERRUPTED
             final_checkpoint = await store.load_checkpoint(session_id)
@@ -10015,7 +10014,7 @@ def test_session_store_conformance_replaces_expired_recovery_claim_during_pause_
                 session_id=session_id,
                 reason="operator supersedes expired recovery owner",
             )
-            with session_engine_module.suppress_interruption_cascade():
+            with suppress_interruption_cascade():
                 events = await _collect_events(app.interrupt_session(request))
             assert events[-1].type is EventType.SESSION_INTERRUPTED
             assert events[-1].payload["interruption_type"] == "operator_requested"
@@ -10625,7 +10624,7 @@ def test_sqlite_public_interrupt_fatal_claim_callback_releases_writer_transactio
                 fail_public_claim_callback
             )
             with (
-                session_engine_module.suppress_interruption_cascade(),
+                suppress_interruption_cascade(),
                 pytest.raises(
                     FatalClaimCallbackSignal,
                     match="public terminal claim callback stopped",
@@ -10642,7 +10641,7 @@ def test_sqlite_public_interrupt_fatal_claim_callback_releases_writer_transactio
             assert store._connection.in_transaction is False
 
             store.transition_status_and_checkpoint = original_transition  # type: ignore[method-assign]
-            with session_engine_module.suppress_interruption_cascade():
+            with suppress_interruption_cascade():
                 events = await _collect_events(
                     app.interrupt_session(
                         InterruptSessionRequest(
@@ -10690,7 +10689,7 @@ def test_incomplete_recovery_success_does_not_suppress_simultaneous_claim_loss(
         )
         session = await store.load(session_id)
         assert session is not None
-        recovery = app._session_engine._recovery_coordinator
+        recovery = app._recovery_coordinator
         release = asyncio.Event()
 
         async def lose_claim_with_recovery_completion(**_kwargs):
@@ -10828,7 +10827,7 @@ def test_session_store_conformance_stops_live_finalizer_after_terminal_claim_los
                 session_id=session_id,
                 reason="operator supersedes active pause",
             )
-            with session_engine_module.suppress_interruption_cascade():
+            with suppress_interruption_cascade():
                 interrupting = asyncio.create_task(_collect_events(app.interrupt_session(request)))
                 tasks.append(interrupting)
                 await asyncio.wait_for(handler_entered.wait(), timeout=10)
@@ -10837,7 +10836,7 @@ def test_session_store_conformance_stops_live_finalizer_after_terminal_claim_los
                 lost_claim = checkpoint["incomplete_session_recovery_claim"]
                 lost_claim_id = lost_claim["claim_id"]
 
-                recovery = app._session_engine._recovery_coordinator
+                recovery = app._recovery_coordinator
                 original_renew = recovery._recovery_ownership.renew_claim
 
                 async def lose_live_claim(
@@ -17397,13 +17396,14 @@ def test_auxiliary_owner_dispatch_fences_survive_interruption(
             assert await store.load_transcript(session_id) == []
             assert await store.load_events(session_id) == []
             if interruption in {"prepare_error", "prepare_cancel"}:
-                coordinator = app._session_engine._recovery_coordinator
-                recovered = await coordinator._model_completion_recovery.reconcile_model_completion_boundary(
-                    running
+                recovered = (
+                    await app._model_completion_recovery.reconcile_model_completion_boundary(
+                        running
+                    )
                 )
                 assert recovered.state == "prepared_abandoned"
                 assert await store.load_active_model_completion_stage(session_id) is None
-                replay = await coordinator._model_completion_recovery.reconcile_model_completion_boundary(
+                replay = await app._model_completion_recovery.reconcile_model_completion_boundary(
                     running
                 )
                 assert replay.state == "none"
@@ -28569,7 +28569,7 @@ def test_session_store_conformance_generated_profiled_fork_is_idempotent(
 
             monkeypatch.setattr(
                 app._session_engine,
-                "_require_ordinary_session_execution",
+                "require_ordinary_session_execution",
                 reject_source_admission,
             )
 

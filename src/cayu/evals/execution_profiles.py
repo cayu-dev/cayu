@@ -504,7 +504,7 @@ async def prepare_eval_execution_profile(
     causal_keys = {limit.key for limit in request.budget_limits if limit.scope == "causal"}
     if request.causal_budget_id is None and len(causal_keys) == 1:
         request = request.model_copy(update={"causal_budget_id": next(iter(causal_keys))})
-    prepared = await target.app._session_engine._prepare_initial_run(
+    prepared = await target.app._session_engine.prepare_initial_run(
         request,
         admit_session=False,
     )

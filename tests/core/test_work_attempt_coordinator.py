@@ -22,6 +22,7 @@ import sys
 blocked = {
     "cayu.applications", "cayu.runtime._session_engine",
     "cayu.runtime._model_step_executor", "cayu.runtime._recovery_coordinator",
+    "cayu.runtime._session_recovery",
 }
 
 class RejectControllers(importlib.abc.MetaPathFinder):
@@ -39,6 +40,10 @@ from cayu.vaults.redaction import SecretRedactor
 
 class ReachedEngine(Exception):
     pass
+
+class Recovery:
+    async def recover_work_attempt_session(self, *args, **kwargs):
+        raise AssertionError("Admission does not perform session recovery")
 
 class Engine:
     def __init__(self):
@@ -74,7 +79,7 @@ async def run():
     engine = Engine()
     coordinator = WorkAttemptCoordinator(
         get_task_store=lambda: store[0], session_store=InMemorySessionStore(),
-        engine=engine, redactor=SecretRedactor(),
+        engine=engine, recovery=Recovery(), redactor=SecretRedactor(),
         apply_run_defaults=lambda request: request.model_copy(update={"max_steps": 3}),
         resolve_session=resolve_session, checkpoint_guard=checkpoint_guard,
     )

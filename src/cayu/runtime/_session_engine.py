@@ -19,7 +19,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from cayu.resource_access import ResourceAccessPolicy, restore_session_stream
+from cayu.resource_access import ResourceAccessPolicy, ResourceSessionStream, restore_session_stream
 from cayu.runtime import _execution_profile_continuation as execution_profile_continuation
 from cayu.runtime._assistant_model_publication import AssistantModelPublication
 from cayu.runtime._durable_tool_round import DeferredInteractionInput, DurableToolRound
@@ -46,11 +46,12 @@ from cayu.runtime._model_completion_recovery import ModelCompletionRecovery
 from cayu.runtime._model_policy import PolicySelection
 from cayu.runtime._pending_tool_round_recovery import PendingToolRoundRecovery
 from cayu.runtime._policy_wire import decode as decode_policy_evidence
-from cayu.runtime._recovery_ownership import RecoveryOwnership
+from cayu.runtime._recovery_ownership import (
+    RecoveryOwnership,
+    _checkpoint_without_active_incomplete_recovery_claim,
+)
 from cayu.runtime._session_finalization import (
     _INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE,
-    _INTERACTION_TRANSITION_REPLAY_ATTEMPTS_ATTRIBUTE,
-    _INTERACTION_TRANSITION_REPLAY_FAILURE_AUTHORITY,
     _INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE,
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
     _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
@@ -59,6 +60,7 @@ from cayu.runtime._session_finalization import (
     _close_async_iterator,
     _collect_through_event_type,
     _interaction_transition_failure_diagnostics,
+    _interaction_transition_replay_failures,
     _is_interaction_transition_run_fence,
     _pop_interaction_transition_cancellation_outcome,
     _raise_primary_with_secondary_failure,
@@ -75,7 +77,6 @@ from cayu.runtime._terminal_evidence_finalization import TerminalEvidenceFinaliz
 from cayu.runtime._terminal_evidence_reader import TerminalEvidenceReader
 from cayu.runtime._user_input_recovery_evidence import UserInputRecoveryEvidence
 from cayu.runtime._work_attempt_invocation import (
-    _WorkAttemptRecoveryAlreadyActive,
     _WorkAttemptRuntimeAuthority,
 )
 from cayu.sessions import _completion_finalization as completion_finalization
@@ -414,7 +415,6 @@ from cayu.runtime._interruption_coordinator import (
     _interruption_cascade_retry_event_payload,
     interruption_cascade_lease_seconds,
     interruption_cascade_suppressed,
-    suppress_interruption_cascade,
 )
 from cayu.runtime._invocation_lifecycle import (
     InvocationContext,
@@ -458,9 +458,7 @@ from cayu.runtime._model_step_executor import (
 )
 from cayu.runtime._producer_execution import _ProducerExecution
 from cayu.runtime._provider_operation_start_owner import is_ambiguous_provider_operation_start_error
-from cayu.runtime._recovery_coordinator import (
-    RecoveryCoordinator,
-    _checkpoint_without_active_incomplete_recovery_claim,
+from cayu.runtime._recovery_claims import (
     _IncompleteRecoveryClaim,
 )
 from cayu.runtime._recovery_requests import (
@@ -570,10 +568,8 @@ from cayu.runtime.model_steps import (
 from cayu.runtime.provider_operations import (
     _PROVIDER_OPERATION_FALLBACK_ORDINALS_CHECKPOINT_KEY,
     _PROVIDER_OPERATION_PENDING_DISPOSITION_CHECKPOINT_KEY,
-    ProviderOperationEvidenceError,
     ProviderOperationInspectionStatus,
     inspect_provider_operation,
-    load_recoverable_provider_operation,
     pending_provider_operation_disposition_from_checkpoint,
 )
 from cayu.runtime.stop_policy import StopDecision, StopLimit
@@ -680,7 +676,6 @@ from cayu.sessions.base import (
     _mark_session_invocation_terminal_event,
     _runtime_resume_transport_metadata,
     _session_metadata_with_model_projection,
-    _set_session_interaction_recovered_active_through,
     attribute_event_to_current_interaction,
     attribute_events_to_current_interaction,
     bind_runtime_session_create_claim,
@@ -753,7 +748,6 @@ from cayu.sessions.messaging import (
     SessionQueuedMessagesPending,
     queued_session_message_input,
 )
-from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import (
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     Session,
@@ -766,15 +760,7 @@ from cayu.sessions.records import (
 )
 from cayu.sessions.recovery import (
     IncompleteSessionRecoveryAction,
-    IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
-    IncompleteSessionsRecoveryPage,
-    IncompleteSessionsRecoveryRequest,
-    RecoveryBlockerCode,
-    StartupRecoveryBlockedSession,
-    StartupRecoveryResult,
-    copy_incomplete_session_recovery_request,
-    copy_incomplete_sessions_recovery_request,
 )
 from cayu.sessions.requests import (
     CompactSessionRequest,
@@ -1951,39 +1937,6 @@ def _consume_authenticated_interaction_transition_run_fence(
             _INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE,
         )
     return authenticated
-
-
-def _interaction_transition_replay_failures(
-    error: BaseException,
-) -> tuple[Exception, ...] | None:
-    """Return runtime-owned replay failures for durable diagnostics."""
-
-    try:
-        authority = BaseException.__getattribute__(
-            error,
-            "_cayu_interaction_transition_replay_failure",
-        )
-    except (AttributeError, TypeError):
-        return None
-    if authority is not _INTERACTION_TRANSITION_REPLAY_FAILURE_AUTHORITY or not isinstance(
-        error,
-        ExceptionGroup,
-    ):
-        return None
-    try:
-        attempts = BaseException.__getattribute__(
-            error,
-            _INTERACTION_TRANSITION_REPLAY_ATTEMPTS_ATTRIBUTE,
-        )
-    except (AttributeError, TypeError):
-        return None
-    if (
-        type(attempts) is not tuple
-        or len(attempts) < 2
-        or any(not isinstance(attempt, Exception) for attempt in attempts)
-    ):
-        return None
-    return attempts
 
 
 def _transcript_snapshot_messages(snapshot: TranscriptSnapshot) -> list[Message]:
@@ -3590,6 +3543,35 @@ def _active_transition_matches_profile_decision(
     )
 
 
+@dataclass(frozen=True)
+class _ResumePreparation:
+    """Validated continuation input retained across abandoned-owner recovery."""
+
+    request: ResumeRequest
+    task_id: str | None
+    start_event_payload_extra: dict[str, Any]
+    start_task_on_enter: bool
+    adoption_request_fingerprint: str | None
+    source_execution_profile: ExecutionProfileIdentity | None
+    required_execution_profile: ExecutionProfileIdentity | None
+    required_session_instance_fingerprint: str | None
+    required_task_session_instance_id: str | None
+    run_operation_id: str | None
+    terminal_event_id: str | None
+    queue_task_id: str | None
+    queued_dispatch_id: str | None
+    required_foreground_wait: ForegroundChildWait | None
+    required_foreground_terminal: ForegroundChildTerminal | None
+    required_foreground_continuation: ForegroundParentContinuation | None
+    foreground_before_mutation: Callable[[], Awaitable[None]] | None
+    continuation_handoff: _ResumeAdmissionHandoff | None
+    participant_context: CollaborationAccessContext | None
+    execution_to_wait: _ExternalExecutionToWait | None
+    budget_policy: BudgetPolicy | None
+    loaded_session: Session
+    recovery_required: bool
+
+
 class SessionEngine:
     """Own durable session operations and one run's end-to-end orchestration."""
 
@@ -3597,6 +3579,7 @@ class SessionEngine:
         self,
         *,
         session_store: SessionStore,
+        resource_session_stream: ResourceSessionStream,
         require_participant_execution: Callable[
             [Session, CollaborationAccessContext | None], Awaitable[None]
         ],
@@ -3613,7 +3596,6 @@ class SessionEngine:
         user_input_evidence: UserInputRecoveryEvidence,
         request_footprint: RequestFootprintConfig,
         tool_round_executor: ToolRoundExecutor,
-        recovery_coordinator: RecoveryCoordinator,
         recovery_ownership: RecoveryOwnership,
         terminal_evidence: TerminalEvidenceReader,
         terminal_finalization: TerminalEvidenceFinalization,
@@ -3654,6 +3636,7 @@ class SessionEngine:
         self._policy_selection = policy_selection
         self._resource_access_policy = resource_access_policy
         self.session_store = session_store
+        self._resource_session_stream = resource_session_stream
         self._require_participant_execution = require_participant_execution
         self.task_store = task_store
         self._get_budget_policy = get_budget_policy
@@ -3665,7 +3648,6 @@ class SessionEngine:
         self._assistant_model_publication = assistant_model_publication
         self._request_footprint = copy_request_footprint_config(request_footprint)
         self._tool_round_executor = tool_round_executor
-        self._recovery_coordinator = recovery_coordinator
         self._pending_tool_round_recovery = pending_tool_round_recovery
         self._deferred_input = deferred_input
         self._recovery_ownership = recovery_ownership
@@ -3674,7 +3656,6 @@ class SessionEngine:
         self._session_finalization = session_finalization
         self._foreground_gate_policy_owner = foreground_gate_policy_owner
         self._terminal_event_publication = terminal_event_publication
-        self._startup_recovery_result = StartupRecoveryResult()
         if type(recovery_cleanup_supervisor) is not RecoveryCleanupSupervisor:
             raise TypeError("recovery_cleanup_supervisor must be a RecoveryCleanupSupervisor.")
         self._recovery_cleanup_supervisor = recovery_cleanup_supervisor
@@ -3718,6 +3699,10 @@ class SessionEngine:
         self._user_input_evidence = user_input_evidence
         self._detached_session_operation_tasks: set[asyncio.Task[Any]] = set()
         self._session_operation_failures = LateFailures("Final session accounting")
+
+    @property
+    def execution_profile_policy_identity(self) -> str | None:
+        return self._execution_profile_policy_identity
 
     def work_attempt_source_request_sha256(
         self,
@@ -4639,329 +4624,6 @@ class SessionEngine:
             )
         return error, outcome.cancellation
 
-    async def resume_pending_interruption_cascade(
-        self,
-        session_id: str,
-        interrupting_inactive_for_seconds: int | None = None,
-    ) -> bool:
-        """Resume exactly one durable descendant-interruption cascade."""
-
-        if interrupting_inactive_for_seconds is not None and (
-            type(interrupting_inactive_for_seconds) is not int
-            or not 0 <= interrupting_inactive_for_seconds <= MAX_DURABLE_JSON_INTEGER
-        ):
-            raise ValueError(
-                "interrupting_inactive_for_seconds must be a non-negative durable integer."
-            )
-        session = await self._require_session(session_id)
-        if session.status not in {
-            SessionStatus.INTERRUPTING,
-            SessionStatus.INTERRUPTED,
-        } or (
-            session.status is SessionStatus.INTERRUPTING
-            and interrupting_inactive_for_seconds is None
-        ):
-            return False
-        marker = await self._background_interruption_coordinator.load_pending_interruption_cascade(
-            session.id
-        )
-        if marker is None:
-            return False
-        if session.status is SessionStatus.INTERRUPTING:
-            (
-                requires_completion_decision,
-                admission_failure,
-            ) = await self._verifier_aware_task_execution_outcome(
-                None,
-                session_id=session.id,
-                admit_session=False,
-            )
-            if admission_failure is not None:
-                raise_task_store_operation_failure(admission_failure)
-            if requires_completion_decision:
-                return False
-
-        already_scheduled = self._background_interruption_coordinator.is_admitted(session.id)
-        if session.status is SessionStatus.INTERRUPTING:
-            recovery_session_id = session.id
-
-            async def admit_before_recovery_mutation() -> None:
-                (
-                    requires_completion_decision,
-                    admission_failure,
-                ) = await self._verifier_aware_task_execution_outcome(
-                    None,
-                    session_id=recovery_session_id,
-                )
-                if admission_failure is not None:
-                    raise_task_store_operation_failure(admission_failure)
-                if requires_completion_decision:
-                    raise TaskCompletionDecisionRequired(
-                        "Contracted tasks require the verifier-aware execution entrance."
-                    ) from None
-
-            with suppress_interruption_cascade():
-                recovery = await self._recovery_coordinator.recover_incomplete_session(
-                    IncompleteSessionRecoveryRequest(
-                        session_id=session.id,
-                        inactive_for_seconds=interrupting_inactive_for_seconds,
-                        reason="interruption_cascade_operator_recovery",
-                        metadata={"source": "recovery_plan"},
-                    ),
-                    before_mutation=admit_before_recovery_mutation,
-                )
-            session = await self._require_session(session.id)
-            if session.status is not SessionStatus.INTERRUPTED:
-                raise RuntimeError(
-                    "Could not finalize the interruption-cascade parent during recovery: "
-                    f"{recovery.actions!r}."
-                )
-        if already_scheduled:
-            task = self._session_finalization.schedule_background_interruption_cascade(
-                parent_session_id=session.id,
-                interrupt_payload=marker["interrupt_payload"],
-                create_if_missing=False,
-            )
-            if task is not None:
-                await asyncio.shield(task)
-        else:
-            await self._background_interruption_coordinator.run_cascade(
-                parent_session_id=session.id,
-                interrupt_payload=marker["interrupt_payload"],
-                create_if_missing=False,
-            )
-        return not already_scheduled
-
-    async def resume_pending_interruption_cascades(
-        self,
-        *,
-        interrupting_inactive_for_seconds: int | None = None,
-        startup_preflight: Callable[[str, int], Awaitable[tuple[RecoveryBlockerCode, ...] | None]]
-        | None = None,
-    ) -> int:
-        """Resume durable descendant interruption work left by an earlier process.
-
-        Both ``interrupting`` and ``interrupted`` parents are inspected. An
-        ``interrupting`` parent is finalized only when
-        ``interrupting_inactive_for_seconds`` is supplied and the store can fence that
-        inactive run. Work remains checkpointed until traversal succeeds, so
-        another restart can retry it safely. Returns the number of roots scheduled.
-        """
-
-        if interrupting_inactive_for_seconds is not None and (
-            type(interrupting_inactive_for_seconds) is not int
-            or not 0 <= interrupting_inactive_for_seconds <= MAX_DURABLE_JSON_INTEGER
-        ):
-            raise ValueError(
-                "interrupting_inactive_for_seconds must be a non-negative durable integer."
-            )
-
-        scheduled = 0
-        blocked_ids: set[str] = set()
-        blocked: list[StartupRecoveryBlockedSession] = []
-        deferred_ids: set[str] = set()
-        skipped_ids: set[str] = set()
-        sweep_count = self._startup_recovery_result.sweep_count + 1
-
-        def report(*, status: Literal["running", "completed", "failed"] = "running") -> None:
-            self._startup_recovery_result = StartupRecoveryResult(
-                completed=status == "completed",
-                status=status,
-                sweep_count=sweep_count,
-                scheduled_roots=scheduled,
-                deferred_session_count=len(deferred_ids),
-                skipped_session_count=len(skipped_ids),
-                blocked_session_count=len(blocked_ids),
-                blocked_sessions=tuple(blocked),
-                blocked_sessions_truncated=len(blocked_ids) > len(blocked),
-            )
-
-        def record_blocked(session_id: str, codes: tuple[RecoveryBlockerCode, ...]) -> None:
-            if session_id in blocked_ids:
-                return
-            blocked_ids.add(session_id)
-            if len(blocked) < 100:
-                blocked.append(
-                    StartupRecoveryBlockedSession(session_id=session_id, blocker_codes=codes)
-                )
-            logger.warning(
-                "Startup recovery blocked session=%s blocker=%s",
-                self._secret_redactor.redact_text(session_id),
-                ",".join(code.value for code in codes),
-            )
-            report()
-
-        report()
-        try:
-            admitted_parent_ids: set[str] = set()
-            for status in (SessionStatus.INTERRUPTING, SessionStatus.INTERRUPTED):
-                if (
-                    status == SessionStatus.INTERRUPTING
-                    and interrupting_inactive_for_seconds is None
-                ):
-                    continue
-                cursor: str | None = None
-                while True:
-                    result = (
-                        await self.session_store.list_sessions_with_pending_interruption_cascade(
-                            SessionQuery(
-                                status=status,
-                                inactive_for_seconds=(
-                                    interrupting_inactive_for_seconds
-                                    if status == SessionStatus.INTERRUPTING
-                                    else None
-                                ),
-                                limit=1000,
-                                cursor=cursor,
-                                order_by=SessionOrder.CREATED_AT_ASC,
-                            )
-                        )
-                    )
-                    for session in result.sessions:
-                        if session.id in admitted_parent_ids:
-                            continue
-                        if (
-                            session.status == SessionStatus.INTERRUPTING
-                            and interrupting_inactive_for_seconds is None
-                        ):
-                            continue
-                        try:
-                            marker = await self._background_interruption_coordinator.load_pending_interruption_cascade(
-                                session.id
-                            )
-                        except (TypeError, ValueError):
-                            record_blocked(session.id, (RecoveryBlockerCode.INVALID_DURABLE_STATE,))
-                            continue
-                        if marker is None:
-                            continue
-                        if session.status == SessionStatus.INTERRUPTING:
-                            (
-                                requires_completion_decision,
-                                admission_failure,
-                            ) = await self._verifier_aware_task_execution_outcome(
-                                None,
-                                session_id=session.id,
-                                admit_session=False,
-                            )
-                            if admission_failure is not None:
-                                del marker, result, session
-                                raise_task_store_operation_failure(admission_failure)
-                            if requires_completion_decision:
-                                # Keep both the stale parent and its durable cascade marker
-                                # untouched for the verifier-aware recovery owner.
-                                continue
-                        already_scheduled = self._background_interruption_coordinator.is_admitted(
-                            session.id
-                        )
-                        if session.status == SessionStatus.INTERRUPTING:
-                            if startup_preflight is not None:
-                                assert interrupting_inactive_for_seconds is not None
-                                codes = await startup_preflight(
-                                    session.id, interrupting_inactive_for_seconds
-                                )
-                                if codes is None:
-                                    skipped_ids.add(session.id)
-                                    report()
-                                    continue
-                                if codes:
-                                    if set(codes) <= {
-                                        RecoveryBlockerCode.ACTIVE_RECOVERY_CLAIM,
-                                        RecoveryBlockerCode.ACTIVE_TASK_CLAIM,
-                                    }:
-                                        deferred_ids.add(session.id)
-                                        report()
-                                    else:
-                                        record_blocked(session.id, codes)
-                                    continue
-                            recovery_session_id = session.id
-
-                            async def admit_before_recovery_mutation(
-                                session_id: str = recovery_session_id,
-                            ) -> None:
-                                (
-                                    requires_completion_decision,
-                                    admission_failure,
-                                ) = await self._verifier_aware_task_execution_outcome(
-                                    None,
-                                    session_id=session_id,
-                                )
-                                if admission_failure is not None:
-                                    raise_task_store_operation_failure(admission_failure)
-                                if requires_completion_decision:
-                                    raise TaskCompletionDecisionRequired(
-                                        "Contracted tasks require the verifier-aware execution "
-                                        "entrance."
-                                    ) from None
-
-                            try:
-                                with suppress_interruption_cascade():
-                                    recovery = await self._recovery_coordinator.recover_incomplete_session(
-                                        IncompleteSessionRecoveryRequest(
-                                            session_id=session.id,
-                                            inactive_for_seconds=interrupting_inactive_for_seconds,
-                                            reason="interruption_cascade_startup_recovery",
-                                            metadata={
-                                                "source": "resume_pending_interruption_cascades"
-                                            },
-                                        ),
-                                        before_mutation=admit_before_recovery_mutation,
-                                    )
-                            except ExecutionProfileMismatchError:
-                                # A registration can change after read-only planning. Isolate
-                                # this typed per-session rejection; store and unknown failures propagate.
-                                record_blocked(
-                                    session.id, (RecoveryBlockerCode.REGISTRATION_INCOMPATIBLE,)
-                                )
-                                continue
-                            except ModelCompletionManualRecoveryRequired:
-                                record_blocked(
-                                    session.id, (RecoveryBlockerCode.MODEL_EFFECT_OUTCOME_UNKNOWN,)
-                                )
-                                continue
-                            except KeyError:
-                                # A root deleted after preflight is no longer startup work.
-                                if await self.session_store.load(session.id) is not None:
-                                    raise
-                                skipped_ids.add(session.id)
-                                report()
-                                continue
-                            recovered_session = await self.session_store.load(session.id)
-                            if recovered_session is None:
-                                skipped_ids.add(session.id)
-                                report()
-                                continue
-                            session = recovered_session
-                            if session.status != SessionStatus.INTERRUPTED:
-                                logger.warning(
-                                    "Could not finalize interruption cascade parent %s during "
-                                    "startup recovery: %s",
-                                    session.id,
-                                    recovery.message,
-                                )
-                                continue
-                        admitted_parent_ids.add(session.id)
-                        self._session_finalization.schedule_background_interruption_cascade(
-                            parent_session_id=session.id,
-                            interrupt_payload=marker["interrupt_payload"],
-                            create_if_missing=False,
-                        )
-                        if not already_scheduled:
-                            scheduled += 1
-                            report()
-                    if result.next_cursor is not None and result.next_cursor == cursor:
-                        raise RuntimeError("Startup recovery returned a repeated session cursor.")
-                    cursor = result.next_cursor
-                    if cursor is None:
-                        break
-        except BaseException:
-            report(status="failed")
-            raise
-        report(status="completed")
-        return scheduled
-
-    def get_startup_recovery_status(self) -> StartupRecoveryResult:
-        return self._startup_recovery_result.model_copy(deep=True)
-
     async def interruption_cascade_status(self, session_id: str) -> str:
         """Return the public control-plane state of a session's durable cascade."""
         durable_status = "none"
@@ -5045,152 +4707,7 @@ class SessionEngine:
             retry_request=retry_request,
         )
 
-    async def recover_abandoned_execution(
-        self,
-        session: Session,
-        *,
-        participant_context: CollaborationAccessContext | None = None,
-        replays_tool_calls: bool = False,
-    ) -> tuple[Event, ...]:
-        from cayu.runtime._abandoned_session_recovery import recover_abandoned_execution
-
-        await self._require_participant_execution(session, participant_context)
-        return await recover_abandoned_execution(
-            store=self.session_store,
-            session=session,
-            locally_active=self._session_control.has_active_tasks(session.id),
-            recover=lambda request: self.recover_incomplete_session(
-                request, participant_context=participant_context
-            ),
-            settle_model_dispatch=self._settle_abandoned_model_dispatch,
-            replays_tool_calls=replays_tool_calls,
-        )
-
-    async def _settle_abandoned_model_dispatch(self, session: Session) -> tuple[Event, ...]:
-        """Interrupt an assistant model call whose owning process is gone.
-
-        Only an ordinary dispatched call qualifies: no terminal response, no provider
-        operation that can be resumed or inspected, and no task contract that needs an
-        explicit completion decision. Everything else stays on the operator path.
-        """
-
-        from cayu.runtime.provider_operations import load_recoverable_provider_operation_start
-
-        active = await self.session_store.load_active_model_completion_stage(session.id)
-        if active is None:
-            return ()
-        stage = active.stage
-        context = model_completion_recovery_context_from_stage(stage)
-        if (
-            stage.state != "in_flight"
-            or stage.purpose != "assistant-turn"
-            or stage.intent.get("provider_operation_start") is not None
-            or context is None
-            or context.task_id is not None
-        ):
-            return ()
-        if (
-            await self.session_store.load_model_completion_stage_dispatch(
-                session.id, stage.stage_id
-            )
-            is None
-            or await self.session_store.load_model_completion_stage_settlement(
-                session.id, stage.stage_id
-            )
-            is not None
-        ):
-            return ()
-        try:
-            if (
-                await load_recoverable_provider_operation(self.session_store, stage) is not None
-                or await load_recoverable_provider_operation_start(self.session_store, stage)
-                is not None
-            ):
-                return ()
-        except ProviderOperationEvidenceError:
-            return ()
-        result = await self._recover_model_completion_stage(
-            ModelCompletionManualRecoveryRequest(
-                session_id=session.id,
-                stage_id=stage.stage_id,
-                expected_run_epoch=session.run_epoch,
-                expected_session_instance_id=session.instance_id,
-                terminal_status=SessionStatus.INTERRUPTED,
-                inactive_for_seconds=0,
-            )
-        )
-        return result.budget_events
-
-    async def recover_incomplete_session(
-        self,
-        request: IncompleteSessionRecoveryRequest,
-        *,
-        participant_context: CollaborationAccessContext | None = None,
-        execution_to_wait: _ExternalExecutionToWait | None = None,
-    ) -> IncompleteSessionRecoveryResult:
-        request = copy_incomplete_session_recovery_request(request)
-        (
-            requires_completion_decision,
-            admission_failure,
-        ) = await self._verifier_aware_task_execution_outcome(
-            None,
-            session_id=request.session_id,
-            admit_session=False,
-        )
-        if admission_failure is not None:
-            del request
-            raise_task_store_operation_failure(admission_failure)
-        if requires_completion_decision:
-            del request
-            raise TaskCompletionDecisionRequired(
-                "Contracted tasks require the verifier-aware execution entrance."
-            ) from None
-        interaction_id = await self._session_finalization.activate_latest_open_interaction(
-            request.session_id
-        )
-        active_through = (
-            None
-            if interaction_id is None
-            else await self._latest_interaction_activity_at(
-                request.session_id,
-                interaction_id,
-            )
-        )
-        if active_through is not None:
-            _set_session_interaction_recovered_active_through(
-                request.session_id,
-                active_through,
-            )
-        try:
-
-            async def admit_before_mutation() -> None:
-                (
-                    requires_completion_decision,
-                    admission_failure,
-                ) = await self._verifier_aware_task_execution_outcome(
-                    None,
-                    session_id=request.session_id,
-                )
-                if admission_failure is not None:
-                    raise_task_store_operation_failure(admission_failure)
-                if requires_completion_decision:
-                    raise TaskCompletionDecisionRequired(
-                        "Contracted tasks require the verifier-aware execution entrance."
-                    ) from None
-
-            return await self._recover_incomplete_session_after_admission(
-                request,
-                interaction_id=interaction_id,
-                active_through=active_through,
-                before_mutation=admit_before_mutation,
-                participant_context=participant_context,
-                execution_to_wait=execution_to_wait,
-            )
-        finally:
-            if interaction_id is not None:
-                _deactivate_session_interaction(request.session_id)
-
-    async def _recover_committed_runtime_task_failure(
+    async def recover_committed_runtime_task_failure(
         self,
         session: Session,
         checkpoint: dict[str, Any] | None,
@@ -5338,7 +4855,7 @@ class SessionEngine:
                 "Committed runtime task failure conflicts with the task terminal outcome."
             ) from None
         await before_mutation()
-        replayed, events = await self._replay_runtime_task_failure_if_needed(
+        replayed, events = await self.replay_runtime_task_failure_if_needed(
             session_id=session.id,
             task_id=task.id,
             task_worker_id=original_worker_id,
@@ -5361,154 +4878,6 @@ class SessionEngine:
             actions=(IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_OWNERSHIP,),
             events=events,
             message="Recovered the committed runtime task failure without redispatching work.",
-        )
-
-    async def _recover_work_attempt_session(
-        self,
-        request: IncompleteSessionRecoveryRequest,
-        *,
-        interaction_id: str,
-        before_mutation: Callable[[], Awaitable[None]],
-        admission: WorkAttemptAdmission | None = None,
-    ) -> IncompleteSessionRecoveryResult:
-        """Settle one contracted predecessor under authenticated attempt authority."""
-
-        request = copy_incomplete_session_recovery_request(request)
-        work_attempt = (
-            None
-            if admission is None or admission.execution_entry is None
-            else _authenticated_work_attempt_invocation(admission)
-        )
-        # A recovery generation replaces only the execution owner. Its durable
-        # WorkAttempt keeps the same interaction identity, so generic abandoned-
-        # session settlement must not publish an interaction terminal event that
-        # the replacement would then silently reopen.
-        _deactivate_session_interaction(request.session_id)
-        # Recovery is entered only after the task store has replaced the expired
-        # execution generation.  Retire any copied predecessor epoch in this
-        # caller before the owned settlement task is created; otherwise an
-        # in-process replacement can carry the crashed worker's context token
-        # into the new generation and reject its own post-settlement transition.
-        _deactivate_session_run_fence(request.session_id)
-
-        async def settle_predecessor() -> IncompleteSessionRecoveryResult:
-            return await self._recovery_coordinator.recover_incomplete_session(
-                request,
-                before_mutation=before_mutation,
-                preserve_interaction_id=interaction_id,
-                _work_attempt=work_attempt,
-            )
-
-        try:
-            return await settle_work_attempt_owned_operation(
-                settle_predecessor,
-                operation_name="work-attempt-predecessor-settlement",
-                preserved_failure_types=(
-                    _WorkAttemptRecoveryAlreadyActive,
-                    WorkAttemptExecutionClaimLost,
-                    WorkAttemptRecoveryRequired,
-                ),
-                redactor=self._secret_redactor,
-            )
-        finally:
-            _deactivate_session_interaction(request.session_id)
-            _deactivate_session_run_fence(request.session_id)
-
-    async def _recover_incomplete_session_after_admission(
-        self,
-        request: IncompleteSessionRecoveryRequest,
-        *,
-        interaction_id: str | None,
-        active_through: datetime | None,
-        before_mutation: Callable[[], Awaitable[None]],
-        participant_context: CollaborationAccessContext | None = None,
-        execution_to_wait: _ExternalExecutionToWait | None = None,
-    ) -> IncompleteSessionRecoveryResult:
-        retained_invocation_context: InvocationContext | None = None
-
-        def retain_invocation_context(context: InvocationContext) -> None:
-            nonlocal retained_invocation_context
-            if (
-                retained_invocation_context is not None
-                and retained_invocation_context is not context
-            ):
-                raise RuntimeError(
-                    "Incomplete-session recovery produced conflicting live authority."
-                )
-            retained_invocation_context = context
-
-        result = await self._recovery_coordinator.recover_incomplete_session(
-            request,
-            execution_to_wait=execution_to_wait,
-            before_mutation=before_mutation,
-            participant_context=participant_context,
-            retain_open_interaction_invocation=(interaction_id is not None),
-            retain_invocation_context=(
-                retain_invocation_context if interaction_id is not None else None
-            ),
-        )
-        if any(
-            action in result.actions
-            for action in (
-                IncompleteSessionRecoveryAction.AMBIGUOUS_PENDING_USER_INPUT,
-                IncompleteSessionRecoveryAction.PENDING_ALLOCATION_CLEANUP,
-            )
-        ):
-            return result
-        if interaction_id is not None:
-            _activate_session_interaction(request.session_id, interaction_id)
-        await before_mutation()
-        reconciled = await self._reconcile_recovered_interaction(
-            result,
-            recovered_active_through=active_through,
-            invocation_context=retained_invocation_context,
-        )
-        if interaction_id is not None and retained_invocation_context is not None:
-            await self._release_reconciled_recovery_invocation(
-                request.session_id,
-                invocation_context=retained_invocation_context,
-            )
-        return reconciled
-
-    async def _release_reconciled_recovery_invocation(
-        self,
-        session_id: str,
-        *,
-        invocation_context: InvocationContext | None,
-    ) -> None:
-        """Release a public recovery epoch after exact interaction settlement."""
-
-        session = await self.session_store.load(session_id)
-        checkpoint = await self.session_store.load_checkpoint(session_id)
-        active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
-        if (
-            session is None
-            or active_profile is None
-            or active_profile.run_epoch != session.run_epoch
-        ):
-            return
-        settlement = await self.session_store.load_invocation_settlement_transition(
-            session_id,
-            expected_session_instance_id=session.instance_id,
-            expected_active_invocation_profile=active_profile,
-        )
-        if settlement is None:
-            return
-        if (
-            invocation_context is None
-            or invocation_context.binding.session_id != session.id
-            or invocation_context.binding.session_instance_id != session.instance_id
-            or invocation_context.binding.run_epoch != session.run_epoch
-            or invocation_context.active_profile != active_profile
-        ):
-            raise RuntimeError(
-                "Reconciled recovery release lacks its authenticated invocation context."
-            )
-        _activate_session_run_fence(session)
-        await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
-            session_id=session_id,
-            execution_profile=invocation_context.profile,
-            invocation_context=invocation_context,
         )
 
     async def recover_model_completion_stage(
@@ -5902,291 +5271,6 @@ class SessionEngine:
             budget_events=tuple(budget_events),
             replayed=transition.replayed,
         )
-
-    async def recover_incomplete_sessions(
-        self,
-        request: IncompleteSessionsRecoveryRequest,
-    ) -> IncompleteSessionsRecoveryPage:
-        request = copy_incomplete_sessions_recovery_request(request)
-        active_through_by_session: dict[str, datetime] = {}
-
-        async def admit_and_activate_interaction(session_id: str) -> None:
-            (
-                requires_completion_decision,
-                admission_failure,
-            ) = await self._verifier_aware_task_execution_outcome(
-                None,
-                session_id=session_id,
-                admit_session=False,
-            )
-            if admission_failure is not None:
-                raise_task_store_operation_failure(admission_failure)
-            if requires_completion_decision:
-                raise TaskCompletionDecisionRequired(
-                    "Contracted tasks require the verifier-aware execution entrance."
-                ) from None
-            interaction_id = await self._session_finalization.activate_latest_open_interaction(
-                session_id
-            )
-            if interaction_id is not None:
-                active_through_by_session[session_id] = await self._latest_interaction_activity_at(
-                    session_id,
-                    interaction_id,
-                )
-                _set_session_interaction_recovered_active_through(
-                    session_id,
-                    active_through_by_session[session_id],
-                )
-
-        async def admit_before_mutation(session_id: str) -> None:
-            (
-                requires_completion_decision,
-                admission_failure,
-            ) = await self._verifier_aware_task_execution_outcome(
-                None,
-                session_id=session_id,
-            )
-            if admission_failure is not None:
-                raise_task_store_operation_failure(admission_failure)
-            if requires_completion_decision:
-                raise TaskCompletionDecisionRequired(
-                    "Contracted tasks require the verifier-aware execution entrance."
-                ) from None
-
-        async def deactivate_interaction(session_id: str) -> None:
-            _deactivate_session_interaction(session_id)
-
-        async def reconcile_result(
-            result: IncompleteSessionRecoveryResult,
-            invocation_context: InvocationContext | None,
-        ) -> IncompleteSessionRecoveryResult:
-            # Recovery cleanup can clear task-local interaction ownership. Restore
-            # the still-open durable interaction before publishing its terminal
-            # transition; the coordinator's after hook releases this ownership.
-            await self._session_finalization.activate_latest_open_interaction(result.session_id)
-            reconciled = await self._reconcile_recovered_interaction(
-                result,
-                recovered_active_through=active_through_by_session.get(result.session_id),
-                invocation_context=invocation_context,
-            )
-            if invocation_context is not None:
-                await self._release_reconciled_recovery_invocation(
-                    result.session_id,
-                    invocation_context=invocation_context,
-                )
-            return reconciled
-
-        recovery = self._recovery_coordinator.recover_incomplete_sessions(
-            request,
-            before_recovery=admit_and_activate_interaction,
-            before_mutation=admit_before_mutation,
-            after_recovery=deactivate_interaction,
-            reconcile_result=reconcile_result,
-        )
-        del request
-        return await recovery
-
-    async def _latest_interaction_activity_at(
-        self,
-        session_id: str,
-        interaction_id: str,
-    ) -> datetime:
-        records = await self.session_store.query_events(
-            EventQuery(
-                session_id=session_id,
-                interaction_id=interaction_id,
-                order_by=EventOrder.SEQUENCE_DESC,
-                limit=1,
-            )
-        )
-        if not records:
-            raise RuntimeError(f"Interaction has no durable activity: {interaction_id}")
-        return records[0].event.timestamp
-
-    async def _publish_durable_recovery_interaction_transition(
-        self,
-        *,
-        session: Session,
-        recovered_active_through: datetime | None,
-        invocation_context: InvocationContext | None,
-    ) -> tuple[Session, Event | None, bool]:
-        """Publish terminal recovery evidence under the applicable authority.
-
-        A context is mandatory once the session has ever acquired invocation
-        authority.  The context-free branch is retained only for a terminal
-        session that was created and disposed before invocation admission.
-        """
-
-        if invocation_context is None:
-            checkpoint = await self.session_store.load_checkpoint(session.id)
-            active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
-            if active_profile is None and invocation_lifecycle_receipt_history_present(checkpoint):
-                raise RuntimeError(
-                    "Recovery interaction settlement lost durable invocation authority."
-                )
-            if active_profile is not None and not active_invocation_execution_profile_is_released(
-                active_profile,
-                session_id=session.id,
-                run_epoch=session.run_epoch,
-            ):
-                raise RuntimeError("Recovery interaction settlement lost its invocation context.")
-            execution_profile = None
-        else:
-            execution_profile = invocation_context.profile
-
-        try:
-            return await self._session_finalization.publish_interaction_transition(
-                session=session,
-                invocation_context=invocation_context,
-                allow_released_invocation_authority=(invocation_context is None),
-                agent_name=session.agent_name,
-                environment_name=session.environment_name,
-                to_status=session.status,
-                from_statuses={session.status},
-                recovered_active_through=recovered_active_through,
-                execution_profile=execution_profile,
-            )
-        except asyncio.CancelledError as cancellation:
-            if _is_interaction_transition_run_fence(cancellation):
-                pop_exception_state(
-                    cancellation,
-                    _INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE,
-                )
-                pop_exception_state(
-                    cancellation,
-                    _INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE,
-                )
-                raise
-
-            transition_cancellation_outcome = _pop_interaction_transition_cancellation_outcome(
-                cancellation
-            )
-            if transition_cancellation_outcome is None:
-                transition_settled = False
-                interaction_transition_failures: list[dict[str, Any]] = []
-                interaction_transition: InteractionTransitionSpec | None = None
-            else:
-                (
-                    transition_settled,
-                    interaction_transition_failures,
-                    interaction_transition,
-                ) = transition_cancellation_outcome
-
-            async def reconcile_terminal_interaction() -> None:
-                if interaction_transition_failures and interaction_transition is not None:
-                    committed = await self._session_finalization.record_durable_interaction_transition_cancellation(
-                        session=session,
-                        transition=interaction_transition,
-                        failures=tuple(interaction_transition_failures),
-                        agent_name=session.agent_name,
-                        environment_name=session.environment_name,
-                        expected_recovery_claim_id=None,
-                    )
-                    if committed:
-                        return
-                if transition_settled or _latest_session_invocation_interaction_is_settled(
-                    session.id
-                ):
-                    return
-                await self._session_finalization.publish_interaction_transition(
-                    session=session,
-                    invocation_context=invocation_context,
-                    allow_released_invocation_authority=(invocation_context is None),
-                    agent_name=session.agent_name,
-                    environment_name=session.environment_name,
-                    to_status=session.status,
-                    from_statuses={session.status},
-                    recovered_active_through=recovered_active_through,
-                    execution_profile=execution_profile,
-                )
-
-            await _run_interaction_transition_cancellation_cleanup_steps(
-                cancellation,
-                supervisor=self._recovery_cleanup_supervisor,
-                steps=(
-                    (
-                        "terminal recovery interaction reconciliation",
-                        reconcile_terminal_interaction,
-                    ),
-                ),
-            )
-            raise
-
-    async def _reconcile_recovered_interaction(
-        self,
-        result: IncompleteSessionRecoveryResult,
-        *,
-        recovered_active_through: datetime | None,
-        invocation_context: InvocationContext | None,
-    ) -> IncompleteSessionRecoveryResult:
-        if any(
-            action in result.actions
-            for action in (
-                IncompleteSessionRecoveryAction.TERMINALIZED_ZERO_WORK,
-                IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,
-                IncompleteSessionRecoveryAction.SKIPPED_UNREGISTERED_AGENT,
-            )
-        ):
-            return result
-        if any(
-            event.type == EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED for event in result.events
-        ):
-            # Exact continuation is paused for an operator decision, not
-            # terminally disposed. Keep the interaction open so the authorized
-            # fallback can resume the same logical model step.
-            return result
-        if _current_session_interaction_id(result.session_id) is None:
-            return result
-        session = await self.session_store.load(result.session_id)
-        if session is None:
-            return result
-        if result.status not in {
-            SessionStatus.COMPLETED,
-            SessionStatus.FAILED,
-            SessionStatus.INTERRUPTED,
-        }:
-            return result
-        interaction_id = _current_session_interaction_id(result.session_id)
-        latest_records = await self.session_store.query_events(
-            EventQuery(
-                session_id=result.session_id,
-                interaction_id=interaction_id,
-                event_types=INTERACTION_LIFECYCLE_EVENT_TYPES,
-                order_by=EventOrder.SEQUENCE_DESC,
-                limit=1,
-            )
-        )
-        if latest_records and latest_records[0].event.type in INTERACTION_TERMINAL_EVENT_TYPES:
-            expected_terminal_type = {
-                SessionStatus.COMPLETED: EventType.INTERACTION_COMPLETED,
-                SessionStatus.FAILED: EventType.INTERACTION_FAILED,
-                SessionStatus.INTERRUPTED: EventType.INTERACTION_INTERRUPTED,
-            }[result.status]
-            if latest_records[0].event.type is not expected_terminal_type:
-                if await self._terminal_evidence.has_completed_queued_predecessor(
-                    session, latest_records[0].event
-                ):
-                    return result
-                raise RuntimeError(
-                    "Recovered interaction terminal evidence conflicts with session status."
-                )
-            # The real transition already committed under the live context in
-            # the inner recovery path.  Do not reuse that now-released context
-            # merely to replay a read-only acknowledgement.
-            return result
-        # Recovery already reconstructed and validated the exact live context.
-        # Retain that lineage through terminal publication instead of consulting
-        # mutable registrations or treating an equal durable profile as live authority.
-        # A context-free transition is allowed only for a pre-admission session;
-        # the publication helper positively proves that no invocation profile exists.
-        _, interaction_event, _ = await self._publish_durable_recovery_interaction_transition(
-            session=session,
-            recovered_active_through=recovered_active_through,
-            invocation_context=invocation_context,
-        )
-        if interaction_event is None:
-            return result
-        return result.model_copy(update={"events": (*result.events, interaction_event)})
 
     async def _emit_interaction_started(
         self,
@@ -6647,7 +5731,7 @@ class SessionEngine:
             result.events,
         )
 
-    async def _prepare_initial_run(
+    async def prepare_initial_run(
         self,
         request: RunRequest,
         *,
@@ -6761,7 +5845,7 @@ class SessionEngine:
         (
             requires_completion_decision,
             admission_failure,
-        ) = await self._verifier_aware_task_execution_outcome(
+        ) = await self.verifier_aware_task_execution_outcome(
             request.task_id,
             session_id=contract_lookup_session_id,
             admit_session=False,
@@ -7040,7 +6124,7 @@ class SessionEngine:
             (
                 requires_completion_decision,
                 admission_failure,
-            ) = await self._verifier_aware_task_execution_outcome(
+            ) = await self.verifier_aware_task_execution_outcome(
                 request.task_id,
                 session_id=contract_lookup_session_id,
                 admit_session=admit_session,
@@ -7338,7 +6422,7 @@ class SessionEngine:
         del validation
         if active is None:
             raise RuntimeError("Work-attempt admission activation returned no authority.")
-        return await self._fan_out_work_attempt_interaction_started(
+        return await self.fan_out_work_attempt_interaction_started(
             active,
             lease_seconds=lease_seconds,
         )
@@ -7449,7 +6533,7 @@ class SessionEngine:
             )
         return current
 
-    async def _fan_out_work_attempt_interaction_started(
+    async def fan_out_work_attempt_interaction_started(
         self,
         admission: WorkAttemptAdmission,
         *,
@@ -7781,7 +6865,7 @@ class SessionEngine:
             ):
                 _activate_session_run_fence(session)
                 _activate_session_interaction(session.id, admission.interaction_id)
-            return await self._fan_out_work_attempt_interaction_started(
+            return await self.fan_out_work_attempt_interaction_started(
                 admission,
                 lease_seconds=stable.lease_seconds,
             )
@@ -8863,7 +7947,7 @@ class SessionEngine:
         )
         if reconciled is not None and reconciled.state is WorkAttemptAdmissionState.ACTIVE:
             return reconciled
-        prepared = await self._prepare_initial_run(
+        prepared = await self.prepare_initial_run(
             request,
             admit_session=False,
             allow_work_attempt_admission=True,
@@ -9443,7 +8527,7 @@ class SessionEngine:
             lease_seconds=lease_seconds,
         )
 
-    async def _verifier_aware_task_execution_outcome(
+    async def verifier_aware_task_execution_outcome(
         self,
         task_id: str | None,
         *,
@@ -9552,7 +8636,7 @@ class SessionEngine:
             return False, admission_outcome.failure
         return False, None
 
-    async def _require_ordinary_session_execution(
+    async def require_ordinary_session_execution(
         self,
         session_id: str,
         *,
@@ -9561,7 +8645,7 @@ class SessionEngine:
         (
             requires_completion_decision,
             admission_failure,
-        ) = await self._verifier_aware_task_execution_outcome(
+        ) = await self.verifier_aware_task_execution_outcome(
             None,
             session_id=session_id,
             admit_session=admit_session,
@@ -9649,7 +8733,7 @@ class SessionEngine:
         session_id: str,
         expired_claim: _ExpiredIncompleteRecoveryClaim,
     ) -> NoReturn:
-        current = await self._require_session(session_id)
+        current = await self.require_session(session_id)
         fenced = await self._recovery_ownership.fence_expired_incomplete_recovery_claim(
             session=current,
             claim_id=expired_claim.claim_id,
@@ -9732,7 +8816,7 @@ class SessionEngine:
                     ),
                     evidence=evidence.encode(),
                 )
-        preparation = self._prepare_initial_run(
+        preparation = self.prepare_initial_run(
             request,
             expected_execution_profile=expected_execution_profile,
             expected_registered_environment=expected_registered_environment,
@@ -10864,33 +9948,6 @@ class SessionEngine:
         if propagated_cancellation_group is not None:
             raise propagated_cancellation_group
 
-    async def settle_foreground_child_terminal(
-        self,
-        wait: ForegroundChildWait,
-        event: Event,
-        *,
-        before_mutation: Callable[[], Awaitable[None]],
-    ) -> None:
-        from cayu.runtime._foreground_child_terminal_settlement import (
-            settle_foreground_child_terminal,
-        )
-
-        tool = self._get_registered_agent(wait.parent_effect.agent_name).tools.get(
-            wait.parent_effect.tool_name
-        )
-        if tool is None or tool.child_session_recovery is None:
-            raise SessionRunFenced(
-                "Foreground terminal cleanup lacks its registered child matcher."
-            )
-        await settle_foreground_child_terminal(
-            wait,
-            event,
-            store=self.session_store,
-            matcher=tool.child_session_recovery,
-            recover=self._recovery_coordinator.recover_incomplete_session,
-            before_mutation=before_mutation,
-        )
-
     async def refresh_foreground_child_action(
         self,
         wait: ForegroundChildWait,
@@ -10913,244 +9970,6 @@ class SessionEngine:
             before_mutation=before_mutation,
         )
 
-    async def resume_foreground_child(
-        self,
-        terminal: ForegroundChildTerminal,
-        *,
-        before_mutation: Callable[[], Awaitable[None]],
-    ) -> None:
-        """Continue the original pending round using its persisted run configuration."""
-        await before_mutation()
-        wait = terminal.wait
-        from cayu.runtime._foreground_child_continuation import (
-            load_attached_foreground_continuation,
-        )
-
-        parent = await self.session_store.load(wait.parent_effect.session_id)
-        if parent is None:
-            raise SessionRunFenced("Foreground continuation parent disappeared.")
-        if await self._recovery_coordinator.resume_foreground_gate(
-            parent, terminal, before_mutation=before_mutation
-        ):
-            return
-        attached = await load_attached_foreground_continuation(parent, store=self.session_store)
-        if attached is not None and attached.terminal == terminal:
-            retained_profile = active_invocation_execution_profile_from_checkpoint(
-                await self.session_store.load_checkpoint(parent.id)
-            )
-            if (
-                retained_profile is None
-                or retained_profile.interaction_id != wait.parent_effect.interaction_id
-                or retained_profile.profile.fingerprint
-                != wait.parent_effect.execution_profile_fingerprint
-            ):
-                raise SessionRunFenced(
-                    "Attached foreground continuation lost its original profile."
-                )
-
-            async def require_attached_ownership() -> None:
-                await before_mutation()
-                current = await self.session_store.load(parent.id)
-                if (
-                    current is None
-                    or await load_attached_foreground_continuation(
-                        current, store=self.session_store
-                    )
-                    != attached
-                ):
-                    raise SessionRunFenced(
-                        "Attached foreground continuation changed during recovery."
-                    )
-
-            if parent.status in {SessionStatus.RUNNING, SessionStatus.INTERRUPTING}:
-                _deactivate_session_interaction(parent.id)
-                _deactivate_session_run_fence(parent.id)
-                try:
-                    await self._recovery_coordinator.recover_incomplete_session(
-                        IncompleteSessionRecoveryRequest(
-                            session_id=parent.id,
-                            inactive_for_seconds=0,
-                            reason="Recovering the owned foreground child continuation.",
-                        ),
-                        before_mutation=require_attached_ownership,
-                        preserve_interaction_id=wait.parent_effect.interaction_id,
-                    )
-                finally:
-                    _deactivate_session_interaction(parent.id)
-                    _deactivate_session_run_fence(parent.id)
-            stream = self._resume_session(
-                request=attached.request.model_copy(
-                    update={
-                        "loop_policies": await self._foreground_gate_policy_owner.for_attached(
-                            self.session_store, parent=parent, continuation=attached
-                        ),
-                    }
-                ),
-                task_id=attached.task_id,
-                start_event_payload_extra={},
-                start_task_on_enter=False,
-                required_foreground_wait=wait,
-                required_foreground_terminal=terminal,
-                required_foreground_continuation=attached,
-                foreground_before_mutation=require_attached_ownership,
-            )
-            async with _close_delegated_event_stream(stream) as owned_stream:
-                async for _ in owned_stream:
-                    pass
-            self._foreground_gate_policy_owner.release_attached(parent, attached)
-            return
-        checkpoint, pending = await pending_round_reader.load_pending_tool_round(
-            self.session_store,
-            wait.parent_effect.session_id,
-        )
-        if pending is None or pending.max_steps is None:
-            raise RuntimeError("Foreground continuation lacks its original pending round.")
-        if pending.tool_round_id != wait.parent_effect.tool_round_id:
-            raise RuntimeError("Foreground continuation conflicts with its original tool round.")
-        active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
-        if (
-            active_profile is None
-            or active_profile.interaction_id != wait.parent_effect.interaction_id
-            or (
-                pending.interaction_id is not None
-                and pending.interaction_id != active_profile.interaction_id
-            )
-        ):
-            raise RuntimeError("Foreground continuation conflicts with its original interaction.")
-        if (
-            active_profile.profile.fingerprint != wait.parent_effect.execution_profile_fingerprint
-            or (
-                pending.execution_profile_fingerprint is not None
-                and pending.execution_profile_fingerprint != active_profile.profile.fingerprint
-            )
-        ):
-            raise RuntimeError("Foreground continuation conflicts with its original profile.")
-        if pending.limits is None or pending.budget_limits is None:
-            raise RuntimeError("Foreground continuation lacks its original limits.")
-        request = ForegroundChildResumeRequest(
-            session_id=wait.parent_effect.session_id,
-            loop_policies=self._foreground_gate_policy_owner.for_wait(parent, wait),
-            messages=[],
-            metadata=pending.request_metadata,
-            max_steps=pending.max_steps,
-            limits=pending.limits,
-            budget_limits=pending.budget_limits,
-            retry_policy=pending.retry_policy,
-            structured_output=pending.structured_output,
-            thinking=pending.thinking,
-        )
-        stream = self._resume_session(
-            request=request,
-            task_id=pending.task_id,
-            start_event_payload_extra={},
-            start_task_on_enter=False,
-            required_foreground_wait=wait,
-            required_foreground_terminal=terminal,
-            foreground_before_mutation=before_mutation,
-        )
-        async with _close_delegated_event_stream(stream) as owned_stream:
-            async for _ in owned_stream:
-                pass
-
-    async def resume(
-        self,
-        request: ResumeRequest,
-        *,
-        store_resolved_session_id: str | None = None,
-        continuation_handoff: _ResumeAdmissionHandoff | None = None,
-        participant_context: CollaborationAccessContext | None = None,
-        execution_to_wait: _ExternalExecutionToWait | None = None,
-    ) -> AsyncGenerator[Event, None]:
-        request = session_request_boundary.prepare_resume_request(
-            request,
-            redactor=self._secret_redactor,
-            store_resolved_session_id=store_resolved_session_id,
-        )
-        session = await self.session_store.load(request.session_id)
-        if session is not None:
-            await self._require_participant_execution(session, participant_context)
-        from cayu.runtime._resume_configuration import inherit_resume_configuration
-
-        # Bind adoption replay to the caller's request before resolving controls
-        # from mutable predecessor evidence. Candidate-profile checks still bind
-        # the effective controls used by the admitted invocation.
-        adoption_request_fingerprint = (
-            None
-            if request.profile_adoption is None
-            else execution_profile_adoption_request_fingerprint(
-                request, redactor=self._secret_redactor
-            )
-        )
-        configuration_differences: tuple[str, ...] = ()
-        if session is not None:
-            request, configuration_differences = await inherit_resume_configuration(
-                self.session_store, session, request, self._effective_retry_policy(None)
-            )
-        task_id, task_session_instance_id = await self._linked_resume_task_id(request)
-        replayed_failure, replay_events = await self._replay_runtime_task_failure_if_needed(
-            session_id=request.session_id,
-            task_id=task_id,
-            task_worker_id=request.task_worker_id,
-            task_handoff_id=request.task_handoff_id,
-        )
-        if replayed_failure:
-            for event in replay_events:
-                yield event
-            return
-        session_stream = self._resume_session(
-            request=request,
-            adoption_request_fingerprint=adoption_request_fingerprint,
-            participant_context=participant_context,
-            task_id=task_id,
-            required_task_session_instance_id=task_session_instance_id,
-            start_event_payload_extra={},
-            start_task_on_enter=False,
-            continuation_handoff=continuation_handoff,
-            execution_to_wait=execution_to_wait,
-        )
-        session_id = request.session_id
-        del request
-        forwarded_stream = self._session_control.stream_with_out_of_band_events(
-            session_id,
-            session_stream,
-        )
-        billing_identity_cancellation: asyncio.CancelledError | None = None
-        billing_identity_cancellation_group: BaseExceptionGroup | None = None
-        propagated_cancellation: asyncio.CancelledError | None = None
-        try:
-            async for event in forwarded_stream:
-                yield event
-        except ExecutionProfileMismatchError as exc:
-            if (
-                configuration_differences
-                and ExecutionProfileComponentClass.FINALIZATION in exc.changed_component_classes
-            ):
-                exc.add_note(
-                    "Resume configuration differs: " + "; ".join(configuration_differences)
-                )
-            raise
-        except asyncio.CancelledError as exc:
-            billing_identity_cancellation = _detach_billing_cancellation_for_public(exc)
-            if billing_identity_cancellation is None:
-                detached_provider_cancellation = _detach_provider_cancellation_for_public(exc)
-                if detached_provider_cancellation is None:
-                    raise
-                propagated_cancellation = detached_provider_cancellation
-        except BaseExceptionGroup as exc:
-            billing_identity_cancellation_group = detach_billing_identity_cancellation_group(exc)
-            if billing_identity_cancellation_group is None:
-                raise
-        except GeneratorExit:
-            await _close_async_iterator(forwarded_stream)
-            raise
-        del forwarded_stream, session_stream
-        if billing_identity_cancellation is not None:
-            raise billing_identity_cancellation
-        if billing_identity_cancellation_group is not None:
-            raise billing_identity_cancellation_group
-        if propagated_cancellation is not None:
-            raise propagated_cancellation
-
     async def compact_session(
         self,
         request: CompactSessionRequest,
@@ -11169,7 +9988,7 @@ class SessionEngine:
         (
             requires_completion_decision,
             admission_failure,
-        ) = await self._verifier_aware_task_execution_outcome(
+        ) = await self.verifier_aware_task_execution_outcome(
             None,
             session_id=request.session_id,
             admit_session=False,
@@ -11232,7 +10051,7 @@ class SessionEngine:
             store_resolved_source_session_id=store_resolved_source_session_id,
             expected_authorized_target_instance_id=expected_authorized_target_instance_id,
         )
-        await self._require_ordinary_session_execution(
+        await self.require_ordinary_session_execution(
             redacted_request.session_id, admit_session=False
         )
         if expected_authorized_target_instance_id is None:
@@ -11258,7 +10077,7 @@ class SessionEngine:
             raise TypeError("Peer append requires a PeerContentAppendRequest.")
         if request.append_key.creation_target is None:
             assert request.append_key.target_session_id is not None
-            await self._require_ordinary_session_execution(
+            await self.require_ordinary_session_execution(
                 request.append_key.target_session_id, admit_session=False
             )
 
@@ -11569,7 +10388,7 @@ class SessionEngine:
                 (
                     requires_completion_decision,
                     admission_failure,
-                ) = await self._verifier_aware_task_execution_outcome(
+                ) = await self.verifier_aware_task_execution_outcome(
                     None,
                     session_id=loaded_session.id,
                 )
@@ -11606,7 +10425,7 @@ class SessionEngine:
                     (
                         requires_completion_decision,
                         admission_failure,
-                    ) = await self._verifier_aware_task_execution_outcome(
+                    ) = await self.verifier_aware_task_execution_outcome(
                         None,
                         session_id=loaded_session.id,
                     )
@@ -11694,7 +10513,7 @@ class SessionEngine:
         (
             requires_completion_decision,
             admission_failure,
-        ) = await self._verifier_aware_task_execution_outcome(
+        ) = await self.verifier_aware_task_execution_outcome(
             None,
             session_id=loaded_session.id,
         )
@@ -12210,7 +11029,7 @@ class SessionEngine:
             if initial_error is not None:
                 raise initial_error
         except _ExpiredIncompleteRecoveryClaim as expired_claim:
-            current = await self._require_session(loaded_session.id)
+            current = await self.require_session(loaded_session.id)
             fenced = await self._recovery_ownership.fence_expired_incomplete_recovery_claim(
                 session=current,
                 claim_id=expired_claim.claim_id,
@@ -12220,7 +11039,7 @@ class SessionEngine:
                     "Expired incomplete-session recovery ownership changed while compaction "
                     "was fencing it; retry with current session state."
                 ) from None
-            current = await self._require_session(loaded_session.id)
+            current = await self.require_session(loaded_session.id)
             raise ValueError(
                 "Session compaction fenced an expired incomplete-session recovery owner; "
                 f"retry with run epoch {current.run_epoch}."
@@ -14531,7 +13350,7 @@ class SessionEngine:
                         ),
                         missing_message="Queued completion produced no terminal event.",
                     )
-                    completed_session = await self._require_session(session.id)
+                    completed_session = await self.require_session(session.id)
                 except BaseException as publication_close_failure:
                     await self._recovery_ownership.run_cleanup_steps(
                         authoritative_failure=publication_close_failure,
@@ -16587,7 +15406,7 @@ class SessionEngine:
             raise RuntimeError("Latest durable tool-exposure profile is not runtime-attested.")
         return exposure.profile_id
 
-    async def _resume_session(
+    async def prepare_resume(
         self,
         *,
         request: ResumeRequest,
@@ -16610,7 +15429,7 @@ class SessionEngine:
         continuation_handoff: _ResumeAdmissionHandoff | None = None,
         participant_context: CollaborationAccessContext | None = None,
         execution_to_wait: _ExternalExecutionToWait | None = None,
-    ) -> AsyncGenerator[Event, None]:
+    ) -> _ResumePreparation:
         if request.failover is not None:
             self.session_store._require_model_failover_stage_protocol()
         # Resume profile admission and the resumed dispatch must observe one
@@ -16633,32 +15452,6 @@ class SessionEngine:
             != request.model_copy(update={"loop_policies": ()})
         ):
             raise TypeError("Attached foreground continuation conflicts with its original request.")
-
-        def require_foreground_checkpoint(
-            session: Session, checkpoint: dict[str, Any] | None
-        ) -> None:
-            if required_foreground_wait is None:
-                return
-            key = (
-                FOREGROUND_CHILD_WAIT_KEY
-                if required_foreground_continuation is None
-                else FOREGROUND_PARENT_CONTINUATION_KEY
-            )
-            expected = (
-                required_foreground_wait.model_dump(mode="json")
-                if required_foreground_continuation is None
-                else required_foreground_continuation.model_dump(mode="json")
-            )
-            if (
-                session.id != required_foreground_wait.parent_effect.session_id
-                or session.instance_id != required_foreground_wait.parent_effect.session_instance_id
-                or checkpoint is None
-                or canonical_durable_json_bytes(checkpoint.get(key), key)
-                != canonical_durable_json_bytes(expected, key)
-            ):
-                raise SessionRunFenced(
-                    "Foreground continuation lost its exact retained checkpoint."
-                )
 
         budget_policy = copy_budget_policy(self._get_budget_policy())
         if (source_execution_profile is None) != (required_execution_profile is None):
@@ -16702,7 +15495,7 @@ class SessionEngine:
         (
             requires_completion_decision,
             admission_failure,
-        ) = await self._verifier_aware_task_execution_outcome(
+        ) = await self.verifier_aware_task_execution_outcome(
             task_id,
             session_id=request.session_id,
             admit_session=False,
@@ -16742,19 +15535,85 @@ class SessionEngine:
             != required_session_instance_fingerprint
         ):
             raise RuntimeError("Queued dispatch target session instance changed.")
-        recovery_required = loaded_session.status in {
-            SessionStatus.RUNNING,
-            SessionStatus.INTERRUPTING,
-        }
-        recovery_events = await self.recover_abandoned_execution(
-            loaded_session,
+        return _ResumePreparation(
+            request=request,
+            task_id=task_id,
+            start_event_payload_extra=start_event_payload_extra,
+            start_task_on_enter=start_task_on_enter,
+            adoption_request_fingerprint=adoption_request_fingerprint,
+            source_execution_profile=source_execution_profile,
+            required_execution_profile=required_execution_profile,
+            required_session_instance_fingerprint=required_session_instance_fingerprint,
+            required_task_session_instance_id=required_task_session_instance_id,
+            run_operation_id=run_operation_id,
+            terminal_event_id=terminal_event_id,
+            queue_task_id=queue_task_id,
+            queued_dispatch_id=queued_dispatch_id,
+            required_foreground_wait=required_foreground_wait,
+            required_foreground_terminal=required_foreground_terminal,
+            required_foreground_continuation=required_foreground_continuation,
+            foreground_before_mutation=foreground_before_mutation,
+            continuation_handoff=continuation_handoff,
             participant_context=participant_context,
-            # Resume continues into the run loop, which replays elected calls.
-            replays_tool_calls=True,
+            execution_to_wait=execution_to_wait,
+            budget_policy=budget_policy,
+            loaded_session=loaded_session,
+            recovery_required=loaded_session.status
+            in {SessionStatus.RUNNING, SessionStatus.INTERRUPTING},
         )
-        for event in recovery_events:
-            yield event
-        if recovery_required:
+
+    async def resume(self, preparation: _ResumePreparation) -> AsyncGenerator[Event, None]:
+        """Execute a prepared continuation after abandoned-owner recovery settles."""
+        request = preparation.request
+        task_id = preparation.task_id
+        start_event_payload_extra = preparation.start_event_payload_extra
+        start_task_on_enter = preparation.start_task_on_enter
+        adoption_request_fingerprint = preparation.adoption_request_fingerprint
+        source_execution_profile = preparation.source_execution_profile
+        required_execution_profile = preparation.required_execution_profile
+        required_session_instance_fingerprint = preparation.required_session_instance_fingerprint
+        required_task_session_instance_id = preparation.required_task_session_instance_id
+        run_operation_id = preparation.run_operation_id
+        terminal_event_id = preparation.terminal_event_id
+        queue_task_id = preparation.queue_task_id
+        queued_dispatch_id = preparation.queued_dispatch_id
+        required_foreground_wait = preparation.required_foreground_wait
+        required_foreground_terminal = preparation.required_foreground_terminal
+        required_foreground_continuation = preparation.required_foreground_continuation
+        foreground_before_mutation = preparation.foreground_before_mutation
+        continuation_handoff = preparation.continuation_handoff
+        participant_context = preparation.participant_context
+        execution_to_wait = preparation.execution_to_wait
+        budget_policy = preparation.budget_policy
+        loaded_session = preparation.loaded_session
+
+        def require_foreground_checkpoint(
+            session: Session, checkpoint: dict[str, Any] | None
+        ) -> None:
+            if required_foreground_wait is None:
+                return
+            key = (
+                FOREGROUND_CHILD_WAIT_KEY
+                if required_foreground_continuation is None
+                else FOREGROUND_PARENT_CONTINUATION_KEY
+            )
+            expected = (
+                required_foreground_wait.model_dump(mode="json")
+                if required_foreground_continuation is None
+                else required_foreground_continuation.model_dump(mode="json")
+            )
+            if (
+                session.id != required_foreground_wait.parent_effect.session_id
+                or session.instance_id != required_foreground_wait.parent_effect.session_instance_id
+                or checkpoint is None
+                or canonical_durable_json_bytes(checkpoint.get(key), key)
+                != canonical_durable_json_bytes(expected, key)
+            ):
+                raise SessionRunFenced(
+                    "Foreground continuation lost its exact retained checkpoint."
+                )
+
+        if preparation.recovery_required:
             loaded_session = await self.session_store.load(request.session_id)
             if loaded_session is None:
                 raise KeyError(f"Session not found: {request.session_id}")
@@ -17035,7 +15894,7 @@ class SessionEngine:
             claim_id, claim_expires_at, store_now = observed_claim
             if claim_expires_at > store_now:
                 raise RuntimeError("Session has an active incomplete-session recovery operation.")
-            current = await self._require_session(loaded_session.id)
+            current = await self.require_session(loaded_session.id)
             fenced = await self._recovery_ownership.fence_expired_incomplete_recovery_claim(
                 session=current,
                 claim_id=claim_id,
@@ -17045,7 +15904,7 @@ class SessionEngine:
                     "Expired incomplete-session recovery ownership changed while resume "
                     "was fencing it; retry with current session state."
                 ) from None
-            current = await self._require_session(loaded_session.id)
+            current = await self.require_session(loaded_session.id)
             raise ValueError(
                 "Session resume fenced an expired incomplete-session recovery owner; "
                 f"retry with run epoch {current.run_epoch}."
@@ -17314,7 +16173,7 @@ class SessionEngine:
         (
             requires_completion_decision,
             admission_failure,
-        ) = await self._verifier_aware_task_execution_outcome(
+        ) = await self.verifier_aware_task_execution_outcome(
             task_id,
             session_id=request.session_id,
         )
@@ -18710,7 +17569,7 @@ class SessionEngine:
                         # child commit. Repair that source-owned state when the
                         # original parent survives; an already completed intent
                         # and a deleted parent require no source admission.
-                        await self._require_ordinary_session_execution(
+                        await self.require_ordinary_session_execution(
                             request.source_session_id,
                             admit_session=True,
                         )
@@ -18777,7 +17636,7 @@ class SessionEngine:
         # Only first-time creation executes against source authority. Keep the
         # public preflight on this branch so reconciliation of an already
         # committed child does not depend on a live parent or its task store.
-        await self._require_ordinary_session_execution(
+        await self.require_ordinary_session_execution(
             source_session.id,
             admit_session=False,
         )
@@ -19568,7 +18427,7 @@ class SessionEngine:
         # Prompt-succession preparation may publish a durable source intent.
         # Close the contract-attachment race immediately before that first
         # possible mutation; the admission also protects the later atomic fork.
-        await self._require_ordinary_session_execution(
+        await self.require_ordinary_session_execution(
             source_session.id,
             admit_session=True,
         )
@@ -20155,7 +19014,73 @@ class SessionEngine:
         # delivered to event sinks without changing that public stream contract.
         yield delivered_fork_event
 
-    async def continue_run(self, request: RecoverySessionRunRequest) -> AsyncGenerator[Event, None]:
+    async def require_continuation_task_authority(
+        self,
+        *,
+        session_id: str,
+        session_instance_id: str | None,
+        task_id: str | None,
+        task_worker_id: str | None,
+        task_handoff_id: str | None = None,
+        allow_terminal_failure_replay: bool = False,
+        approval_failure_identity: ApprovalTaskFailureIdentity | None = None,
+    ) -> None:
+        if task_handoff_id is not None and task_worker_id is None:
+            raise RuntimeError("Task handoff authority requires a continuation worker.")
+        if task_id is None and session_instance_id is None and task_worker_id is None:
+            if task_handoff_id is not None:
+                raise RuntimeError("Workerless continuation retained task handoff authority.")
+            return
+        if task_id is None or session_instance_id is None:
+            raise RuntimeError("Attached-task continuation authority is incomplete.")
+        await self._require_linked_continuation_task_authority(
+            task_id=task_id,
+            task_worker_id=task_worker_id,
+            task_handoff_id=task_handoff_id,
+            session_id=session_id,
+            session_instance_id=session_instance_id,
+            allow_terminal_failure_replay=allow_terminal_failure_replay,
+            approval_failure_identity=approval_failure_identity,
+        )
+
+    async def continue_run(
+        self,
+        request: RecoverySessionRunRequest,
+    ) -> AsyncGenerator[Event, None]:
+        await self._require_participant_execution(request.session, request.participant_context)
+        await self.require_continuation_task_authority(
+            session_id=request.session.id,
+            session_instance_id=(
+                request.session.instance_id if request.task_id is not None else None
+            ),
+            task_id=request.task_id,
+            task_worker_id=request.task_worker_id,
+            task_handoff_id=request.task_handoff_id,
+        )
+        (
+            requires_completion_decision,
+            admission_failure,
+        ) = await self.verifier_aware_task_execution_outcome(
+            request.task_id,
+            session_id=request.session.id,
+        )
+        if admission_failure is not None:
+            del request
+            raise_task_store_operation_failure(admission_failure)
+        if requires_completion_decision:
+            del request
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
+        stream = self._continue_admitted_run(request)
+        stream = await self._resource_session_stream.restore(stream, request.session.id)
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for item in owned_stream:
+                yield item
+
+    async def _continue_admitted_run(
+        self, request: RecoverySessionRunRequest
+    ) -> AsyncGenerator[Event, None]:
         """Continue an admitted invocation after its recovery gate has settled."""
         invocation_context = request.invocation_context
         invocation_context._validate()
@@ -24696,7 +23621,7 @@ class SessionEngine:
         except Exception as task_error:
             return None, task_error
 
-    async def _replay_runtime_task_failure_if_needed(
+    async def replay_runtime_task_failure_if_needed(
         self,
         *,
         session_id: str,
@@ -25276,17 +24201,17 @@ class SessionEngine:
             _deactivate_session_interaction(session.id)
         return True, tuple(replay_events)
 
-    async def _linked_resume_task_id(
+    async def linked_resume_task_id(
         self,
         request: ResumeRequest,
     ) -> tuple[str | None, str | None]:
-        return await self._linked_continuation_task_id(
+        return await self.linked_continuation_task_id(
             session_id=request.session_id,
             task_worker_id=request.task_worker_id,
             task_handoff_id=request.task_handoff_id,
         )
 
-    async def _linked_continuation_task_id(
+    async def linked_continuation_task_id(
         self,
         *,
         session_id: str,
@@ -25799,7 +24724,7 @@ class SessionEngine:
         await self.session_store.transform_checkpoint(session_id, transform)
         return cleared_attempt_id
 
-    async def _require_session(self, session_id: str) -> Session:
+    async def require_session(self, session_id: str) -> Session:
         loaded = await self.session_store.load(session_id)
         if loaded is None:
             raise KeyError(f"Session not found: {session_id}") from None

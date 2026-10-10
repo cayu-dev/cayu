@@ -245,6 +245,8 @@ from cayu.runtime._event_projection import (
     public_event_linkage_id,
     public_event_sequence,
 )
+from cayu.runtime._interruption_coordinator import suppress_interruption_cascade
+from cayu.runtime._live_model_attempt import _provider_failure_proves_no_model_effect
 from cayu.runtime._model_completion_contracts import ModelCompletionManualRecoveryRequired
 from cayu.runtime._model_errors import (
     _BillingIdentityResolutionCancelled,
@@ -58025,8 +58027,8 @@ def test_provider_authentication_failure_requires_unmixed_pre_effect_evidence():
         retryable=False,
     )
 
-    assert session_engine_module._provider_failure_proves_no_model_effect(auth_failure)
-    assert not session_engine_module._provider_failure_proves_no_model_effect(
+    assert _provider_failure_proves_no_model_effect(auth_failure)
+    assert not _provider_failure_proves_no_model_effect(
         ExceptionGroup(
             "mixed provider failure",
             [auth_failure, RuntimeError("cleanup failed")],
@@ -63096,7 +63098,7 @@ def test_remote_interrupt_wins_race_with_policy_plan_publication():
             )
         )
         await asyncio.wait_for(store.policy_publication_started.wait(), timeout=10)
-        with session_engine_module.suppress_interruption_cascade():
+        with suppress_interruption_cascade():
             interrupt_task = asyncio.create_task(
                 collect_interrupt_events(
                     interrupt_app,
@@ -63185,7 +63187,7 @@ def test_remote_interrupt_wins_race_with_atomic_approval_publication():
             )
         )
         await asyncio.wait_for(store.approval_publication_started.wait(), timeout=10)
-        with session_engine_module.suppress_interruption_cascade():
+        with suppress_interruption_cascade():
             interrupt_task = asyncio.create_task(
                 collect_interrupt_events(
                     interrupt_app,
@@ -63283,7 +63285,7 @@ def test_local_interrupt_after_atomic_approval_publication_closes_retained_round
             )
         )
         await asyncio.wait_for(store.approval_fan_out_started.wait(), timeout=10)
-        with session_engine_module.suppress_interruption_cascade():
+        with suppress_interruption_cascade():
             interrupt_task = asyncio.create_task(
                 collect_interrupt_events(
                     app,
@@ -63403,7 +63405,7 @@ def test_operator_interrupt_after_atomic_user_input_open_supersedes_exact_pause(
             session_id=session_id,
             reason="operator supersedes the question",
         )
-        with session_engine_module.suppress_interruption_cascade():
+        with suppress_interruption_cascade():
             interrupt_task = asyncio.create_task(collect_interrupt_events(app, request))
         run_events, interrupt_events = await asyncio.wait_for(
             asyncio.gather(run_task, interrupt_task),
@@ -63524,7 +63526,7 @@ def test_remote_operator_interrupt_wins_before_atomic_user_input_open() -> None:
         )
         await asyncio.wait_for(store.open_started.wait(), timeout=10)
         request = InterruptSessionRequest(session_id=session_id, reason="remote operator")
-        with session_engine_module.suppress_interruption_cascade():
+        with suppress_interruption_cascade():
             interrupt_task = asyncio.create_task(collect_interrupt_events(interrupter, request))
         await asyncio.wait_for(store.interrupt_claimed.wait(), timeout=10)
         store.allow_open.set()
@@ -63623,7 +63625,7 @@ def test_remote_operator_interrupt_after_user_input_open_suppresses_stale_pause_
         )
         await asyncio.wait_for(store.fan_out_started.wait(), timeout=10)
         request = InterruptSessionRequest(session_id=session_id, reason="remote operator")
-        with session_engine_module.suppress_interruption_cascade():
+        with suppress_interruption_cascade():
             interrupt_task = asyncio.create_task(collect_interrupt_events(interrupter, request))
         await asyncio.wait_for(store.interrupt_claimed.wait(), timeout=10)
         store.allow_fan_out.set()
@@ -63732,7 +63734,7 @@ def test_operator_interrupt_does_not_replay_a_newer_user_input_pause_as_success(
         first_private_input_id = first_checkpoint["pending_user_input"]["input_id"]
 
         store.block_operator_interrupt = True
-        with session_engine_module.suppress_interruption_cascade():
+        with suppress_interruption_cascade():
             interrupting = asyncio.create_task(
                 collect_interrupt_events(
                     interrupt_app,
@@ -64187,7 +64189,7 @@ def test_process_loss_after_approval_clear_recovers_exact_interrupt_close_intent
             )
         )
         await asyncio.wait_for(store.approval_fan_out_started.wait(), timeout=10)
-        with session_engine_module.suppress_interruption_cascade():
+        with suppress_interruption_cascade():
             interrupt_task = asyncio.create_task(
                 collect_interrupt_events(
                     app,

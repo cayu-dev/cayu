@@ -4210,7 +4210,7 @@ def test_sqlite_submission_crash_boundaries_reconcile_one_child_and_task(
         app.register_provider(_DurableSubagentProvider(), default=True)
         _register_durable_subagent_agents(app)
         if crash_phase == "during_preparation":
-            original_prepare = app._session_engine._prepare_initial_run
+            original_prepare = app._session_engine.prepare_initial_run
             preparation_calls = 0
 
             async def lose_worker_during_child_preparation(*args, **kwargs):
@@ -4225,7 +4225,7 @@ def test_sqlite_submission_crash_boundaries_reconcile_one_child_and_task(
 
             monkeypatch.setattr(
                 app._session_engine,
-                "_prepare_initial_run",
+                "prepare_initial_run",
                 lose_worker_during_child_preparation,
             )
         try:

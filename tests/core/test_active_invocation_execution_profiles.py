@@ -572,7 +572,7 @@ def test_recovery_session_boundary_validates_full_active_profile_authority(
             expected_error,
             match="active invocation|checkpoint schema|newer root checkpoint|runtime authority|admitted session",
         ):
-            await collect(app._run_recovery_session(request))
+            await collect(app._session_engine.continue_run(request))
 
     asyncio.run(scenario())
 
@@ -4552,9 +4552,11 @@ def test_failed_continuation_resume_cleanup_keeps_prevalidated_profile_object(
             "validate",
             return_prevalidated_profile,
         )
-        monkeypatch.setattr(coordinator, "_resume_interaction", fail_resume_interaction)
         monkeypatch.setattr(
-            coordinator,
+            app._session_finalization, "resume_recovery_interaction", fail_resume_interaction
+        )
+        monkeypatch.setattr(
+            app._session_finalization,
             "finalize_abandoned_session_by_id",
             record_finalization,
         )
@@ -5081,18 +5083,14 @@ async def _assert_snapshot_only_restart_profile_boundary(
         runtime_hooks=[recovery_hook],
     )
     recovery_settlement_contexts: list[InvocationContext] = []
-    original_recovery_interruption = (
-        replacement_app._recovery_coordinator._interrupt_session_for_recovery
-    )
+    original_recovery_interruption = replacement_app._session_finalization.interrupt_recovery
 
     async def capture_recovery_interruption(request: Any):
         recovery_settlement_contexts.append(request.invocation_context)
         async for event in original_recovery_interruption(request):
             yield event
 
-    replacement_app._recovery_coordinator._interrupt_session_for_recovery = (
-        capture_recovery_interruption
-    )
+    replacement_app._session_finalization.interrupt_recovery = capture_recovery_interruption
     if restart_state != "changed":
         result = await replacement_app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(session_id=session_id)

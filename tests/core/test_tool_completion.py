@@ -218,7 +218,7 @@ def test_recovery_checks_execution_permission_before_mutation(boundary, monkeypa
 
         with monkeypatch.context() as patch:
             patch.setattr(
-                reconstructed._session_engine._recovery_coordinator,
+                reconstructed._recovery_coordinator,
                 "_require_participant_execution",
                 denied,
             )

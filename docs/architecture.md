@@ -258,18 +258,40 @@ CayuApp
   -> ModelStepExecutor
   -> ToolRoundExecutor
   -> DurableSubagentCoordinator
-  -> RecoveryCoordinator
+  -> RecoveryOwnership
+  -> SessionFinalization
+  -> PendingToolRoundRecovery
+  -> ModelCompletionRecovery
   -> SessionEngine
+  -> IncompleteSessionRecovery
+  -> RecoveryCoordinator
+  -> SessionRecovery
   -> WorkAttemptCoordinator
   -> QueuedDispatchCoordinator
 ```
 
-`SessionEngine` owns run, resume, fork, explicit compaction, queued-message
-delivery, task linkage, model/tool loop decisions, interruption terminalization,
-turn completion, and terminal hooks. `RecoveryCoordinator` owns durable paused
-continuations, manual outcome reconciliation, incomplete-session repair, and
-abandoned-run finalization. Model, tool, environment, limit, control, and event
-modules own their complete lower-level behavior slices.
+`SessionEngine` owns execution, fork, explicit compaction, queued-message
+delivery, task linkage, and model/tool loop decisions. `SessionRecovery` owns
+startup recovery, abandoned-run recovery, and public resume orchestration above
+the engine. Resume prepares and validates its inputs before recovery, retains its
+budget snapshot, then enters execution after recovery settles.
+
+`RecoveryCoordinator` owns paused continuations and manual outcome reconciliation.
+`IncompleteSessionRecovery` owns incomplete-session inspection and repair;
+`ProviderDispositionRecovery` settles accepted provider decisions and their exact
+continuations. These owners call the engine's execution operations directly.
+`RecoveryAdmission` owns the shared claimed transition and cleanup handoff.
+The engine has no dependency on these continuation coordinators.
+
+`RecoveryOwnership` owns one claim-worker registry, lease renewal, and supervised
+cleanup. Live execution, continuation recovery, and terminal finalization share
+that instance. Borrowed claims retain their original owner and worker lifetime.
+`TerminalEvidenceReader` inspects evidence without acquiring ownership;
+`TerminalEvidenceFinalization` composes it with the shared claim owner.
+`SessionFinalization` owns interruption, limit stops, interaction terminal
+transitions, and abandoned-run finalization. `TerminalEventPublication` owns
+terminal event replay and hook delivery. These parts can be imported without
+the application, execution engine, or continuation coordinators.
 
 `WorkAttemptCoordinator` owns application work-attempt admission, execution
 claim checks and renewal, recovery, and proposal publication. It owns one
@@ -281,7 +303,9 @@ and the checkpoint guard, and keeps admission/tracking and request detachment at
 its public entrances. The verified worker can still acquire an acknowledged
 recovery claim, maintain its heartbeat, and resume recovery separately. The
 coordinator can be composed without importing the application or concrete engine;
-its collaborators provide the same execution and checkpoint contracts.
+its collaborators provide execution, recovery, and checkpoint contracts.
+The verified worker uses `CayuApp.work_attempt_execution`, a typed interface to
+the same execution instance, for admitted-attempt settlement and evidence reads.
 
 `QueuedDispatchCoordinator` owns the session side of durable queued dispatch:
 request preparation, frozen profile and session-instance validation, execution
@@ -333,19 +357,19 @@ and automatic compaction coordination.
 
 `TerminalEvidenceFinalization` owns terminal-evidence inspection and crash repair,
 as well as live claim transfer, exact renewal, heartbeat-monitored preparation and
-streamed completion. Recovery and the engine share one instance. It borrows
-recovery's existing claim supervisor, cleanup supervisor and worker registry, so
+streamed completion. Recovery and the engine share one instance. It uses
+`RecoveryOwnership`'s claim supervisor, cleanup supervisor and worker registry, so
 closing an observer cannot release a claim while its work is still active. Repair
 retains exact event identity, redaction and marker cleanup. Approval/round checks
-come from `_approval_support.py`; user-input authority and recovery claim
-acquisition remain with recovery. Shared claim records live in `_recovery_claims.py`.
+come from `_approval_support.py`; user-input authority remains with its evidence owner, and recovery claim
+acquisition remains with `RecoveryOwnership`. Shared claim records live in `_recovery_claims.py`.
 
 Request and interrupted-run lifetimes in `_terminal_finalization_lifetime.py` own
 preparation, claim handoff, heartbeat shutdown and settlement. They reuse
 SessionControl's task-bound handoffs and select execution under the existing
 supervisor. Borrowed work runs inside its original recovery worker and cannot
-release that worker's claim. The engine supplies interruption policy and terminal
-publication; the lifetime supplies the session authenticated by its final renewal.
+release that worker's claim. `SessionFinalization` supplies interruption policy and terminal publication;
+the lifetime supplies the session authenticated by its final renewal.
 Evidence inspection and claimed crash repair remain independently usable.
 
 `ToolRoundExecutor` delegates ordinary tool-round publication to
@@ -388,15 +412,16 @@ current redactor and existing cancellation counts. Ordinary terminal delivery
 uses `ToolTerminalPublisher.emit`; native effect-refusal settlement retains its
 atomic transaction. Workspace observation remains within the invocation lifetime.
 
-`SessionEngine` also delegates ordinary round closure after a run limit to this
+`SessionFinalization` also delegates ordinary round closure after a run limit to this
 owner. It retains completed effects, publishes skipped results for unstarted
 calls, and commits the round using the same publication operation. A repeated
 closure reads the existing receipt and transcript. Cancellation remains observable
 after publication and deferred input materialization. Only live execution creates
 dispatch state.
 
-`RecoveryCoordinator` delegates interruption snapshot validation, missing-result
-selection and recovered round publication to the same owner. Interruption captures
+`PendingToolRoundRecovery` owns interruption snapshot validation, missing-result
+selection, and recovered round publication below execution. It composes the same
+invocation and durable-round owners. Interruption captures
 the transcript cursor before settlement; publication retains that cursor as its
 concurrency fence. The owner completes the assistant's secret projection, restores
 staged capacity, publishes safe terminals, and commits through the shared
@@ -405,9 +430,11 @@ Recovered terminal events reach the caller after commit and deferred input
 materialization. An error while consuming a terminal hook closes that hook stream
 before returning. Missing-result selection skips recorded and staged calls,
 retains blocked results for unexposed calls, and synthesizes unknown outcomes
-only after reconciliation permits closure. The recovery coordinator supplies
-one per-call resolver for native operations, external-effect journals and child
-sessions. It also coordinates workspace settlement and isolated dispatch evidence.
+only after reconciliation permits closure. Pending-round recovery resolves
+native operations, external-effect journals, and child sessions.
+`WorkspaceObservationRecovery` validates and repairs workspace observations
+through the existing native operations and artifact writer. It retains bounded
+artifact reads until shutdown can safely release their resources.
 An uncertain external effect retains its reconciliation fence. Selection and
 publication use the same round owner without authorizing a second tool execution.
 
@@ -428,7 +455,8 @@ recorded snapshot. The owner binds validation and retry events to the same atomi
 transcript/checkpoint publication. It retains the distinct live and recovery event
 order and returns live cancellation to session control before auxiliary events
 reach the caller.
-The session engine owns model-step limits, retry scheduling and session completion.
+The session engine selects model-step limits and retry scheduling;
+`SessionFinalization` performs the resulting terminal transitions.
 
 Approval and user-input continuations use the owner's private
 `ToolRoundContinuation` phase. It restores reserved capacity, retains per-call
@@ -445,8 +473,11 @@ The recovery coordinator validates grants and answers, selects recorded outcomes
 and owns the exact pending-action closure. Approval rechecks remaining budgets;
 user input retains its pause-time projection. Their receipt checks, deferred-input
 handling and failure settlement remain distinct. Both hand off through
-`SessionEngine.continue_run`; the application retains participant, task and
-resource checks before that entrance.
+`SessionEngine.continue_run`, which checks participant, task, and resource
+authority before advancing the continuation stream.
+`ResourceSessionStream` supplies the same resource guard to application and
+engine entrances. It reads the current policy after loading the durable session
+binding, preserving revocation checks before continuation execution.
 
 `ContinuationEnvironment` composes the existing environment lifecycle for both
 paused continuations and manual approval/input recovery. Reconnection and binding
@@ -481,11 +512,11 @@ receipt, and restart-reconciliation handoff for task-backed subagents. The appli
 facade and task dispatcher reach it only through narrow preparation, settlement, and
 acknowledgement operations.
 
-Some collaborators need to call session orchestration but are constructed before
-`SessionEngine`. `CayuApp` supplies those edges as narrow typed callables; the
-internal modules never type against or depend on the complete façade interface.
-This keeps dependency direction explicit while allowing `CayuApp` to remain the
-single composition root.
+`CayuApp` constructs the lower owners first, then execution, then continuation
+recovery. Registration resolvers and clocks remain explicit collaborators.
+Recovery does not route through application methods to reach private execution
+operations. `DeferredInteractionInput` materializes queued input for live and
+recovered rounds through the same store operation.
 
 `AssistantModelPublication` owns the shared assistant-result commit used by live
 model execution and provider-operation recovery. It prepares the pending tool

@@ -45,6 +45,7 @@ from cayu.sessions._execution_profile_checkpoint import (
 )
 from cayu.sessions._invocation_lifecycle import (
     InvocationMutationResult,
+    InvocationReleaseEvidence,
     invocation_lifecycle_receipt_history_present,
 )
 from cayu.sessions._invocation_terminal_decision import (
@@ -148,15 +149,6 @@ class WorkAttemptEngine(Protocol):
         self, ownership: WorkAttemptRecoveryOwnership
     ) -> WorkAttemptAdmission: ...
 
-    async def _recover_work_attempt_session(
-        self,
-        request: IncompleteSessionRecoveryRequest,
-        *,
-        interaction_id: str,
-        before_mutation: Callable[[], Awaitable[None]],
-        admission: WorkAttemptAdmission | None = None,
-    ) -> IncompleteSessionRecoveryResult: ...
-
     async def has_recoverable_work_attempt_model_result(
         self, admission: WorkAttemptAdmission
     ) -> bool: ...
@@ -165,12 +157,45 @@ class WorkAttemptEngine(Protocol):
         self, admission: WorkAttemptAdmission
     ) -> WorkAttemptAdmission | None: ...
 
-    async def _fan_out_work_attempt_interaction_started(
+    async def fan_out_work_attempt_interaction_started(
         self,
         admission: WorkAttemptAdmission,
         *,
         lease_seconds: int,
     ) -> WorkAttemptAdmission: ...
+
+    async def settle_work_attempt_admission_handoff(
+        self, admission: WorkAttemptAdmission
+    ) -> bool: ...
+
+    async def load_work_attempt_released_recovery_evidence(
+        self, admission: WorkAttemptAdmission
+    ) -> InvocationReleaseEvidence | None: ...
+
+    async def has_recoverable_work_attempt_cleanup(
+        self, admission: WorkAttemptAdmission
+    ) -> bool: ...
+
+    async def load_work_attempt_release_evidence(
+        self, admission: WorkAttemptAdmission
+    ) -> InvocationReleaseEvidence: ...
+
+    async def close_unentered_work_attempt_invocation(
+        self, admission: WorkAttemptAdmission
+    ) -> InvocationReleaseEvidence: ...
+
+
+class WorkAttemptRecovery(Protocol):
+    """Recover an admitted attempt above execution using its exact claim."""
+
+    async def recover_work_attempt_session(
+        self,
+        request: IncompleteSessionRecoveryRequest,
+        *,
+        interaction_id: str,
+        before_mutation: Callable[[], Awaitable[None]],
+        admission: WorkAttemptAdmission | None = None,
+    ) -> IncompleteSessionRecoveryResult: ...
 
 
 class WorkAttemptCheckpointGuard(Protocol):
@@ -203,6 +228,7 @@ class WorkAttemptCoordinator:
         get_task_store: Callable[[], TaskStore | None],
         session_store: SessionStore,
         engine: WorkAttemptEngine,
+        recovery: WorkAttemptRecovery,
         redactor: SecretRedactor,
         apply_run_defaults: Callable[[RunRequest], RunRequest],
         resolve_session: Callable[[str], Awaitable[tuple[str, str | None]]],
@@ -211,6 +237,7 @@ class WorkAttemptCoordinator:
         self._get_task_store = get_task_store
         self._runtime_session_store = session_store
         self._session_engine = engine
+        self._session_recovery = recovery
         self._secret_redactor = redactor
         self._with_application_run_defaults = apply_run_defaults
         self._resolve_public_session_authority = resolve_session
@@ -660,7 +687,7 @@ class WorkAttemptCoordinator:
             del authenticated
 
         try:
-            recovered = await self._session_engine._recover_work_attempt_session(
+            recovered = await self._session_recovery.recover_work_attempt_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=recovering.session_id,
                     reason="work_attempt_predecessor_owner_expired",
@@ -960,7 +987,7 @@ class WorkAttemptCoordinator:
             if session.status is SessionStatus.RUNNING:
                 _activate_session_run_fence(session)
                 _activate_session_interaction(session.id, claimed.interaction_id)
-            return await self._session_engine._fan_out_work_attempt_interaction_started(
+            return await self._session_engine.fan_out_work_attempt_interaction_started(
                 claimed,
                 lease_seconds=stable.lease_seconds,
             )
@@ -1452,7 +1479,7 @@ class WorkAttemptCoordinator:
         del activation_validation
         if active is None:
             raise RuntimeError("Work-attempt recovery activation returned no authority.")
-        return await self._session_engine._fan_out_work_attempt_interaction_started(
+        return await self._session_engine.fan_out_work_attempt_interaction_started(
             active,
             lease_seconds=stable.lease_seconds,
         )

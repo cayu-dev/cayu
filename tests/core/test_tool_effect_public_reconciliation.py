@@ -951,7 +951,7 @@ def test_public_reconciliation_consumes_verified_outcome_without_external_replay
                 from contextvars import ContextVar
 
                 cleanup_read = ContextVar("receipt_cleanup_read", default=False)
-                cleanup = app._recovery_coordinator._cleanup_recovery_handoff
+                cleanup = app._recovery_admission.cleanup_recovery_handoff
                 load = store.load
                 cleanup_error = OSError("receipt cleanup authority read failed")
                 read_failed = False
@@ -978,7 +978,7 @@ def test_public_reconciliation_consumes_verified_outcome_without_external_replay
                     return await load(*args, **kwargs)
 
                 monkeypatch.setattr(
-                    app._recovery_coordinator, "_cleanup_recovery_handoff", scoped_cleanup
+                    app._recovery_admission, "cleanup_recovery_handoff", scoped_cleanup
                 )
 
             async def collect():

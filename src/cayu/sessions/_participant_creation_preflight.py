@@ -27,7 +27,7 @@ class ParticipantCreationMaterial:
 async def prepare_participant_creation_material(
     app, creation, *, resource_owner=None, attachments=()
 ):
-    prepared = await app._session_engine._prepare_initial_run(
+    prepared = await app._session_engine.prepare_initial_run(
         app._with_application_run_defaults(creation.request),
         admit_session=False,
     )

@@ -2386,7 +2386,7 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
                 "Runtime execution profile differs from durable execution authority."
             )
         runtime_request = app._with_application_run_defaults(runtime_request)
-        prepared = await app._session_engine._prepare_initial_run(
+        prepared = await app._session_engine.prepare_initial_run(
             runtime_request,
             admit_session=False,
             store_resolved_existing_session_id=execution.session_id,

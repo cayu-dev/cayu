@@ -683,7 +683,7 @@ class VerifiedTaskWorker:
         assert request.session_id is not None
         assert retained.claim.work_contract is not None
         source = self._validate(
-            lambda: self.app._session_engine.work_attempt_source_request_sha256(
+            lambda: self.app.work_attempt_execution.work_attempt_source_request_sha256(
                 request, kind="initial"
             ),
             "Preparation admission source authority",
@@ -1102,7 +1102,7 @@ class VerifiedTaskWorker:
                 and admission.execution_entry is None
                 and admission.execution_stop is None
             ):
-                if not await self.app._session_engine.settle_work_attempt_admission_handoff(
+                if not await self.app.work_attempt_execution.settle_work_attempt_admission_handoff(
                     admission
                 ):
                     return None
@@ -1120,16 +1120,20 @@ class VerifiedTaskWorker:
             # are reconciled separately by _finish_proposal. Maintenance turns
             # unresolved owner loss into attention, never fresh execution.
             return None
-        release = await self.app._session_engine.load_work_attempt_released_recovery_evidence(
-            admission
+        release = (
+            await self.app.work_attempt_execution.load_work_attempt_released_recovery_evidence(
+                admission
+            )
         )
         if (
             release is None
             and admission.execution_entry is not None
-            and not await self.app._session_engine.has_recoverable_work_attempt_model_result(
+            and not await self.app.work_attempt_execution.has_recoverable_work_attempt_model_result(
                 admission
             )
-            and not await self.app._session_engine.has_recoverable_work_attempt_cleanup(admission)
+            and not await self.app.work_attempt_execution.has_recoverable_work_attempt_cleanup(
+                admission
+            )
         ):
             return None
         # Resolve immutable contract data before claiming the replacement lease;
@@ -1186,8 +1190,10 @@ class VerifiedTaskWorker:
         recovered = await self.app._recover_claimed_work_attempt(ownership)
         async with owner.lock:
             owner.state = recovered
-        release = await self.app._session_engine.load_work_attempt_released_recovery_evidence(
-            recovered
+        release = (
+            await self.app.work_attempt_execution.load_work_attempt_released_recovery_evidence(
+                recovered
+            )
         )
         if release is not None:
             return await self._propose_after_execution(owner, contract)
@@ -1648,7 +1654,7 @@ class VerifiedTaskWorker:
         await owner.heartbeat()
         admission = owner.state
         assert type(admission) is WorkAttemptAdmission
-        await self.app._session_engine.load_work_attempt_release_evidence(admission)
+        await self.app.work_attempt_execution.load_work_attempt_release_evidence(admission)
         if await self._group_cancellation_requested(admission.task_id):
             return await self._settle_runtime_stop(owner, "work_contract_group_cancelled")
         recorded_reason = runtime_stop_reason_for_execution_stop(admission)
@@ -1789,7 +1795,9 @@ class VerifiedTaskWorker:
                     "Expired proposal content identity",
                 )
             )
-            release = await self.app._session_engine.load_work_attempt_release_evidence(admission)
+            release = await self.app.work_attempt_execution.load_work_attempt_release_evidence(
+                admission
+            )
             request = WorkAttemptLifecycleSettlement(
                 settlement_id=verified_task_operation_id("settlement", admission.admission_id),
                 task_id=admission.task_id,
@@ -1960,7 +1968,9 @@ class VerifiedTaskWorker:
                     )
                 if pre_entry_settlement_authority(admission) != request.expected_admission_sha256:
                     raise WorkAttemptAdmissionConflict("Pre-entry cleanup authority changed.")
-                await self.app._session_engine.close_unentered_work_attempt_invocation(admission)
+                await self.app.work_attempt_execution.close_unentered_work_attempt_invocation(
+                    admission
+                )
             try:
                 raw = (
                     existing

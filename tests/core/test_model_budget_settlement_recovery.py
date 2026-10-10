@@ -1330,7 +1330,7 @@ def test_changed_policy_recovery_checks_admission_before_settlement(monkeypatch)
             return admit_session, None
 
         monkeypatch.setattr(
-            app._session_engine, "_verifier_aware_task_execution_outcome", deny_mutation
+            app._session_engine, "verifier_aware_task_execution_outcome", deny_mutation
         )
         with pytest.raises(TaskCompletionDecisionRequired):
             await app.recover_incomplete_session(

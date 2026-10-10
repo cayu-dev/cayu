@@ -26,6 +26,7 @@ from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime import _recovery_coordinator as recovery_coordinator
 from cayu.runtime import _recovery_ownership as recovery_ownership_module
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime._incomplete_session_recovery import _retain_abandoned_unreplayable_tool_round
 from cayu.runtime._recovery_coordinator import (
     _effective_approval_budget_limits,
     _effective_approval_max_steps,
@@ -34,7 +35,6 @@ from cayu.runtime._recovery_coordinator import (
     _effective_approval_thinking,
     _IncompleteRecoveryClaimLost,
     _interrupted_tool_round_results,
-    _retain_abandoned_unreplayable_tool_round,
     _task_cancellation_count,
 )
 from cayu.runtime._recovery_ownership import (

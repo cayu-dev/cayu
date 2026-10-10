@@ -989,7 +989,7 @@ def test_cayu_app_uses_one_configured_recovery_cleanup_supervisor() -> None:
 
     assert app._recovery_cleanup_policy == policy
     assert (
-        app._recovery_coordinator._recovery_cleanup_supervisor
+        app._recovery_ownership._recovery_cleanup_supervisor
         is app._session_engine._recovery_cleanup_supervisor
         is app._recovery_cleanup_supervisor
     )

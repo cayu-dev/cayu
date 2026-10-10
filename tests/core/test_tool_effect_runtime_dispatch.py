@@ -608,7 +608,9 @@ def test_runtime_unknown_external_effect_preserves_round_and_prevents_resume_dis
             for event in await store.load_events("effect-unknown")
         )
         if signal == "close_intent_conflict":
-            from cayu.runtime._recovery_coordinator import _approval_interrupt_close_intent_matches
+            from cayu.runtime._pending_tool_round_recovery import (
+                _approval_interrupt_close_intent_matches,
+            )
             from cayu.sessions.records import SessionStatus
 
             def inject_contradictory_close_intent(_session, checkpoint):

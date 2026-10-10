@@ -22,9 +22,6 @@ from cayu.events import (
 from cayu.providers._credential_boundary import copy_provider_cancellation_failures
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime._approval_support import _pending_approval_and_round_for_atomic_claim
-from cayu.runtime._durable_tool_round import (
-    _interrupted_tool_round_results as _interrupted_tool_round_results,
-)
 from cayu.runtime._interruption_coordinator import (
     _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
 )

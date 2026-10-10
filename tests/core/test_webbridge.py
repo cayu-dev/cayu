@@ -896,7 +896,7 @@ def test_sandboxed_profile_reconstructs_fetch_and_screenshot_identity_after_rest
         return app
 
     async def prepare(app: CayuApp):
-        return await app._session_engine._prepare_initial_run(
+        return await app._session_engine.prepare_initial_run(
             RunRequest(
                 agent_name="browser-agent",
                 messages=[Message.text("user", "inspect")],

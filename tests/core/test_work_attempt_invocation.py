@@ -23,7 +23,7 @@ from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.events import EventType
 from cayu.messages import Message
-from cayu.runtime import _recovery_coordinator as recovery_coordinator_module
+from cayu.runtime import _incomplete_session_recovery as incomplete_recovery_module
 from cayu.runtime._invocation_lifecycle import (
     PreparedInvocationBinding,
     _authenticated_invocation_context,
@@ -468,8 +468,7 @@ def test_work_attempt_recovers_entry_before_model_dispatch(backend, tmp_path, mo
             provider = _RecordingProvider()
             replacement.register_provider(provider, default=True)
             replacement.register_agent(AgentSpec(name="worker", model="verified-work-test-model"))
-            coordinator = replacement._session_engine._recovery_coordinator
-            factory = recovery_coordinator_module.reconstruct_invocation_context
+            factory = incomplete_recovery_module.reconstruct_invocation_context
             recovery_contexts = []
 
             def record_recovery_context(**kwargs):
@@ -479,7 +478,7 @@ def test_work_attempt_recovers_entry_before_model_dispatch(backend, tmp_path, mo
 
             with monkeypatch.context() as patch:
                 patch.setattr(
-                    recovery_coordinator_module,
+                    incomplete_recovery_module,
                     "reconstruct_invocation_context",
                     record_recovery_context,
                 )
@@ -499,17 +498,19 @@ def test_work_attempt_recovers_entry_before_model_dispatch(backend, tmp_path, mo
                 # Characterize the sibling workspace guard under the actual
                 # reconstructed recovery context; full workspace acceptance
                 # still requires its real sync/finalization fault regression.
-                guarded_task = await coordinator._require_governed_completion_task(
-                    session=await sessions.load(admission.session_id),
-                    marker={"task_id": admission.task_id},
-                    invocation_context=context,
+                guarded_task = (
+                    await replacement._incomplete_recovery._require_governed_completion_task(
+                        session=await sessions.load(admission.session_id),
+                        marker={"task_id": admission.task_id},
+                        invocation_context=context,
+                    )
                 )
                 assert guarded_task.status is TaskStatus.RUNNING
                 guarded_task.metadata["caller-mutation"] = True
                 assert "caller-mutation" not in (await tasks.load_task(admission.task_id)).metadata
                 for marker in ({}, {"task_id": None}, {"task_id": "unrelated-task"}):
                     with pytest.raises(RuntimeError, match="conflicting task authority"):
-                        await coordinator._require_governed_completion_task(
+                        await replacement._incomplete_recovery._require_governed_completion_task(
                             session=await sessions.load(admission.session_id),
                             marker=marker,
                             invocation_context=context,

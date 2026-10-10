@@ -31,7 +31,7 @@ from cayu import (
     UserInputTool,
 )
 from cayu.configuration import OperationsConfig
-from cayu.runtime._session_engine import suppress_interruption_cascade
+from cayu.runtime._interruption_coordinator import suppress_interruption_cascade
 from cayu.sessions.cleanup import RecoveryCleanupDeadlineExceeded, RecoveryCleanupPolicy
 
 
@@ -163,7 +163,7 @@ def test_public_preclaimed_finalizer_retains_claim_until_worker_settles(
                 assert "incomplete_session_recovery_claim" not in await store.load_checkpoint(
                     session_id
                 )
-                assert not app._recovery_coordinator._recovery_claim_workers
+                assert not app._recovery_ownership._recovery_claim_workers
                 assert len(provider.requests) == 1
                 published = [
                     event

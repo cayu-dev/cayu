@@ -1954,3 +1954,22 @@ class RecoveryOwnership:
         if loaded is None:
             raise KeyError(f"Session not found: {session_id}") from None
         return loaded
+
+
+def _checkpoint_without_active_incomplete_recovery_claim(
+    checkpoint: dict[str, Any] | None,
+    *,
+    now: datetime,
+) -> dict[str, Any] | None:
+    """Reject live recovery ownership and remove an expired internal marker."""
+    _require_aware_datetime(now, "now")
+    if checkpoint is None:
+        return None
+    updated = copy_durable_record(checkpoint, "checkpoint")
+    existing = _incomplete_recovery_claim_from_checkpoint(updated)
+    if existing is None:
+        return updated
+    if existing[1] > now:
+        raise RuntimeError("Session has an active incomplete-session recovery operation.")
+    updated.pop(_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY, None)
+    return updated

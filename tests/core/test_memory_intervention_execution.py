@@ -1138,7 +1138,7 @@ class _ProfileRacingRuntimeApplicationFactory(_CanonicalRuntimeApplicationFactor
         )
         assert type(app) is CayuApp
         engine = app._session_engine
-        original_prepare = engine._prepare_initial_run
+        original_prepare = engine.prepare_initial_run
         prepare_calls = 0
 
         async def prepare_with_registration_race(*args, **kwargs):
@@ -1152,7 +1152,7 @@ class _ProfileRacingRuntimeApplicationFactory(_CanonicalRuntimeApplicationFactor
                 )
             return await original_prepare(*args, **kwargs)
 
-        engine._prepare_initial_run = prepare_with_registration_race  # type: ignore[method-assign]
+        engine.prepare_initial_run = prepare_with_registration_race  # type: ignore[method-assign]
         return app
 
 
@@ -1193,7 +1193,7 @@ class _StoreRacingRuntimeApplicationFactory(_CanonicalRuntimeApplicationFactory)
         )
         assert type(app) is CayuApp
         engine = app._session_engine
-        original_prepare = engine._prepare_initial_run
+        original_prepare = engine.prepare_initial_run
         prepare_calls = 0
 
         async def prepare_with_store_race(*args, **kwargs):
@@ -1212,7 +1212,7 @@ class _StoreRacingRuntimeApplicationFactory(_CanonicalRuntimeApplicationFactory)
                 )
             return prepared
 
-        engine._prepare_initial_run = prepare_with_store_race  # type: ignore[method-assign]
+        engine.prepare_initial_run = prepare_with_store_race  # type: ignore[method-assign]
         return app
 
 
@@ -1556,7 +1556,7 @@ async def _record_runtime_profile(
         scope=scope,
         policy=policy,
     )
-    prepared = await app._session_engine._prepare_initial_run(
+    prepared = await app._session_engine.prepare_initial_run(
         RunRequest(
             agent_name="agent",
             session_id=f"profile-{suffix}",

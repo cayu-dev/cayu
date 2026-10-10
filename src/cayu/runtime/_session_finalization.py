@@ -121,27 +121,17 @@ from cayu.runtime._continuation_task_failure import (
     runtime_task_failure_terminalization_request,
     runtime_task_terminalization_idempotency_key,
 )
-from cayu.runtime._delegated_event_stream import (
-    _close_delegated_event_stream as _close_delegated_event_stream,
-)
 from cayu.runtime._diagnostics import (
     exception_diagnostic,
 )
 from cayu.runtime._durable_tool_round import (
     DeferredInteractionInput,
     DurableToolRound,
+    _environment_name,
+    _limit_reached_tool_call_event,
+    _limit_reached_tool_round_results,
+    _limit_value_for_payload,
 )
-from cayu.runtime._durable_tool_round import _environment_name as _environment_name
-from cayu.runtime._durable_tool_round import (
-    _interrupted_tool_round_results as _interrupted_tool_round_results,
-)
-from cayu.runtime._durable_tool_round import (
-    _limit_reached_tool_call_event as _limit_reached_tool_call_event,
-)
-from cayu.runtime._durable_tool_round import (
-    _limit_reached_tool_round_results as _limit_reached_tool_round_results,
-)
-from cayu.runtime._durable_tool_round import _limit_value_for_payload as _limit_value_for_payload
 from cayu.runtime._environment_lifecycle import (
     EnvironmentLifecycle,
 )
@@ -184,6 +174,7 @@ from cayu.runtime._recovery_requests import (
     RecoveryAbandonedTurnRequest,
     RecoveryInterruptionRequest,
     RecoveryLimitStopRequest,
+    RecoveryTaskEventRequest,
     RecoveryTerminalEventRequest,
 )
 from cayu.runtime._run_limits import (
@@ -5327,3 +5318,46 @@ class SessionFinalization:
             registered_agent,
             registered_environment,
         )
+
+
+def _interaction_transition_replay_failures(
+    error: BaseException,
+) -> tuple[Exception, ...] | None:
+    """Return runtime-owned replay failures for durable diagnostics."""
+
+    try:
+        authority = BaseException.__getattribute__(
+            error,
+            "_cayu_interaction_transition_replay_failure",
+        )
+    except (AttributeError, TypeError):
+        return None
+    if authority is not _INTERACTION_TRANSITION_REPLAY_FAILURE_AUTHORITY or not isinstance(
+        error,
+        ExceptionGroup,
+    ):
+        return None
+    try:
+        attempts = BaseException.__getattribute__(
+            error,
+            _INTERACTION_TRANSITION_REPLAY_ATTEMPTS_ATTRIBUTE,
+        )
+    except (AttributeError, TypeError):
+        return None
+    if (
+        type(attempts) is not tuple
+        or len(attempts) < 2
+        or any(not isinstance(attempt, Exception) for attempt in attempts)
+    ):
+        return None
+    return attempts
+
+
+def _recovery_task_event(request: RecoveryTaskEventRequest) -> Event:
+    return _task_event(
+        event_type=request.event_type,
+        task=request.task,
+        session=request.session,
+        registered_agent=request.registered_agent,
+        registered_environment=request.registered_environment,
+    )

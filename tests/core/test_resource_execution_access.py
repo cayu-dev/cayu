@@ -130,6 +130,53 @@ def test_expansion_does_not_widen_existing_handle(tmp_path):
     asyncio.run(run())
 
 
+def test_continuation_guard_observes_policy_replaced_during_session_load(tmp_path, monkeypatch):
+    async def run():
+        store = SQLiteSessionStore(tmp_path / "continuation-policy.db")
+        try:
+            app = app_for(store, Policy())
+            access = await app.access("alice")
+            _ = [
+                event
+                async for event in access.run(
+                    RunRequest(
+                        agent_name="shared",
+                        session_id="policy-replacement",
+                        messages=[Message.text("user", "hi")],
+                        labels={"organization": "acme"},
+                    )
+                )
+            ]
+            replacement = Policy()
+            replacement.current = SessionAccessScope()
+            original_load = store.load
+            entered = False
+
+            async def replace_policy_after_load(session_id):
+                session = await original_load(session_id)
+                app.resource_access_policy = replacement
+                return session
+
+            async def continuation():
+                nonlocal entered
+                entered = True
+                yield "unexpected execution"
+
+            monkeypatch.setattr(store, "load", replace_policy_after_load)
+            guarded = await app._resource_session_stream.restore(
+                continuation(), "policy-replacement"
+            )
+            with pytest.raises(SessionAccessDenied):
+                _ = [event async for event in guarded]
+            assert not entered
+            assert replacement.calls > 0
+            assert current_binding() is None
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
 def test_stream_context_is_not_exposed_to_consumer(tmp_path):
     async def run():
         from contextlib import aclosing

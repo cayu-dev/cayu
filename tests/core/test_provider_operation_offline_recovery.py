@@ -73,8 +73,8 @@ from cayu.providers.operations import (
     ProviderOperationStatus,
 )
 from cayu.providers.retry_policy import RetryPolicy
+from cayu.runtime import _provider_disposition_recovery as provider_disposition_module
 from cayu.runtime import _provider_operation_cancellation_owner as cancellation_owner
-from cayu.runtime import _recovery_coordinator as recovery_coordinator_module
 from cayu.runtime import _session_engine as session_engine_module
 from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
 from cayu.runtime._event_writer import RuntimeEventWriter
@@ -4180,7 +4180,7 @@ def test_concurrent_exact_fallback_replay_does_not_start_a_second_transition(
             ModelStreamEvent.text_delta("recovered after concurrent resolution"),
             ModelStreamEvent.completed({"finish_reason": "stop"}),
         )
-        original_transition = app._recovery_coordinator._transition_recovery_session_to_running
+        original_transition = app._recovery_admission.transition_recovery_session_to_running
         transition_call_count = 0
         both_callers_ready = asyncio.Event()
         release_transitions = asyncio.Event()
@@ -4194,8 +4194,8 @@ def test_concurrent_exact_fallback_replay_does_not_start_a_second_transition(
             return await original_transition(*args, **kwargs)
 
         monkeypatch.setattr(
-            app._recovery_coordinator,
-            "_transition_recovery_session_to_running",
+            app._recovery_admission,
+            "transition_recovery_session_to_running",
             blocked_transition,
         )
 
@@ -4278,7 +4278,7 @@ def test_concurrent_exact_fail_replay_observes_in_progress_terminalization(
         )
         terminalization_started = asyncio.Event()
         release_terminalization = asyncio.Event()
-        original_fail = app._recovery_coordinator._fail_provider_operation
+        original_fail = app._session_finalization.fail_recovered_provider_operation
 
         async def blocked_fail(request):
             async for event in original_fail(request):
@@ -4288,8 +4288,8 @@ def test_concurrent_exact_fail_replay_observes_in_progress_terminalization(
                     await release_terminalization.wait()
 
         monkeypatch.setattr(
-            app._recovery_coordinator,
-            "_fail_provider_operation",
+            app._session_finalization,
+            "fail_recovered_provider_operation",
             blocked_fail,
         )
 
@@ -4599,7 +4599,7 @@ def test_same_worker_new_handoff_takes_over_pre_execution_failure_claim(
             expected_run_epoch=interrupted.run_epoch,
             action=ProviderOperationResolutionAction.FAIL,
         )
-        original_claim = app._recovery_coordinator._claim_provider_operation_disposition_execution
+        original_claim = app._provider_disposition._claim_provider_operation_disposition_execution
 
         async def lose_after_execution_claim(**kwargs):
             claimed = await original_claim(**kwargs)
@@ -4607,7 +4607,7 @@ def test_same_worker_new_handoff_takes_over_pre_execution_failure_claim(
             raise _SimulatedProcessLoss("process lost after the execution claim")
 
         monkeypatch.setattr(
-            app._recovery_coordinator,
+            app._provider_disposition,
             "_claim_provider_operation_disposition_execution",
             lose_after_execution_claim,
         )
@@ -4627,7 +4627,7 @@ def test_same_worker_new_handoff_takes_over_pre_execution_failure_claim(
         assert current_owner is not None
 
         monkeypatch.setattr(
-            app._recovery_coordinator,
+            app._provider_disposition,
             "_claim_provider_operation_disposition_execution",
             original_claim,
         )
@@ -4861,7 +4861,7 @@ def test_fallback_limit_outcome_recovers_marker_clear_acknowledgement_loss(
                 },
             },
         )
-        original_clear = recovery_coordinator_module.clear_pending_provider_operation_disposition
+        original_clear = provider_disposition_module.clear_pending_provider_operation_disposition
         failed_once = False
 
         async def lose_first_clear_acknowledgement(session_store, pending) -> None:
@@ -4872,7 +4872,7 @@ def test_fallback_limit_outcome_recovers_marker_clear_acknowledgement_loss(
             await original_clear(session_store, pending)
 
         monkeypatch.setattr(
-            recovery_coordinator_module,
+            provider_disposition_module,
             "clear_pending_provider_operation_disposition",
             lose_first_clear_acknowledgement,
         )
@@ -4891,7 +4891,7 @@ def test_fallback_limit_outcome_recovers_marker_clear_acknowledgement_loss(
         assert provider.adapter.start_calls == 0
 
         monkeypatch.setattr(
-            recovery_coordinator_module,
+            provider_disposition_module,
             "clear_pending_provider_operation_disposition",
             original_clear,
         )

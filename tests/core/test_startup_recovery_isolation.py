@@ -168,7 +168,7 @@ def test_unclassified_preflight_failure_still_fails_startup(monkeypatch, failure
         async def fail(**kwargs):
             raise failure_type("store unavailable")
 
-        monkeypatch.setattr(app._recovery_coordinator, "preflight_incomplete_session", fail)
+        monkeypatch.setattr(app._incomplete_recovery, "preflight_incomplete_session", fail)
         with pytest.raises(failure_type, match="store unavailable"):
             await app.resume_pending_interruption_cascades(interrupting_inactive_for_seconds=0)
         assert not (await app.get_startup_recovery_status()).completed
@@ -422,8 +422,8 @@ def test_preflight_manual_model_recovery_blocks_without_planner_blocker(monkeypa
         async def unexpected(*args, **kwargs):
             raise AssertionError("A manual model decision must not reach automatic recovery.")
 
-        monkeypatch.setattr(app._recovery_coordinator, "preflight_incomplete_session", manual)
-        monkeypatch.setattr(app._recovery_coordinator, "recover_incomplete_session", unexpected)
+        monkeypatch.setattr(app._incomplete_recovery, "preflight_incomplete_session", manual)
+        monkeypatch.setattr(app._incomplete_recovery, "recover_incomplete_session", unexpected)
         assert (
             await app.resume_pending_interruption_cascades(interrupting_inactive_for_seconds=0) == 1
         )
@@ -456,7 +456,7 @@ def test_startup_isolates_manual_model_recovery_after_preflight(monkeypatch):
         monkeypatch.setattr(
             app._recovery_plan_coordinator, "startup_interruption_blockers", allowed
         )
-        monkeypatch.setattr(app._recovery_coordinator, "recover_incomplete_session", manual)
+        monkeypatch.setattr(app._incomplete_recovery, "recover_incomplete_session", manual)
         assert (
             await app.resume_pending_interruption_cascades(interrupting_inactive_for_seconds=0) == 1
         )
@@ -485,7 +485,7 @@ def test_startup_skips_root_deleted_after_preflight(monkeypatch, deleted):
             return await load(session_id)
 
         preflight = app._recovery_plan_coordinator.startup_interruption_blockers
-        recover = app._recovery_coordinator.recover_incomplete_session
+        recover = app._incomplete_recovery.recover_incomplete_session
 
         async def delete_after_preflight(session_id, inactive_for_seconds):
             codes = await preflight(session_id, inactive_for_seconds)
@@ -505,7 +505,7 @@ def test_startup_skips_root_deleted_after_preflight(monkeypatch, deleted):
             app._recovery_plan_coordinator, "startup_interruption_blockers", delete_after_preflight
         )
         monkeypatch.setattr(
-            app._recovery_coordinator, "recover_incomplete_session", delete_after_recovery
+            app._incomplete_recovery, "recover_incomplete_session", delete_after_recovery
         )
         assert (
             await app.resume_pending_interruption_cascades(interrupting_inactive_for_seconds=0) == 1

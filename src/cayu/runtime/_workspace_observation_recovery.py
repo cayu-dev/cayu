@@ -32,9 +32,6 @@ from cayu.execution_units import (
 )
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
-from cayu.runtime._durable_tool_round import (
-    _interrupted_tool_round_results as _interrupted_tool_round_results,
-)
 from cayu.runtime._event_writer import (
     RuntimeEventWriter,
     prepare_runtime_event,

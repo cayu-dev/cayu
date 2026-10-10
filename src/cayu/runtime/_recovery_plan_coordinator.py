@@ -29,6 +29,7 @@ from cayu.runtime._environment_allocation import (
     checkpoint_object_map,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._incomplete_session_recovery import IncompleteSessionRecovery
 from cayu.runtime._model_completion_contracts import (
     ModelCompletionManualRecoveryRequired,
     model_completion_recovery_context_from_stage,
@@ -430,6 +431,7 @@ class RecoveryPlanCoordinator:
         task_store: TaskStore | None,
         event_writer: RuntimeEventWriter,
         recovery_coordinator: RecoveryCoordinator,
+        incomplete_recovery: IncompleteSessionRecovery,
         pending_tool_round_recovery: PendingToolRoundRecovery,
         model_completion_recovery: ModelCompletionRecovery,
         resolve_registered_agent: ResolveRegisteredAgent,
@@ -448,6 +450,7 @@ class RecoveryPlanCoordinator:
         self._task_store = task_store
         self._event_writer = event_writer
         self._recovery_coordinator = recovery_coordinator
+        self._incomplete_recovery = incomplete_recovery
         self._pending_tool_round_recovery = pending_tool_round_recovery
         self._model_completion_recovery = model_completion_recovery
         self._resolve_registered_agent = resolve_registered_agent
@@ -675,7 +678,7 @@ class RecoveryPlanCoordinator:
                 session.metadata
             ).fingerprint
 
-        zero_work = await self._recovery_coordinator.terminalize_zero_work_interruption(
+        zero_work = await self._incomplete_recovery.terminalize_zero_work_interruption(
             session=session,
             inactive_for_seconds=request.selection.inactive_for_seconds,
         )
@@ -700,7 +703,7 @@ class RecoveryPlanCoordinator:
         preflight: IncompleteSessionRecoveryResult | None = None
         if registration_status is RecoveryRegistrationStatus.READY:
             try:
-                preflight = await self._recovery_coordinator.preflight_incomplete_session(
+                preflight = await self._incomplete_recovery.preflight_incomplete_session(
                     session=session,
                     inactive_for_seconds=request.selection.inactive_for_seconds,
                     participant_context=request.participant_context,
@@ -2217,7 +2220,7 @@ class RecoveryPlanCoordinator:
                 session = await self._session_store.load(private_session_id)
                 if session is None:
                     raise RecoveryPlanExecutionFenced("Zero-work session disappeared.")
-                result = await self._recovery_coordinator.terminalize_zero_work_interruption(
+                result = await self._incomplete_recovery.terminalize_zero_work_interruption(
                     recovery_ownership=recovery_ownership,
                     session=session,
                     inactive_for_seconds=None,
@@ -2390,7 +2393,7 @@ class RecoveryPlanCoordinator:
             task_heartbeat_lost: asyncio.Event | None = None
             task_heartbeat: asyncio.Task[None] | None = None
             if recoverable_task is not None:
-                preparation = await self._recovery_coordinator.interrupt_incomplete_session_for_manual_tool_recovery(
+                preparation = await self._incomplete_recovery.interrupt_incomplete_session_for_manual_tool_recovery(
                     IncompleteSessionRecoveryRequest(
                         session_id=private_session_id,
                         inactive_for_seconds=None,

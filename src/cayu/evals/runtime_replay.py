@@ -1571,7 +1571,7 @@ async def _candidate_profile(
             tool_capability_ceiling=tool_capability_ceiling,
         )
     )
-    prepared = await isolated._session_engine._prepare_initial_run(
+    prepared = await isolated._session_engine.prepare_initial_run(
         request,
         admit_session=False,
         store_resolved_existing_session_id=None,

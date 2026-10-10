@@ -281,7 +281,7 @@ def test_incomplete_session_recovery_reconciles_orphaned_environment_progress() 
             messages=[Message.text("user", "run")],
             environment_name="static",
         )
-        prepared = await app._session_engine._prepare_initial_run(
+        prepared = await app._session_engine.prepare_initial_run(
             request,
             admit_session=False,
         )

@@ -241,7 +241,7 @@ def test_cancelled_refresh_retains_dispatched_write_and_finishes_original_parent
         calls = []
         caught = []
         continuation_errors = []
-        resume = app._session_engine.resume_foreground_child
+        resume = app._session_recovery.resume_foreground_child
 
         async def record_continuation_error(*args, **kwargs):
             try:
@@ -251,7 +251,7 @@ def test_cancelled_refresh_retains_dispatched_write_and_finishes_original_parent
                 raise
 
         monkeypatch.setattr(
-            app._session_engine, "resume_foreground_child", record_continuation_error
+            app._session_recovery, "resume_foreground_child", record_continuation_error
         )
         task = None
         try:

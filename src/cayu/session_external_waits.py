@@ -85,7 +85,7 @@ class SessionExternalWaitAdapter:
         session = await self.waits.store.load(session_id)
         if session is None or session.instance_id != retained.execution.session_instance_id:
             raise ExternalWaitUnavailable("External recovery source incarnation is unavailable.")
-        await self.app._session_engine._require_participant_execution(session, None)
+        await self.app._require_participant_execution(session, None)
         boundary = _ExternalExecutionToWait(
             self.waits,
             registration,
@@ -98,7 +98,7 @@ class SessionExternalWaitAdapter:
                 session_id=session_id,
                 wait=await self.waits.inspect(registration.correlation, context=context),
             )
-        await self.app._session_engine.recover_incomplete_session(
+        await self.app._session_recovery.recover_incomplete_session(
             recovery_request,
             execution_to_wait=boundary,
         )
@@ -249,10 +249,10 @@ class SessionExternalWaitAdapter:
         session = await self.waits.store.load(request.session_id)
         if session is None:
             raise ExternalWaitUnavailable("External resume source is unavailable.")
-        linked_task, _ = await self.app._session_engine._linked_resume_task_id(request)
+        linked_task, _ = await self.app._session_engine.linked_resume_task_id(request)
         if session.parent_session_id is not None or linked_task is not None:
             raise ValueError("External session waits support ordinary root sessions only.")
-        await self.app._session_engine._require_participant_execution(session, None)
+        await self.app._require_participant_execution(session, None)
         source_digest = self.app._session_engine.work_attempt_source_request_sha256(
             request, kind="continuation"
         )
