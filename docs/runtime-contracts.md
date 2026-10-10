@@ -7990,6 +7990,27 @@ validated JSON `null` from no validated output. Tests can use
 tool strategy without importing or reproducing Cayu's reserved submission-tool
 wire protocol.
 
+When the stream raises before a terminal event, `run_to_completion` returns a
+`FAILED` outcome built from the exception. `RunOutcome.error_detail` is an
+`ExceptionDetail` with the exception's type and message, its
+`__cause__`/`__context__` chain (`causes`), and for an exception group its leaf
+exceptions (`leaves`), grouped by type and message with a count and each leaf's
+own cause chain. Leaves, causes and message lengths are bounded, and
+`omitted_leaf_count` reports visited leaves excluded by the distinct-leaf bound.
+Repeated occurrences of the same exception or subgroup are counted separately.
+Traversal visits at most 256 node occurrences; `traversal_truncated` is true when
+unvisited occurrences remain. In that case, leaf counts and `omitted_leaf_count`
+cover only the visited prefix, and the text explicitly marks the counts as
+incomplete, even when no leaf was reached. `RunOutcome.error` renders
+the same detail as text, for example
+`ExceptionGroup: ... (3 sub-exceptions); leaf errors: OperationalError: unable to
+open database file (3 times; caused by OSError: [Errno 24] Too many open files)`.
+All text passes through the app's secret redactor. `error_detail` is `None` when
+the failure came from a `session.failed` event. A `session.failed` payload built
+from an exception group appends the same leaf and cause text to its `error`.
+`exception_detail(error, redactor=...)` builds an `ExceptionDetail` for any
+exception, so applications can apply the same summary in their own handlers.
+
 The returned event tuple and structured-output result are detached snapshots,
 including nested event payloads and structured JSON values. Callers may retain
 them as evidence without subsequent mutation of their source objects changing

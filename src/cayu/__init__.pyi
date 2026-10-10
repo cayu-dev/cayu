@@ -3527,6 +3527,10 @@ from cayu.runtime._durable_worker_loop import (
     DurableWorkerMetricsSnapshot as DurableWorkerMetricsSnapshot,
 )
 from cayu.runtime._environment_lifecycle import EnvironmentCapacityError as EnvironmentCapacityError
+from cayu.runtime._exception_detail import ExceptionCause as ExceptionCause
+from cayu.runtime._exception_detail import ExceptionDetail as ExceptionDetail
+from cayu.runtime._exception_detail import ExceptionLeaf as ExceptionLeaf
+from cayu.runtime._exception_detail import exception_detail as exception_detail
 from cayu.runtime._host_continuation_discovery import (
     ContinuationDiscoveryPage as ContinuationDiscoveryPage,
 )
@@ -6951,6 +6955,9 @@ __all__ = [
     "EveryCallRule",
     "EvidenceSpool",
     "ExaWebAdapter",
+    "ExceptionCause",
+    "ExceptionDetail",
+    "ExceptionLeaf",
     "ExecCommand",
     "ExecCommandTool",
     "ExecResult",
@@ -8949,6 +8956,7 @@ __all__ = [
     "evaluate_assertions",
     "evaluate_execution_admission",
     "evaluation_target_identity",
+    "exception_detail",
     "execution_deadline_scope",
     "execution_profile_egress_authority_change",
     "execution_profile_snapshot_ref",

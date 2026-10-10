@@ -1,5 +1,9 @@
 """Static declarations for the lazy public API."""
 
+from cayu.runtime._exception_detail import ExceptionCause as ExceptionCause
+from cayu.runtime._exception_detail import ExceptionDetail as ExceptionDetail
+from cayu.runtime._exception_detail import ExceptionLeaf as ExceptionLeaf
+from cayu.runtime._exception_detail import exception_detail as exception_detail
 from cayu.sessions.base import (
     INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY as INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
 )

@@ -192,6 +192,7 @@ from cayu.runtime._environment_exposure import (
     transfer_queued_environment_exposure,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._exception_detail import exception_detail, exception_detail_suffix
 from cayu.runtime._invocation_lifecycle import (
     InvocationContext,
     _release_invocation_command_with_cleanup_authority,
@@ -7676,6 +7677,11 @@ def exception_failure_payload(
         diagnostic = exception_diagnostic(error, redactor=resolved_redactor)
     elif type(diagnostic) is not ExceptionDiagnostic:
         raise TypeError("diagnostic must be an ExceptionDiagnostic.")
+    if isinstance(error, BaseExceptionGroup) and diagnostic.durable_value_error_code is None:
+        # A group's message names only its child count; keep the leaf errors.
+        suffix = exception_detail_suffix(exception_detail(error, redactor=resolved_redactor))
+        if suffix:
+            diagnostic = replace(diagnostic, message=diagnostic.message + suffix)
     fallback = _redact_and_bound_failure_payload(
         diagnostic.payload_fields(),
         redactor=resolved_redactor,

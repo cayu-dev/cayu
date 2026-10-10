@@ -14,9 +14,15 @@ from typing import TYPE_CHECKING, Any
 
 from cayu._validation import copy_json_value
 from cayu.events import Event, EventType, copy_event
+from cayu.runtime._exception_detail import (
+    MAX_EXCEPTION_SUMMARY_UTF8_BYTES,
+    ExceptionDetail,
+    exception_detail,
+)
 from cayu.runtime.tool_completion import ToolCompletionResult
 from cayu.sessions.base import ResumeRequest
 from cayu.sessions.records import SessionStatus
+from cayu.vaults import SecretRedactor
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp
@@ -47,6 +53,11 @@ class RunOutcome:
     - ``final_text`` is the last completed model turn's text output (``""`` if
       the latest model turn completed without text or failed before completion).
     - ``error`` is the failure message when ``status`` is ``SessionStatus.FAILED``, else ``None``.
+      When the run raised instead of ending in ``session.failed``, it also names
+      an exception group's leaf errors and the cause chain.
+    - ``error_detail`` is the structured, redacted form of that raised exception
+      (type, message, causes and group leaves), or ``None`` when the failure came
+      from a ``session.failed`` event or the run did not fail.
     - ``events`` is the full event stream, if you need more than the summary.
     - ``structured_output`` is the last successfully validated structured value,
       including valid JSON ``null``, or ``None`` when the run had no validated output.
@@ -64,9 +75,12 @@ class RunOutcome:
     structured_output: StructuredOutputResult | None = None
     interaction_id: str | None = None
     tool_completion: ToolCompletionResult | None = None
+    error_detail: ExceptionDetail | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "events", tuple(copy_event(event) for event in self.events))
+        if self.error_detail is not None and type(self.error_detail) is not ExceptionDetail:
+            raise TypeError("error_detail must be an ExceptionDetail.")
         if self.tool_completion is not None:
             if type(self.tool_completion) is not ToolCompletionResult:
                 raise TypeError("tool_completion must be a ToolCompletionResult.")
@@ -110,13 +124,17 @@ async def run_to_completion(app: CayuApp, request: RunRequest | ResumeRequest) -
     ``ResumeRequest(session_id=outcome.session_id, messages=[...])``; a new
     ``RunRequest`` always starts an empty session. A model/tool failure surfaces as
     ``status == SessionStatus.FAILED`` with ``error`` set. Setup-time exceptions
-    before a terminal session event are also converted into a failed outcome.
+    before a terminal session event are also converted into a failed outcome,
+    with ``error_detail`` describing the exception, its causes and, for an
+    exception group, its leaf errors. Both are redacted with the app's secret
+    redactor.
     """
     events: list[Event] = []
     current_turn_text: list[str] = []
     final_text = ""
     status = SessionStatus.INTERRUPTED
     error: str | None = None
+    error_detail: ExceptionDetail | None = None
     tool_completion: ToolCompletionResult | None = None
     structured_output: StructuredOutputResult | None = None
     interaction_id: str | None = None
@@ -161,7 +179,14 @@ async def run_to_completion(app: CayuApp, request: RunRequest | ResumeRequest) -
                 status = SessionStatus.INTERRUPTED
     except Exception as exc:
         status = SessionStatus.FAILED
-        error = f"{type(exc).__name__}: {exc}"
+        redactor = getattr(app, "_secret_redactor", None)
+        if not isinstance(redactor, SecretRedactor):
+            redactor = SecretRedactor()
+        error_detail = exception_detail(exc, redactor=redactor)
+        error = redactor.redact_text_bounded(
+            error_detail.summary(),
+            max_bytes=MAX_EXCEPTION_SUMMARY_UTF8_BYTES,
+        )
 
     return RunOutcome(
         session_id=session_id,
@@ -172,4 +197,5 @@ async def run_to_completion(app: CayuApp, request: RunRequest | ResumeRequest) -
         structured_output=structured_output,
         tool_completion=tool_completion,
         interaction_id=interaction_id,
+        error_detail=error_detail,
     )
