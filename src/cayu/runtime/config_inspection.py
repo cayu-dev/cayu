@@ -67,3 +67,29 @@ class EffectiveRunConfiguration(BaseModel):
         if isinstance(value, ExecutionProfileIdentity):
             value = value.model_dump(mode="json", warnings=False)
         return ExecutionProfileIdentity.model_validate(value)
+
+
+class CandidateExecutionProfile(BaseModel):
+    """The profile Runtime would compare one session's stored profile with.
+
+    It is resolved for the session's agent, environment, provider, model and
+    causal budget id by the ordinary read-only initial-run preflight; no session
+    is loaded or admitted and no provider, tool, hook or environment-factory
+    work runs.
+    """
+
+    model_config = _INSPECTION_MODEL
+
+    agent_name: str
+    environment_name: str | None
+    provider_name: str
+    model: str
+    causal_budget_id: str | None = None
+    execution_profile: ExecutionProfileIdentity
+
+    @field_validator("execution_profile", mode="before")
+    @classmethod
+    def detach_execution_profile(cls, value: object) -> ExecutionProfileIdentity:
+        if isinstance(value, ExecutionProfileIdentity):
+            value = value.model_dump(mode="json", warnings=False)
+        return ExecutionProfileIdentity.model_validate(value)

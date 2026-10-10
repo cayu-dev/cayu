@@ -13,6 +13,7 @@ import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from math import isfinite
 from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeVar, cast
 from unicodedata import category as unicode_category
@@ -280,6 +281,10 @@ from cayu.server.sse import (
     parse_last_event_id,
     session_follow_end_message,
     sse_message_data_bytes,
+)
+from cayu.sessions._execution_profile_checkpoint import (
+    SessionExecutionProfiles,
+    session_execution_profiles,
 )
 from cayu.sessions.base import (
     COMPACTION_INSTRUCTIONS_MAX_CHARS,
@@ -1172,6 +1177,53 @@ def _preaccept_error_detail(cayu_app: Any, error: BaseException) -> str:
     suffix = b"..."
     prefix = encoded[: SSE_ERROR_TEXT_MAX_BYTES - len(suffix)].decode("utf-8", errors="ignore")
     return prefix + suffix.decode()
+
+
+async def _exposed_session_execution_profiles(
+    cayu_app: Any,
+    session_id: str,
+    load: Callable[[], Awaitable[SessionExecutionProfiles]],
+) -> dict[str, Any]:
+    """Project one listed session's profiles; an unreadable one reports an issue.
+
+    One damaged or unreadable session must not hide the others in a listing, so
+    failures become an item issue. Unexpected failures are also logged.
+    """
+
+    try:
+        profiles = await load()
+    except KeyError as exc:
+        # Only the lookup of this exact session means it is gone.
+        profiles = (
+            SessionExecutionProfiles(issues=("session_not_found",))
+            if exc.args == (session_id,)
+            else _failed_session_execution_profiles(cayu_app, session_id, exc)
+        )
+    except CheckpointCompatibilityError:
+        profiles = SessionExecutionProfiles(issues=("checkpoint_incompatible",))
+    except Exception as exc:
+        profiles = _failed_session_execution_profiles(cayu_app, session_id, exc)
+    return profiles.model_dump(mode="json")
+
+
+def _failed_session_execution_profiles(
+    cayu_app: Any,
+    session_id: str,
+    error: Exception,
+) -> SessionExecutionProfiles:
+    with contextlib.suppress(Exception):
+        diagnostic = cayu_app.redact_exception_diagnostic(
+            error,
+            empty_message="Execution-profile inspection failed without a message.",
+            nonportable_message="Execution-profile inspection failed with a nonportable error.",
+        )
+        logger.error(
+            "Execution-profile inspection failed: session_id=%r error_type=%s error=%r",
+            cayu_app.project_session_id_for_exposure(session_id),
+            diagnostic.error_type,
+            diagnostic.message,
+        )
+    return SessionExecutionProfiles(issues=("load_failed",))
 
 
 def _log_mutation_acceptance_failure(
@@ -6619,6 +6671,7 @@ def create_router(
         agent_name: Annotated[str | None, Query()] = None,
         environment_name: Annotated[str | None, Query()] = None,
         cursor: Annotated[str | None, Query()] = None,
+        include: Annotated[list[Literal["execution_profile"]] | None, Query()] = None,
     ):
         requested_session_id = _clean_optional_query_value(session_id, "session_id")
         if requested_session_id is not None:
@@ -6653,7 +6706,18 @@ def create_router(
             ) from exc
         except PendingActionResultTooLarge as exc:
             raise HTTPException(status_code=413, detail=str(exc)) from exc
+        execution_profiles = None
+        if include is not None and "execution_profile" in include:
+            execution_profiles = [
+                await _exposed_session_execution_profiles(
+                    cayu_app,
+                    action.session.id,
+                    partial(cayu_app.inspect_session_execution_profiles, action.session.id),
+                )
+                for action in result.actions
+            ]
         return {
+            "execution_profiles": execution_profiles,
             "actions": [_serialize_pending_action(cayu_app, action) for action in result.actions],
             "issues": [
                 _redact_control_plane_values(
@@ -6687,7 +6751,7 @@ def create_router(
         order_by: SessionOrder = SessionOrder.UPDATED_AT_DESC,
         label: Annotated[list[str] | None, Query()] = None,
         label_selector: Annotated[list[str] | None, Query()] = None,
-        include: Annotated[list[Literal["usage"]] | None, Query()] = None,
+        include: Annotated[list[Literal["usage", "execution_profile"]] | None, Query()] = None,
     ):
         labels = _parse_session_label_filters(label)
         label_selectors = _parse_session_label_selectors(label_selector)
@@ -6736,11 +6800,29 @@ def create_router(
                 ).summary
                 for session in result.sessions
             ]
+        execution_profiles = None
+        if include is not None and "execution_profile" in include:
+            # Opt-in: one checkpoint read per listed session. Profiles are the
+            # redacted identities already used as decision evidence.
+            async def listed_session_profiles(session: Session) -> SessionExecutionProfiles:
+                checkpoint = await session_store.load_checkpoint(session.id)
+                stage = await session_store.load_active_model_completion_stage(session.id)
+                return session_execution_profiles(
+                    session, checkpoint, model_completion_pending=stage is not None
+                )
+
+            execution_profiles = [
+                await _exposed_session_execution_profiles(
+                    cayu_app, session.id, partial(listed_session_profiles, session)
+                )
+                for session in result.sessions
+            ]
         return {
             "sessions": [_serialize_session_base(cayu_app, session) for session in result.sessions],
             "next_cursor": _serialize_session_cursor(cayu_app, result.next_cursor),
             "total_count": result.total_count,
             "usage": usage,
+            "execution_profiles": execution_profiles,
         }
 
     async def get_session_topology(

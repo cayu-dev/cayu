@@ -494,7 +494,7 @@ from cayu.runtime.application_lifecycle import (
     _tracked_entrance,
 )
 from cayu.runtime.build_provenance import current_runtime_build_provenance
-from cayu.runtime.config_inspection import EffectiveRunConfiguration
+from cayu.runtime.config_inspection import CandidateExecutionProfile, EffectiveRunConfiguration
 from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicy,
 )
@@ -557,7 +557,9 @@ from cayu.runtime.tool_effects import (
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
+    SessionExecutionProfiles,
     execution_profile_from_session_metadata,
+    session_execution_profiles,
 )
 from cayu.sessions._foreground_child_checkpoint import ForegroundChildTerminal, ForegroundChildWait
 from cayu.sessions._session_continuation import ContinuationTicket
@@ -5995,6 +5997,91 @@ class CayuApp:
             await self.inspect_effective_run_configuration(request)
         ).execution_profile.fingerprint
 
+    @property
+    def execution_profile_policy_identity(self) -> str | None:
+        """Return the configured ``ExecutionProfilePolicy`` identity, if any."""
+
+        return self._session_engine._execution_profile_policy_identity
+
+    @property
+    def default_environment_name(self) -> str | None:
+        """Return the environment a new run without ``environment_name`` uses, if any."""
+
+        return self._environment_registry.default_name
+
+    @_tracked_entrance
+    async def inspect_candidate_execution_profile(
+        self,
+        agent_name: str,
+        *,
+        environment_name: str | None = None,
+        target: ModelTarget | None = None,
+        causal_budget_id: str | None = None,
+    ) -> CandidateExecutionProfile:
+        """Return the profile Runtime would compare a session of ``agent_name`` with.
+
+        Pass the session's recorded values. ``environment_name`` is used as a
+        stored session uses it, so ``None`` means no environment; pass
+        ``default_environment_name`` for what a new run would get. ``target`` is
+        the session's provider and model, and ``causal_budget_id`` selects the
+        causal-scoped application budget limits; without it a fresh session id
+        stands in, as it does for a new run.
+
+        Inspection runs the ordinary bounded, read-only initial-run preflight
+        with the application's run defaults. It neither loads nor creates a
+        session and dispatches no provider, tool, hook, or environment-factory
+        work.
+        """
+
+        request = self._with_application_run_defaults(
+            RunRequest(
+                agent_name=agent_name,
+                messages=[Message.text("user", "Inspect the candidate execution profile.")],
+                environment_name=environment_name,
+                target=target,
+                causal_budget_id=causal_budget_id,
+            )
+        )
+        prepared = await self._session_engine._prepare_initial_run(
+            request,
+            admit_session=False,
+            inspect_only=True,
+            session_environment=True,
+        )
+        if prepared is None:
+            raise RuntimeError("Candidate inspection cannot resolve a contracted task run.")
+        return CandidateExecutionProfile(
+            agent_name=prepared.registered_agent.spec.name,
+            environment_name=prepared.request.environment_name,
+            provider_name=prepared.session_identity.provider_name,
+            model=prepared.session_identity.model,
+            causal_budget_id=causal_budget_id,
+            execution_profile=prepared.execution_profile,
+        )
+
+    @_tracked_entrance
+    async def inspect_session_execution_profiles(
+        self,
+        session_id: str,
+    ) -> SessionExecutionProfiles:
+        """Return the stored profiles a later invocation of a session must match.
+
+        This reads the session record, its checkpoint and its active
+        model-completion stage only. It never resolves a candidate, consults an
+        ``ExecutionProfilePolicy``, or claims the session.
+        """
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        store = self._runtime_session_store
+        session = await store.load(session_id)
+        if session is None:
+            raise KeyError(session_id)
+        checkpoint = await store.load_checkpoint(session_id)
+        stage = await store.load_active_model_completion_stage(session_id)
+        return session_execution_profiles(
+            session, checkpoint, model_completion_pending=stage is not None
+        )
+
     @_tracked_entrance
     async def inspect_effective_run_configuration(
         self,
@@ -6003,8 +6090,10 @@ class CayuApp:
         """Return redacted effective run controls and their durable profile identity.
 
         Inspection performs the ordinary bounded, read-only initial-run preflight.
-        It creates no session and dispatches no provider, tool, hook, or environment
-        factory work.
+        It neither creates nor loads the session the request names and dispatches
+        no provider, tool, hook, or environment factory work. A named parent
+        session or task, and a work contract bound to a named session, are still
+        read because they shape the run.
         """
 
         if type(request) is not RunRequest:
@@ -6014,7 +6103,7 @@ class CayuApp:
         prepared = await self._session_engine._prepare_initial_run(
             request,
             admit_session=False,
-            store_resolved_existing_session_id=request.session_id,
+            inspect_only=True,
         )
         if prepared is None:
             raise TaskCompletionDecisionRequired(

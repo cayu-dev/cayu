@@ -4151,6 +4151,142 @@ For an accepted boundary, the decision event, optional expected-profile advance,
 
 Custom `SessionStore` implementations must opt into `supports_execution_profile_admission`, repeat the complete decision/profile comparison inside `admit_execution_profile_resume(...)`'s status/checkpoint transaction, append accepted decision evidence before other admission events, and implement `reject_execution_profile_resume(...)` as an atomic conditional event append. Active invocation authority additionally requires the complete lifecycle-command contract described above: the concrete store class must explicitly declare `invocation_lifecycle_command_version = 1`, and every create/admit/rebind/reject/settle/release primitive must preserve the command's complete compare-and-swap and receipt semantics. The older `supports_active_invocation_execution_profiles` declaration or an inherited built-in implementation is not sufficient proof; incomplete or inherited custom capability fails closed before any adapter method is called. In-memory, SQLite, and Postgres stores share conformance coverage for baseline creation, exact admission, changed-profile rejection, active continuation and rejection, accepted adoption, immutable baseline/advanced expectation, atomic event ordering, rollback, acknowledgement loss, restart, and replay. Historical behavior-version identity, contracted verifier-attempt carriage, and complete fork lineage rules are separate contracts. Every runtime operation that executes or derives a durable session—including resume, recovery, explicit compaction, and fork—requires complete execution-profile and tool-capability-ceiling authority. Cayu never reconstructs missing authority from the current agent registration; an incomplete record fails closed before admission or descendant creation.
 
+### Predicting profile admission before a release
+
+A host that publishes a new release can predict, before publishing, whether
+stored sessions will be admitted by it. Prediction reads profiles only; it never
+consults an `ExecutionProfilePolicy`, admits work, or grants authority.
+
+The stored side is `CayuApp.inspect_session_execution_profiles(session_id)`,
+which returns `SessionExecutionProfiles`, built by the pure
+`session_execution_profiles(session, checkpoint, model_completion_pending=...)`:
+
+- `boundary`: where Runtime meets the session next. `continuation` when the
+  checkpoint holds a pending approval, user input, tool round, foreground child
+  wait or continuation, or an accepted provider-operation resolution; when the
+  store holds an active model-completion stage for the session; or when the
+  active invocation has not released its run epoch (it is still running, or it
+  was interrupted and recovery will continue it). `resume` when the active
+  invocation released its run epoch and nothing is pending. `null` when the
+  profile that boundary needs is missing (for example a session created before
+  execution profiles, which has no issue) or an issue is reported.
+- `expected`: the session's current expected profile, compared at `resume`.
+- `active_invocation`: `interaction_id`, `run_epoch`, `released`, and the
+  profile bound to the latest invocation, which `continuation` must reuse
+  exactly.
+- `issues`: `expected_profile_invalid` or `active_invocation_profile_invalid`
+  for a malformed record, and `active_invocation_epoch_mismatch` when the active
+  invocation names another session or a run epoch Runtime would not continue
+  (the session's current epoch or the one before it). Issues are reported
+  instead of raised; Runtime still fails closed on the same records.
+
+A session without a profile record has neither profile. The active
+model-completion stage is stored outside the checkpoint, so the pure function
+takes `model_completion_pending` (whether
+`SessionStore.load_active_model_completion_stage` returns a stage); the
+application method and the server read it for you.
+
+The server exposes the same projection with
+`GET /api/sessions?include=execution_profile` and
+`GET /api/pending-actions?include=execution_profile` as an `execution_profiles`
+list in the same order as `sessions` or `actions`. Each item costs a checkpoint
+read and a model-completion stage read (pending actions also reload the
+session). An item whose records
+cannot be read does not fail the page: it has no profiles and an issue,
+`checkpoint_incompatible` for a checkpoint this release cannot interpret,
+`session_not_found` for a pending action whose session is gone, or
+`load_failed` for any other error, which the server also logs with a redacted
+diagnostic. The values are the redacted `ExecutionProfileIdentity` records
+already published in decision evidence: component classes, strengths,
+availability, SHA-256 fingerprints, runtime build provenance, and typed egress
+authority. Component identities carry no prompts, tool names, schemas, or
+credentials. Typed egress authority is not only fingerprints: it lists policy
+names and kinds, allowed destinations, allowed methods and paths, denied path
+prefixes, binding destinations, credential kinds, credential authority
+fingerprints, and the authority source, scope, policy version, and runner kind.
+It never contains credential values. Expose the output only to callers who may
+see that egress configuration.
+
+The candidate side is `CayuApp.inspect_candidate_execution_profile(agent_name,
+environment_name=None, target=None, causal_budget_id=None)`, which returns
+`CandidateExecutionProfile` (`agent_name`, resolved `environment_name`,
+`provider_name`, `model`, `causal_budget_id`, and `execution_profile`). Pass
+the session's recorded values, as Runtime resolves a resume or continuation
+from them rather than from current defaults:
+
+- `environment_name` is used exactly, so `None` means no environment, as it does
+  for a stored session. `CayuApp.default_environment_name` is what a new run
+  without one would get.
+- `target` is the session's provider and model.
+- `causal_budget_id` selects the application `BudgetLimit`s with
+  `scope="causal"` for that id. Without it a fresh session id stands in, as for
+  a new run, and a causal limit keyed to the session's id is missed.
+
+It runs the ordinary read-only initial-run preflight with the application's run
+defaults. It neither loads nor creates a session, and it dispatches no provider,
+tool, hook, or environment-factory work; `inspect_run_execution_profile` and
+`inspect_effective_run_configuration` share that path and likewise never load
+the session the request names. The configured policy is visible as
+`CayuApp.execution_profile_policy_identity`.
+
+`predict_execution_profile_admission(expected, candidate, boundary=...,
+application_policy_configured=...)` returns `ExecutionProfileAdmissionPrediction`.
+It applies the substitutions Runtime makes when it resolves a candidate, then
+the comparison and decision rules above:
+
+| `boundary` | Stored profile | Components kept from the stored profile | Rule |
+| --- | --- | --- | --- |
+| `continuation` | `active_invocation.profile` | `durable_system_projection`, `finalization`, `invocation_budget_policy`, `structured_output` (recorded invocation semantics) | Exact reuse only; any change is `rejected`. |
+| `resume` | `expected` | `durable_system_projection` | Exact reuse, else the default policy rejects, else a configured policy decides. |
+
+Use the session's reported `boundary` and the profile that row names.
+
+`outcome` is `exact_reuse`, `rejected`, `policy_dependent`, or
+`not_comparable`. `possible_decisions` lists the Runtime decision classes that
+can follow, and `admits` is `true` when work will be admitted, `false` when no
+possible decision admits it, and `null` when a policy decides or the profiles
+cannot be compared. With a configured policy (or `application_policy_configured=None`,
+meaning unknown), a `resume` whose only changes are `runtime` can become
+`compatible_reuse`; one whose only change is a strictly narrower
+`egress_authority` can be `adopted`; any other authority-bearing change can only
+become `migration_required` or `rejected` without explicit adoption intent.
+`not_comparable` means the candidate was resolved for a different provider
+target, or only one side carries a model failover plan; resolve the candidate
+with the session's target instead.
+
+Prediction is conservative in one direction only. A session started with
+request-level controls that the candidate's default run does not repeat, such as
+an explicit `thinking` configuration, a narrowed tool capability ceiling,
+request budget limits, or a failover policy, can be reported as changed or not
+comparable although Runtime would admit it; a reported `exact_reuse` is not
+weakened by that. Process-local components never compare equal across
+processes, so they are always changes. The runtime component compares build
+provenance, so run candidate inspection in the release image with the same
+`CAYU_RUNTIME_BUILD_PROVENANCE` the release will serve with. A
+`causal_budget_id` that the server redacted or aliased for exposure because it
+contains a workload secret cannot be passed back exactly; such a session's
+causal limits are not predicted.
+
+`cayu execution-profile candidates --json` prints each registered agent's
+candidate (or `--agent`; `--environment` or `--no-environment`, defaulting to
+the application default environment; `--provider` and `--model` together; and
+`--causal-budget-id`) after building the application from the project factory,
+and exits `0`, or `4` when a candidate cannot be resolved. `cayu
+execution-profile predict --input FILE --json` reads `{"sessions": [{"id",
+"boundary", "agent_name", "environment_name", "provider_name", "model",
+"causal_budget_id", "expected_profile"}]}`, where every field is required and
+the session fields are its recorded values (`environment_name: null` means no
+environment). It resolves one candidate per distinct agent, environment,
+target, and causal budget id, and exits `0` when every entry is admitted and
+`3` otherwise. Both exit `1` for a project that cannot be built or invalid input
+and emit `{"schema_version": "1", "error": {"code", "message"}}` for `--json`.
+Neither starts the application, loads or writes sessions, or dispatches
+provider, tool, hook, or environment-factory work, and both close the
+application before exiting. Whatever the project factory does while
+constructing the application, such as opening a store, still happens.
+
+### Resume requests
+
 `ResumeRequest` explicitly continues an existing session. It loads the stored transcript, appends the new request messages to that same transcript, emits `session.resumed`, and runs the same model/tool loop as a new session. Resume uses the session's stored agent, provider, model, runtime, and environment identity instead of current application defaults. This prevents an application default change from silently continuing an old session on a different provider or model.
 
 An application may instead supply `ResumeRequest.target=ModelTarget(provider_name=..., model=...)` to adopt a different registered provider and/or model at a clean resume boundary. The target is an explicit execution decision, never an implicit retry fallback. Cayu rejects adoption before target-provider I/O when model-completion recovery, a pending tool round, approval, required user input, deferred interaction input, an unmatched tool call/result boundary, or target-adapter portability validation prevents a clean handoff. A same-provider model change uses the same conservative boundary because provider-native response, reasoning, and cache state can also be model-specific.

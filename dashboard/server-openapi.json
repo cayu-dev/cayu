@@ -18332,6 +18332,15 @@
         "title": "ExecutionEvidenceOverride",
         "type": "object"
       },
+      "ExecutionProfileAdmissionBoundary": {
+        "description": "Where a stored profile meets a candidate release's profile.",
+        "enum": [
+          "continuation",
+          "resume"
+        ],
+        "title": "ExecutionProfileAdmissionBoundary",
+        "type": "string"
+      },
       "ExecutionProfileAdoptionBody": {
         "additionalProperties": false,
         "properties": {
@@ -20121,6 +20130,21 @@
       "ListSessionsResponse": {
         "additionalProperties": false,
         "properties": {
+          "execution_profiles": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/SessionExecutionProfiles"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Present only for `include=execution_profile`: each listed session's stored expected and active-invocation execution profiles and its next admission `boundary`, in the same order as `sessions`. A session whose records cannot be read has no profiles and an entry in `issues`.",
+            "title": "Execution Profiles"
+          },
           "next_cursor": {
             "anyOf": [
               {
@@ -25342,6 +25366,21 @@
             },
             "title": "Actions",
             "type": "array"
+          },
+          "execution_profiles": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/SessionExecutionProfiles"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Present only for `include=execution_profile`: each action's session execution profiles, in the same order as `actions`. Continuing the action requires exact reuse of `active_invocation.profile`. A session whose records cannot be read has no profiles and an entry in `issues`.",
+            "title": "Execution Profiles"
           },
           "has_more": {
             "title": "Has More",
@@ -31858,6 +31897,60 @@
         "title": "SessionDebugState",
         "type": "string"
       },
+      "SessionExecutionProfiles": {
+        "additionalProperties": false,
+        "description": "Redacted profiles a later invocation of one session must match.\n\n``boundary`` is where Runtime meets this session next. ``continuation``\n(pending approval, user input, tool round, child wait, model-completion\nstage or provider-operation resolution, or an unreleased invocation) must\nmatch ``active_invocation.profile`` exactly. ``resume`` (the last invocation\nreleased with nothing pending) is compared with ``expected``. ``boundary``\nis ``None`` when the profile it needs is missing or the records conflict;\na conflict is reported in ``issues``. Both profiles contain only component\nclasses, strengths, fingerprints and typed authority.",
+        "properties": {
+          "active_invocation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionInvocationExecutionProfile"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "boundary": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExecutionProfileAdmissionBoundary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expected": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExecutionProfileIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "issues": {
+            "default": [],
+            "items": {
+              "enum": [
+                "expected_profile_invalid",
+                "active_invocation_profile_invalid",
+                "active_invocation_epoch_mismatch",
+                "session_not_found",
+                "checkpoint_incompatible",
+                "load_failed"
+              ],
+              "type": "string"
+            },
+            "title": "Issues",
+            "type": "array"
+          }
+        },
+        "title": "SessionExecutionProfiles",
+        "type": "object"
+      },
       "SessionExecutionSource": {
         "description": "The runtime boundary that created one session.",
         "enum": [
@@ -32149,6 +32242,37 @@
           }
         },
         "title": "SessionFollowContract",
+        "type": "object"
+      },
+      "SessionInvocationExecutionProfile": {
+        "additionalProperties": false,
+        "description": "Public view of the profile bound to a session's latest invocation.\n\n``released`` is true once the invocation gave up its run epoch (the session\npaused or finished). An unreleased invocation is still running, or was\ninterrupted and is continued by recovery.",
+        "properties": {
+          "interaction_id": {
+            "title": "Interaction Id",
+            "type": "string"
+          },
+          "profile": {
+            "$ref": "#/components/schemas/ExecutionProfileIdentity"
+          },
+          "released": {
+            "title": "Released",
+            "type": "boolean"
+          },
+          "run_epoch": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Run Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "interaction_id",
+          "run_epoch",
+          "released",
+          "profile"
+        ],
+        "title": "SessionInvocationExecutionProfile",
         "type": "object"
       },
       "SessionMessageActionBody": {
@@ -42968,6 +43092,26 @@
               ],
               "title": "Cursor"
             }
+          },
+          {
+            "in": "query",
+            "name": "include",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "const": "execution_profile",
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Include"
+            }
           }
         ],
         "responses": {
@@ -43592,7 +43736,10 @@
               "anyOf": [
                 {
                   "items": {
-                    "const": "usage",
+                    "enum": [
+                      "usage",
+                      "execution_profile"
+                    ],
                     "type": "string"
                   },
                   "type": "array"

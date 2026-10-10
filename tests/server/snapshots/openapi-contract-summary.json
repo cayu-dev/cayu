@@ -5501,6 +5501,219 @@
       "title": "DelegatedActionReference",
       "type": "object"
     },
+    "EgressAuthorityBindingIdentity": {
+      "additionalProperties": false,
+      "description": "One destination/credential class bound to a named policy.",
+      "properties": {
+        "credential_authority_fingerprint": {
+          "title": "Credential Authority Fingerprint",
+          "type": "string"
+        },
+        "credential_kind": {
+          "maxLength": 256,
+          "title": "Credential Kind",
+          "type": "string"
+        },
+        "destination": {
+          "maxLength": 253,
+          "title": "Destination",
+          "type": "string"
+        },
+        "policy_name": {
+          "maxLength": 256,
+          "title": "Policy Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "destination",
+        "policy_name",
+        "credential_kind",
+        "credential_authority_fingerprint"
+      ],
+      "title": "EgressAuthorityBindingIdentity",
+      "type": "object"
+    },
+    "EgressAuthorityCutoverStrategy": {
+      "description": "How an adapter can replace one admitted egress generation.",
+      "enum": [
+        "verified_in_place",
+        "fresh_authority_path",
+        "allocation_replacement",
+        "unsupported"
+      ],
+      "title": "EgressAuthorityCutoverStrategy",
+      "type": "string"
+    },
+    "EgressAuthorityIdentity": {
+      "additionalProperties": false,
+      "description": "Versioned, bounded, secret-free identity for one admitted egress generation.",
+      "properties": {
+        "authority_scope": {
+          "maxLength": 256,
+          "title": "Authority Scope",
+          "type": "string"
+        },
+        "authority_source": {
+          "maxLength": 256,
+          "title": "Authority Source",
+          "type": "string"
+        },
+        "bindings": {
+          "items": {
+            "$ref": "#/components/schemas/EgressAuthorityBindingIdentity"
+          },
+          "title": "Bindings",
+          "type": "array"
+        },
+        "comparison_available": {
+          "title": "Comparison Available",
+          "type": "boolean"
+        },
+        "cutover_strategy": {
+          "$ref": "#/components/schemas/EgressAuthorityCutoverStrategy"
+        },
+        "fingerprint": {
+          "title": "Fingerprint",
+          "type": "string"
+        },
+        "generation": {
+          "minimum": 1.0,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "policies": {
+          "items": {
+            "$ref": "#/components/schemas/EgressAuthorityPolicyIdentity"
+          },
+          "title": "Policies",
+          "type": "array"
+        },
+        "policy_version": {
+          "maxLength": 256,
+          "title": "Policy Version",
+          "type": "string"
+        },
+        "record_type": {
+          "const": "cayu.egress-authority",
+          "default": "cayu.egress-authority",
+          "title": "Record Type",
+          "type": "string"
+        },
+        "runner_kind": {
+          "maxLength": 256,
+          "title": "Runner Kind",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "generation",
+        "authority_source",
+        "authority_scope",
+        "policy_version",
+        "runner_kind",
+        "cutover_strategy",
+        "policies",
+        "bindings",
+        "comparison_available",
+        "fingerprint"
+      ],
+      "title": "EgressAuthorityIdentity",
+      "type": "object"
+    },
+    "EgressAuthorityOperation": {
+      "additionalProperties": false,
+      "description": "One bounded HTTP operation admitted by a built-in policy.",
+      "properties": {
+        "match": {
+          "default": "exact",
+          "enum": [
+            "exact",
+            "prefix"
+          ],
+          "title": "Match",
+          "type": "string"
+        },
+        "method": {
+          "maxLength": 32,
+          "title": "Method",
+          "type": "string"
+        },
+        "path": {
+          "maxLength": 2048,
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "method",
+        "path"
+      ],
+      "title": "EgressAuthorityOperation",
+      "type": "object"
+    },
+    "EgressAuthorityPolicyIdentity": {
+      "additionalProperties": false,
+      "description": "Secret-free canonical projection of one policy's operation semantics.",
+      "properties": {
+        "allowed_destinations": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Allowed Destinations",
+          "type": "array"
+        },
+        "comparison_available": {
+          "default": true,
+          "title": "Comparison Available",
+          "type": "boolean"
+        },
+        "denied_path_prefixes": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Denied Path Prefixes",
+          "type": "array"
+        },
+        "kind": {
+          "enum": [
+            "http",
+            "browser",
+            "opaque",
+            "public_web"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "name": {
+          "maxLength": 256,
+          "title": "Name",
+          "type": "string"
+        },
+        "operations": {
+          "default": [],
+          "items": {
+            "$ref": "#/components/schemas/EgressAuthorityOperation"
+          },
+          "title": "Operations",
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "kind"
+      ],
+      "title": "EgressAuthorityPolicyIdentity",
+      "type": "object"
+    },
     "EnqueueSessionMessageBody": {
       "additionalProperties": false,
       "properties": {
@@ -6176,6 +6389,15 @@
       "title": "EventType",
       "type": "string"
     },
+    "ExecutionProfileAdmissionBoundary": {
+      "description": "Where a stored profile meets a candidate release's profile.",
+      "enum": [
+        "continuation",
+        "resume"
+      ],
+      "title": "ExecutionProfileAdmissionBoundary",
+      "type": "string"
+    },
     "ExecutionProfileAdoptionBody": {
       "additionalProperties": false,
       "properties": {
@@ -6210,6 +6432,148 @@
       ],
       "title": "ExecutionProfileAdoptionBody",
       "type": "object"
+    },
+    "ExecutionProfileComponentClass": {
+      "description": "Stable classes of execution authority represented by a profile.",
+      "enum": [
+        "runtime",
+        "provider_target",
+        "durable_system_projection",
+        "direct_tools",
+        "tool_implementations",
+        "tool_view_grants",
+        "execution_policies",
+        "invocation_policies",
+        "runtime_hooks",
+        "execution_environment",
+        "effect_authority",
+        "egress_authority",
+        "context_selection",
+        "automatic_recall",
+        "context_compaction",
+        "live_state_projection",
+        "provider_adapter",
+        "provider_request_policy",
+        "application_budget_policy",
+        "invocation_budget_policy",
+        "structured_output",
+        "finalization"
+      ],
+      "title": "ExecutionProfileComponentClass",
+      "type": "string"
+    },
+    "ExecutionProfileComponentIdentity": {
+      "additionalProperties": false,
+      "description": "Redacted identity for one typed execution-profile component.",
+      "properties": {
+        "availability": {
+          "$ref": "#/components/schemas/ExecutionProfileIdentityAvailability"
+        },
+        "component_class": {
+          "$ref": "#/components/schemas/ExecutionProfileComponentClass"
+        },
+        "fingerprint": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Fingerprint"
+        },
+        "strength": {
+          "$ref": "#/components/schemas/ExecutionProfileIdentityStrength"
+        }
+      },
+      "required": [
+        "component_class",
+        "strength",
+        "availability",
+        "fingerprint"
+      ],
+      "title": "ExecutionProfileComponentIdentity",
+      "type": "object"
+    },
+    "ExecutionProfileIdentity": {
+      "additionalProperties": false,
+      "description": "Versioned, redacted identity frozen before a session can execute.",
+      "properties": {
+        "components": {
+          "items": {
+            "$ref": "#/components/schemas/ExecutionProfileComponentIdentity"
+          },
+          "title": "Components",
+          "type": "array"
+        },
+        "egress_authority": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/EgressAuthorityIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fingerprint": {
+          "title": "Fingerprint",
+          "type": "string"
+        },
+        "model_failover": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ModelFailoverProfileBinding"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "runtime_build_provenance": {
+          "$ref": "#/components/schemas/RuntimeBuildProvenance"
+        },
+        "schema_version": {
+          "default": 6,
+          "enum": [
+            1,
+            2,
+            4,
+            5,
+            6,
+            7
+          ],
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "fingerprint",
+        "components"
+      ],
+      "title": "ExecutionProfileIdentity",
+      "type": "object"
+    },
+    "ExecutionProfileIdentityAvailability": {
+      "description": "Whether a component can be compared at the admission boundary.",
+      "enum": [
+        "available",
+        "unavailable"
+      ],
+      "title": "ExecutionProfileIdentityAvailability",
+      "type": "string"
+    },
+    "ExecutionProfileIdentityStrength": {
+      "description": "How strongly one component is identified.",
+      "enum": [
+        "application_versioned",
+        "structural",
+        "process_local",
+        "unavailable"
+      ],
+      "title": "ExecutionProfileIdentityStrength",
+      "type": "string"
     },
     "ExecutionSnapshotCapability": {
       "additionalProperties": false,
@@ -7049,6 +7413,21 @@
     "ListSessionsResponse": {
       "additionalProperties": false,
       "properties": {
+        "execution_profiles": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/components/schemas/SessionExecutionProfiles"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Present only for `include=execution_profile`: each listed session's stored expected and active-invocation execution profiles and its next admission `boundary`, in the same order as `sessions`. A session whose records cannot be read has no profiles and an entry in `issues`.",
+          "title": "Execution Profiles"
+        },
         "next_cursor": {
           "anyOf": [
             {
@@ -7162,6 +7541,118 @@
       "title": "MessageRole",
       "type": "string"
     },
+    "ModelFailoverCandidate": {
+      "additionalProperties": false,
+      "properties": {
+        "execution_mode": {
+          "enum": [
+            "synchronous",
+            "background"
+          ],
+          "title": "Execution Mode",
+          "type": "string"
+        },
+        "execution_profile_fingerprint": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Execution Profile Fingerprint",
+          "type": "string"
+        },
+        "model": {
+          "maxLength": 256,
+          "title": "Model",
+          "type": "string"
+        },
+        "provider_name": {
+          "maxLength": 256,
+          "title": "Provider Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider_name",
+        "model",
+        "execution_profile_fingerprint",
+        "execution_mode"
+      ],
+      "title": "ModelFailoverCandidate",
+      "type": "object"
+    },
+    "ModelFailoverCandidateProfile": {
+      "additionalProperties": false,
+      "description": "Nonrecursive, digest-only reconstruction of one unbound candidate.",
+      "properties": {
+        "components": {
+          "items": {
+            "$ref": "#/components/schemas/ExecutionProfileComponentIdentity"
+          },
+          "title": "Components",
+          "type": "array"
+        },
+        "egress_authority": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/EgressAuthorityIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fingerprint": {
+          "title": "Fingerprint",
+          "type": "string"
+        },
+        "runtime_build_provenance": {
+          "$ref": "#/components/schemas/RuntimeBuildProvenance"
+        },
+        "schema_version": {
+          "const": 6,
+          "default": 6,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "fingerprint",
+        "components",
+        "runtime_build_provenance"
+      ],
+      "title": "ModelFailoverCandidateProfile",
+      "type": "object"
+    },
+    "ModelFailoverPlan": {
+      "additionalProperties": false,
+      "description": "Resolved candidate identities, bound into the configured root profile.",
+      "properties": {
+        "candidates": {
+          "items": {
+            "$ref": "#/components/schemas/ModelFailoverCandidate"
+          },
+          "maxItems": 8,
+          "minItems": 2,
+          "title": "Candidates",
+          "type": "array"
+        },
+        "max_total_attempts": {
+          "maximum": 80.0,
+          "minimum": 1.0,
+          "title": "Max Total Attempts",
+          "type": "integer"
+        },
+        "schema_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "candidates",
+        "max_total_attempts"
+      ],
+      "title": "ModelFailoverPlan",
+      "type": "object"
+    },
     "ModelFailoverPolicy": {
       "additionalProperties": false,
       "description": "Bounded, explicit alternatives after an eligible ordinary model failure.\n\nThe primary target is resolved by the run entrance. ``max_total_attempts``\nincludes that primary's attempts and all same-provider retries, not just\ntransitions between targets. This value never authorizes dispatch itself.",
@@ -7187,6 +7678,38 @@
         "fallbacks"
       ],
       "title": "ModelFailoverPolicy",
+      "type": "object"
+    },
+    "ModelFailoverProfileBinding": {
+      "additionalProperties": false,
+      "description": "Reconstructable immutable candidate plan, not mutable selection authority.",
+      "properties": {
+        "candidate_profiles": {
+          "items": {
+            "$ref": "#/components/schemas/ModelFailoverCandidateProfile"
+          },
+          "maxItems": 8,
+          "minItems": 2,
+          "title": "Candidate Profiles",
+          "type": "array"
+        },
+        "plan": {
+          "$ref": "#/components/schemas/ModelFailoverPlan"
+        },
+        "primary_request_policy": {
+          "$ref": "#/components/schemas/ExecutionProfileComponentIdentity"
+        },
+        "strength": {
+          "$ref": "#/components/schemas/ExecutionProfileIdentityStrength"
+        }
+      },
+      "required": [
+        "plan",
+        "candidate_profiles",
+        "primary_request_policy",
+        "strength"
+      ],
+      "title": "ModelFailoverProfileBinding",
       "type": "object"
     },
     "ModelPrice": {
@@ -7474,6 +7997,21 @@
           },
           "title": "Actions",
           "type": "array"
+        },
+        "execution_profiles": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/components/schemas/SessionExecutionProfiles"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Present only for `include=execution_profile`: each action's session execution profiles, in the same order as `actions`. Continuing the action requires exact reuse of `active_invocation.profile`. A session whose records cannot be read has no profiles and an entry in `issues`.",
+          "title": "Execution Profiles"
         },
         "has_more": {
           "title": "Has More",
@@ -9782,6 +10320,60 @@
       "title": "SessionDebugState",
       "type": "string"
     },
+    "SessionExecutionProfiles": {
+      "additionalProperties": false,
+      "description": "Redacted profiles a later invocation of one session must match.\n\n``boundary`` is where Runtime meets this session next. ``continuation``\n(pending approval, user input, tool round, child wait, model-completion\nstage or provider-operation resolution, or an unreleased invocation) must\nmatch ``active_invocation.profile`` exactly. ``resume`` (the last invocation\nreleased with nothing pending) is compared with ``expected``. ``boundary``\nis ``None`` when the profile it needs is missing or the records conflict;\na conflict is reported in ``issues``. Both profiles contain only component\nclasses, strengths, fingerprints and typed authority.",
+      "properties": {
+        "active_invocation": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/SessionInvocationExecutionProfile"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "boundary": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ExecutionProfileAdmissionBoundary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "expected": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ExecutionProfileIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "issues": {
+          "default": [],
+          "items": {
+            "enum": [
+              "expected_profile_invalid",
+              "active_invocation_profile_invalid",
+              "active_invocation_epoch_mismatch",
+              "session_not_found",
+              "checkpoint_incompatible",
+              "load_failed"
+            ],
+            "type": "string"
+          },
+          "title": "Issues",
+          "type": "array"
+        }
+      },
+      "title": "SessionExecutionProfiles",
+      "type": "object"
+    },
     "SessionExecutionSource": {
       "description": "The runtime boundary that created one session.",
       "enum": [
@@ -10073,6 +10665,37 @@
         }
       },
       "title": "SessionFollowContract",
+      "type": "object"
+    },
+    "SessionInvocationExecutionProfile": {
+      "additionalProperties": false,
+      "description": "Public view of the profile bound to a session's latest invocation.\n\n``released`` is true once the invocation gave up its run epoch (the session\npaused or finished). An unreleased invocation is still running, or was\ninterrupted and is continued by recovery.",
+      "properties": {
+        "interaction_id": {
+          "title": "Interaction Id",
+          "type": "string"
+        },
+        "profile": {
+          "$ref": "#/components/schemas/ExecutionProfileIdentity"
+        },
+        "released": {
+          "title": "Released",
+          "type": "boolean"
+        },
+        "run_epoch": {
+          "maximum": 9.223372036854776e+18,
+          "minimum": 1.0,
+          "title": "Run Epoch",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "interaction_id",
+        "run_epoch",
+        "released",
+        "profile"
+      ],
+      "title": "SessionInvocationExecutionProfile",
       "type": "object"
     },
     "SessionMessageActionBody": {
@@ -16120,6 +16743,26 @@
           },
           {
             "in": "query",
+            "name": "include",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "const": "execution_profile",
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Include"
+            }
+          },
+          {
+            "in": "query",
             "name": "kind",
             "required": false,
             "schema": {
@@ -16571,7 +17214,10 @@
               "anyOf": [
                 {
                   "items": {
-                    "const": "usage",
+                    "enum": [
+                      "usage",
+                      "execution_profile"
+                    ],
                     "type": "string"
                   },
                   "type": "array"

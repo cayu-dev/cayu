@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator
 
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
@@ -13,8 +13,11 @@ from cayu._validation import (
     copy_session_metadata,
     require_durable_clean_nonblank,
 )
-from cayu.execution_profiles import ExecutionProfileIdentity
+from cayu.execution_profiles import ExecutionProfileAdmissionBoundary, ExecutionProfileIdentity
 from cayu.sessions.checkpoints import ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
+
+if TYPE_CHECKING:
+    from cayu.sessions.records import Session
 
 _EXECUTION_PROFILE_RECORD_SCHEMA_VERSION = 1
 _ACTIVE_INVOCATION_EXECUTION_PROFILE_SCHEMA_VERSION = 1
@@ -144,6 +147,148 @@ def active_invocation_execution_profile_from_checkpoint(
         return None
     return ActiveInvocationExecutionProfile.model_validate(
         copy_durable_json_value(raw, "active_invocation_execution_profile")
+    )
+
+
+class SessionInvocationExecutionProfile(BaseModel):
+    """Public view of the profile bound to a session's latest invocation.
+
+    ``released`` is true once the invocation gave up its run epoch (the session
+    paused or finished). An unreleased invocation is still running, or was
+    interrupted and is continued by recovery.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    interaction_id: str
+    run_epoch: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    released: StrictBool
+    profile: ExecutionProfileIdentity
+
+    @field_validator("profile", mode="before")
+    @classmethod
+    def copy_profile(cls, value: object) -> ExecutionProfileIdentity:
+        if isinstance(value, ExecutionProfileIdentity):
+            value = value.model_dump(mode="json")
+        return ExecutionProfileIdentity.model_validate(value)
+
+
+SessionExecutionProfileIssue = Literal[
+    "expected_profile_invalid",
+    "active_invocation_profile_invalid",
+    "active_invocation_epoch_mismatch",
+    "session_not_found",
+    "checkpoint_incompatible",
+    "load_failed",
+]
+
+# Checkpoint records whose work continues the active invocation. Runtime
+# admits it only on exact reuse of that invocation's profile.
+_CONTINUATION_CHECKPOINT_KEYS = (
+    "pending_tool_round",
+    "pending_tool_approval",
+    "pending_user_input",
+    "foreground_child_wait",
+    "foreground_parent_continuation",
+    # An accepted provider-operation resolution is recovered before other work.
+    "provider_operation_pending_resolution_disposition",
+)
+
+
+class SessionExecutionProfiles(BaseModel):
+    """Redacted profiles a later invocation of one session must match.
+
+    ``boundary`` is where Runtime meets this session next. ``continuation``
+    (pending approval, user input, tool round, child wait, model-completion
+    stage or provider-operation resolution, or an unreleased invocation) must
+    match ``active_invocation.profile`` exactly. ``resume`` (the last invocation
+    released with nothing pending) is compared with ``expected``. ``boundary``
+    is ``None`` when the profile it needs is missing or the records conflict;
+    a conflict is reported in ``issues``. Both profiles contain only component
+    classes, strengths, fingerprints and typed authority.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    boundary: ExecutionProfileAdmissionBoundary | None = None
+    expected: ExecutionProfileIdentity | None = None
+    active_invocation: SessionInvocationExecutionProfile | None = None
+    issues: tuple[SessionExecutionProfileIssue, ...] = ()
+
+    @field_validator("expected", mode="before")
+    @classmethod
+    def copy_expected(cls, value: object) -> ExecutionProfileIdentity | None:
+        if value is None:
+            return None
+        if isinstance(value, ExecutionProfileIdentity):
+            value = value.model_dump(mode="json")
+        return ExecutionProfileIdentity.model_validate(value)
+
+
+def session_execution_profiles(
+    session: Session,
+    checkpoint: Mapping[str, Any] | None,
+    *,
+    model_completion_pending: bool = False,
+) -> SessionExecutionProfiles:
+    """Project a session's stored profiles without failing on one bad record.
+
+    ``model_completion_pending`` says whether the store holds an active
+    model-completion stage for the session
+    (``SessionStore.load_active_model_completion_stage``). That record lives
+    outside the checkpoint, and Runtime continues the invocation that owns it.
+
+    A session created before execution profiles has neither value. A malformed
+    record, or an active invocation bound to another session or run epoch, is
+    reported in ``issues`` rather than raised, so one damaged session cannot hide
+    the others in a listing; Runtime still fails closed on it.
+    """
+
+    expected: ExecutionProfileIdentity | None = None
+    active: SessionInvocationExecutionProfile | None = None
+    issues: list[SessionExecutionProfileIssue] = []
+    if session.metadata.get(EXECUTION_PROFILE_METADATA_KEY) is not None:
+        try:
+            expected = execution_profile_from_session_metadata(session.metadata)
+        except (TypeError, ValueError):
+            issues.append("expected_profile_invalid")
+    try:
+        snapshot = active_invocation_execution_profile_from_checkpoint(checkpoint)
+    except (TypeError, ValueError):
+        issues.append("active_invocation_profile_invalid")
+    else:
+        if snapshot is not None and not active_invocation_execution_profile_matches_session_epoch(
+            snapshot, session_id=session.id, run_epoch=session.run_epoch
+        ):
+            issues.append("active_invocation_epoch_mismatch")
+        elif snapshot is not None:
+            active = SessionInvocationExecutionProfile(
+                interaction_id=snapshot.interaction_id,
+                run_epoch=snapshot.run_epoch,
+                released=active_invocation_execution_profile_is_released(
+                    snapshot, session_id=session.id, run_epoch=session.run_epoch
+                ),
+                profile=snapshot.profile,
+            )
+    boundary: ExecutionProfileAdmissionBoundary | None = None
+    if not issues:
+        continues = (
+            model_completion_pending
+            or (active is not None and not active.released)
+            or any(
+                checkpoint is not None and checkpoint.get(key) is not None
+                for key in _CONTINUATION_CHECKPOINT_KEYS
+            )
+        )
+        if continues and active is not None:
+            boundary = ExecutionProfileAdmissionBoundary.CONTINUATION
+        elif not continues and expected is not None:
+            boundary = ExecutionProfileAdmissionBoundary.RESUME
+    return SessionExecutionProfiles(
+        boundary=boundary,
+        expected=expected,
+        active_invocation=active,
+        issues=tuple(issues),
     )
 
 

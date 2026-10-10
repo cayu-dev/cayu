@@ -2336,6 +2336,12 @@ from cayu.execution_profiles import (
 from cayu.execution_profiles import (
     EXECUTION_PROFILE_SCHEMA_VERSION as EXECUTION_PROFILE_SCHEMA_VERSION,
 )
+from cayu.execution_profiles import (
+    ExecutionProfileAdmissionBoundary as ExecutionProfileAdmissionBoundary,
+)
+from cayu.execution_profiles import (
+    ExecutionProfileAdmissionPrediction as ExecutionProfileAdmissionPrediction,
+)
 from cayu.execution_profiles import ExecutionProfileAdoptionIntent as ExecutionProfileAdoptionIntent
 from cayu.execution_profiles import (
     ExecutionProfileAuthorityDecision as ExecutionProfileAuthorityDecision,
@@ -2357,6 +2363,9 @@ from cayu.execution_profiles import ExecutionProfilePolicyAction as ExecutionPro
 from cayu.execution_profiles import ExecutionProfilePolicyRequest as ExecutionProfilePolicyRequest
 from cayu.execution_profiles import ExecutionProfilePolicyResult as ExecutionProfilePolicyResult
 from cayu.execution_profiles import (
+    ExecutionProfilePredictionOutcome as ExecutionProfilePredictionOutcome,
+)
+from cayu.execution_profiles import (
     ExecutionProfileRejectionResult as ExecutionProfileRejectionResult,
 )
 from cayu.execution_profiles import (
@@ -2364,6 +2373,9 @@ from cayu.execution_profiles import (
 )
 from cayu.execution_profiles import (
     execution_profile_with_egress_authority as execution_profile_with_egress_authority,
+)
+from cayu.execution_profiles import (
+    predict_execution_profile_admission as predict_execution_profile_admission,
 )
 from cayu.execution_units import BudgetLimitIdentity as BudgetLimitIdentity
 from cayu.execution_units import ModelAttemptIdentity as ModelAttemptIdentity
@@ -3576,6 +3588,7 @@ from cayu.runtime.checks import ProjectCheckReport as ProjectCheckReport
 from cayu.runtime.checks import ProjectDiagnostic as ProjectDiagnostic
 from cayu.runtime.checks import ServiceCheckEvidence as ServiceCheckEvidence
 from cayu.runtime.checks import check_manifest as check_manifest
+from cayu.runtime.config_inspection import CandidateExecutionProfile as CandidateExecutionProfile
 from cayu.runtime.config_inspection import (
     EffectiveConfigurationField as EffectiveConfigurationField,
 )
@@ -3877,6 +3890,15 @@ from cayu.session_external_waits import SessionExternalWaitAdapter as SessionExt
 from cayu.session_external_waits import SessionExternalWaitReceipt as SessionExternalWaitReceipt
 from cayu.sessions._execution_profile_checkpoint import (
     EXECUTION_PROFILE_METADATA_KEY as EXECUTION_PROFILE_METADATA_KEY,
+)
+from cayu.sessions._execution_profile_checkpoint import (
+    SessionExecutionProfiles as SessionExecutionProfiles,
+)
+from cayu.sessions._execution_profile_checkpoint import (
+    SessionInvocationExecutionProfile as SessionInvocationExecutionProfile,
+)
+from cayu.sessions._execution_profile_checkpoint import (
+    session_execution_profiles as session_execution_profiles,
 )
 from cayu.sessions._participant_discovery import (
     ParticipantSessionCursor as ParticipantSessionCursor,
@@ -6407,6 +6429,7 @@ __all__ = [
     "CacheBreakpoint",
     "CachePolicy",
     "CacheUsageMetrics",
+    "CandidateExecutionProfile",
     "CandidatePolicyDisposition",
     "CapturedEvaluationCandidateV1",
     "CapturedEvaluationResultV1",
@@ -6972,6 +6995,8 @@ __all__ = [
     "ExecutionEnvironmentAuthority",
     "ExecutionEvidenceOverride",
     "ExecutionExecutableEvidence",
+    "ExecutionProfileAdmissionBoundary",
+    "ExecutionProfileAdmissionPrediction",
     "ExecutionProfileAdoptionIntent",
     "ExecutionProfileAdoptionRejected",
     "ExecutionProfileAuthorityDecision",
@@ -6990,6 +7015,7 @@ __all__ = [
     "ExecutionProfilePolicyError",
     "ExecutionProfilePolicyRequest",
     "ExecutionProfilePolicyResult",
+    "ExecutionProfilePredictionOutcome",
     "ExecutionProfileRejectionResult",
     "ExecutionRequirements",
     "ExecutionSnapshotAdapter",
@@ -8211,6 +8237,7 @@ __all__ = [
     "SessionEvidenceClosureStore",
     "SessionExecutionConfig",
     "SessionExecutionInProgress",
+    "SessionExecutionProfiles",
     "SessionExecutionSource",
     "SessionExecutionState",
     "SessionExportAcceptance",
@@ -8251,6 +8278,7 @@ __all__ = [
     "SessionInvocation",
     "SessionInvocationAdmission",
     "SessionInvocationBinding",
+    "SessionInvocationExecutionProfile",
     "SessionInvocationSnapshot",
     "SessionLineageNode",
     "SessionLineageOrigin",
@@ -9046,6 +9074,7 @@ __all__ = [
     "pin_workspace_checkpoint",
     "pipeline",
     "planning_policy_commitment",
+    "predict_execution_profile_admission",
     "preflight_eval_scenario",
     "prepare_eval_judge_calibration",
     "prepare_knowledge_activation_request",
@@ -9111,6 +9140,7 @@ __all__ = [
     "score_workflow_eval_capture",
     "scripted_structured_output",
     "secret_env_refs",
+    "session_execution_profiles",
     "session_fork_profile_relationship",
     "session_invocation_for_run_request",
     "session_invocation_from_task",

@@ -349,6 +349,12 @@ from cayu.execution_profiles import (
 from cayu.execution_profiles import (
     EXECUTION_PROFILE_SCHEMA_VERSION as EXECUTION_PROFILE_SCHEMA_VERSION,
 )
+from cayu.execution_profiles import (
+    ExecutionProfileAdmissionBoundary as ExecutionProfileAdmissionBoundary,
+)
+from cayu.execution_profiles import (
+    ExecutionProfileAdmissionPrediction as ExecutionProfileAdmissionPrediction,
+)
 from cayu.execution_profiles import ExecutionProfileAdoptionIntent as ExecutionProfileAdoptionIntent
 from cayu.execution_profiles import (
     ExecutionProfileAuthorityDecision as ExecutionProfileAuthorityDecision,
@@ -370,6 +376,9 @@ from cayu.execution_profiles import ExecutionProfilePolicyAction as ExecutionPro
 from cayu.execution_profiles import ExecutionProfilePolicyRequest as ExecutionProfilePolicyRequest
 from cayu.execution_profiles import ExecutionProfilePolicyResult as ExecutionProfilePolicyResult
 from cayu.execution_profiles import (
+    ExecutionProfilePredictionOutcome as ExecutionProfilePredictionOutcome,
+)
+from cayu.execution_profiles import (
     ExecutionProfileRejectionResult as ExecutionProfileRejectionResult,
 )
 from cayu.execution_profiles import (
@@ -377,6 +386,9 @@ from cayu.execution_profiles import (
 )
 from cayu.execution_profiles import (
     execution_profile_with_egress_authority as execution_profile_with_egress_authority,
+)
+from cayu.execution_profiles import (
+    predict_execution_profile_admission as predict_execution_profile_admission,
 )
 from cayu.execution_units import BudgetLimitIdentity as BudgetLimitIdentity
 from cayu.execution_units import ModelAttemptIdentity as ModelAttemptIdentity
@@ -465,6 +477,7 @@ from cayu.runtime.checks import ProjectCheckReport as ProjectCheckReport
 from cayu.runtime.checks import ProjectDiagnostic as ProjectDiagnostic
 from cayu.runtime.checks import ServiceCheckEvidence as ServiceCheckEvidence
 from cayu.runtime.checks import check_manifest as check_manifest
+from cayu.runtime.config_inspection import CandidateExecutionProfile as CandidateExecutionProfile
 from cayu.runtime.config_inspection import (
     EffectiveConfigurationField as EffectiveConfigurationField,
 )
@@ -788,6 +801,15 @@ from cayu.sessions._execution_profile_checkpoint import (
 )
 from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile as ActiveInvocationExecutionProfile,
+)
+from cayu.sessions._execution_profile_checkpoint import (
+    SessionExecutionProfiles as SessionExecutionProfiles,
+)
+from cayu.sessions._execution_profile_checkpoint import (
+    SessionInvocationExecutionProfile as SessionInvocationExecutionProfile,
+)
+from cayu.sessions._execution_profile_checkpoint import (
+    session_execution_profiles as session_execution_profiles,
 )
 from cayu.sessions._invocation_lifecycle import (
     INVOCATION_LIFECYCLE_COMMAND_VERSION as INVOCATION_LIFECYCLE_COMMAND_VERSION,

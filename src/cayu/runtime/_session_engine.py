@@ -10381,9 +10381,21 @@ class SessionEngine:
         prepared_work_attempt: WorkAttemptAdmission | None = None,
         allow_existing_session_id: bool = False,
         retained_policy_selection: PolicySelection | None = None,
+        inspect_only: bool = False,
+        session_environment: bool = False,
     ) -> _PreparedInitialRun | None:
-        """Resolve one new-session request, optionally without ordinary admission."""
+        """Resolve one new-session request, optionally without ordinary admission.
 
+        ``inspect_only`` resolves a run that is never admitted: it does not load
+        the session the request names, and for a generated session id it skips
+        the session-scoped contract lookups, since no contract can bind an id
+        that did not exist. ``session_environment`` resolves
+        ``environment_name`` as a stored session's does, so ``None`` means no
+        environment rather than the application default.
+        """
+
+        if inspect_only and (admit_session or allow_work_attempt_admission):
+            raise ValueError("Inspection cannot admit a session or a work attempt.")
         if expected_execution_profile is not None:
             if type(expected_execution_profile) is not ExecutionProfileIdentity:
                 raise TypeError(
@@ -10424,10 +10436,14 @@ class SessionEngine:
         elif admit_session or allow_work_attempt_admission:
             boundary.require_admission("run_preparation")
         request = request.model_copy(update={"execution_deadline": boundary})
-        if request.session_id is None:
+        generated_session_id = request.session_id is None
+        if generated_session_id:
             request = request.model_copy(update={"session_id": str(uuid4())})
         if request.session_id is None:
             raise AssertionError("Run request session identity was not assigned.")
+        contract_lookup_session_id = (
+            None if inspect_only and generated_session_id else request.session_id
+        )
         task_store = self.task_store
         task_id = request.task_id
         if task_id is not None:
@@ -10467,7 +10483,7 @@ class SessionEngine:
             admission_failure,
         ) = await self._verifier_aware_task_execution_outcome(
             request.task_id,
-            session_id=request.session_id,
+            session_id=contract_lookup_session_id,
             admit_session=False,
             allow_missing_task=deferred_runtime_task_creation,
         )
@@ -10538,7 +10554,11 @@ class SessionEngine:
                 redactor=self._secret_redactor,
             )
         registered_provider.provider.preflight_model_target(model=model)
-        registered_environment = self._get_registered_environment(request.environment_name)
+        registered_environment = (
+            self._get_registered_environment_for_session(request.environment_name)
+            if session_environment
+            else self._get_registered_environment(request.environment_name)
+        )
         if (
             expected_registered_environment is not None
             and registered_environment is not expected_registered_environment
@@ -10662,7 +10682,7 @@ class SessionEngine:
         prepared_session_id = request.session_id
         if prepared_session_id is None:
             raise AssertionError("Run request session identity was not assigned.")
-        if runtime_prepared_session_authority(request) is None:
+        if not inspect_only and runtime_prepared_session_authority(request) is None:
             existing_session = await self.session_store.load(prepared_session_id)
             if (
                 existing_session is not None
@@ -10740,7 +10760,7 @@ class SessionEngine:
                 admission_failure,
             ) = await self._verifier_aware_task_execution_outcome(
                 request.task_id,
-                session_id=request.session_id,
+                session_id=contract_lookup_session_id,
                 admit_session=admit_session,
                 allow_missing_task=deferred_runtime_task_creation,
             )

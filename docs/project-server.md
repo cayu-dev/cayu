@@ -374,3 +374,69 @@ cannot be migrated by this build with the given inputs (exit `4`). See
 [Deployment migration step](session-store-targets.md#deployment-migration-step)
 for the status fields, provider-managed backup references
 (`--backup-managed`), and the empty-database rule.
+
+## Check that paused sessions resume on a release
+
+Runtime meets a stored session at one of two boundaries. At `continuation`
+(a pending approval, user input, tool round, child wait, model-completion
+stage or provider-operation resolution, or an invocation that has not released
+its run) the release must reuse the paused invocation's
+profile exactly, except for the components Runtime keeps from it (its system
+prompt and recorded run settings). At `resume` (the last invocation released
+with nothing pending) the release is compared with the session's expected
+profile and, when the application configures one, its `ExecutionProfilePolicy`.
+To check this before publishing a release:
+
+1. Read the stored profiles from the release that is serving now with
+   `GET /api/sessions?include=execution_profile` (or
+   `GET /api/pending-actions?include=execution_profile` for only the sessions
+   with pending actions). Each response gains an `execution_profiles` list in
+   the same order as `sessions` or `actions`. Each item reports the session's
+   `boundary`; use `active_invocation.profile` when it is `continuation` and
+   `expected` when it is `resume`. An item with `boundary: null` cannot be
+   predicted; treat it as at risk. It either has an entry in `issues` (a
+   damaged or unreadable record) or no profiles at all (a session created
+   before execution profiles).
+2. Write one entry per session, copying `agent_name`, `environment_name`,
+   `provider_name`, `model` and `causal_budget_id` from the session itself:
+
+   ```json
+   {
+     "sessions": [
+       {
+         "id": "session id",
+         "boundary": "continuation",
+         "agent_name": "assistant",
+         "environment_name": null,
+         "provider_name": "openai",
+         "model": "gpt-5",
+         "causal_budget_id": "session id",
+         "expected_profile": {"schema_version": 6, "fingerprint": "...", "components": []}
+       }
+     ]
+   }
+   ```
+
+   Every field is required. `environment_name: null` means the session has no
+   environment, not the application default. `causal_budget_id` selects the
+   causal-scoped budget limits the session runs under. If the listing shows a
+   redacted or aliased `causal_budget_id` (the server hides ids that contain a
+   workload secret), the exact id cannot be passed back, so that session's
+   causal budget limits are not predicted.
+3. Run `cayu execution-profile predict --input sessions.json --json` as a
+   one-off task from the new release image, with the environment the release
+   will serve with (including `CAYU_RUNTIME_BUILD_PROVENANCE` when you set it).
+   It exits `0` when every entry will resume and `3` when at least one may not.
+   Each prediction reports `outcome` (`exact_reuse`, `rejected`,
+   `policy_dependent` or `not_comparable`), `admits`, and the
+   `changed_component_classes`, for example `direct_tools` when a tool changed.
+
+`cayu execution-profile candidates --json` prints each agent's candidate
+profile on its own. Both commands build the application from the project
+factory, never start it, load or write sessions, or call models or tools, and
+close it before exiting. Whatever the factory does while constructing the
+application, such as opening a store, still happens. Profiles include the typed
+egress authority (policy names, destinations, allowed methods and paths), so
+keep the files as private as the release configuration. See
+[Predicting profile admission before a release](runtime-contracts.md#predicting-profile-admission-before-a-release)
+for the full rules.

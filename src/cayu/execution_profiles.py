@@ -981,8 +981,16 @@ def changed_execution_profile_components(
 ) -> tuple[ExecutionProfileComponentClass, ...]:
     """Return bounded component classes that changed or cannot be verified."""
 
-    expected_by_class = {item.component_class: item for item in expected.components}
-    candidate_by_class = {item.component_class: item for item in candidate.components}
+    return _changed_component_classes(
+        {item.component_class: item for item in expected.components},
+        {item.component_class: item for item in candidate.components},
+    )
+
+
+def _changed_component_classes(
+    expected_by_class: dict[ExecutionProfileComponentClass, ExecutionProfileComponentIdentity],
+    candidate_by_class: dict[ExecutionProfileComponentClass, ExecutionProfileComponentIdentity],
+) -> tuple[ExecutionProfileComponentClass, ...]:
     classes = sorted(set(expected_by_class) | set(candidate_by_class), key=str)
     return tuple(
         component_class
@@ -1074,6 +1082,244 @@ def unavailable_execution_profile_components(
         component.component_class
         for component in profile.components
         if component.availability is ExecutionProfileIdentityAvailability.UNAVAILABLE
+    )
+
+
+class ExecutionProfileAdmissionBoundary(StrEnum):
+    """Where a stored profile meets a candidate release's profile."""
+
+    # Pending approval, user input, tool round or an incomplete interaction:
+    # Runtime requires exact reuse of the active invocation profile.
+    CONTINUATION = "continuation"
+    # A new interaction on a session whose previous interaction is terminal:
+    # Runtime compares the session's expected profile and may consult policy.
+    RESUME = "resume"
+
+
+class ExecutionProfilePredictionOutcome(StrEnum):
+    """Predicted decision class, or why it cannot be decided without the app."""
+
+    EXACT_REUSE = "exact_reuse"
+    REJECTED = "rejected"
+    POLICY_DEPENDENT = "policy_dependent"
+    NOT_COMPARABLE = "not_comparable"
+
+
+# Runtime substitutes these stored components into the candidate it resolves at
+# each boundary, so a release cannot change them for an existing session.
+_RETAINED_COMPONENT_CLASSES = {
+    ExecutionProfileAdmissionBoundary.RESUME: (
+        ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION,
+    ),
+    ExecutionProfileAdmissionBoundary.CONTINUATION: (
+        ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION,
+        ExecutionProfileComponentClass.FINALIZATION,
+        ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY,
+        ExecutionProfileComponentClass.STRUCTURED_OUTPUT,
+    ),
+}
+# The only changes an application policy can classify as compatible reuse.
+_POLICY_COMPATIBLE_COMPONENT_CLASSES = frozenset(
+    {
+        ExecutionProfileComponentClass.RUNTIME,
+        ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION,
+    }
+)
+
+
+class ExecutionProfileAdmissionPrediction(BaseModel):
+    """Host-side prediction of one profile-admission boundary.
+
+    ``outcome`` uses Runtime's decision classes when they follow from the
+    profiles alone. ``policy_dependent`` means a configured
+    ``ExecutionProfilePolicy`` decides; ``possible_decisions`` lists what it can
+    produce and ``admits`` is ``None`` only when one of those admits work.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    boundary: ExecutionProfileAdmissionBoundary
+    outcome: ExecutionProfilePredictionOutcome
+    admits: StrictBool | None
+    possible_decisions: tuple[ExecutionProfileDecisionKind, ...]
+    changed_component_classes: tuple[ExecutionProfileComponentClass, ...]
+    retained_component_classes: tuple[ExecutionProfileComponentClass, ...]
+    authority_changed: StrictBool
+    egress_authority_change: EgressAuthorityChangeKind | None = None
+    expected_fingerprint: str
+    candidate_fingerprint: str
+    reason: str
+
+
+def predict_execution_profile_admission(
+    expected: ExecutionProfileIdentity,
+    candidate: ExecutionProfileIdentity,
+    *,
+    boundary: ExecutionProfileAdmissionBoundary | str,
+    application_policy_configured: bool | None = None,
+) -> ExecutionProfileAdmissionPrediction:
+    """Predict Runtime's admission decision without running the application.
+
+    ``expected`` is the stored profile: a session's expected profile for
+    ``resume``, or its active invocation profile for ``continuation``.
+    ``candidate`` is the new release's profile for the same agent, environment,
+    provider and model. Pass ``application_policy_configured`` when known;
+    ``None`` assumes a policy may be configured. The prediction is pure: it
+    never consults an ``ExecutionProfilePolicy`` and grants no authority.
+    """
+
+    expected = ExecutionProfileIdentity.model_validate(
+        revalidate_model_input(expected, ExecutionProfileIdentity)
+    )
+    candidate = ExecutionProfileIdentity.model_validate(
+        revalidate_model_input(candidate, ExecutionProfileIdentity)
+    )
+    boundary = ExecutionProfileAdmissionBoundary(boundary)
+    policy_configured = application_policy_configured
+    if policy_configured is not None and not isinstance(policy_configured, bool):
+        raise TypeError("application_policy_configured must be a bool or None.")
+
+    def prediction(
+        outcome: ExecutionProfilePredictionOutcome,
+        *,
+        admits: bool | None,
+        possible: tuple[ExecutionProfileDecisionKind, ...],
+        reason: str,
+        changed: tuple[ExecutionProfileComponentClass, ...] = (),
+        retained: tuple[ExecutionProfileComponentClass, ...] = (),
+        egress_change: EgressAuthorityChangeKind | None = None,
+    ) -> ExecutionProfileAdmissionPrediction:
+        return ExecutionProfileAdmissionPrediction(
+            boundary=boundary,
+            outcome=outcome,
+            admits=admits,
+            possible_decisions=possible,
+            changed_component_classes=changed,
+            retained_component_classes=retained,
+            authority_changed=execution_profile_changes_authority(changed),
+            egress_authority_change=egress_change,
+            expected_fingerprint=expected.fingerprint,
+            candidate_fingerprint=candidate.fingerprint,
+            reason=reason,
+        )
+
+    # Runtime resolves the candidate for the session's own provider target and
+    # failover plan. A candidate resolved for another target answers a
+    # different question, so it is never reported as a change.
+    if expected.component(ExecutionProfileComponentClass.PROVIDER_TARGET) != candidate.component(
+        ExecutionProfileComponentClass.PROVIDER_TARGET
+    ):
+        return prediction(
+            ExecutionProfilePredictionOutcome.NOT_COMPARABLE,
+            admits=None,
+            possible=(),
+            reason=(
+                "The candidate was resolved for a different provider target; inspect the "
+                "candidate for the session's provider and model."
+            ),
+        )
+    if (expected.model_failover is None) != (candidate.model_failover is None):
+        return prediction(
+            ExecutionProfilePredictionOutcome.NOT_COMPARABLE,
+            admits=None,
+            possible=(),
+            reason=(
+                "Only one profile carries a model failover plan; the candidate must be "
+                "resolved with the session's failover policy."
+            ),
+        )
+
+    expected_by_class = {item.component_class: item for item in expected.components}
+    candidate_by_class = {item.component_class: item for item in candidate.components}
+    retained = tuple(
+        component_class
+        for component_class in _RETAINED_COMPONENT_CLASSES[boundary]
+        if component_class in expected_by_class and component_class in candidate_by_class
+    )
+    for component_class in retained:
+        candidate_by_class[component_class] = expected_by_class[component_class]
+    changed = _changed_component_classes(expected_by_class, candidate_by_class)
+    egress_change = execution_profile_egress_authority_change(
+        expected,
+        candidate,
+        changed_component_classes=changed,
+    )
+
+    def compared(
+        outcome: ExecutionProfilePredictionOutcome,
+        *,
+        admits: bool | None,
+        possible: tuple[ExecutionProfileDecisionKind, ...],
+        reason: str,
+    ) -> ExecutionProfileAdmissionPrediction:
+        return prediction(
+            outcome,
+            admits=admits,
+            possible=possible,
+            reason=reason,
+            changed=changed,
+            retained=retained,
+            egress_change=egress_change,
+        )
+
+    if not changed:
+        return compared(
+            ExecutionProfilePredictionOutcome.EXACT_REUSE,
+            admits=True,
+            possible=(ExecutionProfileDecisionKind.EXACT_REUSE,),
+            reason="Every compared component is exactly equal.",
+        )
+    if boundary is ExecutionProfileAdmissionBoundary.CONTINUATION:
+        return compared(
+            ExecutionProfilePredictionOutcome.REJECTED,
+            admits=False,
+            possible=(ExecutionProfileDecisionKind.REJECTED,),
+            reason="Pending work requires exact reuse of its active invocation profile.",
+        )
+    if policy_configured is False:
+        return compared(
+            ExecutionProfilePredictionOutcome.REJECTED,
+            admits=False,
+            possible=(ExecutionProfileDecisionKind.REJECTED,),
+            reason="Without an ExecutionProfilePolicy, Runtime rejects every change.",
+        )
+    changed_set = frozenset(changed)
+    if changed_set <= _POLICY_COMPATIBLE_COMPONENT_CLASSES:
+        return compared(
+            ExecutionProfilePredictionOutcome.POLICY_DEPENDENT,
+            admits=None,
+            possible=(
+                ExecutionProfileDecisionKind.COMPATIBLE_REUSE,
+                ExecutionProfileDecisionKind.MIGRATION_REQUIRED,
+                ExecutionProfileDecisionKind.REJECTED,
+            ),
+            reason="An application ExecutionProfilePolicy may classify this as compatible reuse.",
+        )
+    if (
+        changed_set == {ExecutionProfileComponentClass.EGRESS_AUTHORITY}
+        and egress_change is EgressAuthorityChangeKind.NARROWER
+    ):
+        return compared(
+            ExecutionProfilePredictionOutcome.POLICY_DEPENDENT,
+            admits=None,
+            possible=(
+                ExecutionProfileDecisionKind.ADOPTED,
+                ExecutionProfileDecisionKind.MIGRATION_REQUIRED,
+                ExecutionProfileDecisionKind.REJECTED,
+            ),
+            reason="An application ExecutionProfilePolicy may adopt strictly narrower egress.",
+        )
+    return compared(
+        ExecutionProfilePredictionOutcome.POLICY_DEPENDENT,
+        admits=False,
+        possible=(
+            ExecutionProfileDecisionKind.MIGRATION_REQUIRED,
+            ExecutionProfileDecisionKind.REJECTED,
+        ),
+        reason=(
+            "Authority-bearing changes need explicit adoption intent; a policy can only "
+            "choose between migration_required and rejected."
+        ),
     )
 
 

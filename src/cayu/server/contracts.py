@@ -188,6 +188,7 @@ from cayu.server.sse import (
     SseErrorCode,
     SseErrorKind,
 )
+from cayu.sessions._execution_profile_checkpoint import SessionExecutionProfiles
 from cayu.sessions.execution import SessionExecutionState
 from cayu.sessions.interactions import InteractionSummaryEvidence
 from cayu.sessions.invocation import (
@@ -2046,6 +2047,15 @@ class ListSessionsResponse(ApiBaseModel):
             "session, in the same order as `sessions`."
         ),
     )
+    execution_profiles: list[SessionExecutionProfiles] | None = Field(
+        default=None,
+        description=(
+            "Present only for `include=execution_profile`: each listed session's stored "
+            "expected and active-invocation execution profiles and its next admission "
+            "`boundary`, in the same order as `sessions`. A session whose records cannot "
+            "be read has no profiles and an entry in `issues`."
+        ),
+    )
 
 
 class SessionTopologyRequest(ApiBaseModel):
@@ -2458,6 +2468,15 @@ class PendingActionsResponse(ApiBaseModel):
     has_more: StrictBool
     total_count: StrictInt | None = Field(ge=0)
     inspected_candidate_count: StrictInt = Field(ge=0)
+    execution_profiles: list[SessionExecutionProfiles] | None = Field(
+        default=None,
+        description=(
+            "Present only for `include=execution_profile`: each action's session "
+            "execution profiles, in the same order as `actions`. Continuing the action "
+            "requires exact reuse of `active_invocation.profile`. A session whose records "
+            "cannot be read has no profiles and an entry in `issues`."
+        ),
+    )
 
 
 PENDING_ACTION_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {

@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Hosts can predict whether stored sessions resume on a new release before
+  publishing it. `GET /api/sessions` and `GET /api/pending-actions` accept
+  `include=execution_profile` and return each session's expected and
+  active-invocation execution profiles (redacted identities: component classes,
+  fingerprints and typed egress authority) and the boundary Runtime meets it at
+  next; an unreadable session reports an issue instead of failing the page.
+  `cayu execution-profile candidates --json` prints a release's candidate
+  profiles, and `cayu execution-profile predict` compares stored profiles with
+  candidates resolved for each session's environment, target and causal budget
+  id, exiting `3` when a session may not resume. The Python API is
+  `CayuApp.inspect_session_execution_profiles`,
+  `CayuApp.inspect_candidate_execution_profile` and
+  `predict_execution_profile_admission`, which reports Runtime's decision class
+  or `policy_dependent` when an `ExecutionProfilePolicy` would decide.
+  `inspect_run_execution_profile` and `inspect_effective_run_configuration` no
+  longer load the session the request names.
 - Add storage retention for runtime-owned storage, off by default.
   `SQLiteSessionStore` and `PostgresSessionStore` apply a
   `SessionRetentionPolicy`: `compact` removes model text and thinking delta

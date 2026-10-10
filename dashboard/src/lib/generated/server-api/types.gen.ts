@@ -8987,6 +8987,13 @@ export type ExecutionEvidenceOverride = {
 };
 
 /**
+ * ExecutionProfileAdmissionBoundary
+ *
+ * Where a stored profile meets a candidate release's profile.
+ */
+export type ExecutionProfileAdmissionBoundary = 'continuation' | 'resume';
+
+/**
  * ExecutionProfileAdoptionBody
  */
 export type ExecutionProfileAdoptionBody = {
@@ -9987,6 +9994,12 @@ export type ListSessionInteractionsResponse = {
  * ListSessionsResponse
  */
 export type ListSessionsResponse = {
+    /**
+     * Execution Profiles
+     *
+     * Present only for `include=execution_profile`: each listed session's stored expected and active-invocation execution profiles and its next admission `boundary`, in the same order as `sessions`. A session whose records cannot be read has no profiles and an entry in `issues`.
+     */
+    execution_profiles?: Array<SessionExecutionProfiles> | null;
     /**
      * Next Cursor
      */
@@ -12691,6 +12704,12 @@ export type PendingActionsResponse = {
      * Actions
      */
     actions: Array<ApiPendingAction>;
+    /**
+     * Execution Profiles
+     *
+     * Present only for `include=execution_profile`: each action's session execution profiles, in the same order as `actions`. Continuing the action requires exact reuse of `active_invocation.profile`. A session whose records cannot be read has no profiles and an entry in `issues`.
+     */
+    execution_profiles?: Array<SessionExecutionProfiles> | null;
     /**
      * Has More
      */
@@ -16018,6 +16037,30 @@ export type SessionCostSummary = {
 export type SessionDebugState = 'needs_attention' | 'session_failure' | 'tool_issue' | 'interruption';
 
 /**
+ * SessionExecutionProfiles
+ *
+ * Redacted profiles a later invocation of one session must match.
+ *
+ * ``boundary`` is where Runtime meets this session next. ``continuation``
+ * (pending approval, user input, tool round, child wait, model-completion
+ * stage or provider-operation resolution, or an unreleased invocation) must
+ * match ``active_invocation.profile`` exactly. ``resume`` (the last invocation
+ * released with nothing pending) is compared with ``expected``. ``boundary``
+ * is ``None`` when the profile it needs is missing or the records conflict;
+ * a conflict is reported in ``issues``. Both profiles contain only component
+ * classes, strengths, fingerprints and typed authority.
+ */
+export type SessionExecutionProfiles = {
+    active_invocation?: SessionInvocationExecutionProfile | null;
+    boundary?: ExecutionProfileAdmissionBoundary | null;
+    expected?: ExecutionProfileIdentity | null;
+    /**
+     * Issues
+     */
+    issues?: Array<'expected_profile_invalid' | 'active_invocation_profile_invalid' | 'active_invocation_epoch_mismatch' | 'session_not_found' | 'checkpoint_incompatible' | 'load_failed'>;
+};
+
+/**
  * SessionExecutionSource
  *
  * The runtime boundary that created one session.
@@ -16167,6 +16210,31 @@ export type SessionFollowContract = {
      * Unknown Event Marker Behavior
      */
     unknown_event_marker_behavior?: 'reject';
+};
+
+/**
+ * SessionInvocationExecutionProfile
+ *
+ * Public view of the profile bound to a session's latest invocation.
+ *
+ * ``released`` is true once the invocation gave up its run epoch (the session
+ * paused or finished). An unreleased invocation is still running, or was
+ * interrupted and is continued by recovery.
+ */
+export type SessionInvocationExecutionProfile = {
+    /**
+     * Interaction Id
+     */
+    interaction_id: string;
+    profile: ExecutionProfileIdentity;
+    /**
+     * Released
+     */
+    released: boolean;
+    /**
+     * Run Epoch
+     */
+    run_epoch: number;
 };
 
 /**
@@ -22679,6 +22747,10 @@ export type ListPendingActionsApiPendingActionsGetData = {
          * Cursor
          */
         cursor?: string | null;
+        /**
+         * Include
+         */
+        include?: Array<'execution_profile'> | null;
     };
     url: '/api/pending-actions';
 };
@@ -22940,7 +23012,7 @@ export type ListSessionsApiSessionsGetData = {
         /**
          * Include
          */
-        include?: Array<'usage'> | null;
+        include?: Array<'usage' | 'execution_profile'> | null;
     };
     url: '/api/sessions';
 };

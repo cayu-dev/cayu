@@ -6731,6 +6731,35 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.tasks.completion_evaluations",
         "CompletionEvaluationSettlementRequest",
     ),
+    "ExecutionProfileAdmissionBoundary": (
+        "cayu.execution_profiles",
+        "ExecutionProfileAdmissionBoundary",
+    ),
+    "ExecutionProfileAdmissionPrediction": (
+        "cayu.execution_profiles",
+        "ExecutionProfileAdmissionPrediction",
+    ),
+    "ExecutionProfilePredictionOutcome": (
+        "cayu.execution_profiles",
+        "ExecutionProfilePredictionOutcome",
+    ),
+    "predict_execution_profile_admission": (
+        "cayu.execution_profiles",
+        "predict_execution_profile_admission",
+    ),
+    "CandidateExecutionProfile": ("cayu.runtime.config_inspection", "CandidateExecutionProfile"),
+    "SessionExecutionProfiles": (
+        "cayu.sessions._execution_profile_checkpoint",
+        "SessionExecutionProfiles",
+    ),
+    "SessionInvocationExecutionProfile": (
+        "cayu.sessions._execution_profile_checkpoint",
+        "SessionInvocationExecutionProfile",
+    ),
+    "session_execution_profiles": (
+        "cayu.sessions._execution_profile_checkpoint",
+        "session_execution_profiles",
+    ),
 }
 
 PUBLIC_NAMES = [
@@ -8126,6 +8155,14 @@ PUBLIC_NAMES = [
     "ExecutionProfileIdentity",
     "ExecutionProfileIdentityAvailability",
     "ExecutionProfileIdentityStrength",
+    "ExecutionProfileAdmissionBoundary",
+    "ExecutionProfileAdmissionPrediction",
+    "ExecutionProfilePredictionOutcome",
+    "predict_execution_profile_admission",
+    "CandidateExecutionProfile",
+    "SessionExecutionProfiles",
+    "SessionInvocationExecutionProfile",
+    "session_execution_profiles",
     "ExecutionProfileMigrationRequired",
     "ExecutionProfileMismatchError",
     "ExecutionProfilePolicy",
