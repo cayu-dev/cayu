@@ -8,18 +8,18 @@ import pytest
 from cayu import SQLiteSessionStore
 from cayu.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.messages import Message, ProviderStatePart, TextPart, ThinkingPart
+from cayu.sessions._model_failover import MODEL_TARGET_PROJECTION_METADATA_KEY
 from cayu.sessions.base import (
-    MODEL_TARGET_PROJECTION_METADATA_KEY,
     InMemorySessionStore,
     ModelTarget,
     RunRequest,
     SessionModelTransition,
     SessionStatusConflict,
     SessionStore,
-    session_input_messages_sha256,
 )
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import SessionIdentity, SessionStatus
+from cayu.sessions.transcript_input import session_input_messages_sha256
 
 
 async def _close_store(store: SessionStore) -> None:

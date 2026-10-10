@@ -52,12 +52,6 @@ from cayu.evals.scenario import (
 )
 from cayu.events import Event, EventType, event_payload_authority_is_runtime_generated
 from cayu.messages import FilePart, Message, MessageRole, TextPart
-from cayu.sessions.base import (
-    SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
-    SessionInputContractEvidence,
-    parse_session_input_contract_evidence,
-    session_input_messages_sha256,
-)
 from cayu.sessions.messaging import SessionMessageDeliveryMode
 from cayu.sessions.records import TranscriptRecord
 from cayu.sessions.terminal_evidence import (
@@ -65,6 +59,12 @@ from cayu.sessions.terminal_evidence import (
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,
     TerminalSessionEvidenceLimits,
+)
+from cayu.sessions.transcript_input import (
+    SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
+    SessionInputContractEvidence,
+    parse_session_input_contract_evidence,
+    session_input_messages_sha256,
 )
 
 SCENARIO_CAPTURE_MAX_DIAGNOSTICS = 1_024

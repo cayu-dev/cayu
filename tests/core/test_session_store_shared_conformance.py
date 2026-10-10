@@ -241,7 +241,6 @@ from cayu.sessions._model_completion_publication import (
 from cayu.sessions.base import (
     MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES,
     QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY,
-    SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     BudgetReservationIdentityConflict,
     CompactSessionRequest,
     ForkSessionRequest,
@@ -316,6 +315,7 @@ from cayu.sessions.terminal_evidence import (
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,
 )
+from cayu.sessions.transcript_input import SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY
 from cayu.sessions.transcript_queries import TranscriptQuery, TranscriptSnapshot
 from cayu.sessions.usage import UsageRollupQuery
 from cayu.storage.jsonl_export import export_sessions, import_sessions

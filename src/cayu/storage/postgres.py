@@ -198,7 +198,6 @@ from cayu.sessions.base import (
     FORK_TRANSCRIPT_VALIDATION_ERROR,
     INHERIT_INTERACTION,
     MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
-    SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     BudgetReservationIdentityConflict,
     CheckpointRootFieldGuard,
     CheckpointTransform,
@@ -382,7 +381,6 @@ from cayu.sessions.base import (
     restore_persisted_event_authority,
     session_instance_id_for_run_request,
     session_invocation_for_run_request,
-    session_messages_input_contract_evidence,
     session_metadata_for_creation,
     transform_fork_checkpoint,
 )
@@ -488,9 +486,11 @@ from cayu.sessions.topology import (
     SessionTopologyStoreResult,
 )
 from cayu.sessions.transcript_input import (
+    SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     DeferredInteractionInput,
     deferred_interaction_input_from_storage_payload,
     deferred_interaction_input_storage_payload,
+    session_messages_input_contract_evidence,
 )
 from cayu.sessions.transcript_queries import (
     ForkTranscriptValidator,

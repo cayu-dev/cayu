@@ -6523,7 +6523,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "store_agent_snapshot_component_package",
     ),
     "strip_old_file_attachments": ("cayu.context.base", "strip_old_file_attachments"),
-    "system_prompt_messages_sha256": ("cayu.sessions.base", "system_prompt_messages_sha256"),
+    "system_prompt_messages_sha256": (
+        "cayu.sessions.transcript_input",
+        "system_prompt_messages_sha256",
+    ),
     "taint_labels_from_metadata": ("cayu.tools.policy", "taint_labels_from_metadata"),
     "task_create_with_execution_source": (
         "cayu.tasks.creation",

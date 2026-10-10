@@ -555,7 +555,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.sessions.forks",
         "session_prompt_anatomy_transition",
     ),
-    "system_prompt_messages_sha256": ("cayu.sessions.base", "system_prompt_messages_sha256"),
+    "system_prompt_messages_sha256": (
+        "cayu.sessions.transcript_input",
+        "system_prompt_messages_sha256",
+    ),
 }
 
 PUBLIC_NAMES = [

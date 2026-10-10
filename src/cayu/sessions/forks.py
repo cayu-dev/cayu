@@ -43,6 +43,7 @@ from cayu.sessions._execution_profile_checkpoint import (
 from cayu.sessions.records import Session, SessionStatus, copy_session
 
 FORK_EXECUTION_PROFILE_METADATA_KEY = "cayu:fork_execution_profile"
+FORK_SOURCE_SNAPSHOT_METADATA_KEY = "cayu:fork_source_snapshot"
 FORK_EXECUTION_PROFILE_RECORD_TYPE = "cayu.session-fork-execution-profile"
 FORK_EXECUTION_PROFILE_ORDINARY_SCHEMA_VERSION = 1
 FORK_EXECUTION_PROFILE_EXACT_SOURCE_SCHEMA_VERSION = 2

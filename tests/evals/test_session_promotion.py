@@ -61,7 +61,7 @@ from cayu import (
     trajectory_from_session,
 )
 from cayu.evals.models import _trajectory_promotion_capture_sha256
-from cayu.sessions.base import (
+from cayu.sessions.transcript_input import (
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     parse_session_input_contract_evidence,
     session_input_messages_sha256,

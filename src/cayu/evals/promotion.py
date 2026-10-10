@@ -69,8 +69,8 @@ from cayu.evals.published import (
 from cayu.evals.suite_authoring import EvalSuiteAuthoringAssertionSpecV1
 from cayu.events import EventType
 from cayu.messages import Message, MessageRole, TextPart
-from cayu.sessions.base import session_input_messages_sha256
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.transcript_input import session_input_messages_sha256
 
 PROMOTABLE_RUN_INPUT_SCHEMA_VERSION = 1
 PROMOTION_SOURCE_SCHEMA_VERSION = 1

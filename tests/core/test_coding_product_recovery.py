@@ -22,7 +22,8 @@ from cayu.coding_products import (
     CodingTaskAuthority,
 )
 from cayu.messages import Message
-from cayu.sessions.base import RunRequest, session_input_messages_sha256
+from cayu.sessions.base import RunRequest
+from cayu.sessions.transcript_input import session_input_messages_sha256
 from cayu.workspaces.local import LocalWorkspace
 from cayu.workspaces.revisions import (
     WorkspaceRevisionObservation,

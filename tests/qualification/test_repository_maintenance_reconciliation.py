@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from cayu import Event, EventType, Message, TaskStatus
-from cayu.sessions.base import session_input_messages_sha256
+from cayu.sessions.transcript_input import session_input_messages_sha256
 from tests.qualification.test_repository_maintenance_http import _A, _BODY, _OP, client
 from tests.qualification.test_repository_maintenance_http import host as host
 from tests.qualification.test_repository_maintenance_request import consumer as consumer

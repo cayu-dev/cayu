@@ -46023,5 +46023,11 @@
     "tests/core/test_session_fork_package_layout.py::test_prompt_transition_and_replacement_without_implementations[cayu.runtime]": 0.2578082089894451,
     "tests/core/test_session_fork_package_layout.py::test_prompt_transition_and_replacement_without_implementations[cayu.sessions.forks]": 0.263182999973651,
     "tests/core/test_session_fork_package_layout.py::test_prompt_transition_and_replacement_without_implementations[cayu.sessions]": 0.25516345794312656,
-    "tests/core/test_session_fork_package_layout.py::test_prompt_transition_and_replacement_without_implementations[cayu]": 0.25612058298429474
+    "tests/core/test_session_fork_package_layout.py::test_prompt_transition_and_replacement_without_implementations[cayu]": 0.25612058298429474,
+    "tests/core/test_session_request_input_layout.py::test_input_evidence_composes_without_store_or_runtime_execution": 0.34420391701860353,
+    "tests/core/test_session_request_input_layout.py::test_input_evidence_historical_public_identity[SessionInputContractEvidence]": 0.0005003330297768116,
+    "tests/core/test_session_request_input_layout.py::test_input_evidence_historical_public_identity[parse_session_input_contract_evidence]": 0.0002603329485282302,
+    "tests/core/test_session_request_input_layout.py::test_input_evidence_historical_public_identity[session_input_messages_sha256]": 0.00021341798128560185,
+    "tests/core/test_session_request_input_layout.py::test_input_evidence_historical_public_identity[session_messages_input_contract_evidence]": 0.00020845799008384347,
+    "tests/core/test_session_request_input_layout.py::test_input_evidence_historical_public_identity[system_prompt_messages_sha256]": 0.00021808402379974723
 }

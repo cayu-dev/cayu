@@ -28,6 +28,9 @@ from cayu._validation import (
 )
 
 MODEL_FAILOVER_CHECKPOINT_KEY = "model_failover"
+MODEL_TARGET_PROJECTION_METADATA_KEY = "cayu:model_target_projection"
+MODEL_TARGET_PROJECTION_RECORD_TYPE = "cayu.model-target-projection"
+MODEL_TARGET_PROJECTION_SCHEMA_VERSION = 1
 _Digest = Annotated[str, Field(strict=True, pattern=r"^[0-9a-f]{64}$")]
 _Counter = Annotated[StrictInt, Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)]
 

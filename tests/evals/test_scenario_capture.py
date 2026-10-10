@@ -50,7 +50,7 @@ from cayu import (
 from cayu.artifacts.attachments import MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY
 from cayu.evals.scenario_capture import _resolve_artifact_requirements
 from cayu.events import event_payload_authority_is_runtime_generated
-from cayu.sessions.base import (
+from cayu.sessions.transcript_input import (
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     parse_session_input_contract_evidence,
 )

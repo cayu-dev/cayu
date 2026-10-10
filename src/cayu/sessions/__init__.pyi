@@ -103,7 +103,6 @@ from cayu.sessions.base import (
 from cayu.sessions.base import (
     session_invocation_for_run_request as session_invocation_for_run_request,
 )
-from cayu.sessions.base import system_prompt_messages_sha256 as system_prompt_messages_sha256
 from cayu.sessions.checkpoints import CHECKPOINT_SCHEMA_VERSION_KEY as CHECKPOINT_SCHEMA_VERSION_KEY
 from cayu.sessions.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION as CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -446,6 +445,9 @@ from cayu.sessions.topology import SessionTopologyNode as SessionTopologyNode
 from cayu.sessions.topology import SessionTopologyQuery as SessionTopologyQuery
 from cayu.sessions.topology import SessionTopologyStoreResult as SessionTopologyStoreResult
 from cayu.sessions.transcript_input import DeferredInteractionInput as DeferredInteractionInput
+from cayu.sessions.transcript_input import (
+    system_prompt_messages_sha256 as system_prompt_messages_sha256,
+)
 from cayu.sessions.transcript_queries import TranscriptPage as TranscriptPage
 from cayu.sessions.transcript_queries import TranscriptQuery as TranscriptQuery
 from cayu.sessions.transcript_queries import TranscriptSearchHit as TranscriptSearchHit

@@ -60,14 +60,14 @@ from cayu.sessions._invocation_lifecycle import (
     released_invocation_evidence,
     require_invocation_rebind_lineage,
 )
-from cayu.sessions.base import (
-    RunRequest,
-    parse_session_input_contract_evidence,
-    session_input_messages_sha256,
-)
+from cayu.sessions.base import RunRequest
 from cayu.sessions.exports import SessionExportLimits, SessionExportSnapshot
 from cayu.sessions.invocation import SessionInvocationBinding
 from cayu.sessions.records import SessionStatus
+from cayu.sessions.transcript_input import (
+    parse_session_input_contract_evidence,
+    session_input_messages_sha256,
+)
 from cayu.tasks.contracts import (
     CompletionConstraintOutcome,
     CompletionContinuationPolicy,

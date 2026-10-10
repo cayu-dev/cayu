@@ -30,7 +30,7 @@ from cayu.guides.coding_host_evidence import (
     _require_serial_check_quiescence,
 )
 from cayu.guides.coding_host_owner import inspect_stopped_worker
-from cayu.sessions.base import session_input_messages_sha256
+from cayu.sessions.transcript_input import session_input_messages_sha256
 from tests.qualification.repository_maintenance_identity import copy_identity
 from tests.qualification.repository_maintenance_intake import load_owned_coding_task
 from tests.qualification.repository_maintenance_request import decode_request

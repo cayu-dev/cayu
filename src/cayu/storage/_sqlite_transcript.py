@@ -15,10 +15,10 @@ from cayu.sessions._checkpoint_preservation import (
     _checkpoint_transform_result_preserving_completion_result_event_publications,
     _copy_checkpoint_for_transform,
 )
+from cayu.sessions._model_failover import MODEL_TARGET_PROJECTION_METADATA_KEY
 from cayu.sessions.base import (
     INHERIT_INTERACTION,
     MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
-    MODEL_TARGET_PROJECTION_METADATA_KEY,
     RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX,
     CheckpointTransform,
     InteractionAttribution,

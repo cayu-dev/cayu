@@ -558,7 +558,10 @@ indexes; index maintenance, schema validation and atomic reads remain store-owne
 
 `sessions/transcript_input.py` owns deferred input, its durable payload codecs,
 authenticated replacement checks, detached message copying and initial-transcript
-prefix validation. Runtime admission retains the authority that binds a request to
+prefix validation. It also owns fresh-input evidence parsing, canonical input and
+system-prompt fingerprints, and the caller-input peer-content restriction. These
+rules can validate and identify input without a session store. Runtime admission
+retains the authority that binds a request to
 its session; stores compose these pure rules inside their existing publication
 transactions. Public transcript contracts retain their supported imports and saved
 pickle references.
