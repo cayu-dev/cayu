@@ -66,6 +66,7 @@ from cayu.sessions.base import (
     parse_session_input_contract_evidence,
     session_input_messages_sha256,
 )
+from cayu.storage import _postgres_event_delivery as postgres_event_delivery
 from cayu.storage.migrations import SchemaMode
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
@@ -1662,7 +1663,7 @@ def test_postgres_ordinary_event_batch_skips_input_contract_proof_update():
 
     async def scenario() -> list[str]:
         cursor = RecordingCursor()
-        await PostgresSessionStore._enqueue_persisted_event_side_effects(
+        await postgres_event_delivery.enqueue_persisted_event_side_effects(
             cursor,
             "ordinary-event-batch",
             [

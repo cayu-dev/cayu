@@ -6,8 +6,10 @@ import asyncio
 import os
 import subprocess
 import sys
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -170,6 +172,142 @@ def test_sqlite_enqueue_failure_rolls_back_event_publication(tmp_path, monkeypat
             assert await store.load_events("rollback") == []
             assert await store.list_persisted_event_side_effect_deliveries() == []
             await store.append_event("rollback", event)
+            assert [
+                row.event_id for row in await store.list_persisted_event_side_effect_deliveries()
+            ] == [event.id]
+        finally:
+            await store.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.fixture
+def delivery_postgres_dsn(postgres_dsn):
+    from tests.core.postgres_contention_support import drop_cayu_tables
+
+    asyncio.run(drop_cayu_tables(postgres_dsn))
+    try:
+        yield postgres_dsn
+    finally:
+        asyncio.run(drop_cayu_tables(postgres_dsn))
+
+
+def test_postgres_delivery_imports_without_store_adapters():
+    _assert_import_without_adapters("postgres")
+
+
+def test_postgres_delivery_composes_with_direct_connection(delivery_postgres_dsn):
+    import psycopg
+
+    from cayu.storage import _postgres_event_delivery as delivery
+    from cayu.storage.migrations import SchemaMode
+    from cayu.storage.postgres import PostgresSessionStore
+
+    async def exercise():
+        session_id = f"delivery-{uuid4()}"
+        store = PostgresSessionStore(delivery_postgres_dsn, schema_mode=SchemaMode.CREATE)
+        event = Event(type=EventType.MODEL_COMPLETED, session_id=session_id)
+        try:
+            await store.create(
+                RunRequest(session_id=session_id, agent_name="assistant", messages=[]),
+                identity=SessionIdentity(provider_name="provider", model="model"),
+            )
+            await store.append_event(session_id, event)
+        finally:
+            await store.close()
+
+        callbacks = []
+
+        @asynccontextmanager
+        async def connect():
+            async with await psycopg.AsyncConnection.connect(delivery_postgres_dsn) as connection:
+                yield connection
+
+        async def lock_closure_lineage(cur):
+            callbacks.append("closure")
+            await cur.execute("SELECT pg_advisory_xact_lock(42)")
+
+        async def store_now(cur):
+            assert cur.connection.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
+            callbacks.append("clock")
+            await cur.execute("SELECT clock_timestamp()")
+            return (await cur.fetchone())[0]
+
+        expected = await delivery.get_persisted_event_side_effect_delivery(
+            connect, session_id=session_id, event_id=event.id
+        )
+        claim = await delivery.claim_first_persisted_event_side_effect(
+            connect, expected, lock_closure_lineage=lock_closure_lineage
+        )
+        assert claim.event == event and claim.attempt == 1
+        renewed = await delivery.renew_persisted_event_side_effect(
+            connect, claim, lease_seconds=600
+        )
+        assert renewed.lease_expires_at > claim.lease_expires_at
+        pending = await delivery.defer_persisted_event_side_effect(connect, claim)
+        assert pending.attempts == 0 and pending.status is PersistedEventSideEffectStatus.PENDING
+        with pytest.raises(PersistedEventSideEffectClaimLost):
+            await delivery.mark_persisted_event_side_effect_delivered(connect, claim)
+        retried = await delivery.claim_persisted_event_side_effect(
+            connect,
+            session_id=session_id,
+            event_id=event.id,
+            lock_closure_lineage=lock_closure_lineage,
+        )
+        failed = await delivery.mark_persisted_event_side_effect_failed(
+            connect, retried, error="Sink unavailable", max_attempts=3, retry_delay_seconds=0
+        )
+        retired = await delivery.retire_failed_first_event_delivery(
+            connect, failed, store_now=store_now
+        )
+        assert retired.status is PersistedEventSideEffectStatus.DEAD_LETTERED
+        assert callbacks == ["closure", "closure", "clock"]
+        health = await delivery.get_persisted_event_side_effect_health(connect)
+        assert health.dead_lettered == 1 and health.claimable_total == 0
+        page = await delivery.query_persisted_event_side_effect_deliveries(
+            connect, PersistedEventSideEffectQuery()
+        )
+        assert [row.event_id for row in page.deliveries] == [event.id]
+        assert await delivery.list_persisted_event_side_effect_deliveries(connect) == [retired]
+
+    asyncio.run(exercise())
+
+
+def test_postgres_enqueue_failure_rolls_back_event_publication(delivery_postgres_dsn, monkeypatch):
+    import psycopg
+
+    from cayu.storage import _postgres_event_delivery as delivery
+    from cayu.storage.migrations import SchemaMode
+    from cayu.storage.postgres import PostgresSessionStore
+
+    async def exercise():
+        session_id = f"rollback-{uuid4()}"
+        store = PostgresSessionStore(delivery_postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await store.create(
+                RunRequest(session_id=session_id, agent_name="assistant", messages=[]),
+                identity=SessionIdentity(provider_name="provider", model="model"),
+            )
+            event = Event(type=EventType.MODEL_COMPLETED, session_id=session_id)
+            enqueue = delivery.enqueue_persisted_event_side_effects
+
+            async def fail_after_enqueue(cur, sid, events):
+                assert (
+                    cur.connection.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
+                )
+                await enqueue(cur, sid, events)
+                assert (
+                    cur.connection.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
+                )
+                raise RuntimeError("Failure after enqueue")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(delivery, "enqueue_persisted_event_side_effects", fail_after_enqueue)
+                with pytest.raises(RuntimeError, match="Failure after enqueue"):
+                    await store.append_event(session_id, event)
+            assert await store.load_events(session_id) == []
+            assert await store.list_persisted_event_side_effect_deliveries() == []
+            await store.append_event(session_id, event)
             assert [
                 row.event_id for row in await store.list_persisted_event_side_effect_deliveries()
             ] == [event.id]
