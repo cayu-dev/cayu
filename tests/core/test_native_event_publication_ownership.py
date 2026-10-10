@@ -261,3 +261,146 @@ def test_sqlite_event_publication_composes_with_direct_connection(tmp_path):
             connection.close()
 
     asyncio.run(run())
+
+
+def test_postgres_event_publication_imports_without_adapters_or_postgres_driver():
+    _assert_import_without_adapters_or_postgres_driver("postgres")
+
+
+def test_postgres_event_publication_composes_with_direct_connection(postgres_dsn):
+    from contextlib import asynccontextmanager
+
+    import psycopg
+
+    from cayu.storage import _postgres_event_publication as owner
+    from cayu.storage import _postgres_support as support
+    from cayu.storage import postgres as adapter
+    from cayu.storage.migrations import SchemaMode
+
+    async def run():
+        store = adapter.PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            sid = await _seed(store)
+        finally:
+            await store.close()
+        active = False
+        ready = False
+
+        async def ensure_ready():
+            nonlocal ready
+            assert not active
+            ready = True
+
+        @asynccontextmanager
+        async def connect():
+            nonlocal active, ready
+            assert ready and not active
+            ready, active = False, True
+            try:
+                async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+                    yield connection
+            finally:
+                active = False
+
+        async def lock_closure(cur):
+            assert active
+            await cur.execute("SELECT pg_advisory_xact_lock(42)")
+
+        async def load_session(cur, session_id):
+            assert active and session_id == sid
+            await cur.execute(
+                f"SELECT {support.SESSION_COLUMNS} FROM cayu_sessions WHERE id = %s FOR UPDATE",
+                (session_id,),
+            )
+            row = await cur.fetchone()
+            return None if row is None else support.session_from_row(row, labels={})
+
+        async def closure_owners(cur, targets):
+            assert active and tuple(targets) == (sid,)
+            assert cur.connection.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
+            return ()
+
+        async def register_events(cur, session_id, events):
+            # No authority codec is configured for this independently composed fixture.
+            assert active and session_id == sid and all(event.session_id == sid for event in events)
+            assert cur.connection.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
+
+        async def first_existing_event_id(session_id, ids):
+            assert active and session_id == sid
+            async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+                for event_id in ids:
+                    cur = await connection.execute(
+                        "SELECT 1 FROM cayu_events WHERE session_id = %s AND event_id = %s",
+                        (session_id, event_id),
+                    )
+                    if await cur.fetchone() is not None:
+                        return event_id
+            return None
+
+        common = dict(
+            ensure_ready=ensure_ready,
+            load_session=load_session,
+            store_now=adapter.PostgresSessionStore._session_store_now,
+            closure_owners=closure_owners,
+            lock_closure=lock_closure,
+            register_event_authorities=register_events,
+            first_existing_event_id=first_existing_event_id,
+            raise_write_conflict=adapter._raise_session_write_conflict,
+            unique_violation=psycopg.errors.UniqueViolation,
+        )
+        ops = SimpleNamespace(
+            claim_budget_reservation_identity=partial(
+                owner.claim_budget_reservation_identity,
+                connect,
+                ensure_ready=ensure_ready,
+                closure_owners=closure_owners,
+                raise_write_conflict=adapter._raise_session_write_conflict,
+            ),
+            append_workflow_step_started=partial(
+                owner.append_workflow_step_started, connect, **common
+            ),
+        )
+        read = partial(owner.load_mcp_manifest_baselines, connect, ensure_ready=ensure_ready)
+        publish = partial(owner.compare_and_publish_mcp_manifest_checks, connect, sid, **common)
+
+        async def snapshot():
+            assert not active
+            async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+                values = []
+                for table in (
+                    "cayu_events",
+                    "cayu_persisted_event_side_effects",
+                    "cayu_mcp_manifest_baselines",
+                ):
+                    cur = await connection.execute(f"SELECT COUNT(*) FROM {table}")
+                    values.append((await cur.fetchone())[0])
+                cur = await connection.execute(
+                    "SELECT event_seq, last_activity_at FROM cayu_sessions"
+                )
+                return tuple(values) + tuple(await cur.fetchone())
+
+        await _exercise_admission(ops, sid)
+        key, publication = _publication(sid)
+        before = await snapshot()
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+            await connection.execute("""CREATE FUNCTION fail_manifest_baseline() RETURNS trigger
+                LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'baseline write failed'; END $$""")
+            await connection.execute("""CREATE TRIGGER fail_manifest_baseline BEFORE INSERT
+                ON cayu_mcp_manifest_baselines FOR EACH ROW EXECUTE FUNCTION fail_manifest_baseline()""")
+        try:
+            with pytest.raises(psycopg.errors.RaiseException, match="baseline write failed"):
+                await publish(**publication)
+            assert await snapshot() == before
+            assert (await read((key,))).baselines == {}
+        finally:
+            async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+                await connection.execute(
+                    "DROP TRIGGER fail_manifest_baseline ON cayu_mcp_manifest_baselines"
+                )
+                await connection.execute("DROP FUNCTION fail_manifest_baseline()")
+        assert (await publish(**publication)).published
+        assert not (await publish(**publication)).published
+        assert (await read((key,))).baselines == publication["baseline_updates"]
+        assert (await snapshot())[:3] == tuple(count + 1 for count in before[:3])
+
+    asyncio.run(run())

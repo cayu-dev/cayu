@@ -1072,12 +1072,14 @@ transcript/checkpoint updates and delivery receipts retain one native transactio
 PostgreSQL retains readiness order, session locks and read-only snapshot isolation.
 The stores compose these operations; runtime dispatch retains its existing owner.
 
-Native SQLite event-publication operations live in `storage/_sqlite_event_publication.py`:
-event batches, tool-conflict audit events, workflow-start reservations, budget
-identity claims, and MCP baseline reads/publication. Each operation owns its native
-transaction and admission checks. Shared event writers, checkpoint/terminal-receipt
-helpers and closure checks remain explicit capabilities; their existing publication
-and export-ownership boundaries are preserved.
+Native event-publication operations live in `storage/_sqlite_event_publication.py`
+and `storage/_postgres_event_publication.py`: event batches, tool-conflict audit
+events, workflow-start reservations, budget identity claims, and MCP baseline
+reads/publication. Each operation owns its native transaction and admission checks.
+Shared event writers, checkpoint/terminal-receipt helpers, closure and authority
+checks remain explicit capabilities; their existing publication and export-ownership
+boundaries are preserved. PostgreSQL also receives readiness and duplicate-error
+classification separately, preserving validation order and optional driver loading.
 
 Context policies are runtime projections over transcript messages, not storage. They let applications customize the model-facing conversation history by trimming, compacting, replacing bulky tool results, or injecting retrieved context while preserving the raw durable transcript for audit, debugging, resume, and future compaction.
 
