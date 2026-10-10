@@ -14,6 +14,7 @@ import sys
 import time
 import webbrowser
 from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Never
 
@@ -74,6 +75,20 @@ _STORAGE_PUBLICATION_FAILURES = _RETRYABLE_STORAGE_PUBLICATION_FAILURES | {
 _ACKNOWLEDGE_BREAKING_LIST = re.compile(r'"acknowledge_breaking":\s*\[([0-9, ]{1,400})\]')
 _ACKNOWLEDGE_BREAKING_FLAG = re.compile(r"--acknowledge-breaking ([0-9]{1,7})\b")
 _LEGACY_RETRY_REJECTION = "Only paused or failed deployments can be retried."
+# Cloud's owner choice for the serving release's unfinished sessions.
+_SESSION_POLICIES = ("wait", "block", "proceed")
+_DEFAULT_SESSION_WAIT_SECONDS = 900
+_MIN_SESSION_WAIT_SECONDS = 60
+_MAX_SESSION_WAIT_SECONDS = 3600
+_MAX_SESSION_ACKNOWLEDGEMENTS = 200
+_MAX_SESSION_ID_LENGTH = 256
+_ACKNOWLEDGE_ALL_SESSIONS = "*"
+# Publication refusals for unfinished sessions; a retry with a new choice gets past them.
+_SESSION_PUBLICATION_FAILURES = frozenset({"unfinished_sessions", "sessions_unreadable"})
+# Session checks after which Cloud publishes, whatever choice is stored later.
+_PASSED_SESSION_CHECKS = frozenset({"clear", "acknowledged", "unsupported", "not_running"})
+# A waiting preflight's `waiting_for` (Cloud names sessions, session_read or agent_wake).
+_SESSION_WAITING_FOR = re.compile(r"[a-z][a-z0-9_]{0,63}")
 
 
 class CloudCommandError(RuntimeError):
@@ -111,11 +126,12 @@ class _CloudServicePublicationError(CloudApiError):
 
     def __init__(
         self,
-        publication_error: dict[str, str],
+        publication_error: dict[str, Any],
         *,
         application_id: str | None = None,
         deployment_id: str | None = None,
         recovery_arguments: Sequence[str] = (),
+        release: dict[str, Any] | None = None,
     ) -> None:
         app = None if application_id is None else _cloud_application_id(application_id)
         deployment = None if deployment_id is None else _cloud_deployment_id(deployment_id)
@@ -136,7 +152,13 @@ class _CloudServicePublicationError(CloudApiError):
         flags = [
             item for revision in revisions for item in ("--acknowledge-breaking", str(revision))
         ]
+        sessions: list[str] = (
+            _session_retry_acknowledgements(publication_error, release) or []
+            if code in _SESSION_PUBLICATION_FAILURES
+            else []
+        )
         retry_command = None
+        wait_command = None
         if app is not None and deployment is not None:
             command = ["cayu", "cloud", *recovery_arguments, "deployment"]
             suffix = [deployment, "--application", app]
@@ -147,10 +169,69 @@ class _CloudServicePublicationError(CloudApiError):
                 retry_command = shlex.join([*command, "retry", *suffix, *flags])
             elif code in _RETRYABLE_STORAGE_PUBLICATION_FAILURES:
                 retry_command = shlex.join([*command, "retry", *suffix])
+            elif sessions:
+                retry_command = shlex.join(
+                    [
+                        *command,
+                        "retry",
+                        *suffix,
+                        *(
+                            item
+                            for session in sessions
+                            for item in ("--acknowledge-session", session)
+                        ),
+                    ]
+                )
+            if code in _SESSION_PUBLICATION_FAILURES:
+                # A retry replaces the Release's choice, so keep a longer wait it had.
+                waited = _stored_session_wait_seconds(release)
+                wait_command = shlex.join(
+                    [
+                        *command,
+                        "retry",
+                        *suffix,
+                        "--session-policy",
+                        "wait",
+                        *(
+                            ["--session-wait-seconds", str(waited)]
+                            if waited > _DEFAULT_SESSION_WAIT_SECONDS
+                            else []
+                        ),
+                    ]
+                )
+                commands["retry_wait"] = wait_command
             if retry_command is not None:
                 commands["retry"] = retry_command
             self.details["commands"] = commands
-        if revisions:
+        if code in _SESSION_PUBLICATION_FAILURES and wait_command is not None:
+            unfinished = code == "unfinished_sessions"
+            wait_step = (
+                "wait for them again" if unfinished else "wait for Cloud to read them"
+            ) + f" with `{wait_command}`"
+            if retry_command is not None:
+                # Cloud's hint names the portal first for older CLIs; give this CLI's steps.
+                self.details["acknowledge_sessions"] = sessions
+                everyone = sessions == [_ACKNOWLEDGE_ALL_SESSIONS]
+                parts.append(
+                    (
+                        "Answer or finish the sessions and retry, or "
+                        if unfinished
+                        else "Retry once the Agent answers, or "
+                    )
+                    + f"accept that {'every unfinished session' if everyone else 'they'} may "
+                    + f"not resume on this release with `{retry_command}`, or {wait_step}."
+                )
+            else:
+                # Without a list of sessions a retry can pass with (Cloud's is missing,
+                # invalid or truncated), keep Cloud's hint (the portal's Acknowledge and
+                # retry) and add the wait alternative.
+                parts.extend(
+                    [
+                        *([publication_error["hint"]] if "hint" in publication_error else []),
+                        f"Or {wait_step}.",
+                    ]
+                )
+        elif revisions:
             # Cloud's hint names its operator tooling; give the customer CLI's own steps.
             self.details["acknowledge_breaking"] = list(revisions)
             parts.append(
@@ -165,7 +246,9 @@ class _CloudServicePublicationError(CloudApiError):
         super().__init__(
             "service_publication_failed",
             " ".join(parts),
-            code=code if code in _STORAGE_PUBLICATION_FAILURES else None,
+            code=code
+            if code in _STORAGE_PUBLICATION_FAILURES or code in _SESSION_PUBLICATION_FAILURES
+            else None,
         )
         self.publication_error = publication_error.copy()
 
@@ -245,18 +328,22 @@ class _CloudDeploymentStillRunningError(CloudApiError):
         deployment_id: str,
         recovery_arguments: Sequence[str] = (),
         status: str,
+        last_issue: str | None = None,
     ) -> None:
-        super().__init__(
-            "deployment_still_running",
-            "Cayu Cloud is still processing this deployment.",
-        )
+        message = "Cayu Cloud is still processing this deployment."
+        if last_issue is not None:
+            message = f"{message} Last report: {last_issue}"
+        super().__init__("deployment_still_running", message)
         self.application_id = _cloud_application_id(application_id)
         self.deployment_id = _cloud_deployment_id(deployment_id)
         self.recovery_arguments = tuple(recovery_arguments)
         self.status = status if status in _DEPLOYMENT_IN_PROGRESS else "processing"
+        self.last_issue = last_issue
 
     def public_details(self) -> dict[str, object]:
         details: dict[str, object] = {"status": self.status}
+        if self.last_issue is not None:
+            details["last_issue"] = self.last_issue
         if self.application_id is not None:
             details["application"] = self.application_id
         if self.deployment_id is not None:
@@ -314,6 +401,107 @@ class _CloudReleaseNotSelectedError(CloudApiError):
                 ),
                 "status": shlex.join([*command, "service", "status", "--application", app]),
             }
+
+
+class _CloudReleaseSupersededError(CloudApiError):
+    """Cloud selected another Release while this one waited for unfinished sessions."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        application_id: str,
+        deployment_id: str,
+        recovery_arguments: Sequence[str] = (),
+        status: str = "smoke_tested",
+    ) -> None:
+        # Only a Release selected before can be selected again with a rollback.
+        remedy = (
+            "select it again with `cayu cloud rollback`"
+            if status == "promoted"
+            else "change `version` in cayu-cloud.toml and deploy again"
+        )
+        super().__init__(
+            "release_superseded",
+            f"{message} Cayu Cloud won't publish this Release, and the Agent keeps the one it "
+            f"selected. To serve this source, {remedy}.",
+        )
+        self.details: dict[str, object] = {"status": status}
+        app = _cloud_application_id(application_id)
+        deployment = _cloud_deployment_id(deployment_id)
+        if app is not None:
+            self.details["application"] = app
+        if deployment is not None:
+            self.details["deployment_id"] = deployment
+        if app is not None and deployment is not None:
+            command = ["cayu", "cloud", *recovery_arguments, "deployment"]
+            suffix = [deployment, "--application", app]
+            commands = {
+                action: shlex.join([*command, action, *suffix]) for action in ("status", "timeline")
+            }
+            if status == "promoted":
+                commands["rollback"] = shlex.join(
+                    ["cayu", "cloud", *recovery_arguments, "rollback", *suffix, "--wait"]
+                )
+            self.details["commands"] = commands
+
+
+class _CloudSessionChoiceNotAppliedError(CloudApiError):
+    """Cloud kept a more permissive session choice than the command asked for."""
+
+    def __init__(
+        self,
+        not_applied: dict[str, Any],
+        *,
+        application_id: str,
+        deployment_id: str,
+        recovery_arguments: Sequence[str] = (),
+    ) -> None:
+        super().__init__(
+            "session_choice_not_applied",
+            f"{not_applied['message']} That choice may let it replace the serving release "
+            "over unfinished sessions this command's choice would have kept.",
+        )
+        self.details: dict[str, object] = {"not_applied": not_applied}
+        app = _cloud_application_id(application_id)
+        deployment = _cloud_deployment_id(deployment_id)
+        if app is not None:
+            self.details["application"] = app
+        if deployment is not None:
+            self.details["deployment_id"] = deployment
+        if app is not None and deployment is not None:
+            command = ["cayu", "cloud", *recovery_arguments, "deployment"]
+            suffix = [deployment, "--application", app]
+            self.details["commands"] = {
+                action: shlex.join([*command, action, *suffix]) for action in ("status", "timeline")
+            }
+
+
+def _report_not_applied(
+    not_applied: dict[str, Any] | None,
+    *,
+    application_id: str,
+    deployment_id: str,
+    recovery_arguments: Sequence[str],
+    already_selected: bool,
+) -> dict[str, Any] | None:
+    """Fail on a more permissive kept choice, or report what Cloud didn't apply.
+
+    A Release Cloud selected before the command publishes under its choice whatever the
+    command does, so only stderr says so; otherwise a more permissive kept choice fails.
+    """
+
+    if not_applied is None:
+        return None
+    if not_applied.get("more_permissive") and not already_selected:
+        raise _CloudSessionChoiceNotAppliedError(
+            not_applied,
+            application_id=application_id,
+            deployment_id=deployment_id,
+            recovery_arguments=recovery_arguments,
+        )
+    print(f"cayu cloud: {not_applied['message']}", file=sys.stderr)
+    return not_applied
 
 
 class _CloudArchiveStillRunningError(CloudApiError):
@@ -496,7 +684,9 @@ def _cloud_failure(exc: Exception) -> int:
             _CloudDeploymentFailureError,
             _CloudPromotionConflictError,
             _CloudReleaseNotSelectedError,
+            _CloudReleaseSupersededError,
             _CloudRetrySubmissionError,
+            _CloudSessionChoiceNotAppliedError,
         ),
     ):
         error.update(exc.details)
@@ -682,6 +872,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         ),
     )
     _add_acknowledge_breaking_argument(deploy)
+    _add_session_choice_arguments(deploy)
     deploy.add_argument("--poll-seconds", type=_positive_finite_seconds, default=5.0)
     deploy.add_argument("--wait-seconds", type=_positive_finite_seconds, default=1800.0)
     deploy.set_defaults(_cloud_preflight=_preflight_deploy_wait)
@@ -710,6 +901,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         if action == "retry":
             operation.add_argument("--idempotency-key")
             _add_acknowledge_breaking_argument(operation)
+            _add_session_choice_arguments(operation)
             operation.set_defaults(_cloud_preflight=_preflight_acknowledgements)
         if action == "logs":
             operation.add_argument("--diagnostic-offset", type=_diagnostic_offset, default=None)
@@ -734,6 +926,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
             "publication failure if it refuses it."
         ),
     )
+    _add_session_choice_arguments(rollback)
     rollback.add_argument("--poll-seconds", type=_positive_finite_seconds, default=5.0)
     rollback.add_argument("--wait-seconds", type=_positive_finite_seconds, default=1800.0)
     rollback.set_defaults(_cloud_preflight=_preflight_rollback_wait)
@@ -850,6 +1043,211 @@ def _add_acknowledge_breaking_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_session_choice_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--session-policy",
+        choices=_SESSION_POLICIES,
+        help=(
+            "What Cayu Cloud does about the serving release's unfinished sessions before "
+            "this release replaces it: wait (the default) holds publication until none "
+            "blocks, block refuses at once, proceed publishes once every blocking session "
+            "is acknowledged."
+        ),
+    )
+    parser.add_argument(
+        "--session-wait-seconds",
+        type=_session_wait_seconds,
+        metavar="SECONDS",
+        help=(
+            f"How long --session-policy wait holds publication ({_MIN_SESSION_WAIT_SECONDS} "
+            f"to {_MAX_SESSION_WAIT_SECONDS}; Cloud's default is "
+            f"{_DEFAULT_SESSION_WAIT_SECONDS})."
+        ),
+    )
+    parser.add_argument(
+        "--acknowledge-session",
+        action="append",
+        type=_session_id,
+        metavar="SESSION_ID",
+        help=(
+            "Accept that this unfinished session may not resume on the new release "
+            "(repeatable; '*' for every unfinished session). Implies --session-policy proceed."
+        ),
+    )
+
+
+def _session_wait_seconds(value: str) -> int:
+    if (
+        re.fullmatch(r"[1-9][0-9]{0,3}", value) is None
+        or not _MIN_SESSION_WAIT_SECONDS <= int(value) <= _MAX_SESSION_WAIT_SECONDS
+    ):
+        raise argparse.ArgumentTypeError(
+            f"must be a whole number of seconds between {_MIN_SESSION_WAIT_SECONDS} and "
+            f"{_MAX_SESSION_WAIT_SECONDS}"
+        )
+    return int(value)
+
+
+def _session_id(value: str) -> str:
+    if not _valid_session_id(value):
+        raise argparse.ArgumentTypeError(
+            f"must be a Cayu session ID of at most {_MAX_SESSION_ID_LENGTH} printable "
+            f"characters, or '{_ACKNOWLEDGE_ALL_SESSIONS}'"
+        )
+    return value
+
+
+def _valid_session_id(value: object) -> bool:
+    # Cloud's rule: nonempty, no surrounding whitespace, no control characters.
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and value == value.strip()
+        and len(value) <= _MAX_SESSION_ID_LENGTH
+        and all(ord(character) >= 32 for character in value)
+    )
+
+
+def _session_choice(arguments: argparse.Namespace) -> dict[str, Any] | None:
+    """The session choice given on the command line, as Cloud normalizes it, if any."""
+
+    policy = getattr(arguments, "session_policy", None)
+    wait_seconds = getattr(arguments, "session_wait_seconds", None)
+    sessions = set(getattr(arguments, "acknowledge_session", None) or ())
+    if policy is None and wait_seconds is None and not sessions:
+        return None
+    if len(sessions) > _MAX_SESSION_ACKNOWLEDGEMENTS:
+        raise CloudCommandError(
+            "invalid_input",
+            f"At most {_MAX_SESSION_ACKNOWLEDGEMENTS} distinct --acknowledge-session values "
+            f"can be given; use '{_ACKNOWLEDGE_ALL_SESSIONS}' to acknowledge every "
+            "unfinished session.",
+        )
+    acknowledged = (
+        [_ACKNOWLEDGE_ALL_SESSIONS] if _ACKNOWLEDGE_ALL_SESSIONS in sessions else sorted(sessions)
+    )
+    mode = policy or ("proceed" if acknowledged else "wait")
+    if mode == "proceed" and not acknowledged:
+        raise CloudCommandError(
+            "invalid_input",
+            "--session-policy proceed needs --acknowledge-session naming the sessions that "
+            f"may not resume, or '{_ACKNOWLEDGE_ALL_SESSIONS}' for all of them.",
+        )
+    if mode != "proceed" and acknowledged:
+        raise CloudCommandError(
+            "invalid_input",
+            "--acknowledge-session implies --session-policy proceed; it can't be combined "
+            f"with --session-policy {mode}.",
+        )
+    if mode != "wait" and wait_seconds is not None:
+        raise CloudCommandError(
+            "invalid_input", "--session-wait-seconds applies only to --session-policy wait."
+        )
+    return {
+        "acknowledge_sessions": acknowledged,
+        "mode": mode,
+        "wait_seconds": _DEFAULT_SESSION_WAIT_SECONDS if wait_seconds is None else wait_seconds,
+    }
+
+
+def _session_choice_payload(
+    arguments: argparse.Namespace, *, omit_default: bool = False
+) -> dict[str, Any] | None:
+    """The request fields for the command line's session choice.
+
+    Omitted without a choice, so the Release keeps its current one. A create request also
+    omits Cloud's default choice, so it and its idempotency key stay as before.
+    """
+
+    choice = _session_choice(arguments)
+    if choice is None or (omit_default and _default_session_choice(choice)):
+        return None
+    payload: dict[str, Any] = {"session_policy": choice["mode"]}
+    if getattr(arguments, "session_wait_seconds", None) is not None:
+        payload["session_wait_seconds"] = choice["wait_seconds"]
+    if choice["acknowledge_sessions"]:
+        payload["acknowledge_sessions"] = choice["acknowledge_sessions"]
+    return payload
+
+
+def _default_session_choice(choice: dict[str, Any]) -> bool:
+    return choice == {
+        "acknowledge_sessions": [],
+        "mode": "wait",
+        "wait_seconds": _DEFAULT_SESSION_WAIT_SECONDS,
+    }
+
+
+def _stored_session_choice(deployment: dict[str, Any]) -> dict[str, Any]:
+    """A Release's session choice as Cloud returns it; absent means Cloud's default."""
+
+    stored = deployment.get("session_policy")
+    if not isinstance(stored, dict):
+        return {
+            "acknowledge_sessions": [],
+            "mode": "wait",
+            "wait_seconds": _DEFAULT_SESSION_WAIT_SECONDS,
+        }
+    sessions = stored.get("acknowledge_sessions")
+    return {
+        "acknowledge_sessions": sorted(item for item in sessions if isinstance(item, str))
+        if isinstance(sessions, list)
+        else sessions,
+        "mode": stored.get("mode"),
+        "wait_seconds": stored.get("wait_seconds"),
+    }
+
+
+def _stored_session_wait_seconds(release: dict[str, Any] | None) -> int:
+    """How long a Release's stored choice waits; Cloud's default when it's unreadable."""
+
+    stored = None if release is None else release.get("session_policy")
+    seconds = stored.get("wait_seconds") if isinstance(stored, dict) else None
+    if type(seconds) is not int or not (
+        _MIN_SESSION_WAIT_SECONDS <= seconds <= _MAX_SESSION_WAIT_SECONDS
+    ):
+        return _DEFAULT_SESSION_WAIT_SECONDS
+    return seconds
+
+
+def _session_retry_acknowledgements(
+    publication_error: dict[str, Any], release: dict[str, Any] | None
+) -> list[str] | None:
+    """The sessions a `proceed` retry of a refused Release names, or None if none can pass.
+
+    Cloud lists only the blocking sessions the Release's choice doesn't acknowledge yet,
+    and a retry replaces that choice, so the retry also names the ones it acknowledges.
+    Cloud lists at most 100 sessions; when its preflight is `truncated`, a retry naming
+    only those can't pass, and neither can one over Cloud's limit.
+    """
+
+    requested = publication_error.get("acknowledge_sessions")
+    if not requested:
+        return None
+    if requested == [_ACKNOWLEDGE_ALL_SESSIONS]:
+        return list(requested)
+    if release is None:
+        return None
+    # Cloud derives the list from the preflight; without one confirming it is complete,
+    # don't offer a retry.
+    preflight = release.get("session_preflight")
+    if not isinstance(preflight, dict) or preflight.get("truncated") is not False:
+        return None
+    stored = release.get("session_policy")
+    acknowledged: list[str] = []
+    if isinstance(stored, dict) and stored.get("mode") == "proceed":
+        acknowledged = _publication_session_acknowledgements(stored.get("acknowledge_sessions"))
+        if not acknowledged:
+            # A proceed choice always names sessions; one that can't be read can't be kept.
+            return None
+    sessions = set(requested) | set(acknowledged)
+    if _ACKNOWLEDGE_ALL_SESSIONS in sessions:
+        return [_ACKNOWLEDGE_ALL_SESSIONS]
+    if len(sessions) > _MAX_SESSION_ACKNOWLEDGEMENTS:
+        return None
+    return sorted(sessions)
+
+
 def _storage_revision(value: str) -> int:
     if re.fullmatch(r"[1-9][0-9]{0,6}", value) is None or int(value) > _MAX_STORAGE_REVISION:
         raise argparse.ArgumentTypeError(
@@ -876,7 +1274,7 @@ def _acknowledgement_payload(revisions: Sequence[int]) -> dict[str, Any] | None:
     return {"acknowledge_breaking": list(revisions)} if revisions else None
 
 
-def _requested_storage_acknowledgement(publication_error: dict[str, str]) -> tuple[int, ...]:
+def _requested_storage_acknowledgement(publication_error: dict[str, Any]) -> tuple[int, ...]:
     """The breaking revisions Cloud's refusal asks the owner to acknowledge."""
 
     hint = publication_error.get("hint", "")
@@ -1192,6 +1590,16 @@ def _deploy(
     correlation_id = _correlation_id("deploy")
     acknowledged = _acknowledged_revisions(arguments)
     acknowledgement = _acknowledgement_payload(acknowledged)
+    # The choice given on the command line, even Cloud's default, is what a retry or
+    # promote of this source's Release carries. The create omits Cloud's default choice,
+    # so that request and its key stay as before.
+    session_choice = _session_choice(arguments)
+    session_payload = _session_choice_payload(arguments)
+    create_payload = {
+        **(acknowledgement or {}),
+        **(_session_choice_payload(arguments, omit_default=True) or {}),
+    }
+    retry_payload = {**(acknowledgement or {}), **(session_payload or {})} or None
     unacknowledged_payload = project.manifest.deployment_payload(
         repository=repository,
         revision=revision,
@@ -1201,22 +1609,24 @@ def _deploy(
         version=project.manifest.version,
         revision=revision,
         acknowledge_breaking=acknowledged,
+        session_choice=session_choice,
     )
-    retry = None
+    retry: dict[str, Any] | None = None
     acknowledge_existing = False
     try:
         deployment = client.request(
             "POST",
             f"/v1/applications/{application['id']}/deployments",
-            payload={**unacknowledged_payload, **(acknowledgement or {})},
+            payload={**unacknowledged_payload, **create_payload},
             idempotency_key=source_key,
         )
     except CloudApiError as exc:
-        if acknowledgement is None or exc.status_code != 409:
+        if retry_payload is None or exc.status_code != 409:
             raise
-        # The earlier submission may have acknowledged a different set of revisions.
-        # Its current acknowledgement can also have grown through publication retries,
-        # so it cannot reconstruct the original submission key. Match immutable inputs.
+        # The earlier submission may have acknowledged a different set of revisions or
+        # made another session choice. Its current acknowledgement and choice can also
+        # have changed through publication retries, so they cannot reconstruct the
+        # original submission key. Match immutable inputs.
         existing = _existing_source_deployment(
             client,
             application_id=str(application["id"]),
@@ -1229,14 +1639,23 @@ def _deploy(
     original = deployment
     if _deployment_status(deployment) in _DEPLOYMENT_FAILURES:
         deployment = _latest_source_retry(client, str(application["id"]), original)
-    if acknowledge_existing:
+    already_selected = _published_before(
+        client,
+        application_id=str(application["id"]),
+        deployment=deployment,
+        session_choice=session_choice,
+    )
+    if acknowledge_existing or session_choice is not None:
         # Publication may have failed on a retry of the original build. Acknowledge
-        # that selected Release, while retaining the root for failed-build retries.
+        # that selected Release, while retaining the root for failed-build retries. A
+        # replayed create can also return a Release whose choice a retry changed since.
         deployment, retry = _acknowledge_existing_release(
             client,
             application_id=str(application["id"]),
             deployment=deployment,
             acknowledged=acknowledged,
+            session_choice=session_choice,
+            session_payload=session_payload,
             source_key=source_key,
         )
     if _deployment_status(deployment) in _DEPLOYMENT_FAILURES:
@@ -1263,9 +1682,9 @@ def _deploy(
                     "POST",
                     f"/v1/applications/{application['id']}/deployments/{original['id']}/retry",
                     idempotency_key=retry_key,
-                    # Cloud carries a Release's acknowledgement to its retries; this
-                    # adds one given only now.
-                    **({} if acknowledgement is None else {"payload": acknowledgement}),
+                    # Cloud carries a Release's acknowledgement and session choice to its
+                    # retries; this adds the ones given only now.
+                    **({} if retry_payload is None else {"payload": retry_payload}),
                 )
             except CloudApiError as exc:
                 if exc.status_code == 409:
@@ -1305,18 +1724,74 @@ def _deploy(
     # deploy submitted is published by Cloud itself.
     previously_promoted = retry is None and _deployment_status(deployment) == "promoted"
     if not arguments.no_wait:
-        deployment = _wait_for_deployment(
-            client,
-            application_id=str(application["id"]),
-            deployment_id=str(deployment["id"]),
-            include_failure_diagnostics=True,
-            poll_seconds=arguments.poll_seconds,
-            recovery_arguments=_cloud_recovery_arguments(arguments),
-            wait_seconds=arguments.wait_seconds,
-            sleep=sleep,
-            monotonic=monotonic,
-        )
+        followed_id = str(deployment["id"])
+
+        def follow(*, until_built: bool = False) -> dict[str, Any]:
+            return _wait_for_deployment(
+                client,
+                application_id=str(application["id"]),
+                deployment_id=followed_id,
+                include_failure_diagnostics=True,
+                poll_seconds=arguments.poll_seconds,
+                recovery_arguments=_cloud_recovery_arguments(arguments),
+                wait_seconds=arguments.wait_seconds,
+                sleep=sleep,
+                monotonic=monotonic,
+                until_built=until_built,
+            )
+
+        def apply_choice(release: dict[str, Any]) -> dict[str, Any]:
+            nonlocal previously_promoted, retry
+            release, applied = _acknowledge_existing_release(
+                client,
+                application_id=str(application["id"]),
+                deployment=release,
+                acknowledged=acknowledged,
+                session_choice=session_choice,
+                session_payload=session_payload,
+                source_key=source_key,
+            )
+            if applied is not None:
+                if retry is not None:
+                    # This deploy already retried a failed build; keep what it replaced.
+                    applied["previous_deployment_id"] = retry["previous_deployment_id"]
+                retry = applied
+                previously_promoted = False
+            return release
+
+        if _session_choice_pending(deployment, session_choice):
+            # The Release was still building, or a retry returned an attempt already
+            # running, so Cloud checks its publication under its earlier choice. Once it
+            # is built, a retry changes a held or refused publication; otherwise the
+            # promote below carries the choice.
+            deployment = apply_choice(follow(until_built=True))
+        deployment = follow()
+        if (
+            deployment.get("status") == "smoke_tested"
+            and _deployment_publication_error(deployment) is not None
+            and _session_choice_pending(deployment, session_choice)
+        ):
+            # Cloud refused it under its earlier choice after the check above.
+            apply_choice(deployment)
+            deployment = follow()
+        if deployment.get("status") == "smoke_tested":
+            # Cloud refused to publish the built Release (for example for unfinished
+            # sessions) before selecting it. Promoting it would only publish it again under
+            # the same choice; it waits for a retry.
+            publication_error = _deployment_publication_error(deployment)
+            if publication_error is not None:
+                raise _CloudServicePublicationError(
+                    publication_error,
+                    application_id=str(application["id"]),
+                    deployment_id=str(deployment["id"]),
+                    recovery_arguments=_cloud_recovery_arguments(arguments),
+                    release=deployment,
+                )
+    # A choice that goes with the promote may come after Cloud's finalize checked the
+    # sessions under the earlier one, so the check it records is compared below.
+    promoted_with_choice = False
     if not arguments.no_promote and deployment.get("status") == "smoke_tested":
+        promoted_with_choice = _session_choice_pending(deployment, session_choice)
         application, deployment = _promote_release(
             client,
             application=application,
@@ -1327,6 +1802,7 @@ def _deploy(
             wait_seconds=arguments.wait_seconds,
             sleep=sleep,
             monotonic=monotonic,
+            session_payload=session_payload if promoted_with_choice else None,
         )
     runtime_artifact = None
     runtime_artifact_id = deployment.get("runtime_artifact_id")
@@ -1407,6 +1883,28 @@ def _deploy(
     }
     if retry is not None:
         result["retry"] = retry
+    # Without processes there's no publication for the choice to govern.
+    check_preflight = promoted_with_choice and project.manifest.runtime_payload() is not None
+    if check_preflight and not arguments.no_wait:
+        # What Cloud recorded once the service ran this Release.
+        deployment = client.request(
+            "GET", f"/v1/applications/{application['id']}/deployments/{deployment['id']}"
+        )
+        result["deployment"] = deployment
+    not_applied = _report_not_applied(
+        _not_applied(
+            deployment,
+            session_choice=session_choice,
+            acknowledge_breaking=(retry or {}).get("acknowledge_breaking_not_applied", ()),
+            check_preflight=check_preflight,
+        ),
+        application_id=str(application["id"]),
+        deployment_id=str(deployment["id"]),
+        recovery_arguments=_cloud_recovery_arguments(arguments),
+        already_selected=already_selected,
+    )
+    if not_applied is not None:
+        result["not_applied"] = not_applied
     if deploy_check is not None:
         result["deploy_check"] = deploy_check
     safe_result = recorder.redact(result)
@@ -1493,38 +1991,271 @@ def _acknowledge_existing_release(
     deployment: dict[str, Any],
     acknowledged: Sequence[int],
     source_key: str,
+    session_choice: dict[str, Any] | None = None,
+    session_payload: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """Add the acknowledgement to an earlier submission of the same source.
+    """Add the acknowledgement and session choice to an earlier submission of the same source.
 
-    Cloud adds it when the Release's publication failed and awaits a retry, and then
-    publishes the same Release again. A failed build is retried by the caller with the
-    acknowledgement; a Release still in progress is followed as it is.
+    Cloud adds them when the Release's publication failed and awaits a retry, and then
+    publishes the same Release again. A publication waiting for sessions takes only the
+    session choice; Cloud ignores an acknowledgement there, so it isn't sent and the
+    result says it wasn't applied. A failed build is retried by the caller with them; a
+    Release still in progress is followed as it is.
     """
 
     existing = deployment.get("acknowledge_breaking")
-    if isinstance(existing, list) and set(acknowledged) <= set(existing):
+    needs_acknowledgement = bool(acknowledged) and not (
+        isinstance(existing, list) and set(acknowledged) <= set(existing)
+    )
+    needs_choice = _session_choice_pending(deployment, session_choice)
+    if not needs_acknowledgement and not needs_choice:
         return deployment, None
     if _deployment_status(deployment) in _DEPLOYMENT_FAILURES:
         return deployment, None
     deployment_id = str(deployment["id"])
     path = f"/v1/applications/{application_id}/deployments/{deployment_id}"
-    publication_error = _deployment_publication_error(client.request("GET", path))
-    if publication_error is None:
-        return deployment, None
+    current = client.request("GET", path)
+    publication_error = _deployment_publication_error(current)
+    waiting = None if not needs_choice else _waiting_session_preflight(current)
+    if publication_error is None and waiting is None:
+        # The fresh read carries the session check Cloud recorded so far.
+        return (current if needs_choice else deployment), None
     retried = client.request(
         "POST",
         f"{path}/retry",
         idempotency_key="deploy-acknowledge:"
         + hashlib.sha256(f"{source_key}:{deployment_id}".encode()).hexdigest(),
-        payload={"acknowledge_breaking": list(acknowledged)},
+        payload={
+            **(
+                (_acknowledgement_payload(acknowledged) or {})
+                if publication_error is not None
+                else {}
+            ),
+            **(session_payload or {}),
+        },
     )
-    return retried, {
-        "acknowledge_breaking": list(acknowledged),
+    retry: dict[str, Any] = {
         "deployment_id": str(retried["id"]),
-        "failure_code": publication_error["code"],
         "previous_deployment_id": deployment_id,
-        "reason": publication_error["message"],
     }
+    if acknowledged:
+        if publication_error is None and needs_acknowledgement:
+            retry["acknowledge_breaking_not_applied"] = list(acknowledged)
+        else:
+            retry["acknowledge_breaking"] = list(acknowledged)
+    if session_choice is not None:
+        retry["session_policy"] = session_choice
+    if publication_error is not None:
+        retry["failure_code"] = publication_error["code"]
+        retry["reason"] = publication_error["message"]
+    elif waiting is not None:
+        retry["reason"] = waiting["message"]
+    return retried, retry
+
+
+def _published_before(
+    client: CloudApiClient,
+    *,
+    application_id: str,
+    deployment: dict[str, Any],
+    session_choice: dict[str, Any] | None,
+) -> bool:
+    """Whether a Release this command found was already past its session check.
+
+    Then whatever choice it keeps isn't this command's doing. A `promoted` Release may
+    still be mid-check, so it counts only when its recorded check already passed or the
+    Agent's service runs it; an unreadable service counts as not running it. Only read
+    when the command's session choice differs from the Release's.
+    """
+
+    if _deployment_status(deployment) != "promoted" or not _session_choice_pending(
+        deployment, session_choice
+    ):
+        return False
+    preflight = deployment.get("session_preflight")
+    if isinstance(preflight, dict) and preflight.get("state") in _PASSED_SESSION_CHECKS:
+        return True
+    try:
+        service = _read_or_none(client, f"/v1/applications/{application_id}/service")
+    except CloudApiError as exc:
+        if not _transient_api_error(exc):
+            raise
+        return False
+    return service is not None and service.get("deployment_id") == deployment.get("id")
+
+
+def _session_choice_pending(deployment: dict[str, Any], choice: dict[str, Any] | None) -> bool:
+    """Whether the command line made a session choice the Release doesn't have."""
+
+    return choice is not None and _stored_session_choice(deployment) != choice
+
+
+def _not_applied(
+    deployment: dict[str, Any],
+    *,
+    session_choice: dict[str, Any] | None,
+    acknowledge_breaking: Sequence[int] = (),
+    check_preflight: bool = False,
+) -> dict[str, Any] | None:
+    """What the command line asked for that the Release doesn't carry, if anything.
+
+    Cloud takes a session choice only for a new Release or attempt, a publication that
+    waits or was refused, or a promotion, and an acknowledgement only for a refused or
+    paused publication or a new attempt. A command that comes later, or finds an attempt
+    already running, leaves the Release as it was.
+
+    A choice sent with a promote is stored even when Cloud's own finalize already passed
+    the session check under the earlier one, so `check_preflight` also compares the
+    Release's recorded check with the choice. Without a recorded check the choice is
+    reported as unconfirmed.
+    """
+
+    carried = deployment.get("acknowledge_breaking")
+    missing = sorted(set(acknowledge_breaking) - set(carried if isinstance(carried, list) else ()))
+    release = _cloud_deployment_id(str(deployment.get("id")))
+    subject = "the Release" if release is None else f"Release {release}"
+    result: dict[str, Any] = {}
+    parts = []
+    if session_choice is not None:
+        stored = _stored_session_choice(deployment)
+        outcome, checked = "applied", None
+        if stored != session_choice:
+            outcome = "not_applied"
+        elif check_preflight:
+            outcome, checked = _checked_session_choice(deployment, session_choice)
+        if outcome != "applied":
+            kept = checked or stored
+            result.update(
+                {
+                    "confirmed": outcome == "not_applied",
+                    "more_permissive": _more_permissive_publication(
+                        deployment, stored, session_choice
+                    ),
+                    "release_session_policy": stored,
+                    "session_policy": session_choice,
+                }
+            )
+            earlier = f"`{kept['mode']}` " if kept.get("mode") in _SESSION_POLICIES else ""
+            if outcome == "unconfirmed":
+                parts.append(
+                    f"Cayu Cloud has recorded no session check for {subject} under this "
+                    "command's session choice, so it isn't confirmed that publication used it."
+                )
+            else:
+                if checked is not None:
+                    result["checked_session_policy"] = checked
+                parts.append(
+                    f"Cayu Cloud did not apply this command's session choice to {subject}, "
+                    + (
+                        f"which passed its session check under the earlier {earlier}choice."
+                        if checked is not None
+                        else f"which keeps its earlier {earlier}choice."
+                    )
+                )
+    if missing:
+        result["acknowledge_breaking"] = missing
+        parts.append(
+            f"Cayu Cloud did not apply --acknowledge-breaking "
+            f"{', '.join(str(revision) for revision in missing)} to {subject}; if it refuses "
+            "the breaking migration later, its error gives the retry command."
+        )
+    if not parts:
+        return None
+    result["message"] = " ".join(parts)
+    return result
+
+
+def _checked_session_choice(
+    deployment: dict[str, Any], requested: dict[str, Any]
+) -> tuple[str, dict[str, Any] | None]:
+    """Whether the Release's recorded session check agrees with the requested choice.
+
+    Returns `applied`, `unconfirmed`, or `not_applied` with the choice the check
+    effectively passed under. A check that found nothing blocking (or couldn't read
+    sessions, which publishes under any choice) agrees with every choice. One that
+    published by acknowledging sessions agrees only with a choice acknowledging them too;
+    its per-session `acknowledged` flags say which, unless the list was truncated.
+    """
+
+    preflight = deployment.get("session_preflight")
+    if not isinstance(preflight, dict):
+        return "unconfirmed", None
+    state = preflight.get("state")
+    if state in {"clear", "unsupported", "not_running", "superseded"}:
+        return "applied", None
+    if state in {"waiting", "blocked"}:
+        # Cloud rechecks a waiting or refused publication under the stored choice.
+        return ("applied" if preflight.get("policy") == requested["mode"] else "unconfirmed"), None
+    if state != "acknowledged":
+        return "unconfirmed", None
+    if _ACKNOWLEDGE_ALL_SESSIONS in requested["acknowledge_sessions"]:
+        return "applied", None
+    if preflight.get("read") != "complete":
+        # Unread sessions pass only under '*'.
+        acknowledged = [_ACKNOWLEDGE_ALL_SESSIONS]
+    else:
+        sessions = preflight.get("sessions")
+        if not isinstance(sessions, list) or preflight.get("truncated") is not False:
+            return "unconfirmed", None
+        acknowledged = sorted(
+            {
+                item["id"]
+                for item in sessions
+                if isinstance(item, dict)
+                and item.get("blocking") is True
+                and item.get("acknowledged") is True
+                and _valid_session_id(item.get("id"))
+            }
+        )
+    checked = {"acknowledge_sessions": acknowledged, "mode": "proceed"}
+    if _more_permissive_session_choice(checked, requested):
+        return "not_applied", checked
+    return "applied", None
+
+
+def _more_permissive_publication(
+    deployment: dict[str, Any], kept: dict[str, Any], requested: dict[str, Any]
+) -> bool:
+    """Whether the Release can publish over sessions the requested choice would protect.
+
+    A recorded session check decides: one that found nothing blocking, or refused, can't
+    strand a session, and one that acknowledged sessions can only if the requested
+    choice doesn't acknowledge them (or its list was truncated, or its state is
+    unknown). Without a check yet, or while one holds publication, Cloud decides later
+    under the kept choice.
+    """
+
+    preflight = deployment.get("session_preflight")
+    state = preflight.get("state") if isinstance(preflight, dict) else None
+    if state is None or state == "waiting":
+        return _more_permissive_session_choice(kept, requested)
+    if state == "blocked":
+        return False
+    return _checked_session_choice(deployment, requested)[0] != "applied"
+
+
+def _more_permissive_session_choice(kept: dict[str, Any], requested: dict[str, Any]) -> bool:
+    """Whether `kept` publishes over sessions that `requested` would not.
+
+    `block` and `wait` never publish over a blocking session; they differ only in when
+    they refuse. `proceed` does, and between two `proceed` choices one acknowledging a
+    session the other doesn't (or '*') is more permissive.
+    """
+
+    if _ACKNOWLEDGE_ALL_SESSIONS in requested["acknowledge_sessions"]:
+        return False
+    order = {"block": 0, "wait": 0, "proceed": 1}
+    mode = kept.get("mode")
+    if mode not in order:
+        return True
+    if order[mode] != order[requested["mode"]]:
+        return order[mode] > order[requested["mode"]]
+    if mode != "proceed":
+        return False
+    sessions = kept.get("acknowledge_sessions")
+    if not isinstance(sessions, list):
+        return True
+    return not set(sessions) <= set(requested["acknowledge_sessions"])
 
 
 def _deployment_idempotency_key(
@@ -1533,14 +2264,22 @@ def _deployment_idempotency_key(
     version: str,
     revision: str,
     acknowledge_breaking: Sequence[int] = (),
+    session_choice: dict[str, Any] | None = None,
 ) -> str:
-    # Cloud refuses a key reused with another acknowledgement, so a nonempty one is part
-    # of the key. Without it the key is unchanged from earlier CLI releases.
+    # Cloud refuses a key reused with another acknowledgement or session choice, so a
+    # nonempty acknowledgement and a non-default choice are part of the key. Without
+    # them the key is unchanged from earlier CLI releases.
     identity = json.dumps(
         [application_id, version, revision]
-        + ([sorted(set(acknowledge_breaking))] if acknowledge_breaking else []),
+        + ([sorted(set(acknowledge_breaking))] if acknowledge_breaking else [])
+        + (
+            [{"session_policy": session_choice}]
+            if session_choice is not None and not _default_session_choice(session_choice)
+            else []
+        ),
         ensure_ascii=True,
         separators=(",", ":"),
+        sort_keys=True,
     ).encode()
     return "deploy:" + hashlib.sha256(identity).hexdigest()
 
@@ -1740,7 +2479,11 @@ def _deployment(
         result = _validated_deployment_diagnostics(result)
 
     elif arguments.deployment_command == "retry":
-        payload = _acknowledgement_payload(_acknowledged_revisions(arguments))
+        acknowledged = _acknowledged_revisions(arguments)
+        payload = {
+            **(_acknowledgement_payload(acknowledged) or {}),
+            **(_session_choice_payload(arguments) or {}),
+        } or None
         try:
             result = client.request(
                 "POST",
@@ -1757,6 +2500,27 @@ def _deployment(
                 status_code=409,
                 detail=exc.detail,
             ) from exc
+        # A retry of a publication waiting for sessions takes only the session choice, and
+        # one that finds an attempt already running takes neither.
+        not_applied = _report_not_applied(
+            _not_applied(
+                result,
+                session_choice=_session_choice(arguments),
+                acknowledge_breaking=acknowledged,
+            ),
+            application_id=application_id,
+            deployment_id=arguments.deployment_id,
+            recovery_arguments=_cloud_recovery_arguments(arguments),
+            # A promoted Release was selected before this retry; one still in progress
+            # publishes under the choice it keeps.
+            already_selected=_deployment_status(result) == "promoted",
+        )
+        if not_applied is not None:
+            return {
+                "not_applied": not_applied,
+                "operation": "deployment.retry",
+                "result": result,
+            }
     elif arguments.deployment_command == "wait":
         result = _wait_for_deployment(
             client,
@@ -1778,6 +2542,7 @@ def _deployment(
                 application_id=application_id,
                 deployment_id=arguments.deployment_id,
                 recovery_arguments=_cloud_recovery_arguments(arguments),
+                release=result,
             )
     else:
         application = client.request("GET", f"/v1/applications/{application_id}")
@@ -1804,7 +2569,11 @@ def _rollback(
     selected = client.request(
         "POST",
         (f"/v1/applications/{application_id}/deployments/{arguments.deployment_id}/rollback"),
-        payload={"expected_application_revision": application["revision"]},
+        payload={
+            "expected_application_revision": application["revision"],
+            # Cloud checks the serving release's sessions before it publishes this one.
+            **(_session_choice_payload(arguments) or {}),
+        },
     )
     service = client.request(
         "PUT",
@@ -2034,14 +2803,28 @@ def _wait_for_deployment(
     wait_seconds: float,
     sleep: Callable[[float], None],
     monotonic: Callable[[], float],
+    until_built: bool = False,
 ) -> dict[str, Any]:
+    """Wait until the Release is ready, or only until it is built with `until_built`."""
+
     _validate_wait(poll_seconds, wait_seconds)
     deadline = monotonic() + wait_seconds
     path = f"/v1/applications/{application_id}/deployments/{deployment_id}"
+    hold = _SessionHoldWatch(wait_seconds=wait_seconds, monotonic=monotonic)
     while True:
         deployment = client.request("GET", path)
         status = _deployment_status(deployment)
-        if status in _DEPLOYMENT_READY:
+        _raise_if_superseded(
+            deployment,
+            application_id=application_id,
+            deployment_id=deployment_id,
+            recovery_arguments=recovery_arguments,
+            client=client,
+        )
+        # A built Release whose publication waits for the serving release's sessions is
+        # not ready yet: Cloud selects and publishes it, or refuses it, once they settle.
+        deadline = hold.observe(deployment, deadline)
+        if status in _DEPLOYMENT_READY and (hold.waiting is None or until_built):
             return deployment
         if status in _DEPLOYMENT_FAILURES:
             _raise_terminal_deployment(
@@ -2059,8 +2842,140 @@ def _wait_for_deployment(
                 deployment_id=deployment_id,
                 recovery_arguments=recovery_arguments,
                 status=status,
+                last_issue=hold.waiting,
             )
         sleep(poll_seconds)
+
+
+class _SessionHoldWatch:
+    """Follow a Release's publication while Cloud holds it for unfinished sessions.
+
+    Cloud keeps the Release's status while its `session_preflight` waits, until the
+    preflight's `deadline_at`. Each new waiting preflight is reported on standard error
+    and extends the local wait to that deadline plus the command's own wait, so the
+    publication that follows has its usual time.
+    """
+
+    def __init__(self, *, wait_seconds: float, monotonic: Callable[[], float]) -> None:
+        self.wait_seconds = wait_seconds
+        self.monotonic = monotonic
+        self.waiting: str | None = None
+        self._seen: tuple[object, ...] | None = None
+        self._reported: tuple[object, ...] | None = None
+
+    def observe(self, deployment: dict[str, Any], deadline: float) -> float:
+        preflight = _waiting_session_preflight(deployment)
+        if preflight is None:
+            self.waiting = None
+            return deadline
+        self.waiting = preflight["message"]
+        report = (preflight["message"], preflight["waiting_for"], preflight["deadline_at"])
+        if report != self._reported:
+            self._reported = report
+            until = (
+                f" Cayu Cloud decides by {preflight['deadline_at']}."
+                if preflight["deadline_at"] is not None
+                else ""
+            )
+            print(f"cayu cloud: {preflight['message']}{until}", file=sys.stderr)
+        # Only a new check extends the wait, so a preflight that stops changing can't
+        # hold the command forever.
+        seen = (preflight["checked_at"], *report)
+        if seen == self._seen or preflight["remaining_seconds"] is None:
+            return deadline
+        self._seen = seen
+        return max(deadline, self.monotonic() + preflight["remaining_seconds"] + self.wait_seconds)
+
+
+def _waiting_session_preflight(deployment: dict[str, Any]) -> dict[str, Any] | None:
+    """The Release's validated session preflight while it holds publication, else None.
+
+    Unknown fields are ignored. A missing or invalid deadline still reports the wait but
+    does not extend it.
+    """
+
+    candidate = deployment.get("session_preflight")
+    if not isinstance(candidate, dict) or candidate.get("state") != "waiting":
+        return None
+    message = _deployment_failure_string(candidate.get("message"), max_bytes=4096)
+    if message is None or safe_text(message, 4096) is None:
+        message = "Cayu Cloud is waiting for the serving release's unfinished sessions."
+    waiting_for = candidate.get("waiting_for")
+    if not isinstance(waiting_for, str) or _SESSION_WAITING_FOR.fullmatch(waiting_for) is None:
+        waiting_for = None
+    deadline = _cloud_timestamp(candidate.get("deadline_at"))
+    checked = _cloud_timestamp(candidate.get("checked_at"))
+    remaining = None
+    if deadline is not None:
+        # Measured on Cloud's clock when it checked, so local clock skew doesn't matter.
+        reference = checked if checked is not None else datetime.now(UTC)
+        remaining = min(
+            max((deadline - reference).total_seconds(), 0.0), float(_MAX_SESSION_WAIT_SECONDS)
+        )
+    return {
+        "checked_at": None if checked is None else candidate["checked_at"],
+        "deadline_at": None if deadline is None else candidate["deadline_at"],
+        "message": message,
+        "remaining_seconds": remaining,
+        "waiting_for": waiting_for,
+    }
+
+
+def _raise_if_superseded(
+    deployment: dict[str, Any],
+    *,
+    application_id: str,
+    deployment_id: str,
+    recovery_arguments: Sequence[str],
+    client: CloudApiClient | None = None,
+) -> None:
+    """Stop following a Release Cloud won't publish.
+
+    Cloud marks a held Release `superseded` when another one is selected while it waits
+    for unfinished sessions. A Release that was never selected stays `smoke_tested`
+    without a publication error, and Cloud refuses to retry it. One a promote selected
+    before the hold stays `promoted`; with `client`, it is superseded only while the
+    Agent has selected another Release, since a later rollback can select it again.
+    """
+
+    candidate = deployment.get("session_preflight")
+    status = deployment.get("status")
+    if (
+        status not in _DEPLOYMENT_READY
+        or not isinstance(candidate, dict)
+        or candidate.get("state") != "superseded"
+    ):
+        return
+    if status == "promoted":
+        if client is None:
+            return
+        application = client.request("GET", f"/v1/applications/{application_id}")
+        selected = application.get("current_deployment_id")
+        if not isinstance(selected, str) or selected == deployment_id:
+            return
+    message = _deployment_failure_string(candidate.get("message"), max_bytes=4096)
+    if message is None or safe_text(message, 4096) is None:
+        message = (
+            "Cayu Cloud selected another Release while this one waited for the serving "
+            "release's unfinished sessions, so this one was not published."
+        )
+    raise _CloudReleaseSupersededError(
+        message,
+        application_id=application_id,
+        deployment_id=deployment_id,
+        recovery_arguments=recovery_arguments,
+        status=str(status),
+    )
+
+
+def _cloud_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or len(value) > 64:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 def _promote_release(
@@ -2074,6 +2989,7 @@ def _promote_release(
     wait_seconds: float,
     sleep: Callable[[float], None],
     monotonic: Callable[[], float],
+    session_payload: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Promote a smoke-tested release, tolerating Cloud promoting it concurrently.
 
@@ -2083,6 +2999,10 @@ def _promote_release(
     still finishing) was promoted in between: Cloud answers 409 and then promotes this
     release anyway. A conflict is therefore only a failure when the release never
     becomes the promoted one.
+
+    `session_payload` is a session choice the Release doesn't have yet. Cloud stores it
+    once the promote selects the Release, so its publication uses it; a conflict leaves
+    the Release's choice as it was.
     """
 
     application_id = str(application["id"])
@@ -2091,7 +3011,10 @@ def _promote_release(
         promoted = client.request(
             "POST",
             f"{path}/promote",
-            payload={"expected_application_revision": application["revision"]},
+            payload={
+                "expected_application_revision": application["revision"],
+                **(session_payload or {}),
+            },
         )
     except CloudApiError as exc:
         if exc.status_code != 409:
@@ -2100,11 +3023,32 @@ def _promote_release(
     else:
         return promoted, client.request("GET", path)
     deadline = monotonic() + wait_seconds
+    hold = _SessionHoldWatch(wait_seconds=wait_seconds, monotonic=monotonic)
     while True:
         deployment = client.request("GET", path)
         status = _deployment_status(deployment)
         if status == "promoted":
             return client.request("GET", f"/v1/applications/{application_id}"), deployment
+        # Cloud won't promote a Release another one superseded while it waited.
+        _raise_if_superseded(
+            deployment,
+            application_id=application_id,
+            deployment_id=deployment_id,
+            recovery_arguments=recovery_arguments,
+        )
+        publication_error = _deployment_publication_error(deployment)
+        if status == "smoke_tested" and publication_error is not None:
+            # Cloud refused to publish it (for example for unfinished sessions), so it
+            # won't promote it on its own.
+            raise _CloudServicePublicationError(
+                publication_error,
+                application_id=application_id,
+                deployment_id=deployment_id,
+                recovery_arguments=recovery_arguments,
+                release=deployment,
+            )
+        if wait:
+            deadline = hold.observe(deployment, deadline)
         if status in _DEPLOYMENT_FAILURES:
             _raise_terminal_deployment(
                 application_id=application_id,
@@ -2354,29 +3298,36 @@ def _read_or_none(client: CloudApiClient, path: str) -> dict[str, Any] | None:
         raise
 
 
-def _publication_error(
-    client: CloudApiClient, *, application_id: str, deployment_id: str
-) -> dict[str, str] | None:
-    """Why Cayu Cloud could not publish a promoted release, if it reports one."""
-
-    deployment = client.request(
-        "GET", f"/v1/applications/{application_id}/deployments/{deployment_id}"
-    )
-    return _deployment_publication_error(deployment)
-
-
-def _deployment_publication_error(deployment: dict[str, Any]) -> dict[str, str] | None:
+def _deployment_publication_error(deployment: dict[str, Any]) -> dict[str, Any] | None:
     candidate = deployment.get("publication_error")
     if not isinstance(candidate, dict):
         return None
-    error: dict[str, str] = {}
+    error: dict[str, Any] = {}
     for key, max_bytes in (("code", 64), ("message", 512), ("detail", 4096), ("hint", 1024)):
         value = _deployment_failure_string(candidate.get(key), max_bytes=max_bytes)
         if value is not None:
             error[key] = value
     if not {"code", "message", "hint"} <= set(error):
         return None
+    sessions = _publication_session_acknowledgements(candidate.get("acknowledge_sessions"))
+    if sessions:
+        error["acknowledge_sessions"] = sessions
     return error
+
+
+def _publication_session_acknowledgements(value: object) -> list[str]:
+    """The sessions a refusal asks a `proceed` retry to name; empty unless all are valid."""
+
+    if not isinstance(value, list) or len(value) > _MAX_SESSION_ACKNOWLEDGEMENTS:
+        return []
+    sessions: set[str] = set()
+    for item in value:
+        if not isinstance(item, str) or not _valid_session_id(item):
+            return []
+        sessions.add(item)
+    if _ACKNOWLEDGE_ALL_SESSIONS in sessions:
+        return [_ACKNOWLEDGE_ALL_SESSIONS]
+    return sorted(sessions)
 
 
 def _transient_api_error(exc: CloudApiError) -> bool:
@@ -2409,6 +3360,7 @@ def _wait_for_service(
     service = initial
     transient_failures = 0
     last_issue: str | None = None
+    hold = _SessionHoldWatch(wait_seconds=wait_seconds, monotonic=monotonic)
     while True:
         pending = service is None or (
             expected_deployment_id is not None
@@ -2419,23 +3371,36 @@ def _wait_for_service(
             raise archived_agent_error()
         status = "starting" if pending or service is None else _service_status(service)
         if pending and expected_deployment_id is not None:
-            # A publication failure after promotion leaves the old or no service.
+            # A publication failure after promotion leaves the old or no service, and so
+            # does a publication Cloud holds for the serving release's sessions.
             try:
-                publication_error = _publication_error(
-                    client,
-                    application_id=application_id,
-                    deployment_id=expected_deployment_id,
+                expected = client.request(
+                    "GET",
+                    f"/v1/applications/{application_id}/deployments/{expected_deployment_id}",
                 )
             except CloudApiError as exc:
                 if not _transient_api_error(exc):
                     raise
-                publication_error = None
+                expected = None
+            publication_error = None
+            if expected is not None:
+                _raise_if_superseded(
+                    expected,
+                    application_id=application_id,
+                    deployment_id=expected_deployment_id,
+                    recovery_arguments=recovery_arguments,
+                    client=client,
+                )
+                publication_error = _deployment_publication_error(expected)
+                deadline = hold.observe(expected, deadline)
+                last_issue = hold.waiting or last_issue
             if publication_error is not None:
                 raise _CloudServicePublicationError(
                     publication_error,
                     application_id=application_id,
                     deployment_id=expected_deployment_id,
                     recovery_arguments=recovery_arguments,
+                    release=expected,
                 )
         elif service is not None:
             last_issue = _web_not_ready_message(service) or last_issue
@@ -2797,15 +3762,18 @@ def _preflight_wait(arguments: argparse.Namespace) -> None:
 
 def _preflight_deploy_wait(arguments: argparse.Namespace) -> None:
     _acknowledged_revisions(arguments)
+    _session_choice(arguments)
     if not arguments.no_wait:
         _validate_wait(arguments.poll_seconds, arguments.wait_seconds)
 
 
 def _preflight_acknowledgements(arguments: argparse.Namespace) -> None:
     _acknowledged_revisions(arguments)
+    _session_choice(arguments)
 
 
 def _preflight_rollback_wait(arguments: argparse.Namespace) -> None:
+    _session_choice(arguments)
     if arguments.wait:
         _validate_wait(arguments.poll_seconds, arguments.wait_seconds)
 

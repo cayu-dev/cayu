@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- `cayu cloud deploy`, `cayu cloud deployment retry` and `cayu cloud rollback` take
+  Cayu Cloud's choice for the serving release's unfinished sessions:
+  `--session-policy {wait,block,proceed}`, `--session-wait-seconds N` (60 to 3,600)
+  and a repeatable `--acknowledge-session ID` (`'*'` for every unfinished session)
+  that implies `proceed`. Invalid combinations fail locally with `invalid_input`.
+  Without the flags, requests and deploy idempotency keys are unchanged; a
+  non-default choice is part of the deploy's key. Refusals report `error.code`
+  `unfinished_sessions` or `sessions_unreadable` with `error.acknowledge_sessions`, an
+  `error.commands.retry` that acknowledges those sessions together with the ones the
+  release's choice already acknowledged (none when Cloud's list is truncated), and an
+  `error.commands.retry_wait` that waits for them again, keeping a longer stored wait.
+  While Cloud holds a publication for sessions, `deploy`, `deployment wait` and
+  `rollback --wait` report its message and extend their wait to each new check's
+  deadline plus their own wait; a release another one superseded while it waited ends
+  them with `release_superseded`. Rerunning `deploy` with any of the flags (even
+  `--session-policy wait` alone) gives the existing release that choice through a retry
+  or its promote, and `result.not_applied` (or `not_applied` for `deployment retry`)
+  reports a choice or acknowledgement Cloud didn't take, comparing a promoted choice with
+  the session check Cloud recorded. When the release can publish over sessions the
+  requested choice would protect (judged from the recorded check, or from the kept choice
+  before there is one) and it wasn't already published, the command exits `2` with
+  category `session_choice_not_applied`. See
+  [unfinished sessions](cayu-cloud.md#unfinished-sessions).
 - Hosts can predict whether stored sessions resume on a new release before
   publishing it. `GET /api/sessions` and `GET /api/pending-actions` accept
   `include=execution_profile` and return each session's expected and

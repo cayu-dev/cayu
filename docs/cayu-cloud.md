@@ -158,7 +158,9 @@ serving an older release. `rollback` still asks Cloud to publish the selected re
 returns once Cloud accepts it; `rollback --wait` (with `--poll-seconds` and
 `--wait-seconds`) also waits for the service to run that release and reports a
 `publication_error` the same way. `deployment wait` reports a ready release's
-`publication_error` the same way instead of returning it as ready.
+`publication_error` the same way instead of returning it as ready. While Cloud holds a
+release's publication for the serving release's unfinished sessions, these waits keep
+going past `--wait-seconds` (see [Unfinished sessions](#unfinished-sessions)).
 
 Cloud's deployment worker promotes a smoke-tested release on its own, so `deploy`'s
 promote request can race it. The request carries the Agent revision read before the
@@ -260,7 +262,12 @@ instructions to change the source and deploy again. Terminal errors carry `deplo
 
 Submit a retry directly, retaining the same key when retrying an uncertain HTTP outcome.
 `--acknowledge-breaking REVISION` adds a breaking storage revision acknowledgement to the
-retry (see [Breaking storage revisions](#breaking-storage-revisions)):
+retry (see [Breaking storage revisions](#breaking-storage-revisions)), and
+`--session-policy`, `--session-wait-seconds` and `--acknowledge-session` change the
+release's choice for unfinished sessions (see [Unfinished sessions](#unfinished-sessions)).
+When Cloud's answer doesn't carry an acknowledgement or session choice the retry gave it
+(for example because a new attempt was already running), the output adds `not_applied`
+next to `result` and says so on standard error:
 
 ```bash
 cayu cloud deployment retry DEPLOYMENT_ID --application AGENT_SLUG \
@@ -413,6 +420,148 @@ Cloud reports three other breaking-migration failures the same way, each with it
   `rollback --wait` to see this refusal from the rollback itself.
 
 `deployment timeline` also carries these failures, with phase `database_migrated`.
+
+## Unfinished sessions
+
+Before Cloud replaces the release serving an Agent with another one (after a deploy's
+smoke test, a promotion, a rollback, or a publication retry), it reads the serving
+release's unfinished Cayu sessions through the Agent's own control plane. A session that is
+mid-interaction, or paused on a tool approval, user input or another pending action, may
+not resume on the new release, so it blocks the replacement. A session interrupted with
+nothing pending can adopt the new release at its next interaction and doesn't block.
+Agents without the Cayu control plane are published as before.
+
+You choose what Cloud does about blocking sessions, per release:
+
+- `wait` (the default) holds the publication until no session blocks, for at most
+  `--session-wait-seconds` (60 to 3,600; Cloud's default is 900), then refuses. The
+  previous release keeps serving while it waits.
+- `block` refuses at once.
+- `proceed` publishes once every blocking session is acknowledged with
+  `--acknowledge-session SESSION_ID`. The flag can be repeated, and `'*'` acknowledges
+  every unfinished session, including ones Cloud could not read. It implies
+  `--session-policy proceed`.
+
+```bash
+cayu cloud deploy . --session-policy block
+cayu cloud deploy . --session-wait-seconds 1800
+cayu cloud deployment retry DEPLOYMENT_ID --application AGENT_SLUG --acknowledge-session SESSION_ID
+cayu cloud rollback DEPLOYMENT_ID --application AGENT_SLUG --wait --acknowledge-session '*'
+```
+
+`deploy`, `deployment retry` and `rollback` take the three flags and send them as
+`session_policy`, `session_wait_seconds` and `acknowledge_sessions`. An invalid
+combination (`proceed` without sessions, sessions with `wait` or `block`,
+`--session-wait-seconds` without `wait`, more than 200 sessions, or an empty or
+whitespace-padded session ID) fails with `invalid_input` before the CLI signs in or
+uploads. Without the flags, the requests are unchanged: a new release gets Cloud's default
+`wait` choice, and a retry or rollback keeps the release's current one. As with
+`--acknowledge-breaking`, a deploy's idempotency key covers a choice other than Cloud's
+default, so a deploy without the flags (or with `--session-policy wait` alone) keeps the
+key earlier CLI releases used.
+
+While Cloud holds a publication, the release keeps its `smoke_tested` or `promoted` status
+and its `session_preflight.state` is `waiting`; `waiting_for` says whether Cloud waits for
+`sessions` to settle, for a `session_read`, or for a sleeping Agent to wake
+(`agent_wake`), and `deadline_at` says until when. `deploy`, `deployment wait` and
+`rollback --wait` write Cloud's message and deadline to standard error when they change,
+and keep waiting so the publication that follows has its usual time. Each time Cloud
+reports a new check, a wait is extended to that check's `deadline_at` plus its own
+`--wait-seconds`, counted from when the CLI sees the check. The time left until
+`deadline_at` is measured on Cloud's clock and capped at 3,600 seconds per check, and a
+wait is extended only while Cloud keeps checking, so a stalled preflight can't hold it
+forever. Each of `deploy`'s waits (for the build, for a promotion that raced Cloud's own,
+for the service, and on a rerun the extra waits described below) is extended on its own.
+If a wait still ends first, the `deployment_still_running` or `service_still_starting`
+result carries the last message as `last_issue`.
+
+If Cloud selects another release while this one waits, it doesn't publish this one, and
+its `session_preflight.state` becomes `superseded`. A release that was never selected stays
+`smoke_tested`, and Cloud won't retry it. One that `deploy`'s promote selected before Cloud
+held it stays `promoted`. `deploy`, `deployment wait` and `rollback --wait` exit `2` with
+category `release_superseded`, Cloud's message, and `status` and `timeline` commands when
+the release is `smoke_tested`, or `promoted` while the Agent has another release selected
+(a `promoted` release that is still selected, for example after a rollback, isn't
+affected). To serve that source anyway, change `version` in `cayu-cloud.toml` and deploy
+again, or, for a `promoted` release, select it again with the `commands.rollback` given.
+
+When Cloud refuses, the previous release keeps serving and the commands exit `2` with
+category `service_publication_failed` and `error.code` `unfinished_sessions` (Cloud read
+the blocking sessions) or `sessions_unreadable` (it could not read them all).
+`error.publication_error.acknowledge_sessions` is Cloud's list of the blocking sessions
+the release's choice doesn't acknowledge yet (`["*"]` when Cloud could not read them). A
+retry replaces the release's choice, so `error.acknowledge_sessions` and
+`error.commands.retry` also name the sessions an earlier `proceed` choice of the release
+acknowledged. `error.commands.retry_wait` waits for the sessions again, with the
+release's own `--session-wait-seconds` when it was longer than the default:
+
+```bash
+cayu cloud deployment retry DEPLOYMENT_ID --application AGENT_SLUG \
+  --acknowledge-session SESSION_ID --acknowledge-session OTHER_SESSION_ID
+cayu cloud deployment retry DEPLOYMENT_ID --application AGENT_SLUG --session-policy wait
+```
+
+Cloud lists at most 100 sessions. When its `session_preflight` says the list is
+`truncated` (or the CLI can't confirm it isn't), or naming every session would take more
+than 200, a retry naming them can't pass, so the CLI offers no `commands.retry` and keeps
+Cloud's hint next to the wait alternative. It doesn't suggest `'*'` for you: that would
+acknowledge sessions nobody has looked at. Check `deployment status` for the release's
+`session_preflight` and decide, or retry with `--acknowledge-session '*'` yourself.
+
+Answering or finishing the sessions and retrying with `--session-policy wait` publishes
+the release once nothing blocks. A refused rollback or promotion returns the Agent's
+selection to the serving release, and the same retry selects it again.
+
+Running `cayu cloud deploy` again with unchanged source and any of the three flags (even
+`--session-policy wait` alone, which keeps the original create request and key) gives the
+release that choice. The CLI finds the release, as for `--acknowledge-breaking`, and
+retries it with the choice when its publication was refused or is waiting
+(`result.retry` records it). A retry of a waiting publication takes only the session
+choice, so an `--acknowledge-breaking` given with it is listed in
+`result.retry.acknowledge_breaking_not_applied` instead of `acknowledge_breaking`, and in
+`result.not_applied`. A release that was still building is followed until it is built: if
+Cloud then holds or refuses its publication (also when the refusal arrives just after
+that check), the CLI retries it with the choice, and otherwise the choice goes with
+`deploy`'s promote request.
+
+Cloud can't always take the choice: the release may already be selected or published, a
+promote may race Cloud's own, `--no-wait` or `--no-promote` may stop the deploy first, or
+Cloud's finalize may already have checked the sessions under the earlier choice when the
+promote stores the new one. After a promote that carried the choice, the CLI therefore
+reads the release's recorded check and compares it with the choice: a check that found
+nothing blocking agrees with any choice, and one that published by acknowledging sessions
+agrees only if the choice acknowledges them too. Cloud records the check's mode
+(`session_preflight.policy`) and which listed sessions it acknowledged, not the whole
+choice. When it has recorded no check (the deploy didn't wait, or Cloud doesn't check this
+Agent's sessions), or the list was truncated, the CLI can't tell.
+
+`result.not_applied` reports what Cloud didn't take: `session_policy` is the choice given,
+`release_session_policy` the one the release kept, `checked_session_policy` the choice its
+recorded check passed under when that differs, `confirmed` is `false` when the CLI can't
+tell, `more_permissive` says whether the release can publish over sessions the requested
+choice would protect, and `acknowledge_breaking` lists revisions that weren't applied.
+When the release has a recorded check, the check decides `more_permissive`: a check that
+found nothing blocking, couldn't read sessions, or refused can't strand a session, and one
+that published by acknowledging sessions can only if the requested choice doesn't
+acknowledge them (or the list was truncated, or the state is one the CLI doesn't know).
+Without a check yet, or while one holds publication, Cloud decides later under the kept
+choice, so the kept choice is compared with the requested one: `block` and `wait` never
+publish over a blocking session and rank the same, `proceed` ranks above them, and between
+two `proceed` choices the one acknowledging a session the other doesn't (or `'*'`) is more
+permissive. Nothing is more permissive than a requested `'*'`.
+
+When `more_permissive` is `true` and the release wasn't already published before the
+command, the command exits `2` with category `session_choice_not_applied`,
+`not_applied`, and `status` and `timeline` commands, because this command let the release
+publish over sessions it asked to protect. Otherwise it exits `0` and writes the message
+to standard error. A `promoted` release counts as already published only if its recorded
+check had passed when the command found it, or the Agent's service already ran it (the
+CLI reads the service only then, and an unreadable service counts as not running it); a
+`promoted` release can still be mid-check, and then this command's outcome matters.
+`deployment retry` reports the same way, with `not_applied` next to `result`, when
+Cloud's answer doesn't carry the session choice or an `--acknowledge-breaking` revision it
+was given (for example because the publication was waiting, or because a new attempt was
+already running).
 
 ## Agent operator credentials
 
