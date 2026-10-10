@@ -46004,5 +46004,13 @@
     "tests/core/test_session_fork_package_layout.py::test_fork_historical_imports_and_pickle_globals[SessionForkProfileRelationship]": 0.0001480000209994614,
     "tests/core/test_session_fork_package_layout.py::test_fork_historical_imports_and_pickle_globals[copy_profiled_session_fork_result]": 0.00013812596444040537,
     "tests/core/test_session_fork_package_layout.py::test_fork_historical_imports_and_pickle_globals[fork_source_state_sha256]": 0.00015762692783027887,
-    "tests/core/test_session_fork_package_layout.py::test_fork_historical_imports_and_pickle_globals[session_fork_profile_relationship]": 0.0001498329802416265
+    "tests/core/test_session_fork_package_layout.py::test_fork_historical_imports_and_pickle_globals[session_fork_profile_relationship]": 0.0001498329802416265,
+    "tests/core/test_session_fork_package_layout.py::test_fork_historical_imports_and_pickle_globals[ForkSystemPromptReplacement]": 0.00015320797683671117,
+    "tests/core/test_session_fork_package_layout.py::test_fork_historical_imports_and_pickle_globals[PromptAnatomyTransitionReceipt]": 0.00016179203521460295,
+    "tests/core/test_session_fork_package_layout.py::test_fork_historical_imports_and_pickle_globals[apply_fork_system_prompt_replacement]": 0.00018229195848107338,
+    "tests/core/test_session_fork_package_layout.py::test_fork_historical_imports_and_pickle_globals[session_prompt_anatomy_transition]": 0.00016087503172457218,
+    "tests/core/test_session_fork_package_layout.py::test_prompt_transition_and_replacement_without_implementations[cayu.runtime]": 0.2578082089894451,
+    "tests/core/test_session_fork_package_layout.py::test_prompt_transition_and_replacement_without_implementations[cayu.sessions.forks]": 0.263182999973651,
+    "tests/core/test_session_fork_package_layout.py::test_prompt_transition_and_replacement_without_implementations[cayu.sessions]": 0.25516345794312656,
+    "tests/core/test_session_fork_package_layout.py::test_prompt_transition_and_replacement_without_implementations[cayu]": 0.25612058298429474
 }

@@ -245,7 +245,6 @@ from cayu.sessions.base import (
     BudgetReservationIdentityConflict,
     CompactSessionRequest,
     ForkSessionRequest,
-    ForkSystemPromptReplacement,
     InMemorySessionStore,
     InteractionTransitionSpec,
     InterruptSessionRequest,
@@ -290,6 +289,7 @@ from cayu.sessions.event_delivery import (
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.forks import (
     ForkExecutionProfileSelection,
+    ForkSystemPromptReplacement,
 )
 from cayu.sessions.interactions import INTERACTION_LIFECYCLE_EVENT_TYPES
 from cayu.sessions.invocation import (

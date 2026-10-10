@@ -179,7 +179,6 @@ from cayu.sessions.base import (
     CheckpointRootFieldGuard,
     CheckpointTransform,
     ForkCheckpointAuthorityDecoder,
-    ForkSystemPromptReplacement,
     InteractionAttribution,
     InteractionTransitionReceiptResult,
     InteractionTransitionResult,
@@ -354,7 +353,6 @@ from cayu.sessions.base import (
     _validate_tool_round_checkpoint_mutation,
     _validate_tool_round_publication,
     _validate_user_input_checkpoint_mutation,
-    apply_fork_system_prompt_replacement,
     checkpoint_root_field_projection_from_storage,
     copy_run_request,
     copy_session_user_metadata,
@@ -373,8 +371,10 @@ from cayu.sessions.event_delivery import (
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.forks import (
     FORK_EXECUTION_PROFILE_METADATA_KEY,
+    ForkSystemPromptReplacement,
     ProfiledSessionForkResult,
     SessionForkProfileRelationship,
+    apply_fork_system_prompt_replacement,
 )
 from cayu.sessions.inspection import SessionInspectionIdentity
 from cayu.sessions.interactions import (

@@ -610,9 +610,7 @@ from cayu.sessions.execution import (
     SessionExecutionState,
     execution_owned_by,
 )
-from cayu.sessions.forks import (
-    ForkSourceSnapshot,
-)
+from cayu.sessions.forks import ForkSourceSnapshot
 from cayu.sessions.invocation import (
     SessionInvocationBinding,
     copy_session_invocation_binding,

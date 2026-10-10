@@ -110,37 +110,40 @@ from cayu.sessions.forks import (
     FORK_EXECUTION_PROFILE_RECORD_TYPE as FORK_EXECUTION_PROFILE_RECORD_TYPE,
 )
 from cayu.sessions.forks import (
+    PROMPT_ANATOMY_TRANSITION_METADATA_KEY as PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
+)
+from cayu.sessions.forks import (
+    PROMPT_ANATOMY_TRANSITION_RECORD_TYPE as PROMPT_ANATOMY_TRANSITION_RECORD_TYPE,
+)
+from cayu.sessions.forks import (
+    PROMPT_ANATOMY_TRANSITION_SCHEMA_VERSION as PROMPT_ANATOMY_TRANSITION_SCHEMA_VERSION,
+)
+from cayu.sessions.forks import (
     ForkExecutionProfileDecisionRecord as ForkExecutionProfileDecisionRecord,
 )
-from cayu.sessions.forks import (
-    ForkExecutionProfileSelection as ForkExecutionProfileSelection,
-)
-from cayu.sessions.forks import (
-    ForkExecutionProfileSource as ForkExecutionProfileSource,
-)
-from cayu.sessions.forks import (
-    ForkSourceSnapshot as ForkSourceSnapshot,
-)
-from cayu.sessions.forks import (
-    ForkSystemPromptPolicy as ForkSystemPromptPolicy,
-)
-from cayu.sessions.forks import (
-    ProfiledSessionForkResult as ProfiledSessionForkResult,
-)
+from cayu.sessions.forks import ForkExecutionProfileSelection as ForkExecutionProfileSelection
+from cayu.sessions.forks import ForkExecutionProfileSource as ForkExecutionProfileSource
+from cayu.sessions.forks import ForkSourceSnapshot as ForkSourceSnapshot
+from cayu.sessions.forks import ForkSystemPromptPolicy as ForkSystemPromptPolicy
+from cayu.sessions.forks import ForkSystemPromptReplacement as ForkSystemPromptReplacement
+from cayu.sessions.forks import ProfiledSessionForkResult as ProfiledSessionForkResult
+from cayu.sessions.forks import PromptAnatomyTransitionReceipt as PromptAnatomyTransitionReceipt
 from cayu.sessions.forks import (
     SessionForkEnvironmentAllocationOwner as SessionForkEnvironmentAllocationOwner,
 )
+from cayu.sessions.forks import SessionForkProfileRelationship as SessionForkProfileRelationship
 from cayu.sessions.forks import (
-    SessionForkProfileRelationship as SessionForkProfileRelationship,
+    apply_fork_system_prompt_replacement as apply_fork_system_prompt_replacement,
 )
 from cayu.sessions.forks import (
     copy_profiled_session_fork_result as copy_profiled_session_fork_result,
 )
-from cayu.sessions.forks import (
-    fork_source_state_sha256 as fork_source_state_sha256,
-)
+from cayu.sessions.forks import fork_source_state_sha256 as fork_source_state_sha256
 from cayu.sessions.forks import (
     session_fork_profile_relationship as session_fork_profile_relationship,
+)
+from cayu.sessions.forks import (
+    session_prompt_anatomy_transition as session_prompt_anatomy_transition,
 )
 from cayu.sessions.inspection import (
     SESSION_INSPECTION_LABEL_LIMIT as SESSION_INSPECTION_LABEL_LIMIT,
@@ -1663,9 +1666,6 @@ COMPACTION_INSTRUCTIONS_MAX_CHARS = 32_768
 MODEL_TARGET_PROJECTION_METADATA_KEY = "cayu:model_target_projection"
 MODEL_TARGET_PROJECTION_RECORD_TYPE = "cayu.model-target-projection"
 MODEL_TARGET_PROJECTION_SCHEMA_VERSION = 1
-PROMPT_ANATOMY_TRANSITION_METADATA_KEY = "cayu:prompt_anatomy_transition"
-PROMPT_ANATOMY_TRANSITION_RECORD_TYPE = "cayu.prompt-anatomy-transition"
-PROMPT_ANATOMY_TRANSITION_SCHEMA_VERSION = 1
 FORK_SOURCE_SNAPSHOT_METADATA_KEY = "cayu:fork_source_snapshot"
 SESSION_CREATE_CLAIM_METADATA_KEY = "cayu:session_create_claim"
 SESSION_CREATE_CLAIM_RECORD_TYPE = "cayu.session-create-claim"
@@ -2003,60 +2003,6 @@ def session_model_projection_cursor(session: Session) -> int:
     if type(cursor) is not int or not 0 <= cursor <= MAX_DURABLE_JSON_INTEGER:
         raise ValueError("Session model-target projection cursor is malformed.")
     return cursor
-
-
-def session_prompt_anatomy_transition(
-    session: Session,
-) -> PromptAnatomyTransitionReceipt | None:
-    """Return verified durable prompt-succession evidence for one descendant."""
-
-    if type(session) is not Session:
-        raise TypeError("session must be a Session.")
-    raw = session.metadata.get(PROMPT_ANATOMY_TRANSITION_METADATA_KEY)
-    if raw is None:
-        return None
-    try:
-        receipt = PromptAnatomyTransitionReceipt.model_validate(raw)
-    except Exception as exc:
-        raise ValueError("Session prompt-anatomy transition metadata is malformed.") from exc
-    fork_relationship = session_fork_profile_relationship(session)
-    creation_agent_name = (
-        session.agent_name if fork_relationship is None else fork_relationship.child_agent_name
-    )
-    creation_environment_name = (
-        session.environment_name
-        if fork_relationship is None
-        else fork_relationship.child_environment_name
-    )
-    creation_provider_name = (
-        session.provider_name
-        if fork_relationship is None
-        else fork_relationship.child_provider_name
-    )
-    creation_model = session.model if fork_relationship is None else fork_relationship.child_model
-    creation_source_session_id = (
-        session.parent_session_id
-        if fork_relationship is None
-        else fork_relationship.source_session_id
-    )
-    if (
-        receipt.descendant_session_id != session.id
-        or receipt.source_session_id != creation_source_session_id
-        or receipt.child_agent_name != creation_agent_name
-        or receipt.child_environment_name != creation_environment_name
-        or receipt.provider_name != creation_provider_name
-        or receipt.model != creation_model
-        or receipt.source_provider_name != receipt.provider_name
-        or receipt.model_target_changed != (receipt.source_model != receipt.model)
-        or receipt.portability_preflight
-        != (
-            "provider_portable_transcript_preflight"
-            if receipt.model_target_changed
-            else "context_messages_validated"
-        )
-    ):
-        raise ValueError("Session prompt-anatomy transition conflicts with session identity.")
-    return receipt
 
 
 SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY = "input_contract"
@@ -3553,207 +3499,6 @@ class ForkSessionRequest(BaseModel):
         elif self.profile_adoption is None:
             raise ValueError("Current-child profile selection requires profile_adoption.")
         return self
-
-
-class PromptAnatomyTransitionReceipt(BaseModel):
-    """Durable prompt-succession evidence that never contains prompt text."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    record_type: Literal["cayu.prompt-anatomy-transition"] = PROMPT_ANATOMY_TRANSITION_RECORD_TYPE
-    schema_version: Literal[1] = PROMPT_ANATOMY_TRANSITION_SCHEMA_VERSION
-    transition_id: str
-    request_sha256: str
-    source_session_id: str
-    descendant_session_id: str
-    source_status: SessionStatus
-    source_transcript_cursor: int
-    source_prompt_sha256: str
-    child_prompt_sha256: str
-    source_system_prompt_retained: StrictBool
-    child_agent_name: str
-    child_environment_name: str
-    copy_checkpoint: StrictBool
-    source_provider_name: str
-    source_model: str
-    provider_name: str
-    model: str
-    model_target_changed: StrictBool
-    portability_preflight: Literal[
-        "context_messages_validated",
-        "provider_portable_transcript_preflight",
-    ]
-    portability_verified: Literal[True]
-    inherited_taint_labels: tuple[str, ...]
-    policy: Literal[ForkSystemPromptPolicy.CURRENT_AGENT] = ForkSystemPromptPolicy.CURRENT_AGENT
-
-    @classmethod
-    def create(
-        cls,
-        *,
-        request_sha256: str,
-        source_session_id: str,
-        descendant_session_id: str,
-        source_status: SessionStatus,
-        source_transcript_cursor: int,
-        source_prompt_sha256: str,
-        child_prompt_sha256: str,
-        child_agent_name: str,
-        child_environment_name: str,
-        copy_checkpoint: bool,
-        source_provider_name: str,
-        source_model: str,
-        provider_name: str,
-        model: str,
-        model_target_changed: bool,
-        portability_preflight: Literal[
-            "context_messages_validated",
-            "provider_portable_transcript_preflight",
-        ],
-        inherited_taint_labels: tuple[str, ...],
-    ) -> PromptAnatomyTransitionReceipt:
-        """Build one canonical receipt and bind its digest to the same material."""
-
-        payload = {
-            "record_type": PROMPT_ANATOMY_TRANSITION_RECORD_TYPE,
-            "schema_version": PROMPT_ANATOMY_TRANSITION_SCHEMA_VERSION,
-            "request_sha256": request_sha256,
-            "source_session_id": source_session_id,
-            "descendant_session_id": descendant_session_id,
-            "source_status": source_status.value,
-            "source_transcript_cursor": source_transcript_cursor,
-            "source_prompt_sha256": source_prompt_sha256,
-            "child_prompt_sha256": child_prompt_sha256,
-            "source_system_prompt_retained": False,
-            "child_agent_name": child_agent_name,
-            "child_environment_name": child_environment_name,
-            "copy_checkpoint": copy_checkpoint,
-            "source_provider_name": source_provider_name,
-            "source_model": source_model,
-            "provider_name": provider_name,
-            "model": model,
-            "model_target_changed": model_target_changed,
-            "portability_preflight": portability_preflight,
-            "portability_verified": True,
-            "inherited_taint_labels": list(inherited_taint_labels),
-            "policy": ForkSystemPromptPolicy.CURRENT_AGENT.value,
-        }
-        transition_id = sha256(
-            canonical_durable_json_bytes(payload, "prompt_anatomy_transition")
-        ).hexdigest()
-        return cls.model_validate({"transition_id": transition_id, **payload})
-
-    @field_validator(
-        "transition_id",
-        "request_sha256",
-        "source_session_id",
-        "descendant_session_id",
-        "child_agent_name",
-        "source_provider_name",
-        "source_model",
-        "provider_name",
-        "model",
-    )
-    @classmethod
-    def validate_nonblank_receipt_fields(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("child_environment_name")
-    @classmethod
-    def validate_environment(cls, value: str) -> str:
-        return require_clean_nonblank(value, "child_environment_name")
-
-    @field_validator(
-        "transition_id",
-        "request_sha256",
-        "source_prompt_sha256",
-        "child_prompt_sha256",
-    )
-    @classmethod
-    def validate_prompt_digest(cls, value: str, info) -> str:
-        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
-            raise ValueError(f"{info.field_name} must be a lowercase SHA-256 digest.")
-        return value
-
-    @field_validator("inherited_taint_labels")
-    @classmethod
-    def validate_inherited_taint_labels(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        labels = tuple(require_clean_nonblank(label, "inherited_taint_labels") for label in value)
-        if labels != tuple(sorted(set(labels))):
-            raise ValueError("inherited_taint_labels must be sorted and unique.")
-        return labels
-
-    @model_validator(mode="after")
-    def validate_exact_transition_authority(self) -> PromptAnatomyTransitionReceipt:
-        if self.source_system_prompt_retained or self.copy_checkpoint:
-            raise ValueError(
-                "Prompt-anatomy succession must replace the source prompt without checkpoint state."
-            )
-        if self.source_status not in {
-            SessionStatus.COMPLETED,
-            SessionStatus.FAILED,
-            SessionStatus.INTERRUPTED,
-        }:
-            raise ValueError("Prompt-anatomy succession source status is not forkable.")
-        if self.source_provider_name != self.provider_name:
-            raise ValueError("Prompt-anatomy succession cannot change providers.")
-        if self.model_target_changed != (self.source_model != self.model):
-            raise ValueError("Prompt-anatomy succession model-target evidence is inconsistent.")
-        expected_preflight = (
-            "provider_portable_transcript_preflight"
-            if self.model_target_changed
-            else "context_messages_validated"
-        )
-        if self.portability_preflight != expected_preflight:
-            raise ValueError("Prompt-anatomy succession portability evidence is inconsistent.")
-        payload = self.model_dump(mode="json", exclude={"transition_id"})
-        expected_transition_id = sha256(
-            canonical_durable_json_bytes(payload, "prompt_anatomy_transition")
-        ).hexdigest()
-        if self.transition_id != expected_transition_id:
-            raise ValueError("Prompt-anatomy transition_id does not bind the exact receipt.")
-        return self
-
-
-@dataclass(frozen=True, slots=True)
-class ForkSystemPromptReplacement:
-    """Store-boundary instruction to replace every inherited system message."""
-
-    message: Message | None
-
-
-def apply_fork_system_prompt_replacement(
-    messages: list[Message],
-    interaction_ids: list[str | None],
-    replacement: ForkSystemPromptReplacement | None,
-) -> tuple[list[Message], list[str | None]]:
-    """Install one authoritative system message while preserving non-system history."""
-
-    if len(messages) != len(interaction_ids):
-        raise RuntimeError("Fork transcript attribution does not match its messages.")
-    if replacement is None:
-        return messages, interaction_ids
-    replacement_message = replacement.message
-    if replacement_message is not None:
-        if (
-            type(replacement_message) is not Message
-            or replacement_message.role != MessageRole.SYSTEM
-        ):
-            raise TypeError("Fork prompt replacement must be a system Message.")
-        replacement_message = detach_message(replacement_message)
-    retained_messages: list[Message] = []
-    retained_interaction_ids: list[str | None] = []
-    for message, interaction_id in zip(messages, interaction_ids, strict=True):
-        if message.role == MessageRole.SYSTEM:
-            continue
-        retained_messages.append(message)
-        retained_interaction_ids.append(interaction_id)
-    if replacement_message is not None:
-        retained_messages.insert(0, replacement_message)
-        retained_interaction_ids.insert(0, None)
-    messages.clear()
-    interaction_ids.clear()
-    return retained_messages, retained_interaction_ids
 
 
 @dataclass(frozen=True, slots=True)

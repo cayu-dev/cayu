@@ -104,7 +104,6 @@ from cayu.sessions.base import (
     SessionRunFenced,
     SessionStatusConflict,
     SessionStore,
-    session_prompt_anatomy_transition,
 )
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
@@ -116,6 +115,7 @@ from cayu.sessions.forks import (
     ForkExecutionProfileSelection,
     ForkSystemPromptPolicy,
     session_fork_profile_relationship,
+    session_prompt_anatomy_transition,
 )
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 from cayu.sessions.queries import SessionQuery

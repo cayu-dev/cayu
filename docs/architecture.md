@@ -529,8 +529,9 @@ Runtime retains terminal publication and recovery orchestration.
 ### Session fork contracts
 
 `sessions/forks.py` owns fork source snapshots, execution-profile relationships,
-accepted profile-decision evidence and detached fork acknowledgements. Its
-fingerprint, validation and copy rules compose with session records and profile
+accepted profile-decision evidence, detached fork acknowledgements and
+prompt-transition receipts. Its fingerprint, validation, copy and system-prompt
+replacement rules compose with session records, message values and profile
 contracts without loading concrete stores or runtime execution. Fork admission,
 checkpoint authorization and atomic child creation remain with their existing
 runtime and backend owners.

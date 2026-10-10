@@ -3941,7 +3941,6 @@ from cayu.sessions.base import (
 )
 from cayu.sessions.base import ModelFailoverPolicy as ModelFailoverPolicy
 from cayu.sessions.base import ModelTarget as ModelTarget
-from cayu.sessions.base import PromptAnatomyTransitionReceipt as PromptAnatomyTransitionReceipt
 from cayu.sessions.base import ResumeRequest as ResumeRequest
 from cayu.sessions.base import RunRequest as RunRequest
 from cayu.sessions.base import SessionExecutionInProgress as SessionExecutionInProgress
@@ -3959,9 +3958,6 @@ from cayu.sessions.base import (
 from cayu.sessions.base import replace_session_user_metadata as replace_session_user_metadata
 from cayu.sessions.base import (
     session_invocation_for_run_request as session_invocation_for_run_request,
-)
-from cayu.sessions.base import (
-    session_prompt_anatomy_transition as session_prompt_anatomy_transition,
 )
 from cayu.sessions.base import system_prompt_messages_sha256 as system_prompt_messages_sha256
 from cayu.sessions.checkpoints import CHECKPOINT_SCHEMA_VERSION_KEY as CHECKPOINT_SCHEMA_VERSION_KEY
@@ -4091,26 +4087,18 @@ from cayu.sessions.external_waits import ExternalWaitUnavailable as ExternalWait
 from cayu.sessions.forks import (
     ForkExecutionProfileDecisionRecord as ForkExecutionProfileDecisionRecord,
 )
-from cayu.sessions.forks import (
-    ForkExecutionProfileSelection as ForkExecutionProfileSelection,
-)
-from cayu.sessions.forks import (
-    ForkExecutionProfileSource as ForkExecutionProfileSource,
-)
-from cayu.sessions.forks import (
-    ForkSourceSnapshot as ForkSourceSnapshot,
-)
-from cayu.sessions.forks import (
-    ForkSystemPromptPolicy as ForkSystemPromptPolicy,
-)
-from cayu.sessions.forks import (
-    ProfiledSessionForkResult as ProfiledSessionForkResult,
-)
-from cayu.sessions.forks import (
-    SessionForkProfileRelationship as SessionForkProfileRelationship,
-)
+from cayu.sessions.forks import ForkExecutionProfileSelection as ForkExecutionProfileSelection
+from cayu.sessions.forks import ForkExecutionProfileSource as ForkExecutionProfileSource
+from cayu.sessions.forks import ForkSourceSnapshot as ForkSourceSnapshot
+from cayu.sessions.forks import ForkSystemPromptPolicy as ForkSystemPromptPolicy
+from cayu.sessions.forks import ProfiledSessionForkResult as ProfiledSessionForkResult
+from cayu.sessions.forks import PromptAnatomyTransitionReceipt as PromptAnatomyTransitionReceipt
+from cayu.sessions.forks import SessionForkProfileRelationship as SessionForkProfileRelationship
 from cayu.sessions.forks import (
     session_fork_profile_relationship as session_fork_profile_relationship,
+)
+from cayu.sessions.forks import (
+    session_prompt_anatomy_transition as session_prompt_anatomy_transition,
 )
 from cayu.sessions.inspection import SerializedRecordSummary as SerializedRecordSummary
 from cayu.sessions.inspection import SessionInspectionIdentity as SessionInspectionIdentity

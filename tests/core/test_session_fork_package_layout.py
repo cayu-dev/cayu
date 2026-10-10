@@ -99,6 +99,10 @@ session = Session(
         "ProfiledSessionForkResult",
         "copy_profiled_session_fork_result",
         "session_fork_profile_relationship",
+        "PromptAnatomyTransitionReceipt",
+        "session_prompt_anatomy_transition",
+        "ForkSystemPromptReplacement",
+        "apply_fork_system_prompt_replacement",
     ),
 )
 def test_fork_historical_imports_and_pickle_globals(name):
@@ -180,4 +184,54 @@ else:
     raise AssertionError("Malformed acknowledgement state was accepted")
 """,
         "cayu.sessions.forks",
+    )
+
+
+@pytest.mark.parametrize(
+    "public_module", ("cayu", "cayu.sessions", "cayu.runtime", "cayu.sessions.forks")
+)
+def test_prompt_transition_and_replacement_without_implementations(public_module):
+    _without_stores(
+        """
+from cayu.messages import Message
+from cayu.sessions.records import SessionStatus
+
+receipt = public.PromptAnatomyTransitionReceipt.create(
+    request_sha256="a" * 64, source_session_id="source", descendant_session_id="child",
+    source_status=SessionStatus.COMPLETED, source_transcript_cursor=4,
+    source_prompt_sha256="b" * 64, child_prompt_sha256="c" * 64,
+    child_agent_name="agent", child_environment_name="sandbox", copy_checkpoint=False,
+    source_provider_name="fake", source_model="fake-model", provider_name="fake",
+    model="fake-model", model_target_changed=False,
+    portability_preflight="context_messages_validated", inherited_taint_labels=("private",),
+)
+session.metadata[forks.PROMPT_ANATOMY_TRANSITION_METADATA_KEY] = receipt.model_dump(mode="json")
+assert forks.session_prompt_anatomy_transition(session) == receipt
+assert pickle.loads(pickle.dumps(receipt)) == receipt
+assert get_type_hints(type(receipt)) and type(receipt).model_json_schema()
+session.metadata[forks.PROMPT_ANATOMY_TRANSITION_METADATA_KEY]["child_prompt_sha256"] = "d" * 64
+try:
+    forks.session_prompt_anatomy_transition(session)
+except ValueError as exc:
+    assert "malformed" in str(exc)
+else:
+    raise AssertionError("A changed prompt escaped the receipt commitment")
+user = Message.text("user", "retained input")
+messages = [Message.text("system", "old prompt"), user, Message.text("system", "older prompt")]
+attribution = [None, "interaction", None]
+unchanged = forks.apply_fork_system_prompt_replacement(messages, attribution, None)
+assert unchanged[0] is messages and unchanged[1] is attribution
+replacement = forks.ForkSystemPromptReplacement(Message.text("system", "new prompt"))
+updated, owners = forks.apply_fork_system_prompt_replacement(messages, attribution, replacement)
+assert messages == [] and attribution == []
+assert updated == [replacement.message, user] and owners == [None, "interaction"]
+assert updated[0] is not replacement.message and updated[1] is user
+assert pickle.loads(pickle.dumps(replacement)) == replacement
+assert get_type_hints(type(replacement))
+updated, owners = forks.apply_fork_system_prompt_replacement(
+    updated, owners, forks.ForkSystemPromptReplacement(None),
+)
+assert updated == [user] and owners == ["interaction"]
+""",
+        public_module,
     )

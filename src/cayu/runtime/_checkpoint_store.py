@@ -52,9 +52,7 @@ from cayu.sessions.checkpoints import (
     decode_runtime_checkpoint,
     validate_runtime_checkpoint_root_projection,
 )
-from cayu.sessions.forks import (
-    ProfiledSessionForkResult,
-)
+from cayu.sessions.forks import ProfiledSessionForkResult
 from cayu.sessions.records import Session
 
 _ROOT_CHECKPOINT_GUARD = CheckpointRootFieldGuard(

@@ -56,7 +56,6 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyResult,
 )
 from cayu.sessions.base import (
-    PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
     CompactSessionRequest,
     ForkSessionRequest,
     InMemorySessionStore,
@@ -65,6 +64,7 @@ from cayu.sessions.base import (
     run_request_with_runtime_invocation,
 )
 from cayu.sessions.forks import (
+    PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
     ForkExecutionProfileSelection,
     ForkSystemPromptPolicy,
 )

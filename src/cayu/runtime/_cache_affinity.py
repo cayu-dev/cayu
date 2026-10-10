@@ -17,12 +17,8 @@ from __future__ import annotations
 from collections import OrderedDict
 from hashlib import sha256
 
-from cayu.sessions.base import (
-    SessionStore,
-)
-from cayu.sessions.forks import (
-    session_fork_profile_relationship,
-)
+from cayu.sessions.base import SessionStore
+from cayu.sessions.forks import session_fork_profile_relationship
 from cayu.sessions.records import Session
 
 CACHE_AFFINITY_KEY_PREFIX = "cayu-"

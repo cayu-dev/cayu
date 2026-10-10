@@ -285,7 +285,6 @@ from cayu.sessions.base import (
     _checkpoint_with_session_run_operation,
     _reserve_completion_result_event_publication,
     fork_session_invocation,
-    session_prompt_anatomy_transition,
     system_prompt_messages_sha256,
 )
 from cayu.sessions.checkpoints import (
@@ -302,6 +301,7 @@ from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.forks import (
     ForkExecutionProfileSelection,
     ForkSystemPromptPolicy,
+    session_prompt_anatomy_transition,
 )
 from cayu.sessions.invocation import InvocationOriginTrust, SessionExecutionSource
 from cayu.sessions.queries import SessionQuery

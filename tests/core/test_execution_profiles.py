@@ -153,9 +153,7 @@ from cayu.sessions.base import (
     _with_runtime_resume_transport_metadata,
     execution_profile_adoption_request_fingerprint,
 )
-from cayu.sessions.forks import (
-    ForkExecutionProfileSelection,
-)
+from cayu.sessions.forks import ForkExecutionProfileSelection
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
 from cayu.storage.sqlite import SQLiteSessionStore

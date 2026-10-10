@@ -35,9 +35,7 @@ from cayu.sessions.base import (
     SessionStore,
     _initial_transcript_pending_interaction_id,
 )
-from cayu.sessions.forks import (
-    session_fork_profile_relationship,
-)
+from cayu.sessions.forks import session_fork_profile_relationship
 from cayu.sessions.records import Session
 from cayu.vaults.redaction import SecretRedactor
 

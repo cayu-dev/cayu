@@ -4281,7 +4281,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "PromotionCaseV1": ("cayu.evals.promotion", "PromotionCaseV1"),
     "PromotionSourceV1": ("cayu.evals.promotion", "PromotionSourceV1"),
     "PromotionWarningCode": ("cayu.evals.promotion", "PromotionWarningCode"),
-    "PromptAnatomyTransitionReceipt": ("cayu.sessions.base", "PromptAnatomyTransitionReceipt"),
+    "PromptAnatomyTransitionReceipt": ("cayu.sessions.forks", "PromptAnatomyTransitionReceipt"),
     "PromptCacheCompactor": ("cayu.context.base", "PromptCacheCompactor"),
     "PromptContributionAvailability": ("cayu.context.footprints", "PromptContributionAvailability"),
     "PromptContributionFootprint": ("cayu.context.footprints", "PromptContributionFootprint"),
@@ -6509,7 +6509,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "session_invocation_from_task": ("cayu.sessions.invocation", "session_invocation_from_task"),
     "session_prompt_anatomy_transition": (
-        "cayu.sessions.base",
+        "cayu.sessions.forks",
         "session_prompt_anatomy_transition",
     ),
     "session_usage_summary": ("cayu.budgets.usage", "session_usage_summary"),

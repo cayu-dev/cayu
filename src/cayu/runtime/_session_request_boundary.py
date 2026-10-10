@@ -32,7 +32,6 @@ from cayu.sessions._model_failover import ModelFailoverPolicy
 from cayu.sessions.base import (
     FORK_SOURCE_SNAPSHOT_METADATA_KEY,
     MODEL_TARGET_PROJECTION_METADATA_KEY,
-    PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
     CompactSessionRequest,
     ForkSessionRequest,
     InterruptSessionRequest,
@@ -51,6 +50,7 @@ from cayu.sessions.base import (
 )
 from cayu.sessions.forks import (
     FORK_EXECUTION_PROFILE_METADATA_KEY,
+    PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
     ForkExecutionProfileSource,
 )
 from cayu.sessions.messaging import (

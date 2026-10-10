@@ -170,7 +170,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "ForkSessionRequest": ("cayu.sessions.base", "ForkSessionRequest"),
     "ForkSourceSnapshot": ("cayu.sessions.forks", "ForkSourceSnapshot"),
     "ForkSystemPromptPolicy": ("cayu.sessions.forks", "ForkSystemPromptPolicy"),
-    "ForkSystemPromptReplacement": ("cayu.sessions.base", "ForkSystemPromptReplacement"),
+    "ForkSystemPromptReplacement": ("cayu.sessions.forks", "ForkSystemPromptReplacement"),
     "INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY": (
         "cayu.sessions.base",
         "INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY",
@@ -294,7 +294,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "PersistedEventSideEffectStatus",
     ),
     "ProfiledSessionForkResult": ("cayu.sessions.forks", "ProfiledSessionForkResult"),
-    "PromptAnatomyTransitionReceipt": ("cayu.sessions.base", "PromptAnatomyTransitionReceipt"),
+    "PromptAnatomyTransitionReceipt": ("cayu.sessions.forks", "PromptAnatomyTransitionReceipt"),
     "RECOVERY_CLEANUP_MAX_TIMEOUT_SECONDS": (
         "cayu.sessions.cleanup",
         "RECOVERY_CLEANUP_MAX_TIMEOUT_SECONDS",
@@ -552,7 +552,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "session_invocation_from_task": ("cayu.sessions.invocation", "session_invocation_from_task"),
     "session_prompt_anatomy_transition": (
-        "cayu.sessions.base",
+        "cayu.sessions.forks",
         "session_prompt_anatomy_transition",
     ),
     "system_prompt_messages_sha256": ("cayu.sessions.base", "system_prompt_messages_sha256"),
