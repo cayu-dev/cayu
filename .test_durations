@@ -1,4 +1,7 @@
 {
+  "tests/core/test_native_peer_content_ownership.py::test_postgres_peer_imports_without_store_adapters": 1.041,
+  "tests/core/test_native_peer_content_ownership.py::test_postgres_peer_operations_compose_with_direct_connection": 2.049,
+  "tests/core/test_native_peer_content_ownership.py::test_postgres_peer_validation_retains_readiness_order": 0.051,
   "tests/core/test_native_peer_content_ownership.py::test_sqlite_peer_imports_without_store_adapters": 3.233,
   "tests/core/test_native_peer_content_ownership.py::test_sqlite_peer_operations_compose_with_direct_connection": 2.173,
     "tests/core/test_native_event_delivery_ownership.py::test_postgres_delivery_imports_without_store_adapters": 0.742,

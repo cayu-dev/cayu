@@ -277,3 +277,164 @@ def test_sqlite_peer_operations_compose_with_direct_connection(tmp_path):
             connection.close()
 
     asyncio.run(exercise())
+
+
+@pytest.fixture
+def peer_postgres_dsn(postgres_dsn):
+    from tests.core.postgres_contention_support import drop_cayu_tables
+
+    asyncio.run(drop_cayu_tables(postgres_dsn))
+    try:
+        yield postgres_dsn
+    finally:
+        asyncio.run(drop_cayu_tables(postgres_dsn))
+
+
+def test_postgres_peer_imports_without_store_adapters():
+    _assert_import_without_adapters("postgres")
+
+
+def test_postgres_peer_operations_compose_with_direct_connection(peer_postgres_dsn):
+    from contextlib import asynccontextmanager
+
+    import psycopg
+
+    from cayu.storage import _postgres_peer_content, _postgres_support
+    from cayu.storage._participant_bindings_schema import PARTICIPANT_BINDING_COLUMNS
+    from cayu.storage.migrations import SchemaMode
+    from cayu.storage.postgres import PostgresSessionStore
+
+    async def exercise():
+        store = PostgresSessionStore(peer_postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            sessions = await _seed_sessions(store)
+        finally:
+            await store.close()
+        active = False
+        ready = False
+
+        async def ensure_ready():
+            nonlocal ready
+            assert not active
+            ready = True
+
+        @asynccontextmanager
+        async def connect():
+            nonlocal active, ready
+            assert ready and not active
+            ready = False
+            active = True
+            try:
+                async with await psycopg.AsyncConnection.connect(peer_postgres_dsn) as connection:
+                    yield connection
+            finally:
+                active = False
+
+        async def load_for_update(cur, sid):
+            assert active
+            await cur.execute(
+                f"SELECT {_postgres_support.SESSION_COLUMNS} FROM cayu_sessions WHERE id = %s FOR UPDATE",
+                (sid,),
+            )
+            row = await cur.fetchone()
+            return None if row is None else _postgres_support.session_from_row(row, labels={})
+
+        async def store_now(cur):
+            assert (
+                active
+                and cur.connection.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
+            )
+            await cur.execute("SELECT clock_timestamp()")
+            return (await cur.fetchone())[0]
+
+        async def read_creation(target):
+            raise AssertionError("Direct targets must not read creation decisions")
+
+        def assert_idle():
+            assert not active
+
+        async with await psycopg.AsyncConnection.connect(peer_postgres_dsn) as conn:
+            await conn.execute("UPDATE cayu_sessions SET status = 'running'")
+            for session, participant in zip(sessions, ("sender", "consumer"), strict=True):
+                await conn.execute(
+                    f"INSERT INTO cayu_participant_session_bindings ({','.join(PARTICIPANT_BINDING_COLUMNS)}) "
+                    f"VALUES ({','.join('%s' for _ in PARTICIPANT_BINDING_COLUMNS)})",
+                    _binding_values(session, participant),
+                )
+        ops = SimpleNamespace(
+            **{
+                name: partial(
+                    getattr(_postgres_peer_content, name), connect, ensure_ready=ensure_ready
+                )
+                for name in (
+                    "read_peer_content",
+                    "read_peer_content_attempt",
+                    "list_pending_peer_content",
+                    "begin_peer_content_exposure",
+                    "record_peer_content_exposure",
+                    "read_peer_content_exposure",
+                    "exclude_peer_content",
+                )
+            }
+        )
+        ops.append_peer_content = partial(
+            _postgres_peer_content.append_peer_content,
+            connect,
+            ensure_ready=ensure_ready,
+            load_for_update=load_for_update,
+            session_store_now=store_now,
+        )
+        ops.retry_pending_peer_content = partial(
+            _postgres_peer_content.retry_pending_peer_content,
+            connect,
+            ensure_ready=ensure_ready,
+            read_creation_decision=read_creation,
+        )
+        await _exercise(ops, _request(sessions), assert_idle)
+        failed = _request(sessions, "rollback")
+        async with await psycopg.AsyncConnection.connect(peer_postgres_dsn) as conn:
+            await conn.execute("""CREATE FUNCTION fail_peer_receipt() RETURNS trigger
+                LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'receipt write failed'; END $$""")
+            await conn.execute("""CREATE TRIGGER fail_peer_receipt BEFORE INSERT
+                ON cayu_peer_content_receipts FOR EACH ROW EXECUTE FUNCTION fail_peer_receipt()""")
+        try:
+            with pytest.raises(psycopg.errors.RaiseException, match="receipt write failed"):
+                await ops.append_peer_content(failed, qualify_target=lambda session: None)
+            assert_idle()
+            assert await ops.read_peer_content(failed.append_key) is None
+            async with await psycopg.AsyncConnection.connect(peer_postgres_dsn) as conn:
+                for table in ("cayu_session_message_queue", "cayu_events"):
+                    cur = await conn.execute(f"SELECT COUNT(*) FROM {table}")
+                    assert (await cur.fetchone())[0] == 1
+        finally:
+            async with await psycopg.AsyncConnection.connect(peer_postgres_dsn) as conn:
+                await conn.execute("DROP TRIGGER fail_peer_receipt ON cayu_peer_content_receipts")
+                await conn.execute("DROP FUNCTION fail_peer_receipt()")
+        excluded = await ops.exclude_peer_content(failed, reason="withdrawn")
+        assert excluded.status == "excluded"
+        assert (await ops.exclude_peer_content(failed, reason="withdrawn")).replayed
+
+    asyncio.run(exercise())
+
+
+def test_postgres_peer_validation_retains_readiness_order():
+    from cayu.storage import _postgres_peer_content as peer
+
+    def connect():
+        raise AssertionError("Invalid requests must not acquire a connection")
+
+    async def ensure_ready():
+        raise RuntimeError("Readiness checked")
+
+    async def exercise():
+        with pytest.raises(TypeError, match="append_key"):
+            await peer.read_peer_content(connect, object(), ensure_ready=ensure_ready)
+        with pytest.raises(TypeError, match="Invalid exposure lookup"):
+            await peer.read_peer_content_exposure(
+                connect, object(), "exposure", ensure_ready=ensure_ready
+            )
+        for operation in (peer.begin_peer_content_exposure, peer.record_peer_content_exposure):
+            with pytest.raises(RuntimeError, match="Readiness checked"):
+                await operation(connect, object(), ensure_ready=ensure_ready)
+
+    asyncio.run(exercise())

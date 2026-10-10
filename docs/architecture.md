@@ -972,12 +972,15 @@ closure-lock and database-clock capabilities where needed. Enqueue helpers use
 the publication caller's connection or cursor, preserving atomic event and outbox
 writes. Runtime delivery policy remains in the runtime event writer.
 
-SQLite peer-content persistence lives in `storage/_sqlite_peer_content.py`.
+Native peer-content persistence lives in `storage/_sqlite_peer_content.py` and
+`storage/_postgres_peer_content.py`.
 Complete append, replay, exposure, exclusion and retry operations receive native
 execution, session-loading, clock and creation-decision capabilities. Admission
 and queue/event/receipt writes share one transaction; retry releases its read
 scope before asking the caller for fresh export authorization. Peer contracts,
-attempt rules and creation-fence rules retain their existing owners.
+attempt rules and creation-fence rules retain their existing owners. PostgreSQL
+receives readiness separately from connection acquisition to retain validation
+order, and keeps creation-fence, session and advisory locks in their native order.
 
 Context policies are runtime projections over transcript messages, not storage. They let applications customize the model-facing conversation history by trimming, compacting, replacing bulky tool results, or injecting retrieved context while preserving the raw durable transcript for audit, debugging, resume, and future compaction.
 
