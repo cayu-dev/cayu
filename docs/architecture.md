@@ -1081,8 +1081,8 @@ checks remain explicit capabilities; their existing publication and export-owner
 boundaries are preserved. PostgreSQL also receives readiness and duplicate-error
 classification separately, preserving validation order and optional driver loading.
 
-SQLite targeted-tool grant persistence lives in `storage/_sqlite_tool_grants.py`:
-issuance, bounded listing, state reads,
+Native targeted-tool grant persistence lives in `storage/_sqlite_tool_grants.py`
+and `storage/_postgres_tool_grants.py`: issuance, bounded listing, state reads,
 use binding, revocation and reconstruction. Each operation keeps authorization,
 run fencing, grants, usage and audit writes inside its native transaction.
 Connections, readiness, current alias-codec access, shared record decoders,

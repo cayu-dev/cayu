@@ -1,4 +1,6 @@
 {
+  "tests/core/test_postgres_tool_grant_ownership.py::test_postgres_tool_grant_owner_imports_without_adapters_or_driver": 4.078,
+  "tests/core/test_postgres_tool_grant_ownership.py::test_postgres_tool_grant_owner_composes_with_direct_connection": 6.395,
   "tests/core/test_native_tool_grant_ownership.py::test_sqlite_tool_grant_owner_imports_without_adapters_or_driver": 6.736,
   "tests/core/test_native_tool_grant_ownership.py::test_sqlite_tool_grant_owner_composes_with_direct_connection": 5.007,
   "tests/core/test_native_event_publication_ownership.py::test_postgres_event_publication_composes_with_direct_connection": 1.874,
