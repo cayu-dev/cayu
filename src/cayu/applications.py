@@ -318,7 +318,6 @@ from cayu.messages import (
 from cayu.observability.events import EventSink
 from cayu.observability.hooks import (
     RuntimeHook,
-    RuntimeHookPhase,
 )
 from cayu.observability.timing import (
     ModelStepPreparationTiming,
@@ -420,17 +419,17 @@ from cayu.runtime._public_task_scheduling import (
     publish_task_schedule,
 )
 from cayu.runtime._queued_dispatch_coordinator import QueuedDispatchCoordinator
-from cayu.runtime._recovery_coordinator import (
+from cayu.runtime._recovery_coordinator import RecoveryCoordinator
+from cayu.runtime._recovery_ownership import RecoveryOwnership
+from cayu.runtime._recovery_plan_coordinator import RecoveryPlanCoordinator
+from cayu.runtime._recovery_requests import (
     ProviderOperationFailureRequest,
     RecoveryAbandonedTurnRequest,
-    RecoveryCoordinator,
     RecoveryInterruptionRequest,
     RecoveryLimitStopRequest,
     RecoverySessionRunRequest,
     RecoveryTaskEventRequest,
-    RecoveryTerminalEventRequest,
 )
-from cayu.runtime._recovery_plan_coordinator import RecoveryPlanCoordinator
 from cayu.runtime._run_limits import (
     RunLimitController,
     SessionUsageTracker,
@@ -461,6 +460,9 @@ from cayu.runtime._task_store_operation_boundary import (
     task_store_completion_evaluation_capability_is_complete,
     task_store_completion_verifier_dispatch_capability_is_complete,
 )
+from cayu.runtime._terminal_event_publication import TerminalEventPublication
+from cayu.runtime._terminal_evidence_finalization import TerminalEvidenceFinalization
+from cayu.runtime._terminal_evidence_reader import TerminalEvidenceReader
 from cayu.runtime._tool_round_executor import (
     InterruptedToolRoundRequest,
     ToolRoundExecutor,
@@ -1538,7 +1540,32 @@ class CayuApp:
             strict_common_budget_admission=self.enable_common_root_budget_binding,
             knowledge_publication_scope=self._knowledge_publication_scope,
         )
-        self._user_input_evidence = UserInputRecoveryEvidence(self._runtime_session_store)
+        self._user_input_evidence = UserInputRecoveryEvidence(
+            self._runtime_session_store, self._secret_redactor
+        )
+        self._terminal_evidence = TerminalEvidenceReader(
+            session_store=self._runtime_session_store,
+            session_control=self._session_control,
+            user_input_evidence=self._user_input_evidence,
+            secret_redactor=self._secret_redactor,
+        )
+        self._recovery_ownership = RecoveryOwnership(
+            session_store=self._runtime_session_store,
+            environment_lifecycle=self._environment_lifecycle,
+            session_control=self._session_control,
+            recovery_cleanup_supervisor=self._recovery_cleanup_supervisor,
+            terminal_evidence=self._terminal_evidence,
+        )
+        self._terminal_finalization = TerminalEvidenceFinalization(
+            session_store=self._runtime_session_store,
+            session_control=self._session_control,
+            recovery=self._recovery_ownership,
+            terminal_evidence=self._terminal_evidence,
+            user_input_evidence=self._user_input_evidence,
+            event_writer=self._event_writer,
+            secret_redactor=self._secret_redactor,
+            logger=logger,
+        )
         self._model_completion_recovery = ModelCompletionRecovery(
             session_store=self._runtime_session_store,
             event_writer=self._event_writer,
@@ -1572,7 +1599,19 @@ class CayuApp:
             resolve_registered_agent=self._get_registered_agent,
             resolve_registered_environment=self._get_registered_environment_for_session,
         )
+        self._terminal_event_publication = TerminalEventPublication(
+            session_store=self._runtime_session_store,
+            environment_lifecycle=self._environment_lifecycle,
+            event_writer=self._event_writer,
+            secret_redactor=self._secret_redactor,
+            runtime_hooks=self._runtime_hooks,
+            hook_runtime=self,
+        )
         self._recovery_coordinator = RecoveryCoordinator(
+            terminal_event_publication=self._terminal_event_publication,
+            recovery_ownership=self._recovery_ownership,
+            terminal_evidence=self._terminal_evidence,
+            terminal_finalization=self._terminal_finalization,
             pending_tool_round_recovery=self._pending_tool_round_recovery,
             workspace_observation_recovery=self._workspace_observation_recovery,
             resource_access_policy=resource_access_policy,
@@ -1590,10 +1629,6 @@ class CayuApp:
             checkpoint_transform=_replace_checkpoint_preserving_runtime_state,
             effective_retry_policy=self._effective_retry_policy,
             run_session=self._run_recovery_session,
-            emit_terminal_event_with_hooks=self._emit_recovery_terminal_event_with_hooks,
-            terminal_runtime_hooks_are_settled=(
-                self._terminal_runtime_hooks_are_settled_for_recovery
-            ),
             fail_provider_operation=self._fail_provider_operation_resolution,
             stop_session_for_limit_reached=self._stop_recovery_session_for_limit_reached,
             task_event=_recovery_task_event,
@@ -1638,6 +1673,10 @@ class CayuApp:
         )
 
         self._session_engine = SessionEngine(
+            terminal_event_publication=self._terminal_event_publication,
+            recovery_ownership=self._recovery_ownership,
+            terminal_evidence=self._terminal_evidence,
+            terminal_finalization=self._terminal_finalization,
             policy_selection=(None if model_policy is None else model_policy.selection),
             resource_access_policy=resource_access_policy,
             session_store=self._runtime_session_store,
@@ -1666,7 +1705,6 @@ class CayuApp:
             loop_policy_execution_profile_identities=(
                 self._loop_policy_execution_profile_identities
             ),
-            hook_runtime=self,
             get_registered_agent=self._get_registered_agent,
             get_registered_provider=self._get_registered_provider,
             route_registered_provider_for_model=(
@@ -8836,49 +8874,6 @@ class CayuApp:
             async for item in owned_stream:
                 yield item
 
-    def _emit_recovery_terminal_event_with_hooks(
-        self,
-        request: RecoveryTerminalEventRequest,
-    ) -> AsyncIterator[Event]:
-        if request.terminal_event_already_durable:
-            return self._session_engine._replay_terminal_event_with_hooks(
-                event=request.event,
-                phase=request.phase,
-                session=request.session,
-                registered_agent=request.registered_agent,
-                registered_environment=request.registered_environment,
-                execution_profile=request.execution_profile,
-                invocation_context=request.invocation_context,
-                run_runtime_hooks=request.run_runtime_hooks,
-                yield_terminal_event=request.yield_durable_terminal_event,
-            )
-        return self._emit_terminal_event_with_hooks(
-            event=request.event,
-            phase=request.phase,
-            session=request.session,
-            registered_agent=request.registered_agent,
-            registered_environment=request.registered_environment,
-            execution_profile=request.execution_profile,
-            invocation_context=request.invocation_context,
-            run_runtime_hooks=request.run_runtime_hooks,
-        )
-
-    async def _terminal_runtime_hooks_are_settled_for_recovery(
-        self,
-        request: RecoveryTerminalEventRequest,
-    ) -> bool:
-        if not request.terminal_event_already_durable:
-            raise ValueError("Terminal hook settlement requires a durable terminal event.")
-        return await self._session_engine.terminal_runtime_hooks_are_settled(
-            phase=request.phase,
-            session=request.session,
-            terminal_event=request.event,
-            registered_agent=request.registered_agent,
-            registered_environment=request.registered_environment,
-            execution_profile=request.execution_profile,
-            invocation_context=request.invocation_context,
-        )
-
     def _fail_provider_operation_resolution(
         self,
         request: ProviderOperationFailureRequest,
@@ -10062,32 +10057,6 @@ class CayuApp:
         emitted = await self._event_writer.emit(event)
         self._session_control.queue_out_of_band_event(emitted)
         return emitted
-
-    async def _emit_terminal_event_with_hooks(
-        self,
-        *,
-        event: Event,
-        phase: RuntimeHookPhase,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        execution_profile: ExecutionProfileIdentity | None = None,
-        invocation_context: InvocationContext | None = None,
-        run_runtime_hooks: bool = True,
-    ) -> AsyncIterator[Event]:
-        stream = self._session_engine._emit_terminal_event_with_hooks(
-            event=event,
-            phase=phase,
-            session=session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            execution_profile=execution_profile,
-            invocation_context=invocation_context,
-            run_runtime_hooks=run_runtime_hooks,
-        )
-        async with _close_delegated_event_stream(stream) as owned_stream:
-            async for item in owned_stream:
-                yield item
 
     @_tracked_entrance
     async def emit_events(self, session_id: str, events: list[Event]) -> list[Event]:

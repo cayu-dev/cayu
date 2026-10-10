@@ -64,7 +64,7 @@ from cayu.runtime._invocation_lifecycle import (
     reconstruct_invocation_context,
 )
 from cayu.runtime._model_completion_contracts import model_completion_recovery_context_from_stage
-from cayu.runtime._recovery_coordinator import RecoverySessionRunRequest
+from cayu.runtime._recovery_requests import RecoverySessionRunRequest
 from cayu.runtime.build_provenance import RuntimeBuildProvenance
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import (
@@ -3780,7 +3780,7 @@ async def _assert_provider_retry_keeps_process_local_resolution_after_mutation(
     original_model_run_factory = app._model_step_executor.create_run
     original_tool_run_factory = app._tool_round_executor.create_run
     original_terminal_cleanup = app._environment_lifecycle.finalize_terminal_event
-    original_runtime_hook_runner = app._session_engine._run_runtime_hooks
+    original_runtime_hook_runner = app._terminal_event_publication._run_runtime_hooks
     original_turn_completion = app._session_engine._emit_turn_completed
 
     def capture_model_run(**kwargs):
@@ -3810,7 +3810,7 @@ async def _assert_provider_retry_keeps_process_local_resolution_after_mutation(
     app._model_step_executor.create_run = capture_model_run
     app._tool_round_executor.create_run = capture_tool_run
     app._environment_lifecycle.finalize_terminal_event = capture_terminal_cleanup
-    app._session_engine._run_runtime_hooks = capture_runtime_hooks
+    app._terminal_event_publication._run_runtime_hooks = capture_runtime_hooks
     app._session_engine._emit_turn_completed = capture_turn_completion
     replacement_app = CayuApp(enable_logging=False)
     replacement_app.register_provider(replacement_provider, default=True)

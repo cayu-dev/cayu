@@ -11,7 +11,7 @@ from pydantic import ValidationError
 
 from cayu import CayuApp, CayuConfig, OperationsConfig
 from cayu.messages import Message
-from cayu.runtime._recovery_coordinator import _run_recovery_cleanup_steps
+from cayu.runtime._recovery_ownership import _run_recovery_cleanup_steps
 from cayu.sessions.base import CheckpointTransform, InMemorySessionStore
 from cayu.sessions.cleanup import (
     RecoveryCleanupCapacityExceeded,
@@ -1046,7 +1046,7 @@ def test_timed_out_claim_release_converges_through_fresh_runtime() -> None:
             clock=clock,
             enable_logging=False,
         )
-        original_claim = await original_app._recovery_coordinator._claim_incomplete_recovery(
+        original_claim = await original_app._recovery_ownership.claim(
             session=session,
             inactive_for_seconds=None,
         )
@@ -1055,7 +1055,7 @@ def test_timed_out_claim_release_converges_through_fresh_runtime() -> None:
 
         store.block_next_checkpoint_transform = True
         with pytest.raises(RecoveryCleanupDeadlineExceeded):
-            await original_app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+            await original_app._recovery_ownership.cleanup_claim(
                 authority=original_claim.require_authority(),
                 authoritative_failure=None,
             )
@@ -1071,7 +1071,7 @@ def test_timed_out_claim_release_converges_through_fresh_runtime() -> None:
             clock=clock,
             enable_logging=False,
         )
-        replacement_claim = await replacement_app._recovery_coordinator._claim_incomplete_recovery(
+        replacement_claim = await replacement_app._recovery_ownership.claim(
             session=current,
             inactive_for_seconds=None,
             required_expired_claim_id=original_claim_id,
@@ -1085,7 +1085,7 @@ def test_timed_out_claim_release_converges_through_fresh_runtime() -> None:
         marker = checkpoint["incomplete_session_recovery_claim"]
         assert marker["claim_id"] == replacement_claim.claim_id
 
-        await replacement_app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+        await replacement_app._recovery_ownership.cleanup_claim(
             authority=replacement_claim.require_authority(),
             authoritative_failure=None,
         )

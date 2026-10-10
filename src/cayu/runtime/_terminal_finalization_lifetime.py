@@ -301,7 +301,7 @@ class InterruptionFinalization:
                 )
             if reclaimed_handoff_heartbeat is not None:
                 self._retained_for_recovery = True
-                await self._recovery._run_cleanup_steps(
+                await self._recovery.run_cleanup_steps(
                     authoritative_failure=authoritative_failure,
                     steps=(
                         (
@@ -316,7 +316,7 @@ class InterruptionFinalization:
                 and not self._retained_for_recovery
             ):
                 claim_id = self._claim_id
-                await self._recovery._run_cleanup_steps(
+                await self._recovery.run_cleanup_steps(
                     authoritative_failure=authoritative_failure,
                     steps=(
                         (
@@ -325,7 +325,7 @@ class InterruptionFinalization:
                         ),
                         (
                             "unstarted terminal finalization claim release",
-                            lambda: self._recovery._release_incomplete_recovery_claim(
+                            lambda: self._recovery.release_claim(
                                 self._session_id,
                                 claim_id,
                             ),
@@ -400,13 +400,13 @@ class InterruptionFinalization:
             steps.append(
                 (
                     "terminal evidence finalization claim release",
-                    lambda: self._recovery._release_incomplete_recovery_claim(
+                    lambda: self._recovery.release_claim(
                         self._session_id,
                         claim_id,
                     ),
                 )
             )
-        await self._recovery._run_cleanup_steps(
+        await self._recovery.run_cleanup_steps(
             authoritative_failure=authoritative_failure,
             steps=tuple(steps),
         )
@@ -628,9 +628,7 @@ class InterruptedRunFinalization:
                         local_lease_deadline=joined_local_lease_deadline,
                     )
                     self._claim_id = shared_claim[0]
-                    self._borrowed = self._recovery._owns_current_recovery_worker(
-                        session.id, shared_claim[0]
-                    )
+                    self._borrowed = self._recovery.owns_current_worker(session.id, shared_claim[0])
                     self._handoff = TerminalFinalizationClaimHandoff(
                         session_instance_id=loaded_interrupted.instance_id,
                         run_epoch=loaded_interrupted.run_epoch,
@@ -719,7 +717,7 @@ class InterruptedRunFinalization:
         """Stop the handoff and release only locally owned, settled work."""
         claim_id = self._claim_id
         if claim_id is not None:
-            await self._recovery._run_cleanup_steps(
+            await self._recovery.run_cleanup_steps(
                 authoritative_failure=authoritative_failure,
                 steps=(
                     (
@@ -733,7 +731,7 @@ class InterruptedRunFinalization:
                         else (
                             (
                                 "terminal evidence finalization claim release",
-                                lambda: self._recovery._release_incomplete_recovery_claim(
+                                lambda: self._recovery.release_claim(
                                     self._session_id,
                                     claim_id,
                                 ),
@@ -742,3 +740,24 @@ class InterruptedRunFinalization:
                     ),
                 ),
             )
+
+
+_TERMINAL_FINALIZATION_PROCESS_CONTROL_SIGNALS = (GeneratorExit, KeyboardInterrupt, SystemExit)
+
+
+def _terminal_finalization_process_control(
+    error: BaseException | None,
+) -> BaseException | None:
+    """Return the first scalar process-control signal in transfer evidence."""
+
+    if error is None:
+        return None
+    return next(
+        (
+            candidate
+            for candidate in iter_exception_tree(error)
+            if not isinstance(candidate, BaseExceptionGroup)
+            and isinstance(candidate, _TERMINAL_FINALIZATION_PROCESS_CONTROL_SIGNALS)
+        ),
+        None,
+    )

@@ -4371,7 +4371,7 @@ def test_provider_failure_replay_runs_hooks_before_retiring_disposition(
             expected_run_epoch=interrupted.run_epoch,
             action=ProviderOperationResolutionAction.FAIL,
         )
-        original_runner = app._session_engine._run_runtime_hooks
+        original_runner = app._terminal_event_publication._run_runtime_hooks
         process_lost = False
 
         async def lose_before_hooks(**kwargs):
@@ -4382,7 +4382,7 @@ def test_provider_failure_replay_runs_hooks_before_retiring_disposition(
             async for event in original_runner(**kwargs):
                 yield event
 
-        monkeypatch.setattr(app._session_engine, "_run_runtime_hooks", lose_before_hooks)
+        monkeypatch.setattr(app._terminal_event_publication, "_run_runtime_hooks", lose_before_hooks)
         with pytest.raises(_SimulatedProcessLoss):
             _ = [event async for event in app.resolve_provider_operation(request)]
 
@@ -4399,7 +4399,7 @@ def test_provider_failure_replay_runs_hooks_before_retiring_disposition(
             == 1
         )
 
-        monkeypatch.setattr(app._session_engine, "_run_runtime_hooks", original_runner)
+        monkeypatch.setattr(app._terminal_event_publication, "_run_runtime_hooks", original_runner)
         replay = [event async for event in app.resolve_provider_operation(request)]
 
         assert replay[0].type is EventType.PROVIDER_OPERATION_RESOLVED

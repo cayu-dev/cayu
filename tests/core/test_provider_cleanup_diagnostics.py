@@ -221,7 +221,7 @@ def test_injected_cleanup_failure_survives_sqlite_recovery_and_export(
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="injected"))
         if repair:
-            original = app._recovery_coordinator._emit_terminal_event_with_hooks
+            original = app._terminal_event_publication.publish_recovered
 
             async def fail_publication(request):
                 if request.event.type is EventType.SESSION_INTERRUPTED:
@@ -230,7 +230,7 @@ def test_injected_cleanup_failure_survives_sqlite_recovery_and_export(
                     yield event
 
             monkeypatch.setattr(
-                app._recovery_coordinator, "_emit_terminal_event_with_hooks", fail_publication
+                app._terminal_event_publication, "publish_recovered", fail_publication
             )
 
         timeout_slot = []

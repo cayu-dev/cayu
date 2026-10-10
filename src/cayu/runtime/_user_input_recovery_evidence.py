@@ -2,19 +2,29 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
-from cayu._validation import copy_json_value
+from cayu._validation import (
+    copy_json_value,
+)
 from cayu.approvals.user_input import (
     AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY,
     PENDING_USER_INPUT_CHECKPOINT_KEY,
     USER_INPUT_SUPERSESSION_INTENT_KEY,
     AmbiguousUserInputSupersessionIntent,
     PendingUserInput,
+    UserInputPauseState,
     UserInputSupersessionIntent,
     pending_user_input_identity,
+    user_input_lifecycle_authority_from_checkpoint,
 )
-from cayu.events import Event, EventType
+from cayu.events import (
+    Event,
+    EventType,
+)
+from cayu.runtime._interruption_coordinator import (
+    _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
+)
 from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
     interruption_request_id_from_payload,
@@ -25,14 +35,20 @@ from cayu.sessions.base import (
     SessionStore,
 )
 from cayu.sessions.event_queries import EventQuery
-from cayu.sessions.records import EventRecord, Session, SessionStatus
+from cayu.sessions.records import (
+    EventRecord,
+    Session,
+    SessionStatus,
+)
+from cayu.vaults.redaction import SecretRedactor
 
 
 class UserInputRecoveryEvidence:
     """Authenticate exact user-input opening, closure and supersession evidence."""
 
-    def __init__(self, session_store: SessionStore) -> None:
+    def __init__(self, session_store: SessionStore, secret_redactor: SecretRedactor) -> None:
         self._session_store = session_store
+        self._secret_redactor = secret_redactor
 
     async def require_exact_user_input_open_receipt(
         self,
@@ -385,3 +401,172 @@ class UserInputRecoveryEvidence:
                 "User-input closure event conflicts with its receipt."
             )
         return event
+
+    async def classify_pause(
+        self,
+        *,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        input_id: str,
+        _refresh_supersession_conflict: bool = True,
+    ) -> UserInputPauseState:
+        """Classify one exact pause from positive durable lifecycle evidence."""
+
+        close_receipt = await self._session_store.load_runtime_publication_receipt(
+            session.id,
+            f"user-input-close:{input_id}",
+        )
+        if close_receipt is not None:
+            # The caller's checkpoint read may have raced the atomic close.
+            # Read it again only after the receipt is observable so an
+            # acknowledgement-loss retry cannot mistake the pre-close pause
+            # for contradictory durable state.
+            checkpoint = await self._session_store.load_checkpoint(session.id)
+        try:
+            pending, resolution_intent = user_input_lifecycle_authority_from_checkpoint(
+                checkpoint,
+                redactor=self._secret_redactor,
+                current_run_epoch=session.run_epoch,
+                runtime_session=session,
+            )
+        except (TypeError, ValueError, RuntimeError):
+            return UserInputPauseState.AMBIGUOUS
+        interrupt_marker: object | None = None
+        if checkpoint is not None:
+            interrupt_payload = checkpoint.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
+            if type(interrupt_payload) is dict:
+                interrupt_marker = interrupt_payload.get(USER_INPUT_SUPERSESSION_INTENT_KEY)
+
+        try:
+            supersession_events = await self._session_store.load_user_input_supersession_events(
+                session.id,
+                input_id,
+            )
+        except (TypeError, ValueError):
+            return UserInputPauseState.AMBIGUOUS
+        pending_conflicts_with_supersession = pending is not None and (
+            supersession_events
+            or (type(interrupt_marker) is dict and interrupt_marker.get("input_id") == input_id)
+        )
+        if pending_conflicts_with_supersession:
+            # The caller's checkpoint read may have preceded an atomic
+            # supersession whose terminal event is already visible. Never let
+            # that mixed snapshot reclassify the retired pause as active.
+            if not _refresh_supersession_conflict:
+                return UserInputPauseState.AMBIGUOUS
+            refreshed_session = await self._session_store.load(session.id)
+            if refreshed_session is None:
+                return UserInputPauseState.AMBIGUOUS
+            refreshed_checkpoint = await self._session_store.load_checkpoint(session.id)
+            return await self.classify_pause(
+                session=refreshed_session,
+                checkpoint=refreshed_checkpoint,
+                input_id=input_id,
+                _refresh_supersession_conflict=False,
+            )
+        if close_receipt is not None:
+            if (
+                (pending is not None and pending.input_id == input_id)
+                or (resolution_intent is not None and resolution_intent.input_id == input_id)
+                or (type(interrupt_marker) is dict and interrupt_marker.get("input_id") == input_id)
+            ):
+                return UserInputPauseState.AMBIGUOUS
+            if supersession_events:
+                return UserInputPauseState.AMBIGUOUS
+            try:
+                await self.exact_user_input_close_event(
+                    session=session,
+                    input_id=input_id,
+                    receipt=close_receipt,
+                )
+            except SessionRuntimePublicationConflict:
+                return UserInputPauseState.AMBIGUOUS
+            else:
+                return UserInputPauseState.ANSWERED
+
+        if pending is not None:
+            if (
+                pending.input_id != input_id
+                or pending.session_id != session.id
+                or pending.session_instance_id != session.instance_id
+            ):
+                return UserInputPauseState.AMBIGUOUS
+            try:
+                await self.require_exact_user_input_open_receipt(
+                    session=session,
+                    pending=pending,
+                )
+            except SessionRuntimePublicationConflict:
+                return UserInputPauseState.AMBIGUOUS
+            return (
+                UserInputPauseState.ANSWERING
+                if resolution_intent is not None
+                else UserInputPauseState.ACTIVE
+            )
+
+        if resolution_intent is not None:
+            return UserInputPauseState.AMBIGUOUS
+
+        marker_candidates: list[object] = []
+        if interrupt_marker is not None:
+            marker_candidates.append(interrupt_marker)
+        marker_candidates.extend(
+            event.payload.get(USER_INPUT_SUPERSESSION_INTENT_KEY) for event in supersession_events
+        )
+        matching_markers: list[dict[str, object]] = []
+        for marker in marker_candidates:
+            if type(marker) is not dict:
+                continue
+            typed_marker = cast("dict[str, object]", marker)
+            if typed_marker.get("input_id") == input_id:
+                matching_markers.append(typed_marker)
+        if not matching_markers:
+            return UserInputPauseState.AMBIGUOUS
+        if len(supersession_events) > 1:
+            return UserInputPauseState.AMBIGUOUS
+        if any(
+            event.type is not EventType.SESSION_INTERRUPTED
+            or event.session_id != session.id
+            or event.payload.get("interruption_type") != "operator_requested"
+            for event in supersession_events
+        ):
+            return UserInputPauseState.AMBIGUOUS
+        try:
+            open_receipt = await self.require_exact_user_input_open_receipt(
+                session=session,
+                input_id=input_id,
+            )
+        except SessionRuntimePublicationConflict:
+            return UserInputPauseState.AMBIGUOUS
+        immutable_identity_fields = (
+            "schema_version",
+            "session_id",
+            "session_instance_id",
+            "source_interaction_id",
+            "source_run_epoch",
+            "input_id",
+            "tool_call_id",
+            "tool_round_id",
+            "model_step_id",
+            "model_attempt_id",
+            "execution_profile_fingerprint",
+            "pause_digest",
+        )
+        parsed_markers: list[UserInputSupersessionIntent] = []
+        for marker in matching_markers:
+            try:
+                parsed = UserInputSupersessionIntent.model_validate(marker)
+            except (TypeError, ValueError):
+                return UserInputPauseState.AMBIGUOUS
+            if parsed.session_id != session.id or parsed.session_instance_id != session.instance_id:
+                return UserInputPauseState.AMBIGUOUS
+            parsed_payload = parsed.model_dump(mode="json", exclude_none=True)
+            if any(
+                parsed_payload.get(field_name) != open_receipt.intent.get(field_name)
+                for field_name in immutable_identity_fields
+            ):
+                return UserInputPauseState.AMBIGUOUS
+            parsed_markers.append(parsed)
+        if any(marker != parsed_markers[0] for marker in parsed_markers[1:]):
+            return UserInputPauseState.AMBIGUOUS
+        return UserInputPauseState.SUPERSEDED

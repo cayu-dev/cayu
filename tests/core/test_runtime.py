@@ -231,6 +231,7 @@ from cayu.runtime import _approval_support as approval_support_module
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
 from cayu.runtime import _interruption_coordinator as interruption_coordinator_module
 from cayu.runtime import _recovery_coordinator as recovery_coordinator_module
+from cayu.runtime import _recovery_ownership as recovery_ownership_module
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime._binding_cleanup import (
     binding_cleanup_status,
@@ -14849,7 +14850,7 @@ def test_provider_cancellation_publication_failure_remains_repairable(
         app = CayuApp(enable_logging=False)
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-        original_terminal_stream = app._recovery_coordinator._emit_terminal_event_with_hooks
+        original_terminal_stream = app._terminal_event_publication.publish_recovered
 
         async def fail_interrupted_publication(request):  # type: ignore[no-untyped-def]
             if request.event.type == EventType.SESSION_INTERRUPTED:
@@ -14858,8 +14859,8 @@ def test_provider_cancellation_publication_failure_remains_repairable(
                 yield event
 
         monkeypatch.setattr(
-            app._recovery_coordinator,
-            "_emit_terminal_event_with_hooks",
+            app._terminal_event_publication,
+            "publish_recovered",
             fail_interrupted_publication,
         )
         task = asyncio.create_task(
@@ -14903,8 +14904,8 @@ def test_provider_cancellation_publication_failure_remains_repairable(
         )
 
         monkeypatch.setattr(
-            app._recovery_coordinator,
-            "_emit_terminal_event_with_hooks",
+            app._terminal_event_publication,
+            "publish_recovered",
             original_terminal_stream,
         )
         recovered = await app.recover_incomplete_session(
@@ -14950,7 +14951,7 @@ def test_provider_cancellation_live_readback_rejects_conflicting_marker_payload(
         app = CayuApp(session_store=store, enable_logging=False)
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-        original_terminal_stream = app._recovery_coordinator._emit_terminal_event_with_hooks
+        original_terminal_stream = app._terminal_event_publication.publish_recovered
 
         async def conflicting_readback(request):  # type: ignore[no-untyped-def]
             async for event in original_terminal_stream(request):
@@ -14971,8 +14972,8 @@ def test_provider_cancellation_live_readback_rejects_conflicting_marker_payload(
                     yield event
 
         monkeypatch.setattr(
-            app._recovery_coordinator,
-            "_emit_terminal_event_with_hooks",
+            app._terminal_event_publication,
+            "publish_recovered",
             conflicting_readback,
         )
         task = asyncio.create_task(
@@ -21905,8 +21906,8 @@ def test_interrupt_waits_for_actual_terminal_event_before_checkpoint_cleanup(mon
             app._background_interruption_coordinator, "run_cascade", capture_cascade
         )
         monkeypatch.setattr(
-            app._session_engine,
-            "_emit_terminal_event_with_hooks",
+            app._terminal_event_publication,
+            "emit",
             terminal_stream,
         )
         events = [
@@ -22012,8 +22013,8 @@ def test_interrupt_does_not_start_or_clear_cascade_before_terminal_event(monkeyp
             yield await app._event_writer.emit(kwargs["event"])
 
         monkeypatch.setattr(
-            app._session_engine,
-            "_emit_terminal_event_with_hooks",
+            app._terminal_event_publication,
+            "emit",
             delayed_terminal_stream,
         )
         stream = app.interrupt_session(
@@ -24546,7 +24547,7 @@ def test_terminal_runtime_hook_completed_ack_loss_is_not_reentered():
             for index, registered_hook in enumerate(app._runtime_hooks)
         )
 
-        first_attempt = app._session_engine._run_runtime_hooks(
+        first_attempt = app._terminal_event_publication._run_runtime_hooks(
             phase=RuntimeHookPhase.AFTER_SESSION_COMPLETED,
             session=session,
             terminal_event=terminal_event,
@@ -24558,7 +24559,7 @@ def test_terminal_runtime_hook_completed_ack_loss_is_not_reentered():
 
         retry_events = [
             event
-            async for event in app._session_engine._run_runtime_hooks(
+            async for event in app._terminal_event_publication._run_runtime_hooks(
                 phase=RuntimeHookPhase.AFTER_SESSION_COMPLETED,
                 session=session,
                 terminal_event=terminal_event,
@@ -24640,7 +24641,7 @@ def test_terminal_runtime_hook_cancellation_after_reservation_enters_hook_once()
             (registered_hook, "app", index)
             for index, registered_hook in enumerate(app._runtime_hooks)
         )
-        first_attempt = app._session_engine._run_runtime_hooks(
+        first_attempt = app._terminal_event_publication._run_runtime_hooks(
             phase=RuntimeHookPhase.AFTER_SESSION_COMPLETED,
             session=session,
             terminal_event=terminal_event,
@@ -24658,7 +24659,7 @@ def test_terminal_runtime_hook_cancellation_after_reservation_enters_hook_once()
         assert hook.calls == 1
         retry_events = [
             event
-            async for event in app._session_engine._run_runtime_hooks(
+            async for event in app._terminal_event_publication._run_runtime_hooks(
                 phase=RuntimeHookPhase.AFTER_SESSION_COMPLETED,
                 session=session,
                 terminal_event=terminal_event,
@@ -24771,7 +24772,7 @@ def test_terminal_runtime_hook_replay_advances_past_settled_slots():
             for index, registered_hook in enumerate(app._runtime_hooks)
         )
 
-        first_attempt = app._session_engine._run_runtime_hooks(
+        first_attempt = app._terminal_event_publication._run_runtime_hooks(
             phase=RuntimeHookPhase.AFTER_SESSION_COMPLETED,
             session=session,
             terminal_event=terminal_event,
@@ -24786,7 +24787,7 @@ def test_terminal_runtime_hook_replay_advances_past_settled_slots():
 
         replay = [
             event
-            async for event in app._session_engine._run_runtime_hooks(
+            async for event in app._terminal_event_publication._run_runtime_hooks(
                 phase=RuntimeHookPhase.AFTER_SESSION_COMPLETED,
                 session=session,
                 terminal_event=terminal_event,
@@ -24861,7 +24862,7 @@ def test_unsettled_terminal_runtime_hook_reservation_is_not_reentered_or_skipped
             for index, registered_hook in enumerate(app._runtime_hooks)
         )
 
-        first_attempt = app._session_engine._run_runtime_hooks(
+        first_attempt = app._terminal_event_publication._run_runtime_hooks(
             phase=RuntimeHookPhase.AFTER_SESSION_COMPLETED,
             session=session,
             terminal_event=terminal_event,
@@ -24877,7 +24878,7 @@ def test_unsettled_terminal_runtime_hook_reservation_is_not_reentered_or_skipped
 
         retry_events = [
             event
-            async for event in app._session_engine._run_runtime_hooks(
+            async for event in app._terminal_event_publication._run_runtime_hooks(
                 phase=RuntimeHookPhase.AFTER_SESSION_COMPLETED,
                 session=session,
                 terminal_event=terminal_event,
@@ -31071,7 +31072,7 @@ def test_tool_round_recovery_post_persist_failure_preserves_operator_interrupt(
             block_resumable_interrupt,
         )
         monkeypatch.setattr(
-            recovery_coordinator_module,
+            recovery_ownership_module,
             "_MANUAL_RECOVERY_INTERRUPT_POLL_INTERVAL_SECONDS",
             0.01,
         )
@@ -31219,17 +31220,17 @@ def test_manual_recovery_watcher_defers_to_local_active_interruption(
         else:
             app._session_control.signal_interrupt(session_id)
         inspected = asyncio.Event()
-        original_require_session = app._recovery_coordinator._require_session
+        original_require_session = app._recovery_ownership.require_session
 
         async def observed_require_session(candidate_id):
             session = await original_require_session(candidate_id)
             inspected.set()
             return session
 
-        monkeypatch.setattr(app._recovery_coordinator, "_require_session", observed_require_session)
+        monkeypatch.setattr(app._recovery_ownership, "require_session", observed_require_session)
         stop = asyncio.Event()
         watcher = asyncio.create_task(
-            app._recovery_coordinator._watch_manual_recovery_interruption(
+            app._recovery_ownership.watch_manual_recovery_interruption(
                 session_id=session_id, interrupted_baseline_id=None, stop=stop
             )
         )
@@ -31296,7 +31297,7 @@ def test_cayu_app_recover_tool_round_operator_interrupts_blocked_continuation(
         watcher_rechecked = asyncio.Event()
         finalization_cancelled = asyncio.Event()
         original_load = app._session_engine.session_store.load
-        original_require = app._recovery_coordinator._require_session
+        original_require = app._recovery_ownership.require_session
         watcher_checks = 0
 
         async def hold_terminal_publication(candidate_id):
@@ -31324,7 +31325,7 @@ def test_cayu_app_recover_tool_round_operator_interrupts_blocked_continuation(
             return current
 
         monkeypatch.setattr(app._session_engine.session_store, "load", hold_terminal_publication)
-        monkeypatch.setattr(app._recovery_coordinator, "_require_session", observe_watcher)
+        monkeypatch.setattr(app._recovery_ownership, "require_session", observe_watcher)
 
         initial_events = await collect_events(
             app,
@@ -31534,8 +31535,8 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_stops_continuation_before_re
             )
 
         monkeypatch.setattr(
-            app._recovery_coordinator,
-            "_heartbeat_incomplete_recovery_claim",
+            app._recovery_ownership,
+            "heartbeat",
             fail_heartbeat,
         )
         monkeypatch.setattr(
@@ -31667,8 +31668,8 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_cleans_up_while_consumer_is_
             )
 
         monkeypatch.setattr(
-            app._recovery_coordinator,
-            "_heartbeat_incomplete_recovery_claim",
+            app._recovery_ownership,
+            "heartbeat",
             fail_heartbeat,
         )
         monkeypatch.setattr(
@@ -31790,7 +31791,7 @@ def test_cayu_app_recover_tool_round_observes_cross_worker_interrupt_while_pause
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        recovery_coordinator_module,
+        recovery_ownership_module,
         "_MANUAL_RECOVERY_INTERRUPT_POLL_INTERVAL_SECONDS",
         0.01,
     )
@@ -31888,7 +31889,7 @@ def test_cayu_app_recover_tool_round_preserves_cross_worker_interrupt_during_res
             return await super().load_events(session_id)
 
     monkeypatch.setattr(
-        recovery_coordinator_module,
+        recovery_ownership_module,
         "_MANUAL_RECOVERY_INTERRUPT_POLL_INTERVAL_SECONDS",
         60,
     )
@@ -32227,15 +32228,15 @@ def test_cayu_app_recover_tool_round_cancellation_after_claim_commit_preserves_c
             monkeypatch.setattr(recovery_coordinator_module, "time", RecoveryMonotonicClock)
             monkeypatch.setattr(_recovery_claims, "time", RecoveryMonotonicClock)
             cleanup_failure = RuntimeError("expired recovery claim cleanup failed")
-            original_release = app._recovery_coordinator._release_incomplete_recovery_claim
+            original_release = app._recovery_ownership.release_claim
 
             async def release_then_fail(session_id: str, claim_id: str) -> None:
                 await original_release(session_id, claim_id)
                 raise cleanup_failure
 
             monkeypatch.setattr(
-                app._recovery_coordinator,
-                "_release_incomplete_recovery_claim",
+                app._recovery_ownership,
+                "release_claim",
                 release_then_fail,
             )
         else:
@@ -32258,7 +32259,7 @@ def test_cayu_app_recover_tool_round_cancellation_after_claim_commit_preserves_c
         assert recovery_task.cancelling() == 1
         if expire_acknowledgement:
             monotonic_offset = (
-                recovery_coordinator_module._INCOMPLETE_RECOVERY_CLAIM_LEASE.total_seconds() + 1
+                recovery_ownership_module._INCOMPLETE_RECOVERY_CLAIM_LEASE.total_seconds() + 1
             )
         store.allow_recovery_transition_return.set()
         with pytest.raises(asyncio.CancelledError) as cancellation:
@@ -32597,7 +32598,7 @@ def test_manual_recovery_interruption_fence_uses_its_own_lease_deadline(
 
     monkeypatch.setattr(_recovery_claims, "time", RecoveryMonotonicClock)
     monkeypatch.setattr(
-        recovery_coordinator_module,
+        recovery_ownership_module,
         "_INCOMPLETE_RECOVERY_CLAIM_LEASE",
         timedelta(seconds=30),
     )
@@ -32883,7 +32884,7 @@ def test_cayu_app_recover_tool_round_serializes_across_apps(
         return current_time["value"]
 
     monkeypatch.setattr(
-        recovery_coordinator_module,
+        recovery_ownership_module,
         "_INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
         0.01,
     )
@@ -33867,7 +33868,7 @@ def test_cayu_app_recovery_watcher_ignores_its_owned_interrupted_transition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        recovery_coordinator_module,
+        recovery_ownership_module,
         "_MANUAL_RECOVERY_INTERRUPT_POLL_INTERVAL_SECONDS",
         0.01,
     )
@@ -33915,7 +33916,7 @@ def test_cayu_app_recovery_watcher_ignores_its_owned_interrupted_transition(
     async def scenario() -> None:
         terminal_started = asyncio.Event()
         release_terminal = asyncio.Event()
-        original_terminal_stream = app._recovery_coordinator._emit_terminal_event_with_hooks
+        original_terminal_stream = app._terminal_event_publication.publish_recovered
 
         async def block_owned_terminal(request):
             if (
@@ -33928,8 +33929,8 @@ def test_cayu_app_recovery_watcher_ignores_its_owned_interrupted_transition(
                 yield event
 
         monkeypatch.setattr(
-            app._recovery_coordinator,
-            "_emit_terminal_event_with_hooks",
+            app._terminal_event_publication,
+            "publish_recovered",
             block_owned_terminal,
         )
         recovery_task = asyncio.create_task(collect_tool_round_recovery_events(app, request))
@@ -36542,12 +36543,12 @@ def test_incomplete_recovery_renews_claim_while_hook_is_running(monkeypatch) -> 
         assert hook.execution_profiles == [active_profile.profile]
 
     monkeypatch.setattr(
-        recovery_coordinator_module,
+        recovery_ownership_module,
         "_INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
         0.01,
     )
     monkeypatch.setattr(
-        recovery_coordinator_module,
+        recovery_ownership_module,
         "_INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_RETRY_SECONDS",
         0.01,
     )

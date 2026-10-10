@@ -5773,7 +5773,7 @@ def test_elected_worker_replays_approval_failure_after_terminalization_interrupt
 
         original_materialize = app._pending_tool_round_recovery.materialize_expected_deferred_input
         original_fan_out = app._event_writer.fan_out_persisted
-        original_terminal = app._recovery_coordinator._emit_terminal_event_with_hooks
+        original_terminal = app._terminal_event_publication.publish_recovered
 
         async def fail_after_approval_close(*args, **kwargs):
             del args, kwargs
@@ -5803,8 +5803,8 @@ def test_elected_worker_replays_approval_failure_after_terminalization_interrupt
             monkeypatch.setattr(app._event_writer, "fan_out_persisted", lose_after_task_failure)
         else:
             monkeypatch.setattr(
-                app._recovery_coordinator,
-                "_emit_terminal_event_with_hooks",
+                app._terminal_event_publication,
+                "publish_recovered",
                 lose_after_session_failure,
             )
         with pytest.raises(_ApprovalProcessLoss):
@@ -5827,8 +5827,8 @@ def test_elected_worker_replays_approval_failure_after_terminalization_interrupt
         )
         monkeypatch.setattr(app._event_writer, "fan_out_persisted", original_fan_out)
         monkeypatch.setattr(
-            app._recovery_coordinator,
-            "_emit_terminal_event_with_hooks",
+            app._terminal_event_publication,
+            "publish_recovered",
             original_terminal,
         )
         drifted_hook = _VersionedSessionFailureHook("2")
@@ -6448,8 +6448,8 @@ def test_generic_continuation_failure_replays_after_task_terminalization_loss(
             raise RuntimeError("injected trailing terminal cleanup failure")
 
         monkeypatch.setattr(
-            recovered_app._session_engine,
-            "_clear_session_run_operation",
+            recovered_app._terminal_event_publication,
+            "clear_run_operation",
             unavailable_terminal_cleanup,
         )
         completed_replay = [event async for event in recovered_app.resolve_user_input(response)]

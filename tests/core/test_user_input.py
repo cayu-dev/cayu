@@ -2224,7 +2224,7 @@ def test_pause_classifier_refreshes_a_stale_snapshot_after_exact_supersession() 
         )
         assert interrupted[-1].type is EventType.SESSION_INTERRUPTED
 
-        state = await app._recovery_coordinator._classify_user_input_pause(
+        state = await app._user_input_evidence.classify_pause(
             session=stale_session,
             checkpoint=stale_checkpoint,
             input_id=private_input_id,

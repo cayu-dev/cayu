@@ -1466,8 +1466,8 @@ def test_interrupt_redacts_request_before_pending_checkpoint(monkeypatch) -> Non
             yield await app._event_writer.emit(kwargs["event"])
 
         monkeypatch.setattr(
-            app._session_engine,
-            "_emit_terminal_event_with_hooks",
+            app._terminal_event_publication,
+            "emit",
             terminal_stream,
         )
         events = [

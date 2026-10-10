@@ -691,7 +691,7 @@ def test_abandoned_session_contains_cancellation_group_from_terminal_cleanup() -
             )
             yield  # pragma: no cover
 
-        h.app._recovery_coordinator._emit_terminal_event_with_hooks = fail_terminal
+        h.app._terminal_event_publication.publish_recovered = fail_terminal
         await h.app._recovery_coordinator.finalize_abandoned_session_by_id(
             "sess_grouped_abandonment"
         )

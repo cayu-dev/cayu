@@ -170,6 +170,7 @@ from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent, U
 from cayu.providers.bedrock import bedrock_billing_identity, completed_bedrock_billing_identity
 from cayu.providers.operations import ProviderOperationState, ProviderOperationStatus
 from cayu.runtime import _approval_support as approval_support
+from cayu.runtime import _recovery_ownership as recovery_ownership_module
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime._approval_support import _pending_approval_for_atomic_claim
 from cayu.runtime._child_session_notifications import (
@@ -1904,7 +1905,7 @@ def test_session_store_conformance_repairs_provider_cancellation_terminal_public
             app.register_provider(provider, default=True)
             app.register_agent(AgentSpec(name="assistant", model="fake-model"))
             session_id = f"provider-cancellation-repair-{session_store_case[0]}"
-            original_terminal_stream = app._recovery_coordinator._emit_terminal_event_with_hooks
+            original_terminal_stream = app._terminal_event_publication.publish_recovered
 
             async def fail_interrupted_publication(request):  # type: ignore[no-untyped-def]
                 if request.event.type == EventType.SESSION_INTERRUPTED:
@@ -1913,8 +1914,8 @@ def test_session_store_conformance_repairs_provider_cancellation_terminal_public
                     yield event
 
             monkeypatch.setattr(
-                app._recovery_coordinator,
-                "_emit_terminal_event_with_hooks",
+                app._terminal_event_publication,
+                "publish_recovered",
                 fail_interrupted_publication,
             )
 
@@ -7999,7 +8000,7 @@ def test_session_store_conformance_claim_loss_does_not_run_unclaimed_abandonment
                 reason="operator supersedes the paused question",
             )
             recovery = app._session_engine._recovery_coordinator
-            original_heartbeat = recovery._heartbeat_incomplete_recovery_claim
+            original_heartbeat = recovery._recovery_ownership.heartbeat
             original_publish = store.publish_interaction_transition
             original_status_transition = store.transition_status_and_checkpoint
             original_finalize_abandoned = recovery.finalize_abandoned_session_run
@@ -8058,8 +8059,8 @@ def test_session_store_conformance_claim_loss_does_not_run_unclaimed_abandonment
                 observe_abandoned_finalization
             )
             monkeypatch.setattr(
-                recovery,
-                "_heartbeat_incomplete_recovery_claim",
+                recovery._recovery_ownership,
+                "heartbeat",
                 replace_claim_while_transition_waits,
             )
 
@@ -8110,8 +8111,8 @@ def test_session_store_conformance_claim_loss_does_not_run_unclaimed_abandonment
                 original_finalize_abandoned
             )
             monkeypatch.setattr(
-                recovery,
-                "_heartbeat_incomplete_recovery_claim",
+                recovery._recovery_ownership,
+                "heartbeat",
                 original_heartbeat,
             )
             with session_engine_module.suppress_interruption_cascade():
@@ -9220,17 +9221,17 @@ def test_session_store_conformance_reconstructs_active_user_input_supersession(
         session_id = f"user-input-active-supersession-{session_store_case[0]}"
         try:
             monkeypatch.setattr(
-                recovery_coordinator_module,
+                recovery_ownership_module,
                 "_INCOMPLETE_RECOVERY_CLAIM_LEASE",
                 timedelta(seconds=1),
             )
             monkeypatch.setattr(
-                recovery_coordinator_module,
+                recovery_ownership_module,
                 "_INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
                 0.02,
             )
             monkeypatch.setattr(
-                recovery_coordinator_module,
+                recovery_ownership_module,
                 "_INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_RETRY_SECONDS",
                 0.01,
             )
@@ -9844,7 +9845,7 @@ def test_session_store_conformance_does_not_dispatch_expired_terminal_finalizati
         session_id = f"expired-terminal-finalization-claim-{session_store_case[0]}"
         try:
             monkeypatch.setattr(
-                recovery_coordinator_module,
+                recovery_ownership_module,
                 "_INCOMPLETE_RECOVERY_CLAIM_LEASE",
                 timedelta(milliseconds=100),
             )
@@ -9937,7 +9938,7 @@ def test_session_store_conformance_does_not_dispatch_expired_terminal_finalizati
 
             store.transition_status_and_checkpoint = original_transition  # type: ignore[method-assign]
             monkeypatch.setattr(
-                recovery_coordinator_module,
+                recovery_ownership_module,
                 "_INCOMPLETE_RECOVERY_CLAIM_LEASE",
                 timedelta(minutes=5),
             )
@@ -10693,8 +10694,8 @@ def test_incomplete_recovery_success_does_not_suppress_simultaneous_claim_loss(
             )
 
         monkeypatch.setattr(
-            recovery,
-            "_heartbeat_incomplete_recovery_claim",
+            recovery._recovery_ownership,
+            "heartbeat",
             lose_claim_with_recovery_completion,
         )
 
@@ -10703,7 +10704,7 @@ def test_incomplete_recovery_success_does_not_suppress_simultaneous_claim_loss(
             await asyncio.sleep(0)
             return True
 
-        claim = await recovery._claim_incomplete_recovery(
+        claim = await recovery._recovery_ownership.claim(
             session=session,
             inactive_for_seconds=None,
             execution_profile_snapshot=active_invocation_execution_profile_from_checkpoint(
@@ -10715,7 +10716,7 @@ def test_incomplete_recovery_success_does_not_suppress_simultaneous_claim_loss(
             recovery_coordinator_module._IncompleteRecoveryClaimLost,
             match="peer replaced",
         ):
-            await recovery._recover_incomplete_session_with_heartbeat(
+            await recovery._recovery_ownership.run_with_heartbeat(
                 claim=claim,
                 recovery=finish_recovery,
             )
@@ -10737,17 +10738,17 @@ def test_session_store_conformance_stops_live_finalizer_after_terminal_claim_los
         tasks: list[asyncio.Task[list[Event]]] = []
         try:
             monkeypatch.setattr(
-                recovery_coordinator_module,
+                recovery_ownership_module,
                 "_INCOMPLETE_RECOVERY_CLAIM_LEASE",
                 timedelta(seconds=2),
             )
             monkeypatch.setattr(
-                recovery_coordinator_module,
+                recovery_ownership_module,
                 "_INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
                 0.02,
             )
             monkeypatch.setattr(
-                recovery_coordinator_module,
+                recovery_ownership_module,
                 "_INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_RETRY_SECONDS",
                 0.01,
             )
@@ -10831,7 +10832,7 @@ def test_session_store_conformance_stops_live_finalizer_after_terminal_claim_los
                 lost_claim_id = lost_claim["claim_id"]
 
                 recovery = app._session_engine._recovery_coordinator
-                original_renew = recovery._renew_incomplete_recovery_claim
+                original_renew = recovery._recovery_ownership.renew_claim
 
                 async def lose_live_claim(
                     renewed_session_id: str,
@@ -10844,7 +10845,7 @@ def test_session_store_conformance_stops_live_finalizer_after_terminal_claim_los
                         renewed_claim_id,
                     )
 
-                recovery._renew_incomplete_recovery_claim = (  # type: ignore[method-assign]
+                recovery._recovery_ownership.renew_claim = (  # type: ignore[method-assign]
                     lose_live_claim
                 )
                 handoff = (
@@ -17717,7 +17718,7 @@ def test_auxiliary_recovery_terminal_requires_live_exact_owner(
             )
             if dispatched:
                 await store.mark_model_completion_stage_dispatched(session.id, stage=prepared.stage)
-            claim = await app._session_engine._recovery_coordinator._claim_incomplete_recovery(
+            claim = await app._session_engine._recovery_ownership.claim(
                 session=session,
                 inactive_for_seconds=None,
                 execution_profile_snapshot=admitted.active_invocation_profile,

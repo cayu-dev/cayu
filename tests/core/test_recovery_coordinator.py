@@ -24,6 +24,7 @@ from cayu.execution_units import ToolRoundIdentity
 from cayu.messages import Message
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime import _recovery_coordinator as recovery_coordinator
+from cayu.runtime import _recovery_ownership as recovery_ownership_module
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._recovery_coordinator import (
     _effective_approval_budget_limits,
@@ -33,10 +34,12 @@ from cayu.runtime._recovery_coordinator import (
     _effective_approval_thinking,
     _IncompleteRecoveryClaimLost,
     _interrupted_tool_round_results,
-    _recovery_abandonment_signal,
     _retain_abandoned_unreplayable_tool_round,
-    _run_recovery_cleanup_steps,
     _task_cancellation_count,
+)
+from cayu.runtime._recovery_ownership import (
+    _recovery_abandonment_signal,
+    _run_recovery_cleanup_steps,
 )
 from cayu.runtime.build_provenance import (
     RuntimeBuildArtifactKind,
@@ -500,7 +503,7 @@ def test_initial_incomplete_recovery_claim_cannot_fence_replacement_owner() -> N
         replacement_app = CayuApp(session_store=store, clock=clock, enable_logging=False)
 
         first_task = asyncio.create_task(
-            first_app._recovery_coordinator._claim_incomplete_recovery(
+            first_app._recovery_ownership.claim(
                 session=session,
                 inactive_for_seconds=None,
             ),
@@ -515,7 +518,7 @@ def test_initial_incomplete_recovery_claim_cannot_fence_replacement_owner() -> N
         current_time["value"] += timedelta(minutes=6)
         current = await store.load(session.id)
         assert current is not None
-        replacement_claim = await replacement_app._recovery_coordinator._claim_incomplete_recovery(
+        replacement_claim = await replacement_app._recovery_ownership.claim(
             session=current,
             inactive_for_seconds=None,
             required_expired_claim_id=first_marker["claim_id"],
@@ -544,7 +547,7 @@ def test_initial_incomplete_recovery_claim_cannot_fence_replacement_owner() -> N
             await store.update_metadata(session.id, {"replacement_owner_wrote": True})
         finally:
             store.release_first_claim.set()
-            await replacement_app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+            await replacement_app._recovery_ownership.cleanup_claim(
                 authority=replacement_claim.require_authority(),
                 authoritative_failure=None,
             )
@@ -566,7 +569,7 @@ def test_incomplete_recovery_claim_finalization_transfers_across_tasks() -> None
         )
         app = CayuApp(session_store=store, enable_logging=False)
 
-        first = await app._recovery_coordinator._claim_incomplete_recovery(
+        first = await app._recovery_ownership.claim(
             session=session,
             inactive_for_seconds=None,
         )
@@ -577,7 +580,7 @@ def test_incomplete_recovery_claim_finalization_transfers_across_tasks() -> None
         # process-local owner acquired by this task. Context copying must not
         # leave the acquiring task fenced at the released epoch.
         await asyncio.create_task(
-            app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+            app._recovery_ownership.cleanup_claim(
                 authority=first.require_authority(),
                 authoritative_failure=None,
             ),
@@ -589,12 +592,12 @@ def test_incomplete_recovery_claim_finalization_transfers_across_tasks() -> None
         current = await store.load(session.id)
         assert current is not None
         assert current.run_epoch == first.session.run_epoch + 1
-        second = await app._recovery_coordinator._claim_incomplete_recovery(
+        second = await app._recovery_ownership.claim(
             session=current,
             inactive_for_seconds=None,
         )
         assert second is not None
-        await app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+        await app._recovery_ownership.cleanup_claim(
             authority=first.require_authority(),
             authoritative_failure=None,
         )
@@ -604,7 +607,7 @@ def test_incomplete_recovery_claim_finalization_transfers_across_tasks() -> None
         second_marker = second_checkpoint["incomplete_session_recovery_claim"]
         assert second_marker["claim_id"] == second.claim_id
         await asyncio.create_task(
-            app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+            app._recovery_ownership.cleanup_claim(
                 authority=second.require_authority(),
                 authoritative_failure=None,
             )
@@ -616,12 +619,12 @@ def test_incomplete_recovery_claim_finalization_transfers_across_tasks() -> None
         reconstructed = CayuApp(session_store=store, enable_logging=False)
         reconstructed_session = await store.load(session.id)
         assert reconstructed_session is not None
-        third = await reconstructed._recovery_coordinator._claim_incomplete_recovery(
+        third = await reconstructed._recovery_ownership.claim(
             session=reconstructed_session,
             inactive_for_seconds=None,
         )
         assert third is not None
-        await reconstructed._recovery_coordinator._cleanup_incomplete_recovery_claim(
+        await reconstructed._recovery_ownership.cleanup_claim(
             authority=third.require_authority(),
             authoritative_failure=None,
         )
@@ -651,7 +654,7 @@ def test_incomplete_recovery_claim_finalization_is_exactly_once() -> None:
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
         app = CayuApp(session_store=store, enable_logging=False)
-        claim = await app._recovery_coordinator._claim_incomplete_recovery(
+        claim = await app._recovery_ownership.claim(
             session=session,
             inactive_for_seconds=None,
         )
@@ -659,7 +662,7 @@ def test_incomplete_recovery_claim_finalization_is_exactly_once() -> None:
         authority = claim.require_authority()
 
         async def finalize() -> None:
-            await app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+            await app._recovery_ownership.cleanup_claim(
                 authority=authority,
                 authoritative_failure=None,
             )
@@ -718,7 +721,7 @@ def test_incomplete_recovery_claim_marker_release_failure_is_retryable(
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
         app = CayuApp(session_store=store, enable_logging=False)
-        claim = await app._recovery_coordinator._claim_incomplete_recovery(
+        claim = await app._recovery_ownership.claim(
             session=session,
             inactive_for_seconds=None,
         )
@@ -729,7 +732,7 @@ def test_incomplete_recovery_claim_marker_release_failure_is_retryable(
         store.fail_claim_release = True
         failure_label = failure_mode.replace("_", " ")
         with pytest.raises(RuntimeError, match=f"claim release failed {failure_label}"):
-            await app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+            await app._recovery_ownership.cleanup_claim(
                 authority=authority,
                 authoritative_failure=None,
             )
@@ -748,7 +751,7 @@ def test_incomplete_recovery_claim_marker_release_failure_is_retryable(
 
         if failure_mode == "before_commit":
             assert authority.run_fence.retired is False
-            await app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+            await app._recovery_ownership.cleanup_claim(
                 authority=authority,
                 authoritative_failure=None,
             )
@@ -758,7 +761,7 @@ def test_incomplete_recovery_claim_marker_release_failure_is_retryable(
             # caller-owned retry is required to retire process-local authority.
             assert authority.run_fence.retired is True
             expected_release_attempts = 1
-        await app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+        await app._recovery_ownership.cleanup_claim(
             authority=authority,
             authoritative_failure=None,
         )
@@ -808,7 +811,7 @@ def test_claim_release_ack_loss_confirms_transfer_after_fence_failure() -> None:
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
         app = CayuApp(session_store=store, enable_logging=False)
-        first = await app._recovery_coordinator._claim_incomplete_recovery(
+        first = await app._recovery_ownership.claim(
             session=session,
             inactive_for_seconds=None,
         )
@@ -818,7 +821,7 @@ def test_claim_release_ack_loss_confirms_transfer_after_fence_failure() -> None:
         store.fail_fence_release = True
         store.lose_claim_release_acknowledgement = True
         with pytest.raises(RuntimeError, match="recovery fence release unavailable"):
-            await app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+            await app._recovery_ownership.cleanup_claim(
                 authority=authority,
                 authoritative_failure=None,
             )
@@ -832,12 +835,12 @@ def test_claim_release_ack_loss_confirms_transfer_after_fence_failure() -> None:
         # the session immediately claimable without invoking it a second time.
         current = await store.load(session.id)
         assert current is not None
-        replacement = await app._recovery_coordinator._claim_incomplete_recovery(
+        replacement = await app._recovery_ownership.claim(
             session=current,
             inactive_for_seconds=None,
         )
         assert replacement is not None
-        await app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+        await app._recovery_ownership.cleanup_claim(
             authority=replacement.require_authority(),
             authoritative_failure=None,
         )
@@ -876,7 +879,7 @@ def test_claim_release_cancellation_after_commit_retires_authority() -> None:
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
         app = CayuApp(session_store=store, enable_logging=False)
-        claim = await app._recovery_coordinator._claim_incomplete_recovery(
+        claim = await app._recovery_ownership.claim(
             session=session,
             inactive_for_seconds=None,
         )
@@ -885,7 +888,7 @@ def test_claim_release_cancellation_after_commit_retires_authority() -> None:
 
         store.block_claim_release = True
         cleanup_task = asyncio.create_task(
-            app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+            app._recovery_ownership.cleanup_claim(
                 authority=authority,
                 authoritative_failure=None,
             )
@@ -903,12 +906,12 @@ def test_claim_release_cancellation_after_commit_retires_authority() -> None:
 
         current = await store.load(session.id)
         assert current is not None
-        replacement = await app._recovery_coordinator._claim_incomplete_recovery(
+        replacement = await app._recovery_ownership.claim(
             session=current,
             inactive_for_seconds=None,
         )
         assert replacement is not None
-        await app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+        await app._recovery_ownership.cleanup_claim(
             authority=replacement.require_authority(),
             authoritative_failure=None,
         )
@@ -939,7 +942,7 @@ def test_incomplete_recovery_fence_release_failure_transfers_immediately() -> No
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
         app = CayuApp(session_store=store, enable_logging=False)
-        first = await app._recovery_coordinator._claim_incomplete_recovery(
+        first = await app._recovery_ownership.claim(
             session=session,
             inactive_for_seconds=None,
         )
@@ -947,7 +950,7 @@ def test_incomplete_recovery_fence_release_failure_transfers_immediately() -> No
 
         store.fail_fence_release = True
         with pytest.raises(RuntimeError, match="recovery fence release unavailable"):
-            await app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+            await app._recovery_ownership.cleanup_claim(
                 authority=first.require_authority(),
                 authoritative_failure=None,
             )
@@ -956,12 +959,12 @@ def test_incomplete_recovery_fence_release_failure_transfers_immediately() -> No
         assert checkpoint is None or "incomplete_session_recovery_claim" not in checkpoint
         current = await store.load(session.id)
         assert current is not None
-        replacement = await app._recovery_coordinator._claim_incomplete_recovery(
+        replacement = await app._recovery_ownership.claim(
             session=current,
             inactive_for_seconds=None,
         )
         assert replacement is not None
-        await app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+        await app._recovery_ownership.cleanup_claim(
             authority=replacement.require_authority(),
             authoritative_failure=None,
         )
@@ -1004,7 +1007,7 @@ def test_initial_incomplete_recovery_claim_cannot_fence_after_its_lease_expires(
         app = CayuApp(session_store=store, clock=clock, enable_logging=False)
 
         stale_claim = asyncio.create_task(
-            app._recovery_coordinator._claim_incomplete_recovery(
+            app._recovery_ownership.claim(
                 session=session,
                 inactive_for_seconds=None,
             )
@@ -1020,12 +1023,12 @@ def test_initial_incomplete_recovery_claim_cannot_fence_after_its_lease_expires(
         checkpoint = await store.load_checkpoint(session.id)
         assert checkpoint is None or "incomplete_session_recovery_claim" not in checkpoint
 
-        retry = await app._recovery_coordinator._claim_incomplete_recovery(
+        retry = await app._recovery_ownership.claim(
             session=durable,
             inactive_for_seconds=None,
         )
         assert retry is not None
-        await app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+        await app._recovery_ownership.cleanup_claim(
             authority=retry.require_authority(),
             authoritative_failure=None,
         )
@@ -1038,7 +1041,7 @@ def test_incomplete_recovery_rejects_renewal_acknowledged_after_full_lease(
 ) -> None:
     async def scenario() -> None:
         monkeypatch.setattr(
-            recovery_coordinator,
+            recovery_ownership_module,
             "_INCOMPLETE_RECOVERY_CLAIM_LEASE",
             timedelta(milliseconds=50),
         )
@@ -1053,19 +1056,19 @@ def test_incomplete_recovery_rejects_renewal_acknowledged_after_full_lease(
         )
         app = CayuApp(session_store=store, enable_logging=False)
         coordinator = app._recovery_coordinator
-        original_renew = coordinator._renew_incomplete_recovery_claim
+        original_renew = coordinator._recovery_ownership.renew_claim
 
         async def delayed_renew(session_id: str, claim_id: str):
             renewed = await original_renew(session_id, claim_id)
             await asyncio.sleep(0.06)
             return renewed
 
-        monkeypatch.setattr(coordinator, "_renew_incomplete_recovery_claim", delayed_renew)
+        monkeypatch.setattr(coordinator._recovery_ownership, "renew_claim", delayed_renew)
         with pytest.raises(
             _IncompleteRecoveryClaimLost,
             match="acknowledgement consumed its lease",
         ):
-            await coordinator._claim_incomplete_recovery(
+            await coordinator._recovery_ownership.claim(
                 session=session,
                 inactive_for_seconds=None,
             )
@@ -1218,7 +1221,7 @@ def test_expired_local_recovery_claim_never_starts_recovery_callback() -> None:
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
         app = CayuApp(session_store=store, enable_logging=False)
-        claim = await app._recovery_coordinator._claim_incomplete_recovery(
+        claim = await app._recovery_ownership.claim(
             session=session,
             inactive_for_seconds=None,
         )
@@ -1232,12 +1235,12 @@ def test_expired_local_recovery_claim_never_starts_recovery_callback() -> None:
             raise AssertionError("Expired recovery authority must not dispatch work.")
 
         with pytest.raises(_IncompleteRecoveryClaimLost):
-            await app._recovery_coordinator._recover_incomplete_session_with_heartbeat(
+            await app._recovery_ownership.run_with_heartbeat(
                 claim=expired_claim,
                 recovery=recovery,
             )
         assert recovery_started is False
-        await app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+        await app._recovery_ownership.cleanup_claim(
             authority=claim.require_authority(),
             authoritative_failure=None,
         )
@@ -1288,7 +1291,7 @@ def test_initial_incomplete_recovery_reconciles_ambiguous_atomic_claim() -> None
             RuntimeError,
             match="initial recovery claim acknowledgement lost",
         ):
-            await app._recovery_coordinator._claim_incomplete_recovery(
+            await app._recovery_ownership.claim(
                 session=session,
                 inactive_for_seconds=None,
             )
@@ -1298,12 +1301,12 @@ def test_initial_incomplete_recovery_reconciles_ambiguous_atomic_claim() -> None
 
         current = await store.load(session.id)
         assert current is not None
-        retry_claim = await app._recovery_coordinator._claim_incomplete_recovery(
+        retry_claim = await app._recovery_ownership.claim(
             session=current,
             inactive_for_seconds=None,
         )
         assert retry_claim is not None
-        await app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+        await app._recovery_ownership.cleanup_claim(
             authority=retry_claim.require_authority(),
             authoritative_failure=None,
         )
@@ -1342,7 +1345,7 @@ def test_initial_incomplete_recovery_releases_ambiguous_store_time_reservation()
             RuntimeError,
             match="store-time reservation acknowledgement lost",
         ):
-            await app._recovery_coordinator._claim_incomplete_recovery(
+            await app._recovery_ownership.claim(
                 session=session,
                 inactive_for_seconds=None,
             )
@@ -1353,12 +1356,12 @@ def test_initial_incomplete_recovery_releases_ambiguous_store_time_reservation()
         assert current is not None
         assert current.run_epoch == session.run_epoch
 
-        retry_claim = await app._recovery_coordinator._claim_incomplete_recovery(
+        retry_claim = await app._recovery_ownership.claim(
             session=current,
             inactive_for_seconds=None,
         )
         assert retry_claim is not None
-        await app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+        await app._recovery_ownership.cleanup_claim(
             authority=retry_claim.require_authority(),
             authoritative_failure=None,
         )
@@ -1403,7 +1406,7 @@ def test_initial_incomplete_recovery_rejects_build_provenance_change_before_fenc
         )
         app = CayuApp(session_store=store, enable_logging=False)
 
-        claim = await app._recovery_coordinator._claim_incomplete_recovery(
+        claim = await app._recovery_ownership.claim(
             session=session,
             inactive_for_seconds=None,
         )
@@ -1436,7 +1439,7 @@ def test_expired_incomplete_recovery_renewal_does_not_refresh_activity() -> None
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
         app = CayuApp(session_store=store, enable_logging=False)
-        claim = await app._recovery_coordinator._claim_incomplete_recovery(
+        claim = await app._recovery_ownership.claim(
             session=session,
             inactive_for_seconds=None,
         )
@@ -1448,7 +1451,7 @@ def test_expired_incomplete_recovery_renewal_does_not_refresh_activity() -> None
         assert before_checkpoint is not None
 
         current_time["value"] = claim.claim_expires_at
-        renewed_until = await app._recovery_coordinator._renew_incomplete_recovery_claim(
+        renewed_until = await app._recovery_ownership.renew_claim(
             session.id,
             claim.claim_id,
         )
@@ -1456,7 +1459,7 @@ def test_expired_incomplete_recovery_renewal_does_not_refresh_activity() -> None
         assert await store.load(session.id) == before_session
         assert await store.load_checkpoint(session.id) == before_checkpoint
 
-        await app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+        await app._recovery_ownership.cleanup_claim(
             authority=claim.require_authority(),
             authoritative_failure=None,
         )
@@ -1501,7 +1504,7 @@ def test_stalled_incomplete_recovery_renewal_stops_work_at_local_lease_deadline(
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
         app = CayuApp(session_store=store, enable_logging=False)
-        claim = await app._recovery_coordinator._claim_incomplete_recovery(
+        claim = await app._recovery_ownership.claim(
             session=session,
             inactive_for_seconds=None,
         )
@@ -1520,7 +1523,7 @@ def test_stalled_incomplete_recovery_renewal_stops_work_at_local_lease_deadline(
                 recovery_stopped.set()
 
         owner = asyncio.create_task(
-            app._recovery_coordinator._recover_incomplete_session_with_heartbeat(
+            app._recovery_ownership.run_with_heartbeat(
                 claim=short_claim,
                 recovery=recovery,
             )
@@ -1538,7 +1541,7 @@ def test_stalled_incomplete_recovery_renewal_stops_work_at_local_lease_deadline(
 
         store.release_renewal.set()
         await asyncio.wait_for(store.renewal_finished.wait(), timeout=1)
-        await app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+        await app._recovery_ownership.cleanup_claim(
             authority=claim.require_authority(),
             authoritative_failure=None,
         )
@@ -1561,7 +1564,7 @@ def test_incomplete_recovery_fatal_settlement_wins_over_lease_loss(
         )
         app = CayuApp(session_store=store, enable_logging=False)
         coordinator = app._recovery_coordinator
-        claim = await coordinator._claim_incomplete_recovery(
+        claim = await coordinator._recovery_ownership.claim(
             session=session,
             inactive_for_seconds=None,
         )
@@ -1580,12 +1583,12 @@ def test_incomplete_recovery_fatal_settlement_wins_over_lease_loss(
             raise fatal
 
         monkeypatch.setattr(
-            coordinator,
-            "_heartbeat_incomplete_recovery_claim",
+            coordinator._recovery_ownership,
+            "heartbeat",
             lose_lease,
         )
         owner = asyncio.create_task(
-            coordinator._recover_incomplete_session_with_heartbeat(
+            coordinator._recovery_ownership.run_with_heartbeat(
                 claim=claim,
                 recovery=recovery,
             )
@@ -1634,7 +1637,7 @@ def test_incomplete_recovery_renewal_preserves_owner_cancellation(
 
     async def scenario() -> None:
         monkeypatch.setattr(
-            recovery_coordinator,
+            recovery_ownership_module,
             "_INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
@@ -1648,14 +1651,14 @@ def test_incomplete_recovery_renewal_preserves_owner_cancellation(
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
         app = CayuApp(session_store=store, enable_logging=False)
-        claim = await app._recovery_coordinator._claim_incomplete_recovery(
+        claim = await app._recovery_ownership.claim(
             session=session,
             inactive_for_seconds=None,
         )
         assert claim is not None
         store.block_renewal = True
         heartbeat = asyncio.create_task(
-            app._recovery_coordinator._heartbeat_incomplete_recovery_claim(
+            app._recovery_ownership.heartbeat(
                 session_id=session.id,
                 claim_id=claim.claim_id,
                 local_lease_deadline=time.monotonic() + 10,
@@ -1683,7 +1686,7 @@ def test_incomplete_recovery_renewal_preserves_owner_cancellation(
         assert heartbeat.cancelling() == 1
         assert store.renewal_finished.is_set()
 
-        await app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+        await app._recovery_ownership.cleanup_claim(
             authority=claim.require_authority(),
             authoritative_failure=None,
         )
@@ -1704,7 +1707,7 @@ def test_incomplete_recovery_owner_cancellation_drains_opaque_work() -> None:
         )
         app = CayuApp(session_store=store, enable_logging=False)
         coordinator = app._recovery_coordinator
-        claim = await coordinator._claim_incomplete_recovery(
+        claim = await coordinator._recovery_ownership.claim(
             session=session,
             inactive_for_seconds=None,
         )
@@ -1721,7 +1724,7 @@ def test_incomplete_recovery_owner_cancellation_drains_opaque_work() -> None:
             return await asyncio.to_thread(opaque_work)
 
         owner = asyncio.create_task(
-            coordinator._recover_incomplete_session_with_heartbeat(
+            coordinator._recovery_ownership.run_with_heartbeat(
                 claim=claim,
                 recovery=recovery,
             )
@@ -1741,7 +1744,7 @@ def test_incomplete_recovery_owner_cancellation_drains_opaque_work() -> None:
             await asyncio.wait_for(owner, timeout=1)
         assert owner.cancelled() is True
         assert owner.cancelling() == 1
-        await coordinator._cleanup_incomplete_recovery_claim(
+        await coordinator._recovery_ownership.cleanup_claim(
             authority=claim.require_authority(),
             authoritative_failure=None,
             recovery_work_quiescent=True,
@@ -1839,7 +1842,7 @@ def test_live_finalization_shares_recovery_claim_until_work_settles(observer_exi
         try:
             assert await asyncio.wait_for(anext(stream), timeout=5) == "first"
             with pytest.raises(RuntimeError, match="already has active workers"):
-                await recovery._recover_incomplete_session_with_heartbeat(
+                await recovery._recovery_ownership.run_with_heartbeat(
                     claim=recovery_coordinator._IncompleteRecoveryClaim(
                         claim_id=acquisition.claim_id,
                         claim_expires_at=acquisition.claim_expires_at,
@@ -1851,7 +1854,7 @@ def test_live_finalization_shares_recovery_claim_until_work_settles(observer_exi
                 )
             assert not competing_work_dispatched
             release = asyncio.create_task(
-                recovery._release_incomplete_recovery_claim(session.id, acquisition.claim_id)
+                recovery._recovery_ownership.release_claim(session.id, acquisition.claim_id)
             )
             if observer_exit == "close":
                 observer = asyncio.create_task(stream.aclose())

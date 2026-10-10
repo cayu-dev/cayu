@@ -21,6 +21,7 @@ from cayu import (
 from cayu.evals.testing import ScriptedModelProvider, scripted_structured_output
 from cayu.external_waits import ExternalEventWaits
 from cayu.providers.base import ModelStreamEvent
+from cayu.runtime import _recovery_ownership as recovery_ownership_module
 from cayu.runtime._external_execution_to_wait import _ExternalExecutionToWait
 from cayu.session_external_waits import SessionExternalWaitAdapter
 from cayu.sessions.execution import SessionExecutionConfig
@@ -32,11 +33,10 @@ from cayu.storage.sqlite import SQLiteSessionStore
 async def main():
     setup = json.loads(sys.stdin.readline())
     if setup.get("receipt_limit") is not None:
-        from cayu.runtime import _recovery_coordinator
         from cayu.sessions import _invocation_lifecycle
 
         _invocation_lifecycle.INVOCATION_LIFECYCLE_RECEIPT_LEDGER_MAX_ITEMS = setup["receipt_limit"]
-        _recovery_coordinator._INCOMPLETE_RECOVERY_CLAIM_LEASE = timedelta(seconds=2)
+        recovery_ownership_module._INCOMPLETE_RECOVERY_CLAIM_LEASE = timedelta(seconds=2)
     store = (
         SQLiteSessionStore(setup["database"])
         if setup["backend"] == "sqlite"

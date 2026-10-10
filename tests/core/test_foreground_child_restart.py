@@ -22,6 +22,7 @@ from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
 from cayu.approvals.user_input import UserInputResponse
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
+from cayu.runtime import _recovery_ownership as recovery_ownership_module
 from cayu.runtime._model_completion_contracts import ModelCompletionManualRecoveryRequired
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
@@ -67,17 +68,15 @@ async def _worker(path: str, action: str, phase: str) -> None:
     redacted_ids = action.endswith("-redacted")
     action = action.removesuffix("-redacted")
     if phase in {"child-stop-claim", "claim-action-close", "dispatch-action-close"}:
-        from cayu.runtime import _session_engine
 
         # Keep the real store-clock lease and wait for expiry after SIGKILL.
         # The test must not steal a claim merely because its process disappeared.
-        _session_engine._INCOMPLETE_RECOVERY_CLAIM_LEASE = timedelta(
+        recovery_ownership_module._INCOMPLETE_RECOVERY_CLAIM_LEASE = timedelta(
             seconds=_TEST_TERMINAL_CLAIM_LEASE_SECONDS
         )
         if phase in {"claim-action-close", "dispatch-action-close"}:
-            from cayu.runtime import _recovery_coordinator
 
-            _recovery_coordinator._INCOMPLETE_RECOVERY_CLAIM_LEASE = timedelta(
+            recovery_ownership_module._INCOMPLETE_RECOVERY_CLAIM_LEASE = timedelta(
                 seconds=_TEST_TERMINAL_CLAIM_LEASE_SECONDS
             )
     codec = (

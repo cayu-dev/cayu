@@ -611,7 +611,7 @@ async def test_native_deadline_reconciles_completion_publication(
             await asyncio.Event().wait()
         return result
 
-    terminal_stream = app._session_engine._emit_terminal_event_with_hooks
+    terminal_stream = app._terminal_event_publication.emit
 
     async def pause_terminal(**kwargs):
         nonlocal paused, child_id
@@ -624,7 +624,7 @@ async def test_native_deadline_reconciles_completion_publication(
                     await asyncio.Event().wait()
                 yield event
 
-    monkeypatch.setattr(app._session_engine, "_emit_terminal_event_with_hooks", pause_terminal)
+    monkeypatch.setattr(app._terminal_event_publication, "emit", pause_terminal)
     monkeypatch.setattr(store, "append_event", lose_ack)
 
     async def invoke():

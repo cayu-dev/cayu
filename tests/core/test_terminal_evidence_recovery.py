@@ -126,11 +126,11 @@ def test_terminal_publication_uncertainty_preserves_both_failure_chains(
 
         monkeypatch.setattr(app._event_writer, "emit", fail_publication)
         monkeypatch.setattr(
-            app._session_engine,
-            "_reconcile_persisted_terminal_event",
+            app._terminal_event_publication,
+            "reconcile_persisted_terminal_event",
             fail_reconciliation,
         )
-        stream = app._session_engine._emit_terminal_event_with_hooks(
+        stream = app._terminal_event_publication.emit(
             event=Event(
                 type=EventType.SESSION_COMPLETED,
                 session_id=session_id,

@@ -334,8 +334,8 @@ async def terminalize_dispatched_model(
         )
         return updated
 
-    coordinator = engine._recovery_coordinator
-    claim = await coordinator._claim_incomplete_recovery(
+    ownership = engine._recovery_ownership
+    claim = await ownership.claim(
         session=session,
         inactive_for_seconds=request.inactive_for_seconds,
         execution_profile_snapshot=source_profile,
@@ -403,7 +403,7 @@ async def terminalize_dispatched_model(
     failure = None
     try:
         async with asyncio.timeout(_TERMINALIZATION_DEADLINE_SECONDS):
-            result = await coordinator._recover_incomplete_session_with_heartbeat(
+            result = await ownership.run_with_heartbeat(
                 claim=claim,
                 recovery=recover_owned,
             )
@@ -411,7 +411,7 @@ async def terminalize_dispatched_model(
         failure = exc
         raise
     finally:
-        await coordinator._cleanup_incomplete_recovery_claim(
+        await ownership.cleanup_claim(
             authority=claim.require_authority(),
             authoritative_failure=failure,
         )

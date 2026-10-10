@@ -733,7 +733,7 @@ def test_pending_round_recovery_supplies_bounded_durable_tool_authority() -> Non
         session = await store.load(session_id)
         assert session is not None
         messages = await store.load_transcript(session_id)
-        claim = await app._recovery_coordinator._claim_incomplete_recovery(
+        claim = await app._recovery_ownership.claim(
             session=session,
             inactive_for_seconds=None,
         )
@@ -753,7 +753,7 @@ def test_pending_round_recovery_supplies_bounded_durable_tool_authority() -> Non
                 )
             ]
         finally:
-            await app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+            await app._recovery_ownership.cleanup_claim(
                 authority=claim.require_authority(),
                 authoritative_failure=None,
             )
@@ -877,7 +877,7 @@ def test_pending_round_recovery_fences_apply_patch_without_effect_identity() -> 
         session = await store.load(session_id)
         assert session is not None
         messages = await store.load_transcript(session_id)
-        claim = await app._recovery_coordinator._claim_incomplete_recovery(
+        claim = await app._recovery_ownership.claim(
             session=session,
             inactive_for_seconds=None,
         )
@@ -895,7 +895,7 @@ def test_pending_round_recovery_fences_apply_patch_without_effect_identity() -> 
                 ):
                     pass
         finally:
-            await app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+            await app._recovery_ownership.cleanup_claim(
                 authority=claim.require_authority(),
                 authoritative_failure=None,
             )

@@ -10,6 +10,7 @@ import pytest
 from cayu.applications import CayuApp
 from cayu.events import Event, EventType
 from cayu.messages import Message
+from cayu.runtime import _recovery_ownership as recovery_ownership_module
 from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.requests import RunRequest
@@ -205,7 +206,7 @@ def test_shutdown_waits_for_a_detached_recovery_claim_renewal(
     from cayu.runtime import _recovery_coordinator as recovery_module
 
     monkeypatch.setattr(
-        recovery_module, "_INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS", 0.01
+        recovery_ownership_module, "_INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS", 0.01
     )
 
     class BlockingRenewalStore(_ClosableSessionStore):
@@ -239,14 +240,14 @@ def test_shutdown_waits_for_a_detached_recovery_claim_renewal(
         )
         app = CayuApp(session_store=store, enable_logging=False, owned_resources=(store,))
         coordinator = app._recovery_coordinator
-        claim = await coordinator._claim_incomplete_recovery(
+        claim = await coordinator._recovery_ownership.claim(
             session=session, inactive_for_seconds=None
         )
         assert claim is not None
         store.block_renewal = True
         # The renewal outlives the claim's local deadline and is detached.
         with pytest.raises(recovery_module._IncompleteRecoveryClaimLost):
-            await coordinator._heartbeat_incomplete_recovery_claim(
+            await coordinator._recovery_ownership.heartbeat(
                 session_id=session.id,
                 claim_id=claim.claim_id,
                 local_lease_deadline=time.monotonic() + 0.3,
@@ -702,7 +703,7 @@ def test_a_recovery_renewal_settling_in_budget_lets_the_first_attempt_settle(
     from cayu.runtime import _recovery_coordinator as recovery_module
 
     monkeypatch.setattr(
-        recovery_module, "_INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS", 0.01
+        recovery_ownership_module, "_INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS", 0.01
     )
 
     class BlockingRenewalStore(_ClosableSessionStore):
@@ -734,13 +735,13 @@ def test_a_recovery_renewal_settling_in_budget_lets_the_first_attempt_settle(
         )
         app = CayuApp(session_store=store, enable_logging=False, owned_resources=(store,))
         coordinator = app._recovery_coordinator
-        claim = await coordinator._claim_incomplete_recovery(
+        claim = await coordinator._recovery_ownership.claim(
             session=session, inactive_for_seconds=None
         )
         assert claim is not None
         store.block_renewal = True
         with pytest.raises(recovery_module._IncompleteRecoveryClaimLost):
-            await coordinator._heartbeat_incomplete_recovery_claim(
+            await coordinator._recovery_ownership.heartbeat(
                 session_id=session.id,
                 claim_id=claim.claim_id,
                 local_lease_deadline=time.monotonic() + 0.3,
