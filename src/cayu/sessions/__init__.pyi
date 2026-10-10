@@ -4,6 +4,7 @@ from cayu.runtime._exception_detail import ExceptionCause as ExceptionCause
 from cayu.runtime._exception_detail import ExceptionDetail as ExceptionDetail
 from cayu.runtime._exception_detail import ExceptionLeaf as ExceptionLeaf
 from cayu.runtime._exception_detail import exception_detail as exception_detail
+from cayu.sessions._execution_profile_rules import SessionModelTransition as SessionModelTransition
 from cayu.sessions.base import (
     INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY as INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
 )
@@ -58,7 +59,6 @@ from cayu.sessions.base import (
 from cayu.sessions.base import (
     SessionModelCompletionStageIncomplete as SessionModelCompletionStageIncomplete,
 )
-from cayu.sessions.base import SessionModelTransition as SessionModelTransition
 from cayu.sessions.base import SessionOperationInitializer as SessionOperationInitializer
 from cayu.sessions.base import SessionOperationPublication as SessionOperationPublication
 from cayu.sessions.base import SessionOperationTransform as SessionOperationTransform

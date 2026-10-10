@@ -65,11 +65,11 @@ from cayu.runtime.public_authority import (
 )
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_mutation_scope
+from cayu.sessions._execution_profile_rules import SessionModelTransition
 from cayu.sessions.base import (
     InMemorySessionStore,
     ModelTarget,
     QueuedDispatchTerminalReceipt,
-    SessionModelTransition,
     SessionRunFenced,
     _checkpoint_with_session_run_operation,
     _fork_initial_invocation_request_sha256,

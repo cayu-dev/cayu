@@ -61,6 +61,7 @@ from cayu.sessions._execution_profile_checkpoint import (
     execution_profile_baseline_from_session_metadata,
     execution_profile_from_session_metadata,
 )
+from cayu.sessions._execution_profile_rules import SessionModelTransition
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalOutcome,
     invocation_terminal_decision_from_checkpoint,
@@ -72,7 +73,6 @@ from cayu.sessions.base import (
     InteractionTransitionResult,
     InteractionTransitionSpec,
     RuntimePublicationMutation,
-    SessionModelTransition,
     SessionRunFenced,
     apply_runtime_publication_checkpoint_mutation,
 )

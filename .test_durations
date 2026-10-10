@@ -46118,5 +46118,10 @@
     "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[records-is_runtime_owned_session_metadata_key]": 0.0005131240468472242,
     "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[records-replace_session_user_metadata]": 0.0005215010023675859,
     "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[records-session_user_metadata]": 0.000435834052041173,
-    "tests/core/test_session_creation_rules_layout.py::test_user_metadata_preserves_runtime_authority_without_implementations": 0.7471306250081398
+    "tests/core/test_session_creation_rules_layout.py::test_user_metadata_preserves_runtime_authority_without_implementations": 0.7471306250081398,
+    "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[_execution_profile_rules-SessionModelTransition]": 0.0004806250799447298,
+    "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[_execution_profile_rules-execution_profile_adoption_request_fingerprint]": 0.00042812502942979336,
+    "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[_execution_profile_rules-session_model_projection_cursor]": 0.0006503749755211174,
+    "tests/core/test_session_creation_rules_layout.py::test_profile_admission_and_projection_without_implementations": 2.50490054290276,
+    "tests/core/test_session_creation_rules_layout.py::test_profile_adoption_fingerprint_preserves_semantic_authority": 2.925074875005521
 }

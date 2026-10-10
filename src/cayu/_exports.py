@@ -5002,7 +5002,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "SessionMessageSource": ("cayu.sessions.messaging", "SessionMessageSource"),
     "SessionMessageTarget": ("cayu.sessions.messaging", "SessionMessageTarget"),
-    "SessionModelTransition": ("cayu.sessions.base", "SessionModelTransition"),
+    "SessionModelTransition": ("cayu.sessions._execution_profile_rules", "SessionModelTransition"),
     "SessionOperationalSnapshot": ("cayu.sessions.summaries", "SessionOperationalSnapshot"),
     "SessionOrder": ("cayu.sessions.queries", "SessionOrder"),
     "SessionOutcome": ("cayu.sessions.summaries", "SessionOutcome"),

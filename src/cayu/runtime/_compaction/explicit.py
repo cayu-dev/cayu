@@ -153,13 +153,13 @@ from cayu.runtime.loop_policies import (
 from cayu.sessions._execution_profile_checkpoint import (
     execution_profile_from_session_metadata,
 )
+from cayu.sessions._execution_profile_rules import session_model_projection_cursor
 from cayu.sessions.base import (
     SessionOperationPublication,
     SessionStore,
     _incomplete_recovery_claim_from_checkpoint,
     attribute_event_to_current_interaction,
     attribute_events_to_current_interaction,
-    session_model_projection_cursor,
 )
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import (

@@ -535,6 +535,12 @@ from cayu.sessions._execution_profile_checkpoint import (
     execution_profile_from_session_metadata,
     execution_profile_session_metadata,
 )
+from cayu.sessions._execution_profile_rules import (
+    SessionModelTransition,
+    _session_metadata_with_model_projection,
+    execution_profile_adoption_request_fingerprint,
+    session_model_projection_cursor,
+)
 from cayu.sessions._foreground_child_checkpoint import (
     FOREGROUND_CHILD_TERMINAL_KEY,
     FOREGROUND_CHILD_WAIT_KEY,
@@ -593,7 +599,6 @@ from cayu.sessions.base import (
     SessionForkSourceNotFound,
     SessionModelCompletionDispatchAlreadyAuthorized,
     SessionModelCompletionStageConflict,
-    SessionModelTransition,
     SessionOperationInitializer,
     SessionRunFenced,
     SessionRuntimePublicationConflict,
@@ -611,15 +616,12 @@ from cayu.sessions.base import (
     _initial_transcript_pending_interaction_id,
     _latest_session_invocation_interaction_is_settled,
     _mark_session_invocation_terminal_event,
-    _session_metadata_with_model_projection,
     copy_model_completion_manual_recovery_request,
-    execution_profile_adoption_request_fingerprint,
     fork_session_invocation,
     model_completion_stage_settlement_request,
     queued_interaction_profile_handoff_evidence,
     runtime_publication_checkpoint_mutation,
     session_invocation_for_run_request,
-    session_model_projection_cursor,
     validate_profiled_fork_evidence,
 )
 from cayu.sessions.checkpoints import (

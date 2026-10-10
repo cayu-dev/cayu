@@ -89,6 +89,7 @@ from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_is_released,
 )
+from cayu.sessions._execution_profile_rules import execution_profile_adoption_request_fingerprint
 from cayu.sessions._foreground_child_checkpoint import (
     ForegroundChildResumeRequest,
     ForegroundChildTerminal,
@@ -110,7 +111,6 @@ from cayu.sessions.base import (
     _deactivate_session_run_fence,
     _latest_session_invocation_interaction_is_settled,
     _set_session_interaction_recovered_active_through,
-    execution_profile_adoption_request_fingerprint,
 )
 from cayu.sessions.cleanup import RecoveryCleanupSupervisor
 from cayu.sessions.event_queries import EventOrder, EventQuery

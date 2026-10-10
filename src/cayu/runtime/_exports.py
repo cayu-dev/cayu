@@ -1326,7 +1326,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.sessions.base",
         "SessionModelCompletionStageIncomplete",
     ),
-    "SessionModelTransition": ("cayu.sessions.base", "SessionModelTransition"),
+    "SessionModelTransition": ("cayu.sessions._execution_profile_rules", "SessionModelTransition"),
     "SessionOperationInitializer": ("cayu.sessions.base", "SessionOperationInitializer"),
     "SessionOperationPublication": ("cayu.sessions.base", "SessionOperationPublication"),
     "SessionOperationTransform": ("cayu.sessions.base", "SessionOperationTransform"),

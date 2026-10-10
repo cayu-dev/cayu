@@ -52,11 +52,8 @@ from cayu.runtime.execution_profiles import (
     execution_profile_from_session_metadata,
 )
 from cayu.runtime.loop_policies import LoopPolicy
-from cayu.sessions.base import (
-    SessionModelTransition,
-    SessionStore,
-    runtime_publication_checkpoint_mutation,
-)
+from cayu.sessions._execution_profile_rules import SessionModelTransition
+from cayu.sessions.base import SessionStore, runtime_publication_checkpoint_mutation
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,

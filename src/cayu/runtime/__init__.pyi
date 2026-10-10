@@ -811,6 +811,7 @@ from cayu.sessions._execution_profile_checkpoint import (
 from cayu.sessions._execution_profile_checkpoint import (
     session_execution_profiles as session_execution_profiles,
 )
+from cayu.sessions._execution_profile_rules import SessionModelTransition as SessionModelTransition
 from cayu.sessions._invocation_lifecycle import (
     INVOCATION_LIFECYCLE_COMMAND_VERSION as INVOCATION_LIFECYCLE_COMMAND_VERSION,
 )
@@ -928,7 +929,6 @@ from cayu.sessions.base import (
 from cayu.sessions.base import (
     SessionModelCompletionStageIncomplete as SessionModelCompletionStageIncomplete,
 )
-from cayu.sessions.base import SessionModelTransition as SessionModelTransition
 from cayu.sessions.base import SessionOperationInitializer as SessionOperationInitializer
 from cayu.sessions.base import SessionOperationPublication as SessionOperationPublication
 from cayu.sessions.base import SessionOperationTransform as SessionOperationTransform

@@ -25,6 +25,9 @@ import cayu
         ("records", "replace_session_user_metadata"),
         ("creation", "run_request_with_prepared_work_attempt_creation"),
         ("creation", "session_metadata_for_creation"),
+        ("_execution_profile_rules", "SessionModelTransition"),
+        ("_execution_profile_rules", "session_model_projection_cursor"),
+        ("_execution_profile_rules", "execution_profile_adoption_request_fingerprint"),
     ),
 )
 def test_creation_prerequisites_preserve_public_identity(module, name):
@@ -175,5 +178,76 @@ request._runtime_work_attempt_creation = requests._PreparedWorkAttemptCreation(
 rejected(lambda: creation.session_metadata_for_creation(
     metadata, identity=identity, execution_deadline=deadline, prepared_request=request))
 assert metadata == {"customer": {"values": [1]}}
+"""
+    )
+
+
+def test_profile_admission_and_projection_without_implementations():
+    _without_implementations(
+        """
+from cayu.build_provenance import (
+    RuntimeBuildArtifactKind, RuntimeBuildProvenance, RuntimeBuildProvenanceOrigin,
+)
+from cayu.runtime.execution_profiles import build_execution_profile_identity
+from cayu.sessions import _execution_profile_rules as rules, records
+from cayu.sessions._execution_profile_checkpoint import execution_profile_session_metadata
+from cayu.sessions._model_failover import ModelTarget
+from cayu.sessions.invocation import InvocationOrigin, SessionInvocation
+
+def profile(model):
+    return build_execution_profile_identity(runtime_name="cayu", runtime_version="test",
+        provider_name="fake", model=model, durable_system_prompt="instructions", direct_tools=(),
+        tool_catalogue_revision="sha256:" + "a" * 64,
+        runtime_build_provenance=RuntimeBuildProvenance.from_artifact_digest(
+            origin=RuntimeBuildProvenanceOrigin.EXPLICIT_MANIFEST,
+            artifact_kind=RuntimeBuildArtifactKind.OTHER, artifact_digest="b" * 64))
+
+expected, candidate = profile("first"), profile("second")
+session = records.Session(id="session", agent_name="agent", provider_name="fake", model="first",
+    runtime_version="test", causal_budget_id="session", metadata={
+        "cayu:execution_profile": execution_profile_session_metadata(expected),
+        records.RUNTIME_BUILD_PROVENANCE_METADATA_KEY: expected.runtime_build_provenance.model_dump(mode="json")},
+    invocation=SessionInvocation(origin=InvocationOrigin(trust="unattributed"),
+        root_invocation_id="12345678-1234-4234-8234-123456789abc", root_session_id="session", source="sdk_run"))
+assert rules._validate_execution_profile_admission(session, candidate_profile=expected,
+                                                  model_transition=None, decision=None) is None
+rejected(lambda: rules._validate_execution_profile_admission(session, candidate_profile=candidate,
+                                                            model_transition=None, decision=None))
+copied = rules._copy_optional_execution_profile(expected)
+assert copied == expected and copied is not expected
+assert rules.session_model_projection_cursor(session) == 0
+metadata = rules._session_metadata_with_model_projection(session.metadata,
+    target=ModelTarget(provider_name="fake", model="first"), transcript_cursor=7)
+assert rules.session_model_projection_cursor(session.model_copy(update={"metadata": metadata})) == 7
+assert "cayu:model_target_projection" not in session.metadata
+rejected(lambda: rules._session_metadata_with_model_projection(session.metadata,
+    target=ModelTarget(provider_name="fake", model="first"), transcript_cursor=True))
+"""
+    )
+
+
+def test_profile_adoption_fingerprint_preserves_semantic_authority():
+    _without_implementations(
+        """
+from cayu.approvals.actors import ResolutionActor, ResolutionActorSource
+from cayu.execution_profiles import ExecutionProfileAdoptionIntent
+from cayu.messages import Message
+from cayu.sessions import _execution_profile_rules as rules, requests
+from cayu.vaults.redaction import SecretRedactor
+
+intent = ExecutionProfileAdoptionIntent(idempotency_key="adopt", reason="change profile",
+    requested_by=ResolutionActor(subject="operator", source=ResolutionActorSource.REQUEST))
+messages = [Message.text("user", "continue")]
+request = requests.ResumeRequest(session_id="session", messages=messages, profile_adoption=intent)
+redactor = SecretRedactor()
+fingerprint = rules.execution_profile_adoption_request_fingerprint(request, redactor=redactor)
+assert len(fingerprint) == 64
+assert fingerprint == rules.execution_profile_adoption_request_fingerprint(
+    requests.copy_resume_request(request), redactor=redactor)
+changed = request.model_copy(update={"metadata": {"customer": "different"}})
+assert fingerprint != rules.execution_profile_adoption_request_fingerprint(changed, redactor=redactor)
+rejected(lambda: rules.execution_profile_adoption_request_fingerprint(
+    requests.ResumeRequest(session_id="session", messages=messages), redactor=redactor))
+rejected(lambda: rules.execution_profile_adoption_request_fingerprint(request, redactor=object()))
 """
     )

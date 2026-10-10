@@ -3900,6 +3900,7 @@ from cayu.sessions._execution_profile_checkpoint import (
 from cayu.sessions._execution_profile_checkpoint import (
     session_execution_profiles as session_execution_profiles,
 )
+from cayu.sessions._execution_profile_rules import SessionModelTransition as SessionModelTransition
 from cayu.sessions._participant_discovery import (
     ParticipantSessionCursor as ParticipantSessionCursor,
 )
@@ -3938,7 +3939,6 @@ from cayu.sessions.base import ModelFailoverPolicy as ModelFailoverPolicy
 from cayu.sessions.base import ModelTarget as ModelTarget
 from cayu.sessions.base import SessionExecutionInProgress as SessionExecutionInProgress
 from cayu.sessions.base import SessionInvocationAdmission as SessionInvocationAdmission
-from cayu.sessions.base import SessionModelTransition as SessionModelTransition
 from cayu.sessions.base import SessionStore as SessionStore
 from cayu.sessions.base import (
     checkpoint_root_field_projection_from_storage as checkpoint_root_field_projection_from_storage,
