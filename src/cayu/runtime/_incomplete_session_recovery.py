@@ -206,7 +206,6 @@ from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
 )
 from cayu.sessions.base import (
-    CheckpointTransform,
     SessionRunFenced,
     SessionRuntimePublicationConflict,
     SessionStore,
@@ -224,6 +223,7 @@ from cayu.sessions.invocation import (
 )
 from cayu.sessions.queries import MAX_SESSION_LIST_CURSOR_BYTES, SessionOrder, SessionQuery
 from cayu.sessions.records import (
+    CheckpointTransform,
     Session,
     SessionStatus,
     _queued_dispatch_session_instance_fingerprint,

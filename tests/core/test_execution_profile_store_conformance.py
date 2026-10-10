@@ -38,10 +38,9 @@ from cayu.sessions.base import (
     InteractionTransitionSpec,
     SessionInvocationAdmission,
     SessionRunFenced,
-    SessionStatusConflict,
     SessionStore,
 )
-from cayu.sessions.records import SessionIdentity, SessionStatus
+from cayu.sessions.records import SessionIdentity, SessionStatus, SessionStatusConflict
 from cayu.sessions.requests import RunRequest, run_request_with_runtime_session_instance_authority
 from cayu.tools.exposure import ToolCapabilityCeiling
 

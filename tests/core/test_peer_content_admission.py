@@ -19,7 +19,6 @@ from cayu.collaboration.peer_content import (
     PeerContentUnavailable,
 )
 from cayu.messages import Message
-from cayu.sessions.base import SessionStatusConflict
 from cayu.sessions.context_views import ParticipantSessionCreationRequest
 from cayu.sessions.messaging import (
     EnqueueSessionMessageRequest,
@@ -29,7 +28,7 @@ from cayu.sessions.messaging import (
     SessionMessageDeliveryMode,
     SessionMessageQuery,
 )
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import SessionStatus, SessionStatusConflict
 from cayu.sessions.requests import InterruptSessionRequest, RunRequest
 
 

@@ -193,7 +193,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "CheckpointCompatibilityError": ("cayu.sessions.checkpoints", "CheckpointCompatibilityError"),
     "CheckpointRootFieldGuard": ("cayu.sessions.base", "CheckpointRootFieldGuard"),
     "CheckpointRootFieldProjection": ("cayu.sessions.base", "CheckpointRootFieldProjection"),
-    "CheckpointTransform": ("cayu.sessions.base", "CheckpointTransform"),
+    "CheckpointTransform": ("cayu.sessions.records", "CheckpointTransform"),
     "ChildSessionContextContribution": (
         "cayu.sessions.child_context",
         "ChildSessionContextContribution",
@@ -1344,7 +1344,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "SessionStateSnapshot": ("cayu.sessions.records", "SessionStateSnapshot"),
     "SessionStatus": ("cayu.sessions.records", "SessionStatus"),
     "SessionExecutionInProgress": ("cayu.sessions.base", "SessionExecutionInProgress"),
-    "SessionStatusConflict": ("cayu.sessions.base", "SessionStatusConflict"),
+    "SessionStatusConflict": ("cayu.sessions.records", "SessionStatusConflict"),
     "SessionStatusCounts": ("cayu.sessions.queries", "SessionStatusCounts"),
     "SessionSteeringConflict": ("cayu.runtime.session_steering", "SessionSteeringConflict"),
     "SessionSteeringReceipt": ("cayu.runtime.session_steering", "SessionSteeringReceipt"),
@@ -1372,7 +1372,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "StopDecision": ("cayu.runtime.stop_policy", "StopDecision"),
     "StopLimit": ("cayu.runtime.stop_policy", "StopLimit"),
     "StoreManifest": ("cayu.runtime.manifest", "StoreManifest"),
-    "StoreTimeCheckpointTransform": ("cayu.sessions.base", "StoreTimeCheckpointTransform"),
+    "StoreTimeCheckpointTransform": ("cayu.sessions.records", "StoreTimeCheckpointTransform"),
     "StoreTimeSessionOperationTransform": (
         "cayu.sessions.base",
         "StoreTimeSessionOperationTransform",

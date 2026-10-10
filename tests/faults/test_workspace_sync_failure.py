@@ -23,9 +23,9 @@ from cayu.providers.base import ModelStreamEvent
 from cayu.runtime import _environment_lifecycle as lifecycle_module
 from cayu.runtime.verified_task_worker import VerifiedTaskHandler, VerifiedTaskWorker
 from cayu.sessions._completion_finalization import pending_completion_finalization_from_checkpoint
-from cayu.sessions.base import InMemorySessionStore, SessionStatusConflict
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageDeliveryMode
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import SessionStatus, SessionStatusConflict
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
 from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore

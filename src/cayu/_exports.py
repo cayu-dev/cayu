@@ -5017,7 +5017,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "SessionStateSnapshot": ("cayu.sessions.records", "SessionStateSnapshot"),
     "SessionStatus": ("cayu.sessions.records", "SessionStatus"),
     "SessionExecutionInProgress": ("cayu.sessions.base", "SessionExecutionInProgress"),
-    "SessionStatusConflict": ("cayu.sessions.base", "SessionStatusConflict"),
+    "SessionStatusConflict": ("cayu.sessions.records", "SessionStatusConflict"),
     "SessionStatusCounts": ("cayu.sessions.queries", "SessionStatusCounts"),
     "SessionStatusIs": ("cayu.evals.assertions", "SessionStatusIs"),
     "SessionSteeringConflict": ("cayu.runtime.session_steering", "SessionSteeringConflict"),

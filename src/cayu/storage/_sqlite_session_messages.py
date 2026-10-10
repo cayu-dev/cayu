@@ -26,7 +26,6 @@ from cayu.sessions.base import (
     QueuedInteractionProfileHandoff,
     SessionMessageQueueStatus,
     SessionRunFenced,
-    SessionStatusConflict,
     _assert_session_run_epoch,
     _check_closure_lineage_owner,
     _checkpoint_after_queued_interaction_profile_handoff,
@@ -63,7 +62,7 @@ from cayu.sessions.messaging import (
     queued_session_message_input,
     session_message_rejection,
 )
-from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.records import Session, SessionStatus, SessionStatusConflict
 from cayu.sessions.transcript_input import (
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     session_messages_input_contract_evidence,

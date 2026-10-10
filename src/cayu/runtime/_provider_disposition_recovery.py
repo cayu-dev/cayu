@@ -80,11 +80,7 @@ from cayu.runtime.provider_operations import (
 from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
 )
-from cayu.sessions.base import (
-    SessionRunFenced,
-    SessionStatusConflict,
-    SessionStore,
-)
+from cayu.sessions.base import SessionRunFenced, SessionStore
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import (
     InteractionStatus,
@@ -93,6 +89,7 @@ from cayu.sessions.interactions import (
 from cayu.sessions.records import (
     Session,
     SessionStatus,
+    SessionStatusConflict,
 )
 from cayu.tools.exposure import (
     ResolvedToolExposureAuthority,

@@ -558,7 +558,6 @@ from cayu.sessions.base import (
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
     SessionRunFenced,
-    SessionStatusConflict,
     SessionStore,
     copy_model_completion_manual_recovery_request,
 )
@@ -621,6 +620,7 @@ from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import (
     EventRecord,
     Session,
+    SessionStatusConflict,
     _fork_source_session_instance_fingerprint,
     copy_session,
 )

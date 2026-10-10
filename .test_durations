@@ -46106,5 +46106,9 @@
     "tests/core/test_session_create_claim_layout.py::test_private_creation_rules_have_one_owner[_runtime_session_create_reference_operation_id-creation_claims]": 0.0004183329874649644,
     "tests/core/test_session_create_claim_layout.py::test_private_creation_rules_have_one_owner[_runtime_session_create_reference_request_hmac_sha256-creation_claims]": 0.00020029203733429313,
     "tests/core/test_session_create_claim_layout.py::test_private_creation_rules_have_one_owner[_session_create_claim_record-creation_claims]": 0.0001751260133460164,
-    "tests/core/test_session_create_claim_layout.py::test_request_attestation_and_prepared_authority_without_implementations": 0.47130154201295227
+    "tests/core/test_session_create_claim_layout.py::test_request_attestation_and_prepared_authority_without_implementations": 0.47130154201295227,
+    "tests/core/test_session_creation_rules_layout.py::test_creation_event_batch_authority_without_implementations": 0.3399263739702292,
+    "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[event_delivery-restore_persisted_event_authority]": 0.0003972090198658407,
+    "tests/core/test_session_creation_rules_layout.py::test_creation_prerequisites_preserve_public_identity[records-SessionStatusConflict]": 2.9710290000075474,
+    "tests/core/test_session_creation_rules_layout.py::test_creation_status_contracts_without_implementations": 0.4067393320146948
 }

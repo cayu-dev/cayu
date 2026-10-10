@@ -55,12 +55,11 @@ from cayu.sessions.base import (
     ModelCompletionStageRelease,
     SessionOperationPublication,
     SessionRunFenced,
-    SessionStatusConflict,
     SessionStore,
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import SessionStatus, SessionStatusConflict
 from cayu.vaults.redaction import SecretRedactor
 
 _INSPECTION_ATTEMPT_EVENT_TYPES = (

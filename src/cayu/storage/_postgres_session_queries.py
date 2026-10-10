@@ -41,8 +41,8 @@ from cayu.sessions.base import (
     _tool_round_lifecycle_event_limit,
     _validate_interaction_page,
     _validate_tool_round_call_ids,
-    restore_persisted_event_authority,
 )
+from cayu.sessions.event_delivery import restore_persisted_event_authority
 from cayu.sessions.event_queries import EventQuery, EventQueryResultTooLarge, copy_event_query
 from cayu.sessions.inspection import SESSION_INSPECTION_LABEL_LIMIT, SessionInspectionIdentity
 from cayu.sessions.lineage import (

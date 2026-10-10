@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -560,3 +560,37 @@ class SessionInvocationSnapshot(SessionInvocationBinding):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     status: SessionStatus
+
+
+class SessionStatusConflict(ValueError):
+    """A session status transition was rejected because the session was not in an
+    allowed source status (e.g. resuming a session another worker is already
+    running). Subclasses ``ValueError`` so existing ``except ValueError`` handlers
+    keep working; callers that need to react specifically (e.g. requeue) catch this.
+    """
+
+
+CheckpointTransform = Callable[
+    [Session, dict[str, Any] | None],
+    dict[str, Any] | None,
+]
+
+
+StoreTimeCheckpointTransform = Callable[
+    [Session, dict[str, Any] | None, datetime],
+    dict[str, Any] | None,
+]
+
+
+def _validate_status_set(
+    statuses: set[SessionStatus],
+    field_name: str,
+) -> set[SessionStatus]:
+    if type(statuses) is not set:
+        raise TypeError(f"{field_name} must be a set of SessionStatus values.")
+    if not statuses:
+        raise ValueError(f"{field_name} cannot be empty.")
+    for status in statuses:
+        if not isinstance(status, SessionStatus):
+            raise ValueError(f"{field_name} must contain SessionStatus values.")
+    return set(statuses)

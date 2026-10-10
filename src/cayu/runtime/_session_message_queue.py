@@ -40,7 +40,7 @@ def require_open_admission(status: str, checkpoint: object) -> None:
     from cayu.sessions._completion_finalization import (
         PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
     )
-    from cayu.sessions.base import SessionStatusConflict
+    from cayu.sessions.records import SessionStatusConflict
 
     if status not in {"pending", "running"}:
         raise SessionStatusConflict(

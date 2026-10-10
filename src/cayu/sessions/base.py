@@ -48,6 +48,7 @@ from cayu.sessions import _completion_finalization as completion_finalization
 from cayu.sessions import _terminal_evidence as terminal_event_evidence
 from cayu.sessions import authority as session_authority_rules
 from cayu.sessions import creation_fence
+from cayu.sessions import event_delivery as session_event_rules
 from cayu.sessions import event_delivery as side_effect_health
 from cayu.sessions import event_queries as event_query_rules
 from cayu.sessions import inspection as session_inspection_rules
@@ -162,6 +163,9 @@ from cayu.sessions.event_delivery import (
 )
 from cayu.sessions.event_delivery import (
     portable_persisted_event_side_effect_error as portable_persisted_event_side_effect_error,
+)
+from cayu.sessions.event_delivery import (
+    restore_persisted_event_authority as restore_persisted_event_authority,
 )
 from cayu.sessions.event_delivery import (
     validate_persisted_event_side_effect_error as validate_persisted_event_side_effect_error,
@@ -361,6 +365,7 @@ from cayu.sessions.records import MAX_SESSION_ID_BYTES as MAX_SESSION_ID_BYTES
 from cayu.sessions.records import (
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY as RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
 )
+from cayu.sessions.records import CheckpointTransform as CheckpointTransform
 from cayu.sessions.records import EventRecord as EventRecord
 from cayu.sessions.records import PendingActionKind as PendingActionKind
 from cayu.sessions.records import PendingActionSession as PendingActionSession
@@ -375,6 +380,8 @@ from cayu.sessions.records import (
     SessionStateSnapshot as SessionStateSnapshot,
 )
 from cayu.sessions.records import SessionStatus as SessionStatus
+from cayu.sessions.records import SessionStatusConflict as SessionStatusConflict
+from cayu.sessions.records import StoreTimeCheckpointTransform as StoreTimeCheckpointTransform
 from cayu.sessions.records import TranscriptRecord as TranscriptRecord
 from cayu.sessions.records import copy_session as copy_session
 from cayu.sessions.records import copy_session_identity as copy_session_identity
@@ -783,7 +790,6 @@ from cayu.approvals.tools import (
     ToolPolicyEvidence,
     resolution_actor_payload,
 )
-from cayu.artifacts.attachments import MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY
 from cayu.budgets.aggregates import (
     _IN_MEMORY_AGGREGATE_CANCELLATION_INTERVAL,
     EXACT_AGGREGATE,
@@ -814,11 +820,9 @@ from cayu.events import (
     EventType,
     copy_event,
     event_envelope_authority_is_runtime_generated,
-    event_payload_authority_is_runtime_generated,
     event_with_runtime_envelope_authority,
     event_with_runtime_generated_id,
     event_with_runtime_payload_authority,
-    validate_event_envelope,
 )
 from cayu.execution_profiles import (
     EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS,
@@ -1092,14 +1096,6 @@ async def _run_session_commit_guard_owned(
             raise caller_signal from guard_error
         raise
     return caller_signal
-
-
-class SessionStatusConflict(ValueError):
-    """A session status transition was rejected because the session was not in an
-    allowed source status (e.g. resuming a session another worker is already
-    running). Subclasses ``ValueError`` so existing ``except ValueError`` handlers
-    keep working; callers that need to react specifically (e.g. requeue) catch this.
-    """
 
 
 class SessionExecutionInProgress(SessionStatusConflict):
@@ -2713,16 +2709,6 @@ def _project_interruption_cascade_marker(marker: Any) -> dict[str, Any] | None:
     return _project_interruption_cascade_marker_fields("object", field_types, field_values)
 
 
-CheckpointTransform = Callable[
-    [Session, dict[str, Any] | None],
-    dict[str, Any] | None,
-]
-StoreTimeCheckpointTransform = Callable[
-    [Session, dict[str, Any] | None, datetime],
-    dict[str, Any] | None,
-]
-
-
 def _validate_inactive_for_seconds(value: int | None) -> int | None:
     if value is None:
         return None
@@ -3749,7 +3735,7 @@ class RuntimePublicationRequest(BaseModel):
             # before the request and event digests are derived. The publication
             # preparation path reconstructs this model, so this also sanitizes
             # validator-bypassed model_copy/model_construct inputs before commit.
-            copied_event = _copy_event_for_session_store(event)
+            copied_event = session_event_rules._copy_event_for_session_store(event)
             if copied_event.id in seen:
                 raise ValueError(f"Runtime publication event id is duplicated: {copied_event.id}")
             seen.add(copied_event.id)
@@ -14184,7 +14170,7 @@ class InMemorySessionStore(
         to_status: SessionStatus,
     ) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
-        allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
+        allowed_statuses = session_record_rules._validate_status_set(from_statuses, "from_statuses")
         if not isinstance(to_status, SessionStatus):
             raise ValueError("to_status must be a SessionStatus.")
         async with self._lock:
@@ -14312,7 +14298,7 @@ class InMemorySessionStore(
 
         temporary_service_admission = prepare_temporary_transition(temporary_service_admission)
         session_id = require_clean_nonblank(session_id, "session_id")
-        allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
+        allowed_statuses = session_record_rules._validate_status_set(from_statuses, "from_statuses")
         if not isinstance(to_status, SessionStatus):
             raise ValueError("to_status must be a SessionStatus.")
         if (checkpoint_transform is None) == (store_time_checkpoint_transform is None):
@@ -14623,7 +14609,7 @@ class InMemorySessionStore(
         checkpoint_mutation: dict[str, Any] | None = None,
     ) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
-        allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
+        allowed_statuses = session_record_rules._validate_status_set(from_statuses, "from_statuses")
         if not isinstance(to_status, SessionStatus):
             raise ValueError("to_status must be a SessionStatus.")
         mutation = _prepare_queue_completion_checkpoint_mutation(checkpoint_mutation, to_status)
@@ -15127,7 +15113,7 @@ class InMemorySessionStore(
         inactive_for_seconds: int,
     ) -> Session | None:
         session_id = require_clean_nonblank(session_id, "session_id")
-        allowed_statuses = _validate_status_set(statuses, "statuses")
+        allowed_statuses = session_record_rules._validate_status_set(statuses, "statuses")
         validated_inactive_for_seconds = _validate_inactive_for_seconds(inactive_for_seconds)
         assert validated_inactive_for_seconds is not None
         async with self._lock:
@@ -15174,7 +15160,7 @@ class InMemorySessionStore(
         checkpoint_transform: StoreTimeCheckpointTransform,
     ) -> Session | None:
         session_id = require_clean_nonblank(session_id, "session_id")
-        allowed_statuses = _validate_status_set(statuses, "statuses")
+        allowed_statuses = session_record_rules._validate_status_set(statuses, "statuses")
         inactive_for_seconds = _validate_inactive_for_seconds(inactive_for_seconds)
         if checkpoint_transform is None:
             raise TypeError("checkpoint_transform is required.")
@@ -15236,7 +15222,7 @@ class InMemorySessionStore(
         result_checkpoint_transform: CheckpointTransform | None = None,
     ) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
-        allowed_statuses = _validate_status_set(statuses, "statuses")
+        allowed_statuses = session_record_rules._validate_status_set(statuses, "statuses")
         if checkpoint_transform is None:
             raise TypeError("checkpoint_transform is required.")
         if result_checkpoint_transform is not None and not callable(result_checkpoint_transform):
@@ -15821,7 +15807,9 @@ class InMemorySessionStore(
         return self._apply_event_append_unlocked(session, prepared)
 
     async def append_events(self, session_id: str, events: list[Event]) -> None:
-        session_id, copied_events = _copy_session_event_batch(session_id, events)
+        session_id, copied_events = session_event_rules._copy_session_event_batch(
+            session_id, events
+        )
 
         async with self._lock:
             session = self._sessions.get(session_id)
@@ -17808,13 +17796,15 @@ class InMemorySessionStore(
         expected_transcript_cursor: int | None,
         preserve_completion_result_publications: bool,
     ) -> Session:
-        session_id, copied_events = _copy_session_event_batch(session_id, events)
+        session_id, copied_events = session_event_rules._copy_session_event_batch(
+            session_id, events
+        )
         if (checkpoint_transform is None) == (store_time_checkpoint_transform is None):
             raise TypeError("Exactly one checkpoint transform is required.")
         allowed_statuses = (
             None
             if expected_statuses is None
-            else _validate_status_set(expected_statuses, "expected_statuses")
+            else session_record_rules._validate_status_set(expected_statuses, "expected_statuses")
         )
         async with self._lock:
             store_now = self._ownership_clock()
@@ -18115,7 +18105,9 @@ class InMemorySessionStore(
         expected_transcript_cursor: int | None,
         context_view_compaction_cursor: int | None = None,
     ) -> Session:
-        session_id, copied_events = _copy_session_event_batch(session_id, events)
+        session_id, copied_events = session_event_rules._copy_session_event_batch(
+            session_id, events
+        )
         idempotency_key = _reject_reserved_runtime_publication_key(
             idempotency_key,
             "idempotency_key",
@@ -18126,7 +18118,7 @@ class InMemorySessionStore(
         allowed_statuses = (
             None
             if expected_statuses is None
-            else _validate_status_set(expected_statuses, "expected_statuses")
+            else session_record_rules._validate_status_set(expected_statuses, "expected_statuses")
         )
         async with self._lock:
             store_now = self._ownership_clock()
@@ -22028,7 +22020,7 @@ def _prepare_execution_profile_rejection(
     Event,
 ]:
     session_id = require_clean_nonblank(session_id, "session_id")
-    statuses = _validate_status_set(expected_statuses, "expected_statuses")
+    statuses = session_record_rules._validate_status_set(expected_statuses, "expected_statuses")
     if type(expected_run_epoch) is not int:
         raise TypeError("expected_run_epoch must be an integer.")
     if not 0 <= expected_run_epoch <= MAX_DURABLE_JSON_INTEGER:
@@ -22038,7 +22030,7 @@ def _prepare_execution_profile_rejection(
     changed = changed_execution_profile_components(expected, candidate)
     if not changed:
         raise ValueError("Execution-profile rejection requires a changed candidate.")
-    _, copied_events = _copy_session_event_batch(session_id, [event])
+    _, copied_events = session_event_rules._copy_session_event_batch(session_id, [event])
     copied_event = copied_events[0]
     copied_decision = _copy_optional_execution_profile_decision(decision)
     if copied_decision is not None:
@@ -22142,20 +22134,6 @@ def _execution_profile_rejection_events_equivalent(left: Event, right: Event) ->
     return left_document == right_document
 
 
-def _validate_status_set(
-    statuses: set[SessionStatus],
-    field_name: str,
-) -> set[SessionStatus]:
-    if type(statuses) is not set:
-        raise TypeError(f"{field_name} must be a set of SessionStatus values.")
-    if not statuses:
-        raise ValueError(f"{field_name} cannot be empty.")
-    for status in statuses:
-        if not isinstance(status, SessionStatus):
-            raise ValueError(f"{field_name} must contain SessionStatus values.")
-    return set(statuses)
-
-
 def _copy_optional_event_id(value: str | None, field_name: str) -> str | None:
     """Defensively validate an optional exact durable event identity."""
 
@@ -22186,7 +22164,7 @@ def _prepare_session_fork_request(
 ) -> tuple[str, Session, set[SessionStatus], int | None]:
     source_session_id = require_clean_nonblank(source_session_id, "source_session_id")
     fork = copy_session(fork)
-    allowed_statuses = _validate_status_set(source_statuses, "source_statuses")
+    allowed_statuses = session_record_rules._validate_status_set(source_statuses, "source_statuses")
     if fork.parent_session_id != source_session_id:
         raise ValueError("Fork parent_session_id must match source_session_id.")
     if transcript_cursor is not None and transcript_cursor < 0:
@@ -22284,7 +22262,7 @@ def _copy_profiled_fork_authority(
     copied_relationship = SessionForkProfileRelationship.model_validate(
         relationship.model_dump(mode="json")
     )
-    _, copied_events = _copy_session_event_batch(fork.id, events)
+    _, copied_events = session_event_rules._copy_session_event_batch(fork.id, events)
     if not copied_events:
         raise ValueError("A profiled fork requires durable fork evidence.")
     return copied_relationship, copied_events
@@ -24602,7 +24580,9 @@ def _prepare_model_completion_stage(
                 MODEL_FAILOVER_CHECKPOINT_KEY: failover_admission.intent_payload(),
             },
         )
-    allowed_statuses = frozenset(_validate_status_set(expected_statuses, "expected_statuses"))
+    allowed_statuses = frozenset(
+        session_record_rules._validate_status_set(expected_statuses, "expected_statuses")
+    )
     expected_run_epoch = _validate_required_runtime_fence(
         expected_run_epoch,
         "expected_run_epoch",
@@ -27584,7 +27564,9 @@ def _prepare_runtime_publication(
     allowed_statuses = (
         None
         if expected_statuses is None
-        else frozenset(_validate_status_set(expected_statuses, "expected_statuses"))
+        else frozenset(
+            session_record_rules._validate_status_set(expected_statuses, "expected_statuses")
+        )
     )
     expected_run_epoch = _validate_optional_runtime_publication_fence(
         expected_run_epoch,
@@ -28784,200 +28766,6 @@ def _validate_runtime_publication_durable_material(
             )
 
 
-def _persisted_event_authority_fields(event_type: EventType | str) -> tuple[str, ...]:
-    if event_type in {
-        EventType.SESSION_EXPORT_PUBLISHED,
-        EventType.SESSION_EXPORT_RELEASED,
-        EventType.SESSION_EXPORT_RETIRED,
-    }:
-        return ("export_commitment", "output_commitment")
-    if event_type == EventType.SESSION_STARTED:
-        return (
-            "parent_session_id",
-            SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
-        )
-    if event_type == EventType.SESSION_FORKED:
-        return ("parent_session_id", "source_session_id")
-    if event_type in {
-        EventType.SESSION_RESUMED,
-        EventType.SESSION_MESSAGE_QUEUED,
-        EventType.SESSION_MESSAGE_DELIVERED,
-    }:
-        return (SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,)
-    if event_type == EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED:
-        return (
-            "model_attempt_id",
-            "model_step_id",
-            "operation_id",
-            "start_id",
-            "stream_protocol",
-        )
-    if event_type == EventType.PROVIDER_OPERATION_RESOLVED:
-        return (
-            "model_attempt_id",
-            "model_step_id",
-            "operation_id",
-            "resolution_id",
-            "stage_id",
-            "stream_protocol",
-        )
-    if event_type == EventType.TASK_COMPLETION_RESULT_RESOLVED:
-        return (
-            "application_request_sha256",
-            "contract_fingerprint",
-            "contract_id",
-            "decision_id",
-            "resolver_configuration_fingerprint",
-            "resolver_id",
-            "resolver_version",
-            "result_digest",
-            "result_kind",
-            "result_reference_id",
-            "task_id",
-        )
-    if event_type == EventType.TASK_INTERRUPTED_HANDOFF:
-        return ("handoff_id", "task_id")
-    if event_type == EventType.REQUEST_FOOTPRINT_RECORDED:
-        return ("execution_profile_fingerprint",)
-    if event_type == EventType.TOOL_EXPOSURE_RECORDED:
-        return (
-            "catalogue_revision",
-            "execution_profile_fingerprint",
-            "exposure_fingerprint",
-            "model_step_id",
-            "profile_id",
-        )
-    if event_type == EventType.MODEL_STARTED:
-        return (MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY,)
-    return ()
-
-
-def _copy_event_for_session_store(event: Event) -> Event:
-    """Strip caller-authored durable authority before persistence."""
-
-    from cayu.collaboration._session_export_store import require_event_publication
-
-    # Check provenance and exact owner bytes before copying can normalize input,
-    # then recheck the detached value that is actually sent to persistence.
-    # Leave rejection of non-exact events to the existing copy_event contract.
-    if type(event) is Event:
-        require_event_publication(event)
-    copied = copy_event(event)
-    validate_event_envelope(copied)
-    require_event_publication(copied)
-    authority_fields = _persisted_event_authority_fields(copied.type)
-    if not authority_fields:
-        return copied
-    payload = copy_durable_json_object(copied.payload, "event payload")
-    changed = False
-    for field_name in authority_fields:
-        value = payload.get(field_name)
-        if type(value) is str and event_payload_authority_is_runtime_generated(
-            copied,
-            field_name=field_name,
-            value=value,
-        ):
-            continue
-        if field_name in payload:
-            payload.pop(field_name)
-            changed = True
-    return copied if not changed else copied.model_copy(update={"payload": payload})
-
-
-def _event_input_contract_is_runtime_owned(event: Event) -> bool:
-    """Return whether one sanitized event carries the runtime-owned input marker."""
-
-    if type(event) is not Event:
-        raise TypeError("event must be an exact Event.")
-    if event.type not in {
-        EventType.SESSION_STARTED,
-        EventType.SESSION_RESUMED,
-        EventType.SESSION_MESSAGE_QUEUED,
-        EventType.SESSION_MESSAGE_DELIVERED,
-    }:
-        return False
-    marker = event.payload.get(SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY)
-    return type(marker) is str and event_payload_authority_is_runtime_generated(
-        event,
-        field_name=SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
-        value=marker,
-    )
-
-
-def _event_file_attachment_attestations_are_runtime_owned(event: Event) -> bool:
-    """Return whether a model boundary carries exact runtime-resolved file proof."""
-
-    if type(event) is not Event:
-        raise TypeError("event must be an exact Event.")
-    if event.type != EventType.MODEL_STARTED:
-        return False
-    marker = event.payload.get(MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY)
-    return type(marker) is str and event_payload_authority_is_runtime_generated(
-        event,
-        field_name=MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY,
-        value=marker,
-    )
-
-
-def restore_persisted_event_authority(
-    event: Event,
-    *,
-    input_contract_runtime_owned: bool = False,
-    file_attachment_attestations_runtime_owned: bool = False,
-) -> Event:
-    """Restore private authority proven by the built-in store ingestion boundary.
-
-    Every built-in path capable of persisting an authoritative event field routes through
-    :func:`_copy_event_for_session_store`, either as an ordinary event batch or
-    through ``RuntimePublicationRequest``. A retained authority field could
-    therefore only have crossed a persistence boundary with exact runtime
-    authority. SQL serialization does not retain Pydantic private attributes;
-    raw-record decoders use this helper to reconstruct that already-proven
-    provenance without exposing a marker in the public event payload. Trusted
-    Cayu JSONL restore uses the same fixed allowlist at its explicit backup
-    boundary; callers must not restore JSONL obtained from an untrusted source.
-    """
-
-    copied = copy_event(event)
-    if type(input_contract_runtime_owned) is not bool:
-        raise TypeError("input_contract_runtime_owned must be a bool.")
-    if type(file_attachment_attestations_runtime_owned) is not bool:
-        raise TypeError("file_attachment_attestations_runtime_owned must be a bool.")
-    fields = tuple(
-        field_name
-        for field_name in _persisted_event_authority_fields(copied.type)
-        if type(copied.payload.get(field_name)) is str
-        and (
-            field_name != SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY or input_contract_runtime_owned
-        )
-        and (
-            field_name != MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY
-            or file_attachment_attestations_runtime_owned
-        )
-    )
-    return event_with_runtime_payload_authority(copied, *fields) if fields else copied
-
-
-def _copy_session_event_batch(session_id: str, events: list[Event]) -> tuple[str, list[Event]]:
-    session_id = require_clean_nonblank(session_id, "session_id")
-    if type(events) is not list:
-        raise TypeError("Session events must be a list.")
-
-    copied_events: list[Event] = []
-    seen_event_ids: set[str] = set()
-    for event in events:
-        if type(event) is not Event:
-            raise TypeError("Session events must be Event instances.")
-        copied_event = _copy_event_for_session_store(event)
-        if copied_event.session_id != session_id:
-            raise ValueError("Event session_id does not match target session.")
-        if copied_event.id in seen_event_ids:
-            raise ValueError(f"Event already exists for session {session_id}: {copied_event.id}")
-        seen_event_ids.add(copied_event.id)
-        copied_events.append(copied_event)
-    return session_id, copied_events
-
-
 def _copy_workflow_step_reservation(
     session_id: str,
     event: Event,
@@ -28985,7 +28773,7 @@ def _copy_workflow_step_reservation(
     workflow_name: str,
     attempt_id: str,
 ) -> tuple[str, Event, str, str]:
-    session_id, copied_events = _copy_session_event_batch(session_id, [event])
+    session_id, copied_events = session_event_rules._copy_session_event_batch(session_id, [event])
     copied_event = copied_events[0]
     workflow_name = require_clean_nonblank(workflow_name, "workflow_name")
     attempt_id = require_clean_nonblank(attempt_id, "attempt_id")
@@ -29040,7 +28828,7 @@ def _copy_mcp_manifest_publication(
             raise ValueError("MCP baseline update generation does not follow its expectation.")
         updates[key] = copied
 
-    session_id, copied_events = _copy_session_event_batch(session_id, events)
+    session_id, copied_events = session_event_rules._copy_session_event_batch(session_id, events)
     if not copied_events:
         raise ValueError("MCP manifest publication requires at least one event.")
     for event in copied_events:
@@ -29422,7 +29210,9 @@ def _prepare_interaction_transition(
         )
     transition = InteractionTransitionSpec(
         event=copy_event(event),
-        from_statuses=tuple(_validate_status_set(from_statuses, "from_statuses")),
+        from_statuses=tuple(
+            session_record_rules._validate_status_set(from_statuses, "from_statuses")
+        ),
         to_status=to_status,
         only_if_no_queued_messages=only_if_no_queued_messages,
         model_completion_stage_settlement=model_completion_stage_settlement,

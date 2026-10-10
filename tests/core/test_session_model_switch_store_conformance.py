@@ -13,11 +13,10 @@ from cayu.sessions.base import (
     InMemorySessionStore,
     ModelTarget,
     SessionModelTransition,
-    SessionStatusConflict,
     SessionStore,
 )
 from cayu.sessions.event_queries import EventQuery
-from cayu.sessions.records import SessionIdentity, SessionStatus
+from cayu.sessions.records import SessionIdentity, SessionStatus, SessionStatusConflict
 from cayu.sessions.requests import RunRequest
 from cayu.sessions.transcript_input import session_input_messages_sha256
 

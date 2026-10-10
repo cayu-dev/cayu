@@ -236,7 +236,8 @@ async def test_rebound_producer_terminal_and_progress(
         accepted = await app.service_producer_disposition(command, context=CONTEXT)
         assert accepted.disposition == "stop_accepted"
         assert await app.service_producer_disposition(command, context=CONTEXT) == accepted
-        from cayu.sessions.base import SessionRunFenced, SessionStatusConflict
+        from cayu.sessions.base import SessionRunFenced
+        from cayu.sessions.records import SessionStatusConflict
 
         rejection = SessionRunFenced if gate == "input" else SessionStatusConflict
 

@@ -15,10 +15,19 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
-from cayu._validation import MAX_DURABLE_JSON_INTEGER
+from cayu._validation import MAX_DURABLE_JSON_INTEGER, copy_durable_json_object
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu._validation import require_durable_nonblank as require_nonblank
-from cayu.events import Event, copy_event
+from cayu.artifacts.attachments import MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY
+from cayu.events import (
+    Event,
+    EventType,
+    copy_event,
+    event_payload_authority_is_runtime_generated,
+    event_with_runtime_payload_authority,
+    validate_event_envelope,
+)
+from cayu.sessions.transcript_input import SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY
 
 PERSISTED_EVENT_SIDE_EFFECT_MAX_ATTEMPTS = 3
 Status = Literal["pending", "leased", "failed", "delivered", "dead_lettered"]
@@ -389,3 +398,197 @@ class PersistedEventSideEffectDelivery(BaseModel):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError(f"{info.field_name} must be timezone-aware.")
         return value.astimezone(UTC)
+
+
+def _persisted_event_authority_fields(event_type: EventType | str) -> tuple[str, ...]:
+    if event_type in {
+        EventType.SESSION_EXPORT_PUBLISHED,
+        EventType.SESSION_EXPORT_RELEASED,
+        EventType.SESSION_EXPORT_RETIRED,
+    }:
+        return ("export_commitment", "output_commitment")
+    if event_type == EventType.SESSION_STARTED:
+        return (
+            "parent_session_id",
+            SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
+        )
+    if event_type == EventType.SESSION_FORKED:
+        return ("parent_session_id", "source_session_id")
+    if event_type in {
+        EventType.SESSION_RESUMED,
+        EventType.SESSION_MESSAGE_QUEUED,
+        EventType.SESSION_MESSAGE_DELIVERED,
+    }:
+        return (SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,)
+    if event_type == EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED:
+        return (
+            "model_attempt_id",
+            "model_step_id",
+            "operation_id",
+            "start_id",
+            "stream_protocol",
+        )
+    if event_type == EventType.PROVIDER_OPERATION_RESOLVED:
+        return (
+            "model_attempt_id",
+            "model_step_id",
+            "operation_id",
+            "resolution_id",
+            "stage_id",
+            "stream_protocol",
+        )
+    if event_type == EventType.TASK_COMPLETION_RESULT_RESOLVED:
+        return (
+            "application_request_sha256",
+            "contract_fingerprint",
+            "contract_id",
+            "decision_id",
+            "resolver_configuration_fingerprint",
+            "resolver_id",
+            "resolver_version",
+            "result_digest",
+            "result_kind",
+            "result_reference_id",
+            "task_id",
+        )
+    if event_type == EventType.TASK_INTERRUPTED_HANDOFF:
+        return ("handoff_id", "task_id")
+    if event_type == EventType.REQUEST_FOOTPRINT_RECORDED:
+        return ("execution_profile_fingerprint",)
+    if event_type == EventType.TOOL_EXPOSURE_RECORDED:
+        return (
+            "catalogue_revision",
+            "execution_profile_fingerprint",
+            "exposure_fingerprint",
+            "model_step_id",
+            "profile_id",
+        )
+    if event_type == EventType.MODEL_STARTED:
+        return (MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY,)
+    return ()
+
+
+def _copy_event_for_session_store(event: Event) -> Event:
+    """Strip caller-authored durable authority before persistence."""
+
+    from cayu.collaboration._session_export_store import require_event_publication
+
+    # Check provenance and exact owner bytes before copying can normalize input,
+    # then recheck the detached value that is actually sent to persistence.
+    # Leave rejection of non-exact events to the existing copy_event contract.
+    if type(event) is Event:
+        require_event_publication(event)
+    copied = copy_event(event)
+    validate_event_envelope(copied)
+    require_event_publication(copied)
+    authority_fields = _persisted_event_authority_fields(copied.type)
+    if not authority_fields:
+        return copied
+    payload = copy_durable_json_object(copied.payload, "event payload")
+    changed = False
+    for field_name in authority_fields:
+        value = payload.get(field_name)
+        if type(value) is str and event_payload_authority_is_runtime_generated(
+            copied,
+            field_name=field_name,
+            value=value,
+        ):
+            continue
+        if field_name in payload:
+            payload.pop(field_name)
+            changed = True
+    return copied if not changed else copied.model_copy(update={"payload": payload})
+
+
+def _event_input_contract_is_runtime_owned(event: Event) -> bool:
+    """Return whether one sanitized event carries the runtime-owned input marker."""
+
+    if type(event) is not Event:
+        raise TypeError("event must be an exact Event.")
+    if event.type not in {
+        EventType.SESSION_STARTED,
+        EventType.SESSION_RESUMED,
+        EventType.SESSION_MESSAGE_QUEUED,
+        EventType.SESSION_MESSAGE_DELIVERED,
+    }:
+        return False
+    marker = event.payload.get(SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY)
+    return type(marker) is str and event_payload_authority_is_runtime_generated(
+        event,
+        field_name=SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
+        value=marker,
+    )
+
+
+def _event_file_attachment_attestations_are_runtime_owned(event: Event) -> bool:
+    """Return whether a model boundary carries exact runtime-resolved file proof."""
+
+    if type(event) is not Event:
+        raise TypeError("event must be an exact Event.")
+    if event.type != EventType.MODEL_STARTED:
+        return False
+    marker = event.payload.get(MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY)
+    return type(marker) is str and event_payload_authority_is_runtime_generated(
+        event,
+        field_name=MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY,
+        value=marker,
+    )
+
+
+def restore_persisted_event_authority(
+    event: Event,
+    *,
+    input_contract_runtime_owned: bool = False,
+    file_attachment_attestations_runtime_owned: bool = False,
+) -> Event:
+    """Restore private authority proven by the built-in store ingestion boundary.
+
+    Every built-in path capable of persisting an authoritative event field routes through
+    :func:`_copy_event_for_session_store`, either as an ordinary event batch or
+    through ``RuntimePublicationRequest``. A retained authority field could
+    therefore only have crossed a persistence boundary with exact runtime
+    authority. SQL serialization does not retain Pydantic private attributes;
+    raw-record decoders use this helper to reconstruct that already-proven
+    provenance without exposing a marker in the public event payload. Trusted
+    Cayu JSONL restore uses the same fixed allowlist at its explicit backup
+    boundary; callers must not restore JSONL obtained from an untrusted source.
+    """
+
+    copied = copy_event(event)
+    if type(input_contract_runtime_owned) is not bool:
+        raise TypeError("input_contract_runtime_owned must be a bool.")
+    if type(file_attachment_attestations_runtime_owned) is not bool:
+        raise TypeError("file_attachment_attestations_runtime_owned must be a bool.")
+    fields = tuple(
+        field_name
+        for field_name in _persisted_event_authority_fields(copied.type)
+        if type(copied.payload.get(field_name)) is str
+        and (
+            field_name != SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY or input_contract_runtime_owned
+        )
+        and (
+            field_name != MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY
+            or file_attachment_attestations_runtime_owned
+        )
+    )
+    return event_with_runtime_payload_authority(copied, *fields) if fields else copied
+
+
+def _copy_session_event_batch(session_id: str, events: list[Event]) -> tuple[str, list[Event]]:
+    session_id = require_clean_nonblank(session_id, "session_id")
+    if type(events) is not list:
+        raise TypeError("Session events must be a list.")
+
+    copied_events: list[Event] = []
+    seen_event_ids: set[str] = set()
+    for event in events:
+        if type(event) is not Event:
+            raise TypeError("Session events must be Event instances.")
+        copied_event = _copy_event_for_session_store(event)
+        if copied_event.session_id != session_id:
+            raise ValueError("Event session_id does not match target session.")
+        if copied_event.id in seen_event_ids:
+            raise ValueError(f"Event already exists for session {session_id}: {copied_event.id}")
+        seen_event_ids.add(copied_event.id)
+        copied_events.append(copied_event)
+    return session_id, copied_events

@@ -17,10 +17,10 @@ from cayu.sessions.base import (
     _assert_session_run_epoch,
     _check_closure_lineage_owner,
     _copy_mcp_manifest_publication,
-    _copy_session_event_batch,
     _copy_workflow_step_reservation,
     _current_session_run_epoch,
 )
+from cayu.sessions.event_delivery import _copy_session_event_batch
 from cayu.sessions.mcp_manifest_history import (
     McpManifestBaseline,
     McpManifestBaselineLoadResult,

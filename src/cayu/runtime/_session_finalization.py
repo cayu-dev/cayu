@@ -267,7 +267,6 @@ from cayu.sessions.base import (
     SessionModelCompletionStageConflict,
     SessionRunFenced,
     SessionRuntimePublicationConflict,
-    SessionStatusConflict,
     SessionStore,
     _activate_session_interaction,
     _clear_session_interaction_recovered_active_through,
@@ -304,6 +303,7 @@ from cayu.sessions.interactions import (
 from cayu.sessions.records import (
     Session,
     SessionStatus,
+    SessionStatusConflict,
 )
 from cayu.sessions.transcript_queries import (
     TranscriptQuery,

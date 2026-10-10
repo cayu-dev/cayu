@@ -125,12 +125,11 @@ from cayu.sessions.base import (
     ModelCompletionStageRequest,
     SessionOperationPublication,
     SessionRunFenced,
-    SessionStatusConflict,
     SessionStore,
     _deactivate_session_run_fence,
 )
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import SessionStatus, SessionStatusConflict
 from cayu.sessions.recovery import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,

@@ -13,17 +13,13 @@ from cayu.sessions._checkpoint_preservation import (
     _copy_checkpoint_for_transform,
     _replace_checkpoint_preserving_completion_result_event_publications,
 )
-from cayu.sessions.base import (
-    CheckpointTransform,
-    SessionOperationPublication,
-    StoreTimeCheckpointTransform,
-)
+from cayu.sessions.base import SessionOperationPublication
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     decode_runtime_checkpoint,
 )
-from cayu.sessions.records import Session
+from cayu.sessions.records import CheckpointTransform, Session, StoreTimeCheckpointTransform
 
 
 def _preserve_checkpoint(

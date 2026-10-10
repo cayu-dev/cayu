@@ -320,7 +320,6 @@ from cayu.sessions.base import (
     RuntimePublicationReceipt,
     SessionRunFenced,
     SessionRuntimePublicationConflict,
-    SessionStatusConflict,
     SessionStore,
     _activate_owned_session_run_fence,
     _checkpoint_with_session_run_operation,
@@ -339,6 +338,7 @@ from cayu.sessions.interactions import (
 from cayu.sessions.records import (
     Session,
     SessionStatus,
+    SessionStatusConflict,
 )
 from cayu.tasks._terminalization import _terminalize_claimed_task
 from cayu.tasks.store import TaskStore

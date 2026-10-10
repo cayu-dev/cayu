@@ -64,7 +64,6 @@ from cayu.sessions._execution_profile_checkpoint import (
     checkpoint_with_active_invocation_execution_profile,
 )
 from cayu.sessions.base import (
-    CheckpointTransform,
     SessionRunFenced,
     SessionStore,
     _activate_session_interaction,
@@ -83,6 +82,7 @@ from cayu.sessions.interactions import (
     INTERACTION_TERMINAL_EVENT_TYPES,
 )
 from cayu.sessions.records import (
+    CheckpointTransform,
     Session,
     SessionStatus,
 )

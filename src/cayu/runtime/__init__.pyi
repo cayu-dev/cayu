@@ -885,7 +885,6 @@ from cayu.sessions.base import SESSION_RUNTIME_METADATA_PREFIX as SESSION_RUNTIM
 from cayu.sessions.base import ActiveModelCompletionStage as ActiveModelCompletionStage
 from cayu.sessions.base import CheckpointRootFieldGuard as CheckpointRootFieldGuard
 from cayu.sessions.base import CheckpointRootFieldProjection as CheckpointRootFieldProjection
-from cayu.sessions.base import CheckpointTransform as CheckpointTransform
 from cayu.sessions.base import InMemorySessionStore as InMemorySessionStore
 from cayu.sessions.base import (
     InteractionTransitionReceiptResult as InteractionTransitionReceiptResult,
@@ -938,9 +937,7 @@ from cayu.sessions.base import SessionOperationTransform as SessionOperationTran
 from cayu.sessions.base import (
     SessionRuntimePublicationConflict as SessionRuntimePublicationConflict,
 )
-from cayu.sessions.base import SessionStatusConflict as SessionStatusConflict
 from cayu.sessions.base import SessionStore as SessionStore
-from cayu.sessions.base import StoreTimeCheckpointTransform as StoreTimeCheckpointTransform
 from cayu.sessions.base import (
     StoreTimeSessionOperationTransform as StoreTimeSessionOperationTransform,
 )
@@ -1185,6 +1182,7 @@ from cayu.sessions.records import MAX_SESSION_ID_BYTES as MAX_SESSION_ID_BYTES
 from cayu.sessions.records import (
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY as RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
 )
+from cayu.sessions.records import CheckpointTransform as CheckpointTransform
 from cayu.sessions.records import EventRecord as EventRecord
 from cayu.sessions.records import PendingActionKind as PendingActionKind
 from cayu.sessions.records import PendingActionSession as PendingActionSession
@@ -1194,6 +1192,8 @@ from cayu.sessions.records import SessionIdentity as SessionIdentity
 from cayu.sessions.records import SessionInvocationSnapshot as SessionInvocationSnapshot
 from cayu.sessions.records import SessionStateSnapshot as SessionStateSnapshot
 from cayu.sessions.records import SessionStatus as SessionStatus
+from cayu.sessions.records import SessionStatusConflict as SessionStatusConflict
+from cayu.sessions.records import StoreTimeCheckpointTransform as StoreTimeCheckpointTransform
 from cayu.sessions.records import TranscriptRecord as TranscriptRecord
 from cayu.sessions.recovery import (
     MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES as MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES,

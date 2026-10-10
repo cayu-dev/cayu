@@ -260,7 +260,6 @@ from cayu.sessions.base import (
     SessionModelCompletionStageIncomplete,
     SessionOperationPublication,
     SessionRuntimePublicationConflict,
-    SessionStatusConflict,
     SessionStore,
     _checkpoint_with_session_run_operation,
     _deactivate_session_run_fence,
@@ -307,7 +306,7 @@ from cayu.sessions.messaging import (
     SessionQueuedMessagesPending,
 )
 from cayu.sessions.queries import SessionOrder, SessionQuery
-from cayu.sessions.records import Session, SessionIdentity, SessionStatus
+from cayu.sessions.records import Session, SessionIdentity, SessionStatus, SessionStatusConflict
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
 from cayu.sessions.requests import (
     CompactSessionRequest,

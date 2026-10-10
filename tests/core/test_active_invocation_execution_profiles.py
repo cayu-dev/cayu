@@ -100,7 +100,6 @@ from cayu.sessions.base import (
     InteractionTransitionSpec,
     ModelTarget,
     SessionRunFenced,
-    SessionStatusConflict,
     SessionStore,
 )
 from cayu.sessions.checkpoints import (
@@ -117,7 +116,7 @@ from cayu.sessions.forks import (
 )
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 from cayu.sessions.queries import SessionQuery
-from cayu.sessions.records import SessionIdentity, SessionStatus
+from cayu.sessions.records import SessionIdentity, SessionStatus, SessionStatusConflict
 from cayu.sessions.recovery import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,

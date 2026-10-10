@@ -18,8 +18,6 @@ from cayu.sessions import event_delivery as side_effect_health
 from cayu.sessions.base import (
     _copy_failed_first_delivery_retirement,
     _copy_pending_first_event_delivery,
-    _event_file_attachment_attestations_are_runtime_owned,
-    _event_input_contract_is_runtime_owned,
 )
 from cayu.sessions.event_delivery import (
     PersistedEventSideEffectClaim,
@@ -29,6 +27,8 @@ from cayu.sessions.event_delivery import (
     PersistedEventSideEffectPage,
     PersistedEventSideEffectQuery,
     PersistedEventSideEffectStatus,
+    _event_file_attachment_attestations_are_runtime_owned,
+    _event_input_contract_is_runtime_owned,
     validate_persisted_event_side_effect_error,
 )
 from cayu.storage import _sqlite_records as sqlite_records

@@ -132,7 +132,6 @@ from cayu.sessions._model_failover import (
     MODEL_FAILOVER_CHECKPOINT_KEY,
 )
 from cayu.sessions.base import (
-    CheckpointTransform,
     ModelCompletionStage,
     ModelCompletionStageRequest,
     RuntimePublicationRequest,
@@ -141,7 +140,7 @@ from cayu.sessions.base import (
     runtime_publication_checkpoint_mutation,
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery
-from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.records import CheckpointTransform, Session, SessionStatus
 from cayu.vaults.redaction import SecretRedactor
 
 

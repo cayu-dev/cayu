@@ -50,8 +50,9 @@ from cayu.messages import Message
 from cayu.sessions._session_continuation_store import (
     import_history_checkpoint as import_continuation_history_checkpoint,
 )
-from cayu.sessions.base import SessionStore, restore_persisted_event_authority
+from cayu.sessions.base import SessionStore
 from cayu.sessions.checkpoints import decode_runtime_checkpoint
+from cayu.sessions.event_delivery import restore_persisted_event_authority
 from cayu.sessions.exports import (
     SessionExportBoundary,
     SessionExportLimits,

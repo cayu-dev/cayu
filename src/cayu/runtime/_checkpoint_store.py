@@ -35,13 +35,11 @@ from cayu.sessions._checkpoint_preservation import (
 )
 from cayu.sessions.base import (
     CheckpointRootFieldGuard,
-    CheckpointTransform,
     ModelCompletionStageRecoveryFence,
     RuntimePublicationRequest,
     SessionInvocationAdmission,
     SessionOperationInitializer,
     SessionStore,
-    StoreTimeCheckpointTransform,
     _runtime_publication_checkpoint_codec_scope,
     _session_continuation_methods_owned,
     _session_export_methods_owned,
@@ -53,7 +51,7 @@ from cayu.sessions.checkpoints import (
     validate_runtime_checkpoint_root_projection,
 )
 from cayu.sessions.forks import ProfiledSessionForkResult
-from cayu.sessions.records import Session
+from cayu.sessions.records import CheckpointTransform, Session, StoreTimeCheckpointTransform
 
 _ROOT_CHECKPOINT_GUARD = CheckpointRootFieldGuard(
     key=CHECKPOINT_SCHEMA_VERSION_KEY,

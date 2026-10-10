@@ -3941,7 +3941,6 @@ from cayu.sessions.base import ModelTarget as ModelTarget
 from cayu.sessions.base import SessionExecutionInProgress as SessionExecutionInProgress
 from cayu.sessions.base import SessionInvocationAdmission as SessionInvocationAdmission
 from cayu.sessions.base import SessionModelTransition as SessionModelTransition
-from cayu.sessions.base import SessionStatusConflict as SessionStatusConflict
 from cayu.sessions.base import SessionStore as SessionStore
 from cayu.sessions.base import (
     checkpoint_root_field_projection_from_storage as checkpoint_root_field_projection_from_storage,
@@ -4188,6 +4187,7 @@ from cayu.sessions.records import SessionIdentity as SessionIdentity
 from cayu.sessions.records import SessionInvocationSnapshot as SessionInvocationSnapshot
 from cayu.sessions.records import SessionStateSnapshot as SessionStateSnapshot
 from cayu.sessions.records import SessionStatus as SessionStatus
+from cayu.sessions.records import SessionStatusConflict as SessionStatusConflict
 from cayu.sessions.records import TranscriptRecord as TranscriptRecord
 from cayu.sessions.recovery import (
     MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES as MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES,

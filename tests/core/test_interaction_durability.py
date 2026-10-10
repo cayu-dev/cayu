@@ -42,7 +42,6 @@ from cayu.sessions.base import (
     InteractionTransitionResult,
     InteractionTransitionSpec,
     SessionRunFenced,
-    SessionStatusConflict,
 )
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.interactions import (
@@ -51,7 +50,7 @@ from cayu.sessions.interactions import (
     InteractionSummaryEvidence,
 )
 from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageDeliveryMode
-from cayu.sessions.records import SessionIdentity, SessionStatus
+from cayu.sessions.records import SessionIdentity, SessionStatus, SessionStatusConflict
 from cayu.sessions.recovery import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,

@@ -18,14 +18,13 @@ from cayu.sessions._checkpoint_preservation import (
 )
 from cayu.sessions.base import (
     INHERIT_INTERACTION,
-    CheckpointTransform,
     InteractionAttribution,
     _assert_session_run_epoch,
     _check_closure_lineage_owner,
     _checkpoint_after_initial_transcript_publication,
     resolve_interaction_attribution,
 )
-from cayu.sessions.records import Session, TranscriptRecord
+from cayu.sessions.records import CheckpointTransform, Session, TranscriptRecord
 from cayu.sessions.transcript_input import (
     DeferredInteractionInput,
     _initial_transcript_prefix_count,

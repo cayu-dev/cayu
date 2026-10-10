@@ -12,7 +12,7 @@ from pydantic import ValidationError
 from cayu import CayuApp, CayuConfig, OperationsConfig
 from cayu.messages import Message
 from cayu.runtime._recovery_ownership import _run_recovery_cleanup_steps
-from cayu.sessions.base import CheckpointTransform, InMemorySessionStore
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.cleanup import (
     RecoveryCleanupCapacityExceeded,
     RecoveryCleanupDeadlineExceeded,
@@ -22,7 +22,7 @@ from cayu.sessions.cleanup import (
     RecoveryCleanupStepInput,
     RecoveryCleanupSupervisor,
 )
-from cayu.sessions.records import SessionIdentity
+from cayu.sessions.records import CheckpointTransform, SessionIdentity
 from cayu.sessions.requests import RunRequest
 
 

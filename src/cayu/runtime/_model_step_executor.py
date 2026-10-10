@@ -337,13 +337,12 @@ from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.base import (
     ModelCompletionStage,
     ModelCompletionStageRequest,
-    SessionStatusConflict,
     SessionStore,
     _current_session_interaction_id,
 )
 from cayu.sessions.cleanup import RecoveryCleanupSupervisor
 from cayu.sessions.event_queries import EventOrder, EventQuery
-from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.records import Session, SessionStatus, SessionStatusConflict
 from cayu.tools.catalogue import (
     CALL_TOOL_NAME,
     SEARCH_TOOLS_NAME,

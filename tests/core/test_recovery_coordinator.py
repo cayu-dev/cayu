@@ -46,9 +46,10 @@ from cayu.runtime.build_provenance import (
     RuntimeBuildProvenance,
     RuntimeBuildProvenanceOrigin,
 )
-from cayu.sessions.base import CheckpointTransform, InMemorySessionStore
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.records import (
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
+    CheckpointTransform,
     Session,
     SessionIdentity,
     SessionStatus,

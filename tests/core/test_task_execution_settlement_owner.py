@@ -337,7 +337,8 @@ async def test_worker_start_ack_deadline_has_proven_nondispatch_owner(store, mon
 async def test_grouped_busy_session_requeues_with_settled_execution(store, monkeypatch, fault):
     from tests.core.test_dispatch import FakeProvider, _batch, _configured_app
 
-    from cayu.sessions.base import InMemorySessionStore, SessionStatusConflict
+    from cayu.sessions.base import InMemorySessionStore
+    from cayu.sessions.records import SessionStatusConflict
     from cayu.sessions.requests import ResumeRequest, RunRequest
     from cayu.tasks._execution_settlement import _failure_chain
     from cayu.tasks.groups import TaskGroupEventType

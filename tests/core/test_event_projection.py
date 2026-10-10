@@ -84,7 +84,8 @@ from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     PublicAuthorityAliasKeyring,
 )
-from cayu.sessions.base import InMemorySessionStore, restore_persisted_event_authority
+from cayu.sessions.base import InMemorySessionStore
+from cayu.sessions.event_delivery import restore_persisted_event_authority
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import Session, SessionIdentity
 from cayu.sessions.requests import RunRequest

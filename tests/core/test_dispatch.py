@@ -71,7 +71,6 @@ from cayu.sessions.base import (
     QueuedDispatchTerminalReceipt,
     SessionModelTransition,
     SessionRunFenced,
-    SessionStatusConflict,
     _checkpoint_with_session_run_operation,
     _fork_initial_invocation_request_sha256,
     validate_profiled_fork_evidence,
@@ -90,7 +89,7 @@ from cayu.sessions.invocation import (
     SessionInvocationBinding,
     TaskExecutionSource,
 )
-from cayu.sessions.records import Session, SessionIdentity, SessionStatus
+from cayu.sessions.records import Session, SessionIdentity, SessionStatus, SessionStatusConflict
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction
 from cayu.sessions.requests import ForkSessionRequest, ResumeRequest, RunRequest
 from cayu.sessions.transcript_input import session_input_messages_sha256
