@@ -11,7 +11,7 @@ from uuid import uuid4
 import pytest
 from tests.core._execution_profile_fixtures import profiled_session_identity
 
-import cayu.runtime._session_engine as session_engine_module
+import cayu.runtime._session_fork as session_fork_module
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.approvals.tools import (
@@ -1143,7 +1143,7 @@ def test_profiled_fork_supervisory_exit_waits_for_store_settlement(
             source_session_id=source.id,
             session_id="abandoned-profiled-fork-child",
         )
-        original_wait = session_engine_module.await_shielded_task_outcome
+        original_wait = session_fork_module.await_shielded_task_outcome
         supervisory_exit_delivered = False
 
         async def abandon_once(task, **kwargs):
@@ -1159,7 +1159,7 @@ def test_profiled_fork_supervisory_exit_waits_for_store_settlement(
             return await original_wait(task, **kwargs)
 
         monkeypatch.setattr(
-            session_engine_module,
+            session_fork_module,
             "await_shielded_task_outcome",
             abandon_once,
         )
@@ -2201,7 +2201,7 @@ def test_fork_current_child_rejects_unavailable_identity_before_child_creation(
         )
         app.register_provider(ScriptedModelProvider([], name="fake"), default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-        for provenance_owner in (session_engine_module, _session_execution_profile):
+        for provenance_owner in (session_fork_module, _session_execution_profile):
             monkeypatch.setattr(
                 provenance_owner,
                 "current_runtime_build_provenance",

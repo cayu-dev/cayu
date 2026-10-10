@@ -5,6 +5,7 @@ from __future__ import annotations
 from cayu.runtime._task_store_operation_boundary import (
     capture_sensitive_validation,
     capture_task_store_operation,
+    raise_task_store_operation_failure,
 )
 from cayu.tasks.contracts import TaskCompletionDecisionRequired
 from cayu.tasks.records import Task, copy_task
@@ -120,3 +121,28 @@ async def verifier_aware_task_execution_outcome(
     if admission_outcome.failure is not None:
         return False, admission_outcome.failure
     return False, None
+
+
+async def require_ordinary_session_execution(
+    session_id: str,
+    *,
+    admit_session: bool,
+    task_store: TaskStore | None,
+    redactor: SecretRedactor,
+) -> None:
+    (
+        requires_completion_decision,
+        admission_failure,
+    ) = await verifier_aware_task_execution_outcome(
+        None,
+        task_store=task_store,
+        redactor=redactor,
+        session_id=session_id,
+        admit_session=admit_session,
+    )
+    if admission_failure is not None:
+        raise_task_store_operation_failure(admission_failure)
+    if requires_completion_decision:
+        raise TaskCompletionDecisionRequired(
+            "Contracted tasks require the verifier-aware execution entrance."
+        ) from None

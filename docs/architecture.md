@@ -262,6 +262,8 @@ CayuApp
   -> SessionFinalization
   -> PendingToolRoundRecovery
   -> ModelCompletionRecovery
+  -> ExecutionProfileClassifier
+  -> SessionFork
   -> SessionEngine
   -> IncompleteSessionRecovery
   -> RecoveryCoordinator
@@ -270,11 +272,24 @@ CayuApp
   -> QueuedDispatchCoordinator
 ```
 
-`SessionEngine` owns execution, fork, queued-message
+`SessionEngine` owns execution, queued-message
 delivery, task linkage, and model/tool loop decisions. `SessionRecovery` owns
 startup recovery, abandoned-run recovery, and public resume orchestration above
 the engine. Resume prepares and validates its inputs before recovery, retains its
 budget snapshot, then enters execution after recovery settles.
+
+`SessionFork` owns independent child creation: source admission and expired-owner
+fencing, prompt succession, profile selection, atomic publication, cancellation
+settlement and exact replay. `CayuApp` composes it directly and retains public
+request authority, secret detachment and event projection. The fork owner imports
+without the application or session engine and uses the existing native store
+transactions. A committed child's exact replay can survive deletion of its parent.
+
+`ExecutionProfileClassifier` owns the reuse, adoption and authority decisions shared
+by fork and resume. Session discovery initialization and validation live in
+`_session_tool_discovery`; ordinary task admission lives in
+`_task_execution_admission`. Each entrance calls these shared parts at its existing
+admission and publication boundaries.
 
 `RecoveryCoordinator` owns paused continuations and manual outcome reconciliation.
 `IncompleteSessionRecovery` owns incomplete-session inspection and repair;

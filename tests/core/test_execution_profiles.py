@@ -20,6 +20,7 @@ from tests._tool_admission_fixtures import (
 
 import cayu.runtime._execution_profile_admission as execution_profile_admission
 import cayu.runtime._session_engine as session_engine_module
+import cayu.runtime._session_fork as session_fork_module
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
@@ -6075,7 +6076,11 @@ def test_authorized_current_child_fork_adopts_complete_runtime_identity_and_resu
             artifact_digest="b" * 64,
         )
         monkeypatch.setattr(execution_profile_continuation, "_runtime_version", lambda: "0.4.0")
-        for provenance_owner in (session_engine_module, _session_execution_profile):
+        for provenance_owner in (
+            session_engine_module,
+            session_fork_module,
+            _session_execution_profile,
+        ):
             monkeypatch.setattr(
                 provenance_owner,
                 "current_runtime_build_provenance",
@@ -6101,7 +6106,11 @@ def test_authorized_current_child_fork_adopts_complete_runtime_identity_and_resu
             )
 
             monkeypatch.setattr(execution_profile_continuation, "_runtime_version", lambda: "0.4.1")
-            for provenance_owner in (session_engine_module, _session_execution_profile):
+            for provenance_owner in (
+                session_engine_module,
+                session_fork_module,
+                _session_execution_profile,
+            ):
                 monkeypatch.setattr(
                     provenance_owner,
                     "current_runtime_build_provenance",

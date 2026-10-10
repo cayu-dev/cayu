@@ -386,6 +386,7 @@ from cayu.runtime._event_projection import (
 )
 from cayu.runtime._event_watcher_delivery import EventWatcherSupervisor
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._execution_profile_classification import ExecutionProfileClassifier
 from cayu.runtime._execution_profile_continuation import ExecutionProfileContinuation
 from cayu.runtime._execution_profile_identity_validation import (
     copy_secret_free_execution_profile_behavior_identity,
@@ -445,6 +446,7 @@ from cayu.runtime._session_engine import (
 )
 from cayu.runtime._session_execution_presence import process_owner_id
 from cayu.runtime._session_finalization import SessionFinalization
+from cayu.runtime._session_fork import SessionFork
 from cayu.runtime._session_message_coordinator import SessionMessageCoordinator
 from cayu.runtime._session_recovery import SessionRecovery
 from cayu.runtime._session_request_boundary import _validate_resume_request, _validate_run_request
@@ -1713,6 +1715,35 @@ class CayuApp:
             execution_profile_process_identity=self._execution_profile_process_identity,
         )
 
+        self._execution_profile_classifier = ExecutionProfileClassifier(
+            policy=execution_profile_policy,
+            policy_identity=execution_profile_policy_identity,
+            redactor=self._secret_redactor,
+            clock=self._clock,
+        )
+        self._session_fork = SessionFork(
+            session_store=self._runtime_session_store,
+            task_store=self.task_store,
+            profile_classifier=self._execution_profile_classifier,
+            execution_profile_continuation=self._execution_profile_continuation,
+            environment_lifecycle=self._environment_lifecycle,
+            event_writer=self._event_writer,
+            recovery_ownership=self._recovery_ownership,
+            tool_admission=self._tool_round_executor.invocation.admission,
+            secret_redactor=self._secret_redactor,
+            clock=self._clock,
+            runtime_hooks=self._runtime_hooks,
+            loop_policies=self._loop_policies,
+            loop_policy_execution_profile_identities=self._loop_policy_execution_profile_identities,
+            get_budget_policy=lambda: self.budget_policy,
+            get_registered_agent=self._get_registered_agent,
+            get_registered_provider=self._get_registered_provider,
+            get_registered_environment_for_session=self._get_registered_environment_for_session,
+            effective_retry_policy=self._effective_retry_policy,
+            application_run_defaults=resolved_config.run,
+            execution_profile_process_identity=self._execution_profile_process_identity,
+        )
+
         self._session_engine = SessionEngine(
             compaction=self._session_compaction,
             session_finalization=self._session_finalization,
@@ -1759,8 +1790,7 @@ class CayuApp:
             get_registered_environment_for_session=(self._get_registered_environment_for_session),
             effective_retry_policy=self._effective_retry_policy,
             application_run_defaults=resolved_config.run,
-            execution_profile_policy=execution_profile_policy,
-            execution_profile_policy_identity=execution_profile_policy_identity,
+            profile_classifier=self._execution_profile_classifier,
             egress_authority_adoption_handler=egress_authority_adoption_handler,
             execution_profile_process_identity=self._execution_profile_process_identity,
         )
@@ -6259,7 +6289,7 @@ class CayuApp:
     def execution_profile_policy_identity(self) -> str | None:
         """Return the configured ``ExecutionProfilePolicy`` identity, if any."""
 
-        return self._session_engine.execution_profile_policy_identity
+        return self._execution_profile_classifier.policy_identity
 
     @property
     def default_environment_name(self) -> str | None:
@@ -8665,12 +8695,12 @@ class CayuApp:
         failure: BaseException | None = None
         try:
             private_session_id, _ = await self._resolve_public_session_authority(source_session_id)
-            await self._preflight_ordinary_fork_source(private_session_id)
+            await self._session_fork.preflight_source(private_session_id)
             source, checkpoint = await load_runtime_session_checkpoint_snapshot(
                 self._runtime_session_store,
                 private_session_id,
             )
-            await self._session_engine.preflight_fork_source_checkpoint_state(source, checkpoint)
+            await self._session_fork.preflight_fork_source_checkpoint_state(source, checkpoint)
             transcript = await self.session_store.load_transcript_snapshot(private_session_id)
             snapshot = _fork_source_snapshot_from_material(
                 source,
@@ -8684,7 +8714,7 @@ class CayuApp:
                 self._runtime_session_store,
                 private_session_id,
             )
-            await self._session_engine.preflight_fork_source_checkpoint_state(
+            await self._session_fork.preflight_fork_source_checkpoint_state(
                 current_source,
                 current_checkpoint,
             )
@@ -8823,12 +8853,6 @@ class CayuApp:
             raise failure from None
         return tuple(projected_events)
 
-    async def _preflight_ordinary_fork_source(self, session_id: str) -> None:
-        await self._session_engine.require_ordinary_session_execution(
-            session_id,
-            admit_session=False,
-        )
-
     async def _fork_session_private(
         self,
         request: ForkSessionRequest,
@@ -8848,7 +8872,7 @@ class CayuApp:
             ),
         )
         del request
-        stream = self._session_engine.fork_session(
+        stream = self._session_fork.fork_session(
             request=prepared.request,
             request_sha256=prepared.request_sha256,
             accepted_request_sha256s=prepared.accepted_request_sha256s,

@@ -1,4 +1,9 @@
 {
+  "tests/core/test_session_fork_composition.py::test_fork_snapshot_keeps_its_composed_task_admission_store": 0.8547759170178324,
+  "tests/core/test_session_fork_composition.py::test_fork_parts_import_without_application_or_session_engine": 1.4942391669610515,
+  "tests/core/test_session_fork_composition.py::test_profile_classification_executes_without_application_or_execution_owners": 1.2841041249921545,
+  "tests/core/test_session_fork_composition.py::test_public_fork_and_replay_do_not_need_the_session_engine[exact-source]": 0.49758283398114145,
+  "tests/core/test_session_fork_composition.py::test_public_fork_and_replay_do_not_need_the_session_engine[ordinary]": 0.6690146250184625,
   "tests/core/test_session_interaction_rules_layout.py::test_interaction_summaries_do_not_load_invocation_contracts": 0.16808458301238716,
   "tests/core/test_session_interaction_rules_layout.py::test_access_denial_preserves_public_identity": 9.958300506696105e-05,
   "tests/core/test_session_interaction_rules_layout.py::test_access_rules_preserve_public_identity[SessionAccessRule]": 0.00013858400052413344,

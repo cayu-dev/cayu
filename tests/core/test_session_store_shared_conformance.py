@@ -28573,8 +28573,7 @@ def test_session_store_conformance_generated_profiled_fork_is_idempotent(
                 raise AssertionError("exact child replay consulted source task authority")
 
             monkeypatch.setattr(
-                app._session_engine,
-                "require_ordinary_session_execution",
+                "cayu.runtime._session_fork.require_ordinary_session_execution",
                 reject_source_admission,
             )
 
