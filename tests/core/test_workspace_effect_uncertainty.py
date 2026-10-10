@@ -21,7 +21,7 @@ from cayu.environments.bindings import DeterministicWorkspaceBinding
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.runners.base import RunnerExecutionError
-from cayu.runtime._session_engine import SessionEngine
+from cayu.runtime._session_finalization import SessionFinalization
 from cayu.runtime._tool_effect_state import ToolEffectReconciliationRequired, ToolEffectStateOwner
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions.base import InMemorySessionStore
@@ -72,14 +72,16 @@ def test_unknown_effect_workspace_receipt_survives_recovery(
 
     async def scenario():
         interruption_error = OSError("session interruption unavailable")
-        original_interrupt = SessionEngine._handle_session_interrupted
+        original_interrupt = SessionFinalization.handle_session_interrupted
         if mode == "interruption_failure":
 
             async def fail_interruption(self, **kwargs):
                 raise interruption_error
                 yield  # Keep the real cleanup owner's async-iterator contract.
 
-            monkeypatch.setattr(SessionEngine, "_handle_session_interrupted", fail_interruption)
+            monkeypatch.setattr(
+                SessionFinalization, "handle_session_interrupted", fail_interruption
+            )
         root = tmp_path / "workspace"
         root.mkdir()
         path = tmp_path / "sessions.sqlite"
@@ -192,7 +194,9 @@ def test_unknown_effect_workspace_receipt_survives_recovery(
                 assert [error.diagnostic["error_type"] for error in bounded_failures] == ["OSError"]
                 assert "workspace finalization unavailable" not in repr(cause)
             monkeypatch.setattr(store, "publish_runtime_publication", original_publish)
-            monkeypatch.setattr(SessionEngine, "_handle_session_interrupted", original_interrupt)
+            monkeypatch.setattr(
+                SessionFinalization, "handle_session_interrupted", original_interrupt
+            )
             if backend == "sqlite":
                 await store.close()
                 store = SQLiteSessionStore(path)

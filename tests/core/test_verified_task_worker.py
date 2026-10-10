@@ -59,7 +59,7 @@ from cayu.providers.operations import (
     ProviderOperationStatus,
 )
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
-from cayu.runtime._recovery_coordinator import RecoveryCoordinator
+from cayu.runtime._pending_tool_round_recovery import PendingToolRoundRecovery
 from cayu.runtime._tool_effect_state import ToolEffectStateOwner
 from cayu.runtime.completion_verifiers import (
     CompletionVerifierExecutionError,
@@ -877,7 +877,7 @@ def test_tool_settlement_rejects_non_object_terminal_result(result_payload):
         tool_name="record_effect",
         payload={"tool_call_id": "record-effect", "result": result_payload},
     )
-    assert not RecoveryCoordinator._tool_terminals_are_settled([event], ["record-effect"])
+    assert not PendingToolRoundRecovery.tool_terminals_are_settled([event], ["record-effect"])
 
 
 _RECOVERY_SECRET_CANARY = "verified-recovery-dynamic-vault-canary"

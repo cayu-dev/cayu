@@ -21204,7 +21204,7 @@ def test_background_interruption_shutdown_fences_cancellation_resistant_claim(mo
         release_claim = asyncio.Event()
         claim_returned = asyncio.Event()
         claimed_runs: list[str] = []
-        original_claim = app._claim_pending_interruption_cascade
+        original_claim = app._background_interruption_coordinator.claim_pending_interruption_cascade
         original_run_claimed = (
             app._background_interruption_coordinator._run_claimed_background_interruption_cascade
         )
@@ -21369,7 +21369,9 @@ def test_background_interruption_heartbeat_retries_transient_store_error(monkeyp
             "_interrupt_session",
             interrupt_after_renewal,
         )
-        original_renew = app._renew_pending_interruption_cascade_claim
+        original_renew = (
+            app._background_interruption_coordinator.renew_pending_interruption_cascade_claim
+        )
         renew_attempts = 0
 
         async def transient_renew(*args):
@@ -21438,7 +21440,7 @@ def test_background_interruption_does_not_start_after_claim_acknowledgement_expi
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
         coordinator = app._background_interruption_coordinator
-        original_claim = coordinator._claim_pending_interruption_cascade
+        original_claim = coordinator.claim_pending_interruption_cascade
         claimed_run_started = False
         deferred: list[dict[str, Any]] = []
 
@@ -21451,7 +21453,7 @@ def test_background_interruption_does_not_start_after_claim_acknowledgement_expi
             nonlocal claimed_run_started
             claimed_run_started = True
 
-        monkeypatch.setattr(coordinator, "_claim_pending_interruption_cascade", delayed_claim)
+        monkeypatch.setattr(coordinator, "claim_pending_interruption_cascade", delayed_claim)
         monkeypatch.setattr(
             coordinator,
             "_run_claimed_background_interruption_cascade",
@@ -21616,7 +21618,7 @@ def test_background_interruption_claim_loss_cancels_dispatched_child_interruptio
         monkeypatch.setattr(coordinator, "_interrupt_session", blocked_interruption)
         monkeypatch.setattr(
             coordinator,
-            "_renew_pending_interruption_cascade_claim",
+            "renew_pending_interruption_cascade_claim",
             unavailable_renew,
         )
         cascade = asyncio.create_task(
@@ -22466,75 +22468,76 @@ def test_interruption_cascade_generation_rejects_stale_worker_results():
             },
         )
 
-        first = await app._claim_pending_interruption_cascade(session_id, payload)
+        coordinator = app._background_interruption_coordinator
+        first = await coordinator.claim_pending_interruption_cascade(session_id, payload)
         first_claim_status = await app.interruption_cascade_status(session_id)
-        overlapping = await app._claim_pending_interruption_cascade(session_id, payload)
+        overlapping = await coordinator.claim_pending_interruption_cascade(session_id, payload)
         now[0] += timedelta(seconds=20)
-        renewed = await app._renew_pending_interruption_cascade_claim(
+        renewed = await coordinator.renew_pending_interruption_cascade_claim(
             session_id,
             first["attempt_id"],
             first["generation"],
             first["claim_id"],
         )
         now[0] += timedelta(seconds=15)
-        protected_by_heartbeat = await app._claim_pending_interruption_cascade(
+        protected_by_heartbeat = await coordinator.claim_pending_interruption_cascade(
             session_id,
             payload,
         )
         now[0] += timedelta(seconds=16)
-        expired_renewal = await app._renew_pending_interruption_cascade_claim(
+        expired_renewal = await coordinator.renew_pending_interruption_cascade_claim(
             session_id,
             first["attempt_id"],
             first["generation"],
             first["claim_id"],
         )
-        expired_failure_recorded = await app._mark_pending_interruption_cascade_failed(
+        expired_failure_recorded = await coordinator.mark_pending_interruption_cascade_failed(
             session_id,
             first["attempt_id"],
             first["generation"],
             first["claim_id"],
         )
-        expired_completion = await app._complete_pending_interruption_cascade(
+        expired_completion = await coordinator.complete_pending_interruption_cascade(
             session_id,
             first["attempt_id"],
             first["generation"],
             first["claim_id"],
         )
-        await app._release_pending_interruption_cascade_claim(
+        await coordinator.release_pending_interruption_cascade_claim(
             session_id,
             first["attempt_id"],
             first["generation"],
             first["claim_id"],
         )
-        second = await app._claim_pending_interruption_cascade(session_id, payload)
-        stale_failure_recorded = await app._mark_pending_interruption_cascade_failed(
+        second = await coordinator.claim_pending_interruption_cascade(session_id, payload)
+        stale_failure_recorded = await coordinator.mark_pending_interruption_cascade_failed(
             session_id,
             first["attempt_id"],
             first["generation"],
             first["claim_id"],
         )
-        current_failure_recorded = await app._mark_pending_interruption_cascade_failed(
+        current_failure_recorded = await coordinator.mark_pending_interruption_cascade_failed(
             session_id,
             second["attempt_id"],
             second["generation"],
             second["claim_id"],
         )
         failed_status = await app.interruption_cascade_status(session_id)
-        stale_completion = await app._complete_pending_interruption_cascade(
+        stale_completion = await coordinator.complete_pending_interruption_cascade(
             session_id,
             first["attempt_id"],
             first["generation"],
             first["claim_id"],
         )
-        failed_generation_completion = await app._complete_pending_interruption_cascade(
+        failed_generation_completion = await coordinator.complete_pending_interruption_cascade(
             session_id,
             second["attempt_id"],
             second["generation"],
             second["claim_id"],
         )
-        third = await app._claim_pending_interruption_cascade(session_id, payload)
+        third = await coordinator.claim_pending_interruption_cascade(session_id, payload)
         retry_status = await app.interruption_cascade_status(session_id)
-        current_completion = await app._complete_pending_interruption_cascade(
+        current_completion = await coordinator.complete_pending_interruption_cascade(
             session_id,
             third["attempt_id"],
             third["generation"],
@@ -22637,17 +22640,18 @@ def test_interruption_cascade_lease_uses_session_store_time() -> None:
             },
         )
 
-        first = await app._claim_pending_interruption_cascade(session_id, payload)
+        coordinator = app._background_interruption_coordinator
+        first = await coordinator.claim_pending_interruption_cascade(session_id, payload)
         assert first is not None
         assert first["created_at"] == store_now[0].isoformat()
         assert await app.interruption_cascade_status(session_id) == "pending"
 
         worker_now[0] += timedelta(days=3650)
-        assert await app._claim_pending_interruption_cascade(session_id, payload) is None
+        assert await coordinator.claim_pending_interruption_cascade(session_id, payload) is None
         assert await app.interruption_cascade_status(session_id) == "pending"
 
         store_now[0] += timedelta(minutes=5)
-        replacement = await app._claim_pending_interruption_cascade(session_id, payload)
+        replacement = await coordinator.claim_pending_interruption_cascade(session_id, payload)
         assert replacement is not None
         assert replacement["generation"] == first["generation"] + 1
         assert datetime.fromisoformat(replacement["claim_expires_at"]) > store_now[0]
@@ -60714,7 +60718,7 @@ def test_new_interruption_does_not_reuse_terminal_event_from_before_resume():
         )
         events = [
             event
-            async for event in app._handle_session_interrupted(
+            async for event in app._session_finalization.handle_session_interrupted(
                 session=session,
                 registered_agent=app._get_registered_agent("assistant"),
                 registered_environment=None,

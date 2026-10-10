@@ -133,12 +133,12 @@ def test_shutdown_waits_for_an_artifact_recovery_read_that_timed_out(
     from cayu.artifacts import local as local_artifacts
     from cayu.artifacts.local import LocalArtifactStore
     from cayu.environments.bindings import DeterministicWorkspaceBinding
-    from cayu.runtime import _recovery_coordinator
+    from cayu.runtime import _workspace_observation_recovery
     from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
     from cayu.workspaces.local import LocalWorkspace
 
     monkeypatch.setattr(
-        _recovery_coordinator, "_WORKSPACE_ARTIFACT_RECOVERY_READ_TIMEOUT_SECONDS", 0.2
+        _workspace_observation_recovery, "_WORKSPACE_ARTIFACT_RECOVERY_READ_TIMEOUT_SECONDS", 0.2
     )
 
     class OwnedResource:

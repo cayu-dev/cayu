@@ -70,7 +70,7 @@ def test_shutdown_waits_for_a_detached_interruption_claim_renewal(
             )
         coordinator = app._background_interruption_coordinator
         renewal_started, release = asyncio.Event(), asyncio.Event()
-        renew = coordinator._renew_pending_interruption_cascade_claim
+        renew = coordinator.renew_pending_interruption_cascade_claim
 
         async def blocked_renewal(*args):
             # A renewal write that outlives the claim's deadline.
@@ -88,7 +88,7 @@ def test_shutdown_waits_for_a_detached_interruption_claim_renewal(
             )
 
         monkeypatch.setattr(
-            coordinator, "_renew_pending_interruption_cascade_claim", blocked_renewal
+            coordinator, "renew_pending_interruption_cascade_claim", blocked_renewal
         )
         monkeypatch.setattr(coordinator, "_interrupt_session", interrupt_child)
         cascade = app._session_finalization.schedule_background_interruption_cascade(
@@ -435,8 +435,8 @@ def test_a_cascade_cancelled_by_a_drain_timeout_is_waited_for_on_retry(
             )
         coordinator = app._background_interruption_coordinator
         renewal_started, release = asyncio.Event(), asyncio.Event()
-        renew = coordinator._renew_pending_interruption_cascade_claim
-        release_claim = coordinator._release_pending_interruption_cascade_claim
+        renew = coordinator.renew_pending_interruption_cascade_claim
+        release_claim = coordinator.release_pending_interruption_cascade_claim
         writes: list[bool] = []
 
         async def blocked_renewal(*args):
@@ -460,10 +460,10 @@ def test_a_cascade_cancelled_by_a_drain_timeout_is_waited_for_on_retry(
             )
 
         monkeypatch.setattr(
-            coordinator, "_renew_pending_interruption_cascade_claim", blocked_renewal
+            coordinator, "renew_pending_interruption_cascade_claim", blocked_renewal
         )
         monkeypatch.setattr(
-            coordinator, "_release_pending_interruption_cascade_claim", recorded_release
+            coordinator, "release_pending_interruption_cascade_claim", recorded_release
         )
         monkeypatch.setattr(coordinator, "_interrupt_session", interrupt_child)
         app._session_finalization.schedule_background_interruption_cascade(
