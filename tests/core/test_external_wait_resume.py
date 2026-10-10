@@ -164,7 +164,7 @@ def test_public_resume_parks_then_consumes_one_event(
             original_park = _ExternalExecutionToWait.park
 
             async def park_with_live_writer(boundary, invocation):
-                from cayu.sessions.base import _current_session_run_epoch
+                from cayu.sessions._invocation_scope import _current_session_run_epoch
 
                 assert _current_session_run_epoch(session_id) == invocation.binding.run_epoch
                 assert (await store.inspect_session_execution(session_id)).state == "executing"

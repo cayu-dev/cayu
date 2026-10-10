@@ -23,7 +23,6 @@ from tests.runner_cancellation import cancelled_error_with_artifacts
 
 import cayu.runtime._invocation_secrets as invocation_secrets_module
 import cayu.runtime.execution_profiles as execution_profiles_module
-import cayu.sessions.base as sessions_module
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
@@ -50,6 +49,7 @@ from cayu.runtime import _session_checkpoint_admission
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
+from cayu.sessions import _invocation_scope as invocation_scope
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
@@ -2094,7 +2094,7 @@ def test_resume_cleans_up_when_legacy_secret_linkage_arrives_after_preflight() -
         return (
             events,
             await store.load(session_id),
-            sessions_module._current_session_run_epoch(session_id),
+            invocation_scope._current_session_run_epoch(session_id),
         )
 
     events, session, active_run_epoch = asyncio.run(scenario())

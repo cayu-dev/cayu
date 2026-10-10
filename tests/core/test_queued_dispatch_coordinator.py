@@ -13,11 +13,11 @@ from tests.core.test_dispatch import _batch, _build, _create_resumable_session, 
 
 import cayu
 from cayu.events import EventType
-from cayu.sessions.base import (
-    InMemorySessionStore,
+from cayu.sessions._invocation_scope import (
     _current_session_interaction_id,
     _current_session_run_epoch,
 )
+from cayu.sessions.base import InMemorySessionStore
 from cayu.storage.sqlite import SQLiteSessionStore
 
 

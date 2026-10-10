@@ -480,7 +480,7 @@ class _ExternalExecutionToWait:
     @staticmethod
     def _receive_admission(result):
         from cayu.sessions._invocation_lifecycle import InvocationMutationResult
-        from cayu.sessions.base import _activate_session_run_fence
+        from cayu.sessions._invocation_scope import _activate_session_run_fence
 
         if type(result) is not InvocationMutationResult:
             raise RuntimeError("External execution received an invalid native admission.")

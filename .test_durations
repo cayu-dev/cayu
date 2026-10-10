@@ -1,4 +1,9 @@
 {
+  "tests/core/test_session_interaction_rules_layout.py::test_interaction_context_preserves_history_and_restores_outer_scope": 0.44394420803291723,
+  "tests/core/test_session_interaction_rules_layout.py::test_interaction_prerequisites_preserve_public_identity[_invocation_scope-attribute_event_to_current_interaction]": 0.00017208396457135677,
+  "tests/core/test_session_interaction_rules_layout.py::test_interaction_prerequisites_preserve_public_identity[_invocation_scope-attribute_events_to_current_interaction]": 0.00017099996330216527,
+  "tests/core/test_session_interaction_rules_layout.py::test_interaction_prerequisites_preserve_public_identity[_invocation_scope-resolve_interaction_attribution]": 0.000175209017470479,
+  "tests/core/test_session_interaction_rules_layout.py::test_run_fence_retirement_crosses_copied_contexts_without_implementations": 0.46095920802326873,
   "tests/core/test_session_interaction_rules_layout.py::test_interaction_prerequisites_preserve_public_identity[interactions-InteractionTransitionReceiptResult]": 0.00017858296632766724,
   "tests/core/test_session_interaction_rules_layout.py::test_interaction_prerequisites_preserve_public_identity[interactions-InteractionTransitionResult]": 0.00017387495609000325,
   "tests/core/test_session_interaction_rules_layout.py::test_interaction_prerequisites_preserve_public_identity[interactions-InteractionTransitionSpec]": 0.00017020903760567307,

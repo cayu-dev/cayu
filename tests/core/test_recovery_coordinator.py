@@ -11,7 +11,6 @@ from typing import Any
 
 import pytest
 
-import cayu.sessions.base as sessions_module
 from cayu._exception_groups import _exception_graph_contains_identity
 from cayu.applications import CayuApp
 from cayu.approvals.tools import PendingToolApproval, PendingToolCallApproval
@@ -46,6 +45,7 @@ from cayu.runtime.build_provenance import (
     RuntimeBuildProvenance,
     RuntimeBuildProvenanceOrigin,
 )
+from cayu.sessions import _invocation_scope as invocation_scope
 from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.records import (
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
@@ -530,7 +530,7 @@ def test_initial_incomplete_recovery_claim_cannot_fence_replacement_owner() -> N
             store.release_first_claim.set()
             assert await asyncio.wait_for(first_task, timeout=5) is None
             assert (
-                sessions_module._current_session_run_epoch(session.id)
+                invocation_scope._current_session_run_epoch(session.id)
                 == replacement_claim.session.run_epoch
             )
 
@@ -552,7 +552,7 @@ def test_initial_incomplete_recovery_claim_cannot_fence_replacement_owner() -> N
                 authority=replacement_claim.require_authority(),
                 authoritative_failure=None,
             )
-            assert sessions_module._current_session_run_epoch(session.id) is None
+            assert invocation_scope._current_session_run_epoch(session.id) is None
 
     asyncio.run(scenario())
 
@@ -575,7 +575,7 @@ def test_incomplete_recovery_claim_finalization_transfers_across_tasks() -> None
             inactive_for_seconds=None,
         )
         assert first is not None
-        assert sessions_module._current_session_run_epoch(session.id) == first.session.run_epoch
+        assert invocation_scope._current_session_run_epoch(session.id) == first.session.run_epoch
 
         # A supervising task can finalize the durable claim and the exact
         # process-local owner acquired by this task. Context copying must not
@@ -587,7 +587,7 @@ def test_incomplete_recovery_claim_finalization_transfers_across_tasks() -> None
             ),
             context=Context(),
         )
-        assert sessions_module._current_session_run_epoch(session.id) is None
+        assert invocation_scope._current_session_run_epoch(session.id) is None
         assert first.require_authority().retire() is False
 
         current = await store.load(session.id)
@@ -602,7 +602,7 @@ def test_incomplete_recovery_claim_finalization_transfers_across_tasks() -> None
             authority=first.require_authority(),
             authoritative_failure=None,
         )
-        assert sessions_module._current_session_run_epoch(session.id) == second.session.run_epoch
+        assert invocation_scope._current_session_run_epoch(session.id) == second.session.run_epoch
         second_checkpoint = await store.load_checkpoint(session.id)
         assert second_checkpoint is not None
         second_marker = second_checkpoint["incomplete_session_recovery_claim"]
@@ -613,7 +613,7 @@ def test_incomplete_recovery_claim_finalization_transfers_across_tasks() -> None
                 authoritative_failure=None,
             )
         )
-        assert sessions_module._current_session_run_epoch(session.id) is None
+        assert invocation_scope._current_session_run_epoch(session.id) is None
 
         # Reconstruction has no task-local context to inherit. The durable
         # state remains immediately claimable by a new coordinator as well.
@@ -629,7 +629,7 @@ def test_incomplete_recovery_claim_finalization_transfers_across_tasks() -> None
             authority=third.require_authority(),
             authoritative_failure=None,
         )
-        assert sessions_module._current_session_run_epoch(session.id) is None
+        assert invocation_scope._current_session_run_epoch(session.id) is None
 
     asyncio.run(scenario())
 
@@ -674,7 +674,7 @@ def test_incomplete_recovery_claim_finalization_is_exactly_once() -> None:
         await finalize()
 
         assert store.release_calls == 1
-        assert sessions_module._current_session_run_epoch(session.id) is None
+        assert invocation_scope._current_session_run_epoch(session.id) is None
         current = await store.load(session.id)
         assert current is not None
         assert current.run_epoch == claim.session.run_epoch + 1
@@ -773,7 +773,7 @@ def test_incomplete_recovery_claim_marker_release_failure_is_retryable(
             "incomplete_session_recovery_claim" not in checkpoint_after_retry
         )
         assert authority.run_fence.retired is True
-        assert sessions_module._current_session_run_epoch(session.id) is None
+        assert invocation_scope._current_session_run_epoch(session.id) is None
 
     asyncio.run(scenario())
 
@@ -830,7 +830,7 @@ def test_claim_release_ack_loss_confirms_transfer_after_fence_failure() -> None:
         checkpoint = await store.load_checkpoint(session.id)
         assert checkpoint is None or "incomplete_session_recovery_claim" not in checkpoint
         assert authority.run_fence.retired is True
-        assert sessions_module._current_session_run_epoch(session.id) is None
+        assert invocation_scope._current_session_run_epoch(session.id) is None
 
         # The first finalizer is gone. Durable reconciliation alone must make
         # the session immediately claimable without invoking it a second time.
@@ -845,7 +845,7 @@ def test_claim_release_ack_loss_confirms_transfer_after_fence_failure() -> None:
             authority=replacement.require_authority(),
             authoritative_failure=None,
         )
-        assert sessions_module._current_session_run_epoch(session.id) is None
+        assert invocation_scope._current_session_run_epoch(session.id) is None
 
     asyncio.run(scenario())
 
@@ -903,7 +903,7 @@ def test_claim_release_cancellation_after_commit_retires_authority() -> None:
         checkpoint = await store.load_checkpoint(session.id)
         assert checkpoint is None or "incomplete_session_recovery_claim" not in checkpoint
         assert authority.run_fence.retired is True
-        assert sessions_module._current_session_run_epoch(session.id) is None
+        assert invocation_scope._current_session_run_epoch(session.id) is None
 
         current = await store.load(session.id)
         assert current is not None
@@ -969,7 +969,7 @@ def test_incomplete_recovery_fence_release_failure_transfers_immediately() -> No
             authority=replacement.require_authority(),
             authoritative_failure=None,
         )
-        assert sessions_module._current_session_run_epoch(session.id) is None
+        assert invocation_scope._current_session_run_epoch(session.id) is None
 
     asyncio.run(scenario())
 

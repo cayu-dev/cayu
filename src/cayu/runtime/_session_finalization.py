@@ -242,6 +242,19 @@ from cayu.sessions._invocation_lifecycle import (
     AdmittedInvocationBinding,
     SettleInvocationCommand,
 )
+from cayu.sessions._invocation_scope import (
+    _activate_session_interaction,
+    _clear_session_interaction_recovered_active_through,
+    _close_session_interaction,
+    _current_session_interaction_id,
+    _current_session_interaction_recovered_active_through,
+    _current_session_interaction_started_at,
+    _current_session_invocation_interaction_ids,
+    _deactivate_session_interaction,
+    _latest_session_invocation_interaction_is_settled,
+    _mark_session_interaction_settled,
+    _mark_session_invocation_terminal_event,
+)
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalDecision,
     InvocationTerminalOutcome,
@@ -270,18 +283,7 @@ from cayu.sessions.base import (
     SessionModelCompletionStageConflict,
     SessionRunFenced,
     SessionStore,
-    _activate_session_interaction,
-    _clear_session_interaction_recovered_active_through,
-    _close_session_interaction,
-    _current_session_interaction_id,
-    _current_session_interaction_recovered_active_through,
-    _current_session_interaction_started_at,
-    _current_session_invocation_interaction_ids,
-    _deactivate_session_interaction,
     _event_with_session_run_operation,
-    _latest_session_invocation_interaction_is_settled,
-    _mark_session_interaction_settled,
-    _mark_session_invocation_terminal_event,
     model_completion_stage_settlement_request,
 )
 from cayu.sessions.checkpoints import (

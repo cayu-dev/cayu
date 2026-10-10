@@ -63,14 +63,16 @@ from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
     checkpoint_with_active_invocation_execution_profile,
 )
+from cayu.sessions._invocation_scope import (
+    _activate_session_interaction,
+    _activate_session_run_fence,
+    _deactivate_session_interaction,
+    _deactivate_session_run_fence,
+)
 from cayu.sessions.base import (
     SessionRunFenced,
     SessionStore,
-    _activate_session_interaction,
-    _activate_session_run_fence,
     _checkpoint_with_session_run_operation,
-    _deactivate_session_interaction,
-    _deactivate_session_run_fence,
 )
 from cayu.sessions.cleanup import (
     RecoveryCleanup,

@@ -4,11 +4,11 @@ from dataclasses import dataclass
 
 from cayu.collaboration._preparation import prepare_contract
 from cayu.collaboration.exports import SessionExportDenied, SessionExportRuntimeOrigin
-from cayu.sessions.base import (
-    SessionStore,
+from cayu.sessions._invocation_scope import (
     _current_session_interaction_id,
     _current_session_run_epoch,
 )
+from cayu.sessions.base import SessionStore
 from cayu.tools._invocation_lifetime import has_live_tool_invocation
 from cayu.tools.base import ToolContext, _runtime_tool_invocation_authority
 from cayu.vaults.redaction import SecretRedactor

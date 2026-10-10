@@ -99,10 +99,7 @@ from cayu.sessions._foreground_child_checkpoint import (
 from cayu.sessions._invocation_lifecycle import (
     invocation_lifecycle_receipt_history_present,
 )
-from cayu.sessions.base import (
-    ModelCompletionManualRecoveryRequest,
-    SessionRunFenced,
-    SessionStore,
+from cayu.sessions._invocation_scope import (
     _activate_session_interaction,
     _activate_session_run_fence,
     _current_session_interaction_id,
@@ -111,6 +108,7 @@ from cayu.sessions.base import (
     _latest_session_invocation_interaction_is_settled,
     _set_session_interaction_recovered_active_through,
 )
+from cayu.sessions.base import ModelCompletionManualRecoveryRequest, SessionRunFenced, SessionStore
 from cayu.sessions.cleanup import RecoveryCleanupSupervisor
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import (

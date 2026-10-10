@@ -14,13 +14,12 @@ from typing import Protocol
 
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.events import Event
+from cayu.sessions._invocation_scope import _assert_session_run_epoch, _current_session_run_epoch
 from cayu.sessions.base import (
     BudgetReservationIdentityConflict,
-    _assert_session_run_epoch,
     _check_closure_lineage_owner,
     _copy_mcp_manifest_publication,
     _copy_workflow_step_reservation,
-    _current_session_run_epoch,
 )
 from cayu.sessions.event_delivery import _copy_session_event_batch
 from cayu.sessions.mcp_manifest_history import (

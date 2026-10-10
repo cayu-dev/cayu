@@ -37,7 +37,7 @@ from cayu import (
     UserInputTool,
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
-from cayu.sessions.base import _activate_session_run_fence
+from cayu.sessions._invocation_scope import _activate_session_run_fence
 from cayu.sessions.records import SessionIdentity
 from cayu.storage.migrations import SchemaMode
 from cayu.tasks.worker import run_task_worker
@@ -943,7 +943,7 @@ def test_heartbeat_outage_longer_than_lease_reclaims_unless_successor_fenced(
 def test_presence_retires_with_local_fence_and_cleanup_can_remove_reservation(
     backend, request, sqlite_resources
 ):
-    from cayu.sessions.base import _activate_owned_session_run_fence
+    from cayu.sessions._invocation_scope import _activate_owned_session_run_fence
 
     async def scenario():
         async with _stores(backend, request, sqlite_resources) as (store, _):

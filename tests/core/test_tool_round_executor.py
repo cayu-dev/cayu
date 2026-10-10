@@ -13,7 +13,6 @@ import pytest
 from tests.core._execution_profile_fixtures import rebind_test_invocation
 
 import cayu.runtime._invocation_secrets as invocation_secrets
-import cayu.sessions.base as sessions_module
 from cayu._exception_groups import iter_exception_tree
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
@@ -53,6 +52,7 @@ from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
     build_execution_profile_identity,
 )
+from cayu.sessions import _invocation_scope as invocation_scope
 from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 from cayu.sessions.records import Session, SessionStatus
@@ -561,7 +561,7 @@ async def _tool_round_run(
             ).model_dump(mode="json"),
         ),
     )
-    sessions_module._activate_session_interaction(
+    invocation_scope._activate_session_interaction(
         session.id,
         interaction_id,
     )

@@ -36,6 +36,7 @@ from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import _session_engine as session_engine_module
 from cayu.runtime import _session_finalization as session_finalization_module
 from cayu.runtime.loop_policies import LoopPolicy
+from cayu.sessions import _invocation_scope as invocation_scope
 from cayu.sessions.base import InMemorySessionStore, SessionRunFenced
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.interactions import (
@@ -209,7 +210,7 @@ def test_public_run_preserves_recoverable_state_when_interaction_clock_moves_bac
         assert task is not None
         assert task.status is TaskStatus.RUNNING
         assert checkpoint is None or "session_run_operation" not in checkpoint
-        assert sessions_module._current_session_run_epoch(session_id) is None
+        assert invocation_scope._current_session_run_epoch(session_id) is None
 
         records = await store.query_events(EventQuery(session_id=session_id))
         interaction_id = next(
@@ -315,7 +316,7 @@ def test_run_failure_preserves_recoverable_state_when_interaction_clock_moves_ba
         assert session.status is SessionStatus.RUNNING
         assert task is not None
         assert task.status is TaskStatus.RUNNING
-        assert sessions_module._current_session_run_epoch(session_id) is None
+        assert invocation_scope._current_session_run_epoch(session_id) is None
 
         wall["value"] += timedelta(seconds=2)
         page = await app.recover_incomplete_sessions(
@@ -396,7 +397,7 @@ def test_provider_failure_remains_authoritative_when_terminal_preflight_read_fai
         assert session.status is SessionStatus.RUNNING
         assert task is not None
         assert task.status is TaskStatus.RUNNING
-        assert sessions_module._current_session_run_epoch(session_id) is None
+        assert invocation_scope._current_session_run_epoch(session_id) is None
 
     asyncio.run(run())
 
@@ -450,7 +451,7 @@ def test_setup_failure_preserves_recoverable_state_when_clock_moves_backward(
         assert session.status is SessionStatus.RUNNING
         assert task is not None
         assert task.status is TaskStatus.PENDING
-        assert sessions_module._current_session_run_epoch(session_id) is None
+        assert invocation_scope._current_session_run_epoch(session_id) is None
 
         wall["value"] += timedelta(seconds=2)
         page = await app.recover_incomplete_sessions(
@@ -529,7 +530,7 @@ def test_returned_factory_failure_preserves_state_when_clock_moves_backward() ->
         assert session.status is SessionStatus.RUNNING
         assert task is not None
         assert task.status is TaskStatus.RUNNING
-        assert sessions_module._current_session_run_epoch(session_id) is None
+        assert invocation_scope._current_session_run_epoch(session_id) is None
 
         wall["value"] += timedelta(seconds=2)
         page = await app.recover_incomplete_sessions(
@@ -895,7 +896,7 @@ def test_backward_clock_task_cancellation_preserves_cancellation_and_live_state(
             EventType.INTERACTION_INTERRUPTED,
             EventType.SESSION_INTERRUPTED,
         }.intersection(record.event.type for record in records)
-        assert sessions_module._current_session_run_epoch(session_id) is None
+        assert invocation_scope._current_session_run_epoch(session_id) is None
 
     asyncio.run(run())
 
@@ -2354,8 +2355,8 @@ def test_interrupt_transition_cancellation_consumes_exact_settlement_handoff(
             ).model_dump(mode="json"),
         )
         await store.append_event(session_id, started)
-        sessions_module._activate_session_interaction(session_id, interaction_id)
-        sessions_module._activate_session_run_fence(session)
+        invocation_scope._activate_session_interaction(session_id, interaction_id)
+        invocation_scope._activate_session_run_fence(session)
 
         async def interrupt() -> None:
             async for _ in app.interrupt_session(
@@ -2423,8 +2424,8 @@ def test_interrupt_transition_cancellation_consumes_exact_settlement_handoff(
                     }
                 ]
         finally:
-            sessions_module._deactivate_session_interaction(session_id)
-            sessions_module._deactivate_session_run_fence(session_id)
+            invocation_scope._deactivate_session_interaction(session_id)
+            invocation_scope._deactivate_session_run_fence(session_id)
 
     asyncio.run(run())
 
@@ -2782,18 +2783,18 @@ def test_new_interaction_invocation_clears_prior_settlement_evidence() -> None:
     session_id = "sess_reused_recovery_interaction"
     interaction_id = "interaction_reused_after_recovery"
 
-    sessions_module._activate_session_interaction(session_id, interaction_id)
-    sessions_module._mark_session_interaction_settled(session_id, interaction_id)
-    assert sessions_module._latest_session_invocation_interaction_is_settled(session_id) is True
+    invocation_scope._activate_session_interaction(session_id, interaction_id)
+    invocation_scope._mark_session_interaction_settled(session_id, interaction_id)
+    assert invocation_scope._latest_session_invocation_interaction_is_settled(session_id) is True
 
-    sessions_module._deactivate_session_interaction(session_id)
-    sessions_module._activate_session_interaction(session_id, interaction_id)
+    invocation_scope._deactivate_session_interaction(session_id)
+    invocation_scope._activate_session_interaction(session_id, interaction_id)
     try:
         assert (
-            sessions_module._latest_session_invocation_interaction_is_settled(session_id) is False
+            invocation_scope._latest_session_invocation_interaction_is_settled(session_id) is False
         )
     finally:
-        sessions_module._deactivate_session_interaction(session_id)
+        invocation_scope._deactivate_session_interaction(session_id)
 
 
 def test_runtime_cancellation_preserves_queue_guarded_running_transition() -> None:
@@ -4327,7 +4328,7 @@ def test_run_stream_carries_interaction_context_across_consumer_tasks() -> None:
                 events.append(await asyncio.create_task(anext(stream)))
             except StopAsyncIteration:
                 break
-            assert sessions_module._current_session_interaction_id(session_id) is None
+            assert invocation_scope._current_session_interaction_id(session_id) is None
 
         interaction_id = next(
             event.interaction_id for event in events if event.type == EventType.INTERACTION_STARTED
@@ -4342,7 +4343,7 @@ def test_run_stream_carries_interaction_context_across_consumer_tasks() -> None:
             matching = [event for event in events if event.type == event_type]
             assert matching
             assert {event.interaction_id for event in matching} == {interaction_id}
-        assert sessions_module._current_session_interaction_id(session_id) is None
+        assert invocation_scope._current_session_interaction_id(session_id) is None
 
     asyncio.run(run())
 

@@ -320,6 +320,7 @@ from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
+from cayu.sessions._invocation_scope import _current_session_interaction_id
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalOutcome,
     invocation_terminal_decision_from_checkpoint,
@@ -334,12 +335,7 @@ from cayu.sessions._provider_operation_cancellation_claim import (
 )
 from cayu.sessions._terminal_evidence import interruption_request_id_from_payload
 from cayu.sessions.authority import SessionRunFenced
-from cayu.sessions.base import (
-    ModelCompletionStage,
-    ModelCompletionStageRequest,
-    SessionStore,
-    _current_session_interaction_id,
-)
+from cayu.sessions.base import ModelCompletionStage, ModelCompletionStageRequest, SessionStore
 from cayu.sessions.cleanup import RecoveryCleanupSupervisor
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.records import Session, SessionStatus, SessionStatusConflict

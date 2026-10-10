@@ -7,7 +7,6 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 import cayu.runtime._event_writer as event_writer_module
-import cayu.sessions.base as sessions_module
 from cayu.applications import CayuApp
 from cayu.budgets.base import BudgetWindow, InMemoryBudgetStore
 from cayu.events import (
@@ -20,6 +19,7 @@ from cayu.messages import Message
 from cayu.observability.events import EventSink
 from cayu.runtime._event_projection import public_event_id
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.sessions import _invocation_scope as invocation_scope
 from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_delivery import (
     PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES,
@@ -1403,11 +1403,11 @@ def test_sink_failure_omits_unpublishable_legacy_interaction_authority() -> None
             secret_redactor=SecretRedactor(secret),
         )
 
-        sessions_module._activate_session_interaction(legacy.session_id, secret)
+        invocation_scope._activate_session_interaction(legacy.session_id, secret)
         try:
             await writer.fan_out_persisted([legacy])
         finally:
-            sessions_module._deactivate_session_interaction(legacy.session_id)
+            invocation_scope._deactivate_session_interaction(legacy.session_id)
         return await store.load_events(legacy.session_id)
 
     events = asyncio.run(scenario())

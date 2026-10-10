@@ -117,6 +117,7 @@ from cayu.runtime.provider_operations import (
     provider_operation_resolution_storage_key,
     resolve_provider_operation_stage,
 )
+from cayu.sessions._invocation_scope import _deactivate_session_run_fence
 from cayu.sessions._invocation_terminal_decision import (
     settled_invocation_terminal_decision_from_checkpoint,
 )
@@ -126,7 +127,6 @@ from cayu.sessions.base import (
     SessionOperationPublication,
     SessionRunFenced,
     SessionStore,
-    _deactivate_session_run_fence,
 )
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 from cayu.sessions.records import SessionStatus, SessionStatusConflict

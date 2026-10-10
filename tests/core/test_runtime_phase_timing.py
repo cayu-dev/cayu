@@ -929,7 +929,8 @@ def test_interrupted_structured_output_close_is_not_recorded_as_recovered():
 
     from cayu.runtime import _tool_round_recovery as tool_round_recovery
     from cayu.runtime._durable_tool_round import InterruptedToolRoundRequest
-    from cayu.sessions.base import InMemorySessionStore, _activate_session_interaction
+    from cayu.sessions._invocation_scope import _activate_session_interaction
+    from cayu.sessions.base import InMemorySessionStore
 
     async def scenario():
         store = InMemorySessionStore()

@@ -75,6 +75,11 @@ from cayu.sessions._invocation_lifecycle import (
     ReleaseInvocationCommand,
     invocation_lifecycle_receipt_history_present,
 )
+from cayu.sessions._invocation_scope import (
+    _activate_owned_session_run_fence,
+    _activate_session_run_fence,
+    _deactivate_session_run_fence,
+)
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalOutcome,
     invocation_terminal_decision_from_checkpoint,
@@ -90,13 +95,7 @@ from cayu.sessions._terminal_evidence import (
     _session_run_operation_from_checkpoint,
     interruption_request_id_from_payload,
 )
-from cayu.sessions.base import (
-    SessionRunFenced,
-    SessionStore,
-    _activate_owned_session_run_fence,
-    _activate_session_run_fence,
-    _deactivate_session_run_fence,
-)
+from cayu.sessions.base import SessionRunFenced, SessionStore
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,

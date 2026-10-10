@@ -82,7 +82,7 @@ class SessionExecutionPresence:
             self.discard_unused_progress(session.id)
             return
         stop = asyncio.Event()
-        from cayu.sessions.base import _SESSION_RUN_FENCE_OWNERS
+        from cayu.sessions._invocation_scope import _SESSION_RUN_FENCE_OWNERS
 
         fence_owner = (_SESSION_RUN_FENCE_OWNERS.get() or {}).get(session.id)
         if fence_owner is not None and fence_owner.run_epoch == session.run_epoch:

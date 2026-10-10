@@ -48,6 +48,12 @@ from cayu.sessions._invocation_lifecycle import (
     InvocationReleaseEvidence,
     invocation_lifecycle_receipt_history_present,
 )
+from cayu.sessions._invocation_scope import (
+    _activate_session_interaction,
+    _activate_session_run_fence,
+    _deactivate_session_interaction,
+    _deactivate_session_run_fence,
+)
 from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,
     settled_invocation_terminal_decision_from_checkpoint,
@@ -55,10 +61,6 @@ from cayu.sessions._invocation_terminal_decision import (
 from cayu.sessions.base import (
     SessionRunFenced,
     SessionStore,
-    _activate_session_interaction,
-    _activate_session_run_fence,
-    _deactivate_session_interaction,
-    _deactivate_session_run_fence,
     _initial_transcript_pending_interaction_id,
 )
 from cayu.sessions.invocation import SessionInvocationBinding

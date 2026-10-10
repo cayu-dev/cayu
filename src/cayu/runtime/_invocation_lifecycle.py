@@ -191,12 +191,14 @@ from cayu.sessions._invocation_lifecycle import (
 from cayu.sessions._invocation_lifecycle import (
     superseding_invocation_admission_digest_from_state as superseding_invocation_admission_digest_from_state,
 )
-from cayu.sessions.base import (
-    SessionRunFenced,
-    SessionStore,
+from cayu.sessions._invocation_scope import (
     _current_session_run_epoch,
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
+)
+from cayu.sessions.base import (
+    SessionRunFenced,
+    SessionStore,
     runtime_publication_checkpoint_mutation,
 )
 from cayu.sessions.checkpoints import (

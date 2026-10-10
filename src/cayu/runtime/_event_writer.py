@@ -30,13 +30,12 @@ from cayu.runtime._event_projection import (
 )
 from cayu.runtime._phase_timing import RuntimeTimingRecorder, observe_timing_event, phase_scope
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
-from cayu.sessions.base import (
-    SessionStore,
-    _copy_pending_first_event_delivery,
+from cayu.sessions._invocation_scope import (
     _mark_session_invocation_terminal_event,
     attribute_event_to_current_interaction,
     attribute_events_to_current_interaction,
 )
+from cayu.sessions.base import SessionStore, _copy_pending_first_event_delivery
 from cayu.sessions.event_delivery import (
     PERSISTED_EVENT_SIDE_EFFECT_MAX_ATTEMPTS as _PERSISTED_SIDE_EFFECT_MAX_ATTEMPTS,
 )

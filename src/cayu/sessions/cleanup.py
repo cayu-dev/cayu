@@ -367,7 +367,7 @@ class RecoveryCleanupSupervisor:
         )
 
     def _observe_task(self, task: asyncio.Task, operation: str, context: Context) -> None:
-        from cayu.sessions.base import _current_recovery_cleanup_identity
+        from cayu.sessions._invocation_scope import _current_recovery_cleanup_identity
 
         identity = context.run(_current_recovery_cleanup_identity)
         owner = (

@@ -20,12 +20,12 @@ from cayu.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.messages import Message
 from cayu.runtime import _session_message_queue as message_queue
 from cayu.sessions._execution_profile_checkpoint import ActiveInvocationExecutionProfile
+from cayu.sessions._invocation_scope import _assert_session_run_epoch
 from cayu.sessions.access import require_resource_session
 from cayu.sessions.base import (
     MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
     SessionMessageQueueStatus,
     SessionRunFenced,
-    _assert_session_run_epoch,
     _check_closure_lineage_owner,
     _checkpoint_after_queued_interaction_profile_handoff,
     _historical_queued_handoff_stage_from_records,

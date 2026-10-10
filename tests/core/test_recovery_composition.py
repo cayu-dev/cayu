@@ -29,7 +29,7 @@ from cayu.runtime._recovery_requests import (
 from cayu.runtime._run_limits import BudgetEvaluation, LimitEvaluation
 from cayu.runtime._tool_round_executor import ToolRoundLimitRequest
 from cayu.runtime.stop_policy import StopDecision, StopLimit
-from cayu.sessions.base import (
+from cayu.sessions._invocation_scope import (
     _current_session_invocation_terminal_event,
     _mark_session_invocation_terminal_event,
 )

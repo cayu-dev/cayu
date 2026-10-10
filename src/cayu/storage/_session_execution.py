@@ -55,7 +55,7 @@ def _claim(
     operation_run_epoch,
     process_identity=None,
 ):
-    from cayu.sessions.base import _current_session_run_epoch
+    from cayu.sessions._invocation_scope import _current_session_run_epoch
 
     if session is None or session.run_epoch != _current_session_run_epoch(session.id):
         return None

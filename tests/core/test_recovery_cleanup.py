@@ -1100,7 +1100,7 @@ def test_timed_out_claim_release_converges_through_fresh_runtime() -> None:
 @pytest.mark.parametrize("fails", [False, True])
 @pytest.mark.parametrize("session_id", ["first", "s" * 2048], ids=["short-id", "maximum-id"])
 def test_session_cleanup_observations_are_exact_and_scoped(fails, session_id):
-    from cayu.sessions.base import _SessionRunFenceOwnership
+    from cayu.sessions._invocation_scope import _SessionRunFenceOwnership
 
     async def scenario():
         app = CayuApp(
@@ -1177,7 +1177,7 @@ def test_session_cleanup_observations_are_exact_and_scoped(fails, session_id):
 
 
 def test_cleanup_history_is_bounded_and_scoped_drain_excludes_siblings():
-    from cayu.sessions.base import _SessionRunFenceOwnership
+    from cayu.sessions._invocation_scope import _SessionRunFenceOwnership
 
     async def scenario():
         supervisor = RecoveryCleanupSupervisor()
@@ -1270,7 +1270,10 @@ async def test_runtime_cancellation_cleanup_has_admitted_session_identity(monkey
 
 
 def test_nested_cleanup_owner_reactivation_uses_exact_innermost_run():
-    from cayu.sessions.base import _current_recovery_cleanup_identity, _SessionRunFenceOwnership
+    from cayu.sessions._invocation_scope import (
+        _current_recovery_cleanup_identity,
+        _SessionRunFenceOwnership,
+    )
 
     parent = _SessionRunFenceOwnership(session_id="parent", session_instance_id="one", run_epoch=1)
     child = _SessionRunFenceOwnership(session_id="child", session_instance_id="two", run_epoch=2)

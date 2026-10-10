@@ -194,6 +194,16 @@ from cayu.sessions._execution_profile_rules import (
     _validate_execution_profile_rejection_session,
     _validate_session_model_transition,
 )
+from cayu.sessions._invocation_scope import (
+    INHERIT_INTERACTION,
+    InteractionAttribution,
+    _activate_session_run_fence,
+    _assert_session_run_epoch,
+    _assert_session_run_epoch_value,
+    _current_session_run_epoch,
+    _deactivate_session_interaction,
+    _deactivate_session_run_fence,
+)
 from cayu.sessions._invocation_terminal_decision import InvocationTerminalDecision
 from cayu.sessions._model_completion_publication import ModelCompletionStageSettlementRequest
 from cayu.sessions._provider_operation_cancellation_claim import (
@@ -208,12 +218,10 @@ from cayu.sessions.base import (
     CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS,
     DELETE_BLOCKED_SESSION_STATUSES,
     FORK_TRANSCRIPT_VALIDATION_ERROR,
-    INHERIT_INTERACTION,
     MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
     BudgetReservationIdentityConflict,
     CheckpointRootFieldGuard,
     ForkCheckpointAuthorityDecoder,
-    InteractionAttribution,
     ModelCompletionStage,
     ModelCompletionStageAbandonmentResult,
     ModelCompletionStageDispatch,
@@ -230,13 +238,10 @@ from cayu.sessions.base import (
     SessionRunFenced,
     SessionStore,
     StoreTimeSessionOperationTransform,
-    _activate_session_run_fence,
     _active_model_completion_stage_record,
     _active_unexpired_session_operation_id,
     _apply_queue_completion_checkpoint_mutation,
     _apply_runtime_publication_operation_record_mutations,
-    _assert_session_run_epoch,
-    _assert_session_run_epoch_value,
     _authenticated_public_authority_alias_private_value,
     _build_runtime_publication_receipt,
     _checkpoint_after_exact_invocation_terminal_decision,
@@ -244,9 +249,6 @@ from cayu.sessions.base import (
     _child_session_notification_consumption_replays,
     _completion_result_event_publication_delete_block_reason,
     _copy_optional_event_id,
-    _current_session_run_epoch,
-    _deactivate_session_interaction,
-    _deactivate_session_run_fence,
     _durable_subagent_parent_delete_block_reason,
     _initial_transcript_pending_checkpoint,
     _interaction_transition_receipt_record,

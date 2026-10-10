@@ -223,7 +223,7 @@ async def terminalize_dispatched_model(
         from cayu.sessions._invocation_lifecycle import (
             require_released_invocation_command_authority,
         )
-        from cayu.sessions.base import _activate_owned_session_run_fence
+        from cayu.sessions._invocation_scope import _activate_owned_session_run_fence
 
         if session.run_epoch == prior.settlement_run_epoch:
             owner = _activate_owned_session_run_fence(session)

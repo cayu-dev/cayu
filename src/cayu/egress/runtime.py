@@ -178,7 +178,7 @@ from cayu.runtime.execution_identity import (
     ExecutionProfileBehaviorIdentity,
     copy_execution_profile_behavior_identity,
 )
-from cayu.sessions.base import _current_session_interaction_id
+from cayu.sessions._invocation_scope import _current_session_interaction_id
 from cayu.tools.base import ToolRunnerCapabilityRequirement
 from cayu.vaults import SecretRedactor, SecretRef, SecretResolver
 from cayu.workspaces import LocalWorkspace, RunnerBoundWorkspace, Workspace

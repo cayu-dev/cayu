@@ -154,12 +154,11 @@ from cayu.sessions._execution_profile_checkpoint import (
     execution_profile_from_session_metadata,
 )
 from cayu.sessions._execution_profile_rules import session_model_projection_cursor
-from cayu.sessions.base import (
-    SessionOperationPublication,
-    SessionStore,
+from cayu.sessions._invocation_scope import (
     attribute_event_to_current_interaction,
     attribute_events_to_current_interaction,
 )
+from cayu.sessions.base import SessionOperationPublication, SessionStore
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import (
     Session,

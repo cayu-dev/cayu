@@ -9,10 +9,8 @@ from datetime import datetime
 from typing import Any
 
 from cayu.runtime._invocation_lifecycle import InvocationContext
+from cayu.sessions._invocation_scope import _SessionRunFenceOwnership
 from cayu.sessions._terminal_evidence import _SessionRunOperation
-from cayu.sessions.base import (
-    _SessionRunFenceOwnership,
-)
 from cayu.sessions.records import Session
 
 

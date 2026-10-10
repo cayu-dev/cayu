@@ -62,7 +62,7 @@ def test_real_initial_execution_parks_the_exact_external_binding(
             original_park = _ExternalExecutionToWait.park
 
             async def park_with_live_writer(boundary, invocation):
-                from cayu.sessions.base import _current_session_run_epoch
+                from cayu.sessions._invocation_scope import _current_session_run_epoch
 
                 executing_id = invocation.binding.session_id
                 assert _current_session_run_epoch(executing_id) == invocation.binding.run_epoch

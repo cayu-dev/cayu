@@ -213,6 +213,12 @@ from cayu.sessions._invocation_lifecycle import (
     ReleaseInvocationCommand,
     invocation_lifecycle_receipt_history_present,
 )
+from cayu.sessions._invocation_scope import (
+    _current_session_invocation_settlement_transition,
+    _current_session_invocation_terminal_event,
+    _current_session_run_epoch,
+    _deactivate_session_run_fence,
+)
 from cayu.sessions._terminal_evidence import (
     TERMINAL_EVIDENCE_EVENT_TYPES,
     TERMINAL_EVIDENCE_QUERY_LIMIT,
@@ -223,10 +229,6 @@ from cayu.sessions.base import (
     SessionOperationPublication,
     SessionRunFenced,
     SessionStore,
-    _current_session_invocation_settlement_transition,
-    _current_session_invocation_terminal_event,
-    _current_session_run_epoch,
-    _deactivate_session_run_fence,
     _initial_transcript_pending_interaction_id,
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery

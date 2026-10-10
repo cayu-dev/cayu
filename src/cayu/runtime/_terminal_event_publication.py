@@ -67,6 +67,7 @@ from cayu.runtime._recovery_requests import (
     RecoveryTerminalEventRequest,
 )
 from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflict
+from cayu.sessions._invocation_scope import _mark_session_invocation_terminal_event
 from cayu.sessions._terminal_evidence import (
     _session_run_operation_from_checkpoint,
 )
@@ -75,7 +76,6 @@ from cayu.sessions.base import (
     SessionStore,
     _checkpoint_after_session_run_operation_cleanup,
     _event_with_session_run_operation,
-    _mark_session_invocation_terminal_event,
 )
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import (

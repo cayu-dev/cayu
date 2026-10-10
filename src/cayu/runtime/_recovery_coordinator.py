@@ -310,6 +310,10 @@ from cayu.sessions._foreground_child_checkpoint import ForegroundChildTerminal
 from cayu.sessions._invocation_lifecycle import (
     InvocationLifecycleCommandConflict,
 )
+from cayu.sessions._invocation_scope import (
+    _activate_owned_session_run_fence,
+    _deactivate_session_interaction,
+)
 from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
     _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
@@ -323,9 +327,7 @@ from cayu.sessions.base import (
     RuntimePublicationReceipt,
     SessionRunFenced,
     SessionStore,
-    _activate_owned_session_run_fence,
     _checkpoint_with_session_run_operation,
-    _deactivate_session_interaction,
 )
 from cayu.sessions.cleanup import (
     RecoveryCleanupStep,

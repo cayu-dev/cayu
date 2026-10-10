@@ -270,6 +270,7 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
+from cayu.sessions import _invocation_scope as invocation_scope
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
@@ -18730,7 +18731,7 @@ def test_cayu_app_does_not_reconcile_an_ambiguous_takeover_as_a_replacement_owne
             self.replacement_epoch = replacement.run_epoch
             # The replacement represents another worker. Do not leave its
             # process-local fence in this request's context.
-            sessions_module._deactivate_session_run_fence(session_id)
+            invocation_scope._deactivate_session_run_fence(session_id)
             return checkpoint
 
     store = ReplacementDuringReconciliationStore()
@@ -29682,7 +29683,7 @@ async def _close_interrupted_spawn_and_collect_events(
     )
     await store.update_status("child", child_status)
     parent = await store.load("parent")
-    sessions_module._activate_session_interaction("parent", interaction_id)
+    invocation_scope._activate_session_interaction("parent", interaction_id)
     events = []
     async for event in app._pending_tool_round_recovery.close_interrupted_tool_round(
         InterruptedToolRoundRequest(
@@ -32060,7 +32061,7 @@ def test_cayu_app_recover_tool_round_athrow_finalizes_before_return() -> None:
         assert "incomplete_session_recovery_claim" in claimed_checkpoint
         assert app._session_control.has_active_tasks(session_id) is True
         # Ownership belongs to the delegated stream, not the consumer task.
-        assert sessions_module._current_session_run_epoch(session_id) is None
+        assert invocation_scope._current_session_run_epoch(session_id) is None
 
         injected = RuntimeError("consumer rejected recovery event")
         with pytest.raises(RuntimeError, match="consumer rejected recovery event") as exc_info:
@@ -32074,7 +32075,7 @@ def test_cayu_app_recover_tool_round_athrow_finalizes_before_return() -> None:
         assert checkpoint_after_throw["pending_tool_round"]["tool_round_id"] == request.round_id
         assert "incomplete_session_recovery_claim" not in checkpoint_after_throw
         assert app._session_control.has_active_tasks(session_id) is False
-        assert sessions_module._current_session_run_epoch(session_id) is None
+        assert invocation_scope._current_session_run_epoch(session_id) is None
         assert store.release_calls - releases_before == 1
         assert tool.calls == [{}]
 
@@ -32143,7 +32144,7 @@ def test_cayu_app_recover_tool_round_athrow_preserves_cleanup_failure() -> None:
         assert checkpoint_after_throw is not None
         assert "incomplete_session_recovery_claim" not in checkpoint_after_throw
         assert app._session_control.has_active_tasks(session_id) is False
-        assert sessions_module._current_session_run_epoch(session_id) is None
+        assert invocation_scope._current_session_run_epoch(session_id) is None
         assert tool.calls == [{}]
 
     asyncio.run(scenario())
@@ -32346,7 +32347,7 @@ def test_cayu_app_recover_tool_round_reconstruction_failure_releases_claim(
     assert checkpoint_after_failure is not None
     assert "incomplete_session_recovery_claim" not in checkpoint_after_failure
     assert checkpoint_after_failure["pending_tool_round"]["tool_round_id"] == request.round_id
-    assert sessions_module._current_session_run_epoch(session_id) is None
+    assert invocation_scope._current_session_run_epoch(session_id) is None
     assert app._session_control.has_active_tasks(session_id) is False
 
     # Claim cleanup transfers unfinished durable work immediately. Restoring
@@ -33835,7 +33836,7 @@ def test_cayu_app_recover_tool_round_multi_call_recovers_iteratively():
         checkpoint_after_first = await store.load_checkpoint(session_id)
         assert checkpoint_after_first is not None
         assert "pending_tool_round" in checkpoint_after_first
-        assert sessions_module._current_session_run_epoch(session_id) is None
+        assert invocation_scope._current_session_run_epoch(session_id) is None
 
         # The already-recovered call now has a terminal event — re-targeting rejects.
         with pytest.raises(RuntimeError, match="already has a terminal event"):
@@ -33860,7 +33861,7 @@ def test_cayu_app_recover_tool_round_multi_call_recovers_iteratively():
                 message="call_2 confirmed failed externally",
             ),
         )
-        assert sessions_module._current_session_run_epoch(session_id) is None
+        assert invocation_scope._current_session_run_epoch(session_id) is None
         return second_recovery
 
     second_recovery = asyncio.run(recover_remaining_calls())
@@ -34301,7 +34302,7 @@ def test_reactivating_same_interaction_does_not_reset_active_segment(monkeypatch
             from_statuses={SessionStatus.PENDING},
             to_status=SessionStatus.RUNNING,
         )
-        sessions_module._activate_session_interaction(session.id, "interaction-timing")
+        invocation_scope._activate_session_interaction(session.id, "interaction-timing")
         registered_agent = app._get_registered_agent("assistant")
         await app._session_engine._emit_interaction_started(
             session=session,
@@ -34309,7 +34310,7 @@ def test_reactivating_same_interaction_does_not_reset_active_segment(monkeypatch
             environment_name=None,
         )
         monotonic["value"] = 15.0
-        sessions_module._activate_session_interaction(session.id, "interaction-timing")
+        invocation_scope._activate_session_interaction(session.id, "interaction-timing")
         monotonic["value"] = 20.0
         wall["value"] += timedelta(seconds=10)
         paused = await app._session_finalization.emit_interaction_state(
@@ -34322,7 +34323,7 @@ def test_reactivating_same_interaction_does_not_reset_active_segment(monkeypatch
         )
         assert paused is not None
         await store.release_run_fence(session.id)
-        sessions_module._deactivate_session_interaction(session.id)
+        invocation_scope._deactivate_session_interaction(session.id)
         return paused
 
     evidence = InteractionSummaryEvidence.model_validate(asyncio.run(exercise()).payload)
@@ -34351,7 +34352,7 @@ def test_interaction_summary_pages_more_than_5000_usage_events_without_failing()
             from_statuses={SessionStatus.PENDING},
             to_status=SessionStatus.RUNNING,
         )
-        sessions_module._activate_session_interaction(session.id, "interaction-large")
+        invocation_scope._activate_session_interaction(session.id, "interaction-large")
         registered_agent = app._get_registered_agent("assistant")
         await app._session_engine._emit_interaction_started(
             session=session,

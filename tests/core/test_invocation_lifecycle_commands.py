@@ -12,7 +12,6 @@ from uuid import uuid4
 
 import pytest
 
-import cayu.sessions.base as sessions_module
 from cayu._validation import canonical_durable_json_bytes
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
@@ -74,18 +73,14 @@ from cayu.runtime.execution_profiles import (
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _invocation_lifecycle as invocation_contracts_module
+from cayu.sessions import _invocation_scope as invocation_scope
 from cayu.sessions._checkpoint_mutations import (
     RuntimePublicationCheckpointOperation,
     RuntimePublicationMutation,
 )
 from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
-from cayu.sessions.base import (
-    InMemorySessionStore,
-    ModelTarget,
-    SessionRunFenced,
-    SessionStore,
-    _current_session_run_epoch,
-)
+from cayu.sessions._invocation_scope import _current_session_run_epoch
+from cayu.sessions.base import InMemorySessionStore, ModelTarget, SessionRunFenced, SessionStore
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -591,25 +586,25 @@ async def _assert_invocation_command_conformance(store, suffix: str) -> None:
     assert type(evidence).model_validate_json(evidence.model_dump_json()) == evidence
 
     def check_released_context_handoff() -> None:
-        sessions_module._activate_session_run_fence(created.session)
-        sessions_module._activate_session_interaction(session_id, interaction_id)
+        invocation_scope._activate_session_run_fence(created.session)
+        invocation_scope._activate_session_interaction(session_id, interaction_id)
         other_id = f"{session_id}-other"
-        sessions_module._activate_session_run_fence(
+        invocation_scope._activate_session_run_fence(
             created.session.model_copy(update={"id": other_id, "run_epoch": 9})
         )
-        sessions_module._activate_session_interaction(other_id, "other-interaction")
+        invocation_scope._activate_session_interaction(other_id, "other-interaction")
         retire_released_invocation_context(evidence)
         assert _current_session_run_epoch(session_id) is None
-        assert sessions_module._current_session_interaction_id(session_id) is None
+        assert invocation_scope._current_session_interaction_id(session_id) is None
         assert _current_session_run_epoch(other_id) == 9
-        assert sessions_module._current_session_interaction_id(other_id) == "other-interaction"
-        sessions_module._activate_session_run_fence(
+        assert invocation_scope._current_session_interaction_id(other_id) == "other-interaction"
+        invocation_scope._activate_session_run_fence(
             created.session.model_copy(update={"run_epoch": 3})
         )
-        sessions_module._activate_session_interaction(session_id, "new-interaction")
+        invocation_scope._activate_session_interaction(session_id, "new-interaction")
         retire_released_invocation_context(evidence)
         assert _current_session_run_epoch(session_id) == 3
-        assert sessions_module._current_session_interaction_id(session_id) == "new-interaction"
+        assert invocation_scope._current_session_interaction_id(session_id) == "new-interaction"
 
     copy_context().run(check_released_context_handoff)
     with pytest.raises(SessionRunFenced):

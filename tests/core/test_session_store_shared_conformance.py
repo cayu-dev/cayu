@@ -235,6 +235,7 @@ from cayu.sessions._checkpoint_mutations import (
     SessionRuntimePublicationConflict,
     runtime_publication_checkpoint_value_digest,
 )
+from cayu.sessions._invocation_scope import _deactivate_session_run_fence
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalOutcome,
     build_invocation_terminal_decision,
@@ -262,7 +263,6 @@ from cayu.sessions.base import (
     SessionOperationPublication,
     SessionStore,
     _checkpoint_with_session_run_operation,
-    _deactivate_session_run_fence,
     runtime_publication_checkpoint_mutation,
     runtime_publication_event_reference,
     runtime_publication_operation_record_value_digest,
@@ -27414,7 +27414,7 @@ def test_session_store_conformance_pages_hundreds_of_interactions(
 def test_session_store_conformance_distinguishes_inherited_and_explicit_null_transcript_ids(
     session_store_case,
 ) -> None:
-    from cayu.sessions.base import (
+    from cayu.sessions._invocation_scope import (
         _activate_session_interaction,
         _deactivate_session_interaction,
     )

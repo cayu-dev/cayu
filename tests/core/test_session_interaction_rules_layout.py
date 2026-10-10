@@ -31,6 +31,9 @@ import cayu
         ("interactions", "InteractionTransitionReceiptResult"),
         ("interactions", "SessionInvocationAdmission"),
         ("interactions", "copy_interaction_transition_spec"),
+        ("_invocation_scope", "resolve_interaction_attribution"),
+        ("_invocation_scope", "attribute_event_to_current_interaction"),
+        ("_invocation_scope", "attribute_events_to_current_interaction"),
     ),
 )
 def test_interaction_prerequisites_preserve_public_identity(module, name):
@@ -241,5 +244,92 @@ copied = rules._copy_queued_interaction_profile_handoff(session.id, "next", "nex
 assert copied == handoff and copied is not handoff
 rejected(lambda: rules._copy_queued_interaction_profile_handoff(
     session.id, "wrong-delivery", "next", started, handoff))
+"""
+    )
+
+
+def test_run_fence_retirement_crosses_copied_contexts_without_implementations():
+    _without_implementations(
+        _SESSION_FIXTURE
+        + """
+import asyncio
+from cayu.sessions import _invocation_scope as scope
+from cayu.sessions.authority import SessionRunFenced
+
+async def scenario():
+    owner = scope._activate_owned_session_run_fence(session)
+    retired = []
+    owner.on_retire(lambda: retired.append("retired"))
+    proceed = asyncio.Event()
+    ready = asyncio.Event()
+    async def child():
+        assert scope._current_session_run_epoch(session.id) == 1
+        ready.set()
+        await proceed.wait()
+        assert scope._current_session_run_epoch(session.id) is None
+    task = asyncio.create_task(child())
+    try:
+        await ready.wait()
+        rejected(lambda: scope._assert_session_run_epoch_value(session.id, 2), SessionRunFenced)
+        assert owner.retire() and not owner.retire()
+        assert retired == ["retired"]
+    finally:
+        proceed.set()
+        await task
+        scope._deactivate_session_run_fence(session.id)
+    rejected(lambda: owner.activate().__enter__(), RuntimeError)
+    assert scope._current_recovery_cleanup_identity() is None
+asyncio.run(scenario())
+"""
+    )
+
+
+def test_interaction_context_preserves_history_and_restores_outer_scope():
+    _without_implementations(
+        _SESSION_FIXTURE
+        + """
+import asyncio
+from cayu.sessions import _invocation_scope as scope
+from cayu.sessions.interactions import InteractionTransitionSpec
+
+async def scenario():
+    scope._activate_owned_session_run_fence(session)
+    scope._activate_session_interaction(session.id, "first")
+    captured = scope._SessionRunFenceContext.current_or_new()
+    scope._deactivate_session_interaction(session.id)
+    scope._deactivate_session_run_fence(session.id)
+    with captured.activate():
+        assert scope._SessionRunFenceContext.current_or_new() is captured
+        assert scope._current_recovery_cleanup_identity() == (session.id, session.instance_id, 1)
+        with captured.activate():
+            assert scope.resolve_interaction_attribution(session.id, scope.INHERIT_INTERACTION) == "first"
+            assert scope.resolve_interaction_attribution(session.id, None) is None
+        event = Event(type=EventType.MODEL_STARTED, session_id=session.id)
+        assert scope.attribute_event_to_current_interaction(event).interaction_id == "first"
+        assert event.interaction_id is None
+        terminal = Event(type=EventType.SESSION_COMPLETED, session_id=session.id)
+        assert scope.attribute_event_to_current_interaction(terminal).interaction_id is None
+        spec = InteractionTransitionSpec(event=Event(type=EventType.INTERACTION_COMPLETED,
+            session_id=session.id, interaction_id="first"),
+            from_statuses=(SessionStatus.RUNNING,), to_status=SessionStatus.COMPLETED)
+        scope._mark_session_interaction_settled(session.id, "first", spec)
+        scope._mark_session_invocation_terminal_event(terminal)
+        scope._close_session_interaction(session.id)
+        assert scope._current_session_interaction_id(session.id) is None
+        assert scope._latest_session_invocation_interaction_is_settled(session.id)
+        retained = scope._current_session_invocation_settlement_transition(session.id)
+        assert retained == spec and retained is not spec
+        assert scope._current_session_invocation_terminal_event(session.id) == terminal
+    assert scope._current_session_run_epoch(session.id) is None
+    assert scope._current_session_invocation_interaction_ids(session.id) == ()
+    with captured.activate():
+        assert scope._latest_session_invocation_interaction_is_settled(session.id)
+        scope._activate_session_interaction(session.id, "next")
+        assert not scope._latest_session_invocation_interaction_is_settled(session.id)
+        assert scope._current_session_invocation_settlement_transition(session.id) is None
+        scope._deactivate_session_interaction(session.id)
+        assert scope._current_session_invocation_terminal_event(session.id) is None
+        scope._deactivate_session_run_fence(session.id)
+asyncio.run(scenario())
 """
     )
