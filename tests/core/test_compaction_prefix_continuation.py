@@ -25,6 +25,7 @@ from cayu.context.base import (
 from cayu.events import EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelProvider, ModelStreamEvent
+from cayu.runtime._compaction import automatic as _automatic_compaction
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
@@ -602,9 +603,8 @@ def test_partial_checkpoint_does_not_acknowledge_unrepresented_hierarchy_calls(
 
 @pytest.mark.parametrize("committed", [False, True])
 def test_cancellation_cleanup_timeout_cancels_actual_checkpoint_writer(monkeypatch, committed):
-    import cayu.runtime._model_step_executor as executor
 
-    monkeypatch.setattr(executor, "_CONTEXT_TERMINATION_PERSIST_TIMEOUT_S", 0.02)
+    monkeypatch.setattr(_automatic_compaction, "_CONTEXT_TERMINATION_PERSIST_TIMEOUT_S", 0.02)
 
     class StalledStore(InMemorySessionStore):
         invocation_lifecycle_command_version = 1

@@ -356,6 +356,8 @@ from cayu.runtime._checkpoint_store import (
     load_runtime_session_checkpoint_snapshot,
     runtime_checkpoint_session_store,
 )
+from cayu.runtime._compaction.automatic import AutomaticCompaction
+from cayu.runtime._compaction.explicit import SessionCompaction
 from cayu.runtime._continuation_task_failure import ApprovalTaskFailureIdentity
 from cayu.runtime._delegated_event_stream import (
     _close_delegated_event_stream as _close_delegated_event_stream,
@@ -427,13 +429,12 @@ from cayu.runtime._run_limits import (
     RunLimitController,
     SessionUsageTracker,
 )
+from cayu.runtime._session_checkpoint_admission import _reject_unresumable_session_checkpoint
 from cayu.runtime._session_closure_projection import (
     project_closure_export,
     project_closure_manifest,
     project_closure_report,
 )
-from cayu.runtime._session_checkpoint_admission import _reject_unresumable_session_checkpoint
-from cayu.runtime._session_compaction import SessionCompaction
 from cayu.runtime._session_control import (
     SessionControl,
 )
@@ -1626,7 +1627,19 @@ class CayuApp:
             resolve_registered_environment=self._get_registered_environment_for_session,
         )
 
+        self._automatic_compaction = AutomaticCompaction(
+            session_store=self._runtime_session_store,
+            event_writer=self._event_writer,
+            run_limit_controller=self._run_limit_controller,
+            request_footprint=self._request_footprint,
+            secret_redactor=self._secret_redactor,
+            checkpoint_transform=(
+                self._environment_lifecycle.checkpoint_transform_preserving_runtime_state
+            ),
+        )
+
         self._model_step_executor = ModelStepExecutor(
+            automatic_compaction=self._automatic_compaction,
             session_store=self._runtime_session_store,
             recovery_cleanup_supervisor=self._recovery_cleanup_supervisor,
             event_writer=self._event_writer,
@@ -1639,9 +1652,6 @@ class CayuApp:
             max_file_attachments_per_request=self._max_file_attachments_per_request,
             secret_redactor=self._secret_redactor,
             clock=self._clock,
-            checkpoint_transform=(
-                self._environment_lifecycle.checkpoint_transform_preserving_runtime_state
-            ),
             apply_budget_evaluation=self._session_finalization.apply_model_step_budget_evaluation,
             apply_limit_evaluation=self._session_finalization.apply_model_step_limit_evaluation,
             stop_for_budget_reservation_failure=(
@@ -3106,7 +3116,7 @@ class CayuApp:
         compaction, executor = self._session_compaction, self._model_step_executor
         waits = await asyncio.gather(
             compaction.wait_for_session_operations(timeout_s=float(timeout_s)),
-            executor.drain_detached_writes(timeout_s=float(timeout_s)),
+            self._automatic_compaction.drain_detached_writes(timeout_s=float(timeout_s)),
             executor.wait_for_provider_reconciliations(timeout_s=float(timeout_s)),
             wait_until_idle(self._detached_session_store_work, timeout_s=float(timeout_s)),
             return_exceptions=True,
@@ -5228,7 +5238,7 @@ class CayuApp:
             compaction = self._session_compaction
             waits = await asyncio.gather(
                 compaction.wait_for_session_operations(timeout_s=budget),
-                self._model_step_executor.drain_detached_writes(timeout_s=budget),
+                self._automatic_compaction.drain_detached_writes(timeout_s=budget),
                 wait_until_idle(self._detached_session_store_work, timeout_s=budget),
                 return_exceptions=True,
             )
@@ -5354,7 +5364,7 @@ class CayuApp:
             late["provider_reconciliations"] = "late_work"
         if (
             self._session_compaction.session_operations_pending
-            or self._model_step_executor.detached_writes_pending
+            or self._automatic_compaction.detached_writes_pending
             or any(not task.done() for task in self._detached_session_store_work())
         ):
             late["session_operations"] = "late_work"

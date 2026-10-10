@@ -41,6 +41,7 @@ from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._approval_support import _pending_approval_for_atomic_claim
 from cayu.runtime._assistant_model_publication import AssistantModelPublication
+from cayu.runtime._compaction import recovery as compaction_recovery
 from cayu.runtime._durable_tool_round import _environment_name
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._execution_profile_admission import ModelFailoverProfileResolution
@@ -61,7 +62,7 @@ from cayu.runtime._model_completion_contracts import (
 from cayu.runtime._model_execution_selection import ModelExecutionSelection
 from cayu.runtime._model_failover_stage import model_failover_target_for_stored_stage
 from cayu.runtime._model_step_executor import ModelStepExecutor
-from cayu.runtime._run_limits import BorrowedAutomaticCompactionOutcomeUnknown, RunLimitController
+from cayu.runtime._run_limits import RunLimitController
 from cayu.runtime._structured_output_tool_round import has_recoverable_structured_output_round
 from cayu.runtime._user_input_recovery_evidence import UserInputRecoveryEvidence
 from cayu.runtime.loop_policies import LoopPolicy
@@ -623,17 +624,11 @@ class ModelCompletionRecovery:
         if active is not None:
             stage = active.stage
             self.validate_active_model_completion_stage(session, stage)
-            try:
-                recovery_events = tuple(
-                    await self._run_limit_controller.reconcile_borrowed_automatic_compaction_budget_authority(
-                        session=session,
-                        stage=stage,
-                    )
-                )
-            except BorrowedAutomaticCompactionOutcomeUnknown as outcome_unknown:
-                raise ModelCompletionManualRecoveryRequired(
-                    str(outcome_unknown)
-                ) from outcome_unknown
+            recovery_events = await compaction_recovery.reconcile_before_stage_recovery(
+                session=session,
+                stage=stage,
+                run_limit_controller=self._run_limit_controller,
+            )
             if (
                 stage.state == "in_flight"
                 and await self.recoverable_provider_operation(
@@ -854,34 +849,10 @@ class ModelCompletionRecovery:
                         {event.id: event for event in (*recovery_events, *budget_events)}.values()
                     )
                 if stage.purpose == "context-compaction" and stage.reservation_ids:
-                    recovery_context = model_completion_recovery_context_from_stage(stage)
-                    pricing_provider_name = stage.intent.get("pricing_provider_name")
-                    requested_model = stage.intent.get("requested_model")
-                    model_attempt_id = stage.intent.get("model_attempt_id")
-                    if recovery_context is None or not all(
-                        type(value) is str
-                        for value in (
-                            pricing_provider_name,
-                            requested_model,
-                            model_attempt_id,
-                        )
-                    ):
-                        raise ModelCompletionManualRecoveryRequired(
-                            "Completed context-compaction recovery lost its exact budget authority."
-                        )
-                    assert isinstance(pricing_provider_name, str)
-                    assert isinstance(requested_model, str)
-                    assert isinstance(model_attempt_id, str)
-                    budget_events = await self._run_limit_controller.reconcile_completed_automatic_compaction_reservations(
+                    budget_events = await compaction_recovery.reconcile_completed_stage(
                         session=session,
                         stage=stage,
-                        recovery_contexts=recovery_context.budget_reservations,
-                        pricing_provider_name=pricing_provider_name,
-                        model=requested_model,
-                        model_attempt_identity=ModelAttemptIdentity(
-                            model_step_id=stage.logical_step_id,
-                            model_attempt_id=model_attempt_id,
-                        ),
+                        run_limit_controller=self._run_limit_controller,
                     )
                     recovery_events = tuple(
                         {event.id: event for event in (*recovery_events, *budget_events)}.values()
@@ -940,12 +911,7 @@ class ModelCompletionRecovery:
             )
         if pointer is None:
             if active is not None:
-                if active.stage.purpose == "context-compaction":
-                    raise ModelCompletionManualRecoveryRequired(
-                        "The completed context compaction was promoted without a durable "
-                        "context checkpoint; its completion evidence prevents provider "
-                        "redispatch."
-                    )
+                compaction_recovery.require_promoted_context_checkpoint(active.stage)
                 raise RuntimeError(
                     "Promoted model completion did not publish its durable model-step pointer."
                 )

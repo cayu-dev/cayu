@@ -53,7 +53,7 @@ from cayu.providers.base import (
 )
 from cayu.providers.bedrock import bedrock_billing_identity, completed_bedrock_billing_identity
 from cayu.providers.retry_policy import RetryPolicy
-from cayu.runtime import _session_compaction
+from cayu.runtime._compaction import explicit as _session_compaction
 from cayu.runtime._event_projection import (
     PRIVATE_EVENT_AUTHORITY,
     public_event_id,

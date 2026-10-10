@@ -170,7 +170,6 @@ from cayu.providers.bedrock import bedrock_billing_identity, completed_bedrock_b
 from cayu.providers.operations import ProviderOperationState, ProviderOperationStatus
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _recovery_ownership as recovery_ownership_module
-from cayu.runtime import _session_compaction
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime._approval_support import _pending_approval_for_atomic_claim
 from cayu.runtime._child_session_notifications import (
@@ -178,6 +177,8 @@ from cayu.runtime._child_session_notifications import (
     ChildSessionLifecycleQuery,
     ChildSessionNotificationFreshness,
 )
+from cayu.runtime._compaction import automatic as _automatic_compaction
+from cayu.runtime._compaction import explicit as _session_compaction
 from cayu.runtime._event_projection import (
     PRIVATE_EVENT_AUTHORITY,
     REDACTED_CUSTOM_EVENT_TYPE,
@@ -1697,12 +1698,12 @@ def test_automatic_compaction_publication_contention_conformance(
         )
 
         monkeypatch.setattr(
-            model_step_executor_module,
+            _automatic_compaction,
             "_AUTOMATIC_COMPACTION_PREDISPATCH_EVENT_STORE_WAIT_TIMEOUT_S",
             0.5,
         )
         monkeypatch.setattr(
-            model_step_executor_module,
+            _automatic_compaction,
             "_CONTEXT_EVENT_STORE_WAIT_AFTER_CANCELLATION_TIMEOUT_S",
             0.5,
         )

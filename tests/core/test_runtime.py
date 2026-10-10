@@ -238,6 +238,7 @@ from cayu.runtime._binding_cleanup import (
     binding_cleanup_status,
     record_binding_cleanup_failure,
 )
+from cayu.runtime._compaction import automatic as _automatic_compaction
 from cayu.runtime._continuation_task_failure import runtime_task_failure_identity_from_task
 from cayu.runtime._event_projection import (
     PRIVATE_EVENT_AUTHORITY,
@@ -39076,7 +39077,7 @@ def test_automatic_compaction_cancellation_during_publication_reconciliation_pro
             # Bound the blocked read after cancellation without shortening
             # ordinary publication or reconciliation during setup.
             monkeypatch.setattr(
-                model_step_executor_module,
+                _automatic_compaction,
                 "_CONTEXT_EVENT_STORE_WAIT_AFTER_CANCELLATION_TIMEOUT_S",
                 0.01,
             )
@@ -39169,7 +39170,7 @@ def test_automatic_compaction_cancellation_does_not_wait_for_stalled_completion_
     async def run() -> None:
         # Shorten only cancellation draining, not ordinary durable publication.
         monkeypatch.setattr(
-            model_step_executor_module,
+            _automatic_compaction,
             "_CONTEXT_EVENT_STORE_WAIT_AFTER_CANCELLATION_TIMEOUT_S",
             0.01,
         )
@@ -39305,7 +39306,7 @@ def test_automatic_compaction_late_completion_commit_keeps_one_accounting_event(
 
     async def run() -> None:
         monkeypatch.setattr(
-            model_step_executor_module,
+            _automatic_compaction,
             "_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S",
             0.01,
         )
@@ -39428,7 +39429,7 @@ def test_automatic_compaction_late_start_commit_reuses_original_event(
 
     async def run() -> None:
         monkeypatch.setattr(
-            model_step_executor_module,
+            _automatic_compaction,
             "_AUTOMATIC_COMPACTION_PREDISPATCH_EVENT_STORE_WAIT_TIMEOUT_S",
             0.01,
         )
@@ -39626,7 +39627,7 @@ def test_automatic_compaction_exhausted_start_publication_is_typed_and_resumable
             return await original_emit_many(session_id, events)
 
         monkeypatch.setattr(
-            model_step_executor_module,
+            _automatic_compaction,
             "_AUTOMATIC_COMPACTION_PREDISPATCH_PUBLICATION_ATTEMPTS",
             2,
         )
@@ -39821,7 +39822,7 @@ def test_automatic_hierarchy_exhausted_next_start_requires_reconciliation(
             return await original_persist_exact_replay(event)
 
         monkeypatch.setattr(
-            model_step_executor_module,
+            _automatic_compaction,
             "_AUTOMATIC_COMPACTION_PREDISPATCH_PUBLICATION_ATTEMPTS",
             3,
         )

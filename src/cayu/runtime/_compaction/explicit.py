@@ -109,6 +109,7 @@ from cayu.providers.base import (
     ModelProvider,
     ModelRequest,
     UsageDialect,
+    _detach_model_request,
     copy_usage_dialect,
 )
 from cayu.runtime import (
@@ -120,14 +121,12 @@ from cayu.runtime import (
 )
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_request_boundary as session_request_boundary
+from cayu.runtime._compaction.identity import _CompactionExecutionIdentityLedger
 from cayu.runtime._durable_tool_round import _environment_name
 from cayu.runtime._event_writer import (
     RuntimeEventWriter,
 )
-from cayu.runtime._model_step_executor import (
-    _detach_model_request,
-    _session_agent_spec,
-)
+from cayu.runtime._model_execution_selection import _session_agent_spec
 from cayu.runtime._recovery_ownership import (
     RecoveryOwnership,
     _checkpoint_without_active_incomplete_recovery_claim,
@@ -2048,10 +2047,7 @@ class SessionCompaction:
                 await self._event_writer.fan_out_persisted(events)
                 prepublished_dispatch_events.extend(events)
 
-            active_compaction_model_attempt_identity: ModelAttemptIdentity | None = None
-            model_attempts_by_compaction_id: dict[str, ModelAttemptIdentity] = {}
-            compaction_ids_by_model_attempt_id: dict[str, str] = {}
-            issued_compaction_model_attempts: dict[str, ModelAttemptIdentity] = {}
+            compaction_identity_ledger = _CompactionExecutionIdentityLedger(model_step_identity)
 
             async def record_compaction_footprint(
                 *,
@@ -2135,82 +2131,15 @@ class SessionCompaction:
                 *,
                 expected_identity: ModelAttemptIdentity | None = None,
             ) -> dict[str, Any]:
-                copied_payload = copy_json_value(
-                    payload,
-                    "compaction_model_completed_payload",
+                copied_payload = copy_json_value(payload, "compaction_model_completed_payload")
+                identified = compaction_identity_ledger.identify_payload(
+                    copied_payload,
+                    expected_identity=expected_identity,
                 )
-                compaction_attempt_id = copied_payload.get(_COMPACTION_ATTEMPT_ID_KEY)
-                if type(compaction_attempt_id) is not str:
-                    raise RuntimeError("Compaction completion evidence lost its attempt identity.")
-                identity = model_attempts_by_compaction_id.get(compaction_attempt_id)
-                candidate = (
-                    copy_model_attempt_identity(expected_identity)
-                    if expected_identity is not None
-                    else active_compaction_model_attempt_identity
-                )
-                payload_identity: ModelAttemptIdentity | None = None
-                if "model_step_id" in copied_payload or "model_attempt_id" in copied_payload:
-                    try:
-                        payload_identity = ModelAttemptIdentity.model_validate(
-                            {
-                                "model_step_id": copied_payload.get("model_step_id"),
-                                "model_attempt_id": copied_payload.get("model_attempt_id"),
-                            }
-                        )
-                    except (TypeError, ValueError):
-                        raise ValueError(
-                            "Compaction completion carries an invalid model attempt identity."
-                        ) from None
-                    issued_identity = issued_compaction_model_attempts.get(
-                        payload_identity.model_attempt_id
-                    )
-                    if issued_identity != payload_identity:
-                        raise ValueError(
-                            "Compaction completion carries a model attempt identity that "
-                            "was not issued for this logical step."
-                        )
-                if (
-                    candidate is not None
-                    and payload_identity is not None
-                    and candidate != payload_identity
-                ):
-                    raise ValueError(
-                        "Compaction completion identity conflicts with its provider dispatch."
-                    )
-                candidate = candidate or payload_identity
-                if identity is None:
-                    if candidate is None:
-                        raise RuntimeError(
-                            "Compaction completion was observed outside its provider dispatch."
-                        )
-                    existing_compaction_id = compaction_ids_by_model_attempt_id.get(
-                        candidate.model_attempt_id
-                    )
-                    if (
-                        existing_compaction_id is not None
-                        and existing_compaction_id != compaction_attempt_id
-                    ):
-                        raise ValueError(
-                            "Compaction provider dispatch produced conflicting "
-                            "completion identities."
-                        )
-                    identity = copy_model_attempt_identity(candidate)
-                    model_attempts_by_compaction_id[compaction_attempt_id] = identity
-                elif candidate is not None and identity != candidate:
-                    raise ValueError(
-                        "Compaction completion identity conflicts with its provider dispatch."
-                    )
-                existing_compaction_id = compaction_ids_by_model_attempt_id.setdefault(
-                    identity.model_attempt_id,
-                    compaction_attempt_id,
-                )
-                if existing_compaction_id != compaction_attempt_id:
-                    raise ValueError(
-                        "Compaction provider dispatch produced conflicting completion identities."
-                    )
-                strip_runtime_owned_execution_identity(copied_payload)
-                copied_payload.update(identity.payload())
-                return copied_payload
+                identity = {key: identified[key] for key in ("model_step_id", "model_attempt_id")}
+                strip_runtime_owned_execution_identity(identified)
+                identified.update(identity)
+                return identified
 
             def application_compaction_telemetry_event(
                 telemetry: ContextCompactionTelemetry,
@@ -2771,14 +2700,9 @@ class SessionCompaction:
                 max_dispatch_attempts: int,
                 dispatch: Callable[[], Awaitable[tuple[str, dict[str, Any]]]],
             ) -> tuple[str, dict[str, Any]]:
-                nonlocal active_compaction_model_attempt_identity
                 validate_live_compaction_semantics()
-                if active_compaction_model_attempt_identity is not None:
-                    raise RuntimeError("Compaction provider dispatches cannot overlap.")
-                model_attempt_identity = model_step_identity.new_attempt()
-                active_compaction_model_attempt_identity = model_attempt_identity
-                issued_compaction_model_attempts[model_attempt_identity.model_attempt_id] = (
-                    model_attempt_identity
+                model_attempt_identity = compaction_identity_ledger.begin_dispatch(
+                    model_step_identity.new_attempt()
                 )
                 try:
                     return await _run_provider_dispatch(
@@ -2795,11 +2719,7 @@ class SessionCompaction:
                         model_attempt_identity=model_attempt_identity,
                     )
                 finally:
-                    if active_compaction_model_attempt_identity != model_attempt_identity:
-                        raise RuntimeError(
-                            "Compaction provider dispatch identity changed while active."
-                        )
-                    active_compaction_model_attempt_identity = None
+                    compaction_identity_ledger.end_dispatch(model_attempt_identity)
 
             async def run_identity_only_dispatch(
                 provider: ModelProvider,
@@ -2821,19 +2741,14 @@ class SessionCompaction:
                     actual_usage_dialect,
                     billing_identity,
                 )
-                nonlocal active_compaction_model_attempt_identity
                 validate_live_compaction_semantics()
                 if has_compaction_accounting_limits:
                     raise RuntimeError(
                         "Explicit compaction declared deterministic execution but "
                         "attempted provider work under run or cost limits."
                     )
-                if active_compaction_model_attempt_identity is not None:
-                    raise RuntimeError("Compaction provider dispatches cannot overlap.")
-                model_attempt_identity = model_step_identity.new_attempt()
-                active_compaction_model_attempt_identity = model_attempt_identity
-                issued_compaction_model_attempts[model_attempt_identity.model_attempt_id] = (
-                    model_attempt_identity
+                model_attempt_identity = compaction_identity_ledger.begin_dispatch(
+                    model_step_identity.new_attempt()
                 )
                 try:
                     await record_compaction_footprint(
@@ -2848,11 +2763,7 @@ class SessionCompaction:
                     with _compaction_model_attempt_identity_scope(model_attempt_identity):
                         return await dispatch()
                 finally:
-                    if active_compaction_model_attempt_identity != model_attempt_identity:
-                        raise RuntimeError(
-                            "Compaction provider dispatch identity changed while active."
-                        )
-                    active_compaction_model_attempt_identity = None
+                    compaction_identity_ledger.end_dispatch(model_attempt_identity)
 
             async def execute_compaction() -> ContextBuildResult:
                 try:

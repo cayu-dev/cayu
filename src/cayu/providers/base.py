@@ -1934,3 +1934,18 @@ async def _runtime_provider_stream(
                 yield event
     finally:
         controller.close()
+
+
+def _detach_model_request(request: ModelRequest) -> ModelRequest:
+    if type(request) is not ModelRequest:
+        raise TypeError("request must be a ModelRequest.")
+    return ModelRequest(
+        model=request.model,
+        messages=request.messages,
+        tools=request.tools,
+        hosted_tools=request.hosted_tools,
+        targeted_tool_projection=request.targeted_tool_projection,
+        tool_discovery_projection=request.tool_discovery_projection,
+        options=request.options,
+        cache_affinity_key=request.cache_affinity_key,
+    )

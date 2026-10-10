@@ -270,7 +270,7 @@ CayuApp
   -> QueuedDispatchCoordinator
 ```
 
-`SessionEngine` owns execution, fork, explicit compaction, queued-message
+`SessionEngine` owns execution, fork, queued-message
 delivery, task linkage, and model/tool loop decisions. `SessionRecovery` owns
 startup recovery, abandoned-run recovery, and public resume orchestration above
 the engine. Resume prepares and validates its inputs before recovery, retains its
@@ -282,6 +282,26 @@ budget snapshot, then enters execution after recovery settles.
 continuations. These owners call the engine's execution operations directly.
 `RecoveryAdmission` owns the shared claimed transition and cleanup handoff.
 The engine has no dependency on these continuation coordinators.
+
+Compaction lives in `runtime/_compaction/`. `SessionCompaction` owns explicit
+compaction: admission, session-operation claims and heartbeats, provider dispatch,
+budget settlement, checkpoint publication, and replay. The engine retains request
+preparation, participant authorization, and the public event-stream boundary.
+`AutomaticCompaction` supplies stores, accounting, event publication, and retained
+write ownership. Its `AutomaticCompactionRun` owns each context build's compactor
+dispatches and completion evidence, including overflow recovery and cancelled
+builds. Both entrances use the same dispatch-identity ledger; explicit compaction
+retains its operation step, while each automatic provider call gets an independent
+model step that can be settled without completing the assistant turn.
+
+The entrances keep their distinct durable authority: explicit compaction uses a
+session-operation claim; automatic compaction uses model-completion stages,
+including the existing borrowed-stage path after context overflow. The package's
+recovery functions validate saved compaction accounting and reject promoted
+completions without a durable context checkpoint. Generic stage recovery retains
+stage validation and promotion. Application drain and shutdown wait directly on
+both compaction owners. These parts import without the application, session
+engine, model-step executor, or model-completion recovery coordinator.
 
 `RecoveryOwnership` owns one claim-worker registry, lease renewal, and supervised
 cleanup. Live execution, continuation recovery, and terminal finalization share
@@ -334,8 +354,8 @@ projection and hosted tool-discovery preparation live in independent runtime
 modules used by both execution and recovery. Consumers import these parts from
 their owning modules; the executor composes the operations and retains the
 imports it uses. The executor wires the recovery owner's store, event writer,
-run-limit controller, redactor, clock and cancellation owner. Live retry decisions and
-automatic compaction remain with the executor.
+run-limit controller, redactor, clock and cancellation owner. Live retry decisions
+remain with the executor.
 
 `ProviderOperationStartOwner` owns background-provider dispatch, exact start
 identity publication, bounded cancellation settlement and late acknowledgement
@@ -352,8 +372,9 @@ It composes the existing startup, cancellation and recovery owners with explicit
 store, event writer, session control, redactor and clock dependencies. Run-local
 authority callbacks preserve their dispatch and publication order. The model-step
 executor delegates the complete attempt and retains request preparation,
-observation and retry/failover scheduling. `ModelStepRun` retains context recovery
-and automatic compaction coordination.
+observation and retry/failover scheduling. `ModelStepRun` selects the context policy
+and delegates compaction and context-outcome publication to `AutomaticCompactionRun`.
+Live authority validation and budget-stop decisions remain at the model entrance.
 
 `TerminalEvidenceFinalization` owns terminal-evidence inspection and crash repair,
 as well as live claim transfer, exact renewal, heartbeat-monitored preparation and

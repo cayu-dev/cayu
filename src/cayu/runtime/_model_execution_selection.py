@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any
 
+from cayu._validation import copy_durable_metadata, copy_json_value
+from cayu.agents import AgentSpec
 from cayu.execution_profiles import (
     ExecutionProfileIdentity,
 )
@@ -396,3 +398,28 @@ class ModelFailoverAttempt:
 
     def __repr__(self) -> str:
         return "ModelFailoverAttempt(<admitted attempt>)"
+
+
+def _session_agent_spec(
+    *,
+    registered_agent: RegisteredAgentState,
+    session: Session,
+    model_execution_selection: ModelExecutionSelection | None = None,
+) -> AgentSpec:
+    return AgentSpec(
+        name=registered_agent.spec.name,
+        model=session.model
+        if model_execution_selection is None
+        else model_execution_selection.model,
+        provider_name=(
+            session.provider_name
+            if model_execution_selection is None
+            else model_execution_selection.registered_provider.name
+        ),
+        system_prompt=registered_agent.spec.system_prompt,
+        metadata=copy_durable_metadata(registered_agent.spec.metadata),
+        provider_options=copy_json_value(
+            registered_agent.spec.provider_options,
+            "provider_options",
+        ),
+    )

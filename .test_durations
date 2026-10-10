@@ -1,4 +1,10 @@
 {
+  "tests/core/test_compaction_identity.py::test_compaction_cannot_rebind_a_completion_to_another_dispatch": 0.0002800829824991524,
+  "tests/core/test_compaction_identity.py::test_compaction_completion_preserves_issued_step_and_replays_after_dispatch[automatic]": 0.00028724997537210584,
+  "tests/core/test_compaction_identity.py::test_compaction_completion_preserves_issued_step_and_replays_after_dispatch[explicit]": 0.0038806249503977597,
+  "tests/core/test_compaction_identity.py::test_compaction_parts_import_without_execution_owners": 4.429647209006362,
+  "tests/core/test_compaction_identity.py::test_compaction_rejects_conflicting_completion_for_one_dispatch": 0.0002768330159597099,
+  "tests/core/test_compaction_identity.py::test_compaction_rejects_unissued_completion_identity": 0.0006038339924998581,
   "tests/core/test_native_session_message_ownership.py::test_postgres_queue_imports_without_store_adapters": 0.927,
   "tests/core/test_native_session_message_ownership.py::test_postgres_queue_operations_compose_with_direct_connection": 1.801,
   "tests/core/test_native_session_message_ownership.py::test_sqlite_queue_imports_without_store_adapters": 0.793,

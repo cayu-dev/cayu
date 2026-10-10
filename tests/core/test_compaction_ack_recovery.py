@@ -16,7 +16,7 @@ from cayu.applications import CayuApp
 from cayu.context.base import CheckpointCompactionContextPolicy, ModelCompactor
 from cayu.events import EventType
 from cayu.messages import Message
-from cayu.runtime import _session_compaction
+from cayu.runtime._compaction import explicit as _session_compaction
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity, SessionStatus

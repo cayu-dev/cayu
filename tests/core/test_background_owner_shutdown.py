@@ -24,7 +24,8 @@ from cayu.observability.watchers import (
     EventWatcherDeliveryStatus,
     InMemoryEventWatcherStore,
 )
-from cayu.runtime import _session_compaction
+from cayu.runtime._compaction import automatic as _automatic_compaction
+from cayu.runtime._compaction import explicit as _session_compaction
 from cayu.runtime.application_lifecycle import ApplicationAdmissionsSealed
 from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.event_queries import EventQuery
@@ -472,10 +473,9 @@ def test_shutdown_waits_for_a_model_step_write_kept_past_its_bounded_wait(
         policy_for,
     )
 
-    import cayu.runtime._model_step_executor as executor
     from cayu.events import EventType
 
-    monkeypatch.setattr(executor, "_CONTEXT_TERMINATION_PERSIST_TIMEOUT_S", 0.02)
+    monkeypatch.setattr(_automatic_compaction, "_CONTEXT_TERMINATION_PERSIST_TIMEOUT_S", 0.02)
 
     class OpaqueCheckpointStore(InMemorySessionStore):
         """Write the compaction checkpoint only once released, ignoring cancellation."""
@@ -877,7 +877,7 @@ def test_a_cancelled_kept_write_that_fails_is_not_reported(owner: str) -> None:
         app = CayuApp(enable_logging=False, owned_resources=(store,))
         task = asyncio.create_task(_failing("late write rejected"))
         if owner == "model_step_write":
-            app._model_step_executor._retain_detached_task(task)
+            app._automatic_compaction._retain_detached_task(task)
         else:
             app._session_compaction._track_detached_session_operation_task(
                 task, report_failure=False
@@ -1121,7 +1121,7 @@ def test_a_timed_out_session_write_that_then_fails_is_not_reported(
 
 
 def test_superseded_final_accounting_is_not_reported() -> None:
-    from cayu.runtime._session_compaction import SessionCompactionAttemptSuperseded
+    from cayu.runtime._compaction.explicit import SessionCompactionAttemptSuperseded
 
     async def superseded() -> None:
         raise SessionCompactionAttemptSuperseded("a recovering owner took over")
@@ -1207,7 +1207,7 @@ def test_cancelling_the_public_session_drain_keeps_an_unreported_failure(
                 await asyncio.sleep(0.01)
         # Another retained write keeps the combined drain waiting.
         release = asyncio.Event()
-        app._model_step_executor._retain_detached_task(asyncio.create_task(release.wait()))
+        app._automatic_compaction._retain_detached_task(asyncio.create_task(release.wait()))
 
         drain = asyncio.create_task(app.drain_session_operations(timeout_s=10))
         await asyncio.sleep(0.05)
@@ -1240,7 +1240,7 @@ def test_cancelling_the_public_session_drain_keeps_a_final_accounting_failure() 
             await accounting
         # Another retained write keeps the combined drain waiting.
         release = asyncio.Event()
-        app._model_step_executor._retain_detached_task(asyncio.create_task(release.wait()))
+        app._automatic_compaction._retain_detached_task(asyncio.create_task(release.wait()))
 
         drain = asyncio.create_task(app.drain_session_operations(timeout_s=10))
         await asyncio.sleep(0.05)

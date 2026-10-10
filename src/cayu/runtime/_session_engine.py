@@ -26,6 +26,7 @@ from cayu.runtime import (
     _transcript,
 )
 from cayu.runtime._assistant_model_publication import AssistantModelPublication
+from cayu.runtime._compaction.explicit import SessionCompaction
 from cayu.runtime._durable_tool_round import DeferredInteractionInput, DurableToolRound
 from cayu.runtime._durable_tool_round import _environment_name as _environment_name
 from cayu.runtime._durable_tool_round import (
@@ -51,7 +52,6 @@ from cayu.runtime._policy_wire import decode as decode_policy_evidence
 from cayu.runtime._recovery_ownership import (
     RecoveryOwnership,
 )
-from cayu.runtime._session_compaction import SessionCompaction
 from cayu.runtime._session_finalization import (
     _INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE,
     _INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE,
