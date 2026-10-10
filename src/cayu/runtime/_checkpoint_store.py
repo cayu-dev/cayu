@@ -34,8 +34,8 @@ from cayu.sessions._checkpoint_preservation import (
     _replace_checkpoint_preserving_completion_result_event_publications,
 )
 from cayu.sessions._interaction_transitions import SessionInvocationAdmission
+from cayu.sessions.authority import CheckpointRootFieldGuard
 from cayu.sessions.base import (
-    CheckpointRootFieldGuard,
     ModelCompletionStageRecoveryFence,
     RuntimePublicationRequest,
     SessionOperationInitializer,

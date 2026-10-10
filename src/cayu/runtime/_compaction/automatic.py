@@ -128,6 +128,7 @@ from cayu.runtime._run_limits import (
     RunLimitController,
     RunLimitGate,
 )
+from cayu.sessions._checkpoint_mutations import runtime_publication_checkpoint_mutation
 from cayu.sessions._invocation_scope import _current_session_interaction_id
 from cayu.sessions._model_failover import (
     MODEL_FAILOVER_CHECKPOINT_KEY,
@@ -137,7 +138,6 @@ from cayu.sessions.base import (
     ModelCompletionStageRequest,
     RuntimePublicationRequest,
     SessionStore,
-    runtime_publication_checkpoint_mutation,
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.records import CheckpointTransform, Session, SessionStatus

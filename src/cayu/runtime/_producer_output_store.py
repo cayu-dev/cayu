@@ -223,13 +223,15 @@ async def admit_native_producer(store, registration: ProducerOutputRecord, comma
     Only the runtime-owned launch handoff calls this method while holding current
     execution authorization. The source decision alone is not a public grant.
     """
-    from cayu.sessions._checkpoint_mutations import RuntimePublicationMutation
+    from cayu.sessions._checkpoint_mutations import (
+        RuntimePublicationMutation,
+        runtime_publication_checkpoint_mutation,
+    )
     from cayu.sessions._invocation_lifecycle import (
         AdmitInvocationCommand,
         InvocationCheckpointPatch,
         copy_invocation_lifecycle_command,
     )
-    from cayu.sessions.base import runtime_publication_checkpoint_mutation
     from cayu.sessions.records import SessionStatus
 
     redactor = SecretRedactor()

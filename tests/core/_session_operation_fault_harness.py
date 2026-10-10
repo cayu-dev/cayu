@@ -23,11 +23,11 @@ from cayu._exception_groups import (
     set_exception_cause,
 )
 from cayu.events import Event, EventType
+from cayu.sessions._operation_records import _reject_reserved_runtime_publication_key
 from cayu.sessions.base import (
     SessionOperationTransform,
     SessionStore,
     _OwnedOffThreadSessionCommitGuard,
-    _reject_reserved_runtime_publication_key,
 )
 from cayu.sessions.records import Session, SessionStatus
 

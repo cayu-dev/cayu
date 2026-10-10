@@ -60,7 +60,10 @@ from cayu.sessions import _model_completion_publication as model_completion_publ
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
-from cayu.sessions._checkpoint_mutations import RuntimePublicationMutation
+from cayu.sessions._checkpoint_mutations import (
+    RuntimePublicationMutation,
+    runtime_publication_checkpoint_mutation,
+)
 from cayu.sessions._model_completion_publication import ModelCompletionStageDisposition
 from cayu.sessions.base import (
     InMemorySessionStore,
@@ -68,7 +71,6 @@ from cayu.sessions.base import (
     ModelCompletionStage,
     ModelCompletionStageRequest,
     RuntimePublicationRequest,
-    runtime_publication_checkpoint_mutation,
 )
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,

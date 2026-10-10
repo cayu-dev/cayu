@@ -27,13 +27,13 @@ from cayu.runtime.execution_profiles import ExecutionProfileIdentity
 from cayu.sessions import _model_completion_publication as model_completion_publication
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
+from cayu.sessions._checkpoint_mutations import runtime_publication_checkpoint_mutation
 from cayu.sessions.base import (
     InMemorySessionStore,
     ModelCompletionStageRequest,
     RuntimePublicationReceipt,
     RuntimePublicationRequest,
     RuntimePublicationResult,
-    runtime_publication_checkpoint_mutation,
 )
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest

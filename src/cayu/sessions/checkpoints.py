@@ -13,7 +13,7 @@ from cayu.sessions._model_completion_publication import ModelStepPublicationChec
 from cayu.sessions._model_failover import MODEL_FAILOVER_CHECKPOINT_KEY
 
 if TYPE_CHECKING:
-    from cayu.sessions.base import CheckpointRootFieldProjection
+    from cayu.sessions.authority import CheckpointRootFieldProjection
 
 CHECKPOINT_SCHEMA_VERSION_KEY = "checkpoint_schema_version"
 WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY = "workspace_observations"

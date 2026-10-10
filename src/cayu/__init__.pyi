@@ -3929,12 +3929,15 @@ from cayu.sessions._session_continuation import ContinuationConflict as Continua
 from cayu.sessions._session_continuation import ContinuationRecord as ContinuationRecord
 from cayu.sessions._session_continuation import ContinuationService as ContinuationService
 from cayu.sessions._session_continuation import ContinuationUnavailable as ContinuationUnavailable
+from cayu.sessions.authority import CheckpointRootFieldGuard as CheckpointRootFieldGuard
+from cayu.sessions.authority import CheckpointRootFieldProjection as CheckpointRootFieldProjection
 from cayu.sessions.authority import SessionRunFenced as SessionRunFenced
+from cayu.sessions.authority import (
+    checkpoint_root_field_projection_from_storage as checkpoint_root_field_projection_from_storage,
+)
 from cayu.sessions.base import (
     INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY as INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
 )
-from cayu.sessions.base import CheckpointRootFieldGuard as CheckpointRootFieldGuard
-from cayu.sessions.base import CheckpointRootFieldProjection as CheckpointRootFieldProjection
 from cayu.sessions.base import InMemorySessionStore as InMemorySessionStore
 from cayu.sessions.base import (
     ModelCompletionManualRecoveryRequest as ModelCompletionManualRecoveryRequest,
@@ -3946,9 +3949,6 @@ from cayu.sessions.base import ModelFailoverPolicy as ModelFailoverPolicy
 from cayu.sessions.base import ModelTarget as ModelTarget
 from cayu.sessions.base import SessionExecutionInProgress as SessionExecutionInProgress
 from cayu.sessions.base import SessionStore as SessionStore
-from cayu.sessions.base import (
-    checkpoint_root_field_projection_from_storage as checkpoint_root_field_projection_from_storage,
-)
 from cayu.sessions.checkpoints import CHECKPOINT_SCHEMA_VERSION_KEY as CHECKPOINT_SCHEMA_VERSION_KEY
 from cayu.sessions.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION as CURRENT_CHECKPOINT_SCHEMA_VERSION,

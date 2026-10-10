@@ -39,6 +39,7 @@ from cayu.sessions import _execution_profile_rules as session_profile_rules
 from cayu.sessions import _interaction_receipts as interaction_receipts
 from cayu.sessions import _interaction_transitions as interaction_rules
 from cayu.sessions import _invocation_scope as invocation_scope
+from cayu.sessions import _operation_records as operation_record_rules
 from cayu.sessions import _terminal_evidence as terminal_event_evidence
 from cayu.sessions import authority as session_authority_rules
 from cayu.sessions import creation_fence
@@ -71,6 +72,9 @@ from cayu.sessions._checkpoint_mutations import (
 )
 from cayu.sessions._checkpoint_mutations import (
     apply_runtime_publication_checkpoint_mutation as apply_runtime_publication_checkpoint_mutation,
+)
+from cayu.sessions._checkpoint_mutations import (
+    runtime_publication_checkpoint_mutation as runtime_publication_checkpoint_mutation,
 )
 from cayu.sessions._checkpoint_mutations import (
     runtime_publication_checkpoint_value_digest as runtime_publication_checkpoint_value_digest,
@@ -145,6 +149,35 @@ from cayu.sessions._model_failover import (
 )
 from cayu.sessions._model_failover import (
     MODEL_TARGET_PROJECTION_SCHEMA_VERSION as MODEL_TARGET_PROJECTION_SCHEMA_VERSION,
+)
+from cayu.sessions._operation_records import (
+    MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX as MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX,
+)
+from cayu.sessions._operation_records import (
+    RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX as RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX,
+)
+from cayu.sessions._operation_records import (
+    ZERO_WORK_INTERRUPTION_OPERATION_KEY as ZERO_WORK_INTERRUPTION_OPERATION_KEY,
+)
+from cayu.sessions._operation_records import (
+    RuntimePublicationOperationRecordMutation as RuntimePublicationOperationRecordMutation,
+)
+from cayu.sessions._operation_records import (
+    runtime_publication_operation_record_value_digest as runtime_publication_operation_record_value_digest,
+)
+from cayu.sessions.authority import (
+    CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS as CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS,
+)
+from cayu.sessions.authority import CheckpointRootFieldGuard as CheckpointRootFieldGuard
+from cayu.sessions.authority import CheckpointRootFieldProjection as CheckpointRootFieldProjection
+from cayu.sessions.authority import (
+    CheckpointRootFieldProjectionValidator as CheckpointRootFieldProjectionValidator,
+)
+from cayu.sessions.authority import (
+    checkpoint_root_field_projection as checkpoint_root_field_projection,
+)
+from cayu.sessions.authority import (
+    checkpoint_root_field_projection_from_storage as checkpoint_root_field_projection_from_storage,
 )
 from cayu.sessions.creation import (
     run_request_with_prepared_work_attempt_creation as run_request_with_prepared_work_attempt_creation,
@@ -961,7 +994,6 @@ from cayu.messages import (
 )
 from cayu.runtime._child_session_notifications import (
     CHILD_SESSION_ADMISSION_OCCURRENCE_TYPE,
-    CHILD_SESSION_NOTIFICATION_OPERATION_KEY_PREFIX,
     ChildSessionLifecycleEntry,
     ChildSessionLifecycleOccurrence,
     ChildSessionLifecycleOccurrenceSource,
@@ -1470,7 +1502,6 @@ SessionOperationInitializer = Callable[
     [Session],
     Mapping[str, dict[str, Any]],
 ]
-CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS = 32
 
 
 def _prune_expired_completion_result_event_publication_owners(
@@ -1767,125 +1798,6 @@ def _active_runtime_publication_checkpoint_codec() -> _RuntimePublicationCheckpo
     return _RUNTIME_PUBLICATION_CHECKPOINT_CODEC.get()
 
 
-@dataclass(frozen=True)
-class CheckpointRootFieldProjection:
-    """Bounded opaque evidence for one runtime-selected root field."""
-
-    is_present: bool
-    json_type: str | None
-    scalar_text: str | None
-    scalar_text_truncated: bool = False
-
-
-CheckpointRootFieldProjectionValidator = Callable[
-    [str, CheckpointRootFieldProjection],
-    None,
-]
-
-
-@dataclass(frozen=True)
-class CheckpointRootFieldGuard:
-    """One runtime-owned validator to run inside a store read snapshot."""
-
-    key: str
-    validate: CheckpointRootFieldProjectionValidator
-
-    def __post_init__(self) -> None:
-        key = require_clean_nonblank(self.key, "checkpoint root field key")
-        if any(
-            char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_"
-            for char in key
-        ):
-            raise ValueError(
-                "checkpoint root field key must contain only ASCII letters, digits, "
-                "and underscores."
-            )
-        if not callable(self.validate):
-            raise TypeError("checkpoint root field validator must be callable.")
-
-
-def checkpoint_root_field_projection(
-    checkpoint: dict[str, Any] | None,
-    key: str,
-) -> CheckpointRootFieldProjection:
-    """Project one root field without copying arbitrary checkpoint contents."""
-
-    if checkpoint is None or key not in checkpoint:
-        return CheckpointRootFieldProjection(
-            is_present=False,
-            json_type=None,
-            scalar_text=None,
-        )
-    value = checkpoint[key]
-    if value is None:
-        json_type = "null"
-        scalar_text = None
-    elif type(value) is bool:
-        json_type = "boolean"
-        scalar_text = None
-    elif type(value) is int:
-        json_type = "integer"
-        scalar_text = str(value)
-    elif type(value) is float:
-        json_type = "number"
-        scalar_text = None
-    elif type(value) is str:
-        json_type = "string"
-        scalar_text = None
-    elif type(value) is list:
-        json_type = "array"
-        scalar_text = None
-    elif type(value) is dict:
-        json_type = "object"
-        scalar_text = None
-    else:
-        json_type = "other"
-        scalar_text = None
-    truncated = (
-        scalar_text is not None and len(scalar_text) > CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS
-    )
-    return CheckpointRootFieldProjection(
-        is_present=True,
-        json_type=json_type,
-        scalar_text=(
-            None if scalar_text is None else scalar_text[:CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS]
-        ),
-        scalar_text_truncated=truncated,
-    )
-
-
-def checkpoint_root_field_projection_from_storage(
-    *,
-    json_type: str | None,
-    scalar_text: Any,
-) -> CheckpointRootFieldProjection:
-    """Normalize bounded root-field evidence projected by a durable store."""
-
-    json_type_aliases = {
-        "false": "boolean",
-        "real": "number",
-        "text": "string",
-        "true": "boolean",
-    }
-    normalized_json_type = (
-        None if json_type is None else json_type_aliases.get(json_type, json_type)
-    )
-    normalized_scalar = None if scalar_text is None else str(scalar_text)
-    return CheckpointRootFieldProjection(
-        is_present=json_type is not None,
-        json_type=normalized_json_type,
-        scalar_text=(
-            None
-            if normalized_scalar is None
-            else normalized_scalar[:CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS]
-        ),
-        scalar_text_truncated=(
-            normalized_scalar is not None
-            and len(normalized_scalar) > CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS
-        ),
-    )
-
-
 ForkCheckpointAuthorityDecoder = Callable[
     [dict[str, Any] | None],
     dict[str, Any] | None,
@@ -1925,8 +1837,6 @@ def transform_fork_checkpoint(
         raise
 
 
-RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX = "__cayu_runtime_publication_v1__:"
-ZERO_WORK_INTERRUPTION_OPERATION_KEY = "__cayu_zero_work_interruption_v1__"
 RUNTIME_PUBLICATION_RECORD_TYPE = "cayu.runtime-publication"
 RUNTIME_PUBLICATION_SCHEMA_VERSION = 2
 RUNTIME_PUBLICATION_MAX_TRANSCRIPT_MESSAGES = 512
@@ -2026,67 +1936,6 @@ def _copy_runtime_publication_event_reference(
     )
 
 
-class RuntimePublicationOperationRecordMutation(BaseModel):
-    """One CAS-protected session-operation record committed with a publication."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    key: str = Field(max_length=512)
-    expected_value_digest: str | None
-    value: dict[str, Any]
-
-    @field_validator("key")
-    @classmethod
-    def validate_key(cls, value: str) -> str:
-        value = require_clean_nonblank(value, "operation record mutation key")
-        _reject_reserved_runtime_publication_key(value, "operation record mutation key")
-        return value
-
-    @field_validator("expected_value_digest")
-    @classmethod
-    def validate_expected_value_digest(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        if (
-            type(value) is not str
-            or len(value) != 64
-            or any(character not in "0123456789abcdef" for character in value)
-        ):
-            raise ValueError("expected_value_digest must be a lowercase SHA-256 digest.")
-        return value
-
-    @field_validator("value", mode="before")
-    @classmethod
-    def copy_value(cls, value: object) -> dict[str, Any]:
-        return copy_durable_json_object(value, "operation record mutation value")
-
-
-_RuntimePublicationOperationRecordMutationValues = (
-    list[RuntimePublicationOperationRecordMutation | dict[str, Any]]
-    | tuple[RuntimePublicationOperationRecordMutation | dict[str, Any], ...]
-)
-
-
-def _copy_runtime_publication_operation_record_mutation(
-    mutation: RuntimePublicationOperationRecordMutation | dict[str, Any],
-) -> RuntimePublicationOperationRecordMutation:
-    try:
-        if type(mutation) is RuntimePublicationOperationRecordMutation:
-            return RuntimePublicationOperationRecordMutation(
-                key=mutation.key,
-                expected_value_digest=mutation.expected_value_digest,
-                value=mutation.value,
-            )
-        if type(mutation) is dict:
-            return RuntimePublicationOperationRecordMutation.model_validate(mutation)
-    except (AttributeError, TypeError, ValueError) as exc:
-        raise ValueError("Runtime publication operation record mutation is malformed.") from exc
-    raise TypeError(
-        "Operation record mutations must be "
-        "RuntimePublicationOperationRecordMutation values or objects."
-    )
-
-
 class RuntimePublicationRequest(BaseModel):
     """Immutable input bundle for one logical model-step or tool-round publication."""
 
@@ -2179,7 +2028,9 @@ class RuntimePublicationRequest(BaseModel):
     ) -> tuple[RuntimePublicationOperationRecordMutation, ...]:
         if type(value) not in (list, tuple):
             raise TypeError("operation_record_mutations must be a list or tuple.")
-        mutation_values = cast("_RuntimePublicationOperationRecordMutationValues", value)
+        mutation_values = cast(
+            "operation_record_rules._RuntimePublicationOperationRecordMutationValues", value
+        )
         if len(mutation_values) > RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS:
             raise ValueError(
                 "operation_record_mutations cannot exceed the runtime publication bound."
@@ -2187,7 +2038,9 @@ class RuntimePublicationRequest(BaseModel):
         copied = tuple(
             sorted(
                 (
-                    _copy_runtime_publication_operation_record_mutation(mutation)
+                    operation_record_rules._copy_runtime_publication_operation_record_mutation(
+                        mutation
+                    )
                     for mutation in mutation_values
                 ),
                 key=lambda mutation: mutation.key,
@@ -2375,7 +2228,6 @@ class _PreparedRuntimePublication:
     checkpoint_codec: _RuntimePublicationCheckpointCodec | None = None
 
 
-MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX = "__cayu_model_completion_stage_v1__:"
 MODEL_COMPLETION_STAGE_RECORD_TYPE = "cayu.model-completion-stage"
 MODEL_COMPLETION_STAGE_PREPARATION_RECORD_TYPE = "cayu.model-completion-stage.prepared"
 MODEL_COMPLETION_STAGE_TERMINAL_RECORD_TYPE = "cayu.model-completion-stage.completed"
@@ -2963,9 +2815,11 @@ class SessionOperationPublication(BaseModel):
         value: dict[str, dict[str, Any]],
     ) -> dict[str, dict[str, Any]]:
         copied = copy_durable_json_object(value, "operation_records")
-        _validate_session_operation_record_keys(copied)
+        operation_record_rules._validate_session_operation_record_keys(copied)
         for key, record in copied.items():
-            _reject_reserved_runtime_publication_key(key, "operation_records key")
+            operation_record_rules._reject_reserved_runtime_publication_key(
+                key, "operation_records key"
+            )
             if type(record) is not dict:
                 raise ValueError("Session operation records must be objects.")
         return copied
@@ -7267,7 +7121,7 @@ class SessionStore(ABC):
     ) -> RuntimePublicationResult:
         """Atomically verify and publish a terminal stage without a load/publish race."""
 
-        expected_run_epoch = _validate_required_runtime_fence(
+        expected_run_epoch = session_authority_rules._validate_required_runtime_fence(
             expected_run_epoch,
             "expected_run_epoch",
         )
@@ -16350,7 +16204,7 @@ class InMemorySessionStore(
 
         access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
-        idempotency_key = _reject_reserved_runtime_publication_key(
+        idempotency_key = operation_record_rules._reject_reserved_runtime_publication_key(
             idempotency_key,
             "idempotency_key",
             browser_control_read=True,
@@ -16581,7 +16435,7 @@ class InMemorySessionStore(
         session_id, copied_events = session_event_rules._copy_session_event_batch(
             session_id, events
         )
-        idempotency_key = _reject_reserved_runtime_publication_key(
+        idempotency_key = operation_record_rules._reject_reserved_runtime_publication_key(
             idempotency_key,
             "idempotency_key",
         )
@@ -16683,7 +16537,7 @@ class InMemorySessionStore(
                 publication.operation_records,
                 "operation_records",
             )
-            _validate_session_operation_record_keys(copied_records)
+            operation_record_rules._validate_session_operation_record_keys(copied_records)
 
             indices = session_exports.selected_transcript_indices(session_id=session_id)
             if (
@@ -17172,7 +17026,9 @@ class InMemorySessionStore(
                 session_id=session_id,
                 stage=stage,
             )
-            if not _runtime_publication_json_equal(prepared.publication.intent, stage.intent):
+            if not session_authority_rules._runtime_publication_json_equal(
+                prepared.publication.intent, stage.intent
+            ):
                 raise SessionModelCompletionStageConflict(
                     "The terminal model completion intent conflicts with its preparation."
                 )
@@ -17416,7 +17272,7 @@ class InMemorySessionStore(
         mutated_operation_records = (
             operation_records
             if not request.operation_record_mutations
-            else _apply_runtime_publication_operation_record_mutations(
+            else operation_record_rules._apply_runtime_publication_operation_record_mutations(
                 request.operation_record_mutations,
                 operation_records,
             )
@@ -20032,45 +19888,6 @@ def _audit_resolution_actor(actor: ResolutionActor | None) -> ResolutionActor | 
     )
 
 
-def _reject_reserved_runtime_publication_key(
-    value: str, field_name: str, *, browser_control_read: bool = False
-) -> str:
-    from cayu.collaboration._session_export_store import require_operation_key_access
-    from cayu.sessions._argument_continuity import require_private_key_access
-    from cayu.sessions._browser_control_checkpoint import require_browser_control_operation_owner
-    from cayu.sessions._producer_checkpoint import (
-        require_operation_key_access as require_producer_key_access,
-    )
-    from cayu.sessions._session_continuation_scope import (
-        require_operation_key_access as require_continuation_key_access,
-    )
-    from cayu.sessions._tool_call_replay_scope import (
-        require_operation_key_access as require_replay_key_access,
-    )
-
-    value = require_clean_nonblank(value, field_name)
-    require_operation_key_access(value, read=browser_control_read)
-    require_continuation_key_access(value, read=browser_control_read)
-    require_producer_key_access(value, read=browser_control_read)
-    require_private_key_access(value, read=browser_control_read)
-    require_replay_key_access(value, read=browser_control_read)
-    if not browser_control_read:
-        require_browser_control_operation_owner(value)
-    if value == ZERO_WORK_INTERRUPTION_OPERATION_KEY:
-        raise ValueError(f"{field_name} cannot use the reserved zero-work interruption key.")
-    if value.startswith(RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX):
-        raise ValueError(f"{field_name} cannot use the reserved runtime publication namespace.")
-    if value.startswith(INTERACTION_TRANSITION_OPERATION_KEY_PREFIX):
-        raise ValueError(f"{field_name} cannot use the reserved interaction-transition namespace.")
-    if value.startswith(INVOCATION_TERMINAL_EVENT_OPERATION_KEY_PREFIX):
-        raise ValueError(f"{field_name} cannot use the reserved terminal-event namespace.")
-    if value.startswith(MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX):
-        raise ValueError(f"{field_name} cannot use the reserved model-completion stage namespace.")
-    if value.startswith(CHILD_SESSION_NOTIFICATION_OPERATION_KEY_PREFIX):
-        raise ValueError(f"{field_name} cannot use the reserved child-notification namespace.")
-    return value
-
-
 def _require_session_export_target(session_id: str, key: str) -> None:
     """Bind private key access to its target before returning callback input."""
     from cayu.collaboration._session_export_store import OPERATION_PREFIX, checkpoint_visible
@@ -20078,20 +19895,6 @@ def _require_session_export_target(session_id: str, key: str) -> None:
 
     if key.startswith(OPERATION_PREFIX) and not checkpoint_visible(session_id=session_id):
         raise SessionExportConflict()
-
-
-def _validate_session_operation_record_keys(records: Mapping[str, Any]) -> None:
-    from cayu.collaboration._session_export_store import require_operation_record_owner
-    from cayu.sessions._browser_control_checkpoint import require_browser_control_operation_owner
-    from cayu.sessions._session_continuation_store import (
-        require_operation_record_owner as require_continuation_record_owner,
-    )
-
-    for key in records:
-        _reject_reserved_runtime_publication_key(key, "operation_records key")
-        require_browser_control_operation_owner(key, records[key])
-        require_operation_record_owner(key, records[key])
-        require_continuation_record_owner(key, records[key])
 
 
 def _prepare_initial_session_operation_records(
@@ -20118,7 +19921,7 @@ def _prepare_initial_session_operation_records(
 
     if any(key.startswith(OPERATION_PREFIX) for key in copied):
         raise ValueError("Session export records require their publication owner.")
-    _validate_session_operation_record_keys(copied)
+    operation_record_rules._validate_session_operation_record_keys(copied)
     for record in copied.values():
         if type(record) is not dict:
             raise ValueError("Initial session operation records must be objects.")
@@ -20245,60 +20048,6 @@ def runtime_publication_request_digest(
     ).request_digest
 
 
-def runtime_publication_checkpoint_mutation(
-    source_checkpoint: dict[str, Any] | None,
-    checkpoint: dict[str, Any] | None,
-) -> RuntimePublicationMutation:
-    """Build a deterministic top-level CAS patch without fencing unrelated keys."""
-
-    if checkpoint is None:
-        if source_checkpoint is not None:
-            raise ValueError(
-                "Runtime publication checkpoint mutations cannot delete the whole checkpoint."
-            )
-        return RuntimePublicationMutation()
-    source = (
-        {}
-        if source_checkpoint is None
-        else copy_durable_json_object(source_checkpoint, "source_checkpoint")
-    )
-    target = copy_durable_json_object(checkpoint, "checkpoint")
-    operations: list[RuntimePublicationCheckpointOperation] = []
-    for key in sorted(source.keys() | target.keys()):
-        source_present = key in source
-        target_present = key in target
-        if (
-            source_present
-            and target_present
-            and _runtime_publication_json_equal(
-                source[key],
-                target[key],
-            )
-        ):
-            continue
-        expected_value_digest = (
-            runtime_publication_checkpoint_value_digest(source[key]) if source_present else None
-        )
-        if target_present:
-            operations.append(
-                RuntimePublicationCheckpointOperation(
-                    key=key,
-                    expected_value_digest=expected_value_digest,
-                    action="set",
-                    value=target[key],
-                )
-            )
-        else:
-            operations.append(
-                RuntimePublicationCheckpointOperation(
-                    key=key,
-                    expected_value_digest=expected_value_digest,
-                    action="delete",
-                )
-            )
-    return RuntimePublicationMutation(operations=tuple(operations))
-
-
 def _prepare_queue_completion_checkpoint_mutation(
     value: dict[str, Any] | None,
     to_status: SessionStatus,
@@ -20338,44 +20087,6 @@ def _apply_queue_completion_checkpoint_mutation(
         mutation, checkpoint
     )
     assert updated is not None
-    return updated
-
-
-def runtime_publication_operation_record_value_digest(value: object) -> str:
-    """Return the CAS digest used for one session-operation record value."""
-
-    return session_authority_rules._canonical_runtime_publication_digest(
-        copy_durable_json_object(value, "operation record value")
-    )
-
-
-def _apply_runtime_publication_operation_record_mutations(
-    mutations: tuple[RuntimePublicationOperationRecordMutation, ...],
-    records: Mapping[str, dict[str, Any]],
-) -> dict[str, dict[str, Any]]:
-    from cayu.collaboration._session_export_store import OPERATION_PREFIX
-
-    updated = dict(records)
-    for mutation in mutations:
-        if mutation.key.startswith(OPERATION_PREFIX):
-            raise ValueError("Session export records require their publication owner.")
-        current = updated.get(mutation.key)
-        matches = (
-            current is None
-            if mutation.expected_value_digest is None
-            else current is not None
-            and runtime_publication_operation_record_value_digest(current)
-            == mutation.expected_value_digest
-        )
-        if not matches:
-            raise SessionRuntimePublicationConflict(
-                "A runtime publication operation record changed before publication: "
-                f"{mutation.key!r}."
-            )
-        updated[mutation.key] = copy_durable_json_object(
-            mutation.value,
-            "operation record mutation value",
-        )
     return updated
 
 
@@ -20742,7 +20453,9 @@ def _validate_structured_output_tool_round_auxiliary(
             outcome_errors = event_errors
         elif (
             event_output_present != outcome_output_present
-            or not _runtime_publication_json_equal(event_output, outcome_output)
+            or not session_authority_rules._runtime_publication_json_equal(
+                event_output, outcome_output
+            )
             or event_errors != outcome_errors
         ):
             raise ValueError(
@@ -20938,7 +20651,7 @@ def _validate_tool_round_publication(
             "artifacts": part.artifacts,
             "is_error": part.is_error,
         }
-        if not _runtime_publication_json_equal(
+        if not session_authority_rules._runtime_publication_json_equal(
             terminal.payload.get("result"),
             expected_result,
         ):
@@ -20969,7 +20682,9 @@ def _validate_tool_round_publication(
         expected_arguments = (
             terminal.payload.get("arguments") if arguments_state == "finalized" else {}
         )
-        arguments_match = type(expected_arguments) is dict and _runtime_publication_json_equal(
+        arguments_match = type(
+            expected_arguments
+        ) is dict and session_authority_rules._runtime_publication_json_equal(
             part.arguments, expected_arguments
         )
         if terminal_is_gateway:
@@ -20997,7 +20712,7 @@ def _validate_tool_round_publication(
                     arguments_match = (
                         terminal.payload.get("arguments_sha256")
                         == f"sha256:{sha256(canonical_durable_json_bytes(inner_arguments, 'arguments')).hexdigest()}"
-                        and _runtime_publication_json_equal(
+                        and session_authority_rules._runtime_publication_json_equal(
                             inner_arguments,
                             expected_arguments,
                         )
@@ -21091,7 +20806,7 @@ def _validate_structured_output_tool_round_marker(
             and (
                 durable_errors
                 or not auxiliary.output_present
-                or not _runtime_publication_json_equal(
+                or not session_authority_rules._runtime_publication_json_equal(
                     auxiliary.output,
                     durable_validation.output,
                 )
@@ -21206,7 +20921,7 @@ def _validate_structured_output_tool_round_marker(
             type(structured_result) is not dict
             or set(structured_result) != {"output"}
             or not auxiliary.output_present
-            or not _runtime_publication_json_equal(
+            or not session_authority_rules._runtime_publication_json_equal(
                 structured_result["output"],
                 auxiliary.output,
             )
@@ -21225,7 +20940,7 @@ def _validate_structured_output_tool_round_marker(
             if (
                 type(structured_result) is not dict
                 or set(structured_result) != {"structured_output_errors"}
-                or not _runtime_publication_json_equal(
+                or not session_authority_rules._runtime_publication_json_equal(
                     structured_result["structured_output_errors"],
                     expected_errors,
                 )
@@ -21325,36 +21040,6 @@ def _validate_tool_round_checkpoint_mutation(
         )
 
 
-def _runtime_publication_json_equal(left: Any, right: Any) -> bool:
-    """Compare validated JSON material under the durable canonicalization contract."""
-
-    return session_authority_rules._canonical_runtime_publication_digest(
-        left
-    ) == session_authority_rules._canonical_runtime_publication_digest(right)
-
-
-def _validate_required_runtime_fence(value: int, field_name: str) -> int:
-    validated = _validate_optional_runtime_publication_fence(value, field_name)
-    if validated is None:
-        raise TypeError(f"{field_name} must be an integer.")
-    return validated
-
-
-def _validate_optional_runtime_publication_fence(
-    value: int | None,
-    field_name: str,
-) -> int | None:
-    if value is None:
-        return None
-    if type(value) is not int:
-        raise TypeError(f"{field_name} must be an integer or None.")
-    if value < 0:
-        raise ValueError(f"{field_name} must be greater than or equal to 0.")
-    if value > MAX_DURABLE_JSON_INTEGER:
-        raise ValueError(f"{field_name} must be at most {MAX_DURABLE_JSON_INTEGER}.")
-    return value
-
-
 def _prepare_model_completion_stage(
     session_id: str,
     request: ModelCompletionStageRequest,
@@ -21429,11 +21114,11 @@ def _prepare_model_completion_stage(
     allowed_statuses = frozenset(
         session_record_rules._validate_status_set(expected_statuses, "expected_statuses")
     )
-    expected_run_epoch = _validate_required_runtime_fence(
+    expected_run_epoch = session_authority_rules._validate_required_runtime_fence(
         expected_run_epoch,
         "expected_run_epoch",
     )
-    expected_transcript_cursor = _validate_required_runtime_fence(
+    expected_transcript_cursor = session_authority_rules._validate_required_runtime_fence(
         expected_transcript_cursor,
         "expected_transcript_cursor",
     )
@@ -22009,13 +21694,13 @@ def _prepare_model_completion_stage_abandonment(
         session_authority_rules._require_raw_sha256_digest(preparation_digest)
     except ValueError as exc:
         raise ValueError("preparation_digest must be a lowercase SHA-256 digest.") from exc
-    expected_run_epoch = _validate_required_runtime_fence(
+    expected_run_epoch = session_authority_rules._validate_required_runtime_fence(
         expected_run_epoch,
         "expected_run_epoch",
     )
     if stage_source_run_epoch is None:
         stage_source_run_epoch = expected_run_epoch
-    stage_source_run_epoch = _validate_required_runtime_fence(
+    stage_source_run_epoch = session_authority_rules._validate_required_runtime_fence(
         stage_source_run_epoch,
         "stage_source_run_epoch",
     )
@@ -22128,7 +21813,9 @@ def _validate_model_completion_stage_publication(
 ) -> None:
     if publication.publication_id != stage.logical_step_id:
         raise ValueError("Model completion publication_id must equal logical_step_id.")
-    if not _runtime_publication_json_equal(publication.intent, stage.intent):
+    if not session_authority_rules._runtime_publication_json_equal(
+        publication.intent, stage.intent
+    ):
         raise SessionModelCompletionStageConflict(
             "The terminal model completion intent conflicts with its preparation."
         )
@@ -22528,7 +22215,7 @@ def _validate_assistant_model_completion_publication(
         if (
             pending_call.tool_call_id != tool_call.tool_call_id
             or pending_call.tool_name != tool_call.tool_name
-            or not _runtime_publication_json_equal(
+            or not session_authority_rules._runtime_publication_json_equal(
                 pending_call.transcript_arguments,
                 tool_call.arguments,
             )
@@ -23215,7 +22902,7 @@ def model_completion_stage_settlement_request(
         raise SessionModelCompletionStageConflict(
             "Model-completion stage belongs to a different execution profile."
         )
-    settlement_run_epoch = _validate_required_runtime_fence(
+    settlement_run_epoch = session_authority_rules._validate_required_runtime_fence(
         settlement_run_epoch,
         "settlement_run_epoch",
     )
@@ -23822,7 +23509,9 @@ def _reconstruct_model_completion_stage(
             raise SessionModelCompletionStageConflict(
                 "The terminal model completion identity conflicts with its preparation."
             )
-        if not _runtime_publication_json_equal(terminal.publication.intent, preparation.intent):
+        if not session_authority_rules._runtime_publication_json_equal(
+            terminal.publication.intent, preparation.intent
+        ):
             raise SessionModelCompletionStageConflict(
                 "The terminal model completion intent conflicts with its preparation."
             )
@@ -24424,7 +24113,7 @@ def _prepare_runtime_publication(
             raise ValueError("Gate close receipt requires its parent continuation mutation.")
     if copied_request.argument_continuity is not None and copied_request.kind != "tool-round":
         raise ValueError("Private argument continuity requires a tool-round publication.")
-    _validate_session_operation_record_keys(
+    operation_record_rules._validate_session_operation_record_keys(
         {mutation.key: mutation.value for mutation in copied_request.operation_record_mutations}
     )
 
@@ -24453,13 +24142,15 @@ def _prepare_runtime_publication(
             session_record_rules._validate_status_set(expected_statuses, "expected_statuses")
         )
     )
-    expected_run_epoch = _validate_optional_runtime_publication_fence(
+    expected_run_epoch = session_authority_rules._validate_optional_runtime_publication_fence(
         expected_run_epoch,
         "expected_run_epoch",
     )
-    expected_transcript_cursor = _validate_optional_runtime_publication_fence(
-        expected_transcript_cursor,
-        "expected_transcript_cursor",
+    expected_transcript_cursor = (
+        session_authority_rules._validate_optional_runtime_publication_fence(
+            expected_transcript_cursor,
+            "expected_transcript_cursor",
+        )
     )
     transcript_payloads = tuple(
         message.model_dump(mode="json") for message in copied_request.transcript_messages
@@ -25567,7 +25258,9 @@ def _validate_runtime_publication_replay_receipt(
     if (
         receipt.kind != request.kind
         or receipt.interaction_id != request.interaction_id
-        or not _runtime_publication_json_equal(receipt.intent, request.intent)
+        or not session_authority_rules._runtime_publication_json_equal(
+            receipt.intent, request.intent
+        )
         or receipt.transcript_digest != prepared.transcript_digest
         or receipt.events_digest != prepared.events_digest
         or receipt.appended_event_ids != tuple(event.id for event in request.events)

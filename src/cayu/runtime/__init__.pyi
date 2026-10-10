@@ -806,6 +806,9 @@ from cayu.sessions._checkpoint_mutations import (
     SessionRuntimePublicationConflict as SessionRuntimePublicationConflict,
 )
 from cayu.sessions._checkpoint_mutations import (
+    runtime_publication_checkpoint_mutation as runtime_publication_checkpoint_mutation,
+)
+from cayu.sessions._checkpoint_mutations import (
     runtime_publication_checkpoint_value_digest as runtime_publication_checkpoint_value_digest,
 )
 from cayu.sessions._execution_profile_checkpoint import (
@@ -893,6 +896,12 @@ from cayu.sessions._model_completion_publication import (
 from cayu.sessions._model_completion_publication import (
     ModelCompletionStageSettlementRequest as ModelCompletionStageSettlementRequest,
 )
+from cayu.sessions._operation_records import (
+    RuntimePublicationOperationRecordMutation as RuntimePublicationOperationRecordMutation,
+)
+from cayu.sessions._operation_records import (
+    runtime_publication_operation_record_value_digest as runtime_publication_operation_record_value_digest,
+)
 from cayu.sessions._session_continuation import ContinuationConflict as ContinuationConflict
 from cayu.sessions._session_continuation import ContinuationConsumption as ContinuationConsumption
 from cayu.sessions._session_continuation import ContinuationLatch as ContinuationLatch
@@ -907,13 +916,16 @@ from cayu.sessions._session_continuation import ContinuationService as Continuat
 from cayu.sessions._session_continuation import ContinuationTicket as ContinuationTicket
 from cayu.sessions._session_continuation import ContinuationUnavailable as ContinuationUnavailable
 from cayu.sessions._session_continuation import ContinuationWait as ContinuationWait
+from cayu.sessions.authority import CheckpointRootFieldGuard as CheckpointRootFieldGuard
+from cayu.sessions.authority import CheckpointRootFieldProjection as CheckpointRootFieldProjection
 from cayu.sessions.authority import SessionRunFenced as SessionRunFenced
+from cayu.sessions.authority import (
+    checkpoint_root_field_projection_from_storage as checkpoint_root_field_projection_from_storage,
+)
 from cayu.sessions.base import (
     INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY as INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
 )
 from cayu.sessions.base import ActiveModelCompletionStage as ActiveModelCompletionStage
-from cayu.sessions.base import CheckpointRootFieldGuard as CheckpointRootFieldGuard
-from cayu.sessions.base import CheckpointRootFieldProjection as CheckpointRootFieldProjection
 from cayu.sessions.base import InMemorySessionStore as InMemorySessionStore
 from cayu.sessions.base import (
     ModelCompletionManualRecoveryRequest as ModelCompletionManualRecoveryRequest,
@@ -932,9 +944,6 @@ from cayu.sessions.base import ModelCompletionStageResult as ModelCompletionStag
 from cayu.sessions.base import ModelCompletionStageSettlement as ModelCompletionStageSettlement
 from cayu.sessions.base import ModelTarget as ModelTarget
 from cayu.sessions.base import RuntimePublicationEventReference as RuntimePublicationEventReference
-from cayu.sessions.base import (
-    RuntimePublicationOperationRecordMutation as RuntimePublicationOperationRecordMutation,
-)
 from cayu.sessions.base import RuntimePublicationReceipt as RuntimePublicationReceipt
 from cayu.sessions.base import RuntimePublicationRequest as RuntimePublicationRequest
 from cayu.sessions.base import RuntimePublicationResult as RuntimePublicationResult
@@ -953,16 +962,7 @@ from cayu.sessions.base import (
     StoreTimeSessionOperationTransform as StoreTimeSessionOperationTransform,
 )
 from cayu.sessions.base import (
-    checkpoint_root_field_projection_from_storage as checkpoint_root_field_projection_from_storage,
-)
-from cayu.sessions.base import (
-    runtime_publication_checkpoint_mutation as runtime_publication_checkpoint_mutation,
-)
-from cayu.sessions.base import (
     runtime_publication_event_reference as runtime_publication_event_reference,
-)
-from cayu.sessions.base import (
-    runtime_publication_operation_record_value_digest as runtime_publication_operation_record_value_digest,
 )
 from cayu.sessions.checkpoints import CHECKPOINT_SCHEMA_VERSION_KEY as CHECKPOINT_SCHEMA_VERSION_KEY
 from cayu.sessions.checkpoints import (

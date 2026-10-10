@@ -20,11 +20,11 @@ from cayu.providers.base import (
     ToolDiscoveryProjectionRequest,
 )
 from cayu.runtime import _runtime_records as runtime_records
-from cayu.sessions.base import (
+from cayu.sessions._operation_records import (
     RuntimePublicationOperationRecordMutation,
-    SessionStore,
     runtime_publication_operation_record_value_digest,
 )
+from cayu.sessions.base import SessionStore
 from cayu.sessions.records import Session
 from cayu.tools.catalogue import ToolDescriptor
 from cayu.tools.discovery import (

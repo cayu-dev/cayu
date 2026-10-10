@@ -44,7 +44,10 @@ from cayu.runtime._tool_round_recovery import (
     checkpoint_without_pending_tool_round,
     ready_assistant_publication_message,
 )
-from cayu.sessions._checkpoint_mutations import runtime_publication_checkpoint_value_digest
+from cayu.sessions._checkpoint_mutations import (
+    runtime_publication_checkpoint_mutation,
+    runtime_publication_checkpoint_value_digest,
+)
 from cayu.sessions._pending_tool_round import (
     PENDING_TOOL_ROUND_CHECKPOINT_KEY,
     PendingToolRound,
@@ -55,7 +58,6 @@ from cayu.sessions.base import (
     RuntimePublicationRequest,
     RuntimePublicationResult,
     SessionStore,
-    runtime_publication_checkpoint_mutation,
     runtime_publication_event_reference,
 )
 from cayu.sessions.records import SessionStatus

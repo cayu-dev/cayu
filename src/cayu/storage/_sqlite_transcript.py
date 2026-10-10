@@ -22,9 +22,9 @@ from cayu.sessions._invocation_scope import (
     resolve_interaction_attribution,
 )
 from cayu.sessions._model_failover import MODEL_TARGET_PROJECTION_METADATA_KEY
+from cayu.sessions._operation_records import RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX
 from cayu.sessions.base import (
     MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
-    RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX,
     _check_closure_lineage_owner,
     _checkpoint_after_initial_transcript_publication,
 )

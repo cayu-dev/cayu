@@ -27,15 +27,12 @@ from cayu.runtime._model_completion_contracts import (
 )
 from cayu.runtime._model_step_executor import ModelStepRun
 from cayu.runtime._run_limits import RunLimitGate
+from cayu.sessions._checkpoint_mutations import runtime_publication_checkpoint_mutation
 from cayu.sessions._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     ModelStepPublicationCheckpoint,
 )
-from cayu.sessions.base import (
-    InMemorySessionStore,
-    RuntimePublicationRequest,
-    runtime_publication_checkpoint_mutation,
-)
+from cayu.sessions.base import InMemorySessionStore, RuntimePublicationRequest
 from cayu.sessions.records import Session
 from cayu.sessions.requests import RunRequest
 from cayu.tools.exposure import ToolCapabilityCeiling

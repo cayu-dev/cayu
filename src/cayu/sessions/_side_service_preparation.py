@@ -68,13 +68,11 @@ def plan_preparation(
         _copy_checkpoint_for_transform,
         _invocation_lifecycle_authority_read_scope,
     )
+    from cayu.sessions._operation_records import _validate_session_operation_record_keys
     from cayu.sessions._session_continuation_store import ROOT_KEY
     from cayu.sessions._temporary_continuation_store import publish_service_record
     from cayu.sessions._temporary_service_target import publish_target_record
-    from cayu.sessions.base import (
-        SessionOperationPublication,
-        _validate_session_operation_record_keys,
-    )
+    from cayu.sessions.base import SessionOperationPublication
 
     prepared = prepare_selection(prepared)
     intent = prepared.dispatch.intent

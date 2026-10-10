@@ -29,6 +29,7 @@ from cayu.runtime._model_failover import FailoverObservation
 from cayu.runtime._model_failover_stage import ModelFailoverStageAdmission
 from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
 from cayu.runtime.retry_policy import retry_decision
+from cayu.sessions._checkpoint_mutations import runtime_publication_checkpoint_mutation
 from cayu.sessions._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     ModelCompletionStageDisposition,
@@ -42,7 +43,6 @@ from cayu.sessions.base import (
     SessionModelCompletionStageConflict,
     SessionStore,
     model_completion_stage_settlement_request,
-    runtime_publication_checkpoint_mutation,
 )
 from cayu.sessions.records import SessionStatus, SessionStatusConflict
 from cayu.sessions.requests import RunRequest

@@ -9,7 +9,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from cayu._validation import copy_durable_json_object, copy_durable_json_value
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.sessions._model_failover import MODEL_FAILOVER_CHECKPOINT_KEY
-from cayu.sessions.authority import _canonical_runtime_publication_digest
+from cayu.sessions.authority import (
+    _canonical_runtime_publication_digest,
+    _runtime_publication_json_equal,
+)
 from cayu.sessions.checkpoints import COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY
 
 
@@ -187,3 +190,57 @@ def apply_runtime_publication_checkpoint_mutation(
     """Apply a validated runtime publication mutation to a defensive checkpoint copy."""
 
     return _apply_runtime_publication_checkpoint_mutation(mutation, checkpoint)
+
+
+def runtime_publication_checkpoint_mutation(
+    source_checkpoint: dict[str, Any] | None,
+    checkpoint: dict[str, Any] | None,
+) -> RuntimePublicationMutation:
+    """Build a deterministic top-level CAS patch without fencing unrelated keys."""
+
+    if checkpoint is None:
+        if source_checkpoint is not None:
+            raise ValueError(
+                "Runtime publication checkpoint mutations cannot delete the whole checkpoint."
+            )
+        return RuntimePublicationMutation()
+    source = (
+        {}
+        if source_checkpoint is None
+        else copy_durable_json_object(source_checkpoint, "source_checkpoint")
+    )
+    target = copy_durable_json_object(checkpoint, "checkpoint")
+    operations: list[RuntimePublicationCheckpointOperation] = []
+    for key in sorted(source.keys() | target.keys()):
+        source_present = key in source
+        target_present = key in target
+        if (
+            source_present
+            and target_present
+            and _runtime_publication_json_equal(
+                source[key],
+                target[key],
+            )
+        ):
+            continue
+        expected_value_digest = (
+            runtime_publication_checkpoint_value_digest(source[key]) if source_present else None
+        )
+        if target_present:
+            operations.append(
+                RuntimePublicationCheckpointOperation(
+                    key=key,
+                    expected_value_digest=expected_value_digest,
+                    action="set",
+                    value=target[key],
+                )
+            )
+        else:
+            operations.append(
+                RuntimePublicationCheckpointOperation(
+                    key=key,
+                    expected_value_digest=expected_value_digest,
+                    action="delete",
+                )
+            )
+    return RuntimePublicationMutation(operations=tuple(operations))

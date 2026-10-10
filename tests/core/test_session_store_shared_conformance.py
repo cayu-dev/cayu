@@ -234,6 +234,7 @@ from cayu.sessions._checkpoint_mutations import (
     RuntimePublicationCheckpointOperation,
     RuntimePublicationMutation,
     SessionRuntimePublicationConflict,
+    runtime_publication_checkpoint_mutation,
     runtime_publication_checkpoint_value_digest,
 )
 from cayu.sessions._interaction_transitions import (
@@ -256,6 +257,10 @@ from cayu.sessions._model_completion_publication import (
     ModelCompletionStageDisposition,
     ModelStepPublicationCheckpoint,
 )
+from cayu.sessions._operation_records import (
+    RuntimePublicationOperationRecordMutation,
+    runtime_publication_operation_record_value_digest,
+)
 from cayu.sessions.base import (
     MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES,
     BudgetReservationIdentityConflict,
@@ -263,16 +268,13 @@ from cayu.sessions.base import (
     ModelCompletionStageRequest,
     ModelTarget,
     QueuedDispatchTerminalReceiptQuery,
-    RuntimePublicationOperationRecordMutation,
     RuntimePublicationRequest,
     SessionModelCompletionStageConflict,
     SessionModelCompletionStageIncomplete,
     SessionOperationPublication,
     SessionStore,
     _checkpoint_with_session_run_operation,
-    runtime_publication_checkpoint_mutation,
     runtime_publication_event_reference,
-    runtime_publication_operation_record_value_digest,
 )
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,

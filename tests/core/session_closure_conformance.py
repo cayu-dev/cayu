@@ -10,11 +10,11 @@ from cayu.events import Event, EventType
 from cayu.memory.evidence import RecallReceipt
 from cayu.messages import Message
 from cayu.runtime.session_closure import SessionClosureRecord
+from cayu.sessions._checkpoint_mutations import runtime_publication_checkpoint_mutation
 from cayu.sessions.base import (
     RuntimePublicationRequest,
     SessionOperationPublication,
     _checkpoint_with_session_run_operation,
-    runtime_publication_checkpoint_mutation,
 )
 from cayu.sessions.messaging import (
     EnqueueSessionMessageRequest,

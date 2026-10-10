@@ -27,11 +27,8 @@ from cayu.runtime._model_completion_contracts import (
 from cayu.runtime._structured_output_tool_round import _has_structured_output_tool_call
 from cayu.runtime._tool_round_staging import _redactor_for_tool_calls
 from cayu.sessions import _model_completion_publication as model_completion_publication
-from cayu.sessions.base import (
-    RuntimePublicationRequest,
-    SessionStore,
-    runtime_publication_checkpoint_mutation,
-)
+from cayu.sessions._checkpoint_mutations import runtime_publication_checkpoint_mutation
+from cayu.sessions.base import RuntimePublicationRequest, SessionStore
 from cayu.sessions.records import Session
 from cayu.tools.catalogue import CALL_TOOL_NAME
 from cayu.tools.exposure import validate_resolved_tool_exposure_authority

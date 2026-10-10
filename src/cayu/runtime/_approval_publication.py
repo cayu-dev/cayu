@@ -21,13 +21,15 @@ from cayu._validation import MAX_DURABLE_JSON_INTEGER, copy_durable_json_object
 from cayu.events import Event
 from cayu.messages import Message
 from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.sessions._checkpoint_mutations import runtime_publication_checkpoint_value_digest
+from cayu.sessions._checkpoint_mutations import (
+    runtime_publication_checkpoint_mutation,
+    runtime_publication_checkpoint_value_digest,
+)
 from cayu.sessions._invocation_scope import attribute_events_to_current_interaction
 from cayu.sessions.base import (
     RuntimePublicationRequest,
     RuntimePublicationResult,
     SessionStore,
-    runtime_publication_checkpoint_mutation,
     runtime_publication_event_reference,
 )
 from cayu.sessions.records import SessionStatus

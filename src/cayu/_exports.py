@@ -1380,8 +1380,8 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "ChatCompletionsProvider": ("cayu.providers.chat_completions", "ChatCompletionsProvider"),
     "CheckpointCompactionContextPolicy": ("cayu.context.base", "CheckpointCompactionContextPolicy"),
     "CheckpointCompatibilityError": ("cayu.sessions.checkpoints", "CheckpointCompatibilityError"),
-    "CheckpointRootFieldGuard": ("cayu.sessions.base", "CheckpointRootFieldGuard"),
-    "CheckpointRootFieldProjection": ("cayu.sessions.base", "CheckpointRootFieldProjection"),
+    "CheckpointRootFieldGuard": ("cayu.sessions.authority", "CheckpointRootFieldGuard"),
+    "CheckpointRootFieldProjection": ("cayu.sessions.authority", "CheckpointRootFieldProjection"),
     "ChildSessionCompleted": ("cayu.evals.assertions", "ChildSessionCompleted"),
     "ChildSessionContextContribution": (
         "cayu.sessions.child_context",
@@ -5977,7 +5977,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "causal_budget_usage_summary": ("cayu.budgets.usage", "causal_budget_usage_summary"),
     "check_manifest": ("cayu.runtime.checks", "check_manifest"),
     "checkpoint_root_field_projection_from_storage": (
-        "cayu.sessions.base",
+        "cayu.sessions.authority",
         "checkpoint_root_field_projection_from_storage",
     ),
     "classify_retryable_error": ("cayu.runtime.retry_policy", "classify_retryable_error"),

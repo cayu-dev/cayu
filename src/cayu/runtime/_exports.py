@@ -191,8 +191,8 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "CayuConfigSource": ("cayu.configuration", "CayuConfigSource"),
     "CheckpointCompactionContextPolicy": ("cayu.context.base", "CheckpointCompactionContextPolicy"),
     "CheckpointCompatibilityError": ("cayu.sessions.checkpoints", "CheckpointCompatibilityError"),
-    "CheckpointRootFieldGuard": ("cayu.sessions.base", "CheckpointRootFieldGuard"),
-    "CheckpointRootFieldProjection": ("cayu.sessions.base", "CheckpointRootFieldProjection"),
+    "CheckpointRootFieldGuard": ("cayu.sessions.authority", "CheckpointRootFieldGuard"),
+    "CheckpointRootFieldProjection": ("cayu.sessions.authority", "CheckpointRootFieldProjection"),
     "CheckpointTransform": ("cayu.sessions.records", "CheckpointTransform"),
     "ChildSessionContextContribution": (
         "cayu.sessions.child_context",
@@ -1237,7 +1237,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "RuntimePublicationMutation",
     ),
     "RuntimePublicationOperationRecordMutation": (
-        "cayu.sessions.base",
+        "cayu.sessions._operation_records",
         "RuntimePublicationOperationRecordMutation",
     ),
     "RuntimePublicationReceipt": ("cayu.sessions.base", "RuntimePublicationReceipt"),
@@ -1873,7 +1873,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "causal_budget_usage_summary": ("cayu.budgets.usage", "causal_budget_usage_summary"),
     "check_manifest": ("cayu.runtime.checks", "check_manifest"),
     "checkpoint_root_field_projection_from_storage": (
-        "cayu.sessions.base",
+        "cayu.sessions.authority",
         "checkpoint_root_field_projection_from_storage",
     ),
     "classify_retryable_error": ("cayu.runtime.retry_policy", "classify_retryable_error"),
@@ -2006,7 +2006,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "run_to_completion": ("cayu.sessions.outcomes", "run_to_completion"),
     "runtime_evidence": ("cayu.runtime.evidence", "runtime_evidence"),
     "runtime_publication_checkpoint_mutation": (
-        "cayu.sessions.base",
+        "cayu.sessions._checkpoint_mutations",
         "runtime_publication_checkpoint_mutation",
     ),
     "runtime_publication_checkpoint_value_digest": (
@@ -2018,7 +2018,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "runtime_publication_event_reference",
     ),
     "runtime_publication_operation_record_value_digest": (
-        "cayu.sessions.base",
+        "cayu.sessions._operation_records",
         "runtime_publication_operation_record_value_digest",
     ),
     "session_fork_profile_relationship": (
