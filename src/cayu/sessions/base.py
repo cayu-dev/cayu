@@ -418,6 +418,9 @@ from cayu.sessions.requests import copy_interrupt_session_request as copy_interr
 from cayu.sessions.requests import copy_resume_request as copy_resume_request
 from cayu.sessions.requests import copy_run_request as copy_run_request
 from cayu.sessions.requests import (
+    deferred_interaction_input_for_run_request as deferred_interaction_input_for_run_request,
+)
+from cayu.sessions.requests import (
     run_request_authority_is_runtime_generated as run_request_authority_is_runtime_generated,
 )
 from cayu.sessions.requests import (
@@ -425,6 +428,9 @@ from cayu.sessions.requests import (
 )
 from cayu.sessions.requests import (
     run_request_with_runtime_generated_authority as run_request_with_runtime_generated_authority,
+)
+from cayu.sessions.requests import (
+    run_request_with_runtime_initial_transcript_authority as run_request_with_runtime_initial_transcript_authority,
 )
 from cayu.sessions.requests import (
     run_request_with_runtime_invocation as run_request_with_runtime_invocation,
@@ -1771,8 +1777,6 @@ def _assert_session_run_epoch_value(session_id: str, current_run_epoch: int) -> 
 
 SESSION_RUNTIME_METADATA_KEYS = frozenset({"subagent"})
 SESSION_RUNTIME_METADATA_PREFIX = "cayu:"
-
-_RUNTIME_RESUME_TRANSPORT_METADATA_KEYS = frozenset({"traceparent", "tracestate"})
 
 
 def is_runtime_owned_session_metadata_key(key: str) -> bool:
@@ -21542,84 +21546,6 @@ class InMemorySessionStore(
             return _project_interruption_cascade_marker(marker)
 
 
-def run_request_with_runtime_initial_transcript_authority(
-    request: RunRequest,
-    *,
-    interaction_id: str,
-    initial_transcript_messages: list[Message],
-) -> RunRequest:
-    """Bind the exact runtime-rendered initial transcript to session creation."""
-
-    if type(request) is not RunRequest:
-        raise TypeError("Runtime initial transcript authority requires a RunRequest.")
-    session_id = request.session_id
-    if type(session_id) is not str:
-        raise ValueError("Runtime initial transcript authority requires a session_id.")
-    interaction_id = require_clean_nonblank(interaction_id, "interaction_id")
-    initial = copy_transcript_messages(initial_transcript_messages)
-    source = copy_transcript_messages(request.messages)
-    DeferredInteractionInput(
-        interaction_id=interaction_id,
-        source_messages=source,
-        initial_transcript_messages=initial,
-    )
-    current = request._runtime_initial_transcript_authority
-    if current is not None and (
-        type(current) is not session_request_contracts._RuntimeInitialTranscriptAuthority
-        or current.token
-        is not session_request_contracts._RUNTIME_INITIAL_TRANSCRIPT_AUTHORITY_TOKEN
-        or current.session_id != session_id
-        or current.interaction_id != interaction_id
-        or current.source_messages != tuple(source)
-        or current.initial_transcript_messages != tuple(initial)
-    ):
-        raise ValueError("Runtime initial transcript authority conflicts with the request.")
-    copied = copy_run_request(request)
-    copied._runtime_initial_transcript_authority = (
-        session_request_contracts._RuntimeInitialTranscriptAuthority(
-            session_id=session_id,
-            interaction_id=interaction_id,
-            source_messages=source,
-            initial_transcript_messages=initial,
-        )
-    )
-    return copied
-
-
-def deferred_interaction_input_for_run_request(
-    request: RunRequest,
-    *,
-    session_id: str,
-    interaction_id: str,
-    source_messages: list[Message],
-) -> DeferredInteractionInput:
-    """Resolve an authenticated full initial projection or source-only fallback."""
-
-    if type(request) is not RunRequest:
-        raise TypeError("Deferred interaction input requires a RunRequest.")
-    source = copy_transcript_messages(source_messages)
-    authority = request._runtime_initial_transcript_authority
-    if authority is None:
-        return DeferredInteractionInput(
-            interaction_id=interaction_id,
-            source_messages=source,
-        )
-    if (
-        type(authority) is not session_request_contracts._RuntimeInitialTranscriptAuthority
-        or authority.token
-        is not session_request_contracts._RUNTIME_INITIAL_TRANSCRIPT_AUTHORITY_TOKEN
-        or authority.session_id != session_id
-        or authority.interaction_id != interaction_id
-        or authority.source_messages != tuple(source)
-    ):
-        raise ValueError("Runtime initial transcript authority conflicts with session creation.")
-    return DeferredInteractionInput(
-        interaction_id=interaction_id,
-        source_messages=source,
-        initial_transcript_messages=list(authority.initial_transcript_messages),
-    )
-
-
 def session_invocation_for_run_request(
     request: RunRequest,
     *,
@@ -21717,51 +21643,6 @@ def fork_session_invocation(source_session: Session) -> SessionInvocation:
         source_session.invocation,
         source=SessionExecutionSource.FORK,
     )
-
-
-def _with_runtime_resume_transport_metadata(
-    request: ResumeRequest,
-    metadata: dict[str, Any],
-) -> ResumeRequest:
-    """Detach and attest exact server-owned tracing metadata as transport-only input."""
-
-    copied = copy_resume_request(request)
-    owned_metadata = copy_durable_metadata(metadata, "transport_metadata")
-    if not owned_metadata:
-        copied._runtime_transport_metadata_authority = None
-        return copied
-    if any(key not in _RUNTIME_RESUME_TRANSPORT_METADATA_KEYS for key in owned_metadata):
-        raise ValueError("Runtime resume transport metadata contains an unsupported field.")
-    values: list[tuple[str, str]] = []
-    semantic_metadata = copy_durable_metadata(copied.metadata)
-    for key in sorted(owned_metadata):
-        value = owned_metadata[key]
-        if type(value) is not str or semantic_metadata.get(key) != value:
-            raise ValueError("Runtime resume transport metadata does not match the request.")
-        values.append((key, value))
-        semantic_metadata.pop(key)
-    copied = copied.model_copy(update={"metadata": semantic_metadata})
-    copied._runtime_transport_metadata_authority = (
-        session_request_contracts._RuntimeResumeTransportMetadataAuthority(
-            token=session_request_contracts._RUNTIME_RESUME_TRANSPORT_METADATA_TOKEN,
-            values=tuple(values),
-        )
-    )
-    return copied
-
-
-def _runtime_resume_transport_metadata(request: ResumeRequest) -> dict[str, str]:
-    """Return an owned transport-only trace context from runtime-attested authority."""
-
-    if type(request) is not ResumeRequest:
-        raise TypeError("Runtime resume transport metadata requires a ResumeRequest.")
-    authority = request._runtime_transport_metadata_authority
-    if (
-        type(authority) is not session_request_contracts._RuntimeResumeTransportMetadataAuthority
-        or authority.token is not session_request_contracts._RUNTIME_RESUME_TRANSPORT_METADATA_TOKEN
-    ):
-        return {}
-    return dict(authority.values)
 
 
 def execution_profile_adoption_request_fingerprint(

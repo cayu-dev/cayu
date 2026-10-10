@@ -22,6 +22,8 @@ import cayu
         "run_request_with_task_invocation",
         "run_request_with_runtime_session_instance_authority",
         "session_instance_id_for_run_request",
+        "run_request_with_runtime_initial_transcript_authority",
+        "deferred_interaction_input_for_run_request",
     ),
 )
 def test_request_authority_preserves_public_function_identity(name):
@@ -136,3 +138,82 @@ with patch.object(requests, "uuid4", return_value=instance) as mint:
     mint.assert_not_called()
 """
     )
+
+
+def test_initial_transcript_authority_without_implementations():
+    _without_implementations(
+        """
+from cayu.messages import Message
+
+source = requests.RunRequest(agent_name="agent", session_id="owned",
+    messages=[Message.text("user", "input")])
+initial = [Message.text("system", "system prompt"), *source.messages]
+resolve = requests.deferred_interaction_input_for_run_request
+arguments = dict(session_id="owned", interaction_id="interaction", source_messages=source.messages)
+fallback = resolve(source, **arguments)
+assert fallback.source_messages == source.messages
+assert fallback.initial_transcript_messages is None
+owned = requests.run_request_with_runtime_initial_transcript_authority(
+    source, interaction_id="interaction", initial_transcript_messages=initial)
+assert owned is not source and source._runtime_initial_transcript_authority is None
+resolved = resolve(requests.copy_run_request(owned), **arguments)
+assert resolved.initial_transcript_messages == initial
+assert resolved.initial_transcript_messages[0] is not initial[0]
+initial.clear()
+resolved.initial_transcript_messages.clear()
+assert len(resolve(owned, **arguments).initial_transcript_messages) == 2
+for change in ({"session_id": "foreign"}, {"interaction_id": "foreign"},
+               {"source_messages": [Message.text("user", "different")]}):
+    rejected(lambda: resolve(owned, **(arguments | change)))
+for forged in (object(), type("Lookalike", (), {
+    "token": requests._RUNTIME_INITIAL_TRANSCRIPT_AUTHORITY_TOKEN})()):
+    invalid = requests.copy_run_request(owned)
+    invalid._runtime_initial_transcript_authority = forged
+    rejected(lambda: resolve(invalid, **arguments))
+invalid = requests.copy_run_request(owned)
+invalid._runtime_initial_transcript_authority.token = object()
+rejected(lambda: resolve(invalid, **arguments))
+"""
+    )
+
+
+def test_resume_transport_authority_without_implementations():
+    _without_implementations(
+        """
+from dataclasses import replace
+from cayu.messages import Message
+
+trace = {"traceparent": "00-" + "1" * 32 + "-" + "2" * 16 + "-01", "tracestate": "vendor=value"}
+source = requests.ResumeRequest(session_id="owned", messages=[Message.text("user", "resume")], metadata={"customer": "a", **trace})
+attach = requests._with_runtime_resume_transport_metadata
+inspect = requests._runtime_resume_transport_metadata
+assert inspect(source) == {}
+owned = attach(source, trace)
+assert owned is not source and owned.metadata == {"customer": "a"}
+assert source.metadata == {"customer": "a", **trace}
+assert inspect(owned) == inspect(requests.copy_resume_request(owned)) == trace
+inspect(owned).clear()
+assert inspect(owned) == trace
+assert inspect(attach(owned, {})) == {}
+assert attach(owned, {}).metadata == owned.metadata
+for metadata in ({"customer": "a"}, {"traceparent": "different"}, {"traceparent": 1}):
+    rejected(lambda: attach(source, metadata))
+rejected(lambda: inspect(object()))
+for forged in (object(), replace(owned._runtime_transport_metadata_authority, token=object())):
+    invalid = requests.copy_resume_request(owned)
+    invalid._runtime_transport_metadata_authority = forged
+    assert inspect(invalid) == {}
+"""
+    )
+
+
+def test_request_authority_private_consumers_use_canonical_owner():
+    previous_owner = vars(importlib.import_module("cayu.sessions.base"))
+    canonical = vars(importlib.import_module("cayu.sessions.requests"))
+    for name in (
+        "_authenticated_session_instance_id_for_run_request",
+        "_with_runtime_resume_transport_metadata",
+        "_runtime_resume_transport_metadata",
+        "_RUNTIME_RESUME_TRANSPORT_METADATA_KEYS",
+    ):
+        assert name in canonical and name not in previous_owner

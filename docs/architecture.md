@@ -597,7 +597,9 @@ without loading session stores or execution orchestration. The private authority
 values checked during copying share this owner, preserving exact token identity
 and rejecting forged or mismatched handoffs. Invocation/task attachment and
 session-instance allocation and authentication compose these same capabilities in
-the request owner. Store-scoped provenance derivation retains its authorization
+the request owner. Authenticated initial-transcript handoffs and resume transport
+metadata also compose here, keeping runtime tracing separate from semantic input.
+Store-scoped provenance derivation retains its authorization
 checks in the session-store path. Creation-claim authentication composes
 these values in `sessions/creation_claims.py`; runtime admission and native
 operations retain their existing owners.

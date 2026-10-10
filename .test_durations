@@ -1,4 +1,9 @@
 {
+  "tests/core/test_session_request_authority_layout.py::test_initial_transcript_authority_without_implementations": 0.49610520899295807,
+  "tests/core/test_session_request_authority_layout.py::test_request_authority_preserves_public_function_identity[deferred_interaction_input_for_run_request]": 0.000272583041805774,
+  "tests/core/test_session_request_authority_layout.py::test_request_authority_preserves_public_function_identity[run_request_with_runtime_initial_transcript_authority]": 0.0002578339190222323,
+  "tests/core/test_session_request_authority_layout.py::test_request_authority_private_consumers_use_canonical_owner": 0.00021100102458149195,
+  "tests/core/test_session_request_authority_layout.py::test_resume_transport_authority_without_implementations": 0.5728509579785168,
   "tests/core/test_session_request_authority_layout.py::test_invocation_and_task_authority_without_implementations": 0.6683315410045907,
   "tests/core/test_session_request_authority_layout.py::test_request_authority_preserves_public_function_identity[run_request_with_runtime_invocation]": 0.000693917041644454,
   "tests/core/test_session_request_authority_layout.py::test_request_authority_preserves_public_function_identity[run_request_with_runtime_session_instance_authority]": 0.00025637500220909715,

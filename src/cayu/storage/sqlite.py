@@ -331,7 +331,6 @@ from cayu.sessions.base import (
     _validate_user_input_checkpoint_mutation,
     checkpoint_root_field_projection_from_storage,
     copy_session_user_metadata,
-    deferred_interaction_input_for_run_request,
     replace_session_user_metadata,
     transform_fork_checkpoint,
 )
@@ -412,6 +411,7 @@ from cayu.sessions.requests import (
     RunRequest,
     _copy_optional_tool_capability_ceiling,
     copy_run_request,
+    deferred_interaction_input_for_run_request,
 )
 from cayu.sessions.summaries import (
     EventSummary,

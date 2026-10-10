@@ -147,13 +147,17 @@ from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, Lo
 from cayu.sessions.base import (
     InMemorySessionStore,
     ModelTarget,
-    _runtime_resume_transport_metadata,
-    _with_runtime_resume_transport_metadata,
     execution_profile_adoption_request_fingerprint,
 )
 from cayu.sessions.forks import ForkExecutionProfileSelection
 from cayu.sessions.records import SessionIdentity, SessionStatus
-from cayu.sessions.requests import ForkSessionRequest, ResumeRequest, RunRequest
+from cayu.sessions.requests import (
+    ForkSessionRequest,
+    ResumeRequest,
+    RunRequest,
+    _runtime_resume_transport_metadata,
+    _with_runtime_resume_transport_metadata,
+)
 from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tasks.dispatch import DispatchRequest
