@@ -29,6 +29,7 @@ import cayu
         ("_runtime_publication", "RuntimePublicationReceipt"),
         ("_runtime_publication", "RuntimePublicationResult"),
         ("_runtime_publication", "runtime_publication_event_reference"),
+        ("_runtime_publication_rules", "runtime_publication_request_digest"),
     ),
 )
 def test_publication_rules_preserve_public_identity(module, name):
@@ -204,5 +205,76 @@ async def scenario():
     assert rules._active_runtime_publication_checkpoint_codec() is None
 asyncio.run(scenario())
 rejected(lambda: rules._validate_checkpoint_codec_pair(decode, None))
+"""
+    )
+
+
+def test_publication_receipts_bind_exact_material_and_reject_tampering_without_stores():
+    _without_stores(
+        """
+from datetime import UTC, datetime
+from tests._session_provenance import session_fixture
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.sessions import _checkpoint_publication as projection, _runtime_publication_rules as rules
+from cayu.sessions._checkpoint_mutations import RuntimePublicationMutation, SessionRuntimePublicationConflict
+from cayu.sessions._runtime_publication import RuntimePublicationRequest
+from cayu.sessions.records import SessionStatus
+
+now = datetime(2026, 1, 1, tzinfo=UTC)
+session = session_fixture(id="session", agent_name="agent", provider_name="fake", model="fake",
+    status=SessionStatus.RUNNING, run_epoch=3, updated_at=now, last_activity_at=now)
+event = Event(type=EventType.MODEL_COMPLETED, session_id=session.id, interaction_id="interaction",
+    timestamp=now)
+request = RuntimePublicationRequest(publication_id="publication", kind="model-step",
+    interaction_id="interaction", intent={"step": 1}, mutation=RuntimePublicationMutation(),
+    transcript_messages=[Message.text("assistant", "answer")], events=[event])
+with projection._runtime_publication_checkpoint_codec_scope(
+    decode=lambda s,c:c, encode=lambda s,c:c, apply_mutation=lambda s,c,m:c):
+    codec = projection._active_runtime_publication_checkpoint_codec()
+    prepared = rules._prepare_runtime_publication(session.id, request,
+        expected_statuses={SessionStatus.RUNNING}, expected_run_epoch=3, expected_transcript_cursor=0)
+assert prepared.checkpoint_codec is codec
+assert projection._active_runtime_publication_checkpoint_codec() is None
+assert prepared.request_digest == rules.runtime_publication_request_digest(session.id, request)
+receipt = rules._build_runtime_publication_receipt(prepared, source_session=session,
+    checkpoint=None, transcript_start_cursor=0, published_at=now)
+record = rules._runtime_publication_receipt_record(receipt)
+replayed = rules._reconstruct_runtime_publication_receipt(record, storage_key=prepared.storage_key,
+    session_id=session.id, publication_id=request.publication_id, request_digest=prepared.request_digest)
+assert replayed == receipt
+rules._validate_runtime_publication_replay_receipt(replayed, prepared)
+material = dict(transcript_messages=request.transcript_messages,
+    transcript_interaction_ids=("interaction",), appended_events=request.events,
+    durable_referenced_events=())
+rules._validate_runtime_publication_durable_material(receipt, **material)
+rejected(lambda: rules._validate_runtime_publication_durable_material(
+    receipt, **{**material, "transcript_interaction_ids": (None,)}), SessionRuntimePublicationConflict)
+rejected(lambda: rules._validate_runtime_publication_durable_material(
+    receipt, **{**material, "appended_events": ()}), SessionRuntimePublicationConflict)
+record["intent"]["step"] = 2
+rejected(lambda: rules._reconstruct_runtime_publication_receipt(record,
+    storage_key=prepared.storage_key, session_id=session.id, publication_id=request.publication_id),
+    SessionRuntimePublicationConflict)
+assert receipt.intent == {"step": 1}
+"""
+    )
+
+
+def test_workspace_publication_validation_does_not_import_store_implementation():
+    _without_stores(
+        """
+from cayu.sessions._checkpoint_mutations import RuntimePublicationMutation
+from cayu.sessions._runtime_publication import RuntimePublicationRequest
+from cayu.sessions._workspace_observation_publication import _validate_workspace_observation_publication
+
+request = RuntimePublicationRequest(publication_id="workspace", kind="workspace-observation",
+    intent={}, mutation=RuntimePublicationMutation(), transcript_messages=[], events=[])
+try:
+    _validate_workspace_observation_publication(request, session_id="session")
+except ValueError as exc:
+    assert str(exc) == "Workspace-observation publication intent is malformed."
+else:
+    raise AssertionError("Malformed workspace publication was accepted")
 """
     )

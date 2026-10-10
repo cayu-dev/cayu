@@ -49,7 +49,7 @@ from cayu.sessions._runtime_publication import (
     RuntimePublicationRequest,
     RuntimePublicationResult,
 )
-from cayu.sessions.base import SessionStore, runtime_publication_request_digest
+from cayu.sessions._runtime_publication_rules import runtime_publication_request_digest
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -60,6 +60,7 @@ from cayu.vaults.redaction import SecretRedactor
 
 if TYPE_CHECKING:
     from cayu.runtime._event_writer import RuntimeEventWriter
+    from cayu.sessions.base import SessionStore
 
 WORKSPACE_OBSERVATION_RECORD_TYPE = "cayu.workspace-observation"
 WORKSPACE_OBSERVATION_SCHEMA_VERSION = 1
