@@ -91,7 +91,7 @@ def test_shutdown_waits_for_a_detached_interruption_claim_renewal(
             coordinator, "_renew_pending_interruption_cascade_claim", blocked_renewal
         )
         monkeypatch.setattr(coordinator, "_interrupt_session", interrupt_child)
-        cascade = app._session_engine._schedule_background_interruption_cascade(
+        cascade = app._session_finalization.schedule_background_interruption_cascade(
             parent_session_id="parent",
             interrupt_payload={
                 "reason": "stop",
@@ -466,7 +466,7 @@ def test_a_cascade_cancelled_by_a_drain_timeout_is_waited_for_on_retry(
             coordinator, "_release_pending_interruption_cascade_claim", recorded_release
         )
         monkeypatch.setattr(coordinator, "_interrupt_session", interrupt_child)
-        app._session_engine._schedule_background_interruption_cascade(
+        app._session_finalization.schedule_background_interruption_cascade(
             parent_session_id="parent",
             interrupt_payload={
                 "reason": "stop",
@@ -620,7 +620,7 @@ def test_a_worker_still_writing_after_a_drain_timeout_is_waited_for_on_retry(
             )
 
         monkeypatch.setattr(coordinator, "_interrupt_session", interrupt_child)
-        app._session_engine._schedule_background_interruption_cascade(
+        app._session_finalization.schedule_background_interruption_cascade(
             parent_session_id="parent",
             interrupt_payload={
                 "reason": "stop",
@@ -857,7 +857,7 @@ def test_cancelling_the_drain_during_its_cleanup_keeps_still_writing_workers(
                 drain_task.cancel()
 
         monkeypatch.setattr(coordinator, "_interrupt_session", interrupt_child)
-        app._session_engine._schedule_background_interruption_cascade(
+        app._session_finalization.schedule_background_interruption_cascade(
             parent_session_id="parent",
             interrupt_payload={
                 "reason": "stop",

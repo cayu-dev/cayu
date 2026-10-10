@@ -20,15 +20,22 @@ from cayu._validation import (
 from cayu.agents import AgentSpec
 from cayu.approvals.tools import (
     PendingToolApproval,
+    PendingToolCallApproval,
     ToolPolicyEvidence,
     copy_pending_tool_approval,
 )
 from cayu.budgets._run_limit_accounting import (
     pause_run_limit_accounting_context,
 )
-from cayu.budgets.base import BudgetLimit, copy_request_budget_limits
+from cayu.budgets.base import (
+    BudgetLimit,
+    copy_request_budget_limits,
+)
 from cayu.budgets.run_limits import RunLimits, copy_run_limits
-from cayu.context.structured_output import StructuredOutputSpec, copy_structured_output_spec
+from cayu.context.structured_output import (
+    StructuredOutputSpec,
+    copy_structured_output_spec,
+)
 from cayu.context.thinking import ThinkingConfig
 from cayu.events import (
     Event,
@@ -46,6 +53,15 @@ from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.runtime._durable_tool_round import (
+    InterruptedToolRoundRequest as InterruptedToolRoundRequest,
+)
+from cayu.runtime._durable_tool_round import (
+    _interrupted_tool_call_event as _interrupted_tool_call_event,
+)
+from cayu.runtime._durable_tool_round import (
+    _interrupted_tool_call_outcome as _interrupted_tool_call_outcome,
+)
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._interruption_coordinator import (
     _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
@@ -94,6 +110,7 @@ from cayu.tools.discovery import (
     tool_discovery_reference_rejection_reason,
 )
 from cayu.tools.exposure import (
+    ResolvedToolExposureAuthority,
     tool_capability_ceiling_from_session_metadata,
 )
 from cayu.tools.gateway import (
@@ -229,6 +246,17 @@ def _registered_tool_argument_error(registered_tool, arguments):
         # selector/process denial codes and their repair instructions.
         return None
     return tool_argument_validation_error(arguments, registered_tool.schema)
+
+
+_AMBIGUOUS_POLICY_RECOVERY_REASON = (
+    "Tool policy planning was interrupted without a durable outcome; "
+    "explicit approval is required before execution."
+)
+
+_AMBIGUOUS_POLICY_RECOVERY_METADATA = {
+    "recovered": True,
+    "policy_evaluation": "ambiguous",
+}
 
 
 class ToolInvocationAdmission:
@@ -1455,6 +1483,254 @@ class ToolInvocationAdmission:
         if cancellation is not None:
             raise cancellation
         return approval, events
+
+    @timed_phase("admission")
+    async def checkpoint_tool_round_policy_plan(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        tool_calls: list[runtime_records.ToolCallRequest],
+        policy_outcomes: list[runtime_records.ToolCallPolicyOutcome],
+        active_taint_by_id: Mapping[str, frozenset[str]],
+        tool_round_identity: ToolRoundIdentity,
+        recovered: bool = False,
+    ) -> pending_rounds.PendingToolRound:
+        """Atomically replace an unplanned round with its durable policy plan."""
+
+        tool_round_identity = copy_tool_round_identity(tool_round_identity)
+        redactor = _redactor_for_tool_calls(
+            self._secret_redactor,
+            registered_agent=registered_agent,
+            tool_calls=tool_calls,
+        )
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        checkpoint = {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
+        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+            runtime_session=session,
+        )
+        if pending_round is None:
+            raise RuntimeError("Session has no pending tool round for its policy plan.")
+        _require_matching_policy_round(
+            pending_round=pending_round,
+            tool_round_identity=tool_round_identity,
+            tool_calls=tool_calls,
+        )
+        if (
+            pending_approval_reader.pending_approval_from_checkpoint(
+                checkpoint,
+                redactor=self._secret_redactor,
+                consume_on_rejection=True,
+            )
+            is not None
+        ):
+            raise RuntimeError("Session already has a pending tool approval.")
+        planned_round = _planned_pending_tool_round(
+            pending_round=pending_round,
+            tool_calls=tool_calls,
+            policy_outcomes=policy_outcomes,
+            active_taint_by_id=active_taint_by_id,
+            redactor=redactor,
+        )
+        # Retain the exact durable source for the compare-and-swap. Additive
+        # model defaults, including assistant publication evidence introduced
+        # after an older v2 stage was written, must not fabricate a mismatch.
+        source_round_payload = copy_json_value(
+            checkpoint[pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY],
+            "pending_tool_round",
+        )
+        eligible_statuses = {session.status} if recovered else {SessionStatus.RUNNING}
+        planned_round_payload = _require_secret_free_durable_object(
+            planned_round.model_dump(mode="json"),
+            redactor=redactor,
+            field_name="pending_tool_round",
+            schema_root=pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY,
+        )
+
+        def publish_policy_plan(
+            current_session: Session,
+            current_checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            if (
+                current_session.status not in eligible_statuses
+                or current_session.run_epoch != session.run_epoch
+            ):
+                raise RuntimeError("Tool policy publication lost its run fence.")
+            current = (
+                {}
+                if current_checkpoint is None
+                else copy_durable_record(current_checkpoint, "checkpoint")
+            )
+            if (
+                current.get(pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
+                != source_round_payload
+            ):
+                raise RuntimeError("Pending tool round changed before policy publication.")
+            if pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY in current:
+                raise RuntimeError("Session already has a pending tool approval.")
+            if pending_approval_reader.APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY in current:
+                raise RuntimeError("Session has an orphaned approval resolution intent.")
+            current[pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = planned_round_payload
+            return copy_durable_json_object(current, "checkpoint")
+
+        await self._session_store.transform_checkpoint(session.id, publish_policy_plan)
+        return planned_round
+
+    async def fail_closed_recovery_policy_plan(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        tool_calls: list[runtime_records.ToolCallRequest],
+        request_metadata: dict[str, Any],
+        durable_tool_calls: list[PendingToolCallApproval] | None = None,
+        tool_exposure: ResolvedToolExposureAuthority | None = None,
+    ) -> runtime_records.ToolRoundPolicyPlan:
+        """Build a manual gate without replaying an outcome-ambiguous policy.
+
+        A process can stop after ``authorize()`` returns but before its result is
+        durably published. Re-running a stateful or time-sensitive policy cannot
+        prove what that earlier invocation decided. Ambiguous registered calls
+        therefore carry explicit non-authoritative evidence and no policy
+        decision. The round still pauses for operator acknowledgement, but that
+        acknowledgement can only close the ambiguous calls as blocked; it can
+        never authorize dispatch. Recognized durable legacy outcomes remain
+        authoritative.
+        """
+
+        if durable_tool_calls is not None:
+            if [
+                (call.tool_call_id, call.tool_name, call.arguments) for call in durable_tool_calls
+            ] != [(call.id, call.name, call.arguments) for call in tool_calls]:
+                raise RuntimeError(
+                    "Durable recovery policy calls do not match the pending tool round."
+                )
+            durable_by_id = {call.tool_call_id: call for call in durable_tool_calls}
+        else:
+            durable_by_id = {}
+        recognized_decisions = {decision.value for decision in ToolPolicyDecision}
+        policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] = []
+        authoritative_approval_tool_call: runtime_records.ToolCallRequest | None = None
+        ambiguous_tool_call: runtime_records.ToolCallRequest | None = None
+        executable_names = registered_agent.executable_tool_names
+        exposed_names = (
+            executable_names
+            if tool_exposure is None
+            else frozenset((*tool_exposure.tool_names, *registered_agent.runtime_tools))
+        )
+        has_authorizable_call = any(
+            call.name in executable_names
+            and (call.name in exposed_names or call.targeted_tool_invocation is not None)
+            and _tool_dispatch_authority_is_current(registered_agent, call.name)
+            for call in tool_calls
+        )
+        taint_labels = (
+            await self.prior_taint_labels(
+                session_id=session.id,
+                policy=registered_agent.tool_policy,
+                request_metadata=request_metadata,
+            )
+            if has_authorizable_call
+            else set()
+        )
+        active_taint_labels: dict[str, frozenset[str]] = {}
+        for tool_call in tool_calls:
+            active_taint_labels[tool_call.id] = frozenset(taint_labels)
+            if tool_call.name not in executable_names or not _tool_dispatch_authority_is_current(
+                registered_agent,
+                tool_call.name,
+            ):
+                policy_outcomes.append(
+                    runtime_records.ToolCallPolicyOutcome(
+                        call=tool_call,
+                        result=None,
+                        evidence=ToolPolicyEvidence.UNREGISTERED,
+                    )
+                )
+                continue
+            if tool_call.name not in exposed_names and tool_call.targeted_tool_invocation is None:
+                policy_outcomes.append(
+                    runtime_records.ToolCallPolicyOutcome(
+                        call=tool_call,
+                        result=None,
+                        evidence=ToolPolicyEvidence.UNEXPOSED,
+                    )
+                )
+                continue
+            durable_call = durable_by_id.get(tool_call.id)
+            policy_result: ToolPolicyResult | None
+            policy_evidence: ToolPolicyEvidence
+            if durable_call is not None and durable_call.policy_decision in recognized_decisions:
+                restored = approval_support.policy_result_from_pending_tool_call(durable_call)
+                if restored is None:
+                    raise AssertionError("Recognized durable policy decision was not restored.")
+                policy_result = restored
+                policy_evidence = ToolPolicyEvidence.AUTHORITATIVE
+                active_taint_labels[tool_call.id] = frozenset(durable_call.active_taint_labels)
+            else:
+                policy_result = None
+                policy_evidence = ToolPolicyEvidence.AMBIGUOUS
+            policy_outcomes.append(
+                runtime_records.ToolCallPolicyOutcome(
+                    call=tool_call,
+                    result=policy_result,
+                    evidence=policy_evidence,
+                )
+            )
+            if (
+                authoritative_approval_tool_call is None
+                and policy_result is not None
+                and policy_result.decision == ToolPolicyDecision.REQUIRE_APPROVAL
+            ):
+                authoritative_approval_tool_call = tool_call
+            if ambiguous_tool_call is None and policy_evidence is ToolPolicyEvidence.AMBIGUOUS:
+                ambiguous_tool_call = tool_call
+            if policy_result is not None:
+                taint_labels.update(
+                    _taint_labels_for_source_tool(
+                        registered_agent.tool_policy,
+                        tool_call.name,
+                        policy_result=policy_result,
+                    )
+                )
+
+        # A durable REQUIRE_APPROVAL decision must own the visible gate even
+        # when an earlier sibling is ambiguous. Otherwise a "continue safely"
+        # acknowledgement for the ambiguous call could also execute the
+        # authoritatively approval-gated sibling without presenting that
+        # approval as the operator's decision.
+        approval_tool_call = authoritative_approval_tool_call or ambiguous_tool_call
+        if approval_tool_call is None:
+            return runtime_records.ToolRoundPolicyPlan(
+                outcomes=policy_outcomes,
+                pending_approval=None,
+                active_taint_labels=active_taint_labels,
+            )
+        approval_outcome = next(
+            outcome for outcome in policy_outcomes if outcome.call.id == approval_tool_call.id
+        )
+        approval_result = approval_outcome.result
+        if approval_outcome.evidence is ToolPolicyEvidence.AMBIGUOUS:
+            approval_result = ToolPolicyResult(
+                decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+                reason=_AMBIGUOUS_POLICY_RECOVERY_REASON,
+                metadata=_AMBIGUOUS_POLICY_RECOVERY_METADATA,
+            )
+        if approval_result is None:
+            raise AssertionError("Recovery approval lost its display policy result.")
+        return runtime_records.ToolRoundPolicyPlan(
+            outcomes=policy_outcomes,
+            active_taint_labels=active_taint_labels,
+            pending_approval=runtime_records.PendingToolApprovalPlan(
+                call=approval_tool_call,
+                calls=[outcome.call for outcome in policy_outcomes],
+                policy_outcomes=policy_outcomes,
+                policy_result=approval_result,
+            ),
+        )
 
 
 def _registered_mcp_tool_authority_is_unavailable(

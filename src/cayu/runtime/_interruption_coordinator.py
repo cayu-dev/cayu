@@ -4,31 +4,63 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from math import isfinite
-from typing import Any, Protocol
+from typing import Any
+from uuid import uuid4
 
 from cayu._task_wait import (
     await_shielded_task_outcome,
     restore_task_cancellation_requests,
 )
-from cayu._validation import copy_durable_metadata, copy_json_value
-from cayu.approvals.tools import ResolutionActor, resolution_actor_payload
-from cayu.events import Event, EventType, event_with_runtime_payload_authority
-from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu._validation import (
+    copy_durable_metadata,
+    copy_durable_record,
+    copy_json_value,
+)
+from cayu.approvals.tools import (
+    ResolutionActor,
+    resolution_actor_payload,
+)
+from cayu.events import (
+    Event,
+    EventType,
+    event_with_runtime_payload_authority,
+)
+from cayu.providers._credential_boundary import (
+    copy_provider_cancellation_failures,
+)
+from cayu.runtime._durable_tool_round import _environment_name as _environment_name
+from cayu.runtime._durable_tool_round import (
+    _limit_reached_tool_call_event as _limit_reached_tool_call_event,
+)
+from cayu.runtime._durable_tool_round import (
+    _limit_reached_tool_round_results as _limit_reached_tool_round_results,
+)
+from cayu.runtime._durable_tool_round import _limit_value_for_payload as _limit_value_for_payload
+from cayu.runtime._event_writer import (
+    RuntimeEventWriter,
+)
+from cayu.runtime._run_limits import (
+    SessionUsageTracker,
+)
+from cayu.runtime._session_control import (
+    SessionControl,
+)
 from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
+    _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
     interruption_request_id_from_payload,
 )
 from cayu.sessions.base import SessionStore, _deactivate_session_run_fence
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.requests import InterruptSessionRequest
-from cayu.vaults import SecretRedactor
+from cayu.vaults.redaction import SecretRedactor
 
 logger = logging.getLogger(__name__)
 
@@ -200,35 +232,6 @@ class _DeferredBackgroundInterruption:
     retry_request: dict[str, Any] | None = None
 
 
-class _LoadPendingSessionInterruptPayload(Protocol):
-    def __call__(
-        self,
-        session_id: str,
-        *,
-        default: dict[str, Any],
-    ) -> Awaitable[dict[str, Any]]: ...
-
-
-class _LatestSessionInterruptedEvent(Protocol):
-    def __call__(
-        self,
-        session_id: str,
-        *,
-        interruption_request_id: str | None = None,
-    ) -> Awaitable[Event | None]: ...
-
-
-class _ClaimPendingInterruptionCascade(Protocol):
-    def __call__(
-        self,
-        session_id: str,
-        interrupt_payload: dict[str, Any],
-        *,
-        create_if_missing: bool = True,
-        retry_request: dict[str, Any] | None = None,
-    ) -> Awaitable[dict[str, Any] | None]: ...
-
-
 class BackgroundInterruptionCoordinator:
     """Owns durable background-subagent interruption cascade orchestration."""
 
@@ -236,35 +239,17 @@ class BackgroundInterruptionCoordinator:
         self,
         *,
         session_store: SessionStore,
+        session_control: SessionControl[SessionUsageTracker],
         event_writer: RuntimeEventWriter,
         clock: Callable[[], datetime],
         interrupt_session: Callable[[InterruptSessionRequest], AsyncIterator[Event]],
-        load_pending_session_interrupt_payload: _LoadPendingSessionInterruptPayload,
-        latest_session_interrupted_event: _LatestSessionInterruptedEvent,
-        load_pending_interruption_cascade: Callable[[str], Awaitable[dict[str, Any] | None]],
-        claim_pending_interruption_cascade: _ClaimPendingInterruptionCascade,
-        mark_pending_interruption_cascade_failed: Callable[[str, str, int, str], Awaitable[bool]],
-        complete_pending_interruption_cascade: Callable[
-            [str, str, int, str], Awaitable[tuple[bool, bool]]
-        ],
-        renew_pending_interruption_cascade_claim: Callable[[str, str, int, str], Awaitable[bool]],
-        release_pending_interruption_cascade_claim: Callable[[str, str, int, str], Awaitable[None]],
         secret_redactor: SecretRedactor | None = None,
     ) -> None:
         self._session_store = session_store
+        self._session_control = session_control
         self._event_writer = event_writer
         self._clock = clock
         self._interrupt_session = interrupt_session
-        self._load_pending_session_interrupt_payload = load_pending_session_interrupt_payload
-        self._latest_session_interrupted_event = latest_session_interrupted_event
-        self._load_pending_interruption_cascade = load_pending_interruption_cascade
-        self._claim_pending_interruption_cascade = claim_pending_interruption_cascade
-        self._mark_pending_interruption_cascade_failed = mark_pending_interruption_cascade_failed
-        self._complete_pending_interruption_cascade = complete_pending_interruption_cascade
-        self._renew_pending_interruption_cascade_claim = renew_pending_interruption_cascade_claim
-        self._release_pending_interruption_cascade_claim = (
-            release_pending_interruption_cascade_claim
-        )
         self._secret_redactor = secret_redactor or SecretRedactor()
         self._tasks: set[asyncio.Task[None]] = set()
         # Store writes that outlived their claim's deadline: waited for, never
@@ -708,13 +693,13 @@ class BackgroundInterruptionCoordinator:
 
         claim_started_monotonic = time.monotonic()
         if retry_request is None:
-            marker = await self._claim_pending_interruption_cascade(
+            marker = await self.claim_pending_interruption_cascade(
                 parent_session_id,
                 interrupt_payload,
                 create_if_missing=create_if_missing,
             )
         else:
-            marker = await self._claim_pending_interruption_cascade(
+            marker = await self.claim_pending_interruption_cascade(
                 parent_session_id,
                 interrupt_payload,
                 create_if_missing=create_if_missing,
@@ -726,7 +711,7 @@ class BackgroundInterruptionCoordinator:
         if coordinator_stop.is_set():
             return
         if marker is None:
-            current_marker = await self._load_pending_interruption_cascade(parent_session_id)
+            current_marker = await self.load_pending_interruption_cascade(parent_session_id)
             if coordinator_stop.is_set():
                 return
             if current_marker is None:
@@ -780,7 +765,7 @@ class BackgroundInterruptionCoordinator:
             if self._shutdown_active:
                 await self._workers_stopped.wait()
             with contextlib.suppress(Exception):
-                await self._release_pending_interruption_cascade_claim(
+                await self.release_pending_interruption_cascade_claim(
                     state.parent_session_id,
                     state.attempt_id,
                     state.generation,
@@ -806,7 +791,7 @@ class BackgroundInterruptionCoordinator:
 
         if state.failure_count:
             try:
-                recorded = await self._mark_pending_interruption_cascade_failed(
+                recorded = await self.mark_pending_interruption_cascade_failed(
                     parent_session_id,
                     state.attempt_id,
                     state.generation,
@@ -849,7 +834,7 @@ class BackgroundInterruptionCoordinator:
             parent = await self._session_store.load(parent_session_id)
             if parent is None:
                 return
-            marker = await self._load_pending_interruption_cascade(parent_session_id)
+            marker = await self.load_pending_interruption_cascade(parent_session_id)
             if (
                 marker is None
                 or marker.get("attempt_id") != state.attempt_id
@@ -877,7 +862,7 @@ class BackgroundInterruptionCoordinator:
                     )
                 )
             try:
-                await self._complete_pending_interruption_cascade(
+                await self.complete_pending_interruption_cascade(
                     parent_session_id,
                     state.attempt_id,
                     state.generation,
@@ -903,7 +888,7 @@ class BackgroundInterruptionCoordinator:
         exc: Exception,
     ) -> None:
         try:
-            recorded = await self._mark_pending_interruption_cascade_failed(
+            recorded = await self.mark_pending_interruption_cascade_failed(
                 state.parent_session_id,
                 state.attempt_id,
                 state.generation,
@@ -959,7 +944,7 @@ class BackgroundInterruptionCoordinator:
             renewal_started_monotonic = time.monotonic()
 
             async def renew_claim() -> bool:
-                return await self._renew_pending_interruption_cascade_claim(
+                return await self.renew_pending_interruption_cascade_claim(
                     state.parent_session_id,
                     state.attempt_id,
                     state.generation,
@@ -1174,14 +1159,14 @@ class BackgroundInterruptionCoordinator:
             await self._record_background_interruption_error(state, session, exc)
 
     async def _wait_for_background_session_interruption(self, session_id: str) -> bool:
-        pending_interrupt_payload = await self._load_pending_session_interrupt_payload(
+        pending_interrupt_payload = await self.load_pending_session_interrupt_payload(
             session_id,
             default={},
         )
         interruption_request_id = interruption_request_id_from_payload(pending_interrupt_payload)
         for attempt in range(_ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS):
             if (
-                await self._latest_session_interrupted_event(
+                await self._session_control.latest_interrupted_event(
                     session_id,
                     interruption_request_id=interruption_request_id,
                 )
@@ -1299,3 +1284,316 @@ class BackgroundInterruptionCoordinator:
         state.failure_count += 1
         if len(state.failure_details) < _BACKGROUND_INTERRUPTION_FAILURE_DETAIL_LIMIT:
             state.failure_details.append(detail)
+
+    async def load_pending_session_interrupt_payload(
+        self,
+        session_id: str,
+        *,
+        default: dict[str, Any],
+    ) -> dict[str, Any]:
+        checkpoint = await self._session_store.load_checkpoint(session_id)
+        if checkpoint is None:
+            return copy_json_value(default, "interrupt_payload")
+        copied_checkpoint = copy_durable_record(checkpoint, "checkpoint")
+        value = copied_checkpoint.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
+        if value is None:
+            return copy_json_value(default, "interrupt_payload")
+        if type(value) is not dict:
+            raise ValueError("Pending session interrupt checkpoint must be an object.")
+        payload = copy_json_value(value, "interrupt_payload")
+        if "provider_cancellation_failures" in payload:
+            failures = copy_provider_cancellation_failures(
+                payload["provider_cancellation_failures"]
+            )
+            if not failures:
+                raise ValueError("Provider cancellation diagnostics cannot be empty.")
+            interruption_type = payload.get("interruption_type")
+            if type(interruption_type) is not str or interruption_type not in (
+                _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
+                _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+            ):
+                raise ValueError("Provider cancellation interruption type is invalid.")
+            if interruption_request_id_from_payload(payload) is None:
+                raise ValueError("Provider cancellation interruption request ID is missing.")
+            payload["provider_cancellation_failures"] = [dict(item) for item in failures]
+        return payload
+
+    async def load_pending_interruption_cascade(
+        self,
+        session_id: str,
+    ) -> dict[str, Any] | None:
+        checkpoint = await self._session_store.load_checkpoint(session_id)
+        if checkpoint is None:
+            return None
+        marker = checkpoint.get(_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY)
+        if marker is None:
+            return None
+        if type(marker) is not dict:
+            raise ValueError("Pending interruption cascade checkpoint must be an object.")
+        copied_marker = copy_json_value(marker, "pending_interruption_cascade")
+        attempt_id = copied_marker.get("attempt_id")
+        interrupt_payload = copied_marker.get("interrupt_payload")
+        if type(attempt_id) is not str or not attempt_id.strip():
+            raise ValueError("Pending interruption cascade attempt_id must be a non-blank string.")
+        if type(interrupt_payload) is not dict:
+            raise ValueError("Pending interruption cascade payload must be an object.")
+        failure_recorded = copied_marker.get("failure_recorded", False)
+        if type(failure_recorded) is not bool:
+            raise ValueError("Pending interruption cascade failure_recorded must be a boolean.")
+        generation = copied_marker.get("generation", 0)
+        if type(generation) is not int or generation < 0:
+            raise ValueError("Pending interruption cascade generation must be non-negative.")
+        claim_id = copied_marker.get("claim_id")
+        claim_expires_at = _interruption_cascade_marker_datetime(
+            copied_marker,
+            "claim_expires_at",
+        )
+        if claim_id is not None:
+            if type(claim_id) is not str or not claim_id.strip() or claim_expires_at is None:
+                raise ValueError("Pending interruption cascade claim is invalid.")
+        elif claim_expires_at is not None:
+            raise ValueError("Pending interruption cascade claim is invalid.")
+        retry_request = _copy_interruption_cascade_retry_request(copied_marker.get("retry_request"))
+        if retry_request is not None:
+            copied_marker["retry_request"] = retry_request
+        _interruption_cascade_marker_datetime(copied_marker, "created_at")
+        return copied_marker
+
+    async def claim_pending_interruption_cascade(
+        self,
+        session_id: str,
+        interrupt_payload: dict[str, Any],
+        *,
+        create_if_missing: bool = True,
+        retry_request: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        retry_request = _copy_interruption_cascade_retry_request(retry_request)
+        resolved_marker: dict[str, Any] | None = None
+
+        def transform(
+            _session: Session,
+            checkpoint: dict[str, Any] | None,
+            now: datetime,
+        ) -> dict[str, Any] | None:
+            nonlocal resolved_marker
+            copied_checkpoint = (
+                {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
+            )
+            existing = copied_checkpoint.get(_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY)
+            if existing is None:
+                if not create_if_missing:
+                    return None
+                marker = {
+                    "attempt_id": str(uuid4()),
+                    "interrupt_payload": copy_json_value(interrupt_payload, "interrupt_payload"),
+                    "created_at": now.isoformat(),
+                }
+            elif type(existing) is not dict:
+                raise ValueError("Pending interruption cascade checkpoint must be an object.")
+            else:
+                marker = copy_json_value(existing, "pending_interruption_cascade")
+            attempt_id = marker.get("attempt_id")
+            if type(attempt_id) is not str or not attempt_id.strip():
+                raise ValueError(
+                    "Pending interruption cascade attempt_id must be a non-blank string."
+                )
+            if type(marker.get("interrupt_payload")) is not dict:
+                raise ValueError("Pending interruption cascade payload must be an object.")
+            existing_retry_request = _copy_interruption_cascade_retry_request(
+                marker.get("retry_request")
+            )
+            if retry_request is not None:
+                marker["retry_request"] = copy_json_value(retry_request, "retry_request")
+            elif existing_retry_request is not None:
+                marker["retry_request"] = existing_retry_request
+            failure_recorded = marker.get("failure_recorded", False)
+            if type(failure_recorded) is not bool:
+                raise ValueError("Pending interruption cascade failure_recorded must be a boolean.")
+            generation = marker.get("generation", 0)
+            if type(generation) is not int or generation < 0:
+                raise ValueError("Pending interruption cascade generation must be non-negative.")
+            claim_id = marker.get("claim_id")
+            claim_expires_at = _interruption_cascade_marker_datetime(
+                marker,
+                "claim_expires_at",
+            )
+            if claim_id is not None:
+                if type(claim_id) is not str or not claim_id.strip() or claim_expires_at is None:
+                    raise ValueError("Pending interruption cascade claim is invalid.")
+                if claim_expires_at > now:
+                    return None
+            elif claim_expires_at is not None:
+                raise ValueError("Pending interruption cascade claim is invalid.")
+            marker.setdefault("created_at", now.isoformat())
+            marker["generation"] = generation + 1
+            marker["claim_id"] = str(uuid4())
+            marker["claim_expires_at"] = (
+                now + timedelta(seconds=interruption_cascade_lease_seconds())
+            ).isoformat()
+            copied_checkpoint[_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY] = marker
+            resolved_marker = copy_json_value(marker, "pending_interruption_cascade")
+            return copied_checkpoint
+
+        await self._session_store.transform_checkpoint_with_store_time(session_id, transform)
+        return resolved_marker
+
+    async def mark_pending_interruption_cascade_failed(
+        self,
+        session_id: str,
+        attempt_id: str,
+        generation: int,
+        claim_id: str,
+    ) -> bool:
+        recorded = False
+
+        def transform(
+            _session: Session,
+            checkpoint: dict[str, Any] | None,
+            now: datetime,
+        ) -> dict[str, Any] | None:
+            nonlocal recorded
+            if checkpoint is None:
+                return None
+            copied_checkpoint = copy_durable_record(checkpoint, "checkpoint")
+            marker = copied_checkpoint.get(_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY)
+            if (
+                type(marker) is not dict
+                or marker.get("attempt_id") != attempt_id
+                or marker.get("generation") != generation
+                or marker.get("claim_id") != claim_id
+            ):
+                return None
+            claim_expires_at = _interruption_cascade_marker_datetime(
+                marker,
+                "claim_expires_at",
+            )
+            if claim_expires_at is None or claim_expires_at <= now:
+                return None
+            marker["failure_recorded"] = True
+            marker.pop("claim_id", None)
+            marker.pop("claim_expires_at", None)
+            recorded = True
+            return copied_checkpoint
+
+        await self._session_store.transform_checkpoint_with_store_time(session_id, transform)
+        return recorded
+
+    async def complete_pending_interruption_cascade(
+        self,
+        session_id: str,
+        attempt_id: str,
+        generation: int,
+        claim_id: str,
+    ) -> tuple[bool, bool]:
+        cleared = False
+        failure_recorded = False
+
+        def transform(
+            _session: Session,
+            checkpoint: dict[str, Any] | None,
+            now: datetime,
+        ) -> dict[str, Any] | None:
+            nonlocal cleared, failure_recorded
+            if checkpoint is None:
+                return None
+            copied_checkpoint = copy_durable_record(checkpoint, "checkpoint")
+            marker = copied_checkpoint.get(_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY)
+            if (
+                type(marker) is not dict
+                or marker.get("attempt_id") != attempt_id
+                or marker.get("generation") != generation
+                or marker.get("claim_id") != claim_id
+            ):
+                return None
+            claim_expires_at = _interruption_cascade_marker_datetime(
+                marker,
+                "claim_expires_at",
+            )
+            if claim_expires_at is None or claim_expires_at <= now:
+                return None
+            current_failure_recorded = marker.get("failure_recorded", False)
+            if type(current_failure_recorded) is not bool:
+                raise ValueError("Pending interruption cascade failure_recorded must be a boolean.")
+            failure_recorded = current_failure_recorded
+            copied_checkpoint.pop(_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY)
+            cleared = True
+            return copied_checkpoint
+
+        await self._session_store.transform_checkpoint_with_store_time(session_id, transform)
+        return cleared, failure_recorded
+
+    async def renew_pending_interruption_cascade_claim(
+        self,
+        session_id: str,
+        attempt_id: str,
+        generation: int,
+        claim_id: str,
+    ) -> bool:
+        renewed = False
+
+        def transform(
+            _session: Session,
+            checkpoint: dict[str, Any] | None,
+            now: datetime,
+        ) -> dict[str, Any] | None:
+            nonlocal renewed
+            if checkpoint is None:
+                return None
+            copied_checkpoint = copy_durable_record(checkpoint, "checkpoint")
+            marker = copied_checkpoint.get(_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY)
+            if (
+                type(marker) is not dict
+                or marker.get("attempt_id") != attempt_id
+                or marker.get("generation") != generation
+                or marker.get("claim_id") != claim_id
+            ):
+                return None
+            claim_expires_at = _interruption_cascade_marker_datetime(
+                marker,
+                "claim_expires_at",
+            )
+            if claim_expires_at is None or claim_expires_at <= now:
+                return None
+            marker["claim_expires_at"] = (
+                now + timedelta(seconds=interruption_cascade_lease_seconds())
+            ).isoformat()
+            renewed = True
+            return copied_checkpoint
+
+        await self._session_store.transform_checkpoint_with_store_time(session_id, transform)
+        return renewed
+
+    async def release_pending_interruption_cascade_claim(
+        self,
+        session_id: str,
+        attempt_id: str,
+        generation: int,
+        claim_id: str,
+    ) -> None:
+        def transform(
+            _session: Session,
+            checkpoint: dict[str, Any] | None,
+            now: datetime,
+        ) -> dict[str, Any] | None:
+            if checkpoint is None:
+                return None
+            copied_checkpoint = copy_durable_record(checkpoint, "checkpoint")
+            marker = copied_checkpoint.get(_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY)
+            if (
+                type(marker) is not dict
+                or marker.get("attempt_id") != attempt_id
+                or marker.get("generation") != generation
+                or marker.get("claim_id") != claim_id
+            ):
+                return None
+            claim_expires_at = _interruption_cascade_marker_datetime(
+                marker,
+                "claim_expires_at",
+            )
+            if claim_expires_at is None or claim_expires_at <= now:
+                return None
+            marker.pop("claim_id", None)
+            marker.pop("claim_expires_at", None)
+            return copied_checkpoint
+
+        await self._session_store.transform_checkpoint_with_store_time(session_id, transform)

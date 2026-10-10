@@ -6031,7 +6031,7 @@ def test_work_attempt_recovery_honors_durable_interruption_decision(
                 "pending_session_interrupt": payload,
             },
         )
-        decision = await app._session_engine._ensure_interruption_terminal_decision(
+        decision = await app._session_finalization.ensure_interruption_terminal_decision(
             session=interrupted,
             terminal_payload=payload,
             interruption_request_id=payload["interruption_request_id"],
@@ -6110,7 +6110,9 @@ def test_work_attempt_recovery_retries_after_session_only_interruption(
         replacement.register_provider(_RecordingProvider(), default=True)
         replacement.register_agent(AgentSpec(name="worker", model="verified-work-test-model"))
         engine = replacement._session_engine
-        transition = engine._transition_status_under_terminal_finalization_claim
+        transition = (
+            engine._session_finalization._transition_status_under_terminal_finalization_claim
+        )
         fail_once = True
 
         async def fail_after_status(**kwargs):
@@ -6122,7 +6124,9 @@ def test_work_attempt_recovery_retries_after_session_only_interruption(
             return result
 
         monkeypatch.setattr(
-            engine, "_transition_status_under_terminal_finalization_claim", fail_after_status
+            engine._session_finalization,
+            "_transition_status_under_terminal_finalization_claim",
+            fail_after_status,
         )
         recovery = WorkAttemptRecoveryRequest(
             admission_id=admitted.admission_id,

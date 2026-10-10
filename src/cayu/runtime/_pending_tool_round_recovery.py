@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from datetime import datetime
@@ -10,10 +9,6 @@ from functools import partial
 from hashlib import sha256
 from typing import Any
 
-from cayu._task_wait import (
-    await_shielded_task_outcome,
-    unexpected_child_cancellation_error,
-)
 from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
@@ -43,7 +38,7 @@ from cayu.execution_units import (
     ToolRoundIdentity,
     copy_tool_round_identity,
 )
-from cayu.messages import Message, detach_message
+from cayu.messages import Message
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _runtime_records as runtime_records
@@ -63,8 +58,9 @@ from cayu.runtime._durable_subagents import (
     durable_subagent_submission_seed_from_checkpoint,
 )
 from cayu.runtime._durable_tool_round import (
-    DeferredInputMaterialization,
+    DeferredInteractionInput,
     DurableToolRound,
+    InterruptedToolRoundRequest,
 )
 from cayu.runtime._durable_tool_round import (
     _interrupted_tool_round_results as _interrupted_tool_round_results,
@@ -90,7 +86,6 @@ from cayu.runtime._isolated_tool_process import (
     isolated_tool_dispatch_settlement_storage_key,
     isolated_tool_dispatch_storage_key,
 )
-from cayu.runtime._message_redaction import redact_runtime_message_for_boundary
 from cayu.runtime._run_limits import (
     SessionUsageTracker,
 )
@@ -111,11 +106,9 @@ from cayu.runtime._tool_effect_state import (
 from cayu.runtime._tool_invocation.admission import (
     ToolApprovalRequired,
 )
-from cayu.runtime._tool_round_executor import (
-    InterruptedToolRoundRequest,
-    ToolRoundExecutor,
-)
+from cayu.runtime._tool_invocation.invocation import ToolInvocation
 from cayu.runtime._tool_round_staging import (
+    _redactor_for_tool_calls,
     _tool_terminal_payload_limits,
 )
 from cayu.runtime._workspace_observation_recovery import WorkspaceObservationRecovery
@@ -135,9 +128,6 @@ from cayu.sessions.base import (
     SessionRunFenced,
     SessionRuntimePublicationConflict,
     SessionStore,
-    _activate_session_run_fence,
-    _deactivate_session_run_fence,
-    _initial_transcript_pending_interaction_id,
 )
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import (
@@ -300,7 +290,8 @@ class PendingToolRoundRecovery:
         event_writer: RuntimeEventWriter,
         session_control: SessionControl[SessionUsageTracker],
         environment_lifecycle: EnvironmentLifecycle,
-        tool_round_executor: ToolRoundExecutor,
+        tool_invocation: ToolInvocation,
+        deferred_input: DeferredInteractionInput,
         workspace_observation_recovery: WorkspaceObservationRecovery,
         secret_redactor: SecretRedactor,
         clock: Callable[[], datetime],
@@ -311,8 +302,8 @@ class PendingToolRoundRecovery:
         self._event_writer = event_writer
         self._session_control = session_control
         self._environment_lifecycle = environment_lifecycle
-        self._tool_round_executor = tool_round_executor
-        self._tool_invocation = tool_round_executor.invocation
+        self._tool_invocation = tool_invocation
+        self._deferred_input = deferred_input
         self._workspace_observation_recovery = workspace_observation_recovery
         self._secret_redactor = secret_redactor
         self._clock = clock
@@ -347,7 +338,7 @@ class PendingToolRoundRecovery:
         )
         snapshot = await owner.prepare_interruption(
             request,
-            materialize_deferred_input_if_present=self.materialize_deferred_input_if_present,
+            materialize_deferred_input_if_present=self._deferred_input.materialize_if_present,
         )
         if snapshot is None:
             return
@@ -842,160 +833,13 @@ class PendingToolRoundRecovery:
                 execution_profile=execution_profile,
                 invocation_context=invocation_context,
                 redactor=self._secret_redactor,
-                tool_redactor=self._tool_round_executor._secret_redactor,
-                materialize_expected_deferred_input=self.materialize_expected_deferred_input,
+                tool_redactor=self._secret_redactor,
+                materialize_expected_deferred_input=self._deferred_input.materialize_expected,
                 interrupted=interrupted,
             )
         ) as events:
             async for event in events:
                 yield event
-
-    async def materialize_deferred_input_if_present(self, session_id: str) -> bool:
-        """Materialize one private interaction tail using its durable owner identity."""
-
-        deferred = await self._session_store.load_deferred_interaction_input(session_id)
-        if deferred is None:
-            return False
-        checkpoint = await self._session_store.load_checkpoint(session_id)
-        pending_initial_interaction_id = _initial_transcript_pending_interaction_id(checkpoint)
-        if pending_initial_interaction_id is not None:
-            if pending_initial_interaction_id != deferred.interaction_id:
-                raise RuntimeError(
-                    "Deferred initial transcript conflicts with its durable interaction authority."
-                )
-            initial = deferred.initial_transcript_messages
-            if initial is not None:
-                await self._session_store.replace_initial_transcript_messages(
-                    session_id,
-                    deferred.source_messages,
-                    initial,
-                    interaction_id=deferred.interaction_id,
-                )
-                return True
-            # Generic session recovery can expose the source tail without
-            # claiming that the missing runtime-rendered prefix was restored.
-            # The durable pending marker remains for explicit reconciliation.
-            return await self._session_store.materialize_deferred_interaction_input(
-                session_id,
-                interaction_id=deferred.interaction_id,
-            )
-        return await self._session_store.materialize_deferred_interaction_input(
-            session_id,
-            interaction_id=deferred.interaction_id,
-        )
-
-    async def materialize_deferred_input_for_receipt(
-        self,
-        receipt: RuntimePublicationReceipt,
-    ) -> bool:
-        """Finish only the deferred tail owned by an exact approval receipt."""
-
-        if receipt.kind != "approval-close":
-            raise ValueError("Deferred receipt materialization requires an approval-close receipt.")
-        session = await self._session_store.load(receipt.session_id)
-        if session is None:
-            return False
-        deferred = await self._session_store.load_deferred_interaction_input(receipt.session_id)
-        if (
-            deferred is None
-            or receipt.interaction_id is None
-            or deferred.interaction_id != receipt.interaction_id
-        ):
-            return False
-        transcript_cursor = await self._session_store.load_transcript_cursor(receipt.session_id)
-        if transcript_cursor != receipt.transcript_end_cursor:
-            return False
-        _activate_session_run_fence(session)
-        try:
-            return await self._session_store.materialize_deferred_interaction_input(
-                receipt.session_id,
-                interaction_id=receipt.interaction_id,
-            )
-        except SessionRunFenced:
-            return False
-        finally:
-            _deactivate_session_run_fence(receipt.session_id)
-
-    async def materialize_expected_deferred_input(
-        self,
-        session_id: str,
-        expected_messages: list[Message],
-        *,
-        cancellation: asyncio.CancelledError | None = None,
-    ) -> DeferredInputMaterialization:
-        """Append a retained recovery tail without losing caller cancellation."""
-
-        expected = [detach_message(message) for message in expected_messages]
-
-        def redacted_transcript_view(messages: list[Message]) -> list[Message]:
-            return [
-                redact_runtime_message_for_boundary(
-                    message,
-                    redactor=self._secret_redactor,
-                    field_name=f"session.transcript[{index}]",
-                )
-                for index, message in enumerate(messages)
-            ]
-
-        async def materialize() -> list[Message]:
-            deferred = await self._session_store.load_deferred_interaction_input(session_id)
-            if (
-                expected
-                and deferred is not None
-                and redacted_transcript_view(deferred.source_messages) != expected
-            ):
-                raise RuntimeError(
-                    "Deferred interaction input conflicts with its pending tool-round tail "
-                    f"(durable_count={len(deferred.source_messages)}, "
-                    f"expected_count={len(expected)})."
-                )
-            if deferred is not None:
-                await self._session_store.materialize_deferred_interaction_input(
-                    session_id,
-                    interaction_id=deferred.interaction_id,
-                )
-            transcript = await self._session_store.load_transcript(session_id)
-            transcript_view = redacted_transcript_view(transcript)
-            if expected and (
-                len(transcript_view) < len(expected)
-                or transcript_view[-len(expected) :] != expected
-            ):
-                raise RuntimeError(
-                    "Deferred interaction input was not materialized after its tool result."
-                )
-            return transcript_view
-
-        outcome = await await_shielded_task_outcome(
-            asyncio.create_task(materialize()),
-            cancellation=cancellation,
-        )
-        cancellation = outcome.cancellation
-        error = outcome.error
-        if isinstance(error, asyncio.CancelledError):
-            error = unexpected_child_cancellation_error(
-                error,
-                operation="Deferred interaction input materialization",
-            )
-        if error is not None:
-            if cancellation is not None:
-                cancellation.add_note(
-                    "Deferred interaction input materialization also failed: "
-                    f"{type(error).__name__}."
-                )
-                raise cancellation from error
-            raise error
-        if outcome.result is None:
-            missing_result = RuntimeError(
-                "Deferred interaction input materialization returned no transcript."
-            )
-            if cancellation is not None:
-                cancellation.add_note(str(missing_result))
-                raise cancellation from missing_result
-            raise missing_result
-        return DeferredInputMaterialization(
-            messages=outcome.result,
-            cancellation=cancellation,
-        )
 
     async def reattach_subagent_children_in_outcomes(
         self,
@@ -1342,7 +1186,7 @@ class PendingToolRoundRecovery:
                 approval_support.tool_call_request_from_pending(call)
                 for call in pending_round.tool_calls
             ]
-            policy_plan = await self._tool_round_executor.fail_closed_recovery_policy_plan(
+            policy_plan = await self._tool_invocation.admission.fail_closed_recovery_policy_plan(
                 session=session,
                 registered_agent=registered_agent,
                 tool_calls=replanned_tool_calls,
@@ -1382,7 +1226,7 @@ class PendingToolRoundRecovery:
                 for approval_event in approval_events:
                     yield approval_event
                 raise ToolApprovalRequired(approval)
-            pending_round = await self._tool_round_executor.checkpoint_tool_round_policy_plan(
+            pending_round = await self._tool_invocation.admission.checkpoint_tool_round_policy_plan(
                 session=session,
                 registered_agent=registered_agent,
                 tool_calls=replanned_tool_calls,
@@ -1705,7 +1549,8 @@ class PendingToolRoundRecovery:
             task_id=pending_round.task_id,
             execution_profile=invocation_context.profile,
             invocation_context=invocation_context,
-            redactor=self._tool_round_executor.redactor_for_tool_calls(
+            redactor=_redactor_for_tool_calls(
+                self._secret_redactor,
                 registered_agent=registered_agent,
                 tool_calls=round_tool_calls,
             ),
@@ -2106,14 +1951,14 @@ class PendingToolRoundRecovery:
                 expected_transcript_cursor=expected_transcript_cursor,
                 execution_profile=execution_profile,
                 invocation_context=invocation_context,
-                redactor=self._tool_round_executor._secret_redactor,
+                redactor=self._secret_redactor,
                 publication_governor=self._tool_invocation.terminals.governor,
                 clock=self._clock,
                 runtime_hooks=self._tool_invocation.hooks.registrations,
                 emit_result=self._tool_invocation.terminals.publish_result,
                 emit_terminal=self._tool_invocation.terminals.emit_staged,
                 emit_native_terminal=self.emit_confirmed_native_tool_terminal,
-                materialize_expected_deferred_input=self.materialize_expected_deferred_input,
+                materialize_expected_deferred_input=self._deferred_input.materialize_expected,
                 interrupted=interrupted,
                 confirmed_native_effect_records=confirmed_native_effect_records,
             )

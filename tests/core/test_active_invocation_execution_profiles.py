@@ -3781,7 +3781,7 @@ async def _assert_provider_retry_keeps_process_local_resolution_after_mutation(
     original_tool_run_factory = app._tool_round_executor.create_run
     original_terminal_cleanup = app._environment_lifecycle.finalize_terminal_event
     original_runtime_hook_runner = app._terminal_event_publication._run_runtime_hooks
-    original_turn_completion = app._session_engine._emit_turn_completed
+    original_turn_completion = app._session_finalization._emit_turn_completed
 
     def capture_model_run(**kwargs):
         model_profiles.append(kwargs["execution_profile"])
@@ -3811,7 +3811,7 @@ async def _assert_provider_retry_keeps_process_local_resolution_after_mutation(
     app._tool_round_executor.create_run = capture_tool_run
     app._environment_lifecycle.finalize_terminal_event = capture_terminal_cleanup
     app._terminal_event_publication._run_runtime_hooks = capture_runtime_hooks
-    app._session_engine._emit_turn_completed = capture_turn_completion
+    app._session_finalization._emit_turn_completed = capture_turn_completion
     replacement_app = CayuApp(enable_logging=False)
     replacement_app.register_provider(replacement_provider, default=True)
     replacement_app.register_agent(

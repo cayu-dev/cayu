@@ -42,18 +42,11 @@ def _bare_coordinator() -> interruption_coordinator.BackgroundInterruptionCoordi
         raise AssertionError("unused")
 
     return interruption_coordinator.BackgroundInterruptionCoordinator(
+        session_control=None,  # ty: ignore[invalid-argument-type]
         session_store=None,  # ty: ignore[invalid-argument-type]
         event_writer=None,  # ty: ignore[invalid-argument-type]
         clock=None,  # ty: ignore[invalid-argument-type]
         interrupt_session=unused,  # ty: ignore[invalid-argument-type]
-        load_pending_session_interrupt_payload=unused,
-        latest_session_interrupted_event=unused,
-        load_pending_interruption_cascade=unused,
-        claim_pending_interruption_cascade=unused,
-        mark_pending_interruption_cascade_failed=unused,
-        complete_pending_interruption_cascade=unused,
-        renew_pending_interruption_cascade_claim=unused,
-        release_pending_interruption_cascade_claim=unused,
     )
 
 

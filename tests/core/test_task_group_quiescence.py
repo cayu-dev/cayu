@@ -3553,7 +3553,7 @@ async def test_unentered_loser_session_cleanup_is_discoverable_after_restart(
             while datetime.now(UTC) <= admission.claim.lease_expires_at:
                 await asyncio.sleep(0.05)
             if marker_failure is not None:
-                clear = app._session_engine._clear_pending_session_interrupt
+                clear = app._session_finalization.clear_pending_session_interrupt
 
                 async def fail_clear(*args, **kwargs):
                     if marker_failure == "acknowledgement":
@@ -3573,7 +3573,7 @@ async def test_unentered_loser_session_cleanup_is_discoverable_after_restart(
                     )
                 else:
                     monkeypatch.setattr(
-                        app._session_engine, "_clear_pending_session_interrupt", fail_clear
+                        app._session_finalization, "clear_pending_session_interrupt", fail_clear
                     )
                 with pytest.raises(RuntimeError, match="Injected restart"):
                     await owner.run(max_tasks=1)

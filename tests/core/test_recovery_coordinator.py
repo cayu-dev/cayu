@@ -1193,7 +1193,7 @@ def test_terminal_finalization_claim_must_remain_live_at_commit_time() -> None:
             _IncompleteRecoveryClaimLost,
             match="expired before durable publication",
         ):
-            await app._session_engine._publish_terminal_event_under_finalization_claim(
+            await app._session_finalization.publish_terminal_event_under_finalization_claim(
                 event=event,
                 session=session,
                 claim_id=claim_id,

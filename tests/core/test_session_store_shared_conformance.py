@@ -8159,7 +8159,7 @@ def test_session_store_conformance_unclaimed_interruption_cancellation_is_finali
             )
             original_transition = store.update_status
             original_finalize = (
-                app._session_engine._recovery_coordinator.finalize_abandoned_session_run
+                app._session_engine._session_finalization.finalize_abandoned_session_run
             )
             transition_calls = 0
             finalization_calls = 0
@@ -8178,7 +8178,7 @@ def test_session_store_conformance_unclaimed_interruption_cancellation_is_finali
                 return await original_finalize(request)
 
             store.update_status = block_first_transition  # type: ignore[method-assign]
-            app._session_engine._recovery_coordinator.finalize_abandoned_session_run = (  # type: ignore[method-assign]
+            app._session_engine._session_finalization.finalize_abandoned_session_run = (  # type: ignore[method-assign]
                 observe_finalization
             )
             task = asyncio.create_task(
@@ -8665,7 +8665,7 @@ def test_session_store_conformance_user_input_supersession_retry_joins_live_fina
 
             owner_started = asyncio.Event()
             original_terminal_preparation = (
-                app._session_engine._prepare_terminal_event_for_atomic_transition
+                app._session_finalization.prepare_terminal_event_for_atomic_transition
             )
 
             async def hold_owner_before_terminal_event(*args, **kwargs):
@@ -8673,7 +8673,7 @@ def test_session_store_conformance_user_input_supersession_retry_joins_live_fina
                 await owner_release.wait()
                 return await original_terminal_preparation(*args, **kwargs)
 
-            app._session_engine._prepare_terminal_event_for_atomic_transition = (  # type: ignore[method-assign]
+            app._session_finalization.prepare_terminal_event_for_atomic_transition = (  # type: ignore[method-assign]
                 hold_owner_before_terminal_event
             )
             request = InterruptSessionRequest(
@@ -8849,7 +8849,9 @@ def test_session_store_conformance_replays_user_input_supersession_after_termina
             process_loss_injected = False
             if loss_boundary == "before-publication":
                 engine = app._session_engine
-                original_terminal_preparation = engine._prepare_terminal_event_for_atomic_transition
+                original_terminal_preparation = (
+                    engine._session_finalization.prepare_terminal_event_for_atomic_transition
+                )
 
                 async def prepare_terminal_then_lose_process(*args, **kwargs):
                     nonlocal process_loss_injected
@@ -8861,12 +8863,14 @@ def test_session_store_conformance_replays_user_input_supersession_after_termina
                         )
                     return transitioned
 
-                engine._prepare_terminal_event_for_atomic_transition = (  # type: ignore[method-assign]
+                engine._session_finalization.prepare_terminal_event_for_atomic_transition = (  # type: ignore[method-assign]
                     prepare_terminal_then_lose_process
                 )
             else:
                 engine = app._session_engine
-                original_publish_terminal = engine._publish_interaction_transition
+                original_publish_terminal = (
+                    engine._session_finalization.publish_interaction_transition
+                )
 
                 async def commit_terminal_event_then_lose_process(*args, **kwargs):
                     nonlocal process_loss_injected
@@ -8878,7 +8882,7 @@ def test_session_store_conformance_replays_user_input_supersession_after_termina
                         )
                     return published
 
-                engine._publish_interaction_transition = (  # type: ignore[method-assign]
+                engine._session_finalization.publish_interaction_transition = (  # type: ignore[method-assign]
                     commit_terminal_event_then_lose_process
                 )
 
@@ -8927,11 +8931,11 @@ def test_session_store_conformance_replays_user_input_supersession_after_termina
                 assert settled_invocation_terminal_decision_from_checkpoint(checkpoint) is not None
 
             if loss_boundary == "before-publication":
-                engine._prepare_terminal_event_for_atomic_transition = (  # type: ignore[method-assign]
+                engine._session_finalization.prepare_terminal_event_for_atomic_transition = (  # type: ignore[method-assign]
                     original_terminal_preparation
                 )
             else:
-                engine._publish_interaction_transition = (  # type: ignore[method-assign]
+                engine._session_finalization.publish_interaction_transition = (  # type: ignore[method-assign]
                     original_publish_terminal
                 )
             store = await _reopen_store(session_store_case, store)
@@ -8993,7 +8997,9 @@ def test_session_store_conformance_replays_user_input_supersession_after_termina
                 retry_release = release_repair_clear
                 peer_retry_started = asyncio.Event()
                 replay_engine = replay_app._session_engine
-                original_repair_clear = replay_engine._clear_pending_session_interrupt
+                original_repair_clear = (
+                    replay_engine._session_finalization.clear_pending_session_interrupt
+                )
 
                 async def hold_repair_before_marker_clear(*args, **kwargs):
                     repair_clear_started.set()
@@ -9004,7 +9010,7 @@ def test_session_store_conformance_replays_user_input_supersession_after_termina
                     peer_retry_started.set()
                     return await _collect_events(peer_app.interrupt_session(request))
 
-                replay_engine._clear_pending_session_interrupt = (  # type: ignore[method-assign]
+                replay_engine._session_finalization.clear_pending_session_interrupt = (  # type: ignore[method-assign]
                     hold_repair_before_marker_clear
                 )
                 with session_engine_module.suppress_interruption_cascade():
@@ -9034,7 +9040,7 @@ def test_session_store_conformance_replays_user_input_supersession_after_termina
                         asyncio.gather(first_retry, second_retry),
                         timeout=10,
                     )
-                replay_engine._clear_pending_session_interrupt = (  # type: ignore[method-assign]
+                replay_engine._session_finalization.clear_pending_session_interrupt = (  # type: ignore[method-assign]
                     original_repair_clear
                 )
                 assert first_replayed[-1].id == second_replayed[-1].id
@@ -9266,7 +9272,7 @@ def test_session_store_conformance_reconstructs_active_user_input_supersession(
                 tools=[UserInputTool()],
             )
             handler_entered = asyncio.Event()
-            original_handle_interrupted = app._session_engine._handle_session_interrupted
+            original_handle_interrupted = app._session_finalization.handle_session_interrupted
 
             async def hold_live_handler(*args, **kwargs):
                 handler_entered.set()
@@ -9274,7 +9280,7 @@ def test_session_store_conformance_reconstructs_active_user_input_supersession(
                 async for event in original_handle_interrupted(*args, **kwargs):
                     yield event
 
-            app._session_engine._handle_session_interrupted = (  # type: ignore[method-assign]
+            app._session_finalization.handle_session_interrupted = (  # type: ignore[method-assign]
                 hold_live_handler
             )
             running = asyncio.create_task(
@@ -9572,7 +9578,7 @@ def test_session_store_conformance_releases_live_supersession_handoff_after_read
                 tools=[UserInputTool()],
             )
 
-            original_handler = app._session_engine._handle_session_interrupted
+            original_handler = app._session_finalization.handle_session_interrupted
             handler_finished = asyncio.Event()
             read_failure_injected = False
             handoff_read_scope: contextvars.ContextVar[bool] = contextvars.ContextVar(
@@ -9621,7 +9627,7 @@ def test_session_store_conformance_releases_live_supersession_handoff_after_read
                     store.load_checkpoint = original_load_checkpoint  # type: ignore[method-assign]
                     handler_finished.set()
 
-            app._session_engine._handle_session_interrupted = (  # type: ignore[method-assign]
+            app._session_finalization.handle_session_interrupted = (  # type: ignore[method-assign]
                 fail_first_handoff_read
             )
             running = asyncio.create_task(
@@ -9665,7 +9671,7 @@ def test_session_store_conformance_releases_live_supersession_handoff_after_read
             store.claim_persisted_event_side_effect = (  # type: ignore[method-assign]
                 original_side_effect_claim
             )
-            app._session_engine._handle_session_interrupted = (  # type: ignore[method-assign]
+            app._session_finalization.handle_session_interrupted = (  # type: ignore[method-assign]
                 original_handler
             )
             with session_engine_module.suppress_interruption_cascade():
@@ -9752,7 +9758,7 @@ def test_session_store_conformance_reclaims_unaccepted_live_supersession_handoff
                 AgentSpec(name="assistant", model="fake-model"),
                 tools=[UserInputTool()],
             )
-            original_handler = app._session_engine._handle_session_interrupted
+            original_handler = app._session_finalization.handle_session_interrupted
             rejected_before_take = asyncio.Event()
 
             async def reject_before_handoff_acceptance(*args, **kwargs):
@@ -9761,7 +9767,7 @@ def test_session_store_conformance_reclaims_unaccepted_live_supersession_handoff
                     yield args, kwargs
                 raise OSError("live handler failed before accepting its handoff")
 
-            app._session_engine._handle_session_interrupted = (  # type: ignore[method-assign]
+            app._session_finalization.handle_session_interrupted = (  # type: ignore[method-assign]
                 reject_before_handoff_acceptance
             )
             running = asyncio.create_task(
@@ -9811,7 +9817,7 @@ def test_session_store_conformance_reclaims_unaccepted_live_supersession_handoff
 
             await store.transform_checkpoint(session_id, expire_abandoned_claim)
 
-            app._session_engine._handle_session_interrupted = (  # type: ignore[method-assign]
+            app._session_finalization.handle_session_interrupted = (  # type: ignore[method-assign]
                 original_handler
             )
             store.publish_runtime_publication = original_publish  # type: ignore[method-assign]
@@ -10079,7 +10085,7 @@ def test_session_store_conformance_status_only_finalization_requires_exact_live_
                 SessionRunFenced,
                 match="lost its exact terminal recovery claim",
             ):
-                await app._session_engine._publish_interaction_transition(
+                await app._session_finalization.publish_interaction_transition(
                     session=stale_session,
                     agent_name="assistant",
                     environment_name=None,
@@ -10094,7 +10100,7 @@ def test_session_store_conformance_status_only_finalization_requires_exact_live_
                 finalized,
                 event,
                 status_changed,
-            ) = await app._session_engine._publish_interaction_transition(
+            ) = await app._session_finalization.publish_interaction_transition(
                 session=stale_session,
                 agent_name="assistant",
                 environment_name=None,
@@ -10131,7 +10137,7 @@ def test_session_store_conformance_status_only_finalization_requires_exact_live_
                 SessionRunFenced,
                 match="lost its exact terminal recovery claim",
             ):
-                await past_clock_app._session_engine._publish_interaction_transition(
+                await past_clock_app._session_finalization.publish_interaction_transition(
                     session=expired_interrupting,
                     agent_name="assistant",
                     environment_name=None,
@@ -10786,7 +10792,7 @@ def test_session_store_conformance_stops_live_finalizer_after_terminal_claim_los
                 tools=[UserInputTool()],
             )
             handler_entered = asyncio.Event()
-            original_handler = app._session_engine._handle_session_interrupted
+            original_handler = app._session_finalization.handle_session_interrupted
 
             async def hold_live_handler(*args, **kwargs):
                 if (
@@ -10802,7 +10808,7 @@ def test_session_store_conformance_stops_live_finalizer_after_terminal_claim_los
                 async for event in original_handler(*args, **kwargs):
                     yield event
 
-            app._session_engine._handle_session_interrupted = (  # type: ignore[method-assign]
+            app._session_finalization.handle_session_interrupted = (  # type: ignore[method-assign]
                 hold_live_handler
             )
             running = asyncio.create_task(
@@ -12028,7 +12034,7 @@ def test_session_store_conformance_lost_policy_authority_never_becomes_executabl
                         "process stopped after denial and before publication"
                     )
 
-                first_app._tool_round_executor.checkpoint_tool_round_policy_plan = (
+                first_app._tool_invocation.admission.checkpoint_tool_round_policy_plan = (
                     lose_policy_plan_publication
                 )
                 with pytest.raises(_SimulatedProcessLoss, match="after denial"):
@@ -30013,7 +30019,7 @@ def test_session_store_conformance_interrupt_does_not_cancel_consumer(
         signal_sent = asyncio.Event()
         original_check = control.raise_if_interrupted
         original_cancel = control.cancel_active_runs
-        original_handle = app._session_engine._handle_session_interrupted
+        original_handle = app._session_finalization.handle_session_interrupted
         observed = []
         consumer = None
 
@@ -30042,7 +30048,7 @@ def test_session_store_conformance_interrupt_does_not_cancel_consumer(
 
         monkeypatch.setattr(control, "raise_if_interrupted", hold_status_check)
         monkeypatch.setattr(control, "cancel_active_runs", signal)
-        monkeypatch.setattr(app._session_engine, "_handle_session_interrupted", publish)
+        monkeypatch.setattr(app._session_finalization, "handle_session_interrupted", publish)
 
         async def collect():
             async for event in app.run(
@@ -30152,7 +30158,7 @@ def test_session_store_conformance_interrupt_wins_model_preparation(
         runtime_store = app._model_step_executor._session_store
         original_load = runtime_store.load
         original_checkpoint = runtime_store.load_checkpoint
-        original_handle = app._session_engine._handle_session_interrupted
+        original_handle = app._session_finalization.handle_session_interrupted
         refused = False
         cancellation_injected = False
         probe_task = None
@@ -30228,7 +30234,7 @@ def test_session_store_conformance_interrupt_wins_model_preparation(
         monkeypatch.setattr(runtime_store, "load", load)
         monkeypatch.setattr(runtime_store, "load_checkpoint", load_checkpoint)
         monkeypatch.setattr(app._session_control, "cancel_active_runs", signal)
-        monkeypatch.setattr(app._session_engine, "_handle_session_interrupted", publish)
+        monkeypatch.setattr(app._session_finalization, "handle_session_interrupted", publish)
         consumer = asyncio.create_task(
             _collect_events(
                 app.run(

@@ -636,7 +636,7 @@ def test_limited_round_replays_exact_publication_and_repeated_close(
                 monkeypatch=monkeypatch,
                 session_id=f"limited-lost-ack-{completed_first}",
             )
-            close = app._session_engine._close_limited_tool_round
+            close = app._session_finalization._close_limited_tool_round
             close_arguments = {}
 
             async def capture_close(**kwargs):
@@ -645,7 +645,9 @@ def test_limited_round_replays_exact_publication_and_repeated_close(
                     async for event in stream:
                         yield event
 
-            monkeypatch.setattr(app._session_engine, "_close_limited_tool_round", capture_close)
+            monkeypatch.setattr(
+                app._session_finalization, "_close_limited_tool_round", capture_close
+            )
             events = [event async for event in app.run(request)]
             assert events[-1].type is EventType.SESSION_INTERRUPTED
             assert (await store.load(request.session_id)).status is SessionStatus.INTERRUPTED

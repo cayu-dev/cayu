@@ -34,6 +34,7 @@ from cayu.observability.events import EventSink
 from cayu.observability.hooks import RuntimeHook, RuntimeHookContext
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import _session_engine as session_engine_module
+from cayu.runtime import _session_finalization as session_finalization_module
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.sessions.base import (
     InMemorySessionStore,
@@ -2110,7 +2111,7 @@ def test_runtime_bounds_ambiguous_interaction_transition_replay(
         assert len(provider.requests) == 1
 
     monkeypatch.setattr(
-        session_engine_module,
+        session_finalization_module,
         "_INTERACTION_TRANSITION_REPLAY_WINDOW_SECONDS",
         replay_window_seconds,
     )
@@ -2217,15 +2218,17 @@ def test_setup_failure_transition_cancellation_is_reconciled_at_sibling_boundary
         )
         session_id = f"sess_cancel_setup_failure_{commit_before_release}"
         transition_profiles: list[object | None] = []
-        original_publish_transition = app._session_engine._publish_sibling_interaction_transition
+        original_publish_transition = (
+            app._session_finalization.publish_sibling_interaction_transition
+        )
 
         async def capture_transition_profile(**kwargs):
             transition_profiles.append(kwargs.get("execution_profile"))
             return await original_publish_transition(**kwargs)
 
         monkeypatch.setattr(
-            app._session_engine,
-            "_publish_sibling_interaction_transition",
+            app._session_finalization,
+            "publish_sibling_interaction_transition",
             capture_transition_profile,
         )
 
@@ -2264,11 +2267,11 @@ def test_setup_failure_transition_cancellation_is_reconciled_at_sibling_boundary
         assert consumer.cancelled() is True
         assert consumer.cancelling() == 0
         assert (
-            session_engine_module._INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE
+            session_finalization_module._INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE
             not in raised.value.__dict__
         )
         assert (
-            session_engine_module._INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE
+            session_finalization_module._INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE
             not in raised.value.__dict__
         )
         session = await store.load(session_id)
@@ -2390,11 +2393,11 @@ def test_interrupt_transition_cancellation_consumes_exact_settlement_handoff(
             assert consumer.cancelled() is True
             assert consumer.cancelling() == 0
             assert (
-                session_engine_module._INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE
+                session_finalization_module._INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE
                 not in raised.value.__dict__
             )
             assert (
-                session_engine_module._INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE
+                session_finalization_module._INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE
                 not in raised.value.__dict__
             )
             assert (
@@ -2495,11 +2498,11 @@ def test_recovery_limit_cancellation_reconciles_precommit_transition_failures() 
         assert consumer.cancelled() is True
         assert consumer.cancelling() == 0
         assert (
-            session_engine_module._INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE
+            session_finalization_module._INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE
             not in raised.value.__dict__
         )
         assert (
-            session_engine_module._INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE
+            session_finalization_module._INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE
             not in raised.value.__dict__
         )
         cause = exception_cause(raised.value)
@@ -2606,11 +2609,11 @@ def test_recovery_limit_cancellation_consumes_committed_transition_handoff(
         assert consumer.cancelled() is True
         assert consumer.cancelling() == 0
         assert (
-            session_engine_module._INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE
+            session_finalization_module._INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE
             not in raised.value.__dict__
         )
         assert (
-            session_engine_module._INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE
+            session_finalization_module._INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE
             not in raised.value.__dict__
         )
         persisted = await store.load(session_id)
@@ -2918,11 +2921,11 @@ def test_runtime_cancellation_clears_transition_handoff_after_run_fence_loss() -
             assert consumer.cancelled() is True
             assert consumer.cancelling() == 0
             assert (
-                session_engine_module._INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE
+                session_finalization_module._INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE
                 not in raised.value.__dict__
             )
             assert (
-                session_engine_module._INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE
+                session_finalization_module._INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE
                 not in raised.value.__dict__
             )
             assert len(store.attempted_events) == 1
@@ -3362,7 +3365,7 @@ def test_sqlite_cancellation_fences_diagnostic_after_transition_settles(
             assert consumer.cancelled() is True
             assert consumer.cancelling() == 0
             assert (
-                session_engine_module._INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE
+                session_finalization_module._INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE
                 not in raised.value.__dict__
             )
             cause = exception_cause(raised.value)
@@ -3539,7 +3542,7 @@ def test_runtime_cancellation_rejects_conflicting_complete_transition_receipt() 
         assert consumer.cancelled() is True
         assert consumer.cancelling() == 0
         assert (
-            session_engine_module._INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE
+            session_finalization_module._INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE
             not in raised.value.__dict__
         )
         cause = exception_cause(raised.value)
@@ -3605,7 +3608,7 @@ def test_runtime_cancellation_rejects_incoherent_transition_receipt_result() -> 
         assert consumer.cancelled() is True
         assert consumer.cancelling() == 0
         assert (
-            session_engine_module._INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE
+            session_finalization_module._INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE
             not in raised.value.__dict__
         )
         cause = exception_cause(raised.value)
@@ -3688,7 +3691,7 @@ def test_runtime_preserves_all_exhausted_transition_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured_groups: list[ExceptionGroup] = []
-    build_terminal_failure = session_engine_module._interaction_transition_replay_failure
+    build_terminal_failure = session_finalization_module._interaction_transition_replay_failure
 
     def capture_terminal_failure(failures: list[Exception]) -> Exception:
         failure = build_terminal_failure(failures)
@@ -3697,7 +3700,7 @@ def test_runtime_preserves_all_exhausted_transition_failures(
         return failure
 
     monkeypatch.setattr(
-        session_engine_module,
+        session_finalization_module,
         "_interaction_transition_replay_failure",
         capture_terminal_failure,
     )
@@ -3775,7 +3778,7 @@ def test_runtime_records_each_replay_attempt_when_store_reuses_exception() -> No
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
         session_id = "sess_reused_transition_replay_failure"
 
-        representative = session_engine_module._interaction_transition_replay_failure(
+        representative = session_finalization_module._interaction_transition_replay_failure(
             [store.failure, store.failure, store.failure]
         )
         assert isinstance(representative, ExceptionGroup)

@@ -649,17 +649,17 @@ def test_finalize_abandoned_session_by_id_finalizes_and_is_idempotent() -> None:
         )
 
         try:
-            await h.app._recovery_coordinator.finalize_abandoned_session_by_id("sess_strand")
+            await h.app._session_finalization.finalize_abandoned_session_by_id("sess_strand")
             first = await h.store.load("sess_strand")
             assert first is not None and first.status == SessionStatus.INTERRUPTED
 
             # Idempotent: a second call (e.g. also reached by _run_session's finalizer) no-ops.
-            await h.app._recovery_coordinator.finalize_abandoned_session_by_id("sess_strand")
+            await h.app._session_finalization.finalize_abandoned_session_by_id("sess_strand")
             second = await h.store.load("sess_strand")
             assert second is not None and second.status == SessionStatus.INTERRUPTED
 
             # Unknown session id is a safe no-op.
-            await h.app._recovery_coordinator.finalize_abandoned_session_by_id("does-not-exist")
+            await h.app._session_finalization.finalize_abandoned_session_by_id("does-not-exist")
 
             events = await h.store.load_events("sess_strand")
             interrupted = [e for e in events if e.type == EventType.SESSION_INTERRUPTED]
@@ -692,7 +692,7 @@ def test_abandoned_session_contains_cancellation_group_from_terminal_cleanup() -
             yield  # pragma: no cover
 
         h.app._terminal_event_publication.publish_recovered = fail_terminal
-        await h.app._recovery_coordinator.finalize_abandoned_session_by_id(
+        await h.app._session_finalization.finalize_abandoned_session_by_id(
             "sess_grouped_abandonment"
         )
         session = await h.store.load("sess_grouped_abandonment")
@@ -738,7 +738,7 @@ def test_finalize_abandoned_session_does_not_require_registered_environment(
         )
 
         try:
-            await h.app._recovery_coordinator.finalize_abandoned_session_by_id(
+            await h.app._session_finalization.finalize_abandoned_session_by_id(
                 "sess_missing_environment"
             )
             session = await h.store.load("sess_missing_environment")

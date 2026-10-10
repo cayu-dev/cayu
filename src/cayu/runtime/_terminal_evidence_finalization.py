@@ -44,6 +44,9 @@ from cayu.events import (
 from cayu.execution_profiles import (
     event_with_execution_profile_fingerprint_authority,
 )
+from cayu.runtime._durable_tool_round import (
+    _interrupted_tool_round_results as _interrupted_tool_round_results,
+)
 from cayu.runtime._event_writer import (
     RuntimeEventWriter,
     _reconcile_exact_persisted_event,
@@ -167,6 +170,13 @@ class _TerminalFinalizationClaimAcquisition:
     cancellation: asyncio.CancelledError | None = None
     transfer_failure: BaseException | None = None
     process_control: BaseException | None = None
+
+
+_RECOVERY_RESUMABLE_SESSION_STATUSES = {
+    SessionStatus.COMPLETED,
+    SessionStatus.FAILED,
+    SessionStatus.INTERRUPTED,
+}
 
 
 class TerminalEvidenceFinalization:
@@ -1172,3 +1182,44 @@ class TerminalEvidenceFinalization:
                     authority=claim.require_authority(),
                     authoritative_failure=authoritative_failure,
                 )
+
+    async def reconcile_before_continuation(
+        self,
+        *,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+    ) -> tuple[Session, dict[str, Any] | None]:
+        """Finish a previous run's terminal publication before claiming the next run."""
+        if session.status not in _RECOVERY_RESUMABLE_SESSION_STATUSES:
+            if _session_run_operation_from_checkpoint(checkpoint) is None:
+                return session, checkpoint
+            raise RuntimeError(
+                "A non-terminal session retains incomplete terminal evidence for a prior run."
+            )
+        if not await self.repair_required(
+            session=session,
+            checkpoint=checkpoint,
+        ):
+            return session, checkpoint
+        if self._session_control.has_active_tasks(session.id, exclude_current_control_task=True):
+            raise RuntimeError(
+                f"Session has active work while terminal evidence is incomplete: {session.id}"
+            )
+        await self.repair_owned(
+            session=session,
+            inactive_for_seconds=None,
+            previous_status=session.status,
+        )
+        current = await self._recovery.require_session(session.id)
+        current_checkpoint = await self._session_store.load_checkpoint(session.id)
+        if await self.repair_required(
+            session=current,
+            checkpoint=current_checkpoint,
+        ):
+            current_claim = _incomplete_recovery_claim_from_checkpoint(current_checkpoint)
+            if current_claim is not None:
+                raise RuntimeError("Session has an active incomplete-session recovery operation.")
+            raise RuntimeError(
+                "Session terminal evidence recovery did not finish the previous run boundary."
+            )
+        return current, current_checkpoint

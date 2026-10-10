@@ -1480,9 +1480,9 @@ async def _run_terminal_race(config: dict[str, Any]) -> dict[str, Any]:
             )
             await asyncio.Event().wait()
 
-        app._session_engine._fail_task = lose_before_task_terminalization
+        app._session_finalization.fail_task = lose_before_task_terminalization
     elif config.get("race_mode") == "failure_task_commit_loss":
-        original_fail_task = app._session_engine._fail_task
+        original_fail_task = app._session_finalization.fail_task
 
         async def lose_after_task_terminalization(*args, **kwargs):
             task = await original_fail_task(*args, **kwargs)
@@ -1493,7 +1493,7 @@ async def _run_terminal_race(config: dict[str, Any]) -> dict[str, Any]:
             await asyncio.Event().wait()
             return task
 
-        app._session_engine._fail_task = lose_after_task_terminalization
+        app._session_finalization.fail_task = lose_after_task_terminalization
     try:
         await task_store.create_task(
             TaskCreate(

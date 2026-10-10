@@ -2580,7 +2580,7 @@ def test_remote_interrupt_wins_linked_task_failure_and_preserves_queued_turn(
                 interruption_request_id = interruption_request_id_from_payload(terminal_payload)
                 assert interruption_request_id is not None
                 interruption_decision = (
-                    await interrupter._session_engine._ensure_interruption_terminal_decision(
+                    await interrupter._session_finalization.ensure_interruption_terminal_decision(
                         session=interrupting,
                         terminal_payload=terminal_payload,
                         interruption_request_id=interruption_request_id,
@@ -5771,7 +5771,7 @@ def test_elected_worker_replays_approval_failure_after_terminalization_interrupt
             decision=ToolApprovalDecision.APPROVE,
         )
 
-        original_materialize = app._pending_tool_round_recovery.materialize_expected_deferred_input
+        original_materialize = app._deferred_input.materialize_expected
         original_fan_out = app._event_writer.fan_out_persisted
         original_terminal = app._terminal_event_publication.publish_recovered
 
@@ -5795,8 +5795,8 @@ def test_elected_worker_replays_approval_failure_after_terminalization_interrupt
                     )
 
         monkeypatch.setattr(
-            app._pending_tool_round_recovery,
-            "materialize_expected_deferred_input",
+            app._deferred_input,
+            "materialize_expected",
             fail_after_approval_close,
         )
         if loss_point == "after_task_failure":
@@ -5821,8 +5821,8 @@ def test_elected_worker_replays_approval_failure_after_terminalization_interrupt
         )
 
         monkeypatch.setattr(
-            app._pending_tool_round_recovery,
-            "materialize_expected_deferred_input",
+            app._deferred_input,
+            "materialize_expected",
             original_materialize,
         )
         monkeypatch.setattr(app._event_writer, "fan_out_persisted", original_fan_out)
@@ -5969,7 +5969,7 @@ def test_workerless_approval_failure_replays_after_task_terminalization_loss(
             decision=ToolApprovalDecision.APPROVE,
         )
 
-        original_materialize = app._pending_tool_round_recovery.materialize_expected_deferred_input
+        original_materialize = app._deferred_input.materialize_expected
         original_fan_out = app._event_writer.fan_out_persisted
 
         async def fail_after_approval_close(*args, **kwargs):
@@ -5984,8 +5984,8 @@ def test_workerless_approval_failure_replays_after_task_terminalization_loss(
             return await original_fan_out(failure_events)
 
         monkeypatch.setattr(
-            app._pending_tool_round_recovery,
-            "materialize_expected_deferred_input",
+            app._deferred_input,
+            "materialize_expected",
             fail_after_approval_close,
         )
         monkeypatch.setattr(app._event_writer, "fan_out_persisted", lose_after_task_failure)
@@ -6003,8 +6003,8 @@ def test_workerless_approval_failure_replays_after_task_terminalization_loss(
         assert interrupted_before_replay.status is SessionStatus.RUNNING
 
         monkeypatch.setattr(
-            app._pending_tool_round_recovery,
-            "materialize_expected_deferred_input",
+            app._deferred_input,
+            "materialize_expected",
             original_materialize,
         )
         monkeypatch.setattr(app._event_writer, "fan_out_persisted", original_fan_out)
@@ -6267,9 +6267,9 @@ def test_generic_continuation_failure_replays_after_task_terminalization_loss(
             answer="stable",
         )
 
-        original_publish = app._session_engine._publish_sibling_interaction_transition
+        original_publish = app._session_finalization.publish_sibling_interaction_transition
         original_atomic_terminal = (
-            app._session_engine._emit_atomically_persisted_terminal_event_with_hooks
+            app._session_finalization.emit_atomically_persisted_terminal_event_with_hooks
         )
 
         async def lose_after_task_failure(*args, **kwargs):
@@ -6305,20 +6305,20 @@ def test_generic_continuation_failure_replays_after_task_terminalization_loss(
 
         if loss_point == "before_interaction":
             monkeypatch.setattr(
-                app._session_engine,
-                "_publish_sibling_interaction_transition",
+                app._session_finalization,
+                "publish_sibling_interaction_transition",
                 lose_after_task_failure,
             )
         elif loss_point == "before_session_event":
             monkeypatch.setattr(
-                app._session_engine,
-                "_emit_atomically_persisted_terminal_event_with_hooks",
+                app._session_finalization,
+                "emit_atomically_persisted_terminal_event_with_hooks",
                 lose_before_session_event,
             )
         else:
             monkeypatch.setattr(
-                app._session_engine,
-                "_emit_atomically_persisted_terminal_event_with_hooks",
+                app._session_finalization,
+                "emit_atomically_persisted_terminal_event_with_hooks",
                 lose_after_session_event,
             )
         with pytest.raises(_ContinuationProcessLoss):
@@ -6352,13 +6352,13 @@ def test_generic_continuation_failure_replays_after_task_terminalization_loss(
             unsettled_stage_id = None
 
         monkeypatch.setattr(
-            app._session_engine,
-            "_publish_sibling_interaction_transition",
+            app._session_finalization,
+            "publish_sibling_interaction_transition",
             original_publish,
         )
         monkeypatch.setattr(
-            app._session_engine,
-            "_emit_atomically_persisted_terminal_event_with_hooks",
+            app._session_finalization,
+            "emit_atomically_persisted_terminal_event_with_hooks",
             original_atomic_terminal,
         )
         drifted_hook = _VersionedSessionFailureHook("2")
@@ -6557,7 +6557,7 @@ def test_recovery_finishes_failure_decision_committed_before_task_terminalizatio
         claimed = await task_store.claim_task("lost-worker", lease_seconds=1)
         assert claimed is not None and claimed.lease_expires_at is not None
 
-        original_fail_task = app._session_engine._fail_task
+        original_fail_task = app._session_finalization.fail_task
 
         async def lose_before_task_terminalization(*args, **kwargs):
             del args, kwargs
@@ -6566,8 +6566,8 @@ def test_recovery_finishes_failure_decision_committed_before_task_terminalizatio
             raise _WorkerProcessLoss("worker disappeared after the failure decision committed")
 
         monkeypatch.setattr(
-            app._session_engine,
-            "_fail_task",
+            app._session_finalization,
+            "fail_task",
             lose_before_task_terminalization,
         )
         expected_failure = _WorkerProcessLoss if failure_signal == "process_loss" else RuntimeError
@@ -6583,7 +6583,7 @@ def test_recovery_finishes_failure_decision_committed_before_task_terminalizatio
                 )
             ):
                 pass
-        monkeypatch.setattr(app._session_engine, "_fail_task", original_fail_task)
+        monkeypatch.setattr(app._session_finalization, "fail_task", original_fail_task)
 
         stranded_task = await task_store.load_task(claimed.id)
         stranded_session = await session_store.load("pre-terminal-session-loss")
@@ -6894,7 +6894,7 @@ def test_task_worker_preserves_elected_failure_when_task_terminalization_fails_b
         app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
         await task_store.create_task(TaskCreate(task_id="worker-terminalization-task", type="job"))
 
-        original_fail_task = app._session_engine._fail_task
+        original_fail_task = app._session_finalization.fail_task
         fail_calls = 0
 
         async def fail_before_task_terminalization(*args, **kwargs):
@@ -6905,8 +6905,8 @@ def test_task_worker_preserves_elected_failure_when_task_terminalization_fails_b
             return await original_fail_task(*args, **kwargs)
 
         monkeypatch.setattr(
-            app._session_engine,
-            "_fail_task",
+            app._session_finalization,
+            "fail_task",
             fail_before_task_terminalization,
         )
         original_terminalize = task_store.terminalize_task

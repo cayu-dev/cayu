@@ -149,6 +149,15 @@ class ForegroundGatePolicyOwner:
             raise SessionRunFenced("Attached gate lost its accepted policy authority.")
         return record
 
+    def release_attached(self, parent, continuation):
+        prefix, action_id = continuation.publication_id.split(":", 1)
+        if prefix in {"approval-close", "user-input-close"}:
+            self.release(
+                session=parent,
+                kind="approval" if prefix == "approval-close" else "input",
+                action_id=action_id,
+            )
+
 
 def validate_gate_restoration_request(record, request, *, redactor) -> None:
     """Compare public retry material before allowing live policy restoration."""

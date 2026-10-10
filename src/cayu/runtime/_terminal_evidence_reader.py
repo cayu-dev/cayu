@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from cayu._validation import copy_json_value
+from cayu._validation import (
+    copy_json_value,
+)
 from cayu.approvals.user_input import (
     AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY,
     USER_INPUT_SUPERSESSION_INTENT_KEY,
@@ -20,13 +22,28 @@ from cayu.events import (
 from cayu.providers._credential_boundary import copy_provider_cancellation_failures
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime._approval_support import _pending_approval_and_round_for_atomic_claim
-from cayu.runtime._interruption_coordinator import _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY
-from cayu.runtime._run_limits import SessionUsageTracker
-from cayu.runtime._session_control import SessionControl
+from cayu.runtime._durable_tool_round import (
+    _interrupted_tool_round_results as _interrupted_tool_round_results,
+)
+from cayu.runtime._interruption_coordinator import (
+    _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
+)
+from cayu.runtime._run_limits import (
+    SessionUsageTracker,
+)
+from cayu.runtime._session_control import (
+    SessionControl,
+)
 from cayu.runtime._user_input_recovery_evidence import UserInputRecoveryEvidence
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
+from cayu.sessions._checkpoint_preservation import (
+    _invocation_lifecycle_authority_read_scope,
+)
+from cayu.sessions._execution_profile_checkpoint import (
+    active_invocation_execution_profile_from_checkpoint,
+)
 from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
     _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
@@ -45,7 +62,10 @@ from cayu.sessions.base import (
     SessionStore,
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery
-from cayu.sessions.records import Session, SessionStatus
+from cayu.sessions.records import (
+    Session,
+    SessionStatus,
+)
 from cayu.vaults.redaction import SecretRedactor
 
 _TERMINAL_EVENT_TYPE_BY_STATUS = {
@@ -288,4 +308,58 @@ class TerminalEvidenceReader:
                 or pending_action_interrupt_payload is not None
                 or classification.latest_lifecycle_event_type != EventType.SESSION_FORKED
             ),
+        )
+
+    async def has_completed_queued_predecessor(self, session: Session, event: Event) -> bool:
+        """Authenticate a completed interaction in an interrupted queue-bearing run."""
+        if (
+            session.status is not SessionStatus.INTERRUPTED
+            or event.type is not EventType.INTERACTION_COMPLETED
+        ):
+            return False
+        with _invocation_lifecycle_authority_read_scope():
+            checkpoint = await self._session_store.load_checkpoint(session.id)
+        active = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        if (
+            active is None
+            or active.session_id != session.id
+            or active.interaction_id != event.interaction_id
+        ):
+            return False
+        receipt = await self._session_store.load_historical_interaction_settlement(
+            session.id,
+            expected_session_instance_id=session.instance_id,
+            expected_event=event,
+            expected_profile=active.profile,
+        )
+        if (
+            receipt is None
+            or receipt.status_changed
+            or not receipt.transition.only_if_no_queued_messages
+            or receipt.transition.to_status is not SessionStatus.COMPLETED
+            or receipt.session.status is not SessionStatus.RUNNING
+            or receipt.session.run_epoch != active.run_epoch
+        ):
+            return False
+        from cayu.sessions._invocation_lifecycle import (
+            _require_released_invocation_command_receipt,
+        )
+
+        # Session terminal events are session-scoped, not interaction-scoped.
+        # The native release receipt binds this terminal session to the exact
+        # predecessor interaction/profile/epoch instead.
+        _require_released_invocation_command_receipt(
+            session,
+            checkpoint,
+            session_id=session.id,
+            session_instance_id=session.instance_id,
+            active_profile=active,
+        )
+        inspection = await self.inspect(session=session, checkpoint=checkpoint)
+        return (
+            inspection.event is not None
+            and inspection.event.type is EventType.SESSION_INTERRUPTED
+            and inspection.event.interaction_id is None
+            and inspection.pending_interrupt_payload is None
+            and inspection.run_operation is None
         )

@@ -41,7 +41,7 @@ from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
 from cayu.runtime import _execution_profile_continuation as execution_profile_continuation
 from cayu.runtime import _runtime_records as runtime_records
-from cayu.runtime import _session_engine as session_engine
+from cayu.runtime import _session_finalization as session_finalization_module
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_round_publication as tool_round_publication
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
@@ -2142,7 +2142,7 @@ def test_restart_closes_recovered_approval_before_materializing_deferred_tail() 
             staged.session.id,
             from_statuses={SessionStatus.INTERRUPTED},
             to_status=SessionStatus.INTERRUPTING,
-            checkpoint_transform=session_engine._checkpoint_with_pending_session_interrupt(
+            checkpoint_transform=session_finalization_module._checkpoint_with_pending_session_interrupt(
                 {
                     "interruption_type": "operator_requested",
                     "interruption_request_id": "interrupt-recovered-approval",
@@ -2242,7 +2242,7 @@ def test_terminal_restart_materializes_tail_after_tool_publication_commit() -> N
             staged.session.id,
             from_statuses={SessionStatus.INTERRUPTED},
             to_status=SessionStatus.INTERRUPTING,
-            checkpoint_transform=session_engine._checkpoint_with_pending_session_interrupt(
+            checkpoint_transform=session_finalization_module._checkpoint_with_pending_session_interrupt(
                 {
                     "interruption_type": "operator_requested",
                     "interruption_request_id": "interrupt-before-terminal-materialization",

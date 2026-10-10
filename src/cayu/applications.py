@@ -46,7 +46,6 @@ from cayu.approvals.review import (
 )
 from cayu.approvals.tools import (
     PendingToolApproval,
-    ToolApprovalDecision,
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
     copy_tool_approval_recovery_request,
@@ -86,7 +85,6 @@ from cayu.budgets.pricing import (
     CausalBudgetCostSummary,
     PriceBook,
     SessionCostSummary,
-    SessionCostTotals,
 )
 from cayu.budgets.usage import (
     CausalBudgetUsageSummary,
@@ -369,6 +367,7 @@ from cayu.runtime._durable_subagent_coordinator import (
 from cayu.runtime._durable_subagents import (
     DurableSubagentSubmissionIntent,
 )
+from cayu.runtime._durable_tool_round import DeferredInteractionInput
 from cayu.runtime._environment_lifecycle import EnvironmentLifecycle, render_initial_system_prompt
 from cayu.runtime._event_projection import (
     PUBLIC_EVENT_ID_PREFIX,
@@ -388,15 +387,13 @@ from cayu.runtime._execution_profile_identity_validation import (
 from cayu.runtime._execution_to_wait import _ExecutionToWait
 from cayu.runtime._external_execution_to_wait import _ExternalExecutionToWait
 from cayu.runtime._foreground_child_delivery import ForegroundChildDeliveryOwner
+from cayu.runtime._foreground_gate_continuation import ForegroundGatePolicyOwner
 from cayu.runtime._fork_source_snapshot import (
     fork_source_checkpoint_projection,
     fork_source_checkpoint_sha256,
 )
 from cayu.runtime._interruption_coordinator import (
     BackgroundInterruptionCoordinator,
-)
-from cayu.runtime._invocation_lifecycle import (
-    InvocationContext,
 )
 from cayu.runtime._isolated_tool_process import (
     retained_isolated_tool_cleanups_unresolved,
@@ -407,10 +404,7 @@ from cayu.runtime._local_execution_attempt_owner import retained_local_execution
 from cayu.runtime._model_completion_recovery import ModelCompletionRecovery
 from cayu.runtime._model_policy import ModelPolicy
 from cayu.runtime._model_step_executor import (
-    ModelStepBudgetEvaluationRequest,
-    ModelStepBudgetReservationFailureRequest,
     ModelStepExecutor,
-    ModelStepLimitEvaluationRequest,
 )
 from cayu.runtime._pending_tool_round_recovery import PendingToolRoundRecovery
 from cayu.runtime._producer_execution import _ProducerExecution
@@ -423,10 +417,6 @@ from cayu.runtime._recovery_coordinator import RecoveryCoordinator
 from cayu.runtime._recovery_ownership import RecoveryOwnership
 from cayu.runtime._recovery_plan_coordinator import RecoveryPlanCoordinator
 from cayu.runtime._recovery_requests import (
-    ProviderOperationFailureRequest,
-    RecoveryAbandonedTurnRequest,
-    RecoveryInterruptionRequest,
-    RecoveryLimitStopRequest,
     RecoverySessionRunRequest,
     RecoveryTaskEventRequest,
 )
@@ -440,12 +430,10 @@ from cayu.runtime._session_closure_projection import (
     project_closure_report,
 )
 from cayu.runtime._session_control import (
-    ActiveSessionRun,
     SessionControl,
 )
 from cayu.runtime._session_engine import (
     SessionEngine,
-    _checkpoint_with_pending_session_interrupt,
     _environment_name,
     _interaction_transition_replay_failures,
     _reject_unresumable_session_checkpoint,
@@ -453,6 +441,7 @@ from cayu.runtime._session_engine import (
     _task_event,
 )
 from cayu.runtime._session_execution_presence import process_owner_id
+from cayu.runtime._session_finalization import SessionFinalization
 from cayu.runtime._session_message_coordinator import SessionMessageCoordinator
 from cayu.runtime._session_request_boundary import _validate_resume_request, _validate_run_request
 from cayu.runtime._task_store_operation_boundary import (
@@ -463,10 +452,13 @@ from cayu.runtime._task_store_operation_boundary import (
 from cayu.runtime._terminal_event_publication import TerminalEventPublication
 from cayu.runtime._terminal_evidence_finalization import TerminalEvidenceFinalization
 from cayu.runtime._terminal_evidence_reader import TerminalEvidenceReader
+from cayu.runtime._tool_invocation.admission import ToolInvocationAdmission
+from cayu.runtime._tool_invocation.hooks import ToolInvocationHooks
+from cayu.runtime._tool_invocation.invocation import ToolInvocation
+from cayu.runtime._tool_invocation.resources import ToolInvocationResources
+from cayu.runtime._tool_invocation.terminal import ToolTerminalPublisher
 from cayu.runtime._tool_round_executor import (
-    InterruptedToolRoundRequest,
     ToolRoundExecutor,
-    ToolRoundLimitRequest,
 )
 from cayu.runtime._user_input_recovery_evidence import UserInputRecoveryEvidence
 from cayu.runtime._work_attempt_coordinator import WorkAttemptCoordinator
@@ -538,7 +530,6 @@ from cayu.runtime.session_steering import (
     SessionSteeringReceipt,
     StopAfterCurrentToolRoundRequest,
 )
-from cayu.runtime.stop_policy import StopDecision
 from cayu.runtime.tool_effects import (
     ToolEffectConflict,
     ToolEffectReceipt,
@@ -626,7 +617,6 @@ from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import (
     EventRecord,
     Session,
-    SessionStatus,
     _fork_source_session_instance_fingerprint,
     copy_session,
 )
@@ -1482,6 +1472,153 @@ class CayuApp:
             event_writer=self._event_writer,
             secret_redactor=self._secret_redactor,
         )
+        self._user_input_evidence = UserInputRecoveryEvidence(
+            self._runtime_session_store, self._secret_redactor
+        )
+
+        tool_resources = ToolInvocationResources(
+            session_store=self._runtime_session_store,
+            image_decode_policy=self._image_decode_policy,
+            knowledge_publication_scope=self._knowledge_publication_scope,
+            browser_control_service=(
+                self._browser_control_runtime.service
+                if self._browser_control_runtime is not None
+                else None
+            ),
+            clock=self._clock,
+        )
+
+        tool_admission = ToolInvocationAdmission(
+            session_store=self._runtime_session_store,
+            event_writer=self._event_writer,
+            secret_redactor=self._secret_redactor,
+            clock=self._clock,
+        )
+
+        tool_hooks = ToolInvocationHooks(
+            event_writer=self._event_writer, hook_runtime=self, runtime_hooks=self._runtime_hooks
+        )
+
+        self._deferred_input = DeferredInteractionInput(
+            self._runtime_session_store, self._secret_redactor
+        )
+
+        self._workspace_observation_recovery = WorkspaceObservationRecovery(
+            session_store=self._runtime_session_store,
+            event_writer=self._event_writer,
+            secret_redactor=self._secret_redactor,
+        )
+
+        self._terminal_event_publication = TerminalEventPublication(
+            session_store=self._runtime_session_store,
+            environment_lifecycle=self._environment_lifecycle,
+            event_writer=self._event_writer,
+            secret_redactor=self._secret_redactor,
+            runtime_hooks=self._runtime_hooks,
+            hook_runtime=self,
+        )
+
+        self._foreground_gate_policy_owner = ForegroundGatePolicyOwner()
+
+        self._background_interruption_coordinator = BackgroundInterruptionCoordinator(
+            session_control=self._session_control,
+            session_store=self._runtime_session_store,
+            event_writer=self._event_writer,
+            clock=self._clock,
+            interrupt_session=self.interrupt_session,
+            secret_redactor=self._secret_redactor,
+        )
+
+        self._terminal_evidence = TerminalEvidenceReader(
+            session_store=self._runtime_session_store,
+            session_control=self._session_control,
+            user_input_evidence=self._user_input_evidence,
+            secret_redactor=self._secret_redactor,
+        )
+
+        tool_terminals = ToolTerminalPublisher(
+            event_writer=self._event_writer,
+            hooks=tool_hooks,
+            secret_redactor=self._secret_redactor,
+            projection_policy=self._tool_result_projection_policy,
+            clock=self._clock,
+        )
+
+        self._recovery_ownership = RecoveryOwnership(
+            session_store=self._runtime_session_store,
+            environment_lifecycle=self._environment_lifecycle,
+            session_control=self._session_control,
+            recovery_cleanup_supervisor=self._recovery_cleanup_supervisor,
+            terminal_evidence=self._terminal_evidence,
+        )
+
+        self._tool_invocation = ToolInvocation(
+            session_store=self._runtime_session_store,
+            event_writer=self._event_writer,
+            auxiliary_inference=AuxiliaryInferenceOwner(
+                session_store=self._runtime_session_store,
+                event_writer=self._event_writer,
+                run_limit_controller=self._run_limit_controller,
+                clock=self._clock,
+                execution_profile_process_identity=self._execution_profile_process_identity,
+                profile_redactor=self._secret_redactor,
+            ),
+            session_control=self._session_control,
+            admission=tool_admission,
+            hooks=tool_hooks,
+            terminals=tool_terminals,
+            resources=tool_resources,
+            secret_redactor=self._secret_redactor,
+            tool_timeout_seconds=self._tool_timeout_seconds,
+            strict_common_budget_admission=self.enable_common_root_budget_binding,
+        )
+
+        self._terminal_finalization = TerminalEvidenceFinalization(
+            session_store=self._runtime_session_store,
+            session_control=self._session_control,
+            recovery=self._recovery_ownership,
+            terminal_evidence=self._terminal_evidence,
+            user_input_evidence=self._user_input_evidence,
+            event_writer=self._event_writer,
+            secret_redactor=self._secret_redactor,
+            logger=logger,
+        )
+
+        self._pending_tool_round_recovery = PendingToolRoundRecovery(
+            session_store=self._runtime_session_store,
+            event_writer=self._event_writer,
+            session_control=self._session_control,
+            environment_lifecycle=self._environment_lifecycle,
+            tool_invocation=self._tool_invocation,
+            deferred_input=self._deferred_input,
+            workspace_observation_recovery=self._workspace_observation_recovery,
+            secret_redactor=self._secret_redactor,
+            clock=self._clock,
+            resolve_registered_agent=self._get_registered_agent,
+            resolve_registered_environment=self._get_registered_environment_for_session,
+        )
+
+        self._session_finalization = SessionFinalization(
+            session_store=self._runtime_session_store,
+            task_store=self.task_store,
+            event_writer=self._event_writer,
+            session_control=self._session_control,
+            environment_lifecycle=self._environment_lifecycle,
+            run_limit_controller=self._run_limit_controller,
+            recovery_ownership=self._recovery_ownership,
+            recovery_cleanup_supervisor=self._recovery_cleanup_supervisor,
+            terminal_evidence=self._terminal_evidence,
+            terminal_finalization=self._terminal_finalization,
+            terminal_event_publication=self._terminal_event_publication,
+            foreground_gate_policy_owner=self._foreground_gate_policy_owner,
+            background_interruption_coordinator=self._background_interruption_coordinator,
+            deferred_input=self._deferred_input,
+            secret_redactor=self._secret_redactor,
+            clock=self._clock,
+            resolve_registered_agent=self._get_registered_agent,
+            resolve_registered_environment=self._get_registered_environment_for_session,
+        )
+
         self._model_step_executor = ModelStepExecutor(
             session_store=self._runtime_session_store,
             recovery_cleanup_supervisor=self._recovery_cleanup_supervisor,
@@ -1498,74 +1635,31 @@ class CayuApp:
             checkpoint_transform=(
                 self._environment_lifecycle.checkpoint_transform_preserving_runtime_state
             ),
-            apply_budget_evaluation=self._apply_model_step_budget_evaluation,
-            apply_limit_evaluation=self._apply_model_step_limit_evaluation,
+            apply_budget_evaluation=self._session_finalization.apply_model_step_budget_evaluation,
+            apply_limit_evaluation=self._session_finalization.apply_model_step_limit_evaluation,
             stop_for_budget_reservation_failure=(
-                self._stop_for_model_step_budget_reservation_failure
+                self._session_finalization.stop_for_model_step_budget_reservation_failure
             ),
             provider_operation_cancellation_lifecycle=(
                 self._provider_operation_cancellation_lifecycle
             ),
             peer_exposure_guard=self._acquire_peer_exposure_for_model_attempt,
         )
+
         self._tool_round_executor = ToolRoundExecutor(
+            invocation=self._tool_invocation,
             session_store=self._runtime_session_store,
-            auxiliary_inference=AuxiliaryInferenceOwner(
-                session_store=self._runtime_session_store,
-                event_writer=self._event_writer,
-                run_limit_controller=self._run_limit_controller,
-                clock=self._clock,
-                execution_profile_process_identity=self._execution_profile_process_identity,
-                profile_redactor=self._secret_redactor,
-            ),
             event_writer=self._event_writer,
             session_control=self._session_control,
-            hook_runtime=self,
-            runtime_hooks=self._runtime_hooks,
             mcp_manifest_policy=self._mcp_manifest_policy,
-            tool_result_projection_policy=self._tool_result_projection_policy,
             secret_redactor=self._secret_redactor,
-            image_decode_policy=self._image_decode_policy,
-            tool_timeout_seconds=self._tool_timeout_seconds,
             max_parallel_tool_calls=self._max_parallel_tool_calls,
             clock=self._clock,
             checkpoint_transform=_replace_checkpoint_preserving_runtime_state,
-            apply_limit_evaluation=self._apply_tool_round_limit,
-            close_interrupted_round=self._close_tool_round_after_interrupt,
-            browser_control_service=(
-                self._browser_control_runtime.service
-                if self._browser_control_runtime is not None
-                else None
-            ),
-            strict_common_budget_admission=self.enable_common_root_budget_binding,
-            knowledge_publication_scope=self._knowledge_publication_scope,
+            apply_limit_evaluation=self._session_finalization.apply_tool_round_limit,
+            close_interrupted_round=self._pending_tool_round_recovery.close_interrupted_tool_round,
         )
-        self._user_input_evidence = UserInputRecoveryEvidence(
-            self._runtime_session_store, self._secret_redactor
-        )
-        self._terminal_evidence = TerminalEvidenceReader(
-            session_store=self._runtime_session_store,
-            session_control=self._session_control,
-            user_input_evidence=self._user_input_evidence,
-            secret_redactor=self._secret_redactor,
-        )
-        self._recovery_ownership = RecoveryOwnership(
-            session_store=self._runtime_session_store,
-            environment_lifecycle=self._environment_lifecycle,
-            session_control=self._session_control,
-            recovery_cleanup_supervisor=self._recovery_cleanup_supervisor,
-            terminal_evidence=self._terminal_evidence,
-        )
-        self._terminal_finalization = TerminalEvidenceFinalization(
-            session_store=self._runtime_session_store,
-            session_control=self._session_control,
-            recovery=self._recovery_ownership,
-            terminal_evidence=self._terminal_evidence,
-            user_input_evidence=self._user_input_evidence,
-            event_writer=self._event_writer,
-            secret_redactor=self._secret_redactor,
-            logger=logger,
-        )
+
         self._model_completion_recovery = ModelCompletionRecovery(
             session_store=self._runtime_session_store,
             event_writer=self._event_writer,
@@ -1582,32 +1676,11 @@ class CayuApp:
             runtime_hooks=self._runtime_hooks,
             loop_policies=self._loop_policies,
         )
-        self._workspace_observation_recovery = WorkspaceObservationRecovery(
-            session_store=self._runtime_session_store,
-            event_writer=self._event_writer,
-            secret_redactor=self._secret_redactor,
-        )
-        self._pending_tool_round_recovery = PendingToolRoundRecovery(
-            session_store=self._runtime_session_store,
-            event_writer=self._event_writer,
-            session_control=self._session_control,
-            environment_lifecycle=self._environment_lifecycle,
-            tool_round_executor=self._tool_round_executor,
-            workspace_observation_recovery=self._workspace_observation_recovery,
-            secret_redactor=self._secret_redactor,
-            clock=self._clock,
-            resolve_registered_agent=self._get_registered_agent,
-            resolve_registered_environment=self._get_registered_environment_for_session,
-        )
-        self._terminal_event_publication = TerminalEventPublication(
-            session_store=self._runtime_session_store,
-            environment_lifecycle=self._environment_lifecycle,
-            event_writer=self._event_writer,
-            secret_redactor=self._secret_redactor,
-            runtime_hooks=self._runtime_hooks,
-            hook_runtime=self,
-        )
+
         self._recovery_coordinator = RecoveryCoordinator(
+            session_finalization=self._session_finalization,
+            foreground_gate_policy_owner=self._foreground_gate_policy_owner,
+            deferred_input=self._deferred_input,
             terminal_event_publication=self._terminal_event_publication,
             recovery_ownership=self._recovery_ownership,
             terminal_evidence=self._terminal_evidence,
@@ -1629,8 +1702,6 @@ class CayuApp:
             checkpoint_transform=_replace_checkpoint_preserving_runtime_state,
             effective_retry_policy=self._effective_retry_policy,
             run_session=self._run_recovery_session,
-            fail_provider_operation=self._fail_provider_operation_resolution,
-            stop_session_for_limit_reached=self._stop_recovery_session_for_limit_reached,
             task_event=_recovery_task_event,
             resolve_registered_agent=self._get_registered_agent,
             resolve_registered_provider=self._get_registered_provider,
@@ -1639,40 +1710,16 @@ class CayuApp:
             execution_profile_continuation=self._execution_profile_continuation,
             model_completion_recovery=self._model_completion_recovery,
             user_input_evidence=self._user_input_evidence,
-            interrupt_session_for_recovery=self._interrupt_session_for_recovery,
-            pending_session_interrupt_checkpoint=(
-                self._pending_session_interrupt_checkpoint_for_recovery
-            ),
-            abandoned_turn_completed=self._complete_abandoned_recovery_turn,
-            resume_interaction=self._resume_recovery_interaction,
             interaction_transition_replay_failures=_interaction_transition_replay_failures,
             recovery_cleanup_supervisor=self._recovery_cleanup_supervisor,
             runtime_hooks=self._runtime_hooks,
             loop_policies=self._loop_policies,
         )
-        self._background_interruption_coordinator = BackgroundInterruptionCoordinator(
-            session_store=self._runtime_session_store,
-            event_writer=self._event_writer,
-            clock=self._clock,
-            interrupt_session=self.interrupt_session,
-            load_pending_session_interrupt_payload=self._load_pending_session_interrupt_payload,
-            latest_session_interrupted_event=self._session_control.latest_interrupted_event,
-            load_pending_interruption_cascade=self._load_pending_interruption_cascade,
-            claim_pending_interruption_cascade=self._claim_pending_interruption_cascade,
-            mark_pending_interruption_cascade_failed=(
-                self._mark_pending_interruption_cascade_failed
-            ),
-            complete_pending_interruption_cascade=self._complete_pending_interruption_cascade,
-            renew_pending_interruption_cascade_claim=(
-                self._renew_pending_interruption_cascade_claim
-            ),
-            release_pending_interruption_cascade_claim=(
-                self._release_pending_interruption_cascade_claim
-            ),
-            secret_redactor=self._secret_redactor,
-        )
 
         self._session_engine = SessionEngine(
+            session_finalization=self._session_finalization,
+            foreground_gate_policy_owner=self._foreground_gate_policy_owner,
+            deferred_input=self._deferred_input,
             terminal_event_publication=self._terminal_event_publication,
             recovery_ownership=self._recovery_ownership,
             terminal_evidence=self._terminal_evidence,
@@ -1719,6 +1766,7 @@ class CayuApp:
             egress_authority_adoption_handler=egress_authority_adoption_handler,
             execution_profile_process_identity=self._execution_profile_process_identity,
         )
+
         self._work_attempt_coordinator = WorkAttemptCoordinator(
             get_task_store=lambda: self.task_store,
             session_store=self._runtime_session_store,
@@ -5023,7 +5071,7 @@ class CayuApp:
         async def background_interruptions(budget: float) -> bool:
             # Sealed only now: admitted operations that just finished may still
             # have started cascades and deliveries, which this step drains.
-            self._session_engine.seal_background_interruptions()
+            self._background_interruption_coordinator.seal()
             self._foreground_child_delivery_owner.seal()
             return await self.drain_background_interruptions(timeout_s=budget)
 
@@ -5178,7 +5226,7 @@ class CayuApp:
     def _shutdown_late_work(self) -> dict[str, ApplicationShutdownStepReason]:
         late: dict[str, ApplicationShutdownStepReason] = {}
         if (
-            self._session_engine.background_interruptions_pending()
+            self._background_interruption_coordinator.pending
             or self._foreground_child_delivery_owner.pending
         ):
             late["background_interruptions"] = "late_work"
@@ -5227,7 +5275,7 @@ class CayuApp:
 
     async def drain_background_interruptions(self, *, timeout_s: float = 10.0) -> bool:
         results = await asyncio.gather(
-            self._session_engine.drain_background_interruptions(timeout_s=timeout_s),
+            self._background_interruption_coordinator.drain(timeout_s=timeout_s),
             self._foreground_child_delivery_owner.drain(timeout_s=timeout_s),
             return_exceptions=True,
         )
@@ -8874,110 +8922,6 @@ class CayuApp:
             async for item in owned_stream:
                 yield item
 
-    def _fail_provider_operation_resolution(
-        self,
-        request: ProviderOperationFailureRequest,
-    ) -> AsyncIterator[Event]:
-        return self._session_engine.fail_provider_operation_resolution(
-            resolution_event=request.resolution_event,
-            session=request.session,
-            registered_agent=request.registered_agent,
-            registered_environment=request.registered_environment,
-            execution_profile=request.execution_profile,
-            task_id=request.task_id,
-            task_worker_id=request.task_worker_id,
-            task_handoff_id=request.task_handoff_id,
-            legacy_resolution_without_profile=request.legacy_resolution_without_profile,
-            invocation_context=request.invocation_context,
-        )
-
-    def _stop_recovery_session_for_limit_reached(
-        self,
-        request: RecoveryLimitStopRequest,
-    ) -> AsyncIterator[Event]:
-        return self._stop_session_for_limit_reached(
-            session=request.session,
-            registered_agent=request.registered_agent,
-            registered_environment=request.registered_environment,
-            environment_name=request.environment_name,
-            decision=request.decision,
-            usage_summary=request.usage_summary,
-            cost_summary=request.cost_summary,
-            messages=request.messages,
-            tool_calls=request.tool_calls,
-            completed_tool_outcomes=request.completed_tool_outcomes,
-            pending_approval_to_clear=request.pending_approval_to_clear,
-            deferred_messages=request.deferred_messages,
-            requested_approval_decision=request.requested_approval_decision,
-            approval_resolution_request_digest=request.approval_resolution_request_digest,
-            execution_profile=request.execution_profile,
-            invocation_context=request.invocation_context,
-        )
-
-    def _interrupt_session_for_recovery(
-        self,
-        request: RecoveryInterruptionRequest,
-    ) -> AsyncIterator[Event]:
-        return self._handle_session_interrupted(
-            session=request.session,
-            registered_agent=request.registered_agent,
-            registered_environment=request.registered_environment,
-            environment_name=request.environment_name,
-            execution_profile=request.execution_profile,
-            invocation_context=request.invocation_context,
-            run_terminal_hooks=request.run_terminal_hooks,
-            preserve_interaction_id=request.preserve_interaction_id,
-            recovery_claim_id=request.recovery_claim_id,
-        )
-
-    def _pending_session_interrupt_checkpoint_for_recovery(
-        self,
-        payload: dict[str, Any],
-        cascade_created_at: datetime,
-    ):
-        return _checkpoint_with_pending_session_interrupt(
-            payload,
-            cascade_created_at=cascade_created_at,
-        )
-
-    async def _complete_abandoned_recovery_turn(
-        self,
-        request: RecoveryAbandonedTurnRequest,
-    ) -> Session:
-        finalized, _, _ = await self._session_engine._publish_sibling_interaction_transition(
-            session=request.session,
-            invocation_context=request.invocation_context,
-            registered_agent=request.registered_agent,
-            registered_environment=request.registered_environment,
-            environment_name=request.environment_name,
-            to_status=SessionStatus.INTERRUPTED,
-            execution_profile=request.execution_profile,
-        )
-        if request.run_started_at is not None and request.usage_tracker is not None:
-            await self._emit_turn_completed_once(
-                session=finalized,
-                registered_agent=request.registered_agent,
-                environment_name=request.environment_name,
-                status=SessionStatus.INTERRUPTED,
-                run_started_at=request.run_started_at,
-                usage_tracker=request.usage_tracker,
-                active_run=request.active_run,
-                invocation_context=request.invocation_context,
-            )
-        return finalized
-
-    async def _resume_recovery_interaction(
-        self,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-    ) -> Event | None:
-        return await self._session_engine.resume_interaction(
-            session,
-            registered_agent,
-            registered_environment,
-        )
-
     @_admitted_entrance
     async def resolve_user_input(
         self,
@@ -9754,237 +9698,6 @@ class CayuApp:
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield event
-
-    async def _emit_turn_completed_once(
-        self,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        environment_name: str | None,
-        status: SessionStatus,
-        run_started_at: float,
-        usage_tracker: SessionUsageTracker,
-        active_run: ActiveSessionRun[SessionUsageTracker] | None,
-        invocation_context: InvocationContext | None = None,
-    ) -> Event:
-        events = await self._session_engine._emit_turn_completed_once(
-            session=session,
-            registered_agent=registered_agent,
-            environment_name=environment_name,
-            status=status,
-            run_started_at=run_started_at,
-            usage_tracker=usage_tracker,
-            active_run=active_run,
-            invocation_context=invocation_context,
-        )
-        return events[-1]
-
-    async def _apply_model_step_budget_evaluation(
-        self,
-        request: ModelStepBudgetEvaluationRequest,
-    ) -> AsyncIterator[Event]:
-        stream = self._session_engine._apply_model_step_budget_evaluation(request=request)
-        async with _close_delegated_event_stream(stream) as owned_stream:
-            async for item in owned_stream:
-                yield item
-
-    async def _apply_model_step_limit_evaluation(
-        self,
-        request: ModelStepLimitEvaluationRequest,
-    ) -> AsyncIterator[Event]:
-        stream = self._session_engine._apply_model_step_limit_evaluation(request=request)
-        async with _close_delegated_event_stream(stream) as owned_stream:
-            async for item in owned_stream:
-                yield item
-
-    async def _stop_for_model_step_budget_reservation_failure(
-        self,
-        request: ModelStepBudgetReservationFailureRequest,
-    ) -> AsyncIterator[Event]:
-        stream = self._session_engine._stop_for_model_step_budget_reservation_failure(
-            request=request
-        )
-        async with _close_delegated_event_stream(stream) as owned_stream:
-            async for item in owned_stream:
-                yield item
-
-    async def _apply_tool_round_limit(
-        self,
-        request: ToolRoundLimitRequest,
-    ) -> AsyncIterator[Event]:
-        stream = self._session_engine._apply_tool_round_limit(request=request)
-        async with _close_delegated_event_stream(stream) as owned_stream:
-            async for item in owned_stream:
-                yield item
-
-    async def _stop_session_for_limit_reached(
-        self,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        environment_name: str | None,
-        decision: StopDecision,
-        usage_summary: SessionUsageSummary,
-        cost_summary: SessionCostTotals | None,
-        messages: list[Message],
-        tool_calls: list[runtime_records.ToolCallRequest],
-        completed_tool_outcomes: list[runtime_records.ToolCallOutcome],
-        pending_approval_to_clear: PendingToolApproval | None = None,
-        deferred_messages: list[Message] | None = None,
-        requested_approval_decision: ToolApprovalDecision | None = None,
-        approval_resolution_request_digest: str | None = None,
-        run_started_at: float | None = None,
-        turn_usage_tracker: SessionUsageTracker | None = None,
-        active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
-        execution_profile: ExecutionProfileIdentity | None = None,
-        invocation_context: InvocationContext | None = None,
-    ) -> AsyncIterator[Event]:
-        # This adapter is owned by RecoveryCoordinator, not SessionEngine._run_session,
-        # so its terminal transition must consume the sibling cancellation handoff.
-        stream = self._session_engine._stop_session_for_limit_reached(
-            session=session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            environment_name=environment_name,
-            decision=decision,
-            usage_summary=usage_summary,
-            cost_summary=cost_summary,
-            messages=messages,
-            tool_calls=tool_calls,
-            completed_tool_outcomes=completed_tool_outcomes,
-            pending_approval_to_clear=pending_approval_to_clear,
-            deferred_messages=deferred_messages,
-            requested_approval_decision=requested_approval_decision,
-            approval_resolution_request_digest=approval_resolution_request_digest,
-            run_started_at=run_started_at,
-            turn_usage_tracker=turn_usage_tracker,
-            active_run=active_run,
-            execution_profile=execution_profile,
-            invocation_context=invocation_context,
-            reconcile_transition_cancellation=True,
-        )
-        async with _close_delegated_event_stream(stream) as owned_stream:
-            async for item in owned_stream:
-                yield item
-
-    async def _load_pending_session_interrupt_payload(
-        self,
-        session_id: str,
-        *,
-        default: dict[str, Any],
-    ) -> dict[str, Any]:
-        return await self._session_engine._load_pending_session_interrupt_payload(
-            session_id=session_id, default=default
-        )
-
-    async def _load_pending_interruption_cascade(
-        self,
-        session_id: str,
-    ) -> dict[str, Any] | None:
-        return await self._session_engine._load_pending_interruption_cascade(session_id=session_id)
-
-    async def _claim_pending_interruption_cascade(
-        self,
-        session_id: str,
-        interrupt_payload: dict[str, Any],
-        *,
-        create_if_missing: bool = True,
-        retry_request: dict[str, Any] | None = None,
-    ) -> dict[str, Any] | None:
-        return await self._session_engine._claim_pending_interruption_cascade(
-            session_id=session_id,
-            interrupt_payload=interrupt_payload,
-            create_if_missing=create_if_missing,
-            retry_request=retry_request,
-        )
-
-    async def _mark_pending_interruption_cascade_failed(
-        self,
-        session_id: str,
-        attempt_id: str,
-        generation: int,
-        claim_id: str,
-    ) -> bool:
-        return await self._session_engine._mark_pending_interruption_cascade_failed(
-            session_id=session_id, attempt_id=attempt_id, generation=generation, claim_id=claim_id
-        )
-
-    async def _complete_pending_interruption_cascade(
-        self,
-        session_id: str,
-        attempt_id: str,
-        generation: int,
-        claim_id: str,
-    ) -> tuple[bool, bool]:
-        return await self._session_engine._complete_pending_interruption_cascade(
-            session_id=session_id, attempt_id=attempt_id, generation=generation, claim_id=claim_id
-        )
-
-    async def _renew_pending_interruption_cascade_claim(
-        self,
-        session_id: str,
-        attempt_id: str,
-        generation: int,
-        claim_id: str,
-    ) -> bool:
-        return await self._session_engine._renew_pending_interruption_cascade_claim(
-            session_id=session_id, attempt_id=attempt_id, generation=generation, claim_id=claim_id
-        )
-
-    async def _release_pending_interruption_cascade_claim(
-        self,
-        session_id: str,
-        attempt_id: str,
-        generation: int,
-        claim_id: str,
-    ) -> None:
-        return await self._session_engine._release_pending_interruption_cascade_claim(
-            session_id=session_id, attempt_id=attempt_id, generation=generation, claim_id=claim_id
-        )
-
-    async def _handle_session_interrupted(
-        self,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        environment_name: str | None,
-        execution_profile: ExecutionProfileIdentity | None = None,
-        invocation_context: InvocationContext | None = None,
-        run_started_at: float | None = None,
-        turn_usage_tracker: SessionUsageTracker | None = None,
-        active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
-        run_terminal_hooks: bool = True,
-        preserve_interaction_id: str | None = None,
-        recovery_claim_id: str | None = None,
-    ) -> AsyncIterator[Event]:
-        stream = self._session_engine._handle_session_interrupted(
-            session=session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            environment_name=environment_name,
-            execution_profile=execution_profile,
-            invocation_context=invocation_context,
-            run_started_at=run_started_at,
-            turn_usage_tracker=turn_usage_tracker,
-            active_run=active_run,
-            run_terminal_hooks=run_terminal_hooks,
-            preserve_interaction_id=preserve_interaction_id,
-            recovery_claim_id=recovery_claim_id,
-        )
-        async with _close_delegated_event_stream(stream) as owned_stream:
-            async for item in owned_stream:
-                yield item
-
-    async def _close_tool_round_after_interrupt(
-        self,
-        request: InterruptedToolRoundRequest,
-    ) -> AsyncGenerator[Event, None]:
-        stream = self._session_engine._close_tool_round_after_interrupt(request=request)
-        async with _close_delegated_event_stream(stream) as owned_stream:
-            async for item in owned_stream:
-                yield item
 
     def scoped_event_emitter(
         self,

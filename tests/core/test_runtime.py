@@ -232,6 +232,7 @@ from cayu.runtime import _execution_profile_admission as execution_profile_admis
 from cayu.runtime import _interruption_coordinator as interruption_coordinator_module
 from cayu.runtime import _recovery_coordinator as recovery_coordinator_module
 from cayu.runtime import _recovery_ownership as recovery_ownership_module
+from cayu.runtime import _session_finalization as session_finalization_module
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime._binding_cleanup import (
     binding_cleanup_status,
@@ -20729,7 +20730,7 @@ def test_background_interruption_shutdown_cancels_shared_workers_and_keeps_marke
         monkeypatch.setattr(
             app._background_interruption_coordinator, "_interrupt_session", blocked_interrupt
         )
-        app._session_engine._schedule_background_interruption_cascade(
+        app._session_finalization.schedule_background_interruption_cascade(
             parent_session_id=parent_id,
             interrupt_payload={
                 "reason": "operator stop",
@@ -20927,7 +20928,7 @@ def test_background_interruption_shutdown_drains_locally_queued_roots(monkeypatc
             app._background_interruption_coordinator, "run_cascade", controlled_cascade
         )
         for index in range(2):
-            app._session_engine._schedule_background_interruption_cascade(
+            app._session_finalization.schedule_background_interruption_cascade(
                 parent_session_id=f"sess_locally_queued_{index}",
                 interrupt_payload=payload,
                 create_if_missing=False,
@@ -20992,10 +20993,10 @@ def test_background_interruption_shutdown_does_not_restart_external_lease_waiter
 
         monkeypatch.setattr(
             app._background_interruption_coordinator,
-            "_claim_pending_interruption_cascade",
+            "claim_pending_interruption_cascade",
             blocked_claim,
         )
-        app._session_engine._schedule_background_interruption_cascade(
+        app._session_finalization.schedule_background_interruption_cascade(
             parent_session_id=parent_id,
             interrupt_payload=payload,
             create_if_missing=False,
@@ -21054,7 +21055,7 @@ def test_background_interruption_drain_cancellation_cleans_up_owned_work(monkeyp
         monkeypatch.setattr(
             app._background_interruption_coordinator, "_interrupt_session", blocked_interrupt
         )
-        app._session_engine._schedule_background_interruption_cascade(
+        app._session_finalization.schedule_background_interruption_cascade(
             parent_session_id=parent_id,
             interrupt_payload={
                 "reason": "operator stop",
@@ -21141,7 +21142,7 @@ def test_background_interruption_shutdown_grace_detaches_cancellation_resistant_
             "_interrupt_session",
             cancellation_resistant_interrupt,
         )
-        app._session_engine._schedule_background_interruption_cascade(
+        app._session_finalization.schedule_background_interruption_cascade(
             parent_session_id=parent_id,
             interrupt_payload={
                 "reason": "operator stop",
@@ -21223,7 +21224,7 @@ def test_background_interruption_shutdown_fences_cancellation_resistant_claim(mo
 
         monkeypatch.setattr(
             app._background_interruption_coordinator,
-            "_claim_pending_interruption_cascade",
+            "claim_pending_interruption_cascade",
             cancellation_resistant_claim,
         )
         monkeypatch.setattr(
@@ -21231,7 +21232,7 @@ def test_background_interruption_shutdown_fences_cancellation_resistant_claim(mo
             "_run_claimed_background_interruption_cascade",
             record_claimed_run,
         )
-        task = app._session_engine._schedule_background_interruption_cascade(
+        task = app._session_finalization.schedule_background_interruption_cascade(
             parent_session_id=parent_id,
             interrupt_payload=payload,
             create_if_missing=True,
@@ -21381,7 +21382,7 @@ def test_background_interruption_heartbeat_retries_transient_store_error(monkeyp
 
         monkeypatch.setattr(
             app._background_interruption_coordinator,
-            "_renew_pending_interruption_cascade_claim",
+            "renew_pending_interruption_cascade_claim",
             transient_renew,
         )
         await app._background_interruption_coordinator.run_cascade(
@@ -21522,7 +21523,7 @@ def test_background_interruption_heartbeat_loses_claim_with_frozen_worker_clock(
 
         monkeypatch.setattr(
             app._background_interruption_coordinator,
-            "_renew_pending_interruption_cascade_claim",
+            "renew_pending_interruption_cascade_claim",
             unavailable_renew,
         )
         monkeypatch.setattr(
@@ -22179,8 +22180,8 @@ def test_pending_interruption_recovery_discovers_only_indexed_markers(monkeypatc
             return None
 
         monkeypatch.setattr(
-            app._session_engine,
-            "_schedule_background_interruption_cascade",
+            app._session_finalization,
+            "schedule_background_interruption_cascade",
             record_schedule,
         )
         scheduled = await app.resume_pending_interruption_cascades(
@@ -22744,7 +22745,7 @@ def test_interruption_cascade_completion_clear_failure_is_durably_reported(monke
 
         monkeypatch.setattr(
             app._background_interruption_coordinator,
-            "_complete_pending_interruption_cascade",
+            "complete_pending_interruption_cascade",
             fail_checkpoint_clear,
         )
         await app._background_interruption_coordinator.run_cascade(
@@ -22885,7 +22886,7 @@ def test_checkpoint_replacement_preserves_current_runtime_state_without_resurrec
             session_engine_module._replace_checkpoint_preserving_runtime_state(stale_replacement),
         )
         preserved = await store.load_checkpoint(session_id)
-        await app._session_engine._clear_pending_session_interrupt(session_id)
+        await app._session_finalization.clear_pending_session_interrupt(session_id)
         await app._session_engine._clear_pending_interruption_cascade(session_id)
         await store._publish_completion_result_event_publication(
             session_id,
@@ -31511,7 +31512,7 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_stops_continuation_before_re
             assert "incomplete_session_recovery_claim" in checkpoint_during_abort
             cleanup_order.append("environment_abort")
 
-        original_finalize = app._recovery_coordinator.finalize_abandoned_session_by_id
+        original_finalize = app._session_finalization.finalize_abandoned_session_by_id
 
         async def record_abandoned_finalization(
             session_id: str,
@@ -31545,7 +31546,7 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_stops_continuation_before_re
             record_environment_abort,
         )
         monkeypatch.setattr(
-            app._recovery_coordinator,
+            app._session_finalization,
             "finalize_abandoned_session_by_id",
             record_abandoned_finalization,
         )
@@ -31644,7 +31645,7 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_cleans_up_while_consumer_is_
             assert "incomplete_session_recovery_claim" in checkpoint_during_abort
             cleanup_order.append("environment_abort")
 
-        original_finalize = app._recovery_coordinator.finalize_abandoned_session_by_id
+        original_finalize = app._session_finalization.finalize_abandoned_session_by_id
 
         async def record_abandoned_finalization(
             session_id: str,
@@ -31678,7 +31679,7 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_cleans_up_while_consumer_is_
             record_environment_abort,
         )
         monkeypatch.setattr(
-            app._recovery_coordinator,
+            app._session_finalization,
             "finalize_abandoned_session_by_id",
             record_abandoned_finalization,
         )
@@ -32660,7 +32661,7 @@ def test_manual_recovery_interruption_fence_uses_its_own_lease_deadline(
             == expected_expired_fence_failures
         ), [f"{type(candidate).__name__}: {candidate}" for candidate in failure_graph]
 
-        await operator_app._recovery_coordinator.finalize_abandoned_session_by_id(session_id)
+        await operator_app._session_finalization.finalize_abandoned_session_by_id(session_id)
         interruption_events = await asyncio.wait_for(interruption_task, timeout=5)
         assert interruption_events[-1].type == EventType.SESSION_INTERRUPTED
         interrupted = await store.load(session_id)
@@ -33200,7 +33201,7 @@ def test_operator_interrupt_wins_race_with_manual_tool_round_recovery_claim(
         )
         await asyncio.wait_for(store.operator_interrupt_committed.wait(), timeout=15)
         if finalize_before_claim:
-            await operator_app._recovery_coordinator.finalize_abandoned_session_by_id(session_id)
+            await operator_app._session_finalization.finalize_abandoned_session_by_id(session_id)
             interruption_events = await asyncio.wait_for(interrupt_task, timeout=15)
             completed_stop = await store.load(session_id)
             assert recovery_task.done() is False
@@ -33341,7 +33342,7 @@ def test_manual_tool_round_recovery_finalizes_pending_operator_interrupt_before_
             session_id,
             from_statuses={SessionStatus.RUNNING},
             to_status=SessionStatus.INTERRUPTING,
-            checkpoint_transform=session_engine_module._checkpoint_with_pending_session_interrupt(
+            checkpoint_transform=session_finalization_module._checkpoint_with_pending_session_interrupt(
                 interrupt_payload,
             ),
         )
@@ -34298,7 +34299,7 @@ def test_reactivating_same_interaction_does_not_reset_active_segment(monkeypatch
         sessions_module._activate_session_interaction(session.id, "interaction-timing")
         monotonic["value"] = 20.0
         wall["value"] += timedelta(seconds=10)
-        paused = await app._session_engine._emit_interaction_state(
+        paused = await app._session_finalization.emit_interaction_state(
             session=session,
             registered_agent=registered_agent,
             environment_name=None,
@@ -34356,7 +34357,7 @@ def test_interaction_summary_pages_more_than_5000_usage_events_without_failing()
                 for index in range(5001)
             ],
         )
-        completed = await app._session_engine._emit_interaction_state(
+        completed = await app._session_finalization.emit_interaction_state(
             session=session,
             registered_agent=registered_agent,
             environment_name=None,
@@ -64316,7 +64317,7 @@ def test_process_loss_after_ambiguous_approval_clear_recovers_exact_interrupt_cl
             session_id,
             from_statuses={recovered_gate.status},
             to_status=SessionStatus.INTERRUPTING,
-            checkpoint_transform=session_engine_module._checkpoint_with_pending_session_interrupt(
+            checkpoint_transform=session_finalization_module._checkpoint_with_pending_session_interrupt(
                 {
                     "interruption_type": "operator_requested",
                     "interruption_request_id": "interrupt_ambiguous_approval",

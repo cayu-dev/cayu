@@ -4382,7 +4382,9 @@ def test_provider_failure_replay_runs_hooks_before_retiring_disposition(
             async for event in original_runner(**kwargs):
                 yield event
 
-        monkeypatch.setattr(app._terminal_event_publication, "_run_runtime_hooks", lose_before_hooks)
+        monkeypatch.setattr(
+            app._terminal_event_publication, "_run_runtime_hooks", lose_before_hooks
+        )
         with pytest.raises(_SimulatedProcessLoss):
             _ = [event async for event in app.resolve_provider_operation(request)]
 
@@ -6235,7 +6237,7 @@ def test_attached_task_provider_failure_terminalizes_once_and_replays(
             action=ProviderOperationResolutionAction.FAIL,
             reason="operator selected the terminal disposition",
         )
-        publish_transition = app._session_engine._publish_sibling_interaction_transition
+        publish_transition = app._session_finalization.publish_sibling_interaction_transition
         injected_failure = False
 
         async def lose_process_after_task_terminalization(*args, **kwargs):
@@ -6248,8 +6250,8 @@ def test_attached_task_provider_failure_terminalizes_once_and_replays(
             return await publish_transition(*args, **kwargs)
 
         monkeypatch.setattr(
-            app._session_engine,
-            "_publish_sibling_interaction_transition",
+            app._session_finalization,
+            "publish_sibling_interaction_transition",
             lose_process_after_task_terminalization,
         )
         first_attempt: list[Event] = []
@@ -6266,8 +6268,8 @@ def test_attached_task_provider_failure_terminalizes_once_and_replays(
         assert sum(event.type is EventType.TASK_FAILED for event in first_attempt) == 1
 
         monkeypatch.setattr(
-            app._session_engine,
-            "_publish_sibling_interaction_transition",
+            app._session_finalization,
+            "publish_sibling_interaction_transition",
             publish_transition,
         )
         events = [event async for event in app.resolve_provider_operation(request)]
@@ -6363,7 +6365,7 @@ def test_workerless_provider_failure_replays_after_task_terminalization_loss(
             action=ProviderOperationResolutionAction.FAIL,
             reason="operator selected the terminal disposition",
         )
-        publish_transition = app._session_engine._publish_sibling_interaction_transition
+        publish_transition = app._session_finalization.publish_sibling_interaction_transition
         injected_failure = False
 
         async def lose_process_after_task_terminalization(*args, **kwargs):
@@ -6376,8 +6378,8 @@ def test_workerless_provider_failure_replays_after_task_terminalization_loss(
             return await publish_transition(*args, **kwargs)
 
         monkeypatch.setattr(
-            app._session_engine,
-            "_publish_sibling_interaction_transition",
+            app._session_finalization,
+            "publish_sibling_interaction_transition",
             lose_process_after_task_terminalization,
         )
         first_attempt: list[Event] = []
@@ -6394,8 +6396,8 @@ def test_workerless_provider_failure_replays_after_task_terminalization_loss(
         assert sum(event.type is EventType.TASK_FAILED for event in first_attempt) == 1
 
         monkeypatch.setattr(
-            app._session_engine,
-            "_publish_sibling_interaction_transition",
+            app._session_finalization,
+            "publish_sibling_interaction_transition",
             publish_transition,
         )
         if replay_entrance == "typed":

@@ -27,6 +27,7 @@ from uuid import UUID, uuid4, uuid5
 
 from cayu.runtime._continuation_environment import ContinuationEnvironment
 from cayu.runtime._durable_tool_round import (
+    DeferredInteractionInput,
     DurableToolRound,
 )
 from cayu.runtime._durable_tool_round import (
@@ -61,7 +62,6 @@ from cayu.runtime._recovery_ownership import (
 )
 from cayu.runtime._recovery_requests import (
     ProviderOperationFailureRequest,
-    RecoveryAbandonedSessionRequest,
     RecoveryAbandonedTurnRequest,
     RecoveryInterruptionRequest,
     RecoveryLimitStopRequest,
@@ -69,8 +69,13 @@ from cayu.runtime._recovery_requests import (
     RecoveryTaskEventRequest,
     RecoveryTerminalEventRequest,
 )
+from cayu.runtime._session_finalization import (
+    SessionFinalization,
+    _checkpoint_with_pending_session_interrupt,
+)
 from cayu.runtime._structured_output_tool_round import has_recoverable_structured_output_round
 from cayu.runtime._terminal_event_publication import TerminalEventPublication
+from cayu.runtime._terminal_evidence_finalization import _RECOVERY_RESUMABLE_SESSION_STATUSES
 from cayu.runtime._terminal_evidence_reader import TerminalEvidenceReader
 from cayu.runtime._user_input_recovery_evidence import UserInputRecoveryEvidence
 from cayu.runtime._workspace_observation_recovery import (
@@ -99,7 +104,6 @@ from cayu._task_wait import (
 )
 from cayu._validation import (
     canonical_durable_json_bytes,
-    copy_durable_json_value,
     copy_durable_metadata,
     copy_durable_record,
     copy_json_value,
@@ -177,21 +181,14 @@ from cayu.context.structured_output import (
     _require_native_structured_output_support as _require_provider_native_output_support,
 )
 from cayu.context.thinking import ThinkingConfig
-from cayu.deadlines import (
-    current_execution_deadline,
-    effective_deadline,
-    expired_execution_deadline,
-)
 from cayu.environments.factory import EnvironmentFactoryOperation
 from cayu.events import (
     Event,
     EventType,
     copy_event,
-    event_with_runtime_envelope_authority,
     event_with_runtime_generated_id,
     event_with_runtime_payload_authority,
 )
-from cayu.exceptions import InteractionLifecyclePublicationRejected
 from cayu.execution_profiles import (
     ExecutionProfileIdentity,
     event_with_execution_profile_authority,
@@ -201,10 +198,9 @@ from cayu.execution_units import (
     ModelStepIdentity,
     ToolRoundIdentity,
 )
-from cayu.failure_evidence import FailureEvidence, exception_evidence
+from cayu.failure_evidence import exception_evidence
 from cayu.messages import Message, detach_message
 from cayu.observability.hooks import RuntimeHookPhase
-from cayu.providers._credential_boundary import copy_provider_cancellation_failures
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.resource_access import ResourceAccessPolicy, resource_recovery
 from cayu.runtime import _approval_publication as approval_publication
@@ -353,9 +349,6 @@ from cayu.runtime.tool_effects import (
 )
 from cayu.sessions import _model_completion_publication as model_completion_publication
 from cayu.sessions import _tool_call_evidence as tool_call_evidence
-from cayu.sessions._checkpoint_preservation import (
-    _invocation_lifecycle_authority_read_scope,
-)
 from cayu.sessions._durable_operation_ownership import DurableOperationOwnership
 from cayu.sessions._execution_profile_checkpoint import (
     EXECUTION_PROFILE_METADATA_KEY,
@@ -366,7 +359,7 @@ from cayu.sessions._execution_profile_checkpoint import (
     checkpoint_with_active_invocation_execution_profile,
     execution_profile_from_session_metadata,
 )
-from cayu.sessions._foreground_child_checkpoint import ForegroundChildTerminal, ForegroundChildWait
+from cayu.sessions._foreground_child_checkpoint import ForegroundChildTerminal
 from cayu.sessions._invocation_lifecycle import (
     InvocationLifecycleCommandConflict,
     invocation_lifecycle_receipt_history_present,
@@ -382,13 +375,10 @@ from cayu.sessions._terminal_evidence import (
     _SESSION_RUN_OPERATION_CHECKPOINT_KEY,
     _session_run_operation_from_checkpoint,
     _SessionRunOperation,
-    require_interruption_event_matches_pending_marker,
 )
 from cayu.sessions.base import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
     CheckpointTransform,
-    InteractionTransitionReceiptResult,
-    InteractionTransitionSpec,
     RuntimePublicationReceipt,
     SessionRunFenced,
     SessionRuntimePublicationConflict,
@@ -400,9 +390,7 @@ from cayu.sessions.base import (
     _checkpoint_with_session_run_operation,
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
-    _event_with_session_run_operation,
     _incomplete_recovery_claim_from_checkpoint,
-    copy_interaction_transition_spec,
     runtime_publication_checkpoint_value_digest,
 )
 from cayu.sessions.cleanup import (
@@ -466,7 +454,6 @@ from cayu.workspaces.observation_recovery import (
     workspace_observations_from_checkpoint,
 )
 
-_ABANDONED_RUN_REASON = "event_stream_closed"
 _ABANDONED_UNREPLAYABLE_TOOL_ROUND_CHECKPOINT_KEY = "abandoned_unreplayable_tool_round"
 _COMPLETION_FINALIZATION_TASK_EVENT_NAMESPACE = UUID("ae86f400-31e6-4cd2-95f3-7d6f115c21a1")
 _PROVIDER_OPERATION_UNAVAILABLE_INTERRUPT_NAMESPACE = UUID("c7b311fa-d36b-4ecb-a93a-c96e4c047f01")
@@ -485,11 +472,6 @@ _INCOMPLETE_RECOVERY_STATUS_ORDER = (
     SessionStatus.FAILED,
     SessionStatus.COMPLETED,
 )
-_RECOVERY_RESUMABLE_SESSION_STATUSES = {
-    SessionStatus.COMPLETED,
-    SessionStatus.FAILED,
-    SessionStatus.INTERRUPTED,
-}
 
 _TOOL_ROUND_RECOVERABLE_SESSION_STATUSES = {
     SessionStatus.RUNNING,
@@ -867,6 +849,7 @@ class RecoveryCoordinator:
         self,
         *,
         session_store: SessionStore,
+        foreground_gate_policy_owner: ForegroundGatePolicyOwner,
         require_participant_execution: Callable[
             [Session, CollaborationAccessContext | None], Awaitable[None]
         ],
@@ -877,6 +860,7 @@ class RecoveryCoordinator:
         run_limit_controller: RunLimitController,
         tool_round_executor: ToolRoundExecutor,
         pending_tool_round_recovery: PendingToolRoundRecovery,
+        deferred_input: DeferredInteractionInput,
         workspace_observation_recovery: WorkspaceObservationRecovery,
         secret_redactor: SecretRedactor,
         clock: Callable[[], datetime],
@@ -884,8 +868,6 @@ class RecoveryCoordinator:
         effective_retry_policy: EffectiveRetryPolicy,
         run_session: RunSession,
         terminal_event_publication: TerminalEventPublication,
-        fail_provider_operation: ProviderOperationFailureStream,
-        stop_session_for_limit_reached: LimitStopEventStream,
         task_event: TaskEventFactory,
         resolve_registered_agent: RegisteredAgentResolver,
         resolve_registered_provider: RegisteredProviderResolver,
@@ -897,10 +879,7 @@ class RecoveryCoordinator:
         terminal_evidence: TerminalEvidenceReader,
         recovery_ownership: RecoveryOwnership,
         terminal_finalization: TerminalEvidenceFinalization,
-        interrupt_session_for_recovery: RecoveryInterruptionStream,
-        pending_session_interrupt_checkpoint: PendingSessionInterruptCheckpoint,
-        abandoned_turn_completed: AbandonedTurnCompleted,
-        resume_interaction: ResumeInteraction,
+        session_finalization: SessionFinalization,
         interaction_transition_replay_failures: InteractionTransitionReplayFailures,
         recovery_cleanup_supervisor: RecoveryCleanupSupervisor,
         resource_access_policy: ResourceAccessPolicy | None = None,
@@ -912,7 +891,7 @@ class RecoveryCoordinator:
         self._human_review_policy = human_review_policy
         self._session_store = session_store
         self._require_participant_execution = require_participant_execution
-        self._foreground_gate_policy_owner = ForegroundGatePolicyOwner()
+        self._foreground_gate_policy_owner = foreground_gate_policy_owner
         self._task_store = task_store
         self._event_writer = event_writer
         self._session_control = session_control
@@ -920,6 +899,7 @@ class RecoveryCoordinator:
         self._run_limit_controller = run_limit_controller
         self._tool_round_executor = tool_round_executor
         self._pending_tool_round_recovery = pending_tool_round_recovery
+        self._deferred_input = deferred_input
         self._workspace_observation_recovery = workspace_observation_recovery
         self._tool_invocation = tool_round_executor.invocation
         self._secret_redactor = secret_redactor
@@ -928,8 +908,6 @@ class RecoveryCoordinator:
         self._effective_retry_policy = effective_retry_policy
         self._run_session = run_session
         self._terminal_event_publication = terminal_event_publication
-        self._fail_provider_operation = fail_provider_operation
-        self._stop_session_for_limit_reached = stop_session_for_limit_reached
         self._task_event = task_event
         self._resolve_registered_agent = resolve_registered_agent
         self._resolve_registered_provider = resolve_registered_provider
@@ -941,10 +919,7 @@ class RecoveryCoordinator:
         self._terminal_evidence = terminal_evidence
         self._recovery_ownership = recovery_ownership
         self.terminal_finalization = terminal_finalization
-        self._interrupt_session_for_recovery = interrupt_session_for_recovery
-        self._pending_session_interrupt_checkpoint = pending_session_interrupt_checkpoint
-        self._abandoned_turn_completed = abandoned_turn_completed
-        self._resume_interaction = resume_interaction
+        self._session_finalization = session_finalization
         self._interaction_transition_replay_failures = interaction_transition_replay_failures
         if type(recovery_cleanup_supervisor) is not RecoveryCleanupSupervisor:
             raise TypeError("recovery_cleanup_supervisor must be a RecoveryCleanupSupervisor.")
@@ -1231,7 +1206,7 @@ class RecoveryCoordinator:
             cleanup_steps.append(
                 (
                     "abandoned session finalization",
-                    lambda: self.finalize_abandoned_session_by_id(
+                    lambda: self._session_finalization.finalize_abandoned_session_by_id(
                         session_id,
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
@@ -1382,7 +1357,7 @@ class RecoveryCoordinator:
             (
                 loaded_session,
                 checkpoint,
-            ) = await self._reconcile_terminal_evidence_before_continuation(
+            ) = await self.terminal_finalization.reconcile_before_continuation(
                 session=loaded_session,
                 checkpoint=checkpoint,
             )
@@ -1527,7 +1502,7 @@ class RecoveryCoordinator:
             await self._session_control.execution_presence.ensure(session)
             if before_resume is not None and not await before_resume(session):
                 return session, None
-            resumed_event = await self._resume_interaction(
+            resumed_event = await self._session_finalization.resume_recovery_interaction(
                 session,
                 registered_agent,
                 registered_environment,
@@ -1539,7 +1514,7 @@ class RecoveryCoordinator:
                     cleanup_steps.append(
                         (
                             "abandoned session finalization",
-                            lambda: self.finalize_abandoned_session_by_id(
+                            lambda: self._session_finalization.finalize_abandoned_session_by_id(
                                 session.id,
                                 registered_agent=registered_agent,
                                 registered_environment=registered_environment,
@@ -1586,7 +1561,7 @@ class RecoveryCoordinator:
                 cleanup_steps.append(
                     (
                         "abandoned session finalization",
-                        lambda: self.finalize_abandoned_session_by_id(
+                        lambda: self._session_finalization.finalize_abandoned_session_by_id(
                             session.id,
                             registered_agent=registered_agent,
                             registered_environment=registered_environment,
@@ -1747,35 +1722,6 @@ class RecoveryCoordinator:
                 async for _ in owned:
                     pass
         return True
-
-    async def foreground_gate_continuation_policies(self, parent, continuation):
-        return await self._foreground_gate_policy_owner.for_attached(
-            self._session_store, parent=parent, continuation=continuation
-        )
-
-    def retain_foreground_wait_policies(
-        self, parent: Session, wait: ForegroundChildWait, policies: tuple[LoopPolicy, ...]
-    ) -> None:
-        self._foreground_gate_policy_owner.retain_wait(parent, wait, policies)
-
-    def foreground_wait_policies(
-        self, parent: Session, wait: ForegroundChildWait
-    ) -> tuple[LoopPolicy, ...]:
-        return self._foreground_gate_policy_owner.for_wait(parent, wait)
-
-    def release_foreground_gate_continuation_policies(self, parent, continuation):
-        prefix, action_id = continuation.publication_id.split(":", 1)
-        if prefix in {"approval-close", "user-input-close"}:
-            self._foreground_gate_policy_owner.release(
-                session=parent,
-                kind="approval" if prefix == "approval-close" else "input",
-                action_id=action_id,
-            )
-
-    def release_foreground_gate_interaction(self, session: Session, interaction_id: str) -> None:
-        self._foreground_gate_policy_owner.release_interaction(
-            session=session, interaction_id=interaction_id
-        )
 
     async def _restore_closed_foreground_gate_policies(
         self,
@@ -2646,9 +2592,7 @@ class RecoveryCoordinator:
             await self._restore_closed_foreground_gate_policies(
                 current_session, request, close_receipt
             )
-            await self._pending_tool_round_recovery.materialize_deferred_input_for_receipt(
-                close_receipt
-            )
+            await self._deferred_input.materialize_for_receipt(close_receipt)
             yield closure_event
             return
 
@@ -3551,7 +3495,7 @@ class RecoveryCoordinator:
             if refreshed is None:
                 return
             pending, result = refreshed
-            async for event in self._fail_provider_operation(
+            async for event in self._session_finalization.fail_recovered_provider_operation(
                 ProviderOperationFailureRequest(
                     resolution_event=result.event,
                     session=loaded_session,
@@ -4568,7 +4512,7 @@ class RecoveryCoordinator:
             (
                 loaded_session,
                 checkpoint,
-            ) = await self._reconcile_terminal_evidence_before_continuation(
+            ) = await self.terminal_finalization.reconcile_before_continuation(
                 session=loaded_session,
                 checkpoint=checkpoint,
             )
@@ -6215,7 +6159,7 @@ class RecoveryCoordinator:
                 for event in limit_evaluation.events:
                     yield event
                 if limit_evaluation.decision is not None:
-                    async for event in self._stop_session_for_limit_reached(
+                    async for event in self._session_finalization.stop_recovered_session_for_limit(
                         RecoveryLimitStopRequest(
                             session=session,
                             registered_agent=registered_agent,
@@ -6663,12 +6607,10 @@ class RecoveryCoordinator:
                 )
             )
             pending_approval_cleared = True
-            materialized = (
-                await self._pending_tool_round_recovery.materialize_expected_deferred_input(
-                    session.id,
-                    deferred_messages,
-                    cancellation=close_cancellation,
-                )
+            materialized = await self._deferred_input.materialize_expected(
+                session.id,
+                deferred_messages,
+                cancellation=close_cancellation,
             )
             transcript = materialized.messages
             close_cancellation = materialized.cancellation
@@ -6702,7 +6644,7 @@ class RecoveryCoordinator:
                 session=session, kind="approval", action_id=pending_approval.approval_id
             )
         except GeneratorExit:
-            await self.finalize_abandoned_session_by_id(
+            await self._session_finalization.finalize_abandoned_session_by_id(
                 session.id,
                 registered_agent=registered_agent,
                 registered_environment=environment.registered_environment,
@@ -7271,7 +7213,7 @@ class RecoveryCoordinator:
                 raise
             # An operator interruption won the status transition. Finalize its
             # durable request so its identity, reason, and cascade are preserved.
-            async for event in self._interrupt_session_for_recovery(
+            async for event in self._session_finalization.interrupt_recovery(
                 RecoveryInterruptionRequest(
                     session=current,
                     registered_agent=registered_agent,
@@ -7603,7 +7545,7 @@ class RecoveryCoordinator:
                         session.id,
                         SessionStatus.INTERRUPTED,
                     )
-                async for event in self._interrupt_session_for_recovery(
+                async for event in self._session_finalization.interrupt_recovery(
                     RecoveryInterruptionRequest(
                         session=current_session,
                         registered_agent=registered_agent,
@@ -7628,7 +7570,7 @@ class RecoveryCoordinator:
                 is not None
             )
             if publication.persisted and not abandoned:
-                async for event in self._interrupt_session_for_recovery(
+                async for event in self._session_finalization.interrupt_recovery(
                     RecoveryInterruptionRequest(
                         session=session,
                         registered_agent=registered_agent,
@@ -8033,7 +7975,7 @@ class RecoveryCoordinator:
                 is not None
             )
             if publication.persisted and not abandoned:
-                async for event in self._interrupt_session_for_recovery(
+                async for event in self._session_finalization.interrupt_recovery(
                     RecoveryInterruptionRequest(
                         session=session,
                         registered_agent=registered_agent,
@@ -8192,7 +8134,7 @@ class RecoveryCoordinator:
                     steps=(
                         (
                             "abandoned manual recovery reconstruction finalization",
-                            lambda: self.finalize_abandoned_session_by_id(
+                            lambda: self._session_finalization.finalize_abandoned_session_by_id(
                                 claimed_session.id,
                                 registered_agent=registered_agent,
                                 registered_environment=registered_environment,
@@ -8628,7 +8570,7 @@ class RecoveryCoordinator:
                     steps=(
                         (
                             "ambiguous manual recovery claim finalization",
-                            lambda: self.finalize_abandoned_session_by_id(
+                            lambda: self._session_finalization.finalize_abandoned_session_by_id(
                                 reconciled_session.id,
                                 registered_agent=registered_agent,
                                 registered_environment=registered_environment,
@@ -8687,7 +8629,7 @@ class RecoveryCoordinator:
                 steps=(
                     (
                         "abandoned manual recovery finalization",
-                        lambda: self.finalize_abandoned_session_by_id(
+                        lambda: self._session_finalization.finalize_abandoned_session_by_id(
                             claimed_session.id,
                             registered_agent=registered_agent,
                             registered_environment=registered_environment,
@@ -8757,7 +8699,7 @@ class RecoveryCoordinator:
                     steps=(
                         (
                             "abandoned manual recovery finalization",
-                            lambda: self.finalize_abandoned_session_by_id(
+                            lambda: self._session_finalization.finalize_abandoned_session_by_id(
                                 claimed_session.id,
                                 registered_agent=registered_agent,
                                 registered_environment=registered_environment,
@@ -8787,7 +8729,7 @@ class RecoveryCoordinator:
             steps=(
                 (
                     "abandoned manual recovery finalization",
-                    lambda: self.finalize_abandoned_session_by_id(
+                    lambda: self._session_finalization.finalize_abandoned_session_by_id(
                         claimed_session.id,
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
@@ -8863,7 +8805,7 @@ class RecoveryCoordinator:
             )
 
             async def finalize_owned_interruption() -> None:
-                async for _ in self._interrupt_session_for_recovery(interruption_request):
+                async for _ in self._session_finalization.interrupt_recovery(interruption_request):
                     pass
 
             try:
@@ -8882,7 +8824,9 @@ class RecoveryCoordinator:
                         ),
                     )
                     raise claim.error
-                async for event in self._interrupt_session_for_recovery(interruption_request):
+                async for event in self._session_finalization.interrupt_recovery(
+                    interruption_request
+                ):
                     yield event
             except BaseException as exc:
                 authoritative_failure = exc
@@ -9484,7 +9428,7 @@ class RecoveryCoordinator:
                 steps=(
                     (
                         "abandoned session finalization",
-                        lambda: self.finalize_abandoned_session_by_id(
+                        lambda: self._session_finalization.finalize_abandoned_session_by_id(
                             session.id,
                             registered_agent=registered_agent,
                             registered_environment=registered_environment,
@@ -9515,12 +9459,14 @@ class RecoveryCoordinator:
                             steps=(
                                 (
                                     "abandoned session finalization",
-                                    lambda: self.finalize_abandoned_session_by_id(
-                                        session.id,
-                                        registered_agent=registered_agent,
-                                        registered_environment=registered_environment,
-                                        execution_profile=execution_profile_snapshot.profile,
-                                        invocation_context=invocation_context,
+                                    lambda: (
+                                        self._session_finalization.finalize_abandoned_session_by_id(
+                                            session.id,
+                                            registered_agent=registered_agent,
+                                            registered_environment=registered_environment,
+                                            execution_profile=execution_profile_snapshot.profile,
+                                            invocation_context=invocation_context,
+                                        )
                                     ),
                                 ),
                             ),
@@ -9536,7 +9482,7 @@ class RecoveryCoordinator:
                         steps=(
                             (
                                 "abandoned session finalization",
-                                lambda: self.finalize_abandoned_session_by_id(
+                                lambda: self._session_finalization.finalize_abandoned_session_by_id(
                                     session.id,
                                     registered_agent=registered_agent,
                                     registered_environment=registered_environment,
@@ -9611,7 +9557,7 @@ class RecoveryCoordinator:
                         SessionStatus.INTERRUPTED,
                     }:
                         raise
-                    async for event in self._interrupt_session_for_recovery(
+                    async for event in self._session_finalization.interrupt_recovery(
                         RecoveryInterruptionRequest(
                             session=current,
                             registered_agent=registered_agent,
@@ -9664,7 +9610,7 @@ class RecoveryCoordinator:
                 cancellation_baseline=cancellation_baseline,
             )
             if recovery_persisted and abandonment is None:
-                async for event in self._interrupt_session_for_recovery(
+                async for event in self._session_finalization.interrupt_recovery(
                     RecoveryInterruptionRequest(
                         session=session,
                         registered_agent=registered_agent,
@@ -9681,7 +9627,7 @@ class RecoveryCoordinator:
                     steps=(
                         (
                             "abandoned session finalization",
-                            lambda: self.finalize_abandoned_session_by_id(
+                            lambda: self._session_finalization.finalize_abandoned_session_by_id(
                                 session.id,
                                 registered_agent=registered_agent,
                                 registered_environment=registered_environment,
@@ -10252,452 +10198,6 @@ class RecoveryCoordinator:
                 _continued_tool_exposure_profile_id(pending_round.tool_exposure)
             ),
         )
-
-    async def finalize_abandoned_session_run(
-        self,
-        request: RecoveryAbandonedSessionRequest,
-    ) -> Event | None:
-        """Best-effort finalization for a live session whose event stream closed."""
-        if (
-            request.interaction_transition_failures
-            and request.interaction_transition is not None
-            and await self._record_committed_interaction_transition_cancellation(request)
-        ):
-            return None
-        payload: dict[str, Any] = {
-            "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
-            "reason": _ABANDONED_RUN_REASON,
-            "abandoned": True,
-        }
-        terminal_repair = request.retain_terminal_publication_repair
-        retained_repair_payload: dict[str, Any] | None = None
-        if not terminal_repair:
-            checkpoint = await self._session_store.load_checkpoint(request.session.id)
-            marker = (
-                None
-                if checkpoint is None
-                else checkpoint.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
-            )
-            terminal_repair = (
-                isinstance(marker, dict) and marker.get("terminal_publication_repair") is True
-            )
-            if terminal_repair:
-                if not isinstance(marker, dict):
-                    raise ValueError("Terminal publication repair marker must be an object.")
-                retained_repair_payload = copy_durable_record(
-                    marker, "terminal publication repair marker"
-                )
-        if terminal_repair:
-            payload["terminal_publication_repair"] = True
-        deadline = effective_deadline(
-            current_execution_deadline(), request.session.execution_deadline
-        )
-        if deadline.expires_at is not None:
-            payload["execution_deadline"] = deadline.inspection()
-        expired_boundary = request.native_admission_deadline or expired_execution_deadline()
-        payload["failure_evidence"] = FailureEvidence(
-            classification="deadline" if expired_boundary is not None else "interruption",
-            deadline=expired_boundary,
-            deadline_phase=(
-                "admission"
-                if request.native_admission_deadline is not None
-                else "in_flight"
-                if expired_boundary is not None
-                else None
-            ),
-            session_id=request.session.id,
-            run_epoch=request.session.run_epoch,
-            secondary_failures=bool(
-                request.interaction_transition_failures or request.provider_cancellation_failures
-            ),
-        ).model_dump(mode="json")
-        if request.interaction_transition_failures:
-            copied_failures = copy_durable_json_value(
-                list(request.interaction_transition_failures),
-                "interaction transition cancellation diagnostics",
-            )
-            if type(copied_failures) is not list:
-                raise TypeError("Interaction transition cancellation diagnostics must be a list.")
-            payload["interaction_transition_failures"] = copied_failures
-        if request.provider_cancellation_failures or terminal_repair:
-            if terminal_repair:
-                payload["terminal_publication_repair"] = True
-            if not request.provider_cancellation_failures:
-                payload["interruption_request_id"] = str(uuid4())
-            else:
-                copied_provider_failures = copy_provider_cancellation_failures(
-                    request.provider_cancellation_failures
-                )
-                payload["provider_cancellation_failures"] = [
-                    dict(item) for item in copied_provider_failures
-                ]
-                payload["interruption_request_id"] = str(uuid4())
-            if retained_repair_payload is not None:
-                payload = retained_repair_payload
-            # The status transition and terminal-event publication are
-            # separate durable operations. Persist exact repair authority
-            # before either operation so a publication failure or process loss
-            # cannot leave an interrupted session with no diagnostic evidence.
-            await self._session_store.publish_checkpoint_and_events(
-                request.session.id,
-                checkpoint_transform=self._pending_session_interrupt_checkpoint(
-                    payload,
-                    self._clock(),
-                ),
-                events=[],
-                expected_statuses={request.session.status},
-                expected_run_epoch=request.session.run_epoch,
-            )
-
-        async def clear_provider_interrupt_marker(
-            *,
-            require_interrupted: bool,
-        ) -> None:
-            if not request.provider_cancellation_failures and not terminal_repair:
-                return
-
-            def clear_published_interrupt(
-                current_session: Session,
-                checkpoint: dict[str, Any] | None,
-            ) -> dict[str, Any] | None:
-                if checkpoint is None:
-                    return None
-                updated = copy_durable_record(checkpoint, "checkpoint")
-                current = updated.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
-                if current is None:
-                    return updated
-                if current != payload:
-                    raise RuntimeError(
-                        "Pending provider cancellation interruption identity changed."
-                    )
-                if require_interrupted and current_session.status is not SessionStatus.INTERRUPTED:
-                    raise RuntimeError(
-                        "Provider cancellation interruption published before terminal status."
-                    )
-                updated.pop(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
-                return updated
-
-            await self._session_store.publish_checkpoint_and_events(
-                request.session.id,
-                checkpoint_transform=clear_published_interrupt,
-                events=[],
-                expected_statuses=({SessionStatus.INTERRUPTED} if require_interrupted else None),
-                expected_run_epoch=request.session.run_epoch,
-            )
-
-        try:
-            finalized = await self._abandoned_turn_completed(
-                RecoveryAbandonedTurnRequest(
-                    session=request.session,
-                    registered_agent=request.registered_agent,
-                    registered_environment=request.registered_environment,
-                    environment_name=request.environment_name,
-                    run_started_at=request.run_started_at,
-                    usage_tracker=request.turn_usage_tracker,
-                    active_run=request.active_run,
-                    execution_profile=request.execution_profile,
-                    invocation_context=request.invocation_context,
-                )
-            )
-        except InteractionLifecyclePublicationRejected:
-            raise
-        except BaseException as transition_failure:
-            try:
-                active_model_completion = (
-                    await self._session_store.load_active_model_completion_stage(request.session.id)
-                )
-            except BaseException as inspection_failure:
-                add_exception_note_safely(
-                    transition_failure,
-                    "Active model-completion recovery authority inspection also failed: "
-                    f"{type(inspection_failure).__name__}.",
-                )
-                raise transition_failure from inspection_failure
-            if active_model_completion is not None:
-                raise
-            try:
-                finalized = await self._session_store.transition_status(
-                    request.session.id,
-                    from_statuses={
-                        SessionStatus.PENDING,
-                        SessionStatus.RUNNING,
-                        SessionStatus.INTERRUPTING,
-                    },
-                    to_status=SessionStatus.INTERRUPTED,
-                )
-            except KeyError:
-                return
-            except ValueError:
-                loaded = await self._session_store.load(request.session.id)
-                if loaded is None or loaded.status is not SessionStatus.INTERRUPTED:
-                    if loaded is not None:
-                        await clear_provider_interrupt_marker(require_interrupted=False)
-                    return
-                finalized = loaded
-
-        terminal_event: Event | None = None
-
-        async def emit_interrupted() -> None:
-            nonlocal terminal_event
-            async for emitted in self._terminal_event_publication.publish_recovered(
-                RecoveryTerminalEventRequest(
-                    event=Event(
-                        type=EventType.SESSION_INTERRUPTED,
-                        session_id=finalized.id,
-                        agent_name=request.registered_agent.spec.name,
-                        environment_name=request.environment_name,
-                        payload=payload,
-                    ),
-                    phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
-                    session=finalized,
-                    registered_agent=request.registered_agent,
-                    registered_environment=request.registered_environment,
-                    execution_profile=request.execution_profile,
-                    invocation_context=request.invocation_context,
-                    run_runtime_hooks=request.run_terminal_hooks,
-                )
-            ):
-                if (
-                    emitted.type is EventType.SESSION_INTERRUPTED
-                    and emitted.session_id == finalized.id
-                ):
-                    terminal_event = copy_event(emitted)
-
-        if (
-            request.interaction_transition_failures
-            or request.provider_cancellation_failures
-            or terminal_repair
-        ):
-            # These failures are the only durable explanation for an ambiguous
-            # transition that exact readback proved absent. Let the owned
-            # cancellation cleanup preserve a publication failure instead of
-            # silently discarding both pieces of evidence.
-            await emit_interrupted()
-            if request.provider_cancellation_failures:
-                if terminal_event is None:
-                    raise RuntimeError(
-                        "Provider cancellation interruption produced no terminal evidence."
-                    )
-                require_interruption_event_matches_pending_marker(
-                    terminal_event,
-                    payload,
-                )
-            await clear_provider_interrupt_marker(require_interrupted=True)
-        else:
-            with contextlib.suppress(BaseException):
-                await emit_interrupted()
-        return terminal_event
-
-    async def _record_committed_interaction_transition_cancellation(
-        self,
-        request: RecoveryAbandonedSessionRequest,
-    ) -> bool:
-        """Record acknowledgement failures only after exact durable readback."""
-
-        if request.interaction_transition is None:
-            return False
-        return await self._record_durable_interaction_transition_cancellation(
-            session=request.session,
-            transition=request.interaction_transition,
-            failures=request.interaction_transition_failures,
-            agent_name=request.registered_agent.spec.name,
-            environment_name=request.environment_name,
-            expected_recovery_claim_id=(request.interaction_transition_recovery_claim_id),
-        )
-
-    async def _record_durable_interaction_transition_cancellation(
-        self,
-        *,
-        session: Session,
-        transition: InteractionTransitionSpec,
-        failures: tuple[dict[str, Any], ...],
-        agent_name: str,
-        environment_name: str | None,
-        expected_recovery_claim_id: str | None,
-    ) -> bool:
-        """Record an exact transition failure without resolving mutable registrations."""
-
-        if agent_name != session.agent_name or environment_name != session.environment_name:
-            raise RuntimeError(
-                "Interaction transition cancellation identity conflicts with its session."
-            )
-        expected = copy_interaction_transition_spec(transition)
-        if (
-            expected.event.session_id != session.id
-            or expected.event.interaction_id is None
-            or expected.event.type
-            not in {
-                *INTERACTION_TERMINAL_EVENT_TYPES,
-                EventType.INTERACTION_PAUSED,
-            }
-        ):
-            raise RuntimeError(
-                "Interaction transition cancellation evidence is not a settled event "
-                "for the abandoned session."
-            )
-        if expected_recovery_claim_id is None:
-            receipt = await self._session_store.load_interaction_transition_receipt(
-                session.id,
-                transition=expected,
-            )
-        else:
-            receipt = await self._session_store.load_interaction_transition_receipt(
-                session.id,
-                transition=expected,
-                expected_recovery_claim_id=expected_recovery_claim_id,
-            )
-        if receipt is None:
-            return False
-        receipt = InteractionTransitionReceiptResult.model_validate(receipt)
-        if receipt.transition != expected or receipt.session.id != session.id:
-            raise RuntimeError(
-                "Interaction transition cancellation evidence conflicts with its durable receipt."
-            )
-        copied_failures = copy_durable_json_value(
-            list(failures),
-            "interaction transition cancellation diagnostics",
-        )
-        if type(copied_failures) is not list:
-            raise TypeError("Interaction transition cancellation diagnostics must be a list.")
-        await self._event_writer.persist(
-            event_with_runtime_envelope_authority(
-                Event(
-                    type=(EventType.RUNTIME_INTERACTION_TRANSITION_ACKNOWLEDGEMENT_FAILED),
-                    session_id=session.id,
-                    agent_name=agent_name,
-                    environment_name=environment_name,
-                    payload={
-                        "transition_event_type": str(expected.event.type),
-                        "interaction_transition_failures": copied_failures,
-                    },
-                ),
-                "session_id",
-            )
-        )
-        return True
-
-    async def finalize_abandoned_session_by_id(
-        self,
-        session_id: str,
-        *,
-        propagate_interaction_publication_rejection: bool = False,
-        registered_agent: runtime_records.RegisteredAgentState | None = None,
-        registered_environment: runtime_records.RegisteredEnvironment | None = None,
-        execution_profile: ExecutionProfileIdentity | None = None,
-        invocation_context: InvocationContext | None = None,
-        run_terminal_hooks: bool = True,
-    ) -> None:
-        """Idempotently finalize a live session when setup-time streaming is abandoned."""
-        try:
-            session = await self._session_store.load(session_id)
-        except Exception:
-            return
-        if session is None or session.status not in {
-            SessionStatus.PENDING,
-            SessionStatus.RUNNING,
-            SessionStatus.INTERRUPTING,
-        }:
-            return
-        if registered_agent is None:
-            try:
-                registered_agent = self._resolve_registered_agent(session.agent_name)
-            except Exception:
-                await self._finalize_abandoned_without_registered_runtime(session.id)
-                return
-            try:
-                registered_environment = self._resolve_registered_environment(
-                    session.environment_name
-                )
-            except Exception:
-                await self._finalize_abandoned_without_registered_runtime(session.id)
-                return
-        elif (
-            registered_agent.spec.name != session.agent_name
-            or _environment_name(registered_environment) != session.environment_name
-        ):
-            raise RuntimeError(
-                "Frozen abandonment runtime does not match the durable session identity."
-            )
-        if session.status == SessionStatus.INTERRUPTING:
-            try:
-                async for _ in self._interrupt_session_for_recovery(
-                    RecoveryInterruptionRequest(
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        environment_name=_environment_name(registered_environment),
-                        execution_profile=execution_profile,
-                        invocation_context=invocation_context,
-                        run_terminal_hooks=run_terminal_hooks,
-                    )
-                ):
-                    pass
-                return
-            except BaseException:
-                # Preserve the existing best-effort fallback if the durable
-                # operator-interruption payload cannot be finalized.
-                pass
-        try:
-            await self.finalize_abandoned_session_run(
-                RecoveryAbandonedSessionRequest(
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    environment_name=_environment_name(registered_environment),
-                    execution_profile=execution_profile,
-                    invocation_context=invocation_context,
-                    run_terminal_hooks=run_terminal_hooks,
-                )
-            )
-        except InteractionLifecyclePublicationRejected:
-            if propagate_interaction_publication_rejection:
-                raise
-        except BaseException:
-            pass
-
-    async def _finalize_abandoned_without_registered_runtime(self, session_id: str) -> None:
-        try:
-            finalized = await self._session_store.transition_status(
-                session_id,
-                from_statuses={
-                    SessionStatus.PENDING,
-                    SessionStatus.RUNNING,
-                    SessionStatus.INTERRUPTING,
-                },
-                to_status=SessionStatus.INTERRUPTED,
-            )
-        except Exception:
-            return
-        with contextlib.suppress(BaseException):
-            terminal_event = Event(
-                type=EventType.SESSION_INTERRUPTED,
-                session_id=finalized.id,
-                agent_name=finalized.agent_name,
-                environment_name=finalized.environment_name,
-                payload={
-                    "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
-                    "reason": _ABANDONED_RUN_REASON,
-                    "abandoned": True,
-                },
-            )
-            checkpoint = await self._session_store.load_checkpoint(finalized.id)
-            run_operation = _session_run_operation_from_checkpoint(checkpoint)
-            if run_operation is not None:
-                if run_operation.run_epoch != finalized.run_epoch:
-                    raise RuntimeError(
-                        "Abandoned session run operation does not match the active run epoch."
-                    )
-                terminal_event = _event_with_session_run_operation(
-                    terminal_event,
-                    run_operation,
-                )
-            await self._event_writer.emit(terminal_event)
-            if run_operation is not None:
-                await self.terminal_finalization.clear_run_operation(
-                    session_id=finalized.id,
-                    operation=run_operation,
-                    terminal_evidence_durable=True,
-                )
 
     async def recover_incomplete_session(
         self,
@@ -12583,101 +12083,6 @@ class RecoveryCoordinator:
                     authoritative_failure=authoritative_failure,
                 )
 
-    async def _reconcile_terminal_evidence_before_continuation(
-        self,
-        *,
-        session: Session,
-        checkpoint: dict[str, Any] | None,
-    ) -> tuple[Session, dict[str, Any] | None]:
-        """Finish a previous run's terminal publication before claiming the next run."""
-        if session.status not in _RECOVERY_RESUMABLE_SESSION_STATUSES:
-            if _session_run_operation_from_checkpoint(checkpoint) is None:
-                return session, checkpoint
-            raise RuntimeError(
-                "A non-terminal session retains incomplete terminal evidence for a prior run."
-            )
-        if not await self.terminal_finalization.repair_required(
-            session=session,
-            checkpoint=checkpoint,
-        ):
-            return session, checkpoint
-        if self._session_control.has_active_tasks(session.id, exclude_current_control_task=True):
-            raise RuntimeError(
-                f"Session has active work while terminal evidence is incomplete: {session.id}"
-            )
-        await self.terminal_finalization.repair_owned(
-            session=session,
-            inactive_for_seconds=None,
-            previous_status=session.status,
-        )
-        current = await self._recovery_ownership.require_session(session.id)
-        current_checkpoint = await self._session_store.load_checkpoint(session.id)
-        if await self.terminal_finalization.repair_required(
-            session=current,
-            checkpoint=current_checkpoint,
-        ):
-            current_claim = _incomplete_recovery_claim_from_checkpoint(current_checkpoint)
-            if current_claim is not None:
-                raise RuntimeError("Session has an active incomplete-session recovery operation.")
-            raise RuntimeError(
-                "Session terminal evidence recovery did not finish the previous run boundary."
-            )
-        return current, current_checkpoint
-
-    async def has_completed_queued_predecessor(self, session: Session, event: Event) -> bool:
-        """Authenticate a completed interaction in an interrupted queue-bearing run."""
-        if (
-            session.status is not SessionStatus.INTERRUPTED
-            or event.type is not EventType.INTERACTION_COMPLETED
-        ):
-            return False
-        with _invocation_lifecycle_authority_read_scope():
-            checkpoint = await self._session_store.load_checkpoint(session.id)
-        active = active_invocation_execution_profile_from_checkpoint(checkpoint)
-        if (
-            active is None
-            or active.session_id != session.id
-            or active.interaction_id != event.interaction_id
-        ):
-            return False
-        receipt = await self._session_store.load_historical_interaction_settlement(
-            session.id,
-            expected_session_instance_id=session.instance_id,
-            expected_event=event,
-            expected_profile=active.profile,
-        )
-        if (
-            receipt is None
-            or receipt.status_changed
-            or not receipt.transition.only_if_no_queued_messages
-            or receipt.transition.to_status is not SessionStatus.COMPLETED
-            or receipt.session.status is not SessionStatus.RUNNING
-            or receipt.session.run_epoch != active.run_epoch
-        ):
-            return False
-        from cayu.sessions._invocation_lifecycle import (
-            _require_released_invocation_command_receipt,
-        )
-
-        # Session terminal events are session-scoped, not interaction-scoped.
-        # The native release receipt binds this terminal session to the exact
-        # predecessor interaction/profile/epoch instead.
-        _require_released_invocation_command_receipt(
-            session,
-            checkpoint,
-            session_id=session.id,
-            session_instance_id=session.instance_id,
-            active_profile=active,
-        )
-        inspection = await self._terminal_evidence.inspect(session=session, checkpoint=checkpoint)
-        return (
-            inspection.event is not None
-            and inspection.event.type is EventType.SESSION_INTERRUPTED
-            and inspection.event.interaction_id is None
-            and inspection.pending_interrupt_payload is None
-            and inspection.run_operation is None
-        )
-
     def detached_recovery_work(self) -> set[asyncio.Future[Any]]:
         """Recovery work still running after its caller stopped waiting.
 
@@ -13273,9 +12678,8 @@ class RecoveryCoordinator:
                     session.id,
                     from_statuses={session.status},
                     to_status=SessionStatus.INTERRUPTING,
-                    checkpoint_transform=self._pending_session_interrupt_checkpoint(
-                        interrupt_payload,
-                        self._clock(),
+                    checkpoint_transform=_checkpoint_with_pending_session_interrupt(
+                        interrupt_payload, cascade_created_at=self._clock()
                     ),
                 )
             if session.status is SessionStatus.INTERRUPTING:
@@ -13321,9 +12725,8 @@ class RecoveryCoordinator:
                     session.id,
                     from_statuses={session.status},
                     to_status=SessionStatus.INTERRUPTING,
-                    checkpoint_transform=self._pending_session_interrupt_checkpoint(
-                        provider_interrupt_payload,
-                        self._clock(),
+                    checkpoint_transform=_checkpoint_with_pending_session_interrupt(
+                        provider_interrupt_payload, cascade_created_at=self._clock()
                     ),
                 )
             elif session.status is not SessionStatus.INTERRUPTING:
@@ -13418,7 +12821,7 @@ class RecoveryCoordinator:
                     raise RuntimeError(
                         "Provider-operation failure recovery has no execution profile."
                     )
-                async for event in self._fail_provider_operation(
+                async for event in self._session_finalization.fail_recovered_provider_operation(
                     ProviderOperationFailureRequest(
                         resolution_event=resolution_result.event,
                         session=session,
@@ -13773,11 +13176,8 @@ class RecoveryCoordinator:
                 raise SessionRuntimePublicationConflict(
                     "Pending user-input recovery authority is ambiguous."
                 )
-        if (
-            pending_tool_round is None
-            and await self._pending_tool_round_recovery.materialize_deferred_input_if_present(
-                session.id
-            )
+        if pending_tool_round is None and await self._deferred_input.materialize_if_present(
+            session.id
         ):
             actions.append(IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND)
 
@@ -14064,9 +13464,8 @@ class RecoveryCoordinator:
                     session.id,
                     from_statuses={session.status},
                     to_status=SessionStatus.INTERRUPTING,
-                    checkpoint_transform=self._pending_session_interrupt_checkpoint(
-                        interrupt_payload,
-                        self._clock(),
+                    checkpoint_transform=_checkpoint_with_pending_session_interrupt(
+                        interrupt_payload, cascade_created_at=self._clock()
                     ),
                 )
             except ValueError:
@@ -14321,9 +13720,8 @@ class RecoveryCoordinator:
                     session.id,
                     from_statuses={SessionStatus.FAILED},
                     to_status=SessionStatus.INTERRUPTING,
-                    checkpoint_transform=self._pending_session_interrupt_checkpoint(
-                        interrupt_payload,
-                        self._clock(),
+                    checkpoint_transform=_checkpoint_with_pending_session_interrupt(
+                        interrupt_payload, cascade_created_at=self._clock()
                     ),
                 )
             session = await self._finalize_interrupting_for_recovery(
@@ -14553,7 +13951,7 @@ class RecoveryCoordinator:
         recovery_claim_id: str | None = None,
     ) -> Session:
         if session.status == SessionStatus.INTERRUPTING:
-            async for event in self._interrupt_session_for_recovery(
+            async for event in self._session_finalization.interrupt_recovery(
                 RecoveryInterruptionRequest(
                     recovery_claim_id=recovery_claim_id,
                     preserve_interaction_id=preserve_interaction_id,

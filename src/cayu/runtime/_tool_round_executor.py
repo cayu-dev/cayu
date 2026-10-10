@@ -3,8 +3,8 @@
 This module is deliberately below :class:`CayuApp`.  It owns one complete
 tool-round lifecycle without importing or accepting the application facade.
 Session-level limit terminalization and interrupted-round recovery remain
-orchestration boundaries supplied by the session engine and recovery coordinator
-through narrow callbacks.
+operations supplied by the independent session-finalization and pending-round
+recovery components.
 """
 
 from __future__ import annotations
@@ -31,13 +31,11 @@ from cayu._task_wait import (
     unexpected_child_cancellation_error,
 )
 from cayu._validation import (
-    copy_durable_json_object,
     copy_durable_record,
     copy_json_value,
 )
 from cayu.approvals.tools import (
     PendingToolApproval,
-    PendingToolCallApproval,
     ToolPolicyEvidence,
 )
 from cayu.approvals.user_input import (
@@ -51,7 +49,6 @@ from cayu.approvals.user_input import (
     public_pending_user_input_prompt,
     user_input_lifecycle_authority_from_checkpoint,
 )
-from cayu.artifacts._images import ImageDecodePolicy
 from cayu.budgets._run_limit_accounting import (
     RunLimitAccountingContext,
     pause_run_limit_accounting_context,
@@ -79,12 +76,8 @@ from cayu.execution_units import (
     ToolRoundIdentity,
     copy_tool_round_identity,
 )
-from cayu.knowledge._publication import KnowledgePublicationScope
 from cayu.mcp.tools import McpToolAdapter, McpToolset
 from cayu.messages import Message
-from cayu.observability.hooks import (
-    RuntimeHookRuntime,
-)
 from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runners._cleanup import (
     attach_runner_cancellation_failure,
@@ -99,9 +92,7 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
-from cayu.runtime._auxiliary_inference import AuxiliaryInferenceOwner
 from cayu.runtime._auxiliary_invocation import AuxiliaryInvocationPolicy
-from cayu.runtime._browser_control_service import BrowserControlService
 from cayu.runtime._durable_tool_round import DurableToolRound
 from cayu.runtime._durable_tool_round import (
     InterruptedToolRoundRequest as InterruptedToolRoundRequest,
@@ -132,8 +123,6 @@ from cayu.runtime._session_control import (
 )
 from cayu.runtime._tool_invocation.admission import (
     ToolApprovalRequired,
-    ToolInvocationAdmission,
-    _planned_pending_tool_round,
     _require_matching_policy_round,
     _taint_labels_for_source_tool,
     _tool_dispatch_authority_is_current,
@@ -149,15 +138,12 @@ from cayu.runtime._tool_invocation.context import (
     _workspace_id,
 )
 from cayu.runtime._tool_invocation.hooks import (
-    ToolInvocationHooks,
     _redact_event_for_invocation,
 )
 from cayu.runtime._tool_invocation.invocation import ToolInvocation
-from cayu.runtime._tool_invocation.resources import ToolInvocationResources
 from cayu.runtime._tool_invocation.terminal import (
     DeferredTerminalCaptureRecorder,
     DeferredTerminalStager,
-    ToolTerminalPublisher,
 )
 from cayu.runtime._tool_round_staging import (
     CheckpointTransform,
@@ -218,9 +204,6 @@ from cayu.tools.policy import (
     ToolPolicyDecision,
     ToolPolicyResult,
 )
-from cayu.tools.result_projection import (
-    ToolResultProjectionPolicy,
-)
 from cayu.vaults.redaction import SecretRedactor
 
 CheckpointTransformFactory = Callable[[dict[str, Any]], CheckpointTransform]
@@ -247,15 +230,6 @@ class ToolRoundLimitRequest:
 LimitEventStream = Callable[[ToolRoundLimitRequest], AsyncIterator[Event]]
 InterruptedRoundEventStream = Callable[[InterruptedToolRoundRequest], AsyncGenerator[Event, None]]
 
-_AMBIGUOUS_POLICY_RECOVERY_REASON = (
-    "Tool policy planning was interrupted without a durable outcome; "
-    "explicit approval is required before execution."
-)
-_AMBIGUOUS_POLICY_RECOVERY_METADATA = {
-    "recovered": True,
-    "policy_evaluation": "ambiguous",
-}
-
 
 class UserInputRequired(Exception):
     """Internal control signal for a durably checkpointed user-input pause."""
@@ -276,26 +250,19 @@ class ToolRoundExecutor:
     def __init__(
         self,
         *,
+        invocation: ToolInvocation,
         session_store: SessionStore,
         event_writer: RuntimeEventWriter,
-        auxiliary_inference: AuxiliaryInferenceOwner,
         session_control: SessionControl[SessionUsageTracker],
-        hook_runtime: RuntimeHookRuntime,
-        runtime_hooks: tuple[runtime_records.RegisteredRuntimeHook, ...],
         mcp_manifest_policy: McpManifestPolicy | None,
-        tool_result_projection_policy: ToolResultProjectionPolicy | None,
         secret_redactor: SecretRedactor,
-        tool_timeout_seconds: float | None,
         max_parallel_tool_calls: int,
         clock: Callable[[], datetime],
         checkpoint_transform: CheckpointTransformFactory,
         apply_limit_evaluation: LimitEventStream,
         close_interrupted_round: InterruptedRoundEventStream,
-        knowledge_publication_scope: KnowledgePublicationScope,
-        browser_control_service: BrowserControlService | None = None,
-        image_decode_policy: ImageDecodePolicy | None = None,
-        strict_common_budget_admission: bool = False,
     ) -> None:
+        self.invocation = invocation
         self._session_store = session_store
         self._event_writer = event_writer
         self._session_control = session_control
@@ -303,45 +270,9 @@ class ToolRoundExecutor:
         self._secret_redactor = secret_redactor
         self._max_parallel_tool_calls = max_parallel_tool_calls
         self._clock = clock
-        resources = ToolInvocationResources(
-            session_store=session_store,
-            image_decode_policy=image_decode_policy,
-            knowledge_publication_scope=knowledge_publication_scope,
-            browser_control_service=browser_control_service,
-            clock=clock,
-        )
-        admission = ToolInvocationAdmission(
-            session_store=session_store,
-            event_writer=event_writer,
-            secret_redactor=secret_redactor,
-            clock=clock,
-        )
-        hooks = ToolInvocationHooks(
-            event_writer=event_writer, hook_runtime=hook_runtime, runtime_hooks=runtime_hooks
-        )
-        terminals = ToolTerminalPublisher(
-            event_writer=event_writer,
-            hooks=hooks,
-            secret_redactor=secret_redactor,
-            projection_policy=tool_result_projection_policy,
-            clock=clock,
-        )
         self._checkpoint_transform = checkpoint_transform
         self._apply_limit_evaluation = apply_limit_evaluation
         self._close_interrupted_round = close_interrupted_round
-        self.invocation = ToolInvocation(
-            session_store=session_store,
-            event_writer=event_writer,
-            auxiliary_inference=auxiliary_inference,
-            session_control=session_control,
-            admission=admission,
-            hooks=hooks,
-            terminals=terminals,
-            resources=resources,
-            secret_redactor=secret_redactor,
-            tool_timeout_seconds=tool_timeout_seconds,
-            strict_common_budget_admission=strict_common_budget_admission,
-        )
 
     def create_run(
         self,
@@ -501,254 +432,6 @@ class ToolRoundExecutor:
                 policy_result=approval_policy_result,
             ),
         )
-
-    async def fail_closed_recovery_policy_plan(
-        self,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        tool_calls: list[runtime_records.ToolCallRequest],
-        request_metadata: dict[str, Any],
-        durable_tool_calls: list[PendingToolCallApproval] | None = None,
-        tool_exposure: ResolvedToolExposureAuthority | None = None,
-    ) -> runtime_records.ToolRoundPolicyPlan:
-        """Build a manual gate without replaying an outcome-ambiguous policy.
-
-        A process can stop after ``authorize()`` returns but before its result is
-        durably published. Re-running a stateful or time-sensitive policy cannot
-        prove what that earlier invocation decided. Ambiguous registered calls
-        therefore carry explicit non-authoritative evidence and no policy
-        decision. The round still pauses for operator acknowledgement, but that
-        acknowledgement can only close the ambiguous calls as blocked; it can
-        never authorize dispatch. Recognized durable legacy outcomes remain
-        authoritative.
-        """
-
-        if durable_tool_calls is not None:
-            if [
-                (call.tool_call_id, call.tool_name, call.arguments) for call in durable_tool_calls
-            ] != [(call.id, call.name, call.arguments) for call in tool_calls]:
-                raise RuntimeError(
-                    "Durable recovery policy calls do not match the pending tool round."
-                )
-            durable_by_id = {call.tool_call_id: call for call in durable_tool_calls}
-        else:
-            durable_by_id = {}
-        recognized_decisions = {decision.value for decision in ToolPolicyDecision}
-        policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] = []
-        authoritative_approval_tool_call: runtime_records.ToolCallRequest | None = None
-        ambiguous_tool_call: runtime_records.ToolCallRequest | None = None
-        executable_names = registered_agent.executable_tool_names
-        exposed_names = (
-            executable_names
-            if tool_exposure is None
-            else frozenset((*tool_exposure.tool_names, *registered_agent.runtime_tools))
-        )
-        has_authorizable_call = any(
-            call.name in executable_names
-            and (call.name in exposed_names or call.targeted_tool_invocation is not None)
-            and _tool_dispatch_authority_is_current(registered_agent, call.name)
-            for call in tool_calls
-        )
-        taint_labels = (
-            await self.invocation.admission.prior_taint_labels(
-                session_id=session.id,
-                policy=registered_agent.tool_policy,
-                request_metadata=request_metadata,
-            )
-            if has_authorizable_call
-            else set()
-        )
-        active_taint_labels: dict[str, frozenset[str]] = {}
-        for tool_call in tool_calls:
-            active_taint_labels[tool_call.id] = frozenset(taint_labels)
-            if tool_call.name not in executable_names or not _tool_dispatch_authority_is_current(
-                registered_agent,
-                tool_call.name,
-            ):
-                policy_outcomes.append(
-                    runtime_records.ToolCallPolicyOutcome(
-                        call=tool_call,
-                        result=None,
-                        evidence=ToolPolicyEvidence.UNREGISTERED,
-                    )
-                )
-                continue
-            if tool_call.name not in exposed_names and tool_call.targeted_tool_invocation is None:
-                policy_outcomes.append(
-                    runtime_records.ToolCallPolicyOutcome(
-                        call=tool_call,
-                        result=None,
-                        evidence=ToolPolicyEvidence.UNEXPOSED,
-                    )
-                )
-                continue
-            durable_call = durable_by_id.get(tool_call.id)
-            policy_result: ToolPolicyResult | None
-            policy_evidence: ToolPolicyEvidence
-            if durable_call is not None and durable_call.policy_decision in recognized_decisions:
-                restored = approval_support.policy_result_from_pending_tool_call(durable_call)
-                if restored is None:
-                    raise AssertionError("Recognized durable policy decision was not restored.")
-                policy_result = restored
-                policy_evidence = ToolPolicyEvidence.AUTHORITATIVE
-                active_taint_labels[tool_call.id] = frozenset(durable_call.active_taint_labels)
-            else:
-                policy_result = None
-                policy_evidence = ToolPolicyEvidence.AMBIGUOUS
-            policy_outcomes.append(
-                runtime_records.ToolCallPolicyOutcome(
-                    call=tool_call,
-                    result=policy_result,
-                    evidence=policy_evidence,
-                )
-            )
-            if (
-                authoritative_approval_tool_call is None
-                and policy_result is not None
-                and policy_result.decision == ToolPolicyDecision.REQUIRE_APPROVAL
-            ):
-                authoritative_approval_tool_call = tool_call
-            if ambiguous_tool_call is None and policy_evidence is ToolPolicyEvidence.AMBIGUOUS:
-                ambiguous_tool_call = tool_call
-            if policy_result is not None:
-                taint_labels.update(
-                    _taint_labels_for_source_tool(
-                        registered_agent.tool_policy,
-                        tool_call.name,
-                        policy_result=policy_result,
-                    )
-                )
-
-        # A durable REQUIRE_APPROVAL decision must own the visible gate even
-        # when an earlier sibling is ambiguous. Otherwise a "continue safely"
-        # acknowledgement for the ambiguous call could also execute the
-        # authoritatively approval-gated sibling without presenting that
-        # approval as the operator's decision.
-        approval_tool_call = authoritative_approval_tool_call or ambiguous_tool_call
-        if approval_tool_call is None:
-            return runtime_records.ToolRoundPolicyPlan(
-                outcomes=policy_outcomes,
-                pending_approval=None,
-                active_taint_labels=active_taint_labels,
-            )
-        approval_outcome = next(
-            outcome for outcome in policy_outcomes if outcome.call.id == approval_tool_call.id
-        )
-        approval_result = approval_outcome.result
-        if approval_outcome.evidence is ToolPolicyEvidence.AMBIGUOUS:
-            approval_result = ToolPolicyResult(
-                decision=ToolPolicyDecision.REQUIRE_APPROVAL,
-                reason=_AMBIGUOUS_POLICY_RECOVERY_REASON,
-                metadata=_AMBIGUOUS_POLICY_RECOVERY_METADATA,
-            )
-        if approval_result is None:
-            raise AssertionError("Recovery approval lost its display policy result.")
-        return runtime_records.ToolRoundPolicyPlan(
-            outcomes=policy_outcomes,
-            active_taint_labels=active_taint_labels,
-            pending_approval=runtime_records.PendingToolApprovalPlan(
-                call=approval_tool_call,
-                calls=[outcome.call for outcome in policy_outcomes],
-                policy_outcomes=policy_outcomes,
-                policy_result=approval_result,
-            ),
-        )
-
-    @timed_phase("admission")
-    async def checkpoint_tool_round_policy_plan(
-        self,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        tool_calls: list[runtime_records.ToolCallRequest],
-        policy_outcomes: list[runtime_records.ToolCallPolicyOutcome],
-        active_taint_by_id: Mapping[str, frozenset[str]],
-        tool_round_identity: ToolRoundIdentity,
-        recovered: bool = False,
-    ) -> pending_rounds.PendingToolRound:
-        """Atomically replace an unplanned round with its durable policy plan."""
-
-        tool_round_identity = copy_tool_round_identity(tool_round_identity)
-        redactor = _redactor_for_tool_calls(
-            self._secret_redactor,
-            registered_agent=registered_agent,
-            tool_calls=tool_calls,
-        )
-        checkpoint = await self._session_store.load_checkpoint(session.id)
-        checkpoint = {} if checkpoint is None else copy_durable_record(checkpoint, "checkpoint")
-        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
-            checkpoint,
-            redactor=self._secret_redactor,
-            consume_on_rejection=True,
-            runtime_session=session,
-        )
-        if pending_round is None:
-            raise RuntimeError("Session has no pending tool round for its policy plan.")
-        _require_matching_policy_round(
-            pending_round=pending_round,
-            tool_round_identity=tool_round_identity,
-            tool_calls=tool_calls,
-        )
-        if (
-            pending_approval_reader.pending_approval_from_checkpoint(
-                checkpoint,
-                redactor=self._secret_redactor,
-                consume_on_rejection=True,
-            )
-            is not None
-        ):
-            raise RuntimeError("Session already has a pending tool approval.")
-        planned_round = _planned_pending_tool_round(
-            pending_round=pending_round,
-            tool_calls=tool_calls,
-            policy_outcomes=policy_outcomes,
-            active_taint_by_id=active_taint_by_id,
-            redactor=redactor,
-        )
-        # Retain the exact durable source for the compare-and-swap. Additive
-        # model defaults, including assistant publication evidence introduced
-        # after an older v2 stage was written, must not fabricate a mismatch.
-        source_round_payload = copy_json_value(
-            checkpoint[pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY],
-            "pending_tool_round",
-        )
-        eligible_statuses = {session.status} if recovered else {SessionStatus.RUNNING}
-        planned_round_payload = _require_secret_free_durable_object(
-            planned_round.model_dump(mode="json"),
-            redactor=redactor,
-            field_name="pending_tool_round",
-            schema_root=pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY,
-        )
-
-        def publish_policy_plan(
-            current_session: Session,
-            current_checkpoint: dict[str, Any] | None,
-        ) -> dict[str, Any]:
-            if (
-                current_session.status not in eligible_statuses
-                or current_session.run_epoch != session.run_epoch
-            ):
-                raise RuntimeError("Tool policy publication lost its run fence.")
-            current = (
-                {}
-                if current_checkpoint is None
-                else copy_durable_record(current_checkpoint, "checkpoint")
-            )
-            if (
-                current.get(pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
-                != source_round_payload
-            ):
-                raise RuntimeError("Pending tool round changed before policy publication.")
-            if pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY in current:
-                raise RuntimeError("Session already has a pending tool approval.")
-            if pending_approval_reader.APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY in current:
-                raise RuntimeError("Session has an orphaned approval resolution intent.")
-            current[pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = planned_round_payload
-            return copy_durable_json_object(current, "checkpoint")
-
-        await self._session_store.transform_checkpoint(session.id, publish_policy_plan)
-        return planned_round
 
     @timed_phase("round_commit", shared=True)
     async def checkpoint_pending_user_input(
@@ -1623,13 +1306,15 @@ class ToolRoundRun:
         if policy_plan.pending_approval is None:
             try:
                 try:
-                    planned_round = await executor.checkpoint_tool_round_policy_plan(
-                        session=session,
-                        registered_agent=self._registered_agent,
-                        tool_calls=tool_calls,
-                        policy_outcomes=policy_plan.outcomes,
-                        active_taint_by_id=policy_plan.active_taint_labels,
-                        tool_round_identity=tool_round_identity,
+                    planned_round = (
+                        await executor.invocation.admission.checkpoint_tool_round_policy_plan(
+                            session=session,
+                            registered_agent=self._registered_agent,
+                            tool_calls=tool_calls,
+                            policy_outcomes=policy_plan.outcomes,
+                            active_taint_by_id=policy_plan.active_taint_labels,
+                            tool_round_identity=tool_round_identity,
+                        )
                     )
                 except (RuntimeError, ValueError):
                     # A remote worker may commit interruption after the policy
