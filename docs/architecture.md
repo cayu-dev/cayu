@@ -1144,11 +1144,12 @@ consistency checks, closure admission and event writers are explicit capabilitie
 The stores supply these capabilities without moving closure/export helpers or
 run/checkpoint publication into the grant owners.
 
-Native SQLite context-view publication, selection, ownership transitions and
-readback live in `storage/_sqlite_context_views.py`. Each complete operation retains
-admission, bounded expiry, quota checks, retained pins and lifecycle evidence in
-its native transaction. The store supplies its connection, lock and clock.
-Selection/exclusion arbitration shares the native transaction helper; planning
+Native context-view publication, selection, ownership transitions and readback
+live in `storage/_sqlite_context_views.py` and `storage/_postgres_context_views.py`.
+Each complete operation retains admission, bounded expiry, quota checks, retained
+pins and lifecycle evidence in its native transaction. The stores supply explicit
+connections, locks, readiness, clocks and session readers. Selection/exclusion
+arbitration shares the native transaction and advisory-lock helpers; planning
 entry points, completed-turn capture and compaction validation retain their owners.
 
 Context policies are runtime projections over transcript messages, not storage. They let applications customize the model-facing conversation history by trimming, compacting, replacing bulky tool results, or injecting retrieved context while preserving the raw durable transcript for audit, debugging, resume, and future compaction.

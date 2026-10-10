@@ -180,7 +180,7 @@ def test_context_view_limits_are_finite() -> None:
 def test_postgres_context_view_admission_lock_order_is_canonical() -> None:
     """Publication/selection shared locks must be acquired owner-first."""
 
-    from cayu.storage.postgres import PostgresSessionStore
+    from cayu.storage._postgres_context_views import lock_admission
 
     owner = OwnerRef(application_scope="app", owner_id="owner", incarnation="owner-1")
     calls: list[str] = []
@@ -200,10 +200,7 @@ def test_postgres_context_view_admission_lock_order_is_canonical() -> None:
                 raise AssertionError(value)
 
     async def run() -> None:
-        store = object.__new__(PostgresSessionStore)
-        await store._lock_context_view_admission(
-            Cursor(), owner=owner, lifecycle=True, session_id="session"
-        )
+        await lock_admission(Cursor(), owner=owner, lifecycle=True, session_id="session")
 
     asyncio.run(run())
     assert calls == ["owner", "lifecycle", "session"]

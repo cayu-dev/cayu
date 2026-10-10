@@ -375,14 +375,17 @@ async def test_persistent_two_connection_race_and_restart(
 
         monkeypatch.setattr(context_views, "transaction", hold_transaction)
     else:
-        original = store._lock_context_view_admission
+        from cayu.storage import _postgres_context_views as context_views
+
+        original = context_views.lock_admission
 
         async def hold_admission(*args, **kwargs):
             await original(*args, **kwargs)
-            entered.set()
-            await release.wait()
+            if asyncio.get_running_loop() is loop:
+                entered.set()
+                await release.wait()
 
-        monkeypatch.setattr(store, "_lock_context_view_admission", hold_admission)
+        monkeypatch.setattr(context_views, "lock_admission", hold_admission)
 
     async def run(owner, kind):
         if kind == "selection":

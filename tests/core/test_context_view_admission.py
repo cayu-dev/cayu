@@ -380,7 +380,8 @@ def test_sqlite_expiry_selection_serializes_independent_deletion(tmp_path):
     asyncio.run(compete())
 
 
-def test_postgres_expiry_keeps_source_serialization(postgres_dsn):
+def test_postgres_expiry_keeps_source_serialization(postgres_dsn, monkeypatch):
+    from cayu.storage import _postgres_context_views as context_views
     from cayu.storage.migrations import SchemaMode
     from cayu.storage.postgres import PostgresSessionStore
 
@@ -399,7 +400,7 @@ def test_postgres_expiry_keeps_source_serialization(postgres_dsn):
                 _selection(manifest, "old", max_lifetime_seconds=1)
             )
             now[0] += timedelta(seconds=2)
-            original = store._require_context_view_lifecycle_capacity
+            original = context_views.require_lifecycle_capacity
             reached = asyncio.Event()
             resume = asyncio.Event()
             calls = 0
@@ -413,7 +414,7 @@ def test_postgres_expiry_keeps_source_serialization(postgres_dsn):
                     await resume.wait()
                 await original(cur, view_id, additional_slots=additional_slots)
 
-            store._require_context_view_lifecycle_capacity = gated
+            monkeypatch.setattr(context_views, "require_lifecycle_capacity", gated)
             acquisition = asyncio.create_task(
                 store.select_context_view(_selection(manifest, "new"))
             )

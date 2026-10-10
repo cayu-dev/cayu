@@ -24,6 +24,7 @@ from cayu.sessions.context_views import (
     ContextViewSelectionReceipt,
     validate_context_view_receipt_storage,
 )
+from cayu.storage import _postgres_context_views as postgres_views
 from cayu.storage import _sqlite_context_views as sqlite_views
 
 _EXCLUSION_COLUMNS = (
@@ -235,7 +236,6 @@ async def postgres_decision(cur, request):
 class PostgresContextSelectionFenceMixin:
     _ensure_ready: Any
     _connection: Any
-    _lock_context_view_admission: Any
 
     async def _read_context_view_retention(self, target):
         target = ContextViewSelectionTarget.model_validate(target)
@@ -281,7 +281,7 @@ class PostgresContextSelectionFenceMixin:
         async with self._connection() as conn, conn.cursor() as cur:
             await lock_selection_key(cur, request.selection_key)
             owner = request.source_owner
-            await self._lock_context_view_admission(
+            await postgres_views.lock_admission(
                 cur, owner=owner, lifecycle=True, session_id=request.source_session_id
             )
             existing = await postgres_decision(cur, request)
