@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from asyncio import Lock
 from typing import Any
 
 from cayu.collaboration._contracts import ExactConflict, ExactMatch, ExactNotFound, ExactUnavailable
@@ -23,6 +24,7 @@ from cayu.sessions.context_views import (
     ContextViewSelectionReceipt,
     validate_context_view_receipt_storage,
 )
+from cayu.storage import _sqlite_context_views as sqlite_views
 
 _EXCLUSION_COLUMNS = (
     "selection_key, owner_scope, owner_id, owner_incarnation, source_session_id, "
@@ -137,7 +139,7 @@ async def exact_read(operation, *, schema=ContextViewSelectionDecision):
 
 class SQLiteContextSelectionFenceMixin:
     _connection: Any
-    _context_view_transaction: Any
+    _lock: Lock
     _run_read: Any
 
     async def _read_context_view_retention(self, target):
@@ -178,7 +180,7 @@ class SQLiteContextSelectionFenceMixin:
     ):
         require_authority(authority)
         request = snapshot_request(request)
-        async with self._context_view_transaction():
+        async with sqlite_views.transaction(self._connection, lock=self._lock):
             existing = sqlite_decision(self._connection, request)
             decision = control_transition(
                 request, existing, exclude=exclude, target=target, register=register

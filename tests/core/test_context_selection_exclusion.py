@@ -143,7 +143,9 @@ async def test_divergent_index_is_unavailable_not_exclusion(native_stores):
     if backend == "memory":
         store._context_selection_exclusions[request.selection_key] = wrong
     elif backend == "sqlite":
-        async with store._context_view_transaction():
+        from cayu.storage._sqlite_context_views import transaction
+
+        async with transaction(store._connection, lock=store._lock):
             store._connection.execute(
                 "UPDATE cayu_context_selection_exclusions SET decision_json = ? WHERE selection_key = ?",
                 (wrong.model_dump_json(), request.selection_key),
@@ -359,16 +361,19 @@ async def test_persistent_two_connection_race_and_restart(
     backend = native_stores[3][0]
     entered, release, competing = asyncio.Event(), asyncio.Event(), asyncio.Event()
     if backend == "sqlite":
-        original = store._context_view_transaction
+        from cayu.storage import _sqlite_context_views as context_views
+
+        original = context_views.transaction
 
         @asynccontextmanager
-        async def hold_transaction():
-            async with original():
-                entered.set()
-                await release.wait()
+        async def hold_transaction(connection, *, lock):
+            async with original(connection, lock=lock):
+                if connection is store._connection:
+                    entered.set()
+                    await release.wait()
                 yield
 
-        monkeypatch.setattr(store, "_context_view_transaction", hold_transaction)
+        monkeypatch.setattr(context_views, "transaction", hold_transaction)
     else:
         original = store._lock_context_view_admission
 

@@ -38,6 +38,8 @@
   "tests/core/test_session_interaction_rules_layout.py::test_interaction_prerequisites_preserve_public_identity[_model_completion_publication-ModelCompletionStageSettlementRequest]": 0.00017479201778769493,
   "tests/core/test_session_interaction_rules_layout.py::test_recovery_claim_and_completion_marker_rules_without_implementations": 0.3087701670592651,
   "tests/core/test_session_interaction_rules_layout.py::test_stage_settlement_contract_validates_exact_supersession_without_implementations": 0.09537537494907156,
+  "tests/core/test_native_context_view_ownership.py::test_sqlite_context_view_owner_imports_without_adapters_or_driver": 0.869,
+  "tests/core/test_native_context_view_ownership.py::test_sqlite_context_view_owner_composes_with_direct_connection": 0.166,
   "tests/core/test_postgres_tool_grant_ownership.py::test_postgres_tool_grant_owner_imports_without_adapters_or_driver": 4.078,
   "tests/core/test_postgres_tool_grant_ownership.py::test_postgres_tool_grant_owner_composes_with_direct_connection": 6.395,
   "tests/core/test_native_tool_grant_ownership.py::test_sqlite_tool_grant_owner_imports_without_adapters_or_driver": 6.736,
