@@ -121,6 +121,7 @@ from cayu.runtime._continuation_task_failure import (
     runtime_task_failure_terminalization_request,
     runtime_task_terminalization_idempotency_key,
 )
+from cayu.runtime._delegated_event_stream import _close_delegated_event_stream
 from cayu.runtime._diagnostics import (
     exception_diagnostic,
 )
@@ -3326,11 +3327,9 @@ class SessionFinalization:
             execution_profile=request.execution_profile,
             invocation_context=request.invocation_context,
         )
-        try:
-            async for event in events:
+        async with _close_delegated_event_stream(events) as owned_stream:
+            async for event in owned_stream:
                 yield event
-        finally:
-            await _close_async_iterator(events)
 
     async def apply_model_step_limit_evaluation(
         self,
@@ -3349,11 +3348,9 @@ class SessionFinalization:
             execution_profile=request.execution_profile,
             invocation_context=request.invocation_context,
         )
-        try:
-            async for event in events:
+        async with _close_delegated_event_stream(events) as owned_stream:
+            async for event in owned_stream:
                 yield event
-        finally:
-            await _close_async_iterator(events)
 
     async def stop_for_model_step_budget_reservation_failure(
         self,
@@ -3372,17 +3369,15 @@ class SessionFinalization:
             execution_profile=request.execution_profile,
             invocation_context=request.invocation_context,
         )
-        try:
-            async for event in events:
+        async with _close_delegated_event_stream(events) as owned_stream:
+            async for event in owned_stream:
                 yield event
-        finally:
-            await _close_async_iterator(events)
 
     async def apply_tool_round_limit(
         self,
         request: ToolRoundLimitRequest,
     ) -> AsyncGenerator[Event, None]:
-        async for event in self.apply_limit_evaluation(
+        stream = self.apply_limit_evaluation(
             evaluation=request.evaluation,
             session=request.session,
             registered_agent=request.registered_agent,
@@ -3397,8 +3392,10 @@ class SessionFinalization:
             active_run=request.active_run,
             execution_profile=request.execution_profile,
             invocation_context=request.invocation_context,
-        ):
-            yield event
+        )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield event
 
     async def apply_limit_evaluation(
         self,
@@ -5241,11 +5238,11 @@ class SessionFinalization:
             invocation_context=request.invocation_context,
         )
 
-    def stop_recovered_session_for_limit(
+    async def stop_recovered_session_for_limit(
         self,
         request: RecoveryLimitStopRequest,
-    ) -> AsyncIterator[Event]:
-        return self.stop_session_for_limit_reached(
+    ) -> AsyncGenerator[Event, None]:
+        stream = self.stop_session_for_limit_reached(
             session=request.session,
             registered_agent=request.registered_agent,
             registered_environment=request.registered_environment,
@@ -5264,12 +5261,15 @@ class SessionFinalization:
             invocation_context=request.invocation_context,
             reconcile_transition_cancellation=True,
         )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield event
 
-    def interrupt_recovery(
+    async def interrupt_recovery(
         self,
         request: RecoveryInterruptionRequest,
-    ) -> AsyncIterator[Event]:
-        return self.handle_session_interrupted(
+    ) -> AsyncGenerator[Event, None]:
+        stream = self.handle_session_interrupted(
             session=request.session,
             registered_agent=request.registered_agent,
             registered_environment=request.registered_environment,
@@ -5280,6 +5280,11 @@ class SessionFinalization:
             preserve_interaction_id=request.preserve_interaction_id,
             recovery_claim_id=request.recovery_claim_id,
         )
+        # Terminal provenance belongs to this stream. Retaining it in the
+        # caller would let a later recovery inherit a previous invocation's event.
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield event
 
     async def complete_abandoned_turn(
         self,

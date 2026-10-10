@@ -47,6 +47,7 @@ from cayu.observability.hooks import (
     _runtime_hook_event as _build_runtime_hook_event,
 )
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime._delegated_event_stream import _close_delegated_event_stream
 from cayu.runtime._diagnostics import (
     exception_diagnostic,
 )
@@ -1203,7 +1204,12 @@ class TerminalEventPublication:
                 run_runtime_hooks=request.run_runtime_hooks,
                 yield_terminal_event=request.yield_durable_terminal_event,
             )
-        return self.emit(
+        return self._emit_recovered(request)
+
+    async def _emit_recovered(
+        self, request: RecoveryTerminalEventRequest
+    ) -> AsyncGenerator[Event, None]:
+        stream = self.emit(
             event=request.event,
             phase=request.phase,
             session=request.session,
@@ -1213,6 +1219,9 @@ class TerminalEventPublication:
             invocation_context=request.invocation_context,
             run_runtime_hooks=request.run_runtime_hooks,
         )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield event
 
     async def recovered_hooks_are_settled(
         self,

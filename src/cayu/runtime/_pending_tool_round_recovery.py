@@ -52,6 +52,7 @@ from cayu.runtime._child_session_identity import (
     child_session_id_prefix,
     generate_child_session_id,
 )
+from cayu.runtime._delegated_event_stream import _close_delegated_event_stream
 from cayu.runtime._durable_subagents import (
     durable_subagent_submission_from_checkpoint,
     durable_subagent_submission_receipt_from_checkpoint,
@@ -328,6 +329,15 @@ class PendingToolRoundRecovery:
         request: InterruptedToolRoundRequest,
     ) -> AsyncGenerator[Event, None]:
         """Close an interrupted round without replaying unfinished tools."""
+        stream = self._close_interrupted_tool_round(request)
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield event
+
+    async def _close_interrupted_tool_round(
+        self,
+        request: InterruptedToolRoundRequest,
+    ) -> AsyncGenerator[Event, None]:
         owner = DurableToolRound(
             session=request.session,
             tool_round_identity=request.tool_round_identity,
