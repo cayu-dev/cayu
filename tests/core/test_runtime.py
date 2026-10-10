@@ -29515,7 +29515,7 @@ async def _reattach_interrupted_spawn(*, tool_round_id, child_round_id):
     )
     parent = await store.load("parent")
     assert parent is not None
-    outcomes = await app._recovery_coordinator.reattach_subagent_children_in_outcomes(
+    outcomes = await app._pending_tool_round_recovery.reattach_subagent_children_in_outcomes(
         session=parent,
         registered_agent=app._get_registered_agent("parent"),
         tool_round_id=tool_round_id,
@@ -29669,7 +29669,7 @@ async def _close_interrupted_spawn_and_collect_events(
     parent = await store.load("parent")
     sessions_module._activate_session_interaction("parent", interaction_id)
     events = []
-    async for event in app._recovery_coordinator.close_interrupted_tool_round(
+    async for event in app._pending_tool_round_recovery.close_interrupted_tool_round(
         InterruptedToolRoundRequest(
             session=parent,
             registered_agent=app._get_registered_agent("parent"),

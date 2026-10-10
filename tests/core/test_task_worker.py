@@ -5771,7 +5771,7 @@ def test_elected_worker_replays_approval_failure_after_terminalization_interrupt
             decision=ToolApprovalDecision.APPROVE,
         )
 
-        original_materialize = app._recovery_coordinator.materialize_expected_deferred_input
+        original_materialize = app._pending_tool_round_recovery.materialize_expected_deferred_input
         original_fan_out = app._event_writer.fan_out_persisted
         original_terminal = app._recovery_coordinator._emit_terminal_event_with_hooks
 
@@ -5795,7 +5795,7 @@ def test_elected_worker_replays_approval_failure_after_terminalization_interrupt
                     )
 
         monkeypatch.setattr(
-            app._recovery_coordinator,
+            app._pending_tool_round_recovery,
             "materialize_expected_deferred_input",
             fail_after_approval_close,
         )
@@ -5821,7 +5821,7 @@ def test_elected_worker_replays_approval_failure_after_terminalization_interrupt
         )
 
         monkeypatch.setattr(
-            app._recovery_coordinator,
+            app._pending_tool_round_recovery,
             "materialize_expected_deferred_input",
             original_materialize,
         )
@@ -5969,7 +5969,7 @@ def test_workerless_approval_failure_replays_after_task_terminalization_loss(
             decision=ToolApprovalDecision.APPROVE,
         )
 
-        original_materialize = app._recovery_coordinator.materialize_expected_deferred_input
+        original_materialize = app._pending_tool_round_recovery.materialize_expected_deferred_input
         original_fan_out = app._event_writer.fan_out_persisted
 
         async def fail_after_approval_close(*args, **kwargs):
@@ -5984,7 +5984,7 @@ def test_workerless_approval_failure_replays_after_task_terminalization_loss(
             return await original_fan_out(failure_events)
 
         monkeypatch.setattr(
-            app._recovery_coordinator,
+            app._pending_tool_round_recovery,
             "materialize_expected_deferred_input",
             fail_after_approval_close,
         )
@@ -6003,7 +6003,7 @@ def test_workerless_approval_failure_replays_after_task_terminalization_loss(
         assert interrupted_before_replay.status is SessionStatus.RUNNING
 
         monkeypatch.setattr(
-            app._recovery_coordinator,
+            app._pending_tool_round_recovery,
             "materialize_expected_deferred_input",
             original_materialize,
         )

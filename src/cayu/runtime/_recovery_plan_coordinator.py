@@ -34,6 +34,7 @@ from cayu.runtime._model_completion_contracts import (
     model_completion_recovery_context_from_stage,
 )
 from cayu.runtime._model_completion_recovery import ModelCompletionRecovery
+from cayu.runtime._pending_tool_round_recovery import PendingToolRoundRecovery
 from cayu.runtime._provider_cleanup_evidence import local_http_cleanup_event_id
 from cayu.runtime._recovery_coordinator import RecoveryCoordinator
 from cayu.runtime._task_store_operation_boundary import (
@@ -429,6 +430,7 @@ class RecoveryPlanCoordinator:
         task_store: TaskStore | None,
         event_writer: RuntimeEventWriter,
         recovery_coordinator: RecoveryCoordinator,
+        pending_tool_round_recovery: PendingToolRoundRecovery,
         model_completion_recovery: ModelCompletionRecovery,
         resolve_registered_agent: ResolveRegisteredAgent,
         resolve_registered_provider: ResolveRegisteredProvider,
@@ -446,6 +448,7 @@ class RecoveryPlanCoordinator:
         self._task_store = task_store
         self._event_writer = event_writer
         self._recovery_coordinator = recovery_coordinator
+        self._pending_tool_round_recovery = pending_tool_round_recovery
         self._model_completion_recovery = model_completion_recovery
         self._resolve_registered_agent = resolve_registered_agent
         self._resolve_registered_provider = resolve_registered_provider
@@ -811,7 +814,7 @@ class RecoveryPlanCoordinator:
                 if effect is not None and registration_status is RecoveryRegistrationStatus.READY:
                     try:
                         async with asyncio.timeout(15):
-                            ready = await self._recovery_coordinator.has_recoverable_durable_tool_result(
+                            ready = await self._pending_tool_round_recovery.has_recoverable_durable_tool_result(
                                 session=session,
                                 tool_round_id=action.round_id,
                                 tool_call_id=action.tool_call_id,

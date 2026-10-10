@@ -626,7 +626,7 @@ def test_pending_round_recovery_retains_checkpoint_without_call_boundary() -> No
         assert session is not None
 
         with pytest.raises(ValueError, match="before the pending round call boundary"):
-            async for _event in app._recovery_coordinator.recover_pending_tool_round(
+            async for _event in app._pending_tool_round_recovery.recover_pending_tool_round(
                 session=session,
                 registered_agent=app._get_registered_agent("assistant"),
                 registered_environment=None,
@@ -744,7 +744,7 @@ def test_pending_round_recovery_supplies_bounded_durable_tool_authority() -> Non
         try:
             recovered_events = [
                 event
-                async for event in app._recovery_coordinator.recover_pending_tool_round(
+                async for event in app._pending_tool_round_recovery.recover_pending_tool_round(
                     session=claim.session,
                     registered_agent=app._get_registered_agent("assistant"),
                     registered_environment=None,
@@ -886,7 +886,7 @@ def test_pending_round_recovery_fences_apply_patch_without_effect_identity() -> 
         events_before = await store.load_events(session_id)
         try:
             with pytest.raises(ToolEffectReconciliationRequired):
-                async for _event in app._recovery_coordinator.recover_pending_tool_round(
+                async for _event in app._pending_tool_round_recovery.recover_pending_tool_round(
                     session=claim.session,
                     registered_agent=app._get_registered_agent("assistant"),
                     registered_environment=None,
@@ -978,7 +978,7 @@ def test_pending_round_recovery_retains_checkpoint_for_mixed_transcript_identity
         assert session is not None
 
         with pytest.raises(ValueError, match="newer conflicting tool-round evidence"):
-            async for _event in app._recovery_coordinator.recover_pending_tool_round(
+            async for _event in app._pending_tool_round_recovery.recover_pending_tool_round(
                 session=session,
                 registered_agent=app._get_registered_agent("assistant"),
                 registered_environment=None,

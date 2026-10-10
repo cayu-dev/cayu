@@ -327,7 +327,7 @@ def test_interrupt_close_rejects_missing_marker_before_terminal_publication() ->
         )
 
         with pytest.raises(RuntimeError, match="lost its durable pending marker"):
-            async for _event in app._recovery_coordinator.close_interrupted_tool_round(request):
+            async for _event in app._pending_tool_round_recovery.close_interrupted_tool_round(request):
                 pass
         assert not [
             event

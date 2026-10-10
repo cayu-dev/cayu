@@ -948,7 +948,7 @@ def test_interrupted_structured_output_close_is_not_recorded_as_recovered():
         # Interruption before the live runner closes the round through recovery.
         events = [
             event
-            async for event in app._recovery_coordinator.close_interrupted_tool_round(
+            async for event in app._pending_tool_round_recovery.close_interrupted_tool_round(
                 InterruptedToolRoundRequest(
                     session=session,
                     registered_agent=app._get_registered_agent("assistant"),

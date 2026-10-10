@@ -43,6 +43,7 @@ from cayu.runtime._model_completion_contracts import (
 )
 from cayu.runtime._model_completion_recovery import ModelCompletionRecovery
 from cayu.runtime._model_policy import PolicySelection
+from cayu.runtime._pending_tool_round_recovery import PendingToolRoundRecovery
 from cayu.runtime._policy_wire import decode as decode_policy_evidence
 from cayu.runtime._structured_output_tool_round import has_recoverable_structured_output_round
 from cayu.runtime._user_input_recovery_evidence import UserInputRecoveryEvidence
@@ -4767,6 +4768,7 @@ class SessionEngine:
         request_footprint: RequestFootprintConfig,
         tool_round_executor: ToolRoundExecutor,
         recovery_coordinator: RecoveryCoordinator,
+        pending_tool_round_recovery: PendingToolRoundRecovery,
         recovery_cleanup_supervisor: RecoveryCleanupSupervisor,
         background_interruption_coordinator: BackgroundInterruptionCoordinator,
         secret_redactor: SecretRedactor,
@@ -4812,6 +4814,7 @@ class SessionEngine:
         self._request_footprint = copy_request_footprint_config(request_footprint)
         self._tool_round_executor = tool_round_executor
         self._recovery_coordinator = recovery_coordinator
+        self._pending_tool_round_recovery = pending_tool_round_recovery
         self._terminal_finalization = recovery_coordinator.terminal_finalization
         self._startup_recovery_result = StartupRecoveryResult()
         if type(recovery_cleanup_supervisor) is not RecoveryCleanupSupervisor:
@@ -11098,7 +11101,7 @@ class SessionEngine:
                     return True
                 if active is not None:
                     return False
-                return await self._recovery_coordinator.has_completed_tool_round_results(
+                return await self._pending_tool_round_recovery.has_completed_tool_round_results(
                     session_id=session.id, pending_round=pending_round
                 )
             if active is not None:
@@ -11110,7 +11113,7 @@ class SessionEngine:
             # exact receipt/call/transcript validation before any effects.
             return (
                 receipt is not None
-                and await self._recovery_coordinator.has_settled_published_tool_round_results(
+                and await self._pending_tool_round_recovery.has_settled_published_tool_round_results(
                     session_id=session.id, receipt=receipt
                 )
             )
@@ -24734,7 +24737,7 @@ class SessionEngine:
                 replay_limit_evaluations.append(evaluation)
                 return evaluation.decision is None
 
-            async for event in self._recovery_coordinator.recover_pending_tool_round(
+            async for event in self._pending_tool_round_recovery.recover_pending_tool_round(
                 session=session,
                 invocation_context=invocation_context,
                 registered_agent=registered_agent,
@@ -26342,7 +26345,9 @@ class SessionEngine:
                     else None
                 ),
                 prepare_interruption=lambda: (
-                    self._recovery_coordinator.deliver_pending_tool_effect_uncertainty(session)
+                    self._pending_tool_round_recovery.deliver_pending_tool_effect_uncertainty(
+                        session
+                    )
                 ),
                 session=session,
                 registered_agent=registered_agent,
@@ -29484,9 +29489,11 @@ class SessionEngine:
                     session.id,
                     clear_exact_approval_round,
                 )
-                materialized = await self._recovery_coordinator.materialize_expected_deferred_input(
-                    session.id,
-                    deferred_messages,
+                materialized = (
+                    await self._pending_tool_round_recovery.materialize_expected_deferred_input(
+                        session.id,
+                        deferred_messages,
+                    )
                 )
                 messages[:] = materialized.messages
                 yield await self._event_writer.emit(
@@ -29535,10 +29542,10 @@ class SessionEngine:
                 execution_profile=execution_profile,
                 redactor=self._secret_redactor,
                 materialize_deferred_input_if_present=(
-                    self._recovery_coordinator.materialize_deferred_input_if_present
+                    self._pending_tool_round_recovery.materialize_deferred_input_if_present
                 ),
                 materialize_expected_deferred_input=(
-                    self._recovery_coordinator.materialize_expected_deferred_input
+                    self._pending_tool_round_recovery.materialize_expected_deferred_input
                 ),
                 raise_if_interrupted=self._session_control.raise_if_interrupted,
             )
@@ -29706,7 +29713,7 @@ class SessionEngine:
             event_writer=self._event_writer,
             fan_out=False,
         )
-        materialized = await self._recovery_coordinator.materialize_expected_deferred_input(
+        materialized = await self._pending_tool_round_recovery.materialize_expected_deferred_input(
             session.id,
             deferred_messages,
             cancellation=cancellation,
@@ -30982,14 +30989,14 @@ class SessionEngine:
             execution_profile=execution_profile,
             invocation_context=invocation_context,
         )
-        async for event in self._recovery_coordinator.close_interrupted_tool_round(request):
+        async for event in self._pending_tool_round_recovery.close_interrupted_tool_round(request):
             yield event
 
     async def _close_tool_round_after_interrupt(
         self,
         request: InterruptedToolRoundRequest,
     ) -> AsyncGenerator[Event, None]:
-        async for event in self._recovery_coordinator.close_interrupted_tool_round(request):
+        async for event in self._pending_tool_round_recovery.close_interrupted_tool_round(request):
             yield event
 
     async def _interrupt_background_subagent_children(

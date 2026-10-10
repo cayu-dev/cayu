@@ -413,6 +413,7 @@ from cayu.runtime._model_step_executor import (
     ModelStepExecutor,
     ModelStepLimitEvaluationRequest,
 )
+from cayu.runtime._pending_tool_round_recovery import PendingToolRoundRecovery
 from cayu.runtime._producer_execution import _ProducerExecution
 from cayu.runtime._public_task_scheduling import (
     inspect_task_schedule_events,
@@ -470,6 +471,7 @@ from cayu.runtime._work_attempt_coordinator import WorkAttemptCoordinator
 from cayu.runtime._work_attempt_invocation import (
     WorkAttemptRecoveryOwnership,
 )
+from cayu.runtime._workspace_observation_recovery import WorkspaceObservationRecovery
 from cayu.runtime.application_lifecycle import (
     DEFAULT_APPLICATION_SHUTDOWN_TIMEOUT_SECONDS,
     ApplicationAdmission,
@@ -1553,7 +1555,26 @@ class CayuApp:
             runtime_hooks=self._runtime_hooks,
             loop_policies=self._loop_policies,
         )
+        self._workspace_observation_recovery = WorkspaceObservationRecovery(
+            session_store=self._runtime_session_store,
+            event_writer=self._event_writer,
+            secret_redactor=self._secret_redactor,
+        )
+        self._pending_tool_round_recovery = PendingToolRoundRecovery(
+            session_store=self._runtime_session_store,
+            event_writer=self._event_writer,
+            session_control=self._session_control,
+            environment_lifecycle=self._environment_lifecycle,
+            tool_round_executor=self._tool_round_executor,
+            workspace_observation_recovery=self._workspace_observation_recovery,
+            secret_redactor=self._secret_redactor,
+            clock=self._clock,
+            resolve_registered_agent=self._get_registered_agent,
+            resolve_registered_environment=self._get_registered_environment_for_session,
+        )
         self._recovery_coordinator = RecoveryCoordinator(
+            pending_tool_round_recovery=self._pending_tool_round_recovery,
+            workspace_observation_recovery=self._workspace_observation_recovery,
             resource_access_policy=resource_access_policy,
             require_participant_execution=self._require_participant_execution,
             human_review_policy=human_review_policy,
@@ -1635,6 +1656,7 @@ class CayuApp:
             request_footprint=self._request_footprint,
             tool_round_executor=self._tool_round_executor,
             recovery_coordinator=self._recovery_coordinator,
+            pending_tool_round_recovery=self._pending_tool_round_recovery,
             recovery_cleanup_supervisor=self._recovery_cleanup_supervisor,
             background_interruption_coordinator=(self._background_interruption_coordinator),
             secret_redactor=self._secret_redactor,
@@ -1676,6 +1698,7 @@ class CayuApp:
             task_store=self.task_store,
             event_writer=self._event_writer,
             recovery_coordinator=self._recovery_coordinator,
+            pending_tool_round_recovery=self._pending_tool_round_recovery,
             model_completion_recovery=self._model_completion_recovery,
             resolve_registered_agent=self._get_registered_agent,
             resolve_registered_provider=self._get_registered_provider,
