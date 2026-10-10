@@ -23,7 +23,7 @@ from cayu.sessions.records import SessionStatus
 from cayu.workflows.base import WORKFLOW_ATTEMPT_EVENT_TYPE
 
 if TYPE_CHECKING:
-    from cayu.sessions.access import _SessionAccessBounds
+    from cayu.sessions._access_rules import _SessionAccessBounds
 
 
 @dataclass(frozen=True)
@@ -141,7 +141,7 @@ def build_event_query_sql(
     query = copy_event_query(query)
     clauses: list[str] = []
     params: list[object] = []
-    from cayu.sessions.access import _query_bounds
+    from cayu.sessions._access_rules import _query_bounds
 
     access_bounds = _query_bounds.get()
     if access_bounds is not None:

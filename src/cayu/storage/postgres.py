@@ -22,10 +22,7 @@ from cayu.collaboration.peer_content import (
 from cayu.runtime._cost_accounting import CostAccountingSnapshot
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot
 from cayu.sessions import creation_fence
-from cayu.sessions.access import (
-    runtime_session_mutation,
-    runtime_session_query,
-)
+from cayu.sessions._access_rules import runtime_session_mutation, runtime_session_query
 from cayu.sessions.base import (
     _check_closure_lineage_owner,
     _closure_progress_targets,
@@ -76,8 +73,8 @@ if TYPE_CHECKING:
         ZeroWorkInterruptionPublication,
         ZeroWorkInterruptionRequest,
     )
+    from cayu.sessions._access_rules import _SessionAccessBounds
     from cayu.sessions._temporary_continuation import TemporaryServiceAdmission
-    from cayu.sessions.access import _SessionAccessBounds
     from cayu.sessions.exports import SessionExportLimits, SessionExportSnapshot
     from cayu.storage.retention import (
         RetentionAuditEntry,
@@ -340,10 +337,9 @@ from cayu.sessions.base import (
     _validate_tool_round_publication,
     _validate_user_input_checkpoint_mutation,
     checkpoint_root_field_projection_from_storage,
-    session_invocation_for_run_request,
     transform_fork_checkpoint,
 )
-from cayu.sessions.creation import session_metadata_for_creation
+from cayu.sessions.creation import session_invocation_for_run_request, session_metadata_for_creation
 from cayu.sessions.event_delivery import (
     PersistedEventSideEffectClaim,
     PersistedEventSideEffectDelivery,
@@ -727,7 +723,7 @@ class PostgresSessionStore(
     session_access_version: ClassVar[int | None] = 1
 
     async def _access_create_session(self, bounds, request, identity):
-        from cayu.sessions.access import _creation_bounds
+        from cayu.sessions._access_rules import _creation_bounds
 
         token = _creation_bounds.set(bounds)
         try:

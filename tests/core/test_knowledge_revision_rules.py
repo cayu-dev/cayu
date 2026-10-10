@@ -118,7 +118,7 @@ def test_revision_successor_preserves_identity_and_timestamp_order():
 def test_revision_successor_relabel_requires_admitted_and_current_permission():
     from cayu._resource_access_errors import ResourceAccessDenied
     from cayu.knowledge import access
-    from cayu.sessions.access import (
+    from cayu.sessions._access_rules import (
         SessionAccessRule,
         SessionAccessScope,
         SessionAccessSelector,

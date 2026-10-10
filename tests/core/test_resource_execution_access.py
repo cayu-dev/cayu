@@ -6,12 +6,8 @@ import pytest
 
 from cayu import AgentSpec, CayuApp, Message, ModelStreamEvent, RunRequest, ScriptedModelProvider
 from cayu.resource_access import ResourceAccessPolicy, current_binding
-from cayu.sessions.access import (
-    SessionAccessDenied,
-    SessionAccessRule,
-    SessionAccessScope,
-    SessionAccessSelector,
-)
+from cayu.sessions._access_rules import SessionAccessRule, SessionAccessScope, SessionAccessSelector
+from cayu.sessions.access import SessionAccessDenied
 from cayu.sessions.requests import ResumeRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 

@@ -8,7 +8,7 @@ from functools import wraps
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from cayu.sessions.access import _SessionAccessBounds
+    from cayu.sessions._access_rules import _SessionAccessBounds
 
 from cayu._resource_access_errors import ResourceAccessDenied
 
@@ -92,7 +92,7 @@ def runtime_knowledge_operation(action):
                 encode_scope,
                 require_dispatch,
             )
-            from cayu.sessions.access import SessionAccessScope
+            from cayu.sessions._access_rules import SessionAccessScope
 
             execution = _active.get()
             if execution is None:
@@ -145,7 +145,7 @@ class ScopedKnowledgeAccess:
 
     async def _call(self, action, operation):
         from cayu.resource_access import effective_bounds, encode_scope
-        from cayu.sessions.access import SessionAccessScope
+        from cayu.sessions._access_rules import SessionAccessScope
 
         bounds = await effective_bounds(self.__binding, self.__policy, "knowledge")
         constraints = tuple(

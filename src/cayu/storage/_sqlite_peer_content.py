@@ -25,7 +25,7 @@ from cayu.collaboration.peer_content import (
 from cayu.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.messages import Message, MessageRole
 from cayu.runtime import _session_message_queue as message_queue
-from cayu.sessions.access import require_resource_session
+from cayu.sessions._access_rules import require_resource_session
 from cayu.sessions.base import (
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     session_messages_input_contract_evidence,
@@ -68,7 +68,7 @@ async def append_peer_content(
                 request.append_key,
                 None if creation is None else _creation_fence.sqlite_read(connection, creation),
             )
-            from cayu.sessions.access import _query_bounds
+            from cayu.sessions._access_rules import _query_bounds
 
             if _query_bounds.get() is not None:
                 require_resource_session(

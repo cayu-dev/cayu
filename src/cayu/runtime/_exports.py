@@ -2017,7 +2017,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "session_fork_profile_relationship",
     ),
     "session_invocation_for_run_request": (
-        "cayu.sessions.base",
+        "cayu.sessions.creation",
         "session_invocation_for_run_request",
     ),
     "session_invocation_from_task": ("cayu.sessions.invocation", "session_invocation_from_task"),

@@ -5,13 +5,8 @@ from uuid import uuid4
 
 import pytest
 
-from cayu.sessions.access import (
-    ScopedSessionAccess,
-    SessionAccessDenied,
-    SessionAccessRule,
-    SessionAccessScope,
-    SessionAccessSelector,
-)
+from cayu.sessions._access_rules import SessionAccessRule, SessionAccessScope, SessionAccessSelector
+from cayu.sessions.access import ScopedSessionAccess, SessionAccessDenied
 from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionIdentity
@@ -460,7 +455,11 @@ def test_sqlite_relabel_race_checks_inside_write_transaction(tmp_path, operation
 
 
 def test_access_scope_bounds_fit_organization_sized_policies() -> None:
-    from cayu.sessions.access import SessionAccessRule, SessionAccessScope, SessionAccessSelector
+    from cayu.sessions._access_rules import (
+        SessionAccessRule,
+        SessionAccessScope,
+        SessionAccessSelector,
+    )
 
     many_values = SessionAccessSelector(key="team", values=tuple(f"t{i}" for i in range(500)))
     with pytest.raises(ValueError, match="at most 500 values"):

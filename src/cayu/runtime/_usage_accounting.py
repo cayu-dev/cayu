@@ -108,7 +108,7 @@ class SessionUsageCache:
         Filters, windows, grouped output, and access-bounded reads bypass the
         cache so it never serves a result computed under a different scope.
         """
-        from cayu.sessions.access import _query_bounds
+        from cayu.sessions._access_rules import _query_bounds
         from cayu.sessions.event_queries import EventQuery
 
         session_id = query.session_id

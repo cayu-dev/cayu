@@ -134,7 +134,11 @@ def test_access_snapshots_copy_inputs_and_preserve_json_and_pickle_round_trips()
 
 def test_shared_access_rules_preserve_scope_and_resource_predicates():
     from cayu.resource_access import encode_scope
-    from cayu.sessions.access import SessionAccessRule, SessionAccessScope, SessionAccessSelector
+    from cayu.sessions._access_rules import (
+        SessionAccessRule,
+        SessionAccessScope,
+        SessionAccessSelector,
+    )
 
     entry = _entry()
     scope = KnowledgeAccessScope.for_namespace("example")

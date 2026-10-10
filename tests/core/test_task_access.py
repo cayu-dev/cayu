@@ -5,12 +5,8 @@ from uuid import uuid4
 
 import pytest
 
-from cayu.sessions.access import (
-    SessionAccessDenied,
-    SessionAccessRule,
-    SessionAccessScope,
-    SessionAccessSelector,
-)
+from cayu.sessions._access_rules import SessionAccessRule, SessionAccessScope, SessionAccessSelector
+from cayu.sessions.access import SessionAccessDenied
 from cayu.storage.sqlite import SQLiteTaskStore
 from cayu.tasks.access import ScopedTaskAccess
 from cayu.tasks.creation import TaskCreate

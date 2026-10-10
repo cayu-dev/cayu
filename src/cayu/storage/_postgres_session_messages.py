@@ -16,10 +16,10 @@ from cayu.approvals.tools import ResolutionActor, resolution_actor_payload
 from cayu.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.messages import Message
 from cayu.runtime import _session_message_queue as message_queue
+from cayu.sessions._access_rules import require_resource_session
 from cayu.sessions._execution_profile_checkpoint import ActiveInvocationExecutionProfile
 from cayu.sessions._interaction_receipts import _interaction_transition_storage_key
 from cayu.sessions._invocation_scope import _assert_session_run_epoch
-from cayu.sessions.access import require_resource_session
 from cayu.sessions.base import (
     MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
     SessionMessageQueueStatus,

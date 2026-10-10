@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 from cayu._validation import require_clean_nonblank
 
 if TYPE_CHECKING:
-    from cayu.sessions.access import _SessionAccessBounds
+    from cayu.sessions._access_rules import _SessionAccessBounds
 
 
 @dataclass(frozen=True, slots=True)

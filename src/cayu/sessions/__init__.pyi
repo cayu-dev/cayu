@@ -83,9 +83,6 @@ from cayu.sessions.base import (
 from cayu.sessions.base import (
     runtime_publication_operation_record_value_digest as runtime_publication_operation_record_value_digest,
 )
-from cayu.sessions.base import (
-    session_invocation_for_run_request as session_invocation_for_run_request,
-)
 from cayu.sessions.checkpoints import CHECKPOINT_SCHEMA_VERSION_KEY as CHECKPOINT_SCHEMA_VERSION_KEY
 from cayu.sessions.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION as CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -207,6 +204,9 @@ from cayu.sessions.context_views import (
 )
 from cayu.sessions.context_views import (
     RecipientSessionCreationRequest as RecipientSessionCreationRequest,
+)
+from cayu.sessions.creation import (
+    session_invocation_for_run_request as session_invocation_for_run_request,
 )
 from cayu.sessions.event_delivery import (
     PersistedEventSideEffectClaim as PersistedEventSideEffectClaim,

@@ -8,7 +8,8 @@ from tests.core.test_session_access import rule
 
 from cayu.artifacts import LocalArtifactStore, S3ArtifactStore
 from cayu.artifacts.access import ScopedArtifactAccess
-from cayu.sessions.access import SessionAccessDenied, SessionAccessScope
+from cayu.sessions._access_rules import SessionAccessScope
+from cayu.sessions.access import SessionAccessDenied
 
 
 @pytest.mark.parametrize("backend", ["local", "s3"])

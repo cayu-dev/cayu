@@ -125,6 +125,9 @@ from cayu.sessions._model_failover import (
 from cayu.sessions.creation import (
     run_request_with_prepared_work_attempt_creation as run_request_with_prepared_work_attempt_creation,
 )
+from cayu.sessions.creation import (
+    session_invocation_for_run_request as session_invocation_for_run_request,
+)
 from cayu.sessions.creation import session_metadata_for_creation as session_metadata_for_creation
 from cayu.sessions.creation_claims import (
     RUNTIME_SESSION_CREATE_CLAIM_REFERENCE_MAX_KEY_ID_CHARS as RUNTIME_SESSION_CREATE_CLAIM_REFERENCE_MAX_KEY_ID_CHARS,
@@ -766,6 +769,7 @@ if TYPE_CHECKING:
         ZeroWorkInterruptionRequest,
     )
     from cayu.runtime.evidence_spool import EvidenceSpool
+    from cayu.sessions._access_rules import _SessionAccessBounds
     from cayu.sessions._context_view_source import (
         CompletedTurnSnapshot,
         ContextViewPublicationSource,
@@ -797,7 +801,6 @@ if TYPE_CHECKING:
         TemporaryServicePreparation,
         TemporaryServiceRecord,
     )
-    from cayu.sessions.access import _SessionAccessBounds
     from cayu.sessions.context_views import (
         ContextViewLifecycleEvent as _ContextViewLifecycleEvent,
     )
@@ -1023,15 +1026,9 @@ from cayu.sessions.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     decode_runtime_checkpoint,
 )
+from cayu.sessions.invocation import SessionExecutionSource as SessionExecutionSource
 from cayu.sessions.invocation import (
-    InvocationOrigin,
-    InvocationOriginTrust,
-    SessionExecutionSource,
-    SessionInvocation,
     SessionInvocationBinding,
-    copy_invocation_origin,
-    inherited_session_invocation,
-    session_invocation_from_task,
 )
 from cayu.sessions.messaging import (
     SessionMessageActionRequest,
@@ -8618,7 +8615,7 @@ def runtime_session_mutation(operation):
 
     @wraps(operation)
     async def guarded(self, *args, **kwargs):
-        from cayu.sessions.access import runtime_session_mutation as wrap
+        from cayu.sessions._access_rules import runtime_session_mutation as wrap
 
         return await wrap(operation)(self, *args, **kwargs)
 
@@ -8626,7 +8623,7 @@ def runtime_session_mutation(operation):
 
 
 def require_resource_session(session, action="read"):
-    from cayu.sessions.access import require_resource_session as require
+    from cayu.sessions._access_rules import require_resource_session as require
 
     require(session, action)
 
@@ -8636,7 +8633,7 @@ def runtime_session_query(operation):
 
     @wraps(operation)
     async def guarded(self, *args, **kwargs):
-        from cayu.sessions.access import runtime_session_query as wrap
+        from cayu.sessions._access_rules import runtime_session_query as wrap
 
         return await wrap(operation)(self, *args, **kwargs)
 
@@ -8652,7 +8649,7 @@ class InMemorySessionStore(
     session_access_version: ClassVar[int | None] = 1
 
     async def _access_create_session(self, bounds, request, identity):
-        from cayu.sessions.access import _creation_bounds
+        from cayu.sessions._access_rules import _creation_bounds
 
         token = _creation_bounds.set(bounds)
         try:
@@ -15112,7 +15109,7 @@ class InMemorySessionStore(
                 request.append_key,
                 None if creation is None else self._session_creation_decisions.get(creation.key),
             )
-            from cayu.sessions.access import _query_bounds
+            from cayu.sessions._access_rules import _query_bounds
 
             if _query_bounds.get() is not None:
                 require_resource_session(
@@ -20006,94 +20003,6 @@ class InMemorySessionStore(
                 else checkpoint["pending_interruption_cascade"]
             )
             return _project_interruption_cascade_marker(marker)
-
-
-def session_invocation_for_run_request(
-    request: RunRequest,
-    *,
-    session_id: str,
-    parent_session: Session | None,
-) -> SessionInvocation:
-    """Derive exact provenance inside the atomic store-create boundary."""
-
-    if type(request) is not RunRequest:
-        raise TypeError("Session invocation derivation requires a RunRequest.")
-    session_id = session_record_rules._require_bounded_session_id(session_id, "session_id")
-    from cayu.sessions.access import _require_scoped_session_creation
-
-    _require_scoped_session_creation(request, parent_session)
-    source = request._runtime_invocation_source or SessionExecutionSource.SDK_RUN
-    verified_origin = request._verified_invocation_origin
-    task_invocation = request._runtime_task_invocation
-    if request.invocation_origin is not None and verified_origin is not None:
-        raise ValueError("A run cannot carry both host-asserted and server-verified origins.")
-    if parent_session is not None:
-        if request.parent_session_id != parent_session.id:
-            raise ValueError("Parent session identity conflicts with invocation derivation.")
-        if request.invocation_origin is not None or verified_origin is not None:
-            raise ValueError("Derived sessions must inherit their root invocation origin.")
-        if source is SessionExecutionSource.HTTP_RUN:
-            raise ValueError("Derived sessions cannot claim a root HTTP run source.")
-        inherited = inherited_session_invocation(
-            parent_session.invocation,
-            source=source,
-        )
-        if task_invocation is not None and (
-            task_invocation.id != request.task_id
-            or task_invocation.invocation.origin != inherited.origin
-            or task_invocation.invocation.root_invocation_id != inherited.root_invocation_id
-            or (
-                task_invocation.invocation.root_session_id is not None
-                and task_invocation.invocation.root_session_id != inherited.root_session_id
-            )
-        ):
-            raise ValueError("Task and parent session invocation provenance conflict.")
-        return inherited
-    if request.parent_session_id is not None:
-        raise ValueError("Parent session not found for invocation provenance.")
-    if source in {
-        SessionExecutionSource.FORK,
-        SessionExecutionSource.SUBAGENT,
-    }:
-        raise ValueError(f"{source.value} invocation provenance requires a parent session.")
-    if task_invocation is not None:
-        if request.task_id is None:
-            raise ValueError("Task invocation provenance requires RunRequest.task_id.")
-        if request.invocation_origin is not None or verified_origin is not None:
-            raise ValueError("Task-backed sessions must inherit their task origin.")
-        if source is not SessionExecutionSource.TASK:
-            raise ValueError("Root task-backed sessions require a task execution source.")
-        return session_invocation_from_task(
-            task_invocation.invocation,
-            session_id=session_id,
-            source=source,
-        )
-    if source is SessionExecutionSource.TASK:
-        raise ValueError("Task session provenance requires a durable task invocation.")
-    if verified_origin is not None:
-        if source is not SessionExecutionSource.HTTP_RUN:
-            raise ValueError("Server-verified invocation origins require an HTTP run source.")
-        origin = copy_invocation_origin(verified_origin)
-    elif request.invocation_origin is not None:
-        if source is not SessionExecutionSource.SDK_RUN:
-            raise ValueError("Host-asserted invocation origins require an SDK run source.")
-        origin = InvocationOrigin(
-            trust=InvocationOriginTrust.HOST_ASSERTED,
-            subject=request.invocation_origin.subject,
-            tenant=request.invocation_origin.tenant,
-        )
-    else:
-        origin = InvocationOrigin(trust=InvocationOriginTrust.UNATTRIBUTED)
-    from cayu.resource_access import current_binding
-    from cayu.sessions.access import scoped_creation_binding
-
-    return SessionInvocation(
-        resource_access=current_binding() or scoped_creation_binding(),
-        origin=origin,
-        root_invocation_id=str(uuid4()),
-        root_session_id=session_id,
-        source=source,
-    )
 
 
 def _copy_optional_event_id(value: str | None, field_name: str) -> str | None:
@@ -26556,7 +26465,7 @@ def _event_record_matches_session(
     query: EventQuery,
     sessions: dict[str, Session],
 ) -> bool:
-    from cayu.sessions.access import _query_bounds
+    from cayu.sessions._access_rules import _query_bounds
 
     bounds = _query_bounds.get()
     if bounds is not None:

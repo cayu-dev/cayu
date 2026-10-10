@@ -25,7 +25,7 @@ from cayu.collaboration.peer_content import (
 from cayu.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.messages import Message, MessageRole
 from cayu.runtime import _session_message_queue as message_queue
-from cayu.sessions.access import require_resource_session
+from cayu.sessions._access_rules import require_resource_session
 from cayu.sessions.creation_fence import SessionCreationTarget
 from cayu.sessions.messaging import (
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
@@ -66,7 +66,7 @@ async def append_peer_content(
                 request.append_key,
                 None if creation is None else await _creation_fence.postgres_read(cur, creation),
             )
-            from cayu.sessions.access import _query_bounds
+            from cayu.sessions._access_rules import _query_bounds
 
             if _query_bounds.get() is not None:
                 resource_owners = {

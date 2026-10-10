@@ -28,9 +28,7 @@ from cayu.runtime._child_session_notifications import (
 )
 from cayu.runtime._cost_accounting import CostAccountingSnapshot
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot
-from cayu.sessions.access import (
-    runtime_session_query,
-)
+from cayu.sessions._access_rules import runtime_session_query
 from cayu.sessions.base import (
     _TOOL_ROUND_LIFECYCLE_EVENT_TYPES,
     _child_session_lifecycle_entry,
@@ -90,7 +88,7 @@ from cayu.storage._sqlite_connection import SQLiteOperationRunner
 if TYPE_CHECKING:
     from cayu.runtime._cost_accounting_refresh import CostAccountingAuthority
     from cayu.runtime._usage_accounting import SessionUsageCache
-    from cayu.sessions.access import _SessionAccessBounds
+    from cayu.sessions._access_rules import _SessionAccessBounds
 
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500

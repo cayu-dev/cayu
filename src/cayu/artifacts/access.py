@@ -9,7 +9,8 @@ from typing import Any, Literal
 
 from cayu._validation import copy_label_map, require_clean_nonblank
 from cayu.artifacts.base import ArtifactMetadata, ArtifactScope, ArtifactStore
-from cayu.sessions.access import SessionAccessDenied, SessionAccessScope, _SessionAccessBounds
+from cayu.sessions._access_rules import SessionAccessScope, _SessionAccessBounds
+from cayu.sessions.access import SessionAccessDenied
 
 
 @dataclass(frozen=True, slots=True)

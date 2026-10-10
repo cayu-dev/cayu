@@ -75,7 +75,7 @@ def test_http_authentication_is_host_owned_and_foreign_ids_are_hidden():
 def test_http_stream_revalidates_buffered_first_event():
     from cayu.events import Event, EventType
     from cayu.server.resource_access import _stream
-    from cayu.sessions.access import SessionAccessScope
+    from cayu.sessions._access_rules import SessionAccessScope
 
     async def run():
         policy = Policy()

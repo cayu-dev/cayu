@@ -20,7 +20,8 @@ from cayu.environments import Environment, EnvironmentSpec
 from cayu.events import EventType
 from cayu.runtime._tool_execution import tool_idempotency_key
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.sessions.access import SessionAccessDenied, SessionAccessScope
+from cayu.sessions._access_rules import SessionAccessScope
+from cayu.sessions.access import SessionAccessDenied
 from cayu.sessions.records import SessionStatus
 from cayu.tools.base import ToolEffect
 from cayu.tools.policy import ToolPolicy, ToolPolicyDecision, ToolPolicyResult

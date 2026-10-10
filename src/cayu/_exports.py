@@ -332,9 +332,9 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "ResourceAccessDecision": ("cayu.resource_access", "ResourceAccessDecision"),
     "ScopedCayuAccess": ("cayu.resource_access", "ScopedCayuAccess"),
     "ResourceAccessDenied": ("cayu._resource_access_errors", "ResourceAccessDenied"),
-    "SessionAccessScope": ("cayu.sessions.access", "SessionAccessScope"),
-    "SessionAccessRule": ("cayu.sessions.access", "SessionAccessRule"),
-    "SessionAccessSelector": ("cayu.sessions.access", "SessionAccessSelector"),
+    "SessionAccessScope": ("cayu.sessions._access_rules", "SessionAccessScope"),
+    "SessionAccessRule": ("cayu.sessions._access_rules", "SessionAccessRule"),
+    "SessionAccessSelector": ("cayu.sessions._access_rules", "SessionAccessSelector"),
     "PeerContentAppendAuthorization": (
         "cayu.collaboration.peer_content",
         "PeerContentAppendAuthorization",
@@ -6504,7 +6504,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "session_fork_profile_relationship",
     ),
     "session_invocation_for_run_request": (
-        "cayu.sessions.base",
+        "cayu.sessions.creation",
         "session_invocation_for_run_request",
     ),
     "session_invocation_from_task": ("cayu.sessions.invocation", "session_invocation_from_task"),

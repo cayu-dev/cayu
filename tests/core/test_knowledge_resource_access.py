@@ -7,7 +7,7 @@ import pytest
 
 from cayu._resource_access_binding import ResourceExecutionBinding
 from cayu.resource_access import ResourceAccessPolicy, encode_scope, execution_access
-from cayu.sessions.access import SessionAccessRule, SessionAccessScope, SessionAccessSelector
+from cayu.sessions._access_rules import SessionAccessRule, SessionAccessScope, SessionAccessSelector
 from cayu.storage import (
     InMemoryKnowledgeStore,
     KnowledgeAccessScope,

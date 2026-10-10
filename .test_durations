@@ -1,4 +1,11 @@
 {
+  "tests/core/test_session_interaction_rules_layout.py::test_access_denial_preserves_public_identity": 9.958300506696105e-05,
+  "tests/core/test_session_interaction_rules_layout.py::test_access_rules_preserve_public_identity[SessionAccessRule]": 0.00013858400052413344,
+  "tests/core/test_session_interaction_rules_layout.py::test_access_rules_preserve_public_identity[SessionAccessScope]": 0.0001303739263676107,
+  "tests/core/test_session_interaction_rules_layout.py::test_access_rules_preserve_public_identity[SessionAccessSelector]": 0.0021132920519448817,
+  "tests/core/test_session_interaction_rules_layout.py::test_interaction_prerequisites_preserve_public_identity[creation-session_invocation_for_run_request]": 0.00015649996930733323,
+  "tests/core/test_session_interaction_rules_layout.py::test_paired_terminal_decision_requires_exact_profile_without_implementations": 0.5184947909438051,
+  "tests/core/test_session_interaction_rules_layout.py::test_scoped_creation_provenance_without_implementations": 0.38650825002696365,
   "tests/core/test_session_interaction_rules_layout.py::test_terminal_receipts_require_runtime_event_authority_without_implementations": 0.5014224579790607,
   "tests/core/test_session_interaction_rules_layout.py::test_transition_receipts_replay_after_exact_release_without_implementations": 0.5662033339613117,
   "tests/core/test_session_interaction_rules_layout.py::test_interaction_context_preserves_history_and_restores_outer_scope": 0.44394420803291723,

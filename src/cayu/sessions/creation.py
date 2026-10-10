@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from typing import Any
+from uuid import uuid4
 
 from cayu._validation import (
     canonical_durable_json_bytes,
@@ -20,12 +21,22 @@ from cayu.execution_profiles import (
     ExecutionProfileComponentClass,
     direct_tool_capability_ceiling_component,
 )
+from cayu.sessions import records as session_record_rules
 from cayu.sessions import requests as session_request_contracts
 from cayu.sessions._execution_profile_checkpoint import (
     EXECUTION_PROFILE_METADATA_KEY,
     execution_profile_session_metadata,
 )
 from cayu.sessions.forks import FORK_EXECUTION_PROFILE_METADATA_KEY
+from cayu.sessions.invocation import (
+    InvocationOrigin,
+    InvocationOriginTrust,
+    SessionExecutionSource,
+    SessionInvocation,
+    copy_invocation_origin,
+    inherited_session_invocation,
+    session_invocation_from_task,
+)
 from cayu.sessions.records import RUNTIME_BUILD_PROVENANCE_METADATA_KEY, Session, SessionIdentity
 from cayu.sessions.requests import RunRequest, copy_run_request
 from cayu.tools.exposure import (
@@ -156,3 +167,91 @@ def session_metadata_for_creation(
             tool_capability_ceiling,
         )
     return copy_session_metadata(copied)
+
+
+def session_invocation_for_run_request(
+    request: RunRequest,
+    *,
+    session_id: str,
+    parent_session: Session | None,
+) -> SessionInvocation:
+    """Derive exact provenance inside the atomic store-create boundary."""
+
+    if type(request) is not RunRequest:
+        raise TypeError("Session invocation derivation requires a RunRequest.")
+    session_id = session_record_rules._require_bounded_session_id(session_id, "session_id")
+    from cayu.sessions._access_rules import _require_scoped_session_creation
+
+    _require_scoped_session_creation(request, parent_session)
+    source = request._runtime_invocation_source or SessionExecutionSource.SDK_RUN
+    verified_origin = request._verified_invocation_origin
+    task_invocation = request._runtime_task_invocation
+    if request.invocation_origin is not None and verified_origin is not None:
+        raise ValueError("A run cannot carry both host-asserted and server-verified origins.")
+    if parent_session is not None:
+        if request.parent_session_id != parent_session.id:
+            raise ValueError("Parent session identity conflicts with invocation derivation.")
+        if request.invocation_origin is not None or verified_origin is not None:
+            raise ValueError("Derived sessions must inherit their root invocation origin.")
+        if source is SessionExecutionSource.HTTP_RUN:
+            raise ValueError("Derived sessions cannot claim a root HTTP run source.")
+        inherited = inherited_session_invocation(
+            parent_session.invocation,
+            source=source,
+        )
+        if task_invocation is not None and (
+            task_invocation.id != request.task_id
+            or task_invocation.invocation.origin != inherited.origin
+            or task_invocation.invocation.root_invocation_id != inherited.root_invocation_id
+            or (
+                task_invocation.invocation.root_session_id is not None
+                and task_invocation.invocation.root_session_id != inherited.root_session_id
+            )
+        ):
+            raise ValueError("Task and parent session invocation provenance conflict.")
+        return inherited
+    if request.parent_session_id is not None:
+        raise ValueError("Parent session not found for invocation provenance.")
+    if source in {
+        SessionExecutionSource.FORK,
+        SessionExecutionSource.SUBAGENT,
+    }:
+        raise ValueError(f"{source.value} invocation provenance requires a parent session.")
+    if task_invocation is not None:
+        if request.task_id is None:
+            raise ValueError("Task invocation provenance requires RunRequest.task_id.")
+        if request.invocation_origin is not None or verified_origin is not None:
+            raise ValueError("Task-backed sessions must inherit their task origin.")
+        if source is not SessionExecutionSource.TASK:
+            raise ValueError("Root task-backed sessions require a task execution source.")
+        return session_invocation_from_task(
+            task_invocation.invocation,
+            session_id=session_id,
+            source=source,
+        )
+    if source is SessionExecutionSource.TASK:
+        raise ValueError("Task session provenance requires a durable task invocation.")
+    if verified_origin is not None:
+        if source is not SessionExecutionSource.HTTP_RUN:
+            raise ValueError("Server-verified invocation origins require an HTTP run source.")
+        origin = copy_invocation_origin(verified_origin)
+    elif request.invocation_origin is not None:
+        if source is not SessionExecutionSource.SDK_RUN:
+            raise ValueError("Host-asserted invocation origins require an SDK run source.")
+        origin = InvocationOrigin(
+            trust=InvocationOriginTrust.HOST_ASSERTED,
+            subject=request.invocation_origin.subject,
+            tenant=request.invocation_origin.tenant,
+        )
+    else:
+        origin = InvocationOrigin(trust=InvocationOriginTrust.UNATTRIBUTED)
+    from cayu.resource_access import current_binding
+    from cayu.sessions._access_rules import scoped_creation_binding
+
+    return SessionInvocation(
+        resource_access=current_binding() or scoped_creation_binding(),
+        origin=origin,
+        root_invocation_id=str(uuid4()),
+        root_session_id=session_id,
+        source=source,
+    )

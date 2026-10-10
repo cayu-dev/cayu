@@ -34,6 +34,7 @@ import cayu
         ("_invocation_scope", "resolve_interaction_attribution"),
         ("_invocation_scope", "attribute_event_to_current_interaction"),
         ("_invocation_scope", "attribute_events_to_current_interaction"),
+        ("creation", "session_invocation_for_run_request"),
     ),
 )
 def test_interaction_prerequisites_preserve_public_identity(module, name):
@@ -41,6 +42,23 @@ def test_interaction_prerequisites_preserve_public_identity(module, name):
     assert getattr(importlib.import_module("cayu.sessions.base"), name) is canonical
     assert pickle.loads(f"ccayu.sessions.base\n{name}\n.".encode()) is canonical
     assert pickle.loads(pickle.dumps(canonical)) is canonical
+
+
+@pytest.mark.parametrize(
+    "name", ("SessionAccessSelector", "SessionAccessRule", "SessionAccessScope")
+)
+def test_access_rules_preserve_public_identity(name):
+    canonical = getattr(importlib.import_module("cayu.sessions._access_rules"), name)
+    assert getattr(importlib.import_module("cayu.sessions.access"), name) is canonical
+    assert pickle.loads(f"ccayu.sessions.access\n{name}\n.".encode()) is canonical
+    assert pickle.loads(pickle.dumps(canonical)) is canonical
+
+
+def test_access_denial_preserves_public_identity():
+    from cayu._resource_access_errors import ResourceAccessDenied
+    from cayu.sessions.access import SessionAccessDenied
+
+    assert SessionAccessDenied is ResourceAccessDenied
 
 
 def _without_implementations(code: str) -> None:
@@ -407,5 +425,71 @@ rejected(lambda: rules._require_invocation_release_terminal_session_event(record
     expected_active_invocation_profile=active), SessionRunFenced)
 record["event"]["payload"]["forged"] = True
 rejected(lambda: rules._load_invocation_terminal_event_receipt(record), RuntimeError)
+"""
+    )
+
+
+def test_paired_terminal_decision_requires_exact_profile_without_implementations():
+    _without_implementations(
+        _SESSION_FIXTURE
+        + """
+from datetime import UTC, datetime
+from cayu.sessions import _interaction_receipts as rules
+from cayu.sessions._invocation_terminal_decision import (
+    InvocationTerminalOutcome, build_invocation_terminal_decision,
+    checkpoint_with_invocation_terminal_decision, settled_invocation_terminal_decision_from_checkpoint,
+)
+from cayu.sessions.authority import SessionRunFenced
+from cayu.sessions.checkpoints import ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
+
+recovery_id = "model-recovery:" + "b" * 64
+decision = build_invocation_terminal_decision(outcome=InvocationTerminalOutcome.FAILED,
+    session_id=session.id, session_instance_id=session.instance_id, run_epoch=1,
+    profile_interaction_id="first", interaction_id="first",
+    execution_profile_fingerprint=profile.fingerprint,
+    interaction_event_id=recovery_id + ":interaction_failed",
+    terminal_event_id=recovery_id + ":session_failed", observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+    terminal_payload={}, model_recovery_id=recovery_id)
+checkpoint = checkpoint_with_invocation_terminal_decision(
+    {ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY: active.model_dump(mode="json")}, decision)
+rejected(lambda: rules._checkpoint_after_exact_invocation_terminal_decision(
+    checkpoint, session=session, expected=None), SessionRunFenced)
+rejected(lambda: rules._checkpoint_after_exact_invocation_terminal_decision(
+    checkpoint, session=session.model_copy(update={"run_epoch": 2}), expected=decision), SessionRunFenced)
+settled = rules._checkpoint_after_exact_invocation_terminal_decision(
+    checkpoint, session=session, expected=decision)
+assert settled_invocation_terminal_decision_from_checkpoint(settled) == decision
+assert rules._checkpoint_after_exact_invocation_terminal_decision(None, session=session,
+                                                                expected=None) is None
+"""
+    )
+
+
+def test_scoped_creation_provenance_without_implementations():
+    _without_implementations(
+        """
+from cayu.sessions import _access_rules as rules, creation
+from cayu.sessions.requests import RunRequest
+
+wide = rules.SessionAccessRule(selectors=(rules.SessionAccessSelector(key="tenant", values=("a", "b")),))
+narrow = rules.SessionAccessRule(selectors=(rules.SessionAccessSelector(key="tenant", values=("a",)),))
+admitted = rules.SessionAccessScope(read=(wide,), create=(wide,))
+current = rules.SessionAccessScope(read=(narrow,), create=(narrow,))
+bounds = rules._SessionAccessBounds(admitted, current)
+token = rules._creation_bounds.set(bounds)
+try:
+    request = RunRequest(agent_name="agent", session_id="session", messages=[], labels={"tenant": "a"})
+    invocation = creation.session_invocation_for_run_request(request,
+        session_id="session", parent_session=None)
+    assert invocation.root_session_id == "session"
+    assert invocation.source.value == "sdk_run"
+    foreign = request.model_copy(update={"labels": {"tenant": "b"}})
+    rejected(lambda: creation.session_invocation_for_run_request(foreign,
+        session_id="session", parent_session=None), rules.SessionAccessDenied)
+    assert admitted.matches("read", {"tenant": "b"})
+    assert not bounds.matches({"tenant": "b"})
+finally:
+    rules._creation_bounds.reset(token)
+assert rules._creation_bounds.get() is None
 """
     )

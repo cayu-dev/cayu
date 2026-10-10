@@ -34,7 +34,8 @@ from cayu.messages import Message, ToolResultPart
 from cayu.providers import ModelStreamEvent
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
-from cayu.sessions.access import SessionAccessDenied, SessionAccessScope
+from cayu.sessions._access_rules import SessionAccessScope
+from cayu.sessions.access import SessionAccessDenied
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.sessions.requests import RunRequest

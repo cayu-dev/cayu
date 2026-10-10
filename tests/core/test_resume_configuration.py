@@ -136,7 +136,8 @@ asyncio.run(run())
 def test_inherited_resume_still_checks_revoked_resource_access(sqlite_resources, revoked):
     from tests.core.test_resource_execution_access import Policy
 
-    from cayu.sessions.access import SessionAccessDenied, SessionAccessScope
+    from cayu.sessions._access_rules import SessionAccessScope
+    from cayu.sessions.access import SessionAccessDenied
 
     async def run():
         async with sqlite_resources as resources:

@@ -15,12 +15,12 @@ from cayu._resource_access_binding import ResourceExecutionBinding
 from cayu._resource_access_errors import ResourceAccessDenied
 
 if TYPE_CHECKING:
-    from cayu.sessions.access import SessionAccessScope, _SessionAccessBounds
+    from cayu.sessions._access_rules import SessionAccessScope, _SessionAccessBounds
     from cayu.sessions.base import SessionStore
 
 
 def encode_scope(scope) -> str:
-    from cayu.sessions.access import SessionAccessScope
+    from cayu.sessions._access_rules import SessionAccessScope
 
     if type(scope) is not SessionAccessScope:
         raise TypeError("Policy must resolve a SessionAccessScope.")
@@ -28,7 +28,7 @@ def encode_scope(scope) -> str:
 
 
 def decode_scope(value):
-    from cayu.sessions.access import (
+    from cayu.sessions._access_rules import (
         _ACTIONS,
         SessionAccessRule,
         SessionAccessScope,
@@ -64,7 +64,7 @@ class ResourceAccessGrant:
     knowledge: SessionAccessScope | None = None
 
     def __post_init__(self):
-        from cayu.sessions.access import SessionAccessScope
+        from cayu.sessions._access_rules import SessionAccessScope
 
         for name in ("sessions", "tasks", "artifacts", "knowledge"):
             value = getattr(self, name)
@@ -82,7 +82,7 @@ def decode_grant(value):
 
 
 def encode_grant(grant):
-    from cayu.sessions.access import SessionAccessScope
+    from cayu.sessions._access_rules import SessionAccessScope
 
     if type(grant) is SessionAccessScope:
         return encode_scope(grant)
@@ -167,7 +167,7 @@ def current_binding() -> ResourceExecutionBinding | None:
 
 
 async def effective_bounds(binding, policy, kind="sessions"):
-    from cayu.sessions.access import SessionAccessScope, _SessionAccessBounds
+    from cayu.sessions._access_rules import SessionAccessScope, _SessionAccessBounds
 
     if not isinstance(policy, ResourceAccessPolicy) or binding.authority != policy.authority:
         raise ResourceAccessDenied()

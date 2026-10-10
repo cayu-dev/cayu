@@ -630,6 +630,28 @@ material; the memory and native stores retain the complete atomic operation.
 Their event preparation uses `sessions/event_delivery.py` for authority stripping,
 trusted restoration and batch validation, preserving the export-publication gate.
 
+### Session invocation and interaction rules
+
+`sessions/interactions.py` owns invocation admission, queued profile handoff,
+interaction transitions and their input validation. These values compose the
+checkpoint mutation contracts in `sessions/_checkpoint_mutations.py` and the
+stage-settlement contracts in `sessions/_model_completion_publication.py`.
+The stores retain atomic admission, status checks and checkpoint publication.
+
+`sessions/_invocation_scope.py` owns task-local run fences, transferable fence
+ownership, interaction attribution and retained settlement context. Its context
+variables move with their readers and writers, preserving exact owner identity
+and retirement across copied task contexts. Durable evidence belongs to
+`sessions/_interaction_receipts.py`: receipt reconstruction, digest checks,
+incarnation and epoch validation, recovery claimant checks and exact release
+replay. Runtime invocation dispatch and cleanup keep their existing owners.
+
+`sessions/_access_rules.py` owns bounded access policies and query/creation
+scopes. `sessions/access.py` composes those rules with a store through
+`ScopedSessionAccess`. Creation provenance in `sessions/creation.py` uses the
+same scope rules inside the caller's atomic create operation. Policy validation
+and provenance derivation can be used without importing a store implementation.
+
 ### Session query contracts
 
 `sessions/queries.py` owns session listing and aggregate filters, label selectors,

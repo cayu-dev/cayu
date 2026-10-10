@@ -152,7 +152,11 @@ def test_knowledge_store_intersects_ambient_constraints_and_rejects_overflow():
     from cayu._resource_access_errors import ResourceAccessDenied
     from cayu.knowledge.access import _constraints
     from cayu.resource_access import encode_scope
-    from cayu.sessions.access import SessionAccessRule, SessionAccessScope, SessionAccessSelector
+    from cayu.sessions._access_rules import (
+        SessionAccessRule,
+        SessionAccessScope,
+        SessionAccessSelector,
+    )
 
     constraints = tuple(
         encode_scope(
@@ -185,7 +189,7 @@ def test_knowledge_store_requires_intersection_inside_resource_execution():
     from cayu._resource_access_binding import ResourceExecutionBinding
     from cayu._resource_access_errors import ResourceAccessDenied
     from cayu.resource_access import ResourceAccessPolicy, encode_scope, execution_access
-    from cayu.sessions.access import SessionAccessRule, SessionAccessScope
+    from cayu.sessions._access_rules import SessionAccessRule, SessionAccessScope
 
     all_rule = SessionAccessRule(allow_all=True)
     access = SessionAccessScope(read=(all_rule,), execute=(all_rule,))
