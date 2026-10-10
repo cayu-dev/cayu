@@ -50,6 +50,7 @@ from tests.provider_cleanup_assertions import without_redacted_cleanup_context
 from tests.provider_traceback_assertions import is_cayu_source_filename
 from tests.runner_cancellation import cancelled_error_with_artifacts
 
+import cayu
 import cayu.applications as runtime_app_module
 import cayu.budgets.base as budgets_module
 import cayu.context.base as runtime_context_module
@@ -65783,7 +65784,12 @@ def test_successful_automatic_compaction_process_loss_cannot_redispatch(
     child_environment = os.environ.copy()
     existing_python_path = child_environment.get("PYTHONPATH")
     child_environment["PYTHONPATH"] = os.pathsep.join(
-        path for path in (str(repository_root / "src"), existing_python_path) if path
+        path
+        for path in (
+            str(Path(cayu.__file__).resolve().parent.parent),
+            existing_python_path,
+        )
+        if path
     )
     child = subprocess.run(
         [sys.executable, "-c", child_script],

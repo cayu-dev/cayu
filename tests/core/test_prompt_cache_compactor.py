@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from tests._session_provenance import session_fixture
 
+import cayu
 from cayu import (
     AgentSpec,
     CayuApp,
@@ -2177,7 +2178,12 @@ def test_receiptless_compaction_process_loss_releases_exact_budget_without_redis
     child_environment = os.environ.copy()
     existing_python_path = child_environment.get("PYTHONPATH")
     child_environment["PYTHONPATH"] = os.pathsep.join(
-        path for path in (str(repository_root / "src"), existing_python_path) if path
+        path
+        for path in (
+            str(Path(cayu.__file__).resolve().parent.parent),
+            existing_python_path,
+        )
+        if path
     )
     child = subprocess.run(
         [sys.executable, "-c", child_script],
@@ -2339,7 +2345,12 @@ def test_overflow_compaction_process_loss_recovers_borrowed_stage_budget_without
     child_environment = os.environ.copy()
     existing_python_path = child_environment.get("PYTHONPATH")
     child_environment["PYTHONPATH"] = os.pathsep.join(
-        path for path in (str(repository_root / "src"), existing_python_path) if path
+        path
+        for path in (
+            str(Path(cayu.__file__).resolve().parent.parent),
+            existing_python_path,
+        )
+        if path
     )
     child = subprocess.run(
         [sys.executable, "-c", child_script],

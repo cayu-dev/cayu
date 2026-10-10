@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+import cayu
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.budgets.base import BudgetLimit, BudgetPolicy, BudgetReservation
@@ -447,7 +448,12 @@ def test_compaction_rejection_diagnostic_survives_process_loss(
     root = Path(__file__).resolve().parents[2]
     child_environment = os.environ.copy()
     child_environment["PYTHONPATH"] = os.pathsep.join(
-        path for path in (str(root / "src"), child_environment.get("PYTHONPATH")) if path
+        path
+        for path in (
+            str(Path(cayu.__file__).resolve().parent.parent),
+            child_environment.get("PYTHONPATH"),
+        )
+        if path
     )
     child = subprocess.run(
         [
