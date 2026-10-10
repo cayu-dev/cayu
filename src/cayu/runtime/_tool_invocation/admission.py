@@ -85,13 +85,11 @@ from cayu.runtime.public_authority import parse_public_authority_alias
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
+from cayu.sessions._checkpoint_mutations import runtime_publication_checkpoint_value_digest
 from cayu.sessions._checkpoint_secret_validation import (
     require_secret_free_durable_object as _require_secret_free_durable_object,
 )
-from cayu.sessions.base import (
-    SessionStore,
-    runtime_publication_checkpoint_value_digest,
-)
+from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import Session, SessionStatus
 from cayu.tools.base import (

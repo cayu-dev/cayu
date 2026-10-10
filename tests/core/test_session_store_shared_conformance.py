@@ -229,6 +229,12 @@ from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
+from cayu.sessions._checkpoint_mutations import (
+    RuntimePublicationCheckpointOperation,
+    RuntimePublicationMutation,
+    SessionRuntimePublicationConflict,
+    runtime_publication_checkpoint_value_digest,
+)
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalOutcome,
     build_invocation_terminal_decision,
@@ -239,6 +245,7 @@ from cayu.sessions._invocation_terminal_decision import (
 )
 from cayu.sessions._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
+    ModelCompletionStageDisposition,
     ModelStepPublicationCheckpoint,
 )
 from cayu.sessions.base import (
@@ -247,25 +254,20 @@ from cayu.sessions.base import (
     BudgetReservationIdentityConflict,
     InMemorySessionStore,
     InteractionTransitionSpec,
-    ModelCompletionStageDisposition,
     ModelCompletionStageRequest,
     ModelTarget,
     QueuedDispatchTerminalReceiptQuery,
     QueuedInteractionProfileHandoff,
-    RuntimePublicationCheckpointOperation,
-    RuntimePublicationMutation,
     RuntimePublicationOperationRecordMutation,
     RuntimePublicationRequest,
     SessionModelCompletionStageConflict,
     SessionModelCompletionStageIncomplete,
     SessionOperationPublication,
-    SessionRuntimePublicationConflict,
     SessionStore,
     _checkpoint_with_session_run_operation,
     _deactivate_session_run_fence,
     queued_interaction_profile_handoff_evidence,
     runtime_publication_checkpoint_mutation,
-    runtime_publication_checkpoint_value_digest,
     runtime_publication_event_reference,
     runtime_publication_operation_record_value_digest,
 )

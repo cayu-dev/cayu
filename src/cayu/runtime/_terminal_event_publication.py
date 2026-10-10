@@ -66,12 +66,12 @@ from cayu.runtime._invocation_lifecycle import (
 from cayu.runtime._recovery_requests import (
     RecoveryTerminalEventRequest,
 )
+from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflict
 from cayu.sessions._terminal_evidence import (
     _session_run_operation_from_checkpoint,
 )
 from cayu.sessions.base import (
     _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
-    SessionRuntimePublicationConflict,
     SessionStore,
     _checkpoint_after_session_run_operation_cleanup,
     _event_with_session_run_operation,

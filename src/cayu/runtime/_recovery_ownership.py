@@ -91,13 +91,11 @@ from cayu.sessions._terminal_evidence import (
     interruption_request_id_from_payload,
 )
 from cayu.sessions.base import (
-    _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
     SessionRunFenced,
     SessionStore,
     _activate_owned_session_run_fence,
     _activate_session_run_fence,
     _deactivate_session_run_fence,
-    _incomplete_recovery_claim_from_checkpoint,
 )
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
@@ -118,6 +116,10 @@ from cayu.sessions.records import (
     SessionStatus,
     SessionStatusConflict,
     StoreTimeCheckpointTransform,
+)
+from cayu.sessions.recovery import (
+    _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
+    _incomplete_recovery_claim_from_checkpoint,
 )
 
 _INCOMPLETE_RECOVERY_CLAIM_LEASE = timedelta(minutes=5)

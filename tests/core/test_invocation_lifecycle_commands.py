@@ -74,14 +74,15 @@ from cayu.runtime.execution_profiles import (
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _invocation_lifecycle as invocation_contracts_module
+from cayu.sessions._checkpoint_mutations import (
+    RuntimePublicationCheckpointOperation,
+    RuntimePublicationMutation,
+)
 from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
 from cayu.sessions.base import (
-    _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
     InMemorySessionStore,
     InteractionTransitionSpec,
     ModelTarget,
-    RuntimePublicationCheckpointOperation,
-    RuntimePublicationMutation,
     SessionInvocationAdmission,
     SessionRunFenced,
     SessionStore,
@@ -96,7 +97,10 @@ from cayu.sessions.checkpoints import (
     CheckpointCompatibilityError,
 )
 from cayu.sessions.records import SessionIdentity, SessionStatus
-from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
+from cayu.sessions.recovery import (
+    _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
+    IncompleteSessionRecoveryRequest,
+)
 from cayu.sessions.requests import (
     ResumeRequest,
     RunRequest,

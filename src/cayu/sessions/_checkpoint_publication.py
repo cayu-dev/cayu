@@ -9,13 +9,13 @@ from __future__ import annotations
 from typing import Any
 
 from cayu._validation import copy_durable_json_object
-from cayu.sessions.base import (
+from cayu.sessions._checkpoint_mutations import (
     RuntimePublicationCheckpointOperation,
     RuntimePublicationMutation,
-    RuntimePublicationRequest,
     _apply_runtime_publication_checkpoint_mutation,
     runtime_publication_checkpoint_value_digest,
 )
+from cayu.sessions.base import RuntimePublicationRequest
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,

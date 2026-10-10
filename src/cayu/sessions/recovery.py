@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal, Self, cast
@@ -28,6 +29,7 @@ from cayu.collaboration.access import CollaborationAccessContext
 from cayu.environments.factory import EnvironmentAllocationState
 from cayu.events import Event, copy_event
 from cayu.sessions import records as session_record_rules
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.records import PendingActionKind, SessionStatus
 from cayu.tasks.records import TaskStatus
 
@@ -923,3 +925,74 @@ __all__ = [
     "RecoveryTaskClaimEvidence",
     "StaleRecoveryPlanError",
 ]
+
+
+_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY = "incomplete_session_recovery_claim"
+
+
+def _incomplete_recovery_claim_from_checkpoint(
+    checkpoint: Mapping[str, Any] | None,
+) -> tuple[str, datetime] | None:
+    """Parse the runtime-owned incomplete-session recovery lease."""
+    if checkpoint is None or _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY not in checkpoint:
+        return None
+    marker = checkpoint[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY]
+    if type(marker) is not dict or marker.get("version") != 1:
+        raise ValueError("Incomplete-session recovery claim checkpoint is invalid.")
+    claim_id = require_clean_nonblank(marker.get("claim_id"), "recovery_claim.claim_id")
+    claimed_at_value = require_clean_nonblank(
+        marker.get("claimed_at"),
+        "recovery_claim.claimed_at",
+    )
+    expires_at_value = require_clean_nonblank(
+        marker.get("claim_expires_at"),
+        "recovery_claim.claim_expires_at",
+    )
+    try:
+        claimed_at = datetime.fromisoformat(claimed_at_value)
+        expires_at = datetime.fromisoformat(expires_at_value)
+    except ValueError as exc:
+        raise ValueError("Incomplete-session recovery claim timestamps are invalid.") from exc
+    if (
+        claimed_at.tzinfo is None
+        or claimed_at.utcoffset() is None
+        or expires_at.tzinfo is None
+        or expires_at.utcoffset() is None
+        or expires_at <= claimed_at
+    ):
+        raise ValueError("Incomplete-session recovery claim timestamps are invalid.")
+    return claim_id, expires_at
+
+
+def _active_unexpired_incomplete_recovery_claim_id(
+    checkpoint: dict[str, Any] | None,
+    *,
+    now: datetime,
+) -> str | None:
+    """Return the durable recovery owner while its lease remains live."""
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware.")
+    claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
+    if claim is None:
+        return None
+    claim_id, expires_at = claim
+    return claim_id if expires_at.astimezone(UTC) > now.astimezone(UTC) else None
+
+
+def _require_live_incomplete_recovery_claim_for_run_epoch_transfer(
+    checkpoint: Mapping[str, Any] | None,
+    *,
+    now: datetime,
+) -> None:
+    """Reject a run-epoch transfer authorized by an expired recovery lease."""
+
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware.")
+    claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
+    if claim is None:
+        return
+    _claim_id, expires_at = claim
+    if expires_at.astimezone(UTC) <= now.astimezone(UTC):
+        raise SessionRunFenced(
+            "Incomplete-session recovery claim expired before run ownership transfer."
+        )

@@ -185,6 +185,10 @@ from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions import _staged_tool_terminal_reader as staged_terminal_reader
+from cayu.sessions._checkpoint_mutations import (
+    SessionRuntimePublicationConflict,
+    runtime_publication_checkpoint_value_digest,
+)
 from cayu.sessions._durable_operation_ownership import DurableOperationOwnership
 from cayu.sessions._execution_profile_checkpoint import (
     EXECUTION_PROFILE_METADATA_KEY,
@@ -205,13 +209,7 @@ from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
     _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
 )
-from cayu.sessions.base import (
-    SessionRunFenced,
-    SessionRuntimePublicationConflict,
-    SessionStore,
-    _incomplete_recovery_claim_from_checkpoint,
-    runtime_publication_checkpoint_value_digest,
-)
+from cayu.sessions.base import SessionRunFenced, SessionStore
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
@@ -235,6 +233,7 @@ from cayu.sessions.recovery import (
     IncompleteSessionRecoveryResult,
     IncompleteSessionsRecoveryPage,
     IncompleteSessionsRecoveryRequest,
+    _incomplete_recovery_claim_from_checkpoint,
 )
 from cayu.tasks.dispatch import (
     _new_prepared_subagent_dispatch_envelope,

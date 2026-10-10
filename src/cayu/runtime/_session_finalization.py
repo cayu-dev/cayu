@@ -219,6 +219,10 @@ from cayu.runtime.tool_completion import (
 from cayu.sessions import _model_completion_publication as model_completion_publication
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
+from cayu.sessions._checkpoint_mutations import (
+    SessionRuntimePublicationConflict,
+    runtime_publication_checkpoint_value_digest,
+)
 from cayu.sessions._checkpoint_preservation import (
     _invocation_lifecycle_authority_mutation_scope,
     _invocation_lifecycle_authority_read_scope,
@@ -250,6 +254,10 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_event_id,
     settled_invocation_terminal_decision_from_checkpoint,
 )
+from cayu.sessions._model_completion_publication import (
+    ModelCompletionStageDisposition,
+    ModelCompletionStageSettlementRequest,
+)
 from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
     _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
@@ -262,11 +270,8 @@ from cayu.sessions.base import (
     InteractionTransitionReceiptResult,
     InteractionTransitionResult,
     InteractionTransitionSpec,
-    ModelCompletionStageDisposition,
-    ModelCompletionStageSettlementRequest,
     SessionModelCompletionStageConflict,
     SessionRunFenced,
-    SessionRuntimePublicationConflict,
     SessionStore,
     _activate_session_interaction,
     _clear_session_interaction_recovered_active_through,
@@ -277,13 +282,11 @@ from cayu.sessions.base import (
     _current_session_invocation_interaction_ids,
     _deactivate_session_interaction,
     _event_with_session_run_operation,
-    _incomplete_recovery_claim_from_checkpoint,
     _latest_session_invocation_interaction_is_settled,
     _mark_session_interaction_settled,
     _mark_session_invocation_terminal_event,
     copy_interaction_transition_spec,
     model_completion_stage_settlement_request,
-    runtime_publication_checkpoint_value_digest,
 )
 from cayu.sessions.checkpoints import (
     AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY,
@@ -305,6 +308,7 @@ from cayu.sessions.records import (
     SessionStatus,
     SessionStatusConflict,
 )
+from cayu.sessions.recovery import _incomplete_recovery_claim_from_checkpoint
 from cayu.sessions.transcript_queries import (
     TranscriptQuery,
 )

@@ -161,16 +161,14 @@ from cayu.runtime.mcp_manifest_policy import (
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
+from cayu.sessions._checkpoint_mutations import runtime_publication_checkpoint_value_digest
 from cayu.sessions._checkpoint_secret_validation import (
     require_secret_free_durable_object as _require_secret_free_durable_object,
 )
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
-from cayu.sessions.base import (
-    SessionStore,
-    runtime_publication_checkpoint_value_digest,
-)
+from cayu.sessions.base import SessionStore
 from cayu.sessions.mcp_manifest_history import (
     _MCP_MANIFEST_BASELINE_MAX_TOOLS,
     McpManifestBaseline,

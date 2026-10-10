@@ -25,17 +25,14 @@ from cayu.runtime._foreground_subagent_recovery import (
 from cayu.runtime._tool_effect_state import ToolEffectRecord, ToolEffectStateOwner
 from cayu.sessions import _foreground_child_checkpoint as foreground_checkpoint
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
+from cayu.sessions._checkpoint_mutations import runtime_publication_checkpoint_value_digest
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_is_released,
 )
 from cayu.sessions._pending_tool_round import PENDING_TOOL_ROUND_CHECKPOINT_KEY
 from cayu.sessions._tool_effect_intent import ToolEffectIntent
-from cayu.sessions.base import (
-    SessionStore,
-    runtime_publication_checkpoint_mutation,
-    runtime_publication_checkpoint_value_digest,
-)
+from cayu.sessions.base import SessionStore, runtime_publication_checkpoint_mutation
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.pending_actions import pending_action_evidence_round_from_checkpoint
 from cayu.sessions.records import Session, SessionStatus

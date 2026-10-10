@@ -25,13 +25,11 @@ from cayu.runtime._delegated_event_stream import _close_delegated_event_stream
 from cayu.runtime._interruption_coordinator import _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY
 from cayu.runtime._recovery_claims import _IncompleteRecoveryClaimLost
 from cayu.runtime._session_control import TerminalFinalizationClaimHandoff
+from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflict
 from cayu.sessions._invocation_terminal_decision import InvocationTerminalDecision
 from cayu.sessions._terminal_evidence import interruption_request_id_from_payload
-from cayu.sessions.base import (
-    SessionRuntimePublicationConflict,
-    _incomplete_recovery_claim_from_checkpoint,
-)
 from cayu.sessions.records import Session
+from cayu.sessions.recovery import _incomplete_recovery_claim_from_checkpoint
 
 if TYPE_CHECKING:
     from cayu.runtime._terminal_evidence_finalization import TerminalEvidenceFinalization

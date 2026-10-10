@@ -81,6 +81,7 @@ from cayu.runtime._tool_completion import (
     recorded_terminal_tool_completion_payload,
 )
 from cayu.runtime._user_input_recovery_evidence import UserInputRecoveryEvidence
+from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflict
 from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
     _session_run_operation_from_checkpoint,
@@ -89,12 +90,9 @@ from cayu.sessions._terminal_evidence import (
     require_interruption_event_matches_pending_marker,
 )
 from cayu.sessions.base import (
-    _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
-    SessionRuntimePublicationConflict,
     SessionStore,
     _checkpoint_after_session_run_operation_cleanup,
     _event_with_session_run_operation,
-    _incomplete_recovery_claim_from_checkpoint,
 )
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import (
@@ -102,8 +100,10 @@ from cayu.sessions.records import (
     SessionStatus,
 )
 from cayu.sessions.recovery import (
+    _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryResult,
+    _incomplete_recovery_claim_from_checkpoint,
 )
 from cayu.vaults.redaction import SecretRedactor
 

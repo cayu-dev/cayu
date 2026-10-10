@@ -112,7 +112,7 @@ def require_recovery_writer(
     now,
     require_attached_writer: bool = False,
 ) -> ContinuationRecoveryWriter:
-    from cayu.sessions.base import (
+    from cayu.sessions.recovery import (
         _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
         _active_unexpired_incomplete_recovery_claim_id,
     )

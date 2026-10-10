@@ -200,6 +200,10 @@ from cayu.runtime._invocation_lifecycle import (
 from cayu.runtime._tool_execution_requirements import effective_execution_requirements
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
 from cayu.sessions import _completion_finalization as completion_finalization
+from cayu.sessions._checkpoint_mutations import (
+    RuntimePublicationCheckpointOperation,
+    RuntimePublicationMutation,
+)
 from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
@@ -217,8 +221,6 @@ from cayu.sessions._terminal_evidence import (
 )
 from cayu.sessions.base import (
     QueuedInteractionProfileHandoff,
-    RuntimePublicationCheckpointOperation,
-    RuntimePublicationMutation,
     SessionOperationPublication,
     SessionRunFenced,
     SessionStore,
@@ -227,12 +229,12 @@ from cayu.sessions.base import (
     _current_session_invocation_terminal_event,
     _current_session_run_epoch,
     _deactivate_session_run_fence,
-    _incomplete_recovery_claim_from_checkpoint,
     _initial_transcript_pending_interaction_id,
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.messaging import SessionMessageDeliveryBatch
 from cayu.sessions.records import CheckpointTransform, Session, SessionStatus, session_user_metadata
+from cayu.sessions.recovery import _incomplete_recovery_claim_from_checkpoint
 from cayu.tools._operation_boundary import BoundedInvocationOperationRegistry
 from cayu.vaults.redaction import SecretRedactor
 from cayu.workspaces.observation_recovery import (

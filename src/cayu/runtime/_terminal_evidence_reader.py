@@ -35,6 +35,7 @@ from cayu.runtime._user_input_recovery_evidence import UserInputRecoveryEvidence
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
+from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflict
 from cayu.sessions._checkpoint_preservation import (
     _invocation_lifecycle_authority_read_scope,
 )
@@ -54,10 +55,7 @@ from cayu.sessions._terminal_evidence import (
     interruption_request_id_from_payload,
     require_interruption_event_matches_pending_marker,
 )
-from cayu.sessions.base import (
-    SessionRuntimePublicationConflict,
-    SessionStore,
-)
+from cayu.sessions.base import SessionStore
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.records import (
     Session,

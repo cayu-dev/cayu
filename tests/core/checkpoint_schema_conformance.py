@@ -20,13 +20,12 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
-from cayu.sessions.base import (
+from cayu.sessions._checkpoint_mutations import (
     RuntimePublicationCheckpointOperation,
     RuntimePublicationMutation,
-    RuntimePublicationRequest,
-    SessionStore,
     runtime_publication_checkpoint_value_digest,
 )
+from cayu.sessions.base import RuntimePublicationRequest, SessionStore
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,

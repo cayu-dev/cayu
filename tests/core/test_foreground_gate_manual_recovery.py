@@ -23,7 +23,8 @@ from cayu.approvals.user_input import (
 )
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
-from cayu.sessions.base import InMemorySessionStore, SessionRuntimePublicationConflict
+from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflict
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.sessions.requests import RunRequest

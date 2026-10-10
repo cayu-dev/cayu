@@ -40,6 +40,7 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,
     settled_invocation_terminal_decision_from_checkpoint,
 )
+from cayu.sessions.authority import _canonical_runtime_publication_digest
 from cayu.sessions.base import (
     MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
     QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY,
@@ -47,7 +48,6 @@ from cayu.sessions.base import (
     QueuedInteractionProfileHandoff,
     SessionModelCompletionStageConflict,
     SessionRunFenced,
-    _canonical_runtime_publication_digest,
     _model_completion_stage_dispatch_storage_key,
 )
 from cayu.sessions.event_queries import EventQuery

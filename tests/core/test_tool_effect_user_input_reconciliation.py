@@ -31,7 +31,7 @@ from cayu.runtime.tool_effects import (
     ToolEffectReconciliationRequest,
     ToolEffectReconciliationResult,
 )
-from cayu.sessions.base import SessionRuntimePublicationConflict
+from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflict
 from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolEffect, ToolResult, ToolSpec

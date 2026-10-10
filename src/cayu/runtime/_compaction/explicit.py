@@ -157,7 +157,6 @@ from cayu.sessions._execution_profile_rules import session_model_projection_curs
 from cayu.sessions.base import (
     SessionOperationPublication,
     SessionStore,
-    _incomplete_recovery_claim_from_checkpoint,
     attribute_event_to_current_interaction,
     attribute_events_to_current_interaction,
 )
@@ -165,6 +164,7 @@ from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import (
     Session,
 )
+from cayu.sessions.recovery import _incomplete_recovery_claim_from_checkpoint
 from cayu.sessions.requests import (
     CompactSessionRequest,
     copy_compact_session_request,

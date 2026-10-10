@@ -88,7 +88,8 @@ def auxiliary_terminal_publication(
     event: Event,
 ) -> RuntimePublicationRequest:
     """Package prepared accounting without mutating the parent conversation."""
-    from cayu.sessions.base import RuntimePublicationMutation, RuntimePublicationRequest
+    from cayu.sessions._checkpoint_mutations import RuntimePublicationMutation
+    from cayu.sessions.base import RuntimePublicationRequest
 
     publication = RuntimePublicationRequest(
         publication_id=stage.logical_step_id,

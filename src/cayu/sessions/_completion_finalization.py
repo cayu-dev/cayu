@@ -67,3 +67,22 @@ def pending_completion_finalization_from_checkpoint(
     ):
         raise ValueError("Pending completion finalization checkpoint exceeds its byte limit.")
     return marker
+
+
+def _validate_completion_finalization_mutation_shape(value: dict[str, Any]) -> None:
+    """Completion may only install one previously absent finalization marker."""
+
+    operations = value.get("operations")
+    if type(operations) is not list or len(operations) != 1:
+        raise ValueError(
+            "A completion-finalization transition requires exactly one checkpoint operation."
+        )
+    operation = operations[0]
+    if (
+        type(operation) is not dict
+        or operation.get("key") != PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY
+        or operation.get("expected_value_digest") is not None
+        or operation.get("action") != "set"
+        or type(operation.get("value")) is not dict
+    ):
+        raise ValueError("A completion-finalization transition must install a new pending marker.")

@@ -31,12 +31,12 @@ from cayu.runtime.execution_profiles import active_invocation_execution_profile_
 from cayu.runtime.retry_policy import retry_decision
 from cayu.sessions._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
+    ModelCompletionStageDisposition,
     ModelStepPublicationCheckpoint,
 )
 from cayu.sessions._model_failover import MODEL_FAILOVER_CHECKPOINT_KEY, ModelFailoverProgress
 from cayu.sessions.base import (
     InMemorySessionStore,
-    ModelCompletionStageDisposition,
     ModelCompletionStageRequest,
     RuntimePublicationRequest,
     SessionModelCompletionStageConflict,

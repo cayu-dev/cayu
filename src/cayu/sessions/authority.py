@@ -41,3 +41,8 @@ def _require_raw_sha256_digest(value: Any) -> None:
         or any(character not in "0123456789abcdef" for character in value)
     ):
         raise ValueError
+
+
+def _canonical_runtime_publication_digest(value: Any) -> str:
+    encoded = canonical_durable_json_bytes(value, "runtime_publication")
+    return sha256(encoded).hexdigest()

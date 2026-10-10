@@ -39,14 +39,16 @@ from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     public_authority_alias_is_reserved,
 )
-from cayu.sessions.base import (
+from cayu.sessions._checkpoint_mutations import (
     RuntimePublicationCheckpointOperation,
     RuntimePublicationMutation,
+    runtime_publication_checkpoint_value_digest,
+)
+from cayu.sessions.base import (
     RuntimePublicationReceipt,
     RuntimePublicationRequest,
     RuntimePublicationResult,
     SessionStore,
-    runtime_publication_checkpoint_value_digest,
     runtime_publication_request_digest,
 )
 from cayu.sessions.checkpoints import (

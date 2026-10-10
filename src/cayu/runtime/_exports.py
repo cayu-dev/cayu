@@ -852,12 +852,15 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "ModelCompletionStageAbandonmentResult",
     ),
     "ModelCompletionStageDispatch": ("cayu.sessions.base", "ModelCompletionStageDispatch"),
-    "ModelCompletionStageDisposition": ("cayu.sessions.base", "ModelCompletionStageDisposition"),
+    "ModelCompletionStageDisposition": (
+        "cayu.sessions._model_completion_publication",
+        "ModelCompletionStageDisposition",
+    ),
     "ModelCompletionStageRequest": ("cayu.sessions.base", "ModelCompletionStageRequest"),
     "ModelCompletionStageResult": ("cayu.sessions.base", "ModelCompletionStageResult"),
     "ModelCompletionStageSettlement": ("cayu.sessions.base", "ModelCompletionStageSettlement"),
     "ModelCompletionStageSettlementRequest": (
-        "cayu.sessions.base",
+        "cayu.sessions._model_completion_publication",
         "ModelCompletionStageSettlementRequest",
     ),
     "ModelInfo": ("cayu.budgets.pricing", "ModelInfo"),
@@ -1219,11 +1222,14 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "RuntimeHookPhase": ("cayu.observability.hooks", "RuntimeHookPhase"),
     "RuntimeManifest": ("cayu.runtime.manifest", "RuntimeManifest"),
     "RuntimePublicationCheckpointOperation": (
-        "cayu.sessions.base",
+        "cayu.sessions._checkpoint_mutations",
         "RuntimePublicationCheckpointOperation",
     ),
     "RuntimePublicationEventReference": ("cayu.sessions.base", "RuntimePublicationEventReference"),
-    "RuntimePublicationMutation": ("cayu.sessions.base", "RuntimePublicationMutation"),
+    "RuntimePublicationMutation": (
+        "cayu.sessions._checkpoint_mutations",
+        "RuntimePublicationMutation",
+    ),
     "RuntimePublicationOperationRecordMutation": (
         "cayu.sessions.base",
         "RuntimePublicationOperationRecordMutation",
@@ -1338,7 +1344,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "SessionQueuedMessagesPending": ("cayu.sessions.messaging", "SessionQueuedMessagesPending"),
     "SessionRunFenced": ("cayu.sessions.authority", "SessionRunFenced"),
     "SessionRuntimePublicationConflict": (
-        "cayu.sessions.base",
+        "cayu.sessions._checkpoint_mutations",
         "SessionRuntimePublicationConflict",
     ),
     "SessionStateSnapshot": ("cayu.sessions.records", "SessionStateSnapshot"),
@@ -1995,7 +2001,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "runtime_publication_checkpoint_mutation",
     ),
     "runtime_publication_checkpoint_value_digest": (
-        "cayu.sessions.base",
+        "cayu.sessions._checkpoint_mutations",
         "runtime_publication_checkpoint_value_digest",
     ),
     "runtime_publication_event_reference": (

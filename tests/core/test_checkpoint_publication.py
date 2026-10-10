@@ -14,20 +14,14 @@ from tests._session_provenance import session_fixture
 import cayu
 from cayu.messages import Message
 from cayu.sessions import _checkpoint_publication as publication
-from cayu.sessions.base import (
-    RuntimePublicationCheckpointOperation as Operation,
-)
-from cayu.sessions.base import (
-    RuntimePublicationMutation as Mutation,
+from cayu.sessions._checkpoint_mutations import RuntimePublicationCheckpointOperation as Operation
+from cayu.sessions._checkpoint_mutations import RuntimePublicationMutation as Mutation
+from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflict
+from cayu.sessions._checkpoint_mutations import (
+    runtime_publication_checkpoint_value_digest as digest,
 )
 from cayu.sessions.base import (
     RuntimePublicationRequest as Request,
-)
-from cayu.sessions.base import (
-    SessionRuntimePublicationConflict,
-)
-from cayu.sessions.base import (
-    runtime_publication_checkpoint_value_digest as digest,
 )
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,

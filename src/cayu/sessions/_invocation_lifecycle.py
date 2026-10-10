@@ -54,6 +54,10 @@ from cayu.execution_profiles import (
     execution_profile_runtime_component,
 )
 from cayu.messages import Message, detach_message
+from cayu.sessions._checkpoint_mutations import (
+    RuntimePublicationMutation,
+    apply_runtime_publication_checkpoint_mutation,
+)
 from cayu.sessions._durable_operation_ownership import DurableOperationOwnership
 from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
@@ -72,9 +76,7 @@ from cayu.sessions.base import (
     ExecutionProfileRejectionResult,
     InteractionTransitionResult,
     InteractionTransitionSpec,
-    RuntimePublicationMutation,
     SessionRunFenced,
-    apply_runtime_publication_checkpoint_mutation,
 )
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,

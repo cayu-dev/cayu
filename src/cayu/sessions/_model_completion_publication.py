@@ -1,7 +1,8 @@
-"""Durable identity for the latest atomically published assistant model step."""
+"""Durable model-step publication identity and exact stage-settlement contracts."""
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Any, Literal
 
 from pydantic import (
@@ -19,7 +20,9 @@ from cayu._validation import (
     copy_durable_json_object,
     copy_durable_json_value,
     require_clean_nonblank,
+    require_durable_clean_nonblank,
 )
+from cayu.sessions import authority as session_authority_rules
 
 LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY = "last_model_step_publication"
 MODEL_STEP_PUBLICATION_CHECKPOINT_RECORD_TYPE = "cayu.model-step-publication"
@@ -134,3 +137,91 @@ def model_step_publication_from_checkpoint(
     if type(copied) is not dict:
         raise ValueError("Last model-step publication checkpoint must be an object.")
     return ModelStepPublicationCheckpoint.model_validate(copied)
+
+
+class ModelCompletionStageDisposition(StrEnum):
+    """Durable non-success outcome of one exact model-completion dispatch."""
+
+    FAILED_BEFORE_PROVIDER_EFFECT = "failed_before_provider_effect"
+    PROVIDER_EFFECT_OUTCOME_UNKNOWN = "provider_effect_outcome_unknown"
+    SUPERSEDED = "superseded"
+
+
+class ModelCompletionStageSettlementRequest(BaseModel):
+    """Exact authority required to terminally settle one active model stage."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    stage_id: str = Field(max_length=256)
+    logical_step_id: str = Field(max_length=256)
+    model_attempt_id: str = Field(max_length=256)
+    interaction_id: str = Field(max_length=256)
+    request_fingerprint: str
+    provider_effect_id: str = Field(max_length=512)
+    execution_profile_fingerprint: str | None = None
+    preparation_digest: str
+    settlement_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    settled_reservation_ids: tuple[str, ...]
+    disposition: ModelCompletionStageDisposition
+    reason_code: str = Field(min_length=1, max_length=128, pattern=r"^[a-z0-9_.-]+$")
+    superseding_stage_id: str | None = Field(default=None, max_length=256)
+
+    @field_validator(
+        "stage_id",
+        "logical_step_id",
+        "model_attempt_id",
+        "interaction_id",
+        "provider_effect_id",
+        "superseding_stage_id",
+    )
+    @classmethod
+    def validate_identifiers(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator(
+        "request_fingerprint",
+        "execution_profile_fingerprint",
+        "preparation_digest",
+    )
+    @classmethod
+    def validate_digests(cls, value: str | None, info) -> str | None:
+        if value is None:
+            if info.field_name == "execution_profile_fingerprint":
+                return None
+            raise ValueError(f"{info.field_name} is required.")
+        try:
+            session_authority_rules._require_raw_sha256_digest(value)
+        except ValueError as exc:
+            raise ValueError(f"{info.field_name} must be a lowercase SHA-256 digest.") from exc
+        return value
+
+    @field_validator("settled_reservation_ids")
+    @classmethod
+    def validate_settled_reservation_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if type(value) is not tuple:
+            raise TypeError("settled_reservation_ids must be a tuple.")
+        copied = tuple(
+            require_durable_clean_nonblank(reservation_id, "settled_reservation_ids")
+            for reservation_id in value
+        )
+        if len(set(copied)) != len(copied):
+            raise ValueError("settled_reservation_ids must be distinct.")
+        return copied
+
+    @model_validator(mode="after")
+    def validate_supersession(self) -> ModelCompletionStageSettlementRequest:
+        if self.disposition is ModelCompletionStageDisposition.SUPERSEDED:
+            if self.superseding_stage_id is None:
+                raise ValueError("A superseded stage requires superseding_stage_id.")
+            if self.superseding_stage_id == self.stage_id:
+                raise ValueError("A model-completion stage cannot supersede itself.")
+        elif self.superseding_stage_id is not None:
+            raise ValueError("superseding_stage_id is valid only for a superseded stage.")
+        return self

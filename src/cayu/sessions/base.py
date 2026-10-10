@@ -15,7 +15,6 @@ from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from enum import StrEnum
 from hashlib import sha256
 from itertools import islice
 from pathlib import Path
@@ -35,6 +34,7 @@ from cayu.collaboration.peer_content import (
     PeerContentReceipt,
     PeerContentUnavailable,
 )
+from cayu.sessions import _checkpoint_mutations as checkpoint_mutation_rules
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _completion_finalization as completion_finalization
 from cayu.sessions import _execution_profile_rules as session_profile_rules
@@ -49,12 +49,31 @@ from cayu.sessions import inspection as session_inspection_rules
 from cayu.sessions import messaging as session_messaging
 from cayu.sessions import queries as session_query_rules
 from cayu.sessions import records as session_record_rules
+from cayu.sessions import recovery as session_recovery_rules
 from cayu.sessions import requests as session_request_contracts
 from cayu.sessions import terminal_evidence as terminal_session_evidence
 from cayu.sessions import transcript_input as session_transcript_input
 from cayu.sessions import transcript_queries as session_transcript_queries
 from cayu.sessions import usage as session_usage_rules
 from cayu.sessions._argument_continuity import ArgumentContinuity
+from cayu.sessions._checkpoint_mutations import (
+    RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS as RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS,
+)
+from cayu.sessions._checkpoint_mutations import (
+    RuntimePublicationCheckpointOperation as RuntimePublicationCheckpointOperation,
+)
+from cayu.sessions._checkpoint_mutations import (
+    RuntimePublicationMutation as RuntimePublicationMutation,
+)
+from cayu.sessions._checkpoint_mutations import (
+    SessionRuntimePublicationConflict as SessionRuntimePublicationConflict,
+)
+from cayu.sessions._checkpoint_mutations import (
+    apply_runtime_publication_checkpoint_mutation as apply_runtime_publication_checkpoint_mutation,
+)
+from cayu.sessions._checkpoint_mutations import (
+    runtime_publication_checkpoint_value_digest as runtime_publication_checkpoint_value_digest,
+)
 from cayu.sessions._completion_finalization import (
     PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY as PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY,
 )
@@ -67,6 +86,12 @@ from cayu.sessions._execution_profile_rules import (
     session_model_projection_cursor as session_model_projection_cursor,
 )
 from cayu.sessions._external_wait_memory import MemoryExternalWaitMixin
+from cayu.sessions._model_completion_publication import (
+    ModelCompletionStageDisposition as ModelCompletionStageDisposition,
+)
+from cayu.sessions._model_completion_publication import (
+    ModelCompletionStageSettlementRequest as ModelCompletionStageSettlementRequest,
+)
 from cayu.sessions._model_failover import (
     MODEL_TARGET_PROJECTION_METADATA_KEY as MODEL_TARGET_PROJECTION_METADATA_KEY,
 )
@@ -1117,10 +1142,6 @@ class SessionExecutionInProgress(SessionStatusConflict):
         )
 
 
-class SessionRuntimePublicationConflict(ValueError):
-    """A runtime publication identity conflicts with its durable receipt."""
-
-
 class SessionModelCompletionStageConflict(SessionRuntimePublicationConflict):
     """A logical model-completion stage conflicts with immutable durable evidence."""
 
@@ -1853,94 +1874,6 @@ class InteractionTransitionResult(BaseModel):
         return None if value is None else copy_event(value)
 
 
-class ModelCompletionStageDisposition(StrEnum):
-    """Durable non-success outcome of one exact model-completion dispatch."""
-
-    FAILED_BEFORE_PROVIDER_EFFECT = "failed_before_provider_effect"
-    PROVIDER_EFFECT_OUTCOME_UNKNOWN = "provider_effect_outcome_unknown"
-    SUPERSEDED = "superseded"
-
-
-class ModelCompletionStageSettlementRequest(BaseModel):
-    """Exact authority required to terminally settle one active model stage."""
-
-    model_config = ConfigDict(
-        extra="forbid",
-        frozen=True,
-        hide_input_in_errors=True,
-        revalidate_instances="always",
-    )
-
-    stage_id: str = Field(max_length=256)
-    logical_step_id: str = Field(max_length=256)
-    model_attempt_id: str = Field(max_length=256)
-    interaction_id: str = Field(max_length=256)
-    request_fingerprint: str
-    provider_effect_id: str = Field(max_length=512)
-    execution_profile_fingerprint: str | None = None
-    preparation_digest: str
-    settlement_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
-    settled_reservation_ids: tuple[str, ...]
-    disposition: ModelCompletionStageDisposition
-    reason_code: str = Field(min_length=1, max_length=128, pattern=r"^[a-z0-9_.-]+$")
-    superseding_stage_id: str | None = Field(default=None, max_length=256)
-
-    @field_validator(
-        "stage_id",
-        "logical_step_id",
-        "model_attempt_id",
-        "interaction_id",
-        "provider_effect_id",
-        "superseding_stage_id",
-    )
-    @classmethod
-    def validate_identifiers(cls, value: str | None, info) -> str | None:
-        if value is None:
-            return None
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator(
-        "request_fingerprint",
-        "execution_profile_fingerprint",
-        "preparation_digest",
-    )
-    @classmethod
-    def validate_digests(cls, value: str | None, info) -> str | None:
-        if value is None:
-            if info.field_name == "execution_profile_fingerprint":
-                return None
-            raise ValueError(f"{info.field_name} is required.")
-        try:
-            session_authority_rules._require_raw_sha256_digest(value)
-        except ValueError as exc:
-            raise ValueError(f"{info.field_name} must be a lowercase SHA-256 digest.") from exc
-        return value
-
-    @field_validator("settled_reservation_ids")
-    @classmethod
-    def validate_settled_reservation_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if type(value) is not tuple:
-            raise TypeError("settled_reservation_ids must be a tuple.")
-        copied = tuple(
-            require_clean_nonblank(reservation_id, "settled_reservation_ids")
-            for reservation_id in value
-        )
-        if len(set(copied)) != len(copied):
-            raise ValueError("settled_reservation_ids must be distinct.")
-        return copied
-
-    @model_validator(mode="after")
-    def validate_supersession(self) -> ModelCompletionStageSettlementRequest:
-        if self.disposition is ModelCompletionStageDisposition.SUPERSEDED:
-            if self.superseding_stage_id is None:
-                raise ValueError("A superseded stage requires superseding_stage_id.")
-            if self.superseding_stage_id == self.stage_id:
-                raise ValueError("A model-completion stage cannot supersede itself.")
-        elif self.superseding_stage_id is not None:
-            raise ValueError("superseding_stage_id is valid only for a superseded stage.")
-        return self
-
-
 class ModelCompletionStageSettlement(BaseModel):
     """Append-only proof that one exact prepared model effect is no longer active."""
 
@@ -2187,7 +2120,9 @@ class InteractionTransitionSpec(BaseModel):
                 "interaction completion."
             )
         if self.checkpoint_mutation is not None:
-            _validate_completion_finalization_mutation_shape(self.checkpoint_mutation)
+            completion_finalization._validate_completion_finalization_mutation_shape(
+                self.checkpoint_mutation
+            )
         if self.model_completion_stage_settlement is not None:
             if self.only_if_no_queued_messages:
                 raise ValueError(
@@ -3281,7 +3216,6 @@ INTERACTION_TRANSITION_OPERATION_KEY_PREFIX = "__cayu_interaction_transition_v1_
 INVOCATION_TERMINAL_EVENT_OPERATION_KEY_PREFIX = "__cayu_invocation_terminal_event_v1__:"
 RUNTIME_PUBLICATION_RECORD_TYPE = "cayu.runtime-publication"
 RUNTIME_PUBLICATION_SCHEMA_VERSION = 2
-RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS = 128
 RUNTIME_PUBLICATION_MAX_TRANSCRIPT_MESSAGES = 512
 RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS = 512
 _PENDING_TOOL_ROUND_CHECKPOINT_KEY = "pending_tool_round"
@@ -3379,56 +3313,6 @@ def _copy_runtime_publication_event_reference(
     )
 
 
-class RuntimePublicationCheckpointOperation(BaseModel):
-    """One independently fenced top-level checkpoint mutation."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    key: str = Field(max_length=256)
-    expected_value_digest: str | None
-    action: Literal["set", "delete"]
-    value: Any = None
-
-    @field_validator("key")
-    @classmethod
-    def validate_key(cls, value: str) -> str:
-        value = require_clean_nonblank(value, "checkpoint operation key")
-        if value == COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY:
-            raise ValueError(
-                "Runtime publications cannot mutate completion-result event publication authority."
-            )
-        if value == MODEL_FAILOVER_CHECKPOINT_KEY:
-            raise ValueError("Only model-stage preparation may mutate model failover authority.")
-        return value
-
-    @field_validator("expected_value_digest")
-    @classmethod
-    def validate_expected_value_digest(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        if (
-            type(value) is not str
-            or len(value) != 64
-            or any(character not in "0123456789abcdef" for character in value)
-        ):
-            raise ValueError("expected_value_digest must be a lowercase SHA-256 digest.")
-        return value
-
-    @field_validator("value", mode="before")
-    @classmethod
-    def copy_value(cls, value: Any) -> Any:
-        return copy_durable_json_value(value, "checkpoint operation value")
-
-    @model_validator(mode="after")
-    def validate_action(self) -> RuntimePublicationCheckpointOperation:
-        if self.action == "delete":
-            if self.expected_value_digest is None:
-                raise ValueError("A delete checkpoint operation requires a present-value digest.")
-            if self.value is not None:
-                raise ValueError("A delete checkpoint operation cannot carry a value.")
-        return self
-
-
 class RuntimePublicationOperationRecordMutation(BaseModel):
     """One CAS-protected session-operation record committed with a publication."""
 
@@ -3490,73 +3374,6 @@ def _copy_runtime_publication_operation_record_mutation(
     )
 
 
-def _copy_runtime_publication_checkpoint_operation(
-    operation: RuntimePublicationCheckpointOperation | dict[str, Any],
-) -> RuntimePublicationCheckpointOperation:
-    try:
-        if type(operation) is RuntimePublicationCheckpointOperation:
-            return RuntimePublicationCheckpointOperation(
-                key=operation.key,
-                expected_value_digest=operation.expected_value_digest,
-                action=operation.action,
-                value=operation.value,
-            )
-        if type(operation) is dict:
-            return RuntimePublicationCheckpointOperation.model_validate(operation)
-    except (AttributeError, TypeError, ValueError) as exc:
-        raise ValueError("Runtime publication checkpoint operation is malformed.") from exc
-    raise TypeError(
-        "Checkpoint operations must be RuntimePublicationCheckpointOperation values or objects."
-    )
-
-
-class RuntimePublicationMutation(BaseModel):
-    """Deterministic checkpoint patch committed with a publication."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    operations: tuple[RuntimePublicationCheckpointOperation, ...] = Field(default_factory=tuple)
-
-    @field_validator("operations", mode="before")
-    @classmethod
-    def copy_operations(
-        cls,
-        value,
-    ) -> tuple[RuntimePublicationCheckpointOperation, ...]:
-        if type(value) not in (list, tuple):
-            raise TypeError("operations must be a list or tuple of checkpoint operations.")
-        if len(value) > RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS:
-            raise ValueError(
-                "operations cannot contain more than "
-                f"{RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS} checkpoint mutations."
-            )
-        copied = tuple(
-            sorted(
-                (_copy_runtime_publication_checkpoint_operation(operation) for operation in value),
-                key=lambda operation: operation.key,
-            )
-        )
-        keys = tuple(operation.key for operation in copied)
-        if len(set(keys)) != len(keys):
-            raise ValueError("operations cannot mutate the same checkpoint key more than once.")
-        return copied
-
-
-def _copy_runtime_publication_mutation_value(
-    mutation: RuntimePublicationMutation | dict[str, Any],
-) -> RuntimePublicationMutation:
-    try:
-        if type(mutation) is RuntimePublicationMutation:
-            return RuntimePublicationMutation(
-                operations=mutation.operations,
-            )
-        if type(mutation) is dict:
-            return RuntimePublicationMutation.model_validate(mutation)
-    except (AttributeError, TypeError, ValueError) as exc:
-        raise ValueError("Runtime publication mutation is malformed.") from exc
-    raise TypeError("Runtime publication mutation must be a RuntimePublicationMutation or object.")
-
-
 class RuntimePublicationRequest(BaseModel):
     """Immutable input bundle for one logical model-step or tool-round publication."""
 
@@ -3612,7 +3429,7 @@ class RuntimePublicationRequest(BaseModel):
         cls,
         value: RuntimePublicationMutation | dict[str, Any],
     ) -> RuntimePublicationMutation:
-        return _copy_runtime_publication_mutation_value(value)
+        return checkpoint_mutation_rules._copy_runtime_publication_mutation_value(value)
 
     @field_validator("transcript_messages", mode="before")
     @classmethod
@@ -13614,9 +13431,11 @@ class InMemorySessionStore(
             raise ValueError("Session closure requires settled event side-effect deliveries.")
         checkpoint = self._checkpoints.get(session_id)
         deletion_now = self._ownership_clock()
-        active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
-            checkpoint,
-            now=deletion_now,
+        active_recovery_claim_id = (
+            session_recovery_rules._active_unexpired_incomplete_recovery_claim_id(
+                checkpoint,
+                now=deletion_now,
+            )
         )
         if active_recovery_claim_id is not None:
             raise ValueError(
@@ -14090,7 +13909,7 @@ class InMemorySessionStore(
 
             now = self._ownership_clock()
             if to_status is SessionStatus.RUNNING:
-                _require_live_incomplete_recovery_claim_for_run_epoch_transfer(
+                session_recovery_rules._require_live_incomplete_recovery_claim_for_run_epoch_transfer(
                     self._checkpoints.get(session_id),
                     now=now,
                 )
@@ -14318,7 +14137,7 @@ class InMemorySessionStore(
 
             now = self._ownership_clock()
             if to_status is SessionStatus.RUNNING:
-                _require_live_incomplete_recovery_claim_for_run_epoch_transfer(
+                session_recovery_rules._require_live_incomplete_recovery_claim_for_run_epoch_transfer(
                     self._checkpoints.get(session_id),
                     now=now,
                 )
@@ -14702,9 +14521,11 @@ class InMemorySessionStore(
                 session=session,
                 expected=terminal_decision,
             )
-            active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
-                current_checkpoint,
-                now=self._ownership_clock(),
+            active_recovery_claim_id = (
+                session_recovery_rules._active_unexpired_incomplete_recovery_claim_id(
+                    current_checkpoint,
+                    now=self._ownership_clock(),
+                )
             )
             if expected_recovery_claim_id is None:
                 if active_recovery_claim_id is not None:
@@ -14820,9 +14641,11 @@ class InMemorySessionStore(
             )
             updated_checkpoint = self._checkpoints.get(session_id)
             if not queued and checkpoint_mutation_request is not None:
-                updated_checkpoint = _apply_runtime_publication_checkpoint_mutation(
-                    RuntimePublicationMutation.model_validate(checkpoint_mutation_request),
-                    updated_checkpoint,
+                updated_checkpoint = (
+                    checkpoint_mutation_rules._apply_runtime_publication_checkpoint_mutation(
+                        RuntimePublicationMutation.model_validate(checkpoint_mutation_request),
+                        updated_checkpoint,
+                    )
                 )
                 if updated_checkpoint is None:
                     raise AssertionError("Interaction checkpoint mutation deleted its checkpoint.")
@@ -15043,7 +14866,10 @@ class InMemorySessionStore(
                     now=now,
                 )
                 is not None
-                or _incomplete_recovery_claim_from_checkpoint(current_checkpoint) is not None
+                or session_recovery_rules._incomplete_recovery_claim_from_checkpoint(
+                    current_checkpoint
+                )
+                is not None
             ):
                 return None
             inactive_before = utc_duration_cutoff(now, validated_inactive_for_seconds)
@@ -15150,7 +14976,7 @@ class InMemorySessionStore(
             for owner in self._session_closure_progress.values():
                 _check_closure_lineage_owner(owner, (session_id,))
             current = self._checkpoints.get(session_id)
-            _require_live_incomplete_recovery_claim_for_run_epoch_transfer(
+            session_recovery_rules._require_live_incomplete_recovery_claim_for_run_epoch_transfer(
                 current,
                 now=now,
             )
@@ -18964,7 +18790,7 @@ class InMemorySessionStore(
             )
 
         if checkpoint_codec is None:
-            checkpoint = _apply_runtime_publication_checkpoint_mutation(
+            checkpoint = checkpoint_mutation_rules._apply_runtime_publication_checkpoint_mutation(
                 request.mutation,
                 current_checkpoint,
             )
@@ -21661,7 +21487,7 @@ def _invocation_terminal_event_receipt_record(
         session_instance_id=session.instance_id,
         active_profile=active_profile,
         event=event,
-        record_digest=_canonical_runtime_publication_digest(payload),
+        record_digest=session_authority_rules._canonical_runtime_publication_digest(payload),
     )
     return (
         _invocation_terminal_event_storage_key(event.id),
@@ -21675,7 +21501,10 @@ def _load_invocation_terminal_event_receipt(
     try:
         receipt = _InvocationTerminalEventReceipt.model_validate(record)
         digest_payload = receipt.model_dump(mode="json", exclude={"record_digest"})
-        if _canonical_runtime_publication_digest(digest_payload) != receipt.record_digest:
+        if (
+            session_authority_rules._canonical_runtime_publication_digest(digest_payload)
+            != receipt.record_digest
+        ):
             raise ValueError
     except (TypeError, ValueError) as exc:
         raise RuntimeError("Stored invocation terminal-event receipt is invalid.") from exc
@@ -21842,7 +21671,7 @@ def _interaction_transition_receipt_record(
         ),
         recovery_claim_id=recovery_claim_id,
         status_changed=status_changed,
-        record_digest=_canonical_runtime_publication_digest(payload),
+        record_digest=session_authority_rules._canonical_runtime_publication_digest(payload),
     )
     return receipt.model_dump(mode="json")
 
@@ -21868,7 +21697,10 @@ def _load_interaction_transition_receipt(record: object) -> _InteractionTransiti
         if receipt.schema_version < 6:
             digest_payload.pop("terminal_event", None)
             digest_payload.pop("terminal_decision", None)
-        if _canonical_runtime_publication_digest(digest_payload) != receipt.record_digest:
+        if (
+            session_authority_rules._canonical_runtime_publication_digest(digest_payload)
+            != receipt.record_digest
+        ):
             raise ValueError
     except (TypeError, ValueError) as exc:
         raise RuntimeError("Stored interaction-transition receipt is invalid.") from exc
@@ -21972,7 +21804,9 @@ def _validate_interaction_transition_receipt_recovery_authority(
             "Interaction-transition receipt belongs to another recovery authority."
         )
     if expected_recovery_claim_id is not None:
-        current_claim = _incomplete_recovery_claim_from_checkpoint(current_checkpoint)
+        current_claim = session_recovery_rules._incomplete_recovery_claim_from_checkpoint(
+            current_checkpoint
+        )
         if current_claim is not None and current_claim[0] != expected_recovery_claim_id:
             raise SessionRunFenced(
                 "Interaction-transition receipt was superseded by another recovery authority."
@@ -22069,7 +21903,7 @@ def _require_invocation_release_recovery_claim(
 ) -> None:
     """Authenticate a completed recovery owner's exact durable claim."""
 
-    claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
+    claim = session_recovery_rules._incomplete_recovery_claim_from_checkpoint(checkpoint)
     if (
         claim is None
         or claim[0] != recovery_claim_id
@@ -22263,17 +22097,6 @@ def _model_completion_stage_dispatch_storage_key(stage_id: str) -> str:
     )
 
 
-def _canonical_runtime_publication_digest(value: Any) -> str:
-    encoded = canonical_durable_json_bytes(value, "runtime_publication")
-    return sha256(encoded).hexdigest()
-
-
-def runtime_publication_checkpoint_value_digest(value: Any) -> str:
-    """Return the canonical digest used to fence one checkpoint value."""
-
-    return _canonical_runtime_publication_digest(value)
-
-
 def runtime_publication_request_digest(
     session_id: str,
     request: RuntimePublicationRequest,
@@ -22378,25 +22201,6 @@ def runtime_publication_checkpoint_mutation(
     return RuntimePublicationMutation(operations=tuple(operations))
 
 
-def _validate_completion_finalization_mutation_shape(value: dict[str, Any]) -> None:
-    """Completion may only install one previously absent finalization marker."""
-
-    operations = value.get("operations")
-    if type(operations) is not list or len(operations) != 1:
-        raise ValueError(
-            "A completion-finalization transition requires exactly one checkpoint operation."
-        )
-    operation = operations[0]
-    if (
-        type(operation) is not dict
-        or operation.get("key") != PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY
-        or operation.get("expected_value_digest") is not None
-        or operation.get("action") != "set"
-        or type(operation.get("value")) is not dict
-    ):
-        raise ValueError("A completion-finalization transition must install a new pending marker.")
-
-
 def _prepare_queue_completion_checkpoint_mutation(
     value: dict[str, Any] | None,
     to_status: SessionStatus,
@@ -22406,7 +22210,7 @@ def _prepare_queue_completion_checkpoint_mutation(
     if to_status is not SessionStatus.RUNNING:
         raise ValueError("Queue completion checkpointing must retain running status.")
     copied = copy_durable_json_object(value, "checkpoint_mutation")
-    _validate_completion_finalization_mutation_shape(copied)
+    completion_finalization._validate_completion_finalization_mutation_shape(copied)
     mutation = RuntimePublicationMutation.model_validate(copied)
     completion_finalization.pending_completion_finalization_from_checkpoint(
         {PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY: mutation.operations[0].value}
@@ -22432,61 +22236,17 @@ def _apply_queue_completion_checkpoint_mutation(
         or marker["environment_name"] != session.environment_name
     ):
         raise SessionRunFenced("Queue completion finalization lost its active owner authority.")
-    updated = _apply_runtime_publication_checkpoint_mutation(mutation, checkpoint)
+    updated = checkpoint_mutation_rules._apply_runtime_publication_checkpoint_mutation(
+        mutation, checkpoint
+    )
     assert updated is not None
     return updated
-
-
-def _apply_runtime_publication_checkpoint_mutation(
-    mutation: RuntimePublicationMutation,
-    checkpoint: dict[str, Any] | None,
-) -> dict[str, Any] | None:
-    from cayu.collaboration._session_export_store import ROOT_KEY
-
-    if checkpoint is None and not mutation.operations:
-        return None
-    updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
-    for operation in mutation.operations:
-        if operation.key == ROOT_KEY:
-            raise ValueError("Session export authority requires its publication owner.")
-        if operation.key == MODEL_FAILOVER_CHECKPOINT_KEY:
-            raise ValueError("Only model-stage preparation may mutate model failover authority.")
-        present = operation.key in updated
-        if operation.expected_value_digest is None:
-            matches = not present
-        else:
-            matches = present and (
-                runtime_publication_checkpoint_value_digest(updated[operation.key])
-                == operation.expected_value_digest
-            )
-        if not matches:
-            raise SessionRuntimePublicationConflict(
-                "A runtime publication checkpoint key changed before publication: "
-                f"{operation.key!r}."
-            )
-        if operation.action == "set":
-            updated[operation.key] = copy_durable_json_value(
-                operation.value,
-                "checkpoint operation value",
-            )
-        else:
-            del updated[operation.key]
-    return updated
-
-
-def apply_runtime_publication_checkpoint_mutation(
-    mutation: RuntimePublicationMutation,
-    checkpoint: dict[str, Any] | None,
-) -> dict[str, Any] | None:
-    """Apply a validated runtime publication mutation to a defensive checkpoint copy."""
-
-    return _apply_runtime_publication_checkpoint_mutation(mutation, checkpoint)
 
 
 def runtime_publication_operation_record_value_digest(value: object) -> str:
     """Return the CAS digest used for one session-operation record value."""
 
-    return _canonical_runtime_publication_digest(
+    return session_authority_rules._canonical_runtime_publication_digest(
         copy_durable_json_object(value, "operation record value")
     )
 
@@ -22523,7 +22283,9 @@ def _apply_runtime_publication_operation_record_mutations(
 
 def _runtime_publication_event_digest(event: Event) -> str:
     copied_event = copy_event(event)
-    return _canonical_runtime_publication_digest(copied_event.model_dump(mode="json"))
+    return session_authority_rules._canonical_runtime_publication_digest(
+        copied_event.model_dump(mode="json")
+    )
 
 
 def runtime_publication_event_reference(event: Event) -> RuntimePublicationEventReference:
@@ -22532,7 +22294,9 @@ def runtime_publication_event_reference(event: Event) -> RuntimePublicationEvent
     copied_event = copy_event(event)
     return RuntimePublicationEventReference(
         event_id=copied_event.id,
-        event_digest=_canonical_runtime_publication_digest(copied_event.model_dump(mode="json")),
+        event_digest=session_authority_rules._canonical_runtime_publication_digest(
+            copied_event.model_dump(mode="json")
+        ),
     )
 
 
@@ -23466,9 +23230,9 @@ def _validate_tool_round_checkpoint_mutation(
 def _runtime_publication_json_equal(left: Any, right: Any) -> bool:
     """Compare validated JSON material under the durable canonicalization contract."""
 
-    return _canonical_runtime_publication_digest(left) == _canonical_runtime_publication_digest(
-        right
-    )
+    return session_authority_rules._canonical_runtime_publication_digest(
+        left
+    ) == session_authority_rules._canonical_runtime_publication_digest(right)
 
 
 def _validate_required_runtime_fence(value: int, field_name: str) -> int:
@@ -23580,7 +23344,7 @@ def _prepare_model_completion_stage(
         copied_request.stage_id,
     )
     winner_key = _model_completion_stage_winner_storage_key(copied_request.logical_step_id)
-    request_digest = _canonical_runtime_publication_digest(
+    request_digest = session_authority_rules._canonical_runtime_publication_digest(
         {
             "session_id": session_id,
             "stage_id": copied_request.stage_id,
@@ -23956,7 +23720,7 @@ def _model_failover_checkpoint_after_profile_admission(
         execution_profile_fingerprint=candidate_profile.fingerprint,
         plan=binding.plan,
         candidate_index=index,
-        origin_id=_canonical_runtime_publication_digest(
+        origin_id=session_authority_rules._canonical_runtime_publication_digest(
             {
                 "source": None if previous is None else previous.model_dump(mode="json"),
                 "source_profile": source_profile.fingerprint,
@@ -24205,7 +23969,9 @@ def _prepare_model_completion_stage_terminal(
         terminal_storage_key=terminal_key,
         settlement_storage_key=_model_completion_stage_settlement_storage_key(stage_id),
         publication=copied_publication,
-        publication_material_digest=_canonical_runtime_publication_digest(publication_payload),
+        publication_material_digest=session_authority_rules._canonical_runtime_publication_digest(
+            publication_payload
+        ),
         recovery_fence=recovery_fence,
     )
 
@@ -24228,7 +23994,9 @@ def _validate_model_completion_stage_recovery_fence(
         or session.run_epoch != fence.expected_run_epoch
         or active_invocation_execution_profile_from_checkpoint(checkpoint)
         != fence.expected_active_profile
-        or _active_unexpired_incomplete_recovery_claim_id(checkpoint, now=now)
+        or session_recovery_rules._active_unexpired_incomplete_recovery_claim_id(
+            checkpoint, now=now
+        )
         != fence.recovery_claim_id
     ):
         raise SessionRunFenced("Auxiliary recovery lost its invocation or recovery claim.")
@@ -24745,7 +24513,9 @@ def _model_completion_stage_preparation_record(
         "source_transcript_cursor": prepared.expected_transcript_cursor,
         "prepared_at": prepared_at.isoformat().replace("+00:00", "Z"),
     }
-    payload["record_digest"] = _canonical_runtime_publication_digest(payload)
+    payload["record_digest"] = session_authority_rules._canonical_runtime_publication_digest(
+        payload
+    )
     return copy_durable_json_object(payload, "model_completion_stage_preparation")
 
 
@@ -24768,7 +24538,9 @@ def _model_completion_stage_terminal_record(
         "publication_material_digest": prepared.publication_material_digest,
         "completed_at": completed_at.isoformat().replace("+00:00", "Z"),
     }
-    payload["record_digest"] = _canonical_runtime_publication_digest(payload)
+    payload["record_digest"] = session_authority_rules._canonical_runtime_publication_digest(
+        payload
+    )
     return copy_durable_json_object(payload, "model_completion_stage_terminal")
 
 
@@ -24791,7 +24563,9 @@ def _active_model_completion_stage_record(
         "source_transcript_cursor": stage.source_transcript_cursor,
         "activated_at": activated_at.isoformat().replace("+00:00", "Z"),
     }
-    payload["record_digest"] = _canonical_runtime_publication_digest(payload)
+    payload["record_digest"] = session_authority_rules._canonical_runtime_publication_digest(
+        payload
+    )
     return copy_durable_json_object(payload, "active_model_completion_stage")
 
 
@@ -24869,7 +24643,9 @@ def _model_completion_stage_abandonment_record(
         "source_transcript_cursor": stage.source_transcript_cursor,
         "abandoned_at": abandoned_at.isoformat().replace("+00:00", "Z"),
     }
-    payload["record_digest"] = _canonical_runtime_publication_digest(payload)
+    payload["record_digest"] = session_authority_rules._canonical_runtime_publication_digest(
+        payload
+    )
     return copy_durable_json_object(payload, "model_completion_stage_abandonment")
 
 
@@ -25204,7 +24980,9 @@ def _model_completion_stage_dispatch_record(
         "source_transcript_cursor": stage.source_transcript_cursor,
         "dispatched_at": dispatched_at.astimezone(UTC).isoformat().replace("+00:00", "Z"),
     }
-    payload["record_digest"] = _canonical_runtime_publication_digest(payload)
+    payload["record_digest"] = session_authority_rules._canonical_runtime_publication_digest(
+        payload
+    )
     return copy_durable_json_object(payload, "model_completion_stage_dispatch")
 
 
@@ -25226,7 +25004,10 @@ def _reconstruct_model_completion_stage_dispatch(
         ):
             raise ValueError
         digest_payload = dispatch.model_dump(mode="json", exclude={"record_digest"})
-        if _canonical_runtime_publication_digest(digest_payload) != dispatch.record_digest:
+        if (
+            session_authority_rules._canonical_runtime_publication_digest(digest_payload)
+            != dispatch.record_digest
+        ):
             raise ValueError
     except (TypeError, ValueError) as exc:
         raise SessionModelCompletionStageConflict(
@@ -25425,7 +25206,9 @@ def _model_completion_stage_settlement_record(
         "source_transcript_cursor": stage.source_transcript_cursor,
         "settled_at": settled_at.astimezone(UTC).isoformat().replace("+00:00", "Z"),
     }
-    payload["record_digest"] = _canonical_runtime_publication_digest(payload)
+    payload["record_digest"] = session_authority_rules._canonical_runtime_publication_digest(
+        payload
+    )
     return copy_durable_json_object(payload, "model_completion_stage_settlement")
 
 
@@ -25447,7 +25230,10 @@ def _reconstruct_model_completion_stage_settlement(
         ):
             raise ValueError
         digest_payload = settlement.model_dump(mode="json", exclude={"record_digest"})
-        if _canonical_runtime_publication_digest(digest_payload) != settlement.record_digest:
+        if (
+            session_authority_rules._canonical_runtime_publication_digest(digest_payload)
+            != settlement.record_digest
+        ):
             raise ValueError
     except (TypeError, ValueError) as exc:
         raise SessionModelCompletionStageConflict(
@@ -25542,7 +25328,9 @@ def _model_completion_stage_winner_record(
         "publication_digest": receipt.publication_digest,
         "published_at": receipt.published_at.isoformat().replace("+00:00", "Z"),
     }
-    payload["record_digest"] = _canonical_runtime_publication_digest(payload)
+    payload["record_digest"] = session_authority_rules._canonical_runtime_publication_digest(
+        payload
+    )
     return copy_durable_json_object(payload, "model_completion_stage_winner")
 
 
@@ -25590,7 +25378,10 @@ def _reconstruct_active_model_completion_stage_record(
         if storage_key != MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY:
             raise ValueError
         digest_payload = reconstructed.model_dump(mode="json", exclude={"record_digest"})
-        if _canonical_runtime_publication_digest(digest_payload) != reconstructed.record_digest:
+        if (
+            session_authority_rules._canonical_runtime_publication_digest(digest_payload)
+            != reconstructed.record_digest
+        ):
             raise ValueError
     except (KeyError, TypeError, ValueError) as exc:
         raise SessionModelCompletionStageConflict(
@@ -25651,7 +25442,10 @@ def _reconstruct_model_completion_stage_abandonment(
         if storage_key != _model_completion_stage_abandonment_storage_key(stage_id):
             raise ValueError
         digest_payload = reconstructed.model_dump(mode="json", exclude={"record_digest"})
-        if _canonical_runtime_publication_digest(digest_payload) != reconstructed.record_digest:
+        if (
+            session_authority_rules._canonical_runtime_publication_digest(digest_payload)
+            != reconstructed.record_digest
+        ):
             raise ValueError
         return ModelCompletionStageAbandonment(
             session_id=reconstructed.session_id,
@@ -25727,7 +25521,10 @@ def _reconstruct_model_completion_stage_winner_record(
         ):
             raise ValueError
         digest_payload = reconstructed.model_dump(mode="json", exclude={"record_digest"})
-        if _canonical_runtime_publication_digest(digest_payload) != reconstructed.record_digest:
+        if (
+            session_authority_rules._canonical_runtime_publication_digest(digest_payload)
+            != reconstructed.record_digest
+        ):
             raise ValueError
     except (KeyError, TypeError, ValueError) as exc:
         raise SessionModelCompletionStageConflict(
@@ -25784,7 +25581,10 @@ def _reconstruct_model_completion_stage_preparation(
         if storage_key != expected_key:
             raise ValueError
         digest_payload = reconstructed.model_dump(mode="json", exclude={"record_digest"})
-        if _canonical_runtime_publication_digest(digest_payload) != reconstructed.record_digest:
+        if (
+            session_authority_rules._canonical_runtime_publication_digest(digest_payload)
+            != reconstructed.record_digest
+        ):
             raise ValueError
     except (KeyError, TypeError, ValueError) as exc:
         raise SessionModelCompletionStageConflict(
@@ -25866,12 +25666,15 @@ def _reconstruct_model_completion_stage_terminal(
             raise ValueError
         publication_payload = reconstructed.publication.model_dump(mode="json")
         if (
-            _canonical_runtime_publication_digest(publication_payload)
+            session_authority_rules._canonical_runtime_publication_digest(publication_payload)
             != reconstructed.publication_material_digest
         ):
             raise ValueError
         digest_payload = reconstructed.model_dump(mode="json", exclude={"record_digest"})
-        if _canonical_runtime_publication_digest(digest_payload) != reconstructed.record_digest:
+        if (
+            session_authority_rules._canonical_runtime_publication_digest(digest_payload)
+            != reconstructed.record_digest
+        ):
             raise ValueError
     except (KeyError, TypeError, ValueError) as exc:
         raise SessionModelCompletionStageConflict(
@@ -26564,9 +26367,13 @@ def _prepare_runtime_publication(
         message.model_dump(mode="json") for message in copied_request.transcript_messages
     )
     event_payloads = tuple(event.model_dump(mode="json") for event in copied_request.events)
-    transcript_digest = _canonical_runtime_publication_digest(list(transcript_payloads))
-    events_digest = _canonical_runtime_publication_digest(list(event_payloads))
-    request_digest = _canonical_runtime_publication_digest(
+    transcript_digest = session_authority_rules._canonical_runtime_publication_digest(
+        list(transcript_payloads)
+    )
+    events_digest = session_authority_rules._canonical_runtime_publication_digest(
+        list(event_payloads)
+    )
+    request_digest = session_authority_rules._canonical_runtime_publication_digest(
         {
             "session_id": session_id,
             "publication_id": copied_request.publication_id,
@@ -27550,7 +27357,9 @@ def _build_runtime_publication_receipt(
         "interaction_id": request.interaction_id,
         "intent": request.intent,
         "request_digest": prepared.request_digest,
-        "checkpoint_digest": _canonical_runtime_publication_digest(checkpoint),
+        "checkpoint_digest": session_authority_rules._canonical_runtime_publication_digest(
+            checkpoint
+        ),
         "transcript_digest": prepared.transcript_digest,
         "events_digest": prepared.events_digest,
         "source_status": str(source_session.status),
@@ -27563,7 +27372,9 @@ def _build_runtime_publication_receipt(
         ],
         "published_at": published_at.isoformat().replace("+00:00", "Z"),
     }
-    publication_digest = _canonical_runtime_publication_digest(receipt_payload)
+    publication_digest = session_authority_rules._canonical_runtime_publication_digest(
+        receipt_payload
+    )
     return RuntimePublicationReceipt(
         **receipt_payload,
         publication_digest=publication_digest,
@@ -27634,7 +27445,10 @@ def _reconstruct_runtime_publication_receipt(
         if _runtime_publication_storage_key(receipt.publication_id) != storage_key:
             raise ValueError
         digest_payload = receipt.model_dump(mode="json", exclude={"publication_digest"})
-        if _canonical_runtime_publication_digest(digest_payload) != receipt.publication_digest:
+        if (
+            session_authority_rules._canonical_runtime_publication_digest(digest_payload)
+            != receipt.publication_digest
+        ):
             raise ValueError
     except (KeyError, TypeError, ValueError) as exc:
         raise SessionRuntimePublicationConflict(
@@ -27704,7 +27518,7 @@ def _validate_runtime_publication_durable_material(
         raise SessionRuntimePublicationConflict(
             "The durable runtime publication transcript attribution conflicts with its receipt."
         )
-    transcript_digest = _canonical_runtime_publication_digest(
+    transcript_digest = session_authority_rules._canonical_runtime_publication_digest(
         [message.model_dump(mode="json") for message in transcript]
     )
     if transcript_digest != receipt.transcript_digest:
@@ -27716,7 +27530,7 @@ def _validate_runtime_publication_durable_material(
         raise SessionRuntimePublicationConflict(
             "The durable runtime publication event batch is missing or reordered."
         )
-    events_digest = _canonical_runtime_publication_digest(
+    events_digest = session_authority_rules._canonical_runtime_publication_digest(
         [event.model_dump(mode="json") for event in events]
     )
     if events_digest != receipt.events_digest:
@@ -28333,7 +28147,6 @@ def _is_tool_debug_event(event_type: EventType | str) -> bool:
 
 # Sessions that must be interrupted before they can be deleted (in-flight work).
 DELETE_BLOCKED_SESSION_STATUSES = frozenset({SessionStatus.RUNNING, SessionStatus.INTERRUPTING})
-_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY = "incomplete_session_recovery_claim"
 INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY = "initial_transcript_pending"
 # Storage implementations import these aliases while collecting the same
 # bounded evidence consumed by the shared runtime classifier.
@@ -28751,74 +28564,6 @@ def _event_with_session_run_operation(
         bound,
         _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
     )
-
-
-def _incomplete_recovery_claim_from_checkpoint(
-    checkpoint: Mapping[str, Any] | None,
-) -> tuple[str, datetime] | None:
-    """Parse the runtime-owned incomplete-session recovery lease."""
-    if checkpoint is None or _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY not in checkpoint:
-        return None
-    marker = checkpoint[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY]
-    if type(marker) is not dict or marker.get("version") != 1:
-        raise ValueError("Incomplete-session recovery claim checkpoint is invalid.")
-    claim_id = require_clean_nonblank(marker.get("claim_id"), "recovery_claim.claim_id")
-    claimed_at_value = require_clean_nonblank(
-        marker.get("claimed_at"),
-        "recovery_claim.claimed_at",
-    )
-    expires_at_value = require_clean_nonblank(
-        marker.get("claim_expires_at"),
-        "recovery_claim.claim_expires_at",
-    )
-    try:
-        claimed_at = datetime.fromisoformat(claimed_at_value)
-        expires_at = datetime.fromisoformat(expires_at_value)
-    except ValueError as exc:
-        raise ValueError("Incomplete-session recovery claim timestamps are invalid.") from exc
-    if (
-        claimed_at.tzinfo is None
-        or claimed_at.utcoffset() is None
-        or expires_at.tzinfo is None
-        or expires_at.utcoffset() is None
-        or expires_at <= claimed_at
-    ):
-        raise ValueError("Incomplete-session recovery claim timestamps are invalid.")
-    return claim_id, expires_at
-
-
-def _active_unexpired_incomplete_recovery_claim_id(
-    checkpoint: dict[str, Any] | None,
-    *,
-    now: datetime,
-) -> str | None:
-    """Return the durable recovery owner while its lease remains live."""
-    if now.tzinfo is None or now.utcoffset() is None:
-        raise ValueError("now must be timezone-aware.")
-    claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
-    if claim is None:
-        return None
-    claim_id, expires_at = claim
-    return claim_id if expires_at.astimezone(UTC) > now.astimezone(UTC) else None
-
-
-def _require_live_incomplete_recovery_claim_for_run_epoch_transfer(
-    checkpoint: Mapping[str, Any] | None,
-    *,
-    now: datetime,
-) -> None:
-    """Reject a run-epoch transfer authorized by an expired recovery lease."""
-
-    if now.tzinfo is None or now.utcoffset() is None:
-        raise ValueError("now must be timezone-aware.")
-    claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
-    if claim is None:
-        return
-    _claim_id, expires_at = claim
-    if expires_at.astimezone(UTC) <= now.astimezone(UTC):
-        raise SessionRunFenced(
-            "Incomplete-session recovery claim expired before run ownership transfer."
-        )
 
 
 def _active_unexpired_session_operation_id(

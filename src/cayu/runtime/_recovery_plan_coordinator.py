@@ -71,7 +71,6 @@ from cayu.sessions.base import (
     ModelCompletionManualRecoveryRequest,
     ModelCompletionManualRecoveryResult,
     SessionStore,
-    _incomplete_recovery_claim_from_checkpoint,
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.pending_action_contracts import (
@@ -117,6 +116,7 @@ from cayu.sessions.recovery import (
     RecoveryRegistrationStatus,
     RecoveryTaskClaimEvidence,
     StaleRecoveryPlanError,
+    _incomplete_recovery_claim_from_checkpoint,
 )
 from cayu.tasks.handoff import TaskInterruptedHandoffReceipt, interrupted_task_handoff_request
 from cayu.tasks.queries import TaskQuery

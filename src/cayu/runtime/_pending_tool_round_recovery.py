@@ -115,6 +115,7 @@ from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions import _staged_tool_terminal_reader as staged_terminal_reader
+from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflict
 from cayu.sessions._invocation_lifecycle import (
     AdmittedInvocationBinding,
 )
@@ -125,7 +126,6 @@ from cayu.sessions.base import (
     RuntimePublicationReceipt,
     SessionOperationPublication,
     SessionRunFenced,
-    SessionRuntimePublicationConflict,
     SessionStore,
 )
 from cayu.sessions.queries import SessionOrder, SessionQuery

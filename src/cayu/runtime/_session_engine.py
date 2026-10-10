@@ -519,6 +519,7 @@ from cayu.runtime.work_attempt_semantics import WorkAttemptRunSemantics
 from cayu.runtime.work_attempt_source import WorkAttemptSourceRequest, work_attempt_source_digest
 from cayu.sessions import _model_completion_publication as model_completion_publication
 from cayu.sessions import _tool_call_evidence as tool_call_evidence
+from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflict
 from cayu.sessions._checkpoint_preservation import (
     _invocation_lifecycle_authority_mutation_scope,
     _invocation_lifecycle_authority_read_scope,
@@ -571,13 +572,16 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_event_id,
     settled_invocation_terminal_decision_from_checkpoint,
 )
+from cayu.sessions._model_completion_publication import (
+    ModelCompletionStageDisposition,
+    ModelCompletionStageSettlementRequest,
+)
 from cayu.sessions._terminal_evidence import (
     _SESSION_RUN_OPERATION_CHECKPOINT_KEY,
     interruption_request_id_from_payload,
     require_interruption_event_matches_pending_marker,
 )
 from cayu.sessions.base import (
-    _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
     _QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY,
     _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
     FORK_TRANSCRIPT_VALIDATION_ERROR,
@@ -587,9 +591,7 @@ from cayu.sessions.base import (
     InteractionTransitionSpec,
     ModelCompletionManualRecoveryRequest,
     ModelCompletionManualRecoveryResult,
-    ModelCompletionStageDisposition,
     ModelCompletionStageSettlement,
-    ModelCompletionStageSettlementRequest,
     ModelFailoverPolicy,
     ModelTarget,
     QueuedInteractionProfileHandoff,
@@ -597,7 +599,6 @@ from cayu.sessions.base import (
     SessionModelCompletionStageConflict,
     SessionOperationInitializer,
     SessionRunFenced,
-    SessionRuntimePublicationConflict,
     SessionStore,
     _activate_session_interaction,
     _activate_session_run_fence,
@@ -607,7 +608,6 @@ from cayu.sessions.base import (
     _current_session_invocation_terminal_event,
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
-    _incomplete_recovery_claim_from_checkpoint,
     _initial_transcript_pending_interaction_id,
     _latest_session_invocation_interaction_is_settled,
     _mark_session_invocation_terminal_event,
@@ -687,8 +687,10 @@ from cayu.sessions.records import (
     copy_session_runtime_identity,
 )
 from cayu.sessions.recovery import (
+    _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryResult,
+    _incomplete_recovery_claim_from_checkpoint,
 )
 from cayu.sessions.requests import (
     CompactSessionRequest,

@@ -43,7 +43,15 @@ _CONSTANTS = {
 def test_runtime_compatibility_imports_share_canonical_contracts(module_name):
     canonical = importlib.import_module(f"cayu.sessions.{module_name}")
     legacy = importlib.import_module(f"cayu.runtime.{module_name}")
-    for name, value in vars(canonical).items():
+    # Model-stage settlement contracts came from sessions.base; only these
+    # publication-pointer contracts historically had runtime import paths.
+    names = (
+        ("ModelStepPublicationCheckpoint", "model_step_publication_from_checkpoint")
+        if module_name == "_model_completion_publication"
+        else vars(canonical)
+    )
+    for name in names:
+        value = getattr(canonical, name)
         if name.startswith("_"):
             continue
         if getattr(value, "__module__", None) == canonical.__name__:

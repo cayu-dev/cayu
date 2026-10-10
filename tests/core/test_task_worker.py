@@ -54,10 +54,10 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,
     settled_invocation_terminal_decision_from_checkpoint,
 )
+from cayu.sessions._model_completion_publication import ModelCompletionStageDisposition
 from cayu.sessions._terminal_evidence import interruption_request_id_from_payload
 from cayu.sessions.base import (
     InMemorySessionStore,
-    ModelCompletionStageDisposition,
     SessionMessageQueueStatus,
     SessionRunFenced,
     SessionStore,

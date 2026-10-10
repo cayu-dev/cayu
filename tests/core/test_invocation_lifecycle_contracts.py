@@ -56,7 +56,15 @@ def _active_profile():
 def test_legacy_invocation_contract_imports_and_pickles_share_the_canonical_owner(module_name):
     canonical = importlib.import_module(f"cayu.sessions.{module_name}")
     legacy = importlib.import_module(f"cayu.runtime.{module_name}")
-    for name, value in vars(canonical).items():
+    # Only these authority contracts historically lived in the runtime module.
+    # New session-only helpers do not acquire legacy import paths automatically.
+    names = (
+        ("SessionRunFenced", "CheckpointValueAuthority", "checkpoint_value_authority")
+        if module_name == "authority"
+        else vars(canonical)
+    )
+    for name in names:
+        value = getattr(canonical, name)
         if getattr(value, "__module__", None) != canonical.__name__:
             continue
         assert getattr(legacy, name) is value

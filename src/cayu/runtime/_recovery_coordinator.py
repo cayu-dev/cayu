@@ -296,6 +296,10 @@ from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions import _tool_call_evidence as tool_call_evidence
+from cayu.sessions._checkpoint_mutations import (
+    SessionRuntimePublicationConflict,
+    runtime_publication_checkpoint_value_digest,
+)
 from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
     active_invocation_execution_profile_from_checkpoint,
@@ -316,16 +320,12 @@ from cayu.sessions._terminal_evidence import (
     _SessionRunOperation,
 )
 from cayu.sessions.base import (
-    _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
     RuntimePublicationReceipt,
     SessionRunFenced,
-    SessionRuntimePublicationConflict,
     SessionStore,
     _activate_owned_session_run_fence,
     _checkpoint_with_session_run_operation,
     _deactivate_session_interaction,
-    _incomplete_recovery_claim_from_checkpoint,
-    runtime_publication_checkpoint_value_digest,
 )
 from cayu.sessions.cleanup import (
     RecoveryCleanupStep,
@@ -339,6 +339,10 @@ from cayu.sessions.records import (
     Session,
     SessionStatus,
     SessionStatusConflict,
+)
+from cayu.sessions.recovery import (
+    _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
+    _incomplete_recovery_claim_from_checkpoint,
 )
 from cayu.tasks._terminalization import _terminalize_claimed_task
 from cayu.tasks.store import TaskStore

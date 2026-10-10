@@ -796,6 +796,18 @@ from cayu.runtime.tool_effects import (
 from cayu.runtime.tool_effects import (
     ToolEffectReconciliationTarget as ToolEffectReconciliationTarget,
 )
+from cayu.sessions._checkpoint_mutations import (
+    RuntimePublicationCheckpointOperation as RuntimePublicationCheckpointOperation,
+)
+from cayu.sessions._checkpoint_mutations import (
+    RuntimePublicationMutation as RuntimePublicationMutation,
+)
+from cayu.sessions._checkpoint_mutations import (
+    SessionRuntimePublicationConflict as SessionRuntimePublicationConflict,
+)
+from cayu.sessions._checkpoint_mutations import (
+    runtime_publication_checkpoint_value_digest as runtime_publication_checkpoint_value_digest,
+)
 from cayu.sessions._execution_profile_checkpoint import (
     EXECUTION_PROFILE_METADATA_KEY as EXECUTION_PROFILE_METADATA_KEY,
 )
@@ -863,6 +875,12 @@ from cayu.sessions._invocation_lifecycle import (
 from cayu.sessions._invocation_lifecycle import (
     copy_invocation_lifecycle_command as copy_invocation_lifecycle_command,
 )
+from cayu.sessions._model_completion_publication import (
+    ModelCompletionStageDisposition as ModelCompletionStageDisposition,
+)
+from cayu.sessions._model_completion_publication import (
+    ModelCompletionStageSettlementRequest as ModelCompletionStageSettlementRequest,
+)
 from cayu.sessions._session_continuation import ContinuationConflict as ContinuationConflict
 from cayu.sessions._session_continuation import ContinuationConsumption as ContinuationConsumption
 from cayu.sessions._session_continuation import ContinuationLatch as ContinuationLatch
@@ -902,19 +920,11 @@ from cayu.sessions.base import (
     ModelCompletionStageAbandonmentResult as ModelCompletionStageAbandonmentResult,
 )
 from cayu.sessions.base import ModelCompletionStageDispatch as ModelCompletionStageDispatch
-from cayu.sessions.base import ModelCompletionStageDisposition as ModelCompletionStageDisposition
 from cayu.sessions.base import ModelCompletionStageRequest as ModelCompletionStageRequest
 from cayu.sessions.base import ModelCompletionStageResult as ModelCompletionStageResult
 from cayu.sessions.base import ModelCompletionStageSettlement as ModelCompletionStageSettlement
-from cayu.sessions.base import (
-    ModelCompletionStageSettlementRequest as ModelCompletionStageSettlementRequest,
-)
 from cayu.sessions.base import ModelTarget as ModelTarget
-from cayu.sessions.base import (
-    RuntimePublicationCheckpointOperation as RuntimePublicationCheckpointOperation,
-)
 from cayu.sessions.base import RuntimePublicationEventReference as RuntimePublicationEventReference
-from cayu.sessions.base import RuntimePublicationMutation as RuntimePublicationMutation
 from cayu.sessions.base import (
     RuntimePublicationOperationRecordMutation as RuntimePublicationOperationRecordMutation,
 )
@@ -932,9 +942,6 @@ from cayu.sessions.base import (
 from cayu.sessions.base import SessionOperationInitializer as SessionOperationInitializer
 from cayu.sessions.base import SessionOperationPublication as SessionOperationPublication
 from cayu.sessions.base import SessionOperationTransform as SessionOperationTransform
-from cayu.sessions.base import (
-    SessionRuntimePublicationConflict as SessionRuntimePublicationConflict,
-)
 from cayu.sessions.base import SessionStore as SessionStore
 from cayu.sessions.base import (
     StoreTimeSessionOperationTransform as StoreTimeSessionOperationTransform,
@@ -944,9 +951,6 @@ from cayu.sessions.base import (
 )
 from cayu.sessions.base import (
     runtime_publication_checkpoint_mutation as runtime_publication_checkpoint_mutation,
-)
-from cayu.sessions.base import (
-    runtime_publication_checkpoint_value_digest as runtime_publication_checkpoint_value_digest,
 )
 from cayu.sessions.base import (
     runtime_publication_event_reference as runtime_publication_event_reference,

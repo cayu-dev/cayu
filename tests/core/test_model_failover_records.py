@@ -7,6 +7,11 @@ import warnings
 
 import pytest
 
+from cayu.sessions._checkpoint_mutations import (
+    RuntimePublicationCheckpointOperation,
+    RuntimePublicationMutation,
+    apply_runtime_publication_checkpoint_mutation,
+)
 from cayu.sessions._model_failover import (
     MODEL_FAILOVER_CHECKPOINT_KEY,
     ModelFailoverCandidate,
@@ -16,12 +21,7 @@ from cayu.sessions._model_failover import (
     copy_model_failover_state,
     validate_model_failover_successor,
 )
-from cayu.sessions.base import (
-    InMemorySessionStore,
-    RuntimePublicationCheckpointOperation,
-    RuntimePublicationMutation,
-    apply_runtime_publication_checkpoint_mutation,
-)
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,

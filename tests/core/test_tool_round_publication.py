@@ -30,6 +30,7 @@ from cayu.runtime._tool_round_publication import (
     publish_tool_round_with_exact_replay,
 )
 from cayu.sessions._assistant_tool_round_publication import AssistantToolRoundPublication
+from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflict
 from cayu.sessions._pending_tool_round import (
     PENDING_TOOL_ROUND_CHECKPOINT_KEY,
     PendingToolRound,
@@ -40,7 +41,6 @@ from cayu.sessions.base import (
     RuntimePublicationReceipt,
     RuntimePublicationRequest,
     RuntimePublicationResult,
-    SessionRuntimePublicationConflict,
 )
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.records import Session, SessionIdentity, SessionStatus
