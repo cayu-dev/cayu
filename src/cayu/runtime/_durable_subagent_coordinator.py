@@ -52,12 +52,7 @@ from cayu.sessions._execution_profile_checkpoint import (
     execution_profile_from_session_metadata,
 )
 from cayu.sessions._terminal_evidence import _session_run_operation_from_checkpoint
-from cayu.sessions.base import (
-    QueuedDispatchTerminalReceipt,
-    SessionRunFenced,
-    SessionStore,
-    run_request_with_runtime_invocation,
-)
+from cayu.sessions.base import QueuedDispatchTerminalReceipt, SessionRunFenced, SessionStore
 from cayu.sessions.invocation import (
     SessionExecutionSource,
     SessionInvocationBinding,
@@ -75,6 +70,7 @@ from cayu.sessions.requests import (
     copy_run_request,
     run_request_with_prepared_session_authority,
     run_request_with_runtime_generated_authority,
+    run_request_with_runtime_invocation,
 )
 from cayu.tasks.dispatch import (
     DispatchHandle,

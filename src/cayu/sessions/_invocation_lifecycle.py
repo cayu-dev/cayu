@@ -74,7 +74,6 @@ from cayu.sessions.base import (
     RuntimePublicationMutation,
     SessionModelTransition,
     SessionRunFenced,
-    _authenticated_session_instance_id_for_run_request,
     apply_runtime_publication_checkpoint_mutation,
     session_user_metadata,
 )
@@ -100,6 +99,7 @@ from cayu.sessions.records import (
 )
 from cayu.sessions.requests import (
     RunRequest,
+    _authenticated_session_instance_id_for_run_request,
     _run_request_invocation_lifecycle_authority_sha256,
     copy_run_request,
     runtime_prepared_session_authority,

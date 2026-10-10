@@ -22,7 +22,7 @@ from cayu.messages import Message
 from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
-from cayu.sessions.base import InMemorySessionStore, run_request_with_task_invocation
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.recovery import (
     RecoveryBlockerCode,
@@ -37,7 +37,7 @@ from cayu.sessions.recovery import (
     RecoveryRegistrationStatus,
     RecoveryTaskClaimEvidence,
 )
-from cayu.sessions.requests import ResumeRequest, RunRequest
+from cayu.sessions.requests import ResumeRequest, RunRequest, run_request_with_task_invocation
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.creation import TaskCreate, TaskInvocationSnapshot
 from cayu.tasks.memory import InMemoryTaskStore

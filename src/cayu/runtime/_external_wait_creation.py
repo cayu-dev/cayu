@@ -32,7 +32,7 @@ def current_external_creation():
 
 
 def require_external_creation(record: ExternalWaitRecord | None, request) -> None:
-    from cayu.sessions.base import _authenticated_session_instance_id_for_run_request
+    from cayu.sessions.requests import _authenticated_session_instance_id_for_run_request
 
     expected = current_external_creation()
     if expected is None:

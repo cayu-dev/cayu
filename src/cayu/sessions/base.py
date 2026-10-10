@@ -427,10 +427,22 @@ from cayu.sessions.requests import (
     run_request_with_runtime_generated_authority as run_request_with_runtime_generated_authority,
 )
 from cayu.sessions.requests import (
+    run_request_with_runtime_invocation as run_request_with_runtime_invocation,
+)
+from cayu.sessions.requests import (
+    run_request_with_runtime_session_instance_authority as run_request_with_runtime_session_instance_authority,
+)
+from cayu.sessions.requests import (
+    run_request_with_task_invocation as run_request_with_task_invocation,
+)
+from cayu.sessions.requests import (
     runtime_prepared_session_authority as runtime_prepared_session_authority,
 )
 from cayu.sessions.requests import (
     session_input_contract_evidence as session_input_contract_evidence,
+)
+from cayu.sessions.requests import (
+    session_instance_id_for_run_request as session_instance_id_for_run_request,
 )
 from cayu.sessions.summaries import EventSummary as EventSummary
 from cayu.sessions.summaries import SessionOperationalSnapshot as SessionOperationalSnapshot
@@ -945,7 +957,6 @@ from cayu.sessions.invocation import (
     SessionInvocation,
     SessionInvocationBinding,
     copy_invocation_origin,
-    copy_task_invocation,
     inherited_session_invocation,
     session_invocation_from_task,
 )
@@ -960,7 +971,6 @@ from cayu.sessions.messaging import (
     session_message_checkpoint_sha256,
     session_message_rejection,
 )
-from cayu.tasks.creation import TaskInvocationSnapshot
 from cayu.tools.catalogue import CALL_TOOL_NAME
 from cayu.tools.exposure import (
     TOOL_CAPABILITY_CEILING_METADATA_KEY,
@@ -21532,107 +21542,6 @@ class InMemorySessionStore(
             return _project_interruption_cascade_marker(marker)
 
 
-def run_request_with_runtime_invocation(
-    request: RunRequest,
-    *,
-    source: SessionExecutionSource,
-    verified_origin: InvocationOrigin | None = None,
-) -> RunRequest:
-    """Attach invocation authority minted by a trusted Cayu runtime boundary."""
-
-    if type(request) is not RunRequest:
-        raise TypeError("Runtime invocation authority requires a RunRequest.")
-    if type(source) is not SessionExecutionSource:
-        raise TypeError("source must be a SessionExecutionSource.")
-    if verified_origin is not None:
-        verified_origin = copy_invocation_origin(verified_origin)
-        if verified_origin.trust is not InvocationOriginTrust.SERVER_VERIFIED:
-            raise ValueError("Runtime-verified origins must use server_verified trust.")
-        if request.invocation_origin is not None:
-            raise ValueError("A verified invocation cannot also carry a host origin claim.")
-        if source is not SessionExecutionSource.HTTP_RUN:
-            raise ValueError("Server-verified invocation origins require an HTTP run source.")
-    copied = copy_run_request(request)
-    copied._runtime_invocation_source = source
-    copied._verified_invocation_origin = verified_origin
-    return copied
-
-
-def run_request_with_task_invocation(
-    request: RunRequest,
-    task_invocation: TaskInvocationSnapshot,
-) -> RunRequest:
-    """Bind trusted durable task provenance to a session-creation request."""
-
-    if type(request) is not RunRequest:
-        raise TypeError("Task invocation authority requires a RunRequest.")
-    if request.task_id is None:
-        raise ValueError("Task invocation authority requires RunRequest.task_id.")
-    if type(task_invocation) is not TaskInvocationSnapshot:
-        raise TypeError("Task invocation authority requires a TaskInvocationSnapshot.")
-    if task_invocation.id != request.task_id:
-        raise ValueError("Task invocation identity conflicts with RunRequest.task_id.")
-    if task_invocation.session_id is not None and task_invocation.session_id != request.session_id:
-        raise ValueError("Task session identity conflicts with RunRequest.session_id.")
-    if request.invocation_origin is not None or request._verified_invocation_origin is not None:
-        raise ValueError("Task-backed sessions must inherit their task origin.")
-    copied = copy_run_request(request)
-    copied._runtime_task_invocation = TaskInvocationSnapshot(
-        id=task_invocation.id,
-        session_id=task_invocation.session_id,
-        session_instance_id=task_invocation.session_instance_id,
-        invocation=copy_task_invocation(task_invocation.invocation),
-    )
-    if copied._runtime_invocation_source is None:
-        copied._runtime_invocation_source = SessionExecutionSource.TASK
-    return copied
-
-
-def run_request_with_runtime_session_instance_authority(
-    request: RunRequest,
-    *,
-    session_instance_id: str,
-) -> RunRequest:
-    """Bind one trusted pre-create session incarnation to an internal request."""
-
-    if type(request) is not RunRequest:
-        raise TypeError("Runtime session-instance authority requires a RunRequest.")
-    session_id = request.session_id
-    if type(session_id) is not str:
-        raise ValueError("Runtime session-instance authority requires a session_id.")
-    session_instance_id = SessionInvocationBinding.validate_session_instance_id(session_instance_id)
-    current = request._runtime_session_instance_authority
-    if current is not None and (
-        type(current) is not session_request_contracts._RuntimeSessionInstanceAuthority
-        or current.token is not session_request_contracts._RUNTIME_SESSION_INSTANCE_AUTHORITY_TOKEN
-        or current.session_id != session_id
-        or current.session_instance_id != session_instance_id
-    ):
-        raise ValueError("Runtime session-instance authority conflicts with the request.")
-    copied = copy_run_request(request)
-    copied._runtime_session_instance_authority = (
-        session_request_contracts._RuntimeSessionInstanceAuthority(
-            session_id=session_id,
-            session_instance_id=session_instance_id,
-        )
-    )
-    return copied
-
-
-def _authenticated_session_instance_id_for_run_request(
-    request: RunRequest,
-    *,
-    session_id: str,
-) -> str | None:
-    """Return positive runtime-owned incarnation authority without minting one."""
-
-    if type(request) is not RunRequest:
-        raise TypeError("Session instance authority inspection requires a RunRequest.")
-    if request._runtime_session_instance_authority is None:
-        return None
-    return session_instance_id_for_run_request(request, session_id=session_id)
-
-
 def run_request_with_runtime_initial_transcript_authority(
     request: RunRequest,
     *,
@@ -21797,39 +21706,6 @@ def session_invocation_for_run_request(
         root_session_id=session_id,
         source=source,
     )
-
-
-def session_instance_id_for_run_request(
-    request: RunRequest,
-    *,
-    session_id: str,
-) -> str:
-    """Mint one store-owned incarnation for a newly created session."""
-
-    if type(request) is not RunRequest:
-        raise TypeError("Session instance derivation requires a RunRequest.")
-    session_id = session_record_rules._require_bounded_session_id(session_id, "session_id")
-    task_invocation = request._runtime_task_invocation
-    authority = request._runtime_session_instance_authority
-    if authority is not None:
-        if (
-            type(authority) is not session_request_contracts._RuntimeSessionInstanceAuthority
-            or authority.token
-            is not session_request_contracts._RUNTIME_SESSION_INSTANCE_AUTHORITY_TOKEN
-            or authority.session_id != session_id
-        ):
-            raise ValueError("Runtime session-instance authority conflicts with the request.")
-        if task_invocation is not None and (
-            task_invocation.session_id not in {None, session_id}
-            or task_invocation.session_instance_id not in {None, authority.session_instance_id}
-        ):
-            raise ValueError("Task session-instance authority conflicts with session creation.")
-        return authority.session_instance_id
-    if task_invocation is not None and task_invocation.session_instance_id is not None:
-        raise ValueError(
-            "A task already bound to a session instance cannot create that session again."
-        )
-    return str(uuid4())
 
 
 def fork_session_invocation(source_session: Session) -> SessionInvocation:
@@ -21999,7 +21875,7 @@ def run_request_with_prepared_work_attempt_creation(
         or prepared.run_semantics is None
         or copied.session_id != prepared.session_id
         or copied.task_id != prepared.task_id
-        or _authenticated_session_instance_id_for_run_request(
+        or session_request_contracts._authenticated_session_instance_id_for_run_request(
             copied, session_id=prepared.session_id
         )
         != prepared.session_invocation.session_instance_id

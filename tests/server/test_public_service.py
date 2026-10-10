@@ -95,7 +95,7 @@ from cayu.server.service import (
     _product_auth_dependency,
     _ProductResultReceiptPolicy,
 )
-from cayu.sessions.base import run_request_with_task_invocation
+from cayu.sessions.requests import run_request_with_task_invocation
 from cayu.storage.evals_sqlite import SQLiteEvalStore
 from cayu.tasks.creation import task_create_with_runtime_invocation
 

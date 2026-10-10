@@ -38,11 +38,8 @@ from cayu import (
     TaskStatus,
     WorkCompletionConflict,
 )
-from cayu.sessions.base import (
-    SessionStore,
-    fork_session_invocation,
-    run_request_with_task_invocation,
-)
+from cayu.sessions.base import SessionStore, fork_session_invocation
+from cayu.sessions.requests import run_request_with_task_invocation
 from cayu.tasks.store import TaskStore
 
 

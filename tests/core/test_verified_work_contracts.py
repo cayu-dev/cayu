@@ -55,7 +55,7 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
 )
-from cayu.sessions.base import InMemorySessionStore, run_request_with_runtime_invocation
+from cayu.sessions.base import InMemorySessionStore
 from cayu.sessions.forks import (
     PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
     ForkExecutionProfileSelection,
@@ -80,6 +80,7 @@ from cayu.sessions.requests import (
     ForkSessionRequest,
     ResumeRequest,
     RunRequest,
+    run_request_with_runtime_invocation,
 )
 from cayu.storage import migrations as schema_migrations
 from cayu.storage.sqlite import SQLiteTaskStore

@@ -359,7 +359,6 @@ from cayu.sessions.base import (
     deferred_interaction_input_for_run_request,
     replace_session_user_metadata,
     restore_persisted_event_authority,
-    session_instance_id_for_run_request,
     session_invocation_for_run_request,
     session_metadata_for_creation,
     transform_fork_checkpoint,
@@ -440,6 +439,7 @@ from cayu.sessions.requests import (
     RunRequest,
     _copy_optional_tool_capability_ceiling,
     copy_run_request,
+    session_instance_id_for_run_request,
 )
 from cayu.sessions.summaries import (
     EventSummary,

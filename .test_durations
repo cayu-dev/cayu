@@ -1,4 +1,10 @@
 {
+  "tests/core/test_session_request_authority_layout.py::test_invocation_and_task_authority_without_implementations": 0.6683315410045907,
+  "tests/core/test_session_request_authority_layout.py::test_request_authority_preserves_public_function_identity[run_request_with_runtime_invocation]": 0.000693917041644454,
+  "tests/core/test_session_request_authority_layout.py::test_request_authority_preserves_public_function_identity[run_request_with_runtime_session_instance_authority]": 0.00025637500220909715,
+  "tests/core/test_session_request_authority_layout.py::test_request_authority_preserves_public_function_identity[run_request_with_task_invocation]": 0.0003553740098141134,
+  "tests/core/test_session_request_authority_layout.py::test_request_authority_preserves_public_function_identity[session_instance_id_for_run_request]": 0.00024854199727997184,
+  "tests/core/test_session_request_authority_layout.py::test_session_instance_authority_without_implementations": 0.7341178329661489,
   "tests/core/test_compaction_identity.py::test_compaction_cannot_rebind_a_completion_to_another_dispatch": 0.0002800829824991524,
   "tests/core/test_compaction_identity.py::test_compaction_completion_preserves_issued_step_and_replays_after_dispatch[automatic]": 0.00028724997537210584,
   "tests/core/test_compaction_identity.py::test_compaction_completion_preserves_issued_step_and_replays_after_dispatch[explicit]": 0.0038806249503977597,

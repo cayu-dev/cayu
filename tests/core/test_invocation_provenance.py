@@ -17,10 +17,8 @@ from cayu import (
     SessionInvocation,
     SQLiteSessionStore,
 )
-from cayu.sessions.base import (
-    fork_session_invocation,
-    run_request_with_runtime_invocation,
-)
+from cayu.sessions.base import fork_session_invocation
+from cayu.sessions.requests import run_request_with_runtime_invocation
 
 
 def _identity() -> SessionIdentity:

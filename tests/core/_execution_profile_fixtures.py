@@ -55,7 +55,6 @@ from cayu.runtime.loop_policies import LoopPolicy
 from cayu.sessions.base import (
     SessionModelTransition,
     SessionStore,
-    run_request_with_runtime_session_instance_authority,
     runtime_publication_checkpoint_mutation,
 )
 from cayu.sessions.checkpoints import (
@@ -66,7 +65,7 @@ from cayu.sessions.checkpoints import (
 )
 from cayu.sessions.creation_claims import bind_runtime_session_create_claim
 from cayu.sessions.records import Session, SessionIdentity, SessionStatus
-from cayu.sessions.requests import RunRequest
+from cayu.sessions.requests import RunRequest, run_request_with_runtime_session_instance_authority
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.tools.exposure import (
     ToolCapabilityCeiling,

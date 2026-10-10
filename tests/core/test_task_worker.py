@@ -61,7 +61,6 @@ from cayu.sessions.base import (
     SessionMessageQueueStatus,
     SessionRunFenced,
     SessionStore,
-    run_request_with_task_invocation,
 )
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.invocation import TaskExecutionSource
@@ -73,7 +72,12 @@ from cayu.sessions.recovery import (
     IncompleteSessionRecoveryRequest,
     IncompleteSessionsRecoveryRequest,
 )
-from cayu.sessions.requests import InterruptSessionRequest, ResumeRequest, RunRequest
+from cayu.sessions.requests import (
+    InterruptSessionRequest,
+    ResumeRequest,
+    RunRequest,
+    run_request_with_task_invocation,
+)
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tasks.creation import (
     TaskCreate,

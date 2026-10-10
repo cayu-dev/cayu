@@ -51,9 +51,8 @@ from cayu.server.contracts import (
     EvalTargetCatalogEntry,
     EvalTargetCatalogResponse,
 )
-from cayu.sessions.base import run_request_with_runtime_invocation
 from cayu.sessions.invocation import SessionExecutionSource
-from cayu.sessions.requests import RunRequest, copy_run_request
+from cayu.sessions.requests import RunRequest, copy_run_request, run_request_with_runtime_invocation
 
 DEFAULT_EVAL_PROFILE_ID = "default"
 _EXPLICIT_EVAL_PROFILE_ID = "explicit"
