@@ -517,6 +517,11 @@ from cayu.collaboration._clarification_state import (
 )
 from cayu.collaboration._contracts import CollaborationConflict as CollaborationConflict
 from cayu.collaboration._contracts import CollaborationContractError as CollaborationContractError
+from cayu.collaboration._contracts import ExpectedOperation as ExpectedOperation
+from cayu.collaboration._contracts import InitiatorBinding as InitiatorBinding
+from cayu.collaboration._contracts import ObjectRef as ObjectRef
+from cayu.collaboration._contracts import OperationRef as OperationRef
+from cayu.collaboration._contracts import OwnerRef as OwnerRef
 from cayu.collaboration._planning_records import RequestPlanningCursor as RequestPlanningCursor
 from cayu.collaboration._planning_records import RequestPlanningEvent as RequestPlanningEvent
 from cayu.collaboration._planning_records import RequestPlanningPage as RequestPlanningPage
@@ -6996,6 +7001,7 @@ __all__ = [
     "ExecutionSnapshots",
     "ExecutionToolRequirement",
     "ExecutionToolRequirementEvidence",
+    "ExpectedOperation",
     "ExportLimits",
     "ExternalBodyReleaseV1",
     "ExternalContainerLaunchRequestV1",
@@ -7170,6 +7176,7 @@ __all__ = [
     "IncrementalWorkflowCaptureError",
     "InferenceInvoker",
     "InferenceLimits",
+    "InitiatorBinding",
     "InlineDispatcher",
     "InputChannel",
     "InputTokenCountConfidence",
@@ -7604,6 +7611,7 @@ __all__ = [
     "NativeStructuredOutputSchemaInvalid",
     "NativeStructuredOutputUnsupported",
     "NoWorkspaceBinding",
+    "ObjectRef",
     "ObservedDeltaContextEstimator",
     "OpaqueExternalCaseRefV1",
     "OpaqueRecallEvidenceLocator",
@@ -7611,7 +7619,9 @@ __all__ = [
     "OpenAISubscriptionProvider",
     "OpenAIWebSearch",
     "OpenTelemetryEventSink",
+    "OperationRef",
     "OperationsConfig",
+    "OwnerRef",
     "PairedCostAttempt",
     "PairedCostQualityComparisonReport",
     "PairedCostQualityComparisonRequest",

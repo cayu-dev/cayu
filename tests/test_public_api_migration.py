@@ -10,9 +10,11 @@ import re
 import subprocess
 import sys
 import textwrap
+import typing
 from pathlib import Path
 
 import pytest
+from pydantic import BaseModel
 
 _ROOT = Path(__file__).resolve().parents[1]
 _MOVES = json.loads((_ROOT / "docs/public-api-migration.json").read_text())
@@ -64,6 +66,43 @@ def test_public_manifests_resolve_and_match_static_declarations(package_name):
     for name, (module_name, symbol) in manifest.EXPORTS.items():
         assert module_name != package_name, "lazy exports must not resolve through themselves"
         assert getattr(package, name) is getattr(importlib.import_module(module_name), symbol)
+
+
+def _annotation_classes(annotation: object) -> set[type]:
+    pending = [annotation]
+    classes: set[type] = set()
+    while pending:
+        current = pending.pop()
+        pending.extend(typing.get_args(current))
+        if isinstance(current, type):
+            origin = getattr(current, "__pydantic_generic_metadata__", {}).get("origin")
+            classes.add(origin or current)
+    return classes
+
+
+@pytest.mark.parametrize("package_name", ["cayu", "cayu.collaboration"])
+def test_exported_models_use_exported_collaboration_contract_types(package_name):
+    """Public models must be constructible from public imports alone."""
+
+    manifest = importlib.import_module(package_name + "._exports")
+    exported: set[object] = set()
+    models: dict[str, type[BaseModel]] = {}
+    for name, (module_name, symbol) in manifest.EXPORTS.items():
+        try:
+            value = getattr(importlib.import_module(module_name), symbol)
+        except ImportError:
+            continue
+        exported.add(value)
+        if isinstance(value, type) and issubclass(value, BaseModel):
+            models[name] = value
+    missing = {
+        f"{model_name}.{field_name}: {referenced.__qualname__}"
+        for model_name, model in models.items()
+        for field_name, field in model.model_fields.items()
+        for referenced in _annotation_classes(field.annotation)
+        if referenced.__module__ == "cayu.collaboration._contracts" and referenced not in exported
+    }
+    assert not missing, sorted(missing)
 
 
 @pytest.mark.parametrize(

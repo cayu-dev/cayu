@@ -83,6 +83,11 @@ from cayu.collaboration._clarification_state import (
 )
 from cayu.collaboration._contracts import CollaborationConflict as CollaborationConflict
 from cayu.collaboration._contracts import CollaborationContractError as CollaborationContractError
+from cayu.collaboration._contracts import ExpectedOperation as ExpectedOperation
+from cayu.collaboration._contracts import InitiatorBinding as InitiatorBinding
+from cayu.collaboration._contracts import ObjectRef as ObjectRef
+from cayu.collaboration._contracts import OperationRef as OperationRef
+from cayu.collaboration._contracts import OwnerRef as OwnerRef
 from cayu.collaboration._planning_records import RequestPlanningCursor as RequestPlanningCursor
 from cayu.collaboration._planning_records import RequestPlanningEvent as RequestPlanningEvent
 from cayu.collaboration._planning_records import RequestPlanningPage as RequestPlanningPage
@@ -495,6 +500,7 @@ __all__ = [
     "ContinuationUnavailable",
     "ContinueRecipientAdmissionTarget",
     "DiscoveredWait",
+    "ExpectedOperation",
     "ExportLimits",
     "ForkRecipientAdmissionTarget",
     "ForkRecipientCreationPreparation",
@@ -521,6 +527,7 @@ __all__ = [
     "HostRequestMaintenanceSource",
     "HostWaitRule",
     "InMemoryCollaborationStore",
+    "InitiatorBinding",
     "InputChannel",
     "LifecycleCommand",
     "LifecycleIntent",
@@ -540,6 +547,9 @@ __all__ = [
     "NamespaceRotate",
     "NamespaceSeal",
     "NamespaceSnapshot",
+    "ObjectRef",
+    "OperationRef",
+    "OwnerRef",
     "ParticipantAlias",
     "ParticipantAliasChange",
     "ParticipantCommand",
