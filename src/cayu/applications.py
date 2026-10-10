@@ -554,7 +554,6 @@ from cayu.sessions.base import (
     _RECIPIENT_PROVENANCE_CAPABILITY,
     CompactSessionRequest,
     ForkSessionRequest,
-    ForkSourceSnapshot,
     InMemorySessionStore,
     InterruptSessionRequest,
     ModelCompletionManualRecoveryRequest,
@@ -610,6 +609,9 @@ from cayu.sessions.execution import (
     SessionExecutionConfig,
     SessionExecutionState,
     execution_owned_by,
+)
+from cayu.sessions.forks import (
+    ForkSourceSnapshot,
 )
 from cayu.sessions.invocation import (
     SessionInvocationBinding,

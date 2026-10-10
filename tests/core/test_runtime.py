@@ -271,9 +271,7 @@ from cayu.sessions._invocation_terminal_decision import (
     settled_invocation_terminal_decision_from_checkpoint,
 )
 from cayu.sessions.base import (
-    ForkExecutionProfileSelection,
     ForkSessionRequest,
-    ForkSystemPromptPolicy,
     InMemorySessionStore,
     InterruptSessionRequest,
     ModelCompletionManualRecoveryRequest,
@@ -301,6 +299,10 @@ from cayu.sessions.checkpoints import (
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery
+from cayu.sessions.forks import (
+    ForkExecutionProfileSelection,
+    ForkSystemPromptPolicy,
+)
 from cayu.sessions.invocation import InvocationOriginTrust, SessionExecutionSource
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import EventRecord, Session, SessionIdentity, SessionStatus

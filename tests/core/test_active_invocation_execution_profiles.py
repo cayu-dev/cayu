@@ -95,9 +95,7 @@ from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_mutation_scope
 from cayu.sessions.base import (
-    ForkExecutionProfileSelection,
     ForkSessionRequest,
-    ForkSystemPromptPolicy,
     InMemorySessionStore,
     InteractionTransitionSpec,
     ModelTarget,
@@ -106,7 +104,6 @@ from cayu.sessions.base import (
     SessionRunFenced,
     SessionStatusConflict,
     SessionStore,
-    session_fork_profile_relationship,
     session_prompt_anatomy_transition,
 )
 from cayu.sessions.checkpoints import (
@@ -115,6 +112,11 @@ from cayu.sessions.checkpoints import (
     CheckpointCompatibilityError,
 )
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.forks import (
+    ForkExecutionProfileSelection,
+    ForkSystemPromptPolicy,
+    session_fork_profile_relationship,
+)
 from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionIdentity, SessionStatus

@@ -244,7 +244,6 @@ from cayu.sessions.base import (
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     BudgetReservationIdentityConflict,
     CompactSessionRequest,
-    ForkExecutionProfileSelection,
     ForkSessionRequest,
     ForkSystemPromptReplacement,
     InMemorySessionStore,
@@ -289,6 +288,9 @@ from cayu.sessions.event_delivery import (
     PersistedEventSideEffectStatus,
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery
+from cayu.sessions.forks import (
+    ForkExecutionProfileSelection,
+)
 from cayu.sessions.interactions import INTERACTION_LIFECYCLE_EVENT_TYPES
 from cayu.sessions.invocation import (
     InvocationOriginClaim,

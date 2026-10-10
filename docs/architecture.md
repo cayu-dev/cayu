@@ -526,6 +526,15 @@ the run-operation marker parser and terminal-event classifier in
 of a store; native stores retain authorization, locking, queries and atomic reads.
 Runtime retains terminal publication and recovery orchestration.
 
+### Session fork contracts
+
+`sessions/forks.py` owns fork source snapshots, execution-profile relationships,
+accepted profile-decision evidence and detached fork acknowledgements. Its
+fingerprint, validation and copy rules compose with session records and profile
+contracts without loading concrete stores or runtime execution. Fork admission,
+checkpoint authorization and atomic child creation remain with their existing
+runtime and backend owners.
+
 ### Session query contracts
 
 `sessions/queries.py` owns session listing and aggregate filters, label selectors,

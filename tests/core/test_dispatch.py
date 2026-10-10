@@ -67,7 +67,6 @@ from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_mutation_scope
 from cayu.sessions.base import (
     ForkSessionRequest,
-    ForkSourceSnapshot,
     InMemorySessionStore,
     ModelTarget,
     QueuedDispatchTerminalReceipt,
@@ -78,12 +77,15 @@ from cayu.sessions.base import (
     SessionStatusConflict,
     _checkpoint_with_session_run_operation,
     _fork_initial_invocation_request_sha256,
-    fork_source_state_sha256,
-    session_fork_profile_relationship,
     session_input_messages_sha256,
     validate_profiled_fork_evidence,
 )
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.forks import (
+    ForkSourceSnapshot,
+    fork_source_state_sha256,
+    session_fork_profile_relationship,
+)
 from cayu.sessions.invocation import (
     InvocationOrigin,
     InvocationOriginTrust,

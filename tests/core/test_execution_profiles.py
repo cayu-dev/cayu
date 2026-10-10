@@ -144,7 +144,6 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
 from cayu.sessions.base import (
-    ForkExecutionProfileSelection,
     ForkSessionRequest,
     InMemorySessionStore,
     ModelTarget,
@@ -153,6 +152,9 @@ from cayu.sessions.base import (
     _runtime_resume_transport_metadata,
     _with_runtime_resume_transport_metadata,
     execution_profile_adoption_request_fingerprint,
+)
+from cayu.sessions.forks import (
+    ForkExecutionProfileSelection,
 )
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry

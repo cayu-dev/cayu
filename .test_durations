@@ -45988,5 +45988,21 @@
     "tests/core/test_automatic_recall_context.py::test_runtime_provider_requests_stay_append_only_across_recalled_turns": 3.28711787390057,
     "tests/core/test_automatic_recall_context.py::test_runtime_records_carried_memory_when_the_new_interaction_recalls_nothing": 1.413642792031169,
     "tests/core/test_automatic_recall_context.py::test_wrapped_policy_budgets_for_memory_only_while_its_anchor_survives": 0.042835499974898994,
-    "tests/core/test_automatic_recall_context.py::test_wrapped_policy_counts_and_cache_prefixes_see_placed_memory": 0.03773583297152072
+    "tests/core/test_automatic_recall_context.py::test_wrapped_policy_counts_and_cache_prefixes_see_placed_memory": 0.03773583297152072,
+    "tests/core/test_session_fork_package_layout.py::test_fork_acknowledgement_copy_without_implementations": 0.23712166701443493,
+    "tests/core/test_session_fork_package_layout.py::test_fork_evidence_without_implementations[cayu.runtime]": 0.27470062498468906,
+    "tests/core/test_session_fork_package_layout.py::test_fork_evidence_without_implementations[cayu.sessions.forks]": 0.24817795801209286,
+    "tests/core/test_session_fork_package_layout.py::test_fork_evidence_without_implementations[cayu.sessions]": 0.2536946659674868,
+    "tests/core/test_session_fork_package_layout.py::test_fork_evidence_without_implementations[cayu]": 0.24332595901796594,
+    "tests/core/test_session_fork_package_layout.py::test_fork_historical_imports_and_pickle_globals[ForkExecutionProfileDecisionRecord]": 0.0001527080312371254,
+    "tests/core/test_session_fork_package_layout.py::test_fork_historical_imports_and_pickle_globals[ForkExecutionProfileSelection]": 0.00024329102598130703,
+    "tests/core/test_session_fork_package_layout.py::test_fork_historical_imports_and_pickle_globals[ForkExecutionProfileSource]": 0.00017866695998236537,
+    "tests/core/test_session_fork_package_layout.py::test_fork_historical_imports_and_pickle_globals[ForkSourceSnapshot]": 0.0001569169689901173,
+    "tests/core/test_session_fork_package_layout.py::test_fork_historical_imports_and_pickle_globals[ForkSystemPromptPolicy]": 0.62786333396798,
+    "tests/core/test_session_fork_package_layout.py::test_fork_historical_imports_and_pickle_globals[ProfiledSessionForkResult]": 0.00014466798165813088,
+    "tests/core/test_session_fork_package_layout.py::test_fork_historical_imports_and_pickle_globals[SessionForkEnvironmentAllocationOwner]": 0.0001444579684175551,
+    "tests/core/test_session_fork_package_layout.py::test_fork_historical_imports_and_pickle_globals[SessionForkProfileRelationship]": 0.0001480000209994614,
+    "tests/core/test_session_fork_package_layout.py::test_fork_historical_imports_and_pickle_globals[copy_profiled_session_fork_result]": 0.00013812596444040537,
+    "tests/core/test_session_fork_package_layout.py::test_fork_historical_imports_and_pickle_globals[fork_source_state_sha256]": 0.00015762692783027887,
+    "tests/core/test_session_fork_package_layout.py::test_fork_historical_imports_and_pickle_globals[session_fork_profile_relationship]": 0.0001498329802416265
 }

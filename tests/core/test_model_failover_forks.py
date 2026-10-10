@@ -38,7 +38,9 @@ from cayu.runtime.execution_profiles import (
     execution_profile_from_session_metadata,
 )
 from cayu.sessions._model_failover import ModelFailoverSelection
-from cayu.sessions.base import session_fork_profile_relationship
+from cayu.sessions.forks import (
+    session_fork_profile_relationship,
+)
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])

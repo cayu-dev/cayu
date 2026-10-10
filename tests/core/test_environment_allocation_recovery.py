@@ -59,7 +59,12 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
 )
-from cayu.sessions.base import CheckpointTransform, session_fork_profile_relationship
+from cayu.sessions.base import (
+    CheckpointTransform,
+)
+from cayu.sessions.forks import (
+    session_fork_profile_relationship,
+)
 from cayu.sessions.records import Session
 from cayu.storage.migrations import SchemaMode
 from cayu.vaults import SecretRedactor

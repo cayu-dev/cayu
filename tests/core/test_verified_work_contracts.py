@@ -58,13 +58,15 @@ from cayu.runtime.execution_profiles import (
 from cayu.sessions.base import (
     PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
     CompactSessionRequest,
-    ForkExecutionProfileSelection,
     ForkSessionRequest,
-    ForkSystemPromptPolicy,
     InMemorySessionStore,
     ResumeRequest,
     RunRequest,
     run_request_with_runtime_invocation,
+)
+from cayu.sessions.forks import (
+    ForkExecutionProfileSelection,
+    ForkSystemPromptPolicy,
 )
 from cayu.sessions.invocation import (
     InvocationOrigin,

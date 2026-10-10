@@ -162,14 +162,14 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "EventRecord": ("cayu.sessions.records", "EventRecord"),
     "EventSummary": ("cayu.sessions.summaries", "EventSummary"),
     "ForkExecutionProfileDecisionRecord": (
-        "cayu.sessions.base",
+        "cayu.sessions.forks",
         "ForkExecutionProfileDecisionRecord",
     ),
-    "ForkExecutionProfileSelection": ("cayu.sessions.base", "ForkExecutionProfileSelection"),
-    "ForkExecutionProfileSource": ("cayu.sessions.base", "ForkExecutionProfileSource"),
+    "ForkExecutionProfileSelection": ("cayu.sessions.forks", "ForkExecutionProfileSelection"),
+    "ForkExecutionProfileSource": ("cayu.sessions.forks", "ForkExecutionProfileSource"),
     "ForkSessionRequest": ("cayu.sessions.base", "ForkSessionRequest"),
-    "ForkSourceSnapshot": ("cayu.sessions.base", "ForkSourceSnapshot"),
-    "ForkSystemPromptPolicy": ("cayu.sessions.base", "ForkSystemPromptPolicy"),
+    "ForkSourceSnapshot": ("cayu.sessions.forks", "ForkSourceSnapshot"),
+    "ForkSystemPromptPolicy": ("cayu.sessions.forks", "ForkSystemPromptPolicy"),
     "ForkSystemPromptReplacement": ("cayu.sessions.base", "ForkSystemPromptReplacement"),
     "INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY": (
         "cayu.sessions.base",
@@ -293,7 +293,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.sessions.event_delivery",
         "PersistedEventSideEffectStatus",
     ),
-    "ProfiledSessionForkResult": ("cayu.sessions.base", "ProfiledSessionForkResult"),
+    "ProfiledSessionForkResult": ("cayu.sessions.forks", "ProfiledSessionForkResult"),
     "PromptAnatomyTransitionReceipt": ("cayu.sessions.base", "PromptAnatomyTransitionReceipt"),
     "RECOVERY_CLEANUP_MAX_TIMEOUT_SECONDS": (
         "cayu.sessions.cleanup",
@@ -387,7 +387,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "SessionExportLimits": ("cayu.sessions.exports", "SessionExportLimits"),
     "SessionExportSnapshot": ("cayu.sessions.exports", "SessionExportSnapshot"),
     "SessionExportTooLarge": ("cayu.sessions.exports", "SessionExportTooLarge"),
-    "SessionForkProfileRelationship": ("cayu.sessions.base", "SessionForkProfileRelationship"),
+    "SessionForkProfileRelationship": ("cayu.sessions.forks", "SessionForkProfileRelationship"),
     "SessionIdentity": ("cayu.sessions.records", "SessionIdentity"),
     "SessionInspectionIdentity": ("cayu.sessions.inspection", "SessionInspectionIdentity"),
     "SessionInspectionSummary": ("cayu.sessions.inspection", "SessionInspectionSummary"),
@@ -543,7 +543,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "runtime_publication_operation_record_value_digest",
     ),
     "session_fork_profile_relationship": (
-        "cayu.sessions.base",
+        "cayu.sessions.forks",
         "session_fork_profile_relationship",
     ),
     "session_invocation_for_run_request": (

@@ -63,7 +63,6 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyResult,
 )
 from cayu.sessions.base import (
-    ForkExecutionProfileSelection,
     ForkSessionRequest,
     InMemorySessionStore,
     InteractionTransitionSpec,
@@ -73,6 +72,9 @@ from cayu.sessions.base import (
     SessionRunFenced,
 )
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.forks import (
+    ForkExecutionProfileSelection,
+)
 from cayu.sessions.records import Session, SessionIdentity, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.storage.sqlite import SQLiteSessionStore

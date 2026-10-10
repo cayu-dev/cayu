@@ -30,12 +30,10 @@ from cayu.sessions._execution_profile_checkpoint import (
 )
 from cayu.sessions._model_failover import ModelFailoverPolicy
 from cayu.sessions.base import (
-    FORK_EXECUTION_PROFILE_METADATA_KEY,
     FORK_SOURCE_SNAPSHOT_METADATA_KEY,
     MODEL_TARGET_PROJECTION_METADATA_KEY,
     PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
     CompactSessionRequest,
-    ForkExecutionProfileSource,
     ForkSessionRequest,
     InterruptSessionRequest,
     ResumeRequest,
@@ -50,6 +48,10 @@ from cayu.sessions.base import (
     run_request_authority_is_runtime_generated,
     session_user_metadata,
     strip_runtime_session_create_claim_before_redaction,
+)
+from cayu.sessions.forks import (
+    FORK_EXECUTION_PROFILE_METADATA_KEY,
+    ForkExecutionProfileSource,
 )
 from cayu.sessions.messaging import (
     EnqueueSessionMessageRequest,
