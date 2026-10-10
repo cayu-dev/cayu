@@ -25,6 +25,7 @@ from tests.core.verified_worker_fixtures import (
     verified_worker_store_factory as verified_worker_store_factory,
 )
 
+import cayu
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.messages import Message
@@ -174,7 +175,10 @@ def test_worker_settles_expired_prepared_admission(
 
             async def run_crash_child(recovery_entry=False):
                 repository = Path(__file__).resolve().parents[2]
-                environment = {**os.environ, "PYTHONPATH": str(repository / "src")}
+                environment = {
+                    **os.environ,
+                    "PYTHONPATH": str(Path(cayu.__file__).resolve().parent.parent),
+                }
                 environment.pop("CAYU_TEST_VERIFIED_WORKER_DSN", None)
                 if verified_worker_store_factory.postgres_dsn is not None:
                     environment["CAYU_TEST_VERIFIED_WORKER_DSN"] = (
@@ -183,14 +187,17 @@ def test_worker_settles_expired_prepared_admission(
                 child = await asyncio.create_subprocess_exec(
                     sys.executable,
                     "-c",
+                    "import cayu, os, sys; from pathlib import Path; "
+                    "assert Path(cayu.__file__).resolve() == Path(sys.argv[5]).resolve(); "
                     "from tests.core.test_verified_worker_prepared_expiry import _crash_prepared_expiry; "
-                    "import os, sys; _crash_prepared_expiry(sys.argv[1], sys.argv[2] == 'True', "
+                    "_crash_prepared_expiry(sys.argv[1], sys.argv[2] == 'True', "
                     "sys.argv[3] == 'True', os.environ.get('CAYU_TEST_VERIFIED_WORKER_DSN'), "
                     "sys.argv[4] == 'True')",
                     str(verified_worker_store_factory.directory),
                     str(continuing),
                     str(session_mutated),
                     str(recovery_entry),
+                    cayu.__file__,
                     cwd=repository,
                     env=environment,
                     stdout=asyncio.subprocess.PIPE,
