@@ -9,6 +9,9 @@ import pytest
 
 from cayu.tools import _browser_guest
 
+# Keep timing assertions tied to a fixed workload, not the transport envelope.
+_BENCHMARK_SNAPSHOT_BYTES = 256 * 1024
+
 
 def _naive(values: tuple[str, ...], texts: tuple[str, ...]) -> bool:
     return any(value in text for value in values for text in texts)
@@ -73,7 +76,7 @@ def test_adversarial_repeated_page_and_near_miss_cookies_are_bounded() -> None:
         "a" * (1 + index % 200) + "b" + str(index)
         for index in range(_browser_guest._INTERACTIVE_MAX_PROFILE_PRIVATE_VALUES)
     ]
-    found, elapsed = _timed(values, _visible("a" * _browser_guest._INTERACTIVE_MAX_SNAPSHOT_BYTES))
+    found, elapsed = _timed(values, _visible("a" * _BENCHMARK_SNAPSHOT_BYTES))
     assert found is False
     assert elapsed < 2.0
 
@@ -84,9 +87,7 @@ def test_adversarial_short_values_are_bounded() -> None:
         _random_text(rng, "abcdefgh", rng.randint(1, 6)) + "z"
         for _ in range(_browser_guest._INTERACTIVE_MAX_PROFILE_PRIVATE_VALUES)
     }
-    found, elapsed = _timed(
-        sorted(values), _visible("a" * _browser_guest._INTERACTIVE_MAX_SNAPSHOT_BYTES)
-    )
+    found, elapsed = _timed(sorted(values), _visible("a" * _BENCHMARK_SNAPSHOT_BYTES))
     assert found is False
     assert elapsed < 2.0
 
@@ -95,7 +96,7 @@ def test_adversarial_runs_around_one_foreign_character_are_bounded() -> None:
     # 2,048 values like 'aaaaaaaabaaaaaaaa' against an all-'a' page: each plain
     # scan walks the page, which took 0.7-1.8 s on the plain path.
     values = ["a" * (8 + index % 32) + "b" + "a" * (8 + index // 32) for index in range(2048)]
-    found, elapsed = _timed(values, _visible("a" * _browser_guest._INTERACTIVE_MAX_SNAPSHOT_BYTES))
+    found, elapsed = _timed(values, _visible("a" * _BENCHMARK_SNAPSHOT_BYTES))
     assert found is False
     assert elapsed < 1.0
 

@@ -125,7 +125,7 @@ PROTOCOL_VERSION = "cayu.browser-fetch.v4"
 WORKER_VERSION = "4"
 PLAYWRIGHT_VERSION = "1.62.0"
 INTERACTIVE_PROTOCOL_VERSION = "cayu.browser-session.v4"
-INTERACTIVE_WORKER_VERSION = "18"
+INTERACTIVE_WORKER_VERSION = "19"
 CONTROL_BOOTSTRAP_PROTOCOL = "cayu.browser-control-bootstrap.v1"
 _BROKER_ERROR_HEADER = "x-cayu-egress-error"
 _MAX_URL_LENGTH = 8192
@@ -181,7 +181,7 @@ _INTERACTIVE_MAX_PROFILE_PRIVATE_VALUES = 2 * (
 _INTERACTIVE_MAX_PROFILE_NAME_BYTES = 4_096
 _INTERACTIVE_MAX_PROFILE_VALUE_BYTES = 1024 * 1024
 _INTERACTIVE_MAX_REQUEST_BYTES = 7 * _INTERACTIVE_MAX_PROFILE_PLAINTEXT_BYTES
-_INTERACTIVE_MAX_SNAPSHOT_BYTES = 256 * 1024
+_INTERACTIVE_MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
 _INTERACTIVE_MAX_DOM_NODES = 100_000
 _INTERACTIVE_MAX_REFS = 1_024
 _INTERACTIVE_MAX_ARTIFACT_BYTES = 32 * 1024 * 1024
@@ -737,7 +737,7 @@ class _TemporaryProfileOwner:
 
 @dataclass(frozen=True)
 class _InteractiveLimits:
-    max_snapshot_bytes: int
+    max_snapshot_bytes: int | None
     max_dom_nodes: int
     max_refs: int
     max_artifact_bytes: int
@@ -1298,10 +1298,14 @@ def _interactive_request_from_json(raw: Any) -> _InteractiveRequest:
     }:
         raise _GuestFailure("incompatible_browser")
     limits = _InteractiveLimits(
-        max_snapshot_bytes=_bounded_int(
-            raw_limits["max_snapshot_bytes"],
-            minimum=1,
-            maximum=_INTERACTIVE_MAX_SNAPSHOT_BYTES,
+        max_snapshot_bytes=(
+            None
+            if raw_limits["max_snapshot_bytes"] is None
+            else _bounded_int(
+                raw_limits["max_snapshot_bytes"],
+                minimum=1,
+                maximum=_INTERACTIVE_MAX_SNAPSHOT_BYTES,
+            )
         ),
         max_dom_nodes=_bounded_int(
             raw_limits["max_dom_nodes"],
@@ -8792,9 +8796,12 @@ async def _admit_interactive_snapshot_materialization(
     # bounded amount of extra source so ordinary truncation remains useful,
     # while preventing one unbounded accessible scalar from being materialized
     # by Playwright before Cayu can truncate the result.
-    remaining_source_bytes = (
-        limits.max_snapshot_bytes * _INTERACTIVE_ACCESSIBILITY_SOURCE_MULTIPLIER
+    source_byte_limit = (
+        _INTERACTIVE_MAX_ACCESSIBILITY_MATERIALIZATION_BYTES
+        if limits.max_snapshot_bytes is None
+        else limits.max_snapshot_bytes * _INTERACTIVE_ACCESSIBILITY_SOURCE_MULTIPLIER
     )
+    remaining_source_bytes = source_byte_limit
     total_nodes = 0
     total_source_bytes = 0
     for frame_id in await _interactive_frame_ids(state.cdp):
@@ -8803,7 +8810,11 @@ async def _admit_interactive_snapshot_materialization(
             frame_id,
             max_nodes=remaining_nodes,
             max_source_bytes=remaining_source_bytes,
-            max_scalar_bytes=limits.max_snapshot_bytes,
+            max_scalar_bytes=(
+                _INTERACTIVE_MAX_ACCESSIBILITY_MATERIALIZATION_BYTES
+                if limits.max_snapshot_bytes is None
+                else limits.max_snapshot_bytes
+            ),
         )
         if limit_exceeded or node_count > remaining_nodes or source_bytes > remaining_source_bytes:
             if node_count > remaining_nodes:
@@ -8813,7 +8824,7 @@ async def _admit_interactive_snapshot_materialization(
             elif source_bytes > remaining_source_bytes:
                 diagnostic = _limit_diagnostic(
                     "accessibility_source_bytes",
-                    limits.max_snapshot_bytes * _INTERACTIVE_ACCESSIBILITY_SOURCE_MULTIPLIER,
+                    source_byte_limit,
                     total_source_bytes + source_bytes,
                     "bytes",
                 )
@@ -9514,7 +9525,10 @@ def _interactive_snapshot(
         if not replaced:
             continue
         encoded = (replaced + "\n").encode("utf-8", errors="replace")
-        if used_bytes + len(encoded) > limits.max_snapshot_bytes:
+        if (
+            limits.max_snapshot_bytes is not None
+            and used_bytes + len(encoded) > limits.max_snapshot_bytes
+        ):
             truncation.append("snapshot")
             break
         output.append(replaced)

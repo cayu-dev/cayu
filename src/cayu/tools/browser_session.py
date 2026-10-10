@@ -29,6 +29,7 @@ from pydantic import (
 from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
+    extract_durable_value_error,
     require_durable_clean_nonblank,
     require_durable_text,
 )
@@ -111,7 +112,7 @@ from cayu.vaults.redaction import SecretRedactor
 
 BROWSER_SESSION_PROTOCOL_VERSION = PINNED_BROWSER_SESSION_WORKLOAD.protocol_version
 BROWSER_SESSION_WORKER_VERSION = PINNED_BROWSER_SESSION_WORKLOAD.worker_version
-DEFAULT_BROWSER_SESSION_MAX_SNAPSHOT_BYTES = 64 * 1024
+DEFAULT_BROWSER_SESSION_MAX_SNAPSHOT_BYTES: int | None = None
 DEFAULT_BROWSER_SESSION_MAX_DOM_NODES = DEFAULT_BROWSER_FETCH_MAX_DOM_NODES
 DEFAULT_BROWSER_SESSION_MAX_REFS = 256
 DEFAULT_BROWSER_SESSION_MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
@@ -156,7 +157,8 @@ DEFAULT_BROWSER_SESSION_UPLOAD_CONTENT_TYPES = (
     "text/csv",
     "text/plain",
 )
-MAX_BROWSER_SESSION_MAX_SNAPSHOT_BYTES = 256 * 1024
+# Transport envelopes cover the guest accessibility materialization ceiling.
+MAX_BROWSER_SESSION_MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
 MAX_BROWSER_SESSION_MAX_DOM_NODES = MAX_BROWSER_FETCH_MAX_DOM_NODES
 MAX_BROWSER_SESSION_MAX_REFS = 1_024
 MAX_BROWSER_SESSION_MAX_ARTIFACT_BYTES = 32 * 1024 * 1024
@@ -682,7 +684,7 @@ class BrowserBackendIdentity(BaseModel):
     browser: str = Field(min_length=1, max_length=64)
     browser_version: str = Field(min_length=1, max_length=128)
     worker_protocol: Literal["cayu.browser-session.v4"]
-    worker_version: Literal["18"]
+    worker_version: Literal["19"]
 
     @field_validator("backend", "backend_version", "browser", "browser_version")
     @classmethod
@@ -885,6 +887,7 @@ _LIMIT_UNITS = {
     "response_bytes": "bytes",
     "response_declared_bytes": "bytes",
     "snapshot_bytes": "bytes",
+    "durable_observation_bytes": "bytes",
     "snapshot_refs": "refs",
 }
 
@@ -1228,7 +1231,7 @@ class _RunnerBrowserSessionBackend(BrowserSessionBackend):
         expected_runner_candidate: str | None,
         expected_environment_authority: ExecutionEnvironmentAuthority | None,
         expected_workload_authority: RunnerWorkloadAuthority,
-        max_snapshot_bytes: int,
+        max_snapshot_bytes: int | None,
         max_dom_nodes: int,
         max_refs: int,
         max_artifact_bytes: int,
@@ -2043,7 +2046,7 @@ class BrowserSessionTool(Tool):
     def __init__(
         self,
         *,
-        max_snapshot_bytes: int = DEFAULT_BROWSER_SESSION_MAX_SNAPSHOT_BYTES,
+        max_snapshot_bytes: int | None = DEFAULT_BROWSER_SESSION_MAX_SNAPSHOT_BYTES,
         max_dom_nodes: int = DEFAULT_BROWSER_SESSION_MAX_DOM_NODES,
         max_refs: int = DEFAULT_BROWSER_SESSION_MAX_REFS,
         max_artifact_bytes: int = DEFAULT_BROWSER_SESSION_MAX_ARTIFACT_BYTES,
@@ -2106,10 +2109,14 @@ class BrowserSessionTool(Tool):
                 else visual_policy
             )
         )
-        self.max_snapshot_bytes = _bounded_configuration(
-            max_snapshot_bytes,
-            "max_snapshot_bytes",
-            maximum=MAX_BROWSER_SESSION_MAX_SNAPSHOT_BYTES,
+        self.max_snapshot_bytes = (
+            None
+            if max_snapshot_bytes is None
+            else _bounded_configuration(
+                max_snapshot_bytes,
+                "max_snapshot_bytes",
+                maximum=MAX_BROWSER_SESSION_MAX_SNAPSHOT_BYTES,
+            )
         )
         self.max_dom_nodes = _bounded_configuration(
             max_dom_nodes,
@@ -4611,8 +4618,10 @@ class BrowserSessionTool(Tool):
             fingerprint=fingerprint,
             request=request,
             state="terminal",
-            result=result,
         )
+        # Validate the complete publication below, including both result copies,
+        # operation metadata and the session, before sealing or storing it.
+        terminal["result"] = result.model_dump(mode="json")
         if request["operation"] == "observe" and observation_confirmed and not result.is_error:
             terminal["observation_confirmed"] = True
             terminal["observation_protected"] = observation_protected
@@ -4650,12 +4659,37 @@ class BrowserSessionTool(Tool):
                 live=live,
                 state=session_state,
             )
-            sealed_publication = authority.seal_durable_output(
-                {
-                    "operation": terminal,
-                    "session": session_record,
-                }
-            )
+            try:
+                publication = copy_durable_json_object(
+                    {"operation": terminal, "session": session_record},
+                    "browser_terminal_publication",
+                )
+            except ValueError as error:
+                refusal = _durable_observation_size_refusal(error, request, allocation_disposition)
+                if refusal is None:
+                    raise
+                # The operation completed; an oversized observation must not
+                # strand its receipt or authorize another guest effect.
+                _invalidate_session_refs(parent_state, request)
+                result = refusal
+                terminal["result"] = result.model_dump(mode="json")
+                terminal.pop("observation_confirmed", None)
+                terminal.pop("observation_protected", None)
+                terminal.pop("close_confirmed", None)
+                if session_state != "closed":
+                    session_state = "uncertain"
+                session_record = _browser_session_record(
+                    ctx=ctx,
+                    authority=authority,
+                    browser_session_id=session_id,
+                    live=live,
+                    state=session_state,
+                )
+                publication = copy_durable_json_object(
+                    {"operation": terminal, "session": session_record},
+                    "browser_terminal_publication",
+                )
+            sealed_publication = authority.seal_durable_output(publication)
             if type(sealed_publication) is not dict or set(sealed_publication) != {
                 "operation",
                 "session",
@@ -4892,7 +4926,7 @@ class BrowserSessionTool(Tool):
             )
         observation_limit = None
         snapshot_bytes = len(observation.snapshot.encode("utf-8"))
-        if snapshot_bytes > self.max_snapshot_bytes:
+        if self.max_snapshot_bytes is not None and snapshot_bytes > self.max_snapshot_bytes:
             observation_limit = {
                 "identifier": "snapshot_bytes",
                 "bound": self.max_snapshot_bytes,
@@ -4913,7 +4947,7 @@ class BrowserSessionTool(Tool):
             or observation.page_id != request["page_id"]
             or page_set is None
             or page_set.active_page_id != observation.page_id
-            or len(observation.snapshot.encode("utf-8")) > self.max_snapshot_bytes
+            or (self.max_snapshot_bytes is not None and snapshot_bytes > self.max_snapshot_bytes)
             or len(observation.refs) > self.max_refs
         ):
             return _error_result(
@@ -5079,11 +5113,20 @@ class BrowserSessionTool(Tool):
         if observation.rendered_text is not None:
             content += "\nRetained browser text (historical evidence): " + json.dumps(artifacts)
             content += "\nUse read_text with artifact_id, session_id, page_id, expected_revision; optional offset, max_bytes, query."
-        return ToolResult(
-            content=content,
-            structured=structured,
-            artifacts=artifacts,
-        )
+        try:
+            return ToolResult(
+                content=content,
+                structured=structured,
+                artifacts=artifacts,
+            )
+        except ValueError as error:
+            refusal = _durable_observation_size_refusal(
+                error, request, response.allocation_disposition
+            )
+            if refusal is None:
+                raise
+            _invalidate_session_refs(parent_state, request)
+            return refusal
 
     async def _publish_artifacts(
         self,
@@ -6048,6 +6091,31 @@ def _error_result(
     )
 
 
+def _durable_observation_size_refusal(
+    error: ValueError,
+    request: Mapping[str, Any],
+    allocation_disposition: Literal["live", "retired", "uncertain"] | None,
+) -> ToolResult | None:
+    failure = extract_durable_value_error(error)
+    if failure is None or failure.code != "json_value_too_large" or failure.limit is None:
+        return None
+    return _error_result(
+        "oversized_snapshot",
+        dispatch="completed",
+        request=request,
+        allocation_disposition=allocation_disposition,
+        limit={
+            "identifier": "durable_observation_bytes",
+            "bound": failure.limit,
+            "observed": failure.observed_lower_bound,
+            "units": "bytes",
+            "measurement": "lower_bound"
+            if failure.observed_lower_bound is not None
+            else "unavailable",
+        },
+    )
+
+
 def _operation_record_is_ambiguous(record: _OperationRecord) -> bool:
     structured = record.result.structured
     return isinstance(structured, Mapping) and structured.get("error") == "outcome_ambiguous"
@@ -6136,7 +6204,7 @@ def _secret_snapshot_is_current(
 def _browser_session_response_envelope_limit(
     *,
     max_artifact_bytes: int,
-    max_snapshot_bytes: int,
+    max_snapshot_bytes: int | None,
     max_refs: int,
     max_page_records: int,
 ) -> int:
@@ -6146,7 +6214,9 @@ def _browser_session_response_envelope_limit(
     # Six bytes per source byte covers JSON's longest scalar escape. Ref names
     # are independently bounded because one snapshot line can produce many
     # references carrying the same name.
-    observation_text_bytes = 6 * max_snapshot_bytes
+    observation_text_bytes = 6 * (
+        MAX_BROWSER_SESSION_MAX_SNAPSHOT_BYTES if max_snapshot_bytes is None else max_snapshot_bytes
+    )
     ref_structure_bytes = max_refs * _BROWSER_SESSION_REF_ENVELOPE_BYTES
     url_and_title_bytes = 6 * (MAX_WEB_FETCH_URL_LENGTH + _MAX_TITLE_BYTES)
     page_registry_bytes = max_page_records * (
@@ -6164,14 +6234,19 @@ def _browser_session_response_envelope_limit(
 
 def _browser_terminal_result_envelope_limit(
     *,
-    max_snapshot_bytes: int,
+    max_snapshot_bytes: int | None,
     max_refs: int,
     max_page_records: int,
 ) -> int:
     """Bound one sealed result containing both text and structured observation evidence."""
 
     observation_bytes = (
-        6 * max_snapshot_bytes
+        6
+        * (
+            MAX_BROWSER_SESSION_MAX_SNAPSHOT_BYTES
+            if max_snapshot_bytes is None
+            else max_snapshot_bytes
+        )
         + max_refs * _BROWSER_SESSION_REF_ENVELOPE_BYTES
         + 6 * (MAX_WEB_FETCH_URL_LENGTH + _MAX_TITLE_BYTES)
         + _BROWSER_SESSION_RESPONSE_FIXED_BYTES
@@ -6187,7 +6262,7 @@ def _validate_recovered_browser_tool_result(
     *,
     operation: str,
     upload_artifact_count: int | None,
-    max_snapshot_bytes: int,
+    max_snapshot_bytes: int | None,
     max_refs: int,
     max_page_records: int,
     max_page_creations_per_operation: int,
@@ -6220,7 +6295,7 @@ def _validate_recovered_browser_tool_result(
             snapshot = require_durable_text(snapshot, "snapshot")
         except (TypeError, ValueError, RecursionError):
             return None
-        if len(snapshot.encode("utf-8")) > max_snapshot_bytes:
+        if max_snapshot_bytes is not None and len(snapshot.encode("utf-8")) > max_snapshot_bytes:
             return None
     refs = raw_structured.get("refs")
     if refs is not None:
@@ -6288,9 +6363,9 @@ def _validate_recovered_browser_tool_result(
         except (KeyError, TypeError, ValueError, RecursionError):
             return None
         if (
-            len(observation.snapshot.encode("utf-8")) > max_snapshot_bytes
-            or len(observation.refs) > max_refs
-        ):
+            max_snapshot_bytes is not None
+            and len(observation.snapshot.encode("utf-8")) > max_snapshot_bytes
+        ) or len(observation.refs) > max_refs:
             return None
         page = next(
             (item for item in page_set.pages if item.page_id == observation.page_id),
@@ -6367,7 +6442,7 @@ def _validate_durable_browser_operation_record(
     record: object,
     *,
     identity: _DurableBrowserOperationIdentity,
-    max_snapshot_bytes: int,
+    max_snapshot_bytes: int | None,
     max_refs: int,
     max_page_records: int,
     max_page_creations_per_operation: int,
@@ -7405,7 +7480,7 @@ def _durable_browser_replay_result(
     operation_id: str,
     fingerprint: str,
     upload_artifacts_sha256: str | None,
-    max_snapshot_bytes: int,
+    max_snapshot_bytes: int | None,
     max_refs: int,
     max_page_records: int,
     max_page_creations_per_operation: int,

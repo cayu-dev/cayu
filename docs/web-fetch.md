@@ -246,7 +246,7 @@ Prefer `WebBridge.sandboxed_browser(environment=..., browser_image=...)` for
 application setup. It validates those runner claims and artifact storage before
 agent registration, binds their identities plus the exact environment/factory
 egress authority into the constructed tools, and
-requires the pinned `cayu-browser-fetch:18-playwright-1.62.0` image declaration.
+requires the pinned `cayu-browser-fetch:19-playwright-1.62.0` image declaration.
 Docker proves it by the exact image; Lambda MicroVM proves it by hashing the
 installed worker in each MicroVM (see
 [Lambda MicroVM browser image and admission](browser-session.md#lambda-microvm-browser-image-and-admission)).

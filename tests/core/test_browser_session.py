@@ -91,7 +91,7 @@ _IDENTITY = BrowserBackendIdentity(
     browser="chromium",
     browser_version="test-chromium",
     worker_protocol="cayu.browser-session.v4",
-    worker_version="18",
+    worker_version="19",
 )
 
 
@@ -960,7 +960,7 @@ class _WireRunner:
             stdout=json.dumps(
                 {
                     "protocol_version": "cayu.browser-session.v4",
-                    "worker_version": "18",
+                    "worker_version": "19",
                     "playwright_version": "1.62.0",
                     "kind": "success",
                     "allocation_disposition": "live",
@@ -984,7 +984,7 @@ class _WireRunner:
                             "browser": "chromium",
                             "browser_version": "test-chromium",
                             "worker_protocol": "cayu.browser-session.v4",
-                            "worker_version": "18",
+                            "worker_version": "19",
                         },
                     },
                     "page_set": {
@@ -1065,7 +1065,7 @@ class _ProfileWireRunner(_WireRunner):
                     stdout=json.dumps(
                         {
                             "protocol_version": "cayu.browser-session.v4",
-                            "worker_version": "18",
+                            "worker_version": "19",
                             "playwright_version": "1.62.0",
                             "kind": "error",
                             "allocation_disposition": "retired",
@@ -1077,7 +1077,7 @@ class _ProfileWireRunner(_WireRunner):
                 stdout=json.dumps(
                     {
                         "protocol_version": "cayu.browser-session.v4",
-                        "worker_version": "18",
+                        "worker_version": "19",
                         "playwright_version": "1.62.0",
                         "kind": "profile_restore",
                         "allocation_disposition": "live",
@@ -1090,7 +1090,7 @@ class _ProfileWireRunner(_WireRunner):
                 stdout=json.dumps(
                     {
                         "protocol_version": "cayu.browser-session.v4",
-                        "worker_version": "18",
+                        "worker_version": "19",
                         "playwright_version": "1.62.0",
                         "kind": "profile_checkpoint",
                         "allocation_disposition": "live",
@@ -1103,7 +1103,7 @@ class _ProfileWireRunner(_WireRunner):
                 stdout=json.dumps(
                     {
                         "protocol_version": "cayu.browser-session.v4",
-                        "worker_version": "18",
+                        "worker_version": "19",
                         "playwright_version": "1.62.0",
                         "kind": "closed",
                         "allocation_disposition": "retired",
@@ -1291,7 +1291,7 @@ def _browser_profile_binding(
         ),
         destination_policy=BrowserProfileDestinationPolicy.build(("https://example.test",)),
         browser_protocol="cayu.browser-session.v4",
-        browser_worker_version="18",
+        browser_worker_version="19",
         store=store,
         key_authority=AESGCMBrowserProfileKeyAuthority(
             authority_id="browser-profile-test-key",
@@ -1517,8 +1517,11 @@ async def _recover_durable_browser_result(
     parent_run_epoch: int = 1,
     allocation_fingerprint: str | None = "a" * 64,
     expected_disposition: str | None = None,
+    session_store: SQLiteSessionStore | None = None,
 ) -> ToolResult:
     async def load(key: str) -> dict[str, Any] | None:
+        if session_store is not None:
+            return await session_store.load_session_operation("parent-session", key)
         record = records.get(key)
         return None if record is None else json.loads(json.dumps(record))
 
@@ -1547,7 +1550,7 @@ def _tool(backend: _FakeBrowserBackend) -> BrowserSessionTool:
     return BrowserSessionTool._from_backend_for_testing(backend)
 
 
-def _interactive_limits(**updates: int) -> _browser_guest._InteractiveLimits:
+def _interactive_limits(**updates: int | None) -> _browser_guest._InteractiveLimits:
     values = {
         "max_snapshot_bytes": 1024,
         "max_dom_nodes": 100,
@@ -1725,7 +1728,7 @@ def _interactive_raw_request(operation: str) -> dict[str, Any]:
     raw: dict[str, Any] = {
         "visual_policy": None,
         "protocol_version": "cayu.browser-session.v4",
-        "worker_version": "18",
+        "worker_version": "19",
         "expected_playwright_version": "1.62.0",
         "operation": operation,
         "session_id": "bs_test",
@@ -5069,7 +5072,7 @@ def test_profile_guest_response_protects_page_evidence(
                 "browser": "chromium",
                 "browser_version": "test-chromium",
                 "worker_protocol": "cayu.browser-session.v4",
-                "worker_version": "18",
+                "worker_version": "19",
             },
         }
 
@@ -7437,6 +7440,25 @@ def test_interactive_guest_snapshot_uses_opaque_refs_and_independent_bounds() ->
     assert "refs" in truncation
 
 
+@pytest.mark.parametrize("cap", [None, 512 * 1024])
+def test_interactive_guest_large_snapshot_has_only_an_explicit_byte_cap(cap) -> None:
+    raw = "\n".join('- paragraph "' + "é" * 1000 + '"' for _ in range(600))
+    request = _interactive_raw_request("navigate")
+    request["limits"]["max_snapshot_bytes"] = cap
+    limits = _browser_guest._interactive_request_from_json(request).limits
+
+    snapshot, refs, _, truncation = _browser_guest._interactive_snapshot(raw, limits)
+
+    assert not refs
+    if cap is None:
+        assert len(snapshot.encode()) > 1024 * 1024
+        assert snapshot == raw
+        assert not truncation
+    else:
+        assert 256 * 1024 < len(snapshot.encode()) <= cap
+        assert "snapshot" in truncation
+
+
 def test_interactive_guest_snapshot_ignores_ref_shaped_accessible_text() -> None:
     snapshot, refs, metadata, truncation = _browser_guest._interactive_snapshot(
         '- textbox "Transfer to [ref=e1] later" [ref=e2]\n- button "Approve" [ref=e1]',
@@ -7760,7 +7782,7 @@ def test_interactive_guest_operation_ledger_deduplicates_without_replay() -> Non
             self.calls += 1
             return {
                 "protocol_version": "cayu.browser-session.v4",
-                "worker_version": "18",
+                "worker_version": "19",
                 "playwright_version": "1.62.0",
                 "kind": "success",
                 "observation": {"call": self.calls, "operation": request.operation},
@@ -7886,7 +7908,7 @@ def test_interactive_guest_admits_switches_closes_and_tracks_popup_lineage() -> 
                     "browser": "chromium",
                     "browser_version": "test-chromium",
                     "worker_protocol": "cayu.browser-session.v4",
-                    "worker_version": "18",
+                    "worker_version": "19",
                 },
             }
 
@@ -8556,8 +8578,9 @@ def test_interactive_guest_whole_close_preserves_cancellation_after_all_cleanup(
 
 
 @pytest.mark.parametrize("text_fits", [True, False])
+@pytest.mark.parametrize("snapshot_cap", [None, 256 * 1024])
 def test_interactive_guest_bounds_text_instead_of_materializing_amplified_accessibility(
-    monkeypatch, text_fits
+    monkeypatch, text_fits, snapshot_cap
 ) -> None:
     class _AmplifiedCdp(_BoundedSnapshotCdp):
         async def send(
@@ -8626,7 +8649,7 @@ def test_interactive_guest_bounds_text_instead_of_materializing_amplified_access
             "observe",
             limits=_interactive_limits(
                 max_dom_nodes=2_000,
-                max_snapshot_bytes=256 * 1024,
+                max_snapshot_bytes=snapshot_cap,
             ),
         )
         await _configure_interactive_daemon_for_test(daemon, request)
@@ -8644,7 +8667,10 @@ def test_interactive_guest_bounds_text_instead_of_materializing_amplified_access
             assert result["kind"] == "success", result
             observation = result["observation"]
             assert observation["snapshot"].startswith("[Bounded rendered text;")
-            assert len(observation["snapshot"].encode()) <= request.limits.max_snapshot_bytes
+            if snapshot_cap is None:
+                assert len(observation["snapshot"].encode()) > 1024 * 1024
+            else:
+                assert len(observation["snapshot"].encode()) <= snapshot_cap
             assert observation["refs"] == []
             assert set(observation["truncation_reasons"]) >= {"snapshot", "refs"}
             assert not context.closed
@@ -8777,7 +8803,7 @@ def test_interactive_guest_operation_ledger_reserves_cleanup_capacity() -> None:
         async def _execute_locked(self, request):
             return {
                 "protocol_version": "cayu.browser-session.v4",
-                "worker_version": "18",
+                "worker_version": "19",
                 "playwright_version": "1.62.0",
                 "kind": "success",
                 "observation": {"operation": request.operation},
@@ -9704,7 +9730,7 @@ def test_interactive_guest_ref_limits_independently_retire_allocation(
                 "browser": "chromium",
                 "browser_version": "test-chromium",
                 "worker_protocol": "cayu.browser-session.v4",
-                "worker_version": "18",
+                "worker_version": "19",
             },
         }
 
@@ -10003,7 +10029,7 @@ def test_interactive_guest_popup_guard_bounds_one_effect_before_target_admission
                     "browser": "chromium",
                     "browser_version": "test-chromium",
                     "worker_protocol": "cayu.browser-session.v4",
-                    "worker_version": "18",
+                    "worker_version": "19",
                 },
             }
 
@@ -13307,6 +13333,131 @@ def test_browser_session_operation_conflict_fails_before_runner_preflight(tmp_pa
         assert refused.structured["error"] == "operation_conflict"
         assert len(backend.preflight_calls) == 1
         assert len(backend.calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_browser_session_large_default_observation_survives_durable_recovery(
+    tmp_path: Path,
+) -> None:
+    snapshot = '- paragraph "' + "é" * (512 * 1024) + '"'
+
+    class LargeBackend(_FakeBrowserBackend):
+        async def execute(self, ctx, request):
+            response = await super().execute(ctx, request)
+            return replace(
+                response,
+                observation=response.observation.model_copy(update={"snapshot": snapshot}),
+            )
+
+    async def scenario() -> None:
+        backend = LargeBackend()
+        records: dict[str, dict[str, Any]] = {}
+        args = {
+            "operation": "navigate",
+            "url": "https://example.test/large-document",
+            "operation_id": "large-document",
+        }
+        tool = _tool(backend)
+        assert tool.max_snapshot_bytes is None
+        terminal = await tool.run(_durable_context(tmp_path, args=args, records=records), args)
+        assert terminal.is_error is False
+        assert terminal.structured["snapshot"] == snapshot
+
+        recovered = await _recover_durable_browser_result(tool, args=args, records=records)
+
+        assert recovered == terminal
+        assert len(backend.calls) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("character", "size", "refused"),
+    [
+        ("x", 6 * 1024 * 1024, False),
+        ("x", 8 * 1024 * 1024, True),
+        ("\x01", 2 * 1024 * 1024, True),
+        ("x", 17 * 1024 * 1024, True),
+    ],
+    ids=["large-success", "duplicated-result", "json-escaping", "structured-result"],
+)
+def test_browser_session_observation_durable_size_settles_in_sqlite(
+    tmp_path: Path, character: str, size: int, refused: bool
+) -> None:
+    snapshot = "[Bounded rendered text; main document only; element references unavailable]\n"
+    snapshot += character * size
+
+    class LargeBackend(_FakeBrowserBackend):
+        async def execute(self, ctx, request):
+            response = await super().execute(ctx, request)
+            return replace(
+                response,
+                observation=response.observation.model_copy(update={"snapshot": snapshot}),
+            )
+
+    async def scenario() -> None:
+        path = tmp_path / "browser-observation.sqlite"
+        store = SQLiteSessionStore(path)
+        backend = LargeBackend()
+        records: dict[str, dict[str, Any]] = {}
+        args = {
+            "operation": "navigate",
+            "url": "https://example.test/large-document",
+            "operation_id": "large-document",
+        }
+        try:
+            await store.create(
+                RunRequest(session_id="parent-session", agent_name="assistant", messages=[]),
+                identity=SessionIdentity(provider_name="test", model="test"),
+                interaction_started_event=Event(
+                    id="large-browser-started",
+                    type=EventType.INTERACTION_STARTED,
+                    session_id="parent-session",
+                    interaction_id="large-browser-interaction",
+                    agent_name="assistant",
+                ),
+                interaction_source_messages=[],
+            )
+            terminal = await _tool(backend).run(
+                _durable_context(tmp_path, args=args, records=records, session_store=store), args
+            )
+            assert terminal.is_error is refused
+            if refused:
+                assert terminal.structured["error"] == "oversized_snapshot"
+                assert terminal.structured["execution"]["dispatch"] == "completed"
+                limit = terminal.structured["limit"]
+                assert limit["identifier"] == "durable_observation_bytes"
+                assert limit["bound"] == 16 * 1024 * 1024
+                assert limit["observed"] > limit["bound"]
+                assert limit["measurement"] == "lower_bound"
+            else:
+                assert terminal.structured["snapshot"] == snapshot
+            operation = next(
+                value
+                for value in records.values()
+                if value.get("record_type") == "cayu.browser-operation"
+            )
+            assert operation["state"] == "terminal"
+        finally:
+            await store.close()
+        reopened = SQLiteSessionStore(path)
+        try:
+            recovered = await _recover_durable_browser_result(
+                _tool(backend),
+                args=args,
+                records={},
+                session_store=reopened,
+                expected_disposition="confirmed",
+            )
+            assert recovered == terminal
+            retried = await _tool(backend).run(
+                _durable_context(tmp_path, args=args, records=records, session_store=reopened), args
+            )
+            assert retried == terminal
+            assert len(backend.calls) == 1
+        finally:
+            await reopened.close()
 
     asyncio.run(scenario())
 

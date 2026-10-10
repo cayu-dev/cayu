@@ -21,10 +21,10 @@ for tool in browser.tools:
 ```
 
 The environment or factory must prove the exact
-`cayu-browser-fetch:18-playwright-1.62.0` workload (the Docker image, or on
+`cayu-browser-fetch:19-playwright-1.62.0` workload (the Docker image, or on
 Lambda MicroVM the verified worker described in
 [Lambda MicroVM browser image and admission](#lambda-microvm-browser-image-and-admission)), the
-`cayu.browser-session.v4` protocol and worker version 18, brokered deny-by-default egress,
+`cayu.browser-session.v4` protocol and worker version 19, brokered deny-by-default egress,
 confirmed cancellation and cleanup, and one stable ArtifactStore. Construction
 is side-effect-free for factories; the same candidate, workload, and artifact
 authorities are checked again after materialization. There is no fallback to
@@ -437,6 +437,13 @@ value. A declared Content-Length guard is identified separately from measured
 transfer bytes. Unknown guards have null identifier, bound, observed, and units.
 DOM nodes, frame counts, accessible scalar/source bytes, materialization bounds,
 and final snapshot bytes/refs are distinct; none implies an exact response size.
+`durable_observation_bytes` identifies the shared 16 MiB complete durable-record
+ceiling, including escaped text, structured copies, and operation metadata. An
+observation that cannot fit returns a persisted `oversized_snapshot` result with
+completed dispatch evidence; retrying that operation does not repeat its effect.
+The uncapped `max_snapshot_bytes=None` default does not remove this record limit.
+Use `export_text` and paged `read_text` for larger rendered text within the
+configured artifact limits.
 Diagnostics contain only validated identifiers and numeric evidence, never page
 text. Older workers can still return limit errors without measurement details.
 
@@ -1060,8 +1067,9 @@ text, omits element references, and marks snapshot/reference truncation; it must
 be treated as a complete accessibility tree. Screenshots and text export remain
 available through the same session.
 
-Configure the returned snapshot size through
-`WebBridge.sandboxed_browser(..., interactive_options={"max_snapshot_bytes": 65536})`.
-This bounds returned text; it does not raise the accessibility allocation ceiling.
+Returned observations have no snapshot-specific byte cap by default
+(`max_snapshot_bytes=None`). To opt into truncation, configure
+`WebBridge.sandboxed_browser(..., interactive_options={"max_snapshot_bytes": 1048576})`.
+An explicit value bounds returned text; it does not raise the accessibility allocation ceiling.
 The existing `max_dom_nodes` and `max_artifact_bytes` settings also bound fallback
 text capture. If bounded capture cannot succeed, the browser retains its size refusal.

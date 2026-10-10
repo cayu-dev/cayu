@@ -513,7 +513,7 @@ class BrowserVerifier:
             identity = ExecutionProfileBehaviorIdentity(
                 name="model-verifier-docker",
                 behavior_version="1",
-                implementation_version="2026-09-24",
+                implementation_version="2026-10-09",
             )
             policy = PublicWebEgressPolicy(name="model-verifier-public-web")
             factory = VirtualEgressEnvironmentFactory(
@@ -529,6 +529,8 @@ class BrowserVerifier:
                 environment=factory,
                 browser_image=DEFAULT_WEBBRIDGE_INTERACTIVE_BROWSER_IMAGE,
                 interactive=True,
+                # Provider documentation can exceed the general 10,000-node default.
+                interactive_options={"max_dom_nodes": 100_000},
             )
             self._env_name = "model-verifier-docker"
             app.register_environment_factory(

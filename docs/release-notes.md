@@ -1,5 +1,15 @@
 # Release notes
 
+## Unreleased
+
+- Interactive browser observations no longer have a default 64 KiB text cap.
+  Set `max_snapshot_bytes` explicitly to opt into truncation. Larger observations
+  within the shared durable-record ceiling remain available after recovery;
+  observations that exceed it return a persisted refusal without replaying the
+  browser action. Rebuild the browser image using
+  `cayu-browser-fetch:19-playwright-1.62.0`. The model-catalog verifier also allows
+  larger documentation DOMs within the browser's existing 100,000-node maximum.
+
 ## v0.10.1
 
 Cayu preserves prompt-cache prefixes, improves interrupted tool-call recovery,

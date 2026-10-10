@@ -45663,5 +45663,16 @@
     "tests/core/test_human_attention_handoff.py::test_rejected_scan_cursor_restarts_with_one_page_budget": 0.783380082983058,
     "tests/core/test_human_attention_handoff.py::test_restart_backfills_pre_enrollment_pauses_across_pages": 2.231449333950877,
     "tests/core/test_human_attention_handoff.py::test_supersession_is_reported_by_the_repair_pass": 1.0137591250240803,
-    "tests/core/test_human_attention_handoff.py::test_unavailable_reads_make_scan_and_verification_incomplete": 0.8289286670042202
+    "tests/core/test_human_attention_handoff.py::test_unavailable_reads_make_scan_and_verification_incomplete": 0.8289286670042202,
+    "tests/core/test_browser_session.py::test_browser_session_large_default_observation_survives_durable_recovery": 0.19249429198680446,
+    "tests/core/test_browser_session.py::test_browser_session_observation_durable_size_settles_in_sqlite[duplicated-result]": 1.0122624590294436,
+    "tests/core/test_browser_session.py::test_browser_session_observation_durable_size_settles_in_sqlite[json-escaping]": 0.6316775839659385,
+    "tests/core/test_browser_session.py::test_browser_session_observation_durable_size_settles_in_sqlite[large-success]": 3.7279454990057275,
+    "tests/core/test_browser_session.py::test_browser_session_observation_durable_size_settles_in_sqlite[structured-result]": 1.4915324579924345,
+    "tests/core/test_browser_session.py::test_interactive_guest_bounds_text_instead_of_materializing_amplified_accessibility[262144-False]": 0.0010767080239020288,
+    "tests/core/test_browser_session.py::test_interactive_guest_bounds_text_instead_of_materializing_amplified_accessibility[262144-True]": 0.006649624963756651,
+    "tests/core/test_browser_session.py::test_interactive_guest_bounds_text_instead_of_materializing_amplified_accessibility[None-False]": 0.00296400097431615,
+    "tests/core/test_browser_session.py::test_interactive_guest_bounds_text_instead_of_materializing_amplified_accessibility[None-True]": 0.013343249971512705,
+    "tests/core/test_browser_session.py::test_interactive_guest_large_snapshot_has_only_an_explicit_byte_cap[524288]": 0.013172623992431909,
+    "tests/core/test_browser_session.py::test_interactive_guest_large_snapshot_has_only_an_explicit_byte_cap[None]": 0.026114624983165413
 }
