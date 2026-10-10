@@ -964,6 +964,12 @@ capabilities. Combined transcript and checkpoint writes retain one native transa
 The SQLite connection owner provides the shared `SQLiteOperationRunner` protocol;
 PostgreSQL operations use ready connections and cursor-bound supporting capabilities.
 
+SQLite persisted-event delivery lives in `storage/_sqlite_event_delivery.py`.
+The owner receives read/write runners and an ownership clock for claims, leases,
+acknowledgements, retry/defer/retirement and bounded health queries. Its enqueue
+helper uses the publication caller's connection, preserving atomic event and
+outbox writes. Runtime delivery policy remains in the runtime event writer.
+
 Context policies are runtime projections over transcript messages, not storage. They let applications customize the model-facing conversation history by trimming, compacting, replacing bulky tool results, or injecting retrieved context while preserving the raw durable transcript for audit, debugging, resume, and future compaction.
 
 Knowledge records and access scopes live in `knowledge/records.py` and

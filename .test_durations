@@ -1,4 +1,7 @@
 {
+    "tests/core/test_native_event_delivery_ownership.py::test_sqlite_delivery_imports_without_store_adapters": 0.858,
+    "tests/core/test_native_event_delivery_ownership.py::test_sqlite_delivery_composes_with_direct_connection": 0.169,
+    "tests/core/test_native_event_delivery_ownership.py::test_sqlite_enqueue_failure_rolls_back_event_publication": 0.141,
     "tests/core/test_native_transcript_ownership.py::test_postgres_transcript_imports_without_store_adapters": 0.75,
     "tests/core/test_native_transcript_ownership.py::test_postgres_transcript_composes_with_direct_connection": 1.585,
     "tests/core/test_native_transcript_ownership.py::test_sqlite_transcript_imports_without_store_adapters": 0.815,
