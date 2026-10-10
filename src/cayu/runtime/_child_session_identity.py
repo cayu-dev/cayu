@@ -76,7 +76,25 @@ class ChildSessionRecoveryMatcher(ABC):
         arguments: dict[str, Any],
         require_fingerprint: bool,
     ) -> bool:
-        """Return exact authority evidence for one recovered child candidate."""
+        """Return exact authority evidence for one recovered child candidate.
+
+        ``environment_name`` is the parent's environment. Registrations that
+        place children elsewhere derive the child's environment from it.
+        """
+
+    def recoverable_child_environment_name(
+        self,
+        *,
+        arguments: dict[str, Any],
+        parent_environment_name: str | None,
+    ) -> str | None:
+        """Return the environment a child spawned with these arguments must use.
+
+        The default is the parent's environment.
+        """
+
+        del arguments
+        return parent_environment_name
 
     def matches_recoverable_submission(
         self,

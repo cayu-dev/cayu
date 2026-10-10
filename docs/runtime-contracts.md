@@ -4695,9 +4695,17 @@ separate runtime. It creates a new child `RunRequest` with `parent_session_id`
 set to the calling session and `causal_budget_id` inherited from the caller,
 then runs the configured child agent through the normal Cayu loop. The child
 agent has its own `AgentSpec`, tools, policies, model, context policy, and
-durable events, but inherits the parent's `environment_name` (it is not
-configurable per subagent). To shape a child's environment differently, branch a
-single `EnvironmentFactory` on `EnvironmentFactoryRequest.agent_name`.
+durable events. It runs in the parent's `environment_name` unless its
+`SubagentSpec.environment_name` names another registered environment. The
+resolved child environment is part of the spawn fingerprint and is checked when
+recovery re-attaches a child or a durable submission is admitted, so changing a
+spec's environment between a crash and recovery is an identity conflict, not a
+silent move. When the override names an environment factory, each child gets its
+own allocation: `EnvironmentFactory.create(...)` receives the child's
+`session_id`, `parent_session_id` and `agent_name`, and recovery reconnects that
+allocation through the checkpointed reconnect metadata. The environment is chosen
+per subagent alias; for per-call variation register several aliases or branch the
+factory on `EnvironmentFactoryRequest`.
 Runtime-created child session ids are opaque durable identities. Subagent
 spawns derive a collision-resistant id from the parent-scoped tool-execution
 idempotency key, so retries and process reconstruction select the same id;

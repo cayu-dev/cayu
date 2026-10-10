@@ -247,7 +247,14 @@ class SubagentExecutionMode(StrEnum):
 
 
 class SubagentSpec(BaseModel):
-    """Model-facing subagent target backed by a Cayu agent registration."""
+    """Model-facing subagent target backed by a Cayu agent registration.
+
+    ``environment_name`` selects the registered environment the child runs in.
+    ``None`` inherits the parent's environment. Point it at an environment
+    factory to give every spawned child its own allocation: the factory is
+    called with the child's session id and reconnects the same allocation
+    when the child is recovered.
+    """
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
@@ -255,6 +262,7 @@ class SubagentSpec(BaseModel):
     description: str = ""
     context_mode: SubagentContextMode = SubagentContextMode.TASK_ONLY
     mode: SubagentExecutionMode = SubagentExecutionMode.FOREGROUND
+    environment_name: str | None = None
     max_steps: StrictInt = Field(default=DEFAULT_MAX_STEPS, ge=1, le=MAX_STEPS)
     result_max_chars: StrictInt = Field(
         default=DEFAULT_SUBAGENT_RESULT_MAX_CHARS,
@@ -267,6 +275,13 @@ class SubagentSpec(BaseModel):
     @field_validator("agent_name")
     @classmethod
     def validate_agent_name(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("environment_name")
+    @classmethod
+    def validate_environment_name(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return value
         return require_clean_nonblank(value, info.field_name)
 
     @field_validator("description")
@@ -425,6 +440,7 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
             logical_spawn_id=ctx.idempotency_key,
         )
         causal_budget_id = ctx.causal_budget_id or ctx.session_id
+        environment_name = _subagent_environment_name(spec, ctx.environment_name)
         child_metadata: dict[str, Any] = {
             **copy_durable_metadata(spec.metadata),
             **metadata,
@@ -448,7 +464,7 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
             spec=spec,
             parent_session_id=ctx.session_id,
             causal_budget_id=causal_budget_id,
-            environment_name=ctx.environment_name,
+            environment_name=environment_name,
             task=task,
             metadata=child_metadata,
         )
@@ -470,7 +486,7 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
             session_id=child_session_id,
             parent_session_id=ctx.session_id,
             causal_budget_id=causal_budget_id,
-            environment_name=ctx.environment_name,
+            environment_name=environment_name,
             messages=[Message.text("user", task)],
             metadata=child_metadata,
             budget_limits=copy_request_budget_limits(ctx._causal_budget_limits_for_builtin()),
@@ -621,7 +637,7 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
             spec=spec,
             parent_session_id=ctx.session_id,
             causal_budget_id=causal_budget_id,
-            environment_name=ctx.environment_name,
+            environment_name=environment_name,
             spawn_fingerprint=spawn_fingerprint,
             structured=structured,
         )
@@ -704,7 +720,7 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
                 spec=spec,
                 parent_session_id=ctx.session_id,
                 causal_budget_id=causal_budget_id,
-                environment_name=ctx.environment_name,
+                environment_name=environment_name,
                 spawn_fingerprint=spawn_fingerprint,
                 structured=structured,
             )
@@ -851,6 +867,8 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
         arguments: dict[str, Any],
         require_fingerprint: bool,
     ) -> bool:
+        """Match a recovered child; ``environment_name`` is the parent's environment."""
+
         try:
             agent_alias, task, metadata = _subagent_arguments(arguments)
         except (TypeError, ValueError):
@@ -858,6 +876,7 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
         spec = self._agents.get(agent_alias)
         if spec is None or spec.context_mode is not SubagentContextMode.TASK_ONLY:
             return False
+        child_environment_name = _subagent_environment_name(spec, environment_name)
         child_metadata: dict[str, Any] = {
             **copy_durable_metadata(spec.metadata),
             **metadata,
@@ -876,7 +895,7 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
             spec=spec,
             parent_session_id=parent_session_id,
             causal_budget_id=causal_budget_id,
-            environment_name=environment_name,
+            environment_name=child_environment_name,
             task=task,
             metadata=child_metadata,
         )
@@ -887,7 +906,7 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
             spec=spec,
             parent_session_id=parent_session_id,
             causal_budget_id=causal_budget_id,
-            environment_name=environment_name,
+            environment_name=child_environment_name,
             spawn_fingerprint=expected_fingerprint,
             require_fingerprint=require_fingerprint,
         ):
@@ -921,6 +940,21 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
             effective_arguments=arguments,
         )
         return child if reconciled is None else reconciled
+
+    def recoverable_child_environment_name(
+        self,
+        *,
+        arguments: dict[str, Any],
+        parent_environment_name: str | None,
+    ) -> str | None:
+        try:
+            agent_alias, _task, _metadata = _subagent_arguments(arguments)
+        except (TypeError, ValueError):
+            return parent_environment_name
+        spec = self._agents.get(agent_alias)
+        if spec is None:
+            return parent_environment_name
+        return _subagent_environment_name(spec, parent_environment_name)
 
     def matches_recoverable_submission(
         self,
@@ -961,7 +995,7 @@ class SubagentTool(Tool, ChildSessionRecoveryMatcher):
             spec=spec,
             parent_session_id=parent_session.id,
             causal_budget_id=parent_session.causal_budget_id,
-            environment_name=parent_session.environment_name,
+            environment_name=_subagent_environment_name(spec, parent_session.environment_name),
             task=task,
             metadata=child_metadata,
         )
@@ -1370,6 +1404,17 @@ def _durable_subagent_queued_result(
             "dispatch_status": handle.status.value,
         },
     )
+
+
+def _subagent_environment_name(
+    spec: SubagentSpec,
+    parent_environment_name: str | None,
+) -> str | None:
+    """Return the child's environment: the spec's override, else the parent's."""
+
+    if spec.environment_name is not None:
+        return spec.environment_name
+    return parent_environment_name
 
 
 def _subagent_spawn_fingerprint(

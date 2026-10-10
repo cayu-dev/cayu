@@ -329,7 +329,11 @@ class DurableSubagentCoordinator:
                 for key, value in expected_subagent_metadata.items()
             )
             or request.causal_budget_id != parent.causal_budget_id
-            or request.environment_name != parent.environment_name
+            or request.environment_name
+            != registered_tool.child_session_recovery.recoverable_child_environment_name(
+                arguments=copied_effective_arguments,
+                parent_environment_name=parent.environment_name,
+            )
         ):
             raise RuntimeError(
                 "Durable subagent request conflicts with its parent invocation authority."

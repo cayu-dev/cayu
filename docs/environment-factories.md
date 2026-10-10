@@ -228,6 +228,33 @@ Notes:
   `workspace_factory=MicrosandboxWorkspace` produces a first-party workspace
   in the enforced microVM without exposing the raw `MicrosandboxRunner`.
 
+### Per-child workspaces for subagents
+
+A `SubagentTool` child runs in its parent's environment by default. Set
+`SubagentSpec.environment_name` to a registered factory to give every child of
+that alias its own allocation, for example one checkout per builder:
+
+```python
+app.register_environment_factory(EnvironmentSpec(name="builder-checkout"), LocalNativeFactory(base))
+
+delegate = SubagentTool(
+    app,
+    agents={
+        "builder": SubagentSpec(
+            agent_name="builder",
+            description="Edits its own copy of the repository.",
+            environment_name="builder-checkout",
+        )
+    },
+)
+```
+
+The factory's `create(request)` receives the child's `session_id` and the
+parent's id in `parent_session_id`, so it can key the copy off the child. The
+child environment is part of the spawn fingerprint: recovery reconnects the same
+allocation, and a spec whose `environment_name` changed since the spawn fails
+with an identity conflict instead of moving the child.
+
 ### Process-external allocation
 
 A factory whose `CREATE` path mutates a remote provider must not use ordinary

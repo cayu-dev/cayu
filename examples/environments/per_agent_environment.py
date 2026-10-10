@@ -1,10 +1,10 @@
 """Per-agent environment shaping: one factory, a different binding per agent.
 
-A subagent inherits its parent's ``environment_name`` (see ``SubagentTool``), so
-parent and child always resolve the *same* registered environment. To give an
-orchestrator agent and a QA agent differently-shaped environments anyway, branch
-a single ``EnvironmentFactory`` on ``request.agent_name`` — a required, per-session
-field. Here the ``"orchestrator"`` agent gets no checkout (``NoWorkspaceBinding``)
+A subagent inherits its parent's ``environment_name`` unless its
+``SubagentSpec.environment_name`` names another registered environment. When
+parent and child share one environment name, you can still give an orchestrator
+agent and a QA agent differently-shaped environments by branching a single
+``EnvironmentFactory`` on ``request.agent_name`` — a required, per-session field. Here the ``"orchestrator"`` agent gets no checkout (``NoWorkspaceBinding``)
 while the ``"qa"`` agent gets a git sandbox, both under one environment name.
 
 Run it (no keys, no network — the git binding is constructed, not cloned here):

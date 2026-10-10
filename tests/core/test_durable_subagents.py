@@ -19,6 +19,11 @@ from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.configuration import CayuConfig, ToolExecutionConfig
 from cayu.environments.base import Environment, EnvironmentSpec
+from cayu.environments.factory import (
+    EnvironmentFactory,
+    EnvironmentFactoryRequest,
+    EnvironmentFactoryResult,
+)
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.observability.hooks import (
@@ -892,7 +897,11 @@ class _CrashAfterDurableChildCompletionDispatcher(TaskStoreDispatcher):
         raise _SimulatedWorkerLoss("simulated parent loss before tool-result publication")
 
 
-def _register_durable_subagent_agents(app: CayuApp) -> None:
+def _register_durable_subagent_agents(
+    app: CayuApp,
+    *,
+    environment_name: str | None = None,
+) -> None:
     app.register_agent(
         AgentSpec(name="parent", model="model"),
         tools=[
@@ -903,12 +912,33 @@ def _register_durable_subagent_agents(app: CayuApp) -> None:
                     "reviewer": SubagentSpec(
                         agent_name="reviewer",
                         mode=SubagentExecutionMode.DURABLE,
+                        environment_name=environment_name,
                     )
                 },
             )
         ],
     )
     app.register_agent(AgentSpec(name="reviewer", model="model"))
+
+
+class _RecordingChildEnvironmentFactory(EnvironmentFactory):
+    def __init__(self) -> None:
+        self.requests: list[EnvironmentFactoryRequest] = []
+
+    async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
+        self.requests.append(request)
+        return EnvironmentFactoryResult(
+            environment=Environment(EnvironmentSpec(name=request.environment_name))
+        )
+
+
+def _register_durable_child_environments(app: CayuApp) -> _RecordingChildEnvironmentFactory:
+    factory = _RecordingChildEnvironmentFactory()
+    app.register_environment_factory(EnvironmentSpec(name="reviewer-checkout"), factory)
+    app.register_environment_factory(
+        EnvironmentSpec(name="other-checkout"), _RecordingChildEnvironmentFactory()
+    )
+    return factory
 
 
 def _run_sqlite_durable_child_worker(session_path: str, task_path: str) -> None:
@@ -1138,6 +1168,117 @@ def test_durable_subagent_creates_child_before_claimable_task_and_worker_complet
         assert len(provider.requests) == 3
 
     asyncio.run(run())
+
+
+def test_durable_subagent_child_runs_in_its_spec_environment() -> None:
+    async def run() -> None:
+        sessions = InMemorySessionStore()
+        tasks = InMemoryTaskStore()
+        dispatcher = TaskStoreDispatcher(tasks)
+        app = CayuApp(
+            session_store=sessions,
+            task_store=tasks,
+            dispatcher=dispatcher,
+            enable_logging=False,
+        )
+        app.register_provider(_DurableSubagentProvider(), default=True)
+        factory = _register_durable_child_environments(app)
+        _register_durable_subagent_agents(app, environment_name="reviewer-checkout")
+
+        parent_events = await _collect(
+            app.run(
+                RunRequest(
+                    agent_name="parent",
+                    session_id="durable-env-parent",
+                    messages=[Message.text("user", "parent task")],
+                )
+            )
+        )
+
+        assert parent_events[-1].type == EventType.SESSION_COMPLETED
+        parent = await sessions.load("durable-env-parent")
+        (child,) = (
+            await sessions.list_sessions(SessionQuery(parent_session_id="durable-env-parent"))
+        ).sessions
+        assert parent is not None
+        assert parent.environment_name is None
+        assert child.status is SessionStatus.PENDING
+        assert child.environment_name == "reviewer-checkout"
+        handle = await dispatcher.process_next(app, worker_id="durable-env-worker")
+        assert handle is not None
+        assert handle.status.value == "completed"
+        completed = await sessions.load(child.id)
+        assert completed is not None
+        assert completed.status is SessionStatus.COMPLETED
+        assert completed.environment_name == "reviewer-checkout"
+        assert [
+            (request.session_id, request.parent_session_id) for request in factory.requests
+        ] == [(child.id, "durable-env-parent")]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("recovery_environment", "child_created"),
+    [("reviewer-checkout", True), ("other-checkout", False), (None, False)],
+)
+def test_parent_recovery_creates_durable_child_only_in_the_spawned_environment(
+    recovery_environment: str | None,
+    child_created: bool,
+) -> None:
+    sessions = _CrashBeforeDurableChildStore()
+    tasks = InMemoryTaskStore()
+
+    def build_app() -> CayuApp:
+        app = CayuApp(
+            session_store=sessions,
+            task_store=tasks,
+            dispatcher=TaskStoreDispatcher(tasks),
+            enable_logging=False,
+        )
+        app.register_provider(_DurableSubagentProvider(), default=True)
+        _register_durable_child_environments(app)
+        return app
+
+    async def crash_parent() -> None:
+        app = build_app()
+        _register_durable_subagent_agents(app, environment_name="reviewer-checkout")
+        with pytest.raises(_SimulatedWorkerLoss):
+            await _collect(
+                app.run(
+                    RunRequest(
+                        agent_name="parent",
+                        session_id="durable-env-recovery",
+                        messages=[Message.text("user", "parent task")],
+                    )
+                )
+            )
+
+    async def recover_parent() -> None:
+        app = build_app()
+        _register_durable_subagent_agents(app, environment_name=recovery_environment)
+        request = IncompleteSessionRecoveryRequest(
+            session_id="durable-env-recovery",
+            reason="fresh worker restart",
+        )
+        if child_created:
+            await app.recover_incomplete_session(request)
+        else:
+            # A spec that now names another environment fails closed instead of
+            # creating the child somewhere it was not spawned.
+            with pytest.raises(RuntimeError, match="no longer matches its registered tool"):
+                await app.recover_incomplete_session(request)
+        children = (
+            await sessions.list_sessions(SessionQuery(parent_session_id="durable-env-recovery"))
+        ).sessions
+        if child_created:
+            assert [child.environment_name for child in children] == ["reviewer-checkout"]
+        else:
+            assert children == []
+            assert await tasks.list_tasks(TaskQuery()) == []
+
+    asyncio.run(crash_parent())
+    asyncio.run(recover_parent())
 
 
 def test_durable_subagent_initializes_discovery_view_before_queue_publication() -> None:
