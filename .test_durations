@@ -1,4 +1,6 @@
 {
+  "tests/core/test_session_interaction_rules_layout.py::test_terminal_receipts_require_runtime_event_authority_without_implementations": 0.5014224579790607,
+  "tests/core/test_session_interaction_rules_layout.py::test_transition_receipts_replay_after_exact_release_without_implementations": 0.5662033339613117,
   "tests/core/test_session_interaction_rules_layout.py::test_interaction_context_preserves_history_and_restores_outer_scope": 0.44394420803291723,
   "tests/core/test_session_interaction_rules_layout.py::test_interaction_prerequisites_preserve_public_identity[_invocation_scope-attribute_event_to_current_interaction]": 0.00017208396457135677,
   "tests/core/test_session_interaction_rules_layout.py::test_interaction_prerequisites_preserve_public_identity[_invocation_scope-attribute_events_to_current_interaction]": 0.00017099996330216527,

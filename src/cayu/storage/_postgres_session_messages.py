@@ -17,6 +17,7 @@ from cayu.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.messages import Message
 from cayu.runtime import _session_message_queue as message_queue
 from cayu.sessions._execution_profile_checkpoint import ActiveInvocationExecutionProfile
+from cayu.sessions._interaction_receipts import _interaction_transition_storage_key
 from cayu.sessions._invocation_scope import _assert_session_run_epoch
 from cayu.sessions.access import require_resource_session
 from cayu.sessions.base import (
@@ -26,7 +27,6 @@ from cayu.sessions.base import (
     _check_closure_lineage_owner,
     _checkpoint_after_queued_interaction_profile_handoff,
     _historical_queued_handoff_stage_from_records,
-    _interaction_transition_storage_key,
     _model_completion_stage_dispatch_storage_key,
     _model_completion_stage_storage_identity,
     _reconstruct_active_model_completion_stage,

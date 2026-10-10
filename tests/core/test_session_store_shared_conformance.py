@@ -226,6 +226,7 @@ from cayu.runtime.provider_operations import (
 )
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
+from cayu.sessions import _interaction_receipts as interaction_receipts
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
@@ -25983,7 +25984,7 @@ def test_session_store_conformance_terminal_decision_publishes_exact_event_pair_
                 session_store_case,
                 store,
                 session_id=session_id,
-                storage_key=sessions_module._invocation_terminal_event_storage_key(
+                storage_key=interaction_receipts._invocation_terminal_event_storage_key(
                     terminal_event.id
                 ),
             )

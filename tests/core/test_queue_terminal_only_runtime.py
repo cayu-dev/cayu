@@ -25,6 +25,7 @@ from cayu.observability.hooks import RuntimeHook, RuntimeHookContext
 from cayu.runtime._environment_exposure import require_environment_exposed
 from cayu.runtime._environment_lifecycle import EnvironmentLifecycle
 from cayu.runtime.execution_profiles import active_invocation_execution_profile_from_checkpoint
+from cayu.sessions import _interaction_receipts as interaction_receipts
 from cayu.sessions import authority as session_authority_rules
 from cayu.sessions.base import PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY, InMemorySessionStore
 from cayu.sessions.messaging import (
@@ -167,7 +168,7 @@ def test_rejected_completion_publication_keeps_owner_until_quiescent(
                             )
                             receipt_before = deepcopy(
                                 store._session_operation_records["terminal-queue"][
-                                    session_module._interaction_transition_storage_key(
+                                    interaction_receipts._interaction_transition_storage_key(
                                         predecessor.id
                                     )
                                 ]
@@ -341,7 +342,7 @@ def test_rejected_completion_publication_keeps_owner_until_quiescent(
         predecessor = next(e for e in events if e.type == EventType.INTERACTION_COMPLETED)
         assert (
             store._session_operation_records[final.id][
-                session_module._interaction_transition_storage_key(predecessor.id)
+                interaction_receipts._interaction_transition_storage_key(predecessor.id)
             ]
             == receipt_before
         )
@@ -1042,7 +1043,7 @@ def test_running_handoff_requires_exact_finalization_mutation(tmp_path, monkeypa
                 conflicting["record_digest"] = (
                     session_authority_rules._canonical_runtime_publication_digest(digest_payload)
                 )
-                session_module._load_interaction_transition_receipt(conflicting)
+                interaction_receipts._load_interaction_transition_receipt(conflicting)
                 with pytest.raises(
                     session_module.SessionRunFenced, match="completion-finalization"
                 ):

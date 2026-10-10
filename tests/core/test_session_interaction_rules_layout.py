@@ -88,6 +88,7 @@ from cayu.sessions._execution_profile_checkpoint import (
 )
 from cayu.sessions.invocation import InvocationOrigin, SessionInvocation
 from cayu.sessions.records import Session, SessionStatus
+from cayu.tools.exposure import ToolCapabilityCeiling, session_metadata_with_tool_capability_ceiling
 
 profile = build_execution_profile_identity(runtime_name="cayu", runtime_version="test",
     provider_name="fake", model="model", durable_system_prompt="instructions", direct_tools=(),
@@ -99,6 +100,8 @@ session = Session(id="session", agent_name="agent", provider_name="fake", model=
         "cayu:runtime_build_provenance": profile.runtime_build_provenance.model_dump(mode="json")},
     invocation=SessionInvocation(origin=InvocationOrigin(trust="unattributed"),
         root_invocation_id="12345678-1234-4234-8234-123456789abc", root_session_id="session", source="sdk_run"))
+session.metadata = session_metadata_with_tool_capability_ceiling(
+    session.metadata, ToolCapabilityCeiling(tool_names=()))
 active = ActiveInvocationExecutionProfile(session_id="session", interaction_id="first",
     run_epoch=1, profile=profile)
 """
@@ -331,5 +334,78 @@ async def scenario():
         assert scope._current_session_invocation_terminal_event(session.id) is None
         scope._deactivate_session_run_fence(session.id)
 asyncio.run(scenario())
+"""
+    )
+
+
+def test_transition_receipts_replay_after_exact_release_without_implementations():
+    _without_implementations(
+        _SESSION_FIXTURE
+        + """
+from cayu.sessions import _interaction_receipts as rules, _invocation_lifecycle as lifecycle
+from cayu.sessions.authority import SessionRunFenced
+from cayu.sessions.checkpoints import INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY
+from cayu.sessions.interactions import InteractionTransitionSpec
+
+event = Event(type=EventType.INTERACTION_COMPLETED, session_id=session.id, interaction_id="first")
+spec = InteractionTransitionSpec(event=event, from_statuses=(SessionStatus.RUNNING,),
+    to_status=SessionStatus.COMPLETED)
+record = rules._interaction_transition_receipt_record(session=session, event=event,
+    from_statuses={SessionStatus.RUNNING}, to_status=SessionStatus.COMPLETED,
+    only_if_no_queued_messages=False, model_completion_stage_settlement=None,
+    status_changed=True, invocation_session_instance_id=session.instance_id,
+    invocation_active_profile=active)
+receipt = rules._reconstruct_interaction_transition_receipt(record, transition=spec)
+rules._require_invocation_release_settlement_record(record, current_session=session,
+    transition=spec, expected_session_instance_id=session.instance_id,
+    expected_active_invocation_profile=active)
+advanced = session.model_copy(update={"run_epoch": 2})
+authority = dict(expected_session_instance_id=session.instance_id,
+                 expected_active_invocation_profile=active)
+rejected(lambda: rules._validate_interaction_transition_receipt_authority(receipt,
+    current_session=advanced, current_checkpoint=None, **authority), SessionRunFenced)
+command = lifecycle.ReleaseInvocationCommand(session_id=session.id,
+    expected_session_instance_id=session.instance_id, expected_run_epoch=1,
+    expected_active_profile=active, settlement_transition=spec)
+release = lifecycle._invocation_lifecycle_command_receipt(command,
+    active_profile=active, result_session=advanced)
+ledger = lifecycle._InvocationLifecycleReceiptLedger(receipts=(release,))
+checkpoint = {INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY: ledger.model_dump(mode="json")}
+rules._validate_interaction_transition_receipt_authority(receipt,
+    current_session=advanced, current_checkpoint=checkpoint, **authority)
+rejected(lambda: rules._validate_interaction_transition_receipt_authority(receipt,
+    current_session=advanced.model_copy(update={"instance_id": "replacement"}),
+    current_checkpoint=checkpoint, **authority), SessionRunFenced)
+record["event"]["payload"]["forged"] = True
+rejected(lambda: rules._load_interaction_transition_receipt(record), RuntimeError)
+"""
+    )
+
+
+def test_terminal_receipts_require_runtime_event_authority_without_implementations():
+    _without_implementations(
+        _SESSION_FIXTURE
+        + """
+from cayu.events import event_with_runtime_envelope_authority
+from cayu.sessions import _interaction_receipts as rules
+from cayu.sessions.authority import SessionRunFenced
+from cayu.sessions.checkpoints import ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
+
+checkpoint = {ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY: active.model_dump(mode="json")}
+event = Event(type=EventType.SESSION_COMPLETED, session_id=session.id)
+assert rules._invocation_terminal_event_receipt_record(
+    session=session, checkpoint=checkpoint, event=event) is None
+owned = event_with_runtime_envelope_authority(event, "session_id")
+key, record = rules._invocation_terminal_event_receipt_record(
+    session=session, checkpoint=checkpoint, event=owned)
+assert key == rules._invocation_terminal_event_storage_key(event.id)
+rules._require_invocation_release_terminal_session_event(record, owned,
+    current_session=session, expected_event=owned, expected_session_instance_id=session.instance_id,
+    expected_active_invocation_profile=active)
+rejected(lambda: rules._require_invocation_release_terminal_session_event(record, None,
+    current_session=session, expected_event=owned, expected_session_instance_id=session.instance_id,
+    expected_active_invocation_profile=active), SessionRunFenced)
+record["event"]["payload"]["forged"] = True
+rejected(lambda: rules._load_invocation_terminal_event_receipt(record), RuntimeError)
 """
     )

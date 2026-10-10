@@ -2441,7 +2441,7 @@ def test_invocation_lifecycle_commands_are_atomic_in_local_stores(
         try:
             await _assert_create_result_preparation_failure_is_atomic(store, store_kind)
             if store_kind == "memory":
-                import cayu.sessions.base as receipt_module
+                from cayu.sessions import _interaction_receipts as receipt_module
             else:
                 from cayu.storage import sqlite as receipt_module
 
