@@ -37,15 +37,17 @@ from cayu.runtime import _session_engine as session_engine_module
 from cayu.runtime import _session_finalization as session_finalization_module
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.sessions import _invocation_scope as invocation_scope
+from cayu.sessions._interaction_transitions import (
+    InteractionTransitionReceiptResult,
+    InteractionTransitionResult,
+    InteractionTransitionSpec,
+)
 from cayu.sessions.base import InMemorySessionStore, SessionRunFenced
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
     InteractionStatus,
     InteractionSummaryEvidence,
-    InteractionTransitionReceiptResult,
-    InteractionTransitionResult,
-    InteractionTransitionSpec,
 )
 from cayu.sessions.messaging import EnqueueSessionMessageRequest, SessionMessageDeliveryMode
 from cayu.sessions.records import SessionIdentity, SessionStatus, SessionStatusConflict

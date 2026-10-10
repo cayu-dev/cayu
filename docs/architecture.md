@@ -632,11 +632,13 @@ trusted restoration and batch validation, preserving the export-publication gate
 
 ### Session invocation and interaction rules
 
-`sessions/interactions.py` owns invocation admission, queued profile handoff,
+`sessions/_interaction_transitions.py` owns invocation admission, queued profile handoff,
 interaction transitions and their input validation. These values compose the
 checkpoint mutation contracts in `sessions/_checkpoint_mutations.py` and the
 stage-settlement contracts in `sessions/_model_completion_publication.py`.
 The stores retain atomic admission, status checks and checkpoint publication.
+`sessions/interactions.py` retains lightweight lifecycle summaries without
+loading invocation admission, execution profiles or checkpoint mutation rules.
 
 `sessions/_invocation_scope.py` owns task-local run fences, transferable fence
 ownership, interaction attribution and retained settlement context. Its context

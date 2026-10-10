@@ -30,6 +30,7 @@ from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
     checkpoint_with_active_invocation_execution_profile,
 )
+from cayu.sessions._interaction_transitions import SessionInvocationAdmission
 from cayu.sessions._invocation_lifecycle import (
     _INVOCATION_COMMAND_ADAPTER as _INVOCATION_COMMAND_ADAPTER,
 )
@@ -206,7 +207,6 @@ from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
-from cayu.sessions.interactions import SessionInvocationAdmission
 from cayu.sessions.records import Session, SessionStatus, copy_session
 from cayu.tools.discovery import (
     initial_tool_discovery_operation_records_from_initialization,

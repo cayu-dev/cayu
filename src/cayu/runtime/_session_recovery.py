@@ -96,6 +96,7 @@ from cayu.sessions._foreground_child_checkpoint import (
     ForegroundChildWait,
     ForegroundParentContinuation,
 )
+from cayu.sessions._interaction_transitions import InteractionTransitionSpec
 from cayu.sessions._invocation_lifecycle import (
     invocation_lifecycle_receipt_history_present,
 )
@@ -114,7 +115,6 @@ from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
     INTERACTION_TERMINAL_EVENT_TYPES,
-    InteractionTransitionSpec,
 )
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import (

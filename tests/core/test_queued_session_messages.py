@@ -36,6 +36,10 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyResult,
     active_invocation_execution_profile_from_checkpoint,
 )
+from cayu.sessions._interaction_transitions import (
+    QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY,
+    QueuedInteractionProfileHandoff,
+)
 from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,
     settled_invocation_terminal_decision_from_checkpoint,
@@ -49,10 +53,6 @@ from cayu.sessions.base import (
     _model_completion_stage_dispatch_storage_key,
 )
 from cayu.sessions.event_queries import EventQuery
-from cayu.sessions.interactions import (
-    QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY,
-    QueuedInteractionProfileHandoff,
-)
 from cayu.sessions.messaging import (
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
     EnqueueSessionMessageRequest,

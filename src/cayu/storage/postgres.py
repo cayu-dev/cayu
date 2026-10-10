@@ -209,6 +209,16 @@ from cayu.sessions._interaction_receipts import (
     _validate_interaction_transition_recovery_claim_id,
     _validate_invocation_release_settlement_receipt_authority,
 )
+from cayu.sessions._interaction_transitions import (
+    InteractionTransitionReceiptResult,
+    InteractionTransitionResult,
+    InteractionTransitionSpec,
+    QueuedInteractionProfileHandoff,
+    _copy_optional_interaction_admission,
+    _copy_transition_interaction_admission,
+    _prepare_interaction_transition,
+    _prepare_interaction_transition_receipt_lookup,
+)
 from cayu.sessions._invocation_scope import (
     INHERIT_INTERACTION,
     InteractionAttribution,
@@ -362,16 +372,6 @@ from cayu.sessions.forks import (
     apply_fork_system_prompt_replacement,
 )
 from cayu.sessions.inspection import SessionInspectionIdentity
-from cayu.sessions.interactions import (
-    InteractionTransitionReceiptResult,
-    InteractionTransitionResult,
-    InteractionTransitionSpec,
-    QueuedInteractionProfileHandoff,
-    _copy_optional_interaction_admission,
-    _copy_transition_interaction_admission,
-    _prepare_interaction_transition,
-    _prepare_interaction_transition_receipt_lookup,
-)
 from cayu.sessions.invocation import SessionInvocation
 from cayu.sessions.lineage import (
     SessionLineageQuery,

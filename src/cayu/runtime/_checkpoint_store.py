@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from cayu.execution_profiles import (
         ExecutionProfileRejectionResult,
     )
+    from cayu.sessions._interaction_transitions import InteractionTransitionResult
     from cayu.sessions._invocation_lifecycle import (
         AdmitInvocationCommand,
         CreateInvocationCommand,
@@ -23,7 +24,6 @@ if TYPE_CHECKING:
         ReleaseInvocationCommand,
         SettleInvocationCommand,
     )
-    from cayu.sessions.interactions import InteractionTransitionResult
 
 from cayu._validation import copy_durable_json_object
 from cayu.execution_profiles import (
@@ -33,6 +33,7 @@ from cayu.sessions._checkpoint_preservation import (
     _invocation_lifecycle_authority_read_scope,
     _replace_checkpoint_preserving_completion_result_event_publications,
 )
+from cayu.sessions._interaction_transitions import SessionInvocationAdmission
 from cayu.sessions.base import (
     CheckpointRootFieldGuard,
     ModelCompletionStageRecoveryFence,
@@ -50,7 +51,6 @@ from cayu.sessions.checkpoints import (
     validate_runtime_checkpoint_root_projection,
 )
 from cayu.sessions.forks import ProfiledSessionForkResult
-from cayu.sessions.interactions import SessionInvocationAdmission
 from cayu.sessions.records import CheckpointTransform, Session, StoreTimeCheckpointTransform
 
 _ROOT_CHECKPOINT_GUARD = CheckpointRootFieldGuard(

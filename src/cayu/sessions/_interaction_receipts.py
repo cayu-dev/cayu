@@ -17,6 +17,7 @@ from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
     active_invocation_execution_profile_from_checkpoint,
 )
+from cayu.sessions._interaction_transitions import InteractionTransitionSpec
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalDecision,
     checkpoint_after_invocation_terminal_decision,
@@ -25,7 +26,6 @@ from cayu.sessions._invocation_terminal_decision import (
 )
 from cayu.sessions._model_completion_publication import ModelCompletionStageSettlementRequest
 from cayu.sessions.authority import SessionRunFenced
-from cayu.sessions.interactions import InteractionTransitionSpec
 from cayu.sessions.invocation import SessionInvocationBinding
 from cayu.sessions.records import Session, SessionStatus, copy_session
 

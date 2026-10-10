@@ -238,6 +238,12 @@ from cayu.sessions._foreground_child_checkpoint import (
     ForegroundChildWait,
     foreground_child_state_from_checkpoint,
 )
+from cayu.sessions._interaction_transitions import (
+    InteractionTransitionReceiptResult,
+    InteractionTransitionResult,
+    InteractionTransitionSpec,
+    copy_interaction_transition_spec,
+)
 from cayu.sessions._invocation_lifecycle import (
     AdmittedInvocationBinding,
     SettleInvocationCommand,
@@ -299,10 +305,6 @@ from cayu.sessions.interactions import (
     INTERACTION_TERMINAL_EVENT_TYPES,
     InteractionStatus,
     InteractionSummaryEvidence,
-    InteractionTransitionReceiptResult,
-    InteractionTransitionResult,
-    InteractionTransitionSpec,
-    copy_interaction_transition_spec,
     interaction_usage_summary,
 )
 from cayu.sessions.records import (

@@ -55,6 +55,7 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
+from cayu.sessions._interaction_transitions import InteractionTransitionSpec
 from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,
     settled_invocation_terminal_decision_from_checkpoint,
@@ -66,7 +67,6 @@ from cayu.sessions.checkpoints import (
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
 from cayu.sessions.event_queries import EventQuery
-from cayu.sessions.interactions import InteractionTransitionSpec
 from cayu.sessions.records import (
     CheckpointTransform,
     EventRecord,

@@ -64,6 +64,11 @@ from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
     active_invocation_execution_profile_from_checkpoint,
 )
+from cayu.sessions._interaction_transitions import (
+    QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY,
+    QueuedInteractionProfileHandoff,
+    queued_interaction_profile_handoff_evidence,
+)
 from cayu.sessions._invocation_lifecycle import RejectInvocationCommand
 from cayu.sessions.base import (
     ActiveModelCompletionStage,
@@ -75,9 +80,6 @@ from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
     INTERACTION_TERMINAL_EVENT_TYPES,
-    QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY,
-    QueuedInteractionProfileHandoff,
-    queued_interaction_profile_handoff_evidence,
 )
 from cayu.sessions.records import Session
 from cayu.tools.exposure import tool_capability_ceiling_from_session_metadata

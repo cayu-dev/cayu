@@ -2824,11 +2824,17 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "InteractionStatus": ("cayu.sessions.interactions", "InteractionStatus"),
     "InteractionSummaryEvidence": ("cayu.sessions.interactions", "InteractionSummaryEvidence"),
     "InteractionTransitionReceiptResult": (
-        "cayu.sessions.interactions",
+        "cayu.sessions._interaction_transitions",
         "InteractionTransitionReceiptResult",
     ),
-    "InteractionTransitionResult": ("cayu.sessions.interactions", "InteractionTransitionResult"),
-    "InteractionTransitionSpec": ("cayu.sessions.interactions", "InteractionTransitionSpec"),
+    "InteractionTransitionResult": (
+        "cayu.sessions._interaction_transitions",
+        "InteractionTransitionResult",
+    ),
+    "InteractionTransitionSpec": (
+        "cayu.sessions._interaction_transitions",
+        "InteractionTransitionSpec",
+    ),
     "InterruptSessionRequest": ("cayu.sessions.requests", "InterruptSessionRequest"),
     "InterruptedTaskContinuationClaimPage": (
         "cayu.tasks.handoff",
@@ -4960,7 +4966,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "SessionInspectionUsageSummary": ("cayu.sessions.inspection", "SessionInspectionUsageSummary"),
     "SessionInterrupted": ("cayu.evals.assertions", "SessionInterrupted"),
     "SessionInvocation": ("cayu.sessions.invocation", "SessionInvocation"),
-    "SessionInvocationAdmission": ("cayu.sessions.interactions", "SessionInvocationAdmission"),
+    "SessionInvocationAdmission": (
+        "cayu.sessions._interaction_transitions",
+        "SessionInvocationAdmission",
+    ),
     "SessionInvocationBinding": ("cayu.sessions.invocation", "SessionInvocationBinding"),
     "SessionInvocationSnapshot": ("cayu.sessions.records", "SessionInvocationSnapshot"),
     "SessionLineageNode": ("cayu.sessions.lineage", "SessionLineageNode"),

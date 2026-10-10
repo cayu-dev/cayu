@@ -33,8 +33,11 @@ from cayu.runtime.execution_profiles import (
     build_execution_profile_identity,
     execution_profile_decision_payload,
 )
+from cayu.sessions._interaction_transitions import (
+    InteractionTransitionSpec,
+    SessionInvocationAdmission,
+)
 from cayu.sessions.base import InMemorySessionStore, SessionRunFenced, SessionStore
-from cayu.sessions.interactions import InteractionTransitionSpec, SessionInvocationAdmission
 from cayu.sessions.records import SessionIdentity, SessionStatus, SessionStatusConflict
 from cayu.sessions.requests import RunRequest, run_request_with_runtime_session_instance_authority
 from cayu.tools.exposure import ToolCapabilityCeiling

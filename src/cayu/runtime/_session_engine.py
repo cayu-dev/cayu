@@ -550,6 +550,13 @@ from cayu.sessions._foreground_child_checkpoint import (
     ForegroundParentContinuation,
     foreground_child_state_from_checkpoint,
 )
+from cayu.sessions._interaction_transitions import (
+    QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY,
+    InteractionTransitionResult,
+    InteractionTransitionSpec,
+    QueuedInteractionProfileHandoff,
+    queued_interaction_profile_handoff_evidence,
+)
 from cayu.sessions._invocation_lifecycle import (
     AdmitInvocationCommand,
     AdmittedInvocationBinding,
@@ -660,13 +667,8 @@ from cayu.sessions.forks import (
 from cayu.sessions.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
     INTERACTION_TERMINAL_EVENT_TYPES,
-    QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY,
     InteractionStatus,
     InteractionSummaryEvidence,
-    InteractionTransitionResult,
-    InteractionTransitionSpec,
-    QueuedInteractionProfileHandoff,
-    queued_interaction_profile_handoff_evidence,
 )
 from cayu.sessions.invocation import SessionExecutionSource, SessionInvocationBinding
 from cayu.sessions.invocation_release import (

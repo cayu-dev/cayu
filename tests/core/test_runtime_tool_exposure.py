@@ -62,10 +62,13 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
 )
+from cayu.sessions._interaction_transitions import (
+    InteractionTransitionSpec,
+    SessionInvocationAdmission,
+)
 from cayu.sessions.base import InMemorySessionStore, SessionRunFenced
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.forks import ForkExecutionProfileSelection
-from cayu.sessions.interactions import InteractionTransitionSpec, SessionInvocationAdmission
 from cayu.sessions.records import Session, SessionIdentity, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.sessions.requests import ForkSessionRequest, ResumeRequest, RunRequest

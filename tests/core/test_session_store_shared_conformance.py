@@ -236,6 +236,12 @@ from cayu.sessions._checkpoint_mutations import (
     SessionRuntimePublicationConflict,
     runtime_publication_checkpoint_value_digest,
 )
+from cayu.sessions._interaction_transitions import (
+    QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY,
+    InteractionTransitionSpec,
+    QueuedInteractionProfileHandoff,
+    queued_interaction_profile_handoff_evidence,
+)
 from cayu.sessions._invocation_scope import _deactivate_session_run_fence
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalOutcome,
@@ -286,13 +292,7 @@ from cayu.sessions.forks import (
     ForkSystemPromptReplacement,
     fork_session_invocation,
 )
-from cayu.sessions.interactions import (
-    INTERACTION_LIFECYCLE_EVENT_TYPES,
-    QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY,
-    InteractionTransitionSpec,
-    QueuedInteractionProfileHandoff,
-    queued_interaction_profile_handoff_evidence,
-)
+from cayu.sessions.interactions import INTERACTION_LIFECYCLE_EVENT_TYPES
 from cayu.sessions.invocation import (
     InvocationOriginClaim,
     InvocationOriginTrust,

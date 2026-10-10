@@ -24,13 +24,13 @@ import cayu
         ("_checkpoint_mutations", "apply_runtime_publication_checkpoint_mutation"),
         ("_model_completion_publication", "ModelCompletionStageDisposition"),
         ("_model_completion_publication", "ModelCompletionStageSettlementRequest"),
-        ("interactions", "QueuedInteractionProfileHandoff"),
-        ("interactions", "queued_interaction_profile_handoff_evidence"),
-        ("interactions", "InteractionTransitionResult"),
-        ("interactions", "InteractionTransitionSpec"),
-        ("interactions", "InteractionTransitionReceiptResult"),
-        ("interactions", "SessionInvocationAdmission"),
-        ("interactions", "copy_interaction_transition_spec"),
+        ("_interaction_transitions", "QueuedInteractionProfileHandoff"),
+        ("_interaction_transitions", "queued_interaction_profile_handoff_evidence"),
+        ("_interaction_transitions", "InteractionTransitionResult"),
+        ("_interaction_transitions", "InteractionTransitionSpec"),
+        ("_interaction_transitions", "InteractionTransitionReceiptResult"),
+        ("_interaction_transitions", "SessionInvocationAdmission"),
+        ("_interaction_transitions", "copy_interaction_transition_spec"),
         ("_invocation_scope", "resolve_interaction_attribution"),
         ("_invocation_scope", "attribute_event_to_current_interaction"),
         ("_invocation_scope", "attribute_events_to_current_interaction"),
@@ -125,6 +125,25 @@ active = ActiveInvocationExecutionProfile(session_id="session", interaction_id="
 """
 
 
+def test_interaction_summaries_do_not_load_invocation_contracts():
+    _without_implementations(
+        """
+class RejectInvocationContracts(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in {
+            "cayu.sessions._interaction_transitions",
+            "cayu.sessions._execution_profile_rules",
+            "cayu.sessions.requests",
+        }:
+            raise AssertionError(f"Interaction summaries imported {fullname}")
+sys.meta_path.insert(0, RejectInvocationContracts())
+from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
+assert InteractionStatus.COMPLETED.value == "completed"
+assert InteractionSummaryEvidence.__module__ == "cayu.sessions.interactions"
+"""
+    )
+
+
 def test_checkpoint_mutations_preserve_cas_and_detachment_without_implementations():
     _without_implementations(
         """
@@ -209,7 +228,7 @@ def test_interaction_transition_contracts_without_implementations():
     _without_implementations(
         _SESSION_FIXTURE
         + """
-from cayu.sessions import interactions as rules
+from cayu.sessions import _interaction_transitions as rules
 
 event = Event(type=EventType.INTERACTION_COMPLETED, session_id=session.id,
               interaction_id="first", payload={"nested": {"value": 1}})
@@ -238,7 +257,7 @@ def test_invocation_admission_and_queued_handoff_without_implementations():
         _SESSION_FIXTURE
         + """
 from cayu.messages import Message
-from cayu.sessions import interactions as rules
+from cayu.sessions import _interaction_transitions as rules
 from cayu.tools.exposure import ToolCapabilityCeiling
 
 started = Event(type=EventType.INTERACTION_STARTED, session_id=session.id, interaction_id="next")
@@ -311,7 +330,7 @@ def test_interaction_context_preserves_history_and_restores_outer_scope():
         + """
 import asyncio
 from cayu.sessions import _invocation_scope as scope
-from cayu.sessions.interactions import InteractionTransitionSpec
+from cayu.sessions._interaction_transitions import InteractionTransitionSpec
 
 async def scenario():
     scope._activate_owned_session_run_fence(session)
@@ -363,7 +382,7 @@ def test_transition_receipts_replay_after_exact_release_without_implementations(
 from cayu.sessions import _interaction_receipts as rules, _invocation_lifecycle as lifecycle
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.checkpoints import INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY
-from cayu.sessions.interactions import InteractionTransitionSpec
+from cayu.sessions._interaction_transitions import InteractionTransitionSpec
 
 event = Event(type=EventType.INTERACTION_COMPLETED, session_id=session.id, interaction_id="first")
 spec = InteractionTransitionSpec(event=event, from_statuses=(SessionStatus.RUNNING,),

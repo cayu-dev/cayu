@@ -37,6 +37,7 @@ from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _completion_finalization as completion_finalization
 from cayu.sessions import _execution_profile_rules as session_profile_rules
 from cayu.sessions import _interaction_receipts as interaction_receipts
+from cayu.sessions import _interaction_transitions as interaction_rules
 from cayu.sessions import _invocation_scope as invocation_scope
 from cayu.sessions import _terminal_evidence as terminal_event_evidence
 from cayu.sessions import authority as session_authority_rules
@@ -46,7 +47,6 @@ from cayu.sessions import event_delivery as side_effect_health
 from cayu.sessions import event_queries as event_query_rules
 from cayu.sessions import forks as session_fork_rules
 from cayu.sessions import inspection as session_inspection_rules
-from cayu.sessions import interactions as interaction_rules
 from cayu.sessions import messaging as session_messaging
 from cayu.sessions import queries as session_query_rules
 from cayu.sessions import records as session_record_rules
@@ -92,6 +92,30 @@ from cayu.sessions._interaction_receipts import (
 )
 from cayu.sessions._interaction_receipts import (
     INVOCATION_TERMINAL_EVENT_OPERATION_KEY_PREFIX as INVOCATION_TERMINAL_EVENT_OPERATION_KEY_PREFIX,
+)
+from cayu.sessions._interaction_transitions import (
+    QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY as QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY,
+)
+from cayu.sessions._interaction_transitions import (
+    InteractionTransitionReceiptResult as InteractionTransitionReceiptResult,
+)
+from cayu.sessions._interaction_transitions import (
+    InteractionTransitionResult as InteractionTransitionResult,
+)
+from cayu.sessions._interaction_transitions import (
+    InteractionTransitionSpec as InteractionTransitionSpec,
+)
+from cayu.sessions._interaction_transitions import (
+    QueuedInteractionProfileHandoff as QueuedInteractionProfileHandoff,
+)
+from cayu.sessions._interaction_transitions import (
+    SessionInvocationAdmission as SessionInvocationAdmission,
+)
+from cayu.sessions._interaction_transitions import (
+    copy_interaction_transition_spec as copy_interaction_transition_spec,
+)
+from cayu.sessions._interaction_transitions import (
+    queued_interaction_profile_handoff_evidence as queued_interaction_profile_handoff_evidence,
 )
 from cayu.sessions._invocation_scope import INHERIT_INTERACTION as INHERIT_INTERACTION
 from cayu.sessions._invocation_scope import (
@@ -296,24 +320,6 @@ from cayu.sessions.inspection import SerializedRecordSummary as SerializedRecord
 from cayu.sessions.inspection import SessionInspectionIdentity as SessionInspectionIdentity
 from cayu.sessions.inspection import SessionInspectionSummary as SessionInspectionSummary
 from cayu.sessions.inspection import SessionInspectionUsageSummary as SessionInspectionUsageSummary
-from cayu.sessions.interactions import (
-    QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY as QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY,
-)
-from cayu.sessions.interactions import (
-    InteractionTransitionReceiptResult as InteractionTransitionReceiptResult,
-)
-from cayu.sessions.interactions import InteractionTransitionResult as InteractionTransitionResult
-from cayu.sessions.interactions import InteractionTransitionSpec as InteractionTransitionSpec
-from cayu.sessions.interactions import (
-    QueuedInteractionProfileHandoff as QueuedInteractionProfileHandoff,
-)
-from cayu.sessions.interactions import SessionInvocationAdmission as SessionInvocationAdmission
-from cayu.sessions.interactions import (
-    copy_interaction_transition_spec as copy_interaction_transition_spec,
-)
-from cayu.sessions.interactions import (
-    queued_interaction_profile_handoff_evidence as queued_interaction_profile_handoff_evidence,
-)
 from cayu.sessions.lineage import (
     SESSION_LINEAGE_DEFAULT_CHILD_LIMIT as SESSION_LINEAGE_DEFAULT_CHILD_LIMIT,
 )

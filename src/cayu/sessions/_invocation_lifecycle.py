@@ -67,6 +67,10 @@ from cayu.sessions._execution_profile_checkpoint import (
     execution_profile_from_session_metadata,
 )
 from cayu.sessions._execution_profile_rules import SessionModelTransition
+from cayu.sessions._interaction_transitions import (
+    InteractionTransitionResult,
+    InteractionTransitionSpec,
+)
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalOutcome,
     invocation_terminal_decision_from_checkpoint,
@@ -83,7 +87,6 @@ from cayu.sessions.checkpoints import (
     INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )
-from cayu.sessions.interactions import InteractionTransitionResult, InteractionTransitionSpec
 from cayu.sessions.invocation import SessionInvocationBinding
 from cayu.sessions.invocation_release import InvocationReleaseEvidence
 from cayu.sessions.records import (

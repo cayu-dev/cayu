@@ -208,6 +208,10 @@ from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authori
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
+from cayu.sessions._interaction_transitions import (
+    QueuedInteractionProfileHandoff,
+    _copy_queued_interaction_profile_handoff,
+)
 from cayu.sessions._invocation_lifecycle import (
     AdmittedInvocationBinding,
     ReleaseInvocationCommand,
@@ -232,10 +236,6 @@ from cayu.sessions.base import (
     _initial_transcript_pending_interaction_id,
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery
-from cayu.sessions.interactions import (
-    QueuedInteractionProfileHandoff,
-    _copy_queued_interaction_profile_handoff,
-)
 from cayu.sessions.messaging import SessionMessageDeliveryBatch
 from cayu.sessions.records import CheckpointTransform, Session, SessionStatus, session_user_metadata
 from cayu.sessions.recovery import _incomplete_recovery_claim_from_checkpoint

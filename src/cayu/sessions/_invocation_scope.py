@@ -13,8 +13,11 @@ from weakref import ReferenceType, ref
 
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.events import Event, EventType, copy_event, event_with_runtime_envelope_authority
+from cayu.sessions._interaction_transitions import (
+    InteractionTransitionSpec,
+    copy_interaction_transition_spec,
+)
 from cayu.sessions.authority import SessionRunFenced
-from cayu.sessions.interactions import InteractionTransitionSpec, copy_interaction_transition_spec
 from cayu.sessions.records import Session
 
 _SESSION_CLEANUP_IDENTITIES: ContextVar[dict[str, tuple[str, int]] | None] = ContextVar(
