@@ -57,9 +57,7 @@ from cayu.runtime._session_control import (
 )
 from cayu.runtime.stop_policy import StopDecision
 from cayu.runtime.tool_completion import ToolCompletionPolicy, ToolCompletionResult
-from cayu.sessions.base import (
-    InteractionTransitionSpec,
-)
+from cayu.sessions.interactions import InteractionTransitionSpec
 from cayu.sessions.records import (
     Session,
 )

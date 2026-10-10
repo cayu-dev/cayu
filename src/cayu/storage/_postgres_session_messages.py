@@ -20,15 +20,11 @@ from cayu.sessions._execution_profile_checkpoint import ActiveInvocationExecutio
 from cayu.sessions.access import require_resource_session
 from cayu.sessions.base import (
     MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
-    QueuedInteractionProfileHandoff,
     SessionMessageQueueStatus,
     SessionRunFenced,
     _assert_session_run_epoch,
     _check_closure_lineage_owner,
     _checkpoint_after_queued_interaction_profile_handoff,
-    _copy_historical_queued_interaction_profile_handoff,
-    _copy_queued_interaction_profile_handoff,
-    _copy_queued_interaction_started_event,
     _historical_queued_handoff_stage_from_records,
     _interaction_transition_storage_key,
     _model_completion_stage_dispatch_storage_key,
@@ -37,6 +33,12 @@ from cayu.sessions.base import (
     _reconstruct_active_model_completion_stage_record,
     _reconstruct_model_completion_stage_dispatch,
     _validate_message_delivery_eligible_through,
+)
+from cayu.sessions.interactions import (
+    QueuedInteractionProfileHandoff,
+    _copy_historical_queued_interaction_profile_handoff,
+    _copy_queued_interaction_profile_handoff,
+    _copy_queued_interaction_started_event,
 )
 from cayu.sessions.messaging import (
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,

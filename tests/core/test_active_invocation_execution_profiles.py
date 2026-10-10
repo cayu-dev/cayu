@@ -95,13 +95,7 @@ from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, Lo
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_mutation_scope
-from cayu.sessions.base import (
-    InMemorySessionStore,
-    InteractionTransitionSpec,
-    ModelTarget,
-    SessionRunFenced,
-    SessionStore,
-)
+from cayu.sessions.base import InMemorySessionStore, ModelTarget, SessionRunFenced, SessionStore
 from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -114,7 +108,11 @@ from cayu.sessions.forks import (
     session_fork_profile_relationship,
     session_prompt_anatomy_transition,
 )
-from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
+from cayu.sessions.interactions import (
+    InteractionStatus,
+    InteractionSummaryEvidence,
+    InteractionTransitionSpec,
+)
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import SessionIdentity, SessionStatus, SessionStatusConflict
 from cayu.sessions.recovery import (

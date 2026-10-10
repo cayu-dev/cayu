@@ -32,7 +32,6 @@ from cayu.sessions._invocation_terminal_decision import (
 )
 from cayu.sessions.base import (
     ZERO_WORK_INTERRUPTION_OPERATION_KEY,
-    InteractionTransitionSpec,
     SessionExecutionSource,
     _interaction_transition_receipt_record,
     _interaction_transition_storage_key,
@@ -41,7 +40,11 @@ from cayu.sessions.base import (
     _load_invocation_terminal_event_receipt,
 )
 from cayu.sessions.checkpoints import decode_runtime_checkpoint
-from cayu.sessions.interactions import InteractionStatus, InteractionSummaryEvidence
+from cayu.sessions.interactions import (
+    InteractionStatus,
+    InteractionSummaryEvidence,
+    InteractionTransitionSpec,
+)
 from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.recovery import _incomplete_recovery_claim_from_checkpoint
 

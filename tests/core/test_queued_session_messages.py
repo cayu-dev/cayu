@@ -43,14 +43,16 @@ from cayu.sessions._invocation_terminal_decision import (
 from cayu.sessions.authority import _canonical_runtime_publication_digest
 from cayu.sessions.base import (
     MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
-    QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY,
     InMemorySessionStore,
-    QueuedInteractionProfileHandoff,
     SessionModelCompletionStageConflict,
     SessionRunFenced,
     _model_completion_stage_dispatch_storage_key,
 )
 from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.interactions import (
+    QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY,
+    QueuedInteractionProfileHandoff,
+)
 from cayu.sessions.messaging import (
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
     EnqueueSessionMessageRequest,

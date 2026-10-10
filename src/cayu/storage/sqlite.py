@@ -190,16 +190,12 @@ from cayu.sessions.base import (
     CheckpointRootFieldGuard,
     ForkCheckpointAuthorityDecoder,
     InteractionAttribution,
-    InteractionTransitionReceiptResult,
-    InteractionTransitionResult,
-    InteractionTransitionSpec,
     ModelCompletionStage,
     ModelCompletionStageAbandonmentResult,
     ModelCompletionStageDispatch,
     ModelCompletionStageResult,
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
-    QueuedInteractionProfileHandoff,
     RuntimePublicationReceipt,
     RuntimePublicationResult,
     SessionModelCompletionDispatchAlreadyAuthorized,
@@ -224,8 +220,6 @@ from cayu.sessions.base import (
     _child_session_notification_consumption_replays,
     _completion_result_event_publication_delete_block_reason,
     _copy_optional_event_id,
-    _copy_optional_interaction_admission,
-    _copy_transition_interaction_admission,
     _current_session_run_epoch,
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
@@ -257,8 +251,6 @@ from cayu.sessions.base import (
     _ModelCompletionStagePromotionContext,
     _next_runtime_publication_timestamp,
     _prepare_initial_session_operation_records,
-    _prepare_interaction_transition,
-    _prepare_interaction_transition_receipt_lookup,
     _prepare_model_completion_stage_promotion,
     _prepare_queue_completion_checkpoint_mutation,
     _PreparedModelCompletionStage,
@@ -343,6 +335,16 @@ from cayu.sessions.forks import (
     apply_fork_system_prompt_replacement,
 )
 from cayu.sessions.inspection import SessionInspectionIdentity
+from cayu.sessions.interactions import (
+    InteractionTransitionReceiptResult,
+    InteractionTransitionResult,
+    InteractionTransitionSpec,
+    QueuedInteractionProfileHandoff,
+    _copy_optional_interaction_admission,
+    _copy_transition_interaction_admission,
+    _prepare_interaction_transition,
+    _prepare_interaction_transition_receipt_lookup,
+)
 from cayu.sessions.invocation import SessionInvocation
 from cayu.sessions.lineage import (
     SessionLineageQuery,

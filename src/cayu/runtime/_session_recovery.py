@@ -100,7 +100,6 @@ from cayu.sessions._invocation_lifecycle import (
     invocation_lifecycle_receipt_history_present,
 )
 from cayu.sessions.base import (
-    InteractionTransitionSpec,
     ModelCompletionManualRecoveryRequest,
     SessionRunFenced,
     SessionStore,
@@ -117,6 +116,7 @@ from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
     INTERACTION_TERMINAL_EVENT_TYPES,
+    InteractionTransitionSpec,
 )
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import (

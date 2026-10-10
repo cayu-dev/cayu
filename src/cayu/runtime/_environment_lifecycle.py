@@ -220,11 +220,9 @@ from cayu.sessions._terminal_evidence import (
     classify_current_terminal_evidence,
 )
 from cayu.sessions.base import (
-    QueuedInteractionProfileHandoff,
     SessionOperationPublication,
     SessionRunFenced,
     SessionStore,
-    _copy_queued_interaction_profile_handoff,
     _current_session_invocation_settlement_transition,
     _current_session_invocation_terminal_event,
     _current_session_run_epoch,
@@ -232,6 +230,10 @@ from cayu.sessions.base import (
     _initial_transcript_pending_interaction_id,
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery
+from cayu.sessions.interactions import (
+    QueuedInteractionProfileHandoff,
+    _copy_queued_interaction_profile_handoff,
+)
 from cayu.sessions.messaging import SessionMessageDeliveryBatch
 from cayu.sessions.records import CheckpointTransform, Session, SessionStatus, session_user_metadata
 from cayu.sessions.recovery import _incomplete_recovery_claim_from_checkpoint

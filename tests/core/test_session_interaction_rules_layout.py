@@ -24,6 +24,13 @@ import cayu
         ("_checkpoint_mutations", "apply_runtime_publication_checkpoint_mutation"),
         ("_model_completion_publication", "ModelCompletionStageDisposition"),
         ("_model_completion_publication", "ModelCompletionStageSettlementRequest"),
+        ("interactions", "QueuedInteractionProfileHandoff"),
+        ("interactions", "queued_interaction_profile_handoff_evidence"),
+        ("interactions", "InteractionTransitionResult"),
+        ("interactions", "InteractionTransitionSpec"),
+        ("interactions", "InteractionTransitionReceiptResult"),
+        ("interactions", "SessionInvocationAdmission"),
+        ("interactions", "copy_interaction_transition_spec"),
     ),
 )
 def test_interaction_prerequisites_preserve_public_identity(module, name):
@@ -67,6 +74,31 @@ def rejected(call, error_type=ValueError):
         timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+_SESSION_FIXTURE = """
+from cayu.build_provenance import RuntimeBuildProvenance
+from cayu.events import Event, EventType
+from cayu.runtime.execution_profiles import build_execution_profile_identity
+from cayu.sessions._execution_profile_checkpoint import (
+    ActiveInvocationExecutionProfile, execution_profile_session_metadata,
+)
+from cayu.sessions.invocation import InvocationOrigin, SessionInvocation
+from cayu.sessions.records import Session, SessionStatus
+
+profile = build_execution_profile_identity(runtime_name="cayu", runtime_version="test",
+    provider_name="fake", model="model", durable_system_prompt="instructions", direct_tools=(),
+    tool_catalogue_revision="sha256:" + "a" * 64,
+    runtime_build_provenance=RuntimeBuildProvenance.unavailable("test_fixture"))
+session = Session(id="session", agent_name="agent", provider_name="fake", model="model",
+    runtime_version="test", causal_budget_id="session", status=SessionStatus.COMPLETED,
+    run_epoch=1, metadata={"cayu:execution_profile": execution_profile_session_metadata(profile),
+        "cayu:runtime_build_provenance": profile.runtime_build_provenance.model_dump(mode="json")},
+    invocation=SessionInvocation(origin=InvocationOrigin(trust="unattributed"),
+        root_invocation_id="12345678-1234-4234-8234-123456789abc", root_session_id="session", source="sdk_run"))
+active = ActiveInvocationExecutionProfile(session_id="session", interaction_id="first",
+    run_epoch=1, profile=profile)
+"""
 
 
 def test_checkpoint_mutations_preserve_cas_and_detachment_without_implementations():
@@ -145,5 +177,69 @@ mutation = {"operations": [{"key": completion.PENDING_COMPLETION_FINALIZATION_CH
 completion._validate_completion_finalization_mutation_shape(mutation)
 mutation["operations"][0]["expected_value_digest"] = "a" * 64
 rejected(lambda: completion._validate_completion_finalization_mutation_shape(mutation))
+"""
+    )
+
+
+def test_interaction_transition_contracts_without_implementations():
+    _without_implementations(
+        _SESSION_FIXTURE
+        + """
+from cayu.sessions import interactions as rules
+
+event = Event(type=EventType.INTERACTION_COMPLETED, session_id=session.id,
+              interaction_id="first", payload={"nested": {"value": 1}})
+spec = rules.InteractionTransitionSpec(event=event, from_statuses=(SessionStatus.RUNNING,),
+    to_status=SessionStatus.COMPLETED)
+copied = rules.copy_interaction_transition_spec(spec)
+event.payload["nested"]["value"] = 2
+assert copied == spec and copied is not spec
+assert spec.event.payload == {"nested": {"value": 1}}
+receipt = rules.InteractionTransitionReceiptResult(session=session, transition=spec,
+    status_changed=True)
+assert receipt.replayed and receipt.session is not session
+rejected(lambda: rules.InteractionTransitionReceiptResult(session=session,
+    transition=spec, status_changed=False))
+rejected(lambda: rules.InteractionTransitionSpec(event=event,
+    from_statuses=(SessionStatus.RUNNING,), to_status=SessionStatus.RUNNING))
+rejected(lambda: rules.InteractionTransitionSpec(event=event,
+    from_statuses=(SessionStatus.RUNNING, SessionStatus.RUNNING),
+    to_status=SessionStatus.COMPLETED))
+"""
+    )
+
+
+def test_invocation_admission_and_queued_handoff_without_implementations():
+    _without_implementations(
+        _SESSION_FIXTURE
+        + """
+from cayu.messages import Message
+from cayu.sessions import interactions as rules
+from cayu.tools.exposure import ToolCapabilityCeiling
+
+started = Event(type=EventType.INTERACTION_STARTED, session_id=session.id, interaction_id="next")
+fields = dict(from_statuses=frozenset({SessionStatus.COMPLETED}),
+    checkpoint_transform=lambda session, checkpoint: checkpoint, execution_profile=profile,
+    interaction_source_messages=(Message.text("user", "continue"),),
+    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()))
+admission = rules.SessionInvocationAdmission(**fields, interaction_started_event=started)
+assert admission.execution_profile == profile and admission.execution_profile is not profile
+assert admission.interaction_started_event is not started
+rejected(lambda: rules.SessionInvocationAdmission(**fields, interaction_started_event=started,
+    continued_interaction_id="first"))
+rejected(lambda: rules.SessionInvocationAdmission(**fields, continued_interaction_id="first"))
+continued = rules.SessionInvocationAdmission(**fields, continued_interaction_id="first",
+    expected_active_invocation_profile=active, defer_interaction_source=True)
+assert continued.continued_interaction_id == "first"
+target = active.model_copy(update={"interaction_id": "next"})
+handoff = rules.QueuedInteractionProfileHandoff(expected_session_instance_id=session.instance_id,
+    predecessor_settlement_event_id="settled", expected_active_profile=active,
+    target_active_profile=target)
+started.payload[rules.QUEUED_INTERACTION_PROFILE_HANDOFF_PAYLOAD_KEY] = (
+    rules.queued_interaction_profile_handoff_evidence(handoff))
+copied = rules._copy_queued_interaction_profile_handoff(session.id, "next", "next", started, handoff)
+assert copied == handoff and copied is not handoff
+rejected(lambda: rules._copy_queued_interaction_profile_handoff(
+    session.id, "wrong-delivery", "next", started, handoff))
 """
     )

@@ -47,6 +47,7 @@ from cayu.execution_profiles import (
     ExecutionProfileDecision,
     ExecutionProfileDecisionKind,
     ExecutionProfileIdentity,
+    ExecutionProfileRejectionResult,
     changed_execution_profile_components,
     direct_tool_capability_ceiling_component,
     execution_profile_changes_authority,
@@ -72,12 +73,7 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_matches_recovery_profile,
     settled_invocation_terminal_decision_from_checkpoint,
 )
-from cayu.sessions.base import (
-    ExecutionProfileRejectionResult,
-    InteractionTransitionResult,
-    InteractionTransitionSpec,
-    SessionRunFenced,
-)
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
@@ -87,6 +83,7 @@ from cayu.sessions.checkpoints import (
     INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
 )
+from cayu.sessions.interactions import InteractionTransitionResult, InteractionTransitionSpec
 from cayu.sessions.invocation import SessionInvocationBinding
 from cayu.sessions.invocation_release import InvocationReleaseEvidence
 from cayu.sessions.records import (

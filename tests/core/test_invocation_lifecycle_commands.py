@@ -81,9 +81,7 @@ from cayu.sessions._checkpoint_mutations import (
 from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
 from cayu.sessions.base import (
     InMemorySessionStore,
-    InteractionTransitionSpec,
     ModelTarget,
-    SessionInvocationAdmission,
     SessionRunFenced,
     SessionStore,
     _current_session_run_epoch,
@@ -96,6 +94,7 @@ from cayu.sessions.checkpoints import (
     SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
     CheckpointCompatibilityError,
 )
+from cayu.sessions.interactions import InteractionTransitionSpec, SessionInvocationAdmission
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.sessions.recovery import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,

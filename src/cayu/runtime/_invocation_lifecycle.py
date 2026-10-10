@@ -192,7 +192,6 @@ from cayu.sessions._invocation_lifecycle import (
     superseding_invocation_admission_digest_from_state as superseding_invocation_admission_digest_from_state,
 )
 from cayu.sessions.base import (
-    SessionInvocationAdmission,
     SessionRunFenced,
     SessionStore,
     _current_session_run_epoch,
@@ -205,6 +204,7 @@ from cayu.sessions.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
+from cayu.sessions.interactions import SessionInvocationAdmission
 from cayu.sessions.records import Session, SessionStatus, copy_session
 from cayu.tools.discovery import (
     initial_tool_discovery_operation_records_from_initialization,

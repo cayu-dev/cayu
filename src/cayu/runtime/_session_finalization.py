@@ -267,9 +267,6 @@ from cayu.sessions._terminal_evidence import (
 )
 from cayu.sessions.base import (
     _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
-    InteractionTransitionReceiptResult,
-    InteractionTransitionResult,
-    InteractionTransitionSpec,
     SessionModelCompletionStageConflict,
     SessionRunFenced,
     SessionStore,
@@ -285,7 +282,6 @@ from cayu.sessions.base import (
     _latest_session_invocation_interaction_is_settled,
     _mark_session_interaction_settled,
     _mark_session_invocation_terminal_event,
-    copy_interaction_transition_spec,
     model_completion_stage_settlement_request,
 )
 from cayu.sessions.checkpoints import (
@@ -301,6 +297,10 @@ from cayu.sessions.interactions import (
     INTERACTION_TERMINAL_EVENT_TYPES,
     InteractionStatus,
     InteractionSummaryEvidence,
+    InteractionTransitionReceiptResult,
+    InteractionTransitionResult,
+    InteractionTransitionSpec,
+    copy_interaction_transition_spec,
     interaction_usage_summary,
 )
 from cayu.sessions.records import (
