@@ -577,6 +577,13 @@ values checked during copying share this owner, preserving exact token identity
 and rejecting forged or mismatched handoffs. Authority issuance and authentication,
 runtime admission and native operations retain their existing owners.
 
+### Session creation claims
+
+`sessions/creation_claims.py` owns bounded creation references, their secret keys
+and authentication results. These values compose without loading session stores
+or execution orchestration. The existing `sessions/authority.py` owns their shared
+raw digest validation, preserving the same checks used by durable record readers.
+
 ### Session query contracts
 
 `sessions/queries.py` owns session listing and aggregate filters, label selectors,

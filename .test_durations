@@ -46067,5 +46067,11 @@
     "tests/core/test_session_request_package_layout.py::test_request_historical_public_identity[copy_interrupt_session_request]": 0.0003504169872030616,
     "tests/core/test_session_request_package_layout.py::test_request_historical_public_identity[copy_resume_request]": 0.0003754170029424131,
     "tests/core/test_session_request_package_layout.py::test_request_historical_public_identity[copy_run_request]": 0.00028899998869746923,
-    "tests/core/test_session_request_package_layout.py::test_request_historical_public_identity[session_input_contract_evidence]": 0.0003869579522870481
+    "tests/core/test_session_request_package_layout.py::test_request_historical_public_identity[session_input_contract_evidence]": 0.0003869579522870481,
+    "tests/core/test_session_create_claim_layout.py::test_creation_claim_contract_historical_public_identity[RuntimeSessionCreateClaimAuthenticationDisposition]": 0.0005423339898698032,
+    "tests/core/test_session_create_claim_layout.py::test_creation_claim_contract_historical_public_identity[RuntimeSessionCreateClaimAuthentication]": 0.0006588759715668857,
+    "tests/core/test_session_create_claim_layout.py::test_creation_claim_contract_historical_public_identity[RuntimeSessionCreateClaimReferenceKey]": 0.0007586669526062906,
+    "tests/core/test_session_create_claim_layout.py::test_creation_claim_contract_historical_public_identity[RuntimeSessionCreateClaimReference]": 0.0004927499685436487,
+    "tests/core/test_session_create_claim_layout.py::test_creation_claim_values_without_implementations": 0.8592407509568147,
+    "tests/core/test_session_create_claim_layout.py::test_raw_digest_validation_has_one_independent_owner": 1.5984826649655588
 }

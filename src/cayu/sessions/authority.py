@@ -32,3 +32,12 @@ def checkpoint_value_authority(value: Any, field_name: str) -> CheckpointValueAu
 
     encoded = canonical_durable_json_bytes(value, field_name)
     return CheckpointValueAuthority(sha256=sha256(encoded).hexdigest())
+
+
+def _require_raw_sha256_digest(value: Any) -> None:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError

@@ -23,7 +23,7 @@ from hashlib import sha256
 from itertools import islice
 from pathlib import Path
 from types import FunctionType, MethodType
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self, cast, overload
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast, overload
 from uuid import uuid4
 from weakref import ReferenceType, ref
 
@@ -47,6 +47,7 @@ from cayu.deadlines import (
 from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _completion_finalization as completion_finalization
 from cayu.sessions import _terminal_evidence as terminal_event_evidence
+from cayu.sessions import authority as session_authority_rules
 from cayu.sessions import creation_fence
 from cayu.sessions import event_delivery as side_effect_health
 from cayu.sessions import event_queries as event_query_rules
@@ -74,6 +75,39 @@ from cayu.sessions._model_failover import (
 )
 from cayu.sessions._model_failover import (
     MODEL_TARGET_PROJECTION_SCHEMA_VERSION as MODEL_TARGET_PROJECTION_SCHEMA_VERSION,
+)
+from cayu.sessions.creation_claims import (
+    RUNTIME_SESSION_CREATE_CLAIM_REFERENCE_MAX_KEY_ID_CHARS as RUNTIME_SESSION_CREATE_CLAIM_REFERENCE_MAX_KEY_ID_CHARS,
+)
+from cayu.sessions.creation_claims import (
+    RUNTIME_SESSION_CREATE_CLAIM_REFERENCE_MAX_OPERATION_ID_CHARS as RUNTIME_SESSION_CREATE_CLAIM_REFERENCE_MAX_OPERATION_ID_CHARS,
+)
+from cayu.sessions.creation_claims import (
+    RUNTIME_SESSION_CREATE_CLAIM_REFERENCE_RECORD_TYPE as RUNTIME_SESSION_CREATE_CLAIM_REFERENCE_RECORD_TYPE,
+)
+from cayu.sessions.creation_claims import (
+    RUNTIME_SESSION_CREATE_CLAIM_REFERENCE_SCHEMA_VERSION as RUNTIME_SESSION_CREATE_CLAIM_REFERENCE_SCHEMA_VERSION,
+)
+from cayu.sessions.creation_claims import (
+    SESSION_CREATE_CLAIM_METADATA_KEY as SESSION_CREATE_CLAIM_METADATA_KEY,
+)
+from cayu.sessions.creation_claims import (
+    SESSION_CREATE_CLAIM_RECORD_TYPE as SESSION_CREATE_CLAIM_RECORD_TYPE,
+)
+from cayu.sessions.creation_claims import (
+    SESSION_CREATE_CLAIM_SCHEMA_VERSION as SESSION_CREATE_CLAIM_SCHEMA_VERSION,
+)
+from cayu.sessions.creation_claims import (
+    RuntimeSessionCreateClaimAuthentication as RuntimeSessionCreateClaimAuthentication,
+)
+from cayu.sessions.creation_claims import (
+    RuntimeSessionCreateClaimAuthenticationDisposition as RuntimeSessionCreateClaimAuthenticationDisposition,
+)
+from cayu.sessions.creation_claims import (
+    RuntimeSessionCreateClaimReference as RuntimeSessionCreateClaimReference,
+)
+from cayu.sessions.creation_claims import (
+    RuntimeSessionCreateClaimReferenceKey as RuntimeSessionCreateClaimReferenceKey,
 )
 from cayu.sessions.event_delivery import (
     PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES as PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES,
@@ -658,7 +692,6 @@ from pydantic import (
     SecretStr,
     StrictBool,
     StrictInt,
-    StrictStr,
     field_validator,
     model_validator,
 )
@@ -1683,133 +1716,10 @@ def _assert_session_run_epoch_value(session_id: str, current_run_epoch: int) -> 
         )
 
 
-SESSION_CREATE_CLAIM_METADATA_KEY = "cayu:session_create_claim"
-SESSION_CREATE_CLAIM_RECORD_TYPE = "cayu.session-create-claim"
-SESSION_CREATE_CLAIM_SCHEMA_VERSION = 1
-RUNTIME_SESSION_CREATE_CLAIM_REFERENCE_RECORD_TYPE = "cayu.runtime-session-create-claim-reference"
-RUNTIME_SESSION_CREATE_CLAIM_REFERENCE_SCHEMA_VERSION = 1
-RUNTIME_SESSION_CREATE_CLAIM_REFERENCE_MAX_KEY_ID_CHARS = 256
-RUNTIME_SESSION_CREATE_CLAIM_REFERENCE_MAX_OPERATION_ID_CHARS = 256
 SESSION_RUNTIME_METADATA_KEYS = frozenset({"subagent"})
 SESSION_RUNTIME_METADATA_PREFIX = "cayu:"
 
 _RUNTIME_RESUME_TRANSPORT_METADATA_KEYS = frozenset({"traceparent", "tracestate"})
-
-
-@dataclass(frozen=True, slots=True, repr=False)
-class RuntimeSessionCreateClaimReferenceKey:
-    """Caller-scoped secret used only to blind request-authority identities."""
-
-    key_id: str
-    secret: bytes
-
-    def __post_init__(self) -> None:
-        key_id = require_clean_nonblank(self.key_id, "key_id")
-        if len(key_id) > RUNTIME_SESSION_CREATE_CLAIM_REFERENCE_MAX_KEY_ID_CHARS:
-            raise ValueError("Runtime session create reference key_id exceeds its character bound.")
-        if type(self.secret) is not bytes or len(self.secret) < 32:
-            raise ValueError("Runtime session create reference keys require at least 32 bytes.")
-        object.__setattr__(self, "key_id", key_id)
-
-    def __repr__(self) -> str:
-        return f"RuntimeSessionCreateClaimReferenceKey(key_id={self.key_id!r})"
-
-
-class RuntimeSessionCreateClaimReference(BaseModel):
-    """Secret-free keyed identity for reconstructing one private create claim."""
-
-    model_config = ConfigDict(
-        extra="forbid",
-        frozen=True,
-        hide_input_in_errors=True,
-        revalidate_instances="always",
-        validate_default=True,
-    )
-
-    record_type: Literal["cayu.runtime-session-create-claim-reference"] = (
-        RUNTIME_SESSION_CREATE_CLAIM_REFERENCE_RECORD_TYPE
-    )
-    schema_version: Literal[1] = RUNTIME_SESSION_CREATE_CLAIM_REFERENCE_SCHEMA_VERSION
-    session_id: StrictStr = Field(max_length=512)
-    operation_id: StrictStr = Field(
-        max_length=RUNTIME_SESSION_CREATE_CLAIM_REFERENCE_MAX_OPERATION_ID_CHARS
-    )
-    request_authority_key_id: StrictStr = Field(
-        max_length=RUNTIME_SESSION_CREATE_CLAIM_REFERENCE_MAX_KEY_ID_CHARS
-    )
-    request_authority_hmac_sha256: StrictStr = Field(min_length=64, max_length=64)
-    claim_id: StrictStr = Field(min_length=64, max_length=64)
-
-    @field_validator("schema_version", mode="before")
-    @classmethod
-    def validate_schema_version(cls, value: object) -> object:
-        if type(value) is not int:
-            raise ValueError("schema_version must be a JSON integer.")
-        return value
-
-    @field_validator("session_id", "operation_id", "request_authority_key_id")
-    @classmethod
-    def validate_ids(cls, value: str, info: Any) -> str:
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("request_authority_hmac_sha256", "claim_id")
-    @classmethod
-    def validate_digests(cls, value: str, info: Any) -> str:
-        _require_raw_sha256_digest(value)
-        return value
-
-
-class RuntimeSessionCreateClaimAuthenticationDisposition(StrEnum):
-    MISSING_SESSION = "missing_session"
-    MATCHING_SESSION = "matching_session"
-    FOREIGN_SESSION = "foreign_session"
-    INCOMPLETE_EVIDENCE = "incomplete_evidence"
-    MALFORMED_EVIDENCE = "malformed_evidence"
-    TAMPERED_EVIDENCE = "tampered_evidence"
-    IDENTITY_CONFLICT = "identity_conflict"
-
-
-class RuntimeSessionCreateClaimAuthentication(BaseModel):
-    """Content-free classification of existing-session create authority."""
-
-    model_config = ConfigDict(
-        extra="forbid",
-        frozen=True,
-        hide_input_in_errors=True,
-        revalidate_instances="always",
-    )
-
-    disposition: RuntimeSessionCreateClaimAuthenticationDisposition
-    session_status: SessionStatus | None = None
-    transient_input_authenticated: StrictBool = False
-
-    @field_validator("transient_input_authenticated", mode="before")
-    @classmethod
-    def validate_exact_boolean(cls, value: object) -> object:
-        if type(value) is not bool:
-            raise ValueError("transient_input_authenticated must be a JSON boolean.")
-        return value
-
-    @model_validator(mode="after")
-    def validate_shape(self) -> Self:
-        missing = (
-            self.disposition is RuntimeSessionCreateClaimAuthenticationDisposition.MISSING_SESSION
-        )
-        if missing != (self.session_status is None):
-            raise ValueError("Only a missing-session result can omit session status.")
-        if (
-            self.transient_input_authenticated
-            and self.disposition
-            is not RuntimeSessionCreateClaimAuthenticationDisposition.MATCHING_SESSION
-        ):
-            raise ValueError("Only a matching session can authenticate transient input.")
-        return self
-
-    @property
-    def matches(self) -> bool:
-        return (
-            self.disposition is RuntimeSessionCreateClaimAuthenticationDisposition.MATCHING_SESSION
-        )
 
 
 def is_runtime_owned_session_metadata_key(key: str) -> bool:
@@ -2049,7 +1959,7 @@ class ModelCompletionStageSettlementRequest(BaseModel):
                 return None
             raise ValueError(f"{info.field_name} is required.")
         try:
-            _require_raw_sha256_digest(value)
+            session_authority_rules._require_raw_sha256_digest(value)
         except ValueError as exc:
             raise ValueError(f"{info.field_name} must be a lowercase SHA-256 digest.") from exc
         return value
@@ -2123,7 +2033,7 @@ class ModelCompletionStageSettlement(BaseModel):
     @field_validator("record_digest")
     @classmethod
     def validate_record_digest(cls, value: str) -> str:
-        _require_raw_sha256_digest(value)
+        session_authority_rules._require_raw_sha256_digest(value)
         return value
 
     @model_validator(mode="after")
@@ -2473,7 +2383,7 @@ class _InteractionTransitionReceipt(BaseModel):
     @field_validator("record_digest")
     @classmethod
     def validate_record_digest(cls, value: str) -> str:
-        _require_raw_sha256_digest(value)
+        session_authority_rules._require_raw_sha256_digest(value)
         return value
 
     @model_validator(mode="after")
@@ -2598,7 +2508,7 @@ class _InvocationTerminalEventReceipt(BaseModel):
     @field_validator("record_digest")
     @classmethod
     def validate_record_digest(cls, value: str) -> str:
-        _require_raw_sha256_digest(value)
+        session_authority_rules._require_raw_sha256_digest(value)
         return value
 
     @model_validator(mode="after")
@@ -4228,7 +4138,7 @@ class ModelCompletionStageDispatch(BaseModel):
                 return None
             raise ValueError(f"{info.field_name} is required.")
         try:
-            _require_raw_sha256_digest(value)
+            session_authority_rules._require_raw_sha256_digest(value)
         except ValueError as exc:
             raise ValueError(f"{info.field_name} must be a lowercase SHA-256 digest.") from exc
         return value
@@ -4556,7 +4466,7 @@ class ModelCompletionStageRelease(BaseModel):
     @field_validator("preparation_digest")
     @classmethod
     def validate_preparation_digest(cls, value: str) -> str:
-        _require_raw_sha256_digest(value)
+        session_authority_rules._require_raw_sha256_digest(value)
         return value
 
 
@@ -22443,8 +22353,8 @@ def authenticate_runtime_session_create_claim_reference(
             session=session,
         )
     try:
-        _require_raw_sha256_digest(record["claim_id"])
-        _require_raw_sha256_digest(record["request_sha256"])
+        session_authority_rules._require_raw_sha256_digest(record["claim_id"])
+        session_authority_rules._require_raw_sha256_digest(record["request_sha256"])
     except (TypeError, ValueError):
         return _runtime_session_create_authentication(
             RuntimeSessionCreateClaimAuthenticationDisposition.MALFORMED_EVIDENCE,
@@ -22479,7 +22389,7 @@ def authenticate_runtime_session_create_claim_reference(
         )
     try:
         require_clean_nonblank(interaction_id, "interaction_id")
-        _require_raw_sha256_digest(messages_sha256)
+        session_authority_rules._require_raw_sha256_digest(messages_sha256)
     except (TypeError, ValueError):
         return _runtime_session_create_authentication(
             RuntimeSessionCreateClaimAuthenticationDisposition.MALFORMED_EVIDENCE,
@@ -26439,7 +26349,7 @@ def _prepare_model_completion_stage_abandonment(
         session_id, stage_id
     )
     try:
-        _require_raw_sha256_digest(preparation_digest)
+        session_authority_rules._require_raw_sha256_digest(preparation_digest)
     except ValueError as exc:
         raise ValueError("preparation_digest must be a lowercase SHA-256 digest.") from exc
     expected_run_epoch = _validate_required_runtime_fence(
@@ -27183,7 +27093,7 @@ def _model_completion_stage_provider_effect_id(stage: ModelCompletionStage) -> s
             "Model-completion stage has no provider effect identity."
         )
     try:
-        _require_raw_sha256_digest(request_fingerprint)
+        session_authority_rules._require_raw_sha256_digest(request_fingerprint)
     except ValueError as exc:
         raise SessionModelCompletionStageConflict(
             "Model-completion stage request fingerprint is malformed."
@@ -27454,7 +27364,7 @@ def _model_completion_stage_execution_profile_fingerprint(
             "Model-completion stage execution profile identity is malformed."
         )
     try:
-        _require_raw_sha256_digest(fingerprint)
+        session_authority_rules._require_raw_sha256_digest(fingerprint)
     except ValueError as exc:
         raise SessionModelCompletionStageConflict(
             "Model-completion stage execution profile identity is malformed."
@@ -27841,15 +27751,6 @@ def _model_completion_stage_winner_record(
     return copy_durable_json_object(payload, "model_completion_stage_winner")
 
 
-def _require_raw_sha256_digest(value: Any) -> None:
-    if (
-        type(value) is not str
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise ValueError
-
-
 def _reconstruct_active_model_completion_stage_record(
     record: dict[str, Any],
     *,
@@ -27882,8 +27783,8 @@ def _reconstruct_active_model_completion_stage_record(
         ):
             if type(record[field]) is not int:
                 raise TypeError
-        _require_raw_sha256_digest(record["preparation_digest"])
-        _require_raw_sha256_digest(record["record_digest"])
+        session_authority_rules._require_raw_sha256_digest(record["preparation_digest"])
+        session_authority_rules._require_raw_sha256_digest(record["record_digest"])
         reconstructed = _ActiveModelCompletionStageRecord.model_validate(record)
         if reconstructed.record_type != MODEL_COMPLETION_ACTIVE_STAGE_RECORD_TYPE:
             raise ValueError
@@ -27944,7 +27845,7 @@ def _reconstruct_model_completion_stage_abandonment(
             "active_marker_digest",
             "record_digest",
         ):
-            _require_raw_sha256_digest(record[field])
+            session_authority_rules._require_raw_sha256_digest(record[field])
         reconstructed = _ModelCompletionStageAbandonmentRecord.model_validate(record)
         if reconstructed.record_type != MODEL_COMPLETION_STAGE_ABANDONMENT_RECORD_TYPE:
             raise ValueError
@@ -28018,7 +27919,7 @@ def _reconstruct_model_completion_stage_winner_record(
             "publication_digest",
             "record_digest",
         ):
-            _require_raw_sha256_digest(record[field])
+            session_authority_rules._require_raw_sha256_digest(record[field])
         reconstructed = _ModelCompletionStageWinnerRecord.model_validate(record)
         if reconstructed.record_type != MODEL_COMPLETION_WINNER_RECORD_TYPE:
             raise ValueError
@@ -28075,8 +27976,8 @@ def _reconstruct_model_completion_stage_preparation(
             raise TypeError
         if type(record["source_transcript_cursor"]) is not int:
             raise TypeError
-        _require_raw_sha256_digest(record["request_digest"])
-        _require_raw_sha256_digest(record["record_digest"])
+        session_authority_rules._require_raw_sha256_digest(record["request_digest"])
+        session_authority_rules._require_raw_sha256_digest(record["record_digest"])
         reconstructed = _ModelCompletionStagePreparationRecord.model_validate(record)
         if reconstructed.record_type != MODEL_COMPLETION_STAGE_PREPARATION_RECORD_TYPE:
             raise ValueError
@@ -28128,9 +28029,9 @@ def _reconstruct_model_completion_stage_terminal(
             or type(record["publication"]) is not dict
         ):
             raise TypeError
-        _require_raw_sha256_digest(record["preparation_digest"])
-        _require_raw_sha256_digest(record["publication_material_digest"])
-        _require_raw_sha256_digest(record["record_digest"])
+        session_authority_rules._require_raw_sha256_digest(record["preparation_digest"])
+        session_authority_rules._require_raw_sha256_digest(record["publication_material_digest"])
+        session_authority_rules._require_raw_sha256_digest(record["record_digest"])
         publication_record = record["publication"]
         required_publication_fields = set(RuntimePublicationRequest.model_fields) - {
             "interaction_id"
@@ -28996,7 +28897,7 @@ def _validate_user_input_checkpoint_mutation(
     if type(intent.get("source_run_epoch")) is not int or intent["source_run_epoch"] < 0:
         raise ValueError("User-input publication source_run_epoch is invalid.")
     for field_name in ("execution_profile_fingerprint", "pause_digest"):
-        _require_raw_sha256_digest(intent.get(field_name))
+        session_authority_rules._require_raw_sha256_digest(intent.get(field_name))
     event_ids = intent.get("event_ids")
     if (
         type(event_ids) is not list
@@ -29191,8 +29092,8 @@ def _validate_user_input_checkpoint_mutation(
             != resolution_intent.resolution_request_digest
         ):
             raise ValueError("User-input closure has invalid resolution authority.")
-        _require_raw_sha256_digest(intent["answer_request_digest"])
-        _require_raw_sha256_digest(intent["resolution_request_digest"])
+        session_authority_rules._require_raw_sha256_digest(intent["answer_request_digest"])
+        session_authority_rules._require_raw_sha256_digest(intent["resolution_request_digest"])
         expected_call_ids = [call.tool_call_id for call in pending.tool_calls]
         if intent.get("tool_call_ids") != expected_call_ids:
             raise ValueError("User-input closure call identities conflict with its pause.")
@@ -30812,7 +30713,7 @@ def _copy_session_model_transition(
     if event.interaction_id != interaction_id:
         raise ValueError("model_transition.event belongs to a different interaction.")
     source_digest = transition.source_transcript_digest
-    _require_raw_sha256_digest(source_digest)
+    session_authority_rules._require_raw_sha256_digest(source_digest)
     source_cursor = transition.source_transcript_cursor
     if type(source_cursor) is not int or not 0 <= source_cursor <= MAX_DURABLE_JSON_INTEGER:
         raise ValueError("model_transition.source_transcript_cursor is malformed.")

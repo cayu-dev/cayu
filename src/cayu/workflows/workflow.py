@@ -75,14 +75,16 @@ from cayu.runtime._session_request_boundary import prepare_run_request
 from cayu.sessions._model_failover import ModelFailoverPolicy, copy_optional_model_failover_policy
 from cayu.sessions.base import (
     ModelTarget,
-    RuntimeSessionCreateClaimAuthenticationDisposition,
-    RuntimeSessionCreateClaimReference,
-    RuntimeSessionCreateClaimReferenceKey,
     authenticate_runtime_session_create_claim_reference,
     run_request_with_runtime_generated_authority,
     run_request_with_runtime_invocation,
     run_request_with_runtime_session_create_claim_reference,
     runtime_session_create_claim_reference,
+)
+from cayu.sessions.creation_claims import (
+    RuntimeSessionCreateClaimAuthenticationDisposition,
+    RuntimeSessionCreateClaimReference,
+    RuntimeSessionCreateClaimReferenceKey,
 )
 from cayu.sessions.invocation import SessionExecutionSource
 from cayu.sessions.records import SessionStatus
