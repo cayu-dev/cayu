@@ -148,6 +148,49 @@ a wake-up set, not a second lifecycle reducer. A `session.resumed` event does no
 prove an answer completed; execution may still be uncertain. Do not subscribe to
 or emit health changes through the same sink to repair its own failures.
 
+## Ready-made handoff to an HTTP receiver
+
+When the destination is a service reached over HTTP, use
+`cayu.human_attention_handoff` instead of writing the consumer above. It is the same
+integration, packaged: an `EventSink` plus a bounded reconciler that speak the versioned
+`cayu.human-attention-handoff/v1` receiver protocol (`docs/runtime-contracts.md`). Any
+service can implement the receiver; Runtime names none.
+
+```python
+from cayu.human_attention_handoff import HumanAttentionHandoff
+
+handoff = HumanAttentionHandoff.from_environment(requester_label="requester")
+app = CayuApp(session_store=store, event_sinks=handoff.event_sinks())
+handoff.bind(app)
+repair = asyncio.create_task(handoff.run())  # web lifespan or a worker
+```
+
+`from_environment` reads `CAYU_ATTENTION_HANDOFF_URL` and `CAYU_ATTENTION_HANDOFF_TOKEN`;
+without them the handoff is inert, so the same code runs locally. Pass
+`HumanAttentionReceiver(url=..., token=...)` directly to configure it in code.
+
+- The sink synchronizes a session on attention lifecycle events and returns only after
+  the receiver answered 2xx, so Runtime's persisted delivery retries anything else.
+  Frequent `session.checkpointed` and `tool.call.*` events synchronize only sessions this
+  process knows to hold an open request.
+- After a transport or 5xx failure the sink fails fast for `failure_backoff_seconds`
+  (30 s). A 401, 403 or 409 means the receiver declined; it is logged and not retried.
+- `reconcile_once()` scans `query_pending_actions` from the cursor the receiver persisted
+  (32 pages of 200 by default), reads the exact state of every request the receiver
+  still holds open, and reports the pass. `run()` repeats it at start-up and then every
+  `reconcile_interval_seconds` the receiver advertises (300 s by default).
+- Verification resumes after the last accepted reference page on the next pass and
+  wraps after reaching the end. This cursor is local to the handoff instance; a process
+  restart begins verification from the start. Unavailable reads make the affected
+  scan or verification phase incomplete.
+- Only identities, Runtime's fixed summary, state, reason, agent name and the requester
+  reference leave the process. The requester reference is the session label named by
+  `requester_label`, set by application code through `RunRequest(labels=...)`; a delegated
+  child inherits its nearest ancestor's. Delegated parents are never handed off.
+- Run `run()` in one long-lived process. A second one is harmless because receiver writes
+  are idempotent. An SDK-only worker without the server preset passes
+  `recover_event_side_effects=True` so the loop also runs bounded event recovery.
+
 ## Interpreting state
 
 | State | Evidence and consumer behavior |

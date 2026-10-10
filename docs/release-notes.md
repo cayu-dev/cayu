@@ -5,6 +5,15 @@
 Cayu preserves prompt-cache prefixes, improves interrupted tool-call recovery,
 and keeps no-progress compaction out of model-facing context.
 
+- Add `cayu.human_attention_handoff`, a ready-made, provider-neutral human-attention
+  handoff: an `EventSink` and a bounded reconciler that hand committed attention
+  observations (identities, fixed summaries, states and an application-owned requester
+  reference, never question text or tool arguments) to any HTTP receiver implementing the
+  versioned `cayu.human-attention-handoff/v1` protocol. It returns from `emit` only after
+  the receiver durably accepted, repairs from a receiver-persisted cursor, and is inert
+  without `CAYU_ATTENTION_HANDOFF_URL` and `CAYU_ATTENTION_HANDOFF_TOKEN`. See
+  `cayu guide human-attention`.
+
 - Providers keep later system messages in conversation order instead of moving
   them into the leading prompt. OpenAI Responses uses developer messages; Chat
   Completions retains system messages; Anthropic, Vertex and Bedrock use

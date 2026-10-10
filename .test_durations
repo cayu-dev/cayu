@@ -45650,5 +45650,18 @@
     "tests/environments/test_execution_snapshots.py::test_restore_settlement_outlives_source_snapshot[sqlite-terminal-expired]": 0.25360008399002254,
     "tests/environments/test_execution_snapshots.py::test_restore_settlement_outlives_source_snapshot[sqlite-terminal-missing]": 0.3375142499571666,
     "tests/environments/test_execution_snapshots.py::test_restore_settlement_outlives_source_snapshot[sqlite-verified-expired]": 0.2866565819713287,
-    "tests/environments/test_execution_snapshots.py::test_restore_settlement_outlives_source_snapshot[sqlite-verified-missing]": 0.2658846669946797
+    "tests/environments/test_execution_snapshots.py::test_restore_settlement_outlives_source_snapshot[sqlite-verified-missing]": 0.2658846669946797,
+    "tests/core/test_human_attention_handoff.py::test_a_committed_question_is_handed_off_and_its_answer_settles_it": 2.415055666991975,
+    "tests/core/test_human_attention_handoff.py::test_a_delegated_parent_is_navigation_only": 0.15843445900827646,
+    "tests/core/test_human_attention_handoff.py::test_an_unconfigured_handoff_is_inert": 0.00042800098890438676,
+    "tests/core/test_human_attention_handoff.py::test_approvals_settle_with_runtime_meaning[approve-resolved]": 1.7047574169118889,
+    "tests/core/test_human_attention_handoff.py::test_approvals_settle_with_runtime_meaning[deny-cancelled]": 1.6638687079539523,
+    "tests/core/test_human_attention_handoff.py::test_bounded_verification_progresses_and_retries_unacknowledged_pages": 0.007267249922733754,
+    "tests/core/test_human_attention_handoff.py::test_declines_are_not_retried_but_outages_are": 0.8088030419312418,
+    "tests/core/test_human_attention_handoff.py::test_fail_fast_window_after_a_failure": 0.779167458997108,
+    "tests/core/test_human_attention_handoff.py::test_outage_and_lost_acknowledgement_leave_the_pause_and_one_request": 0.8258271249360405,
+    "tests/core/test_human_attention_handoff.py::test_rejected_scan_cursor_restarts_with_one_page_budget": 0.783380082983058,
+    "tests/core/test_human_attention_handoff.py::test_restart_backfills_pre_enrollment_pauses_across_pages": 2.231449333950877,
+    "tests/core/test_human_attention_handoff.py::test_supersession_is_reported_by_the_repair_pass": 1.0137591250240803,
+    "tests/core/test_human_attention_handoff.py::test_unavailable_reads_make_scan_and_verification_incomplete": 0.8289286670042202
 }
