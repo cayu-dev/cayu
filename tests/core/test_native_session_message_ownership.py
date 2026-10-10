@@ -244,3 +244,181 @@ def test_sqlite_queue_operations_compose_with_direct_connection(tmp_path):
             connection.close()
 
     asyncio.run(run())
+
+
+@pytest.fixture
+def queue_postgres_dsn(postgres_dsn):
+    from tests.core.postgres_contention_support import drop_cayu_tables
+
+    asyncio.run(drop_cayu_tables(postgres_dsn))
+    try:
+        yield postgres_dsn
+    finally:
+        asyncio.run(drop_cayu_tables(postgres_dsn))
+
+
+def test_postgres_queue_imports_without_store_adapters():
+    _assert_import_without_adapters("postgres")
+
+
+def test_postgres_queue_operations_compose_with_direct_connection(queue_postgres_dsn):
+    from contextlib import asynccontextmanager
+
+    import psycopg
+
+    from cayu.storage import _postgres_session_messages as owner
+    from cayu.storage import _postgres_support as support
+    from cayu.storage import postgres as adapter
+    from cayu.storage.migrations import SchemaMode
+
+    async def run():
+        store = adapter.PostgresSessionStore(queue_postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            sid = await _seed(store)
+        finally:
+            await store.close()
+        active = False
+        ready = False
+
+        async def ensure_ready():
+            nonlocal ready
+            assert not active
+            ready = True
+
+        @asynccontextmanager
+        async def connect():
+            nonlocal active, ready
+            assert ready and not active
+            ready = False
+            active = True
+            try:
+                async with await psycopg.AsyncConnection.connect(queue_postgres_dsn) as connection:
+                    yield connection
+            finally:
+                active = False
+
+        def assert_transaction(cur):
+            assert active
+            assert cur.connection.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
+
+        async def load_labels(cur, session_id):
+            assert_transaction(cur)
+            assert session_id == sid
+            return {}
+
+        async def load_session(cur, session_id):
+            assert active
+            await cur.execute(
+                f"SELECT {support.SESSION_COLUMNS} FROM cayu_sessions WHERE id = %s FOR UPDATE",
+                (session_id,),
+            )
+            row = await cur.fetchone()
+            return None if row is None else support.session_from_row(row, labels={})
+
+        async def load_checkpoint(cur, session_id):
+            assert_transaction(cur)
+            await cur.execute(
+                "SELECT state FROM cayu_checkpoints WHERE session_id = %s", (session_id,)
+            )
+            row = await cur.fetchone()
+            return None if row is None else support._json_obj(row[0])
+
+        async def closure_owners(cur, targets):
+            assert_transaction(cur)
+            assert tuple(targets) == (sid,)
+            return ()
+
+        async def register_events(cur, session_id, events):
+            # No authority codec is configured for this independently composed store.
+            assert_transaction(cur)
+            assert session_id == sid and all(event.session_id == sid for event in events)
+
+        async def register_authorities(cur, session_id, *, interaction_ids=()):
+            assert_transaction(cur)
+            assert session_id == sid and not interaction_ids
+
+        async def reject_steering(cur, session, *, allow_completed_interaction=False):
+            assert_transaction(cur)
+            assert session.id == sid and session.status == SessionStatus.RUNNING
+
+        async def upsert_checkpoint(*args):
+            raise AssertionError("This delivery has no profile handoff to publish")
+
+        common = dict(ensure_ready=ensure_ready)
+        writes = dict(
+            **common,
+            load_session=load_session,
+            store_now=adapter.PostgresSessionStore._session_store_now,
+            load_checkpoint=load_checkpoint,
+        )
+        snapshot = partial(
+            owner.snapshot_session_message_source,
+            connect,
+            **common,
+            load_labels=load_labels,
+            load_checkpoint=load_checkpoint,
+        )
+        inspect = partial(
+            owner.inspect_session_messages, connect, **common, load_labels=load_labels
+        )
+        enqueue = partial(
+            owner.enqueue_session_message,
+            connect,
+            **writes,
+            closure_owners=closure_owners,
+            register_event_authorities=register_events,
+        )
+        deliver = partial(
+            owner.deliver_queued_session_messages,
+            connect,
+            **writes,
+            register_event_authorities=register_events,
+            register_authorities=register_authorities,
+            reject_steering=reject_steering,
+            upsert_checkpoint=upsert_checkpoint,
+            decode_stage_record=adapter._decode_model_completion_stage_record,
+        )
+        source = await snapshot(sid, include_transcript_digest=True, include_checkpoint_digest=True)
+        assert source.transcript_sha256 and source.checkpoint_sha256
+        request = EnqueueSessionMessageRequest(
+            session_id=sid,
+            idempotency_key="direct",
+            content="direct queue message",
+            delivery_mode="next_turn",
+            conditions=SessionMessageConditions(source=source),
+        )
+        accepted = await enqueue(request)
+        assert (await enqueue(request)).replayed
+        query = SessionMessageQuery(session_id=sid)
+        before = await inspect(query)
+        assert before.records[0].queue_id == accepted.message.queue_id
+        with pytest.raises(SessionMessageConflict):
+            await inspect(query, expected_authorized_session_instance_id="different-incarnation")
+        async with await psycopg.AsyncConnection.connect(queue_postgres_dsn) as conn:
+            await conn.execute("""CREATE FUNCTION fail_queue_receipt() RETURNS trigger
+                LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'receipt write failed'; END $$""")
+            await conn.execute("""CREATE TRIGGER fail_queue_receipt BEFORE INSERT
+                ON cayu_session_message_deliveries FOR EACH ROW EXECUTE FUNCTION fail_queue_receipt()""")
+        try:
+            with pytest.raises(psycopg.errors.RaiseException, match="receipt write failed"):
+                await deliver(sid, include_on_idle=True, delivery_id="direct-delivery")
+            assert not active
+            assert await inspect(query) == before
+            async with await psycopg.AsyncConnection.connect(queue_postgres_dsn) as conn:
+                cur = await conn.execute("SELECT COUNT(*) FROM cayu_transcript_messages")
+                assert (await cur.fetchone())[0] == 0
+        finally:
+            async with await psycopg.AsyncConnection.connect(queue_postgres_dsn) as conn:
+                await conn.execute(
+                    "DROP TRIGGER fail_queue_receipt ON cayu_session_message_deliveries"
+                )
+                await conn.execute("DROP FUNCTION fail_queue_receipt()")
+        batch = await deliver(sid, include_on_idle=True, delivery_id="direct-delivery")
+        assert len(batch.messages) == 1 and batch.messages[0].queue_id == accepted.message.queue_id
+        replay = await deliver(sid, include_on_idle=True, delivery_id="direct-delivery")
+        assert (
+            replay.replayed and replay.messages == batch.messages and replay.events == batch.events
+        )
+        assert not active
+
+    asyncio.run(run())

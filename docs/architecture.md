@@ -1026,12 +1026,13 @@ attempt rules and creation-fence rules retain their existing owners. PostgreSQL
 receives readiness separately from connection acquisition to retain validation
 order, and keeps creation-fence, session and advisory locks in their native order.
 
-SQLite queued-message persistence lives in `storage/_sqlite_session_messages.py`: source
-snapshots, bounded inspection, queue actions, enqueue, delivery and persisted
-interaction-profile handoff repair. Operations receive native execution, checkpoint,
+Native queued-message persistence lives in `storage/_sqlite_session_messages.py` and
+`storage/_postgres_session_messages.py`: source snapshots, bounded inspection, queue
+actions, enqueue, delivery and persisted interaction-profile handoff repair. Operations receive native execution, checkpoint,
 closure, event-publication and steering capabilities. Authorization, queue state,
 transcript/checkpoint updates and delivery receipts retain one native transaction.
-The store composes these operations; runtime dispatch retains its existing owner.
+PostgreSQL retains readiness order, session locks and read-only snapshot isolation.
+The stores compose these operations; runtime dispatch retains its existing owner.
 
 Context policies are runtime projections over transcript messages, not storage. They let applications customize the model-facing conversation history by trimming, compacting, replacing bulky tool results, or injecting retrieved context while preserving the raw durable transcript for audit, debugging, resume, and future compaction.
 

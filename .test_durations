@@ -1,4 +1,6 @@
 {
+  "tests/core/test_native_session_message_ownership.py::test_postgres_queue_imports_without_store_adapters": 0.927,
+  "tests/core/test_native_session_message_ownership.py::test_postgres_queue_operations_compose_with_direct_connection": 1.801,
   "tests/core/test_native_session_message_ownership.py::test_sqlite_queue_imports_without_store_adapters": 0.793,
   "tests/core/test_native_session_message_ownership.py::test_sqlite_queue_operations_compose_with_direct_connection": 0.861,
   "tests/core/test_native_peer_content_ownership.py::test_postgres_peer_imports_without_store_adapters": 1.041,
