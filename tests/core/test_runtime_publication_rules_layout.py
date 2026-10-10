@@ -278,3 +278,46 @@ else:
     raise AssertionError("Malformed workspace publication was accepted")
 """
     )
+
+
+def test_tool_publication_binds_results_lifecycle_and_pending_marker_without_stores():
+    _without_stores(
+        """
+from cayu.approvals.tools import PendingToolCallApproval
+from cayu.events import Event, EventType
+from cayu.messages import Message, ToolResultPart
+from cayu.sessions import _tool_round_publication_rules as rules
+from cayu.sessions._checkpoint_mutations import (
+    RuntimePublicationCheckpointOperation, RuntimePublicationMutation, SessionRuntimePublicationConflict,
+    runtime_publication_checkpoint_value_digest,
+)
+from cayu.sessions._pending_tool_round import PendingToolRound, pending_tool_round_identity
+from cayu.sessions._runtime_publication import RuntimePublicationRequest, runtime_publication_event_reference
+
+pending = PendingToolRound(model_step_id="mstep_" + "1" * 32, model_attempt_id="matt_" + "2" * 32,
+    tool_round_id="tround_" + "3" * 32, agent_name="agent", environment_name=None, task_id=None,
+    tool_calls=[PendingToolCallApproval(tool_call_id="call", tool_name="lookup", arguments={})])
+identity = pending_tool_round_identity(pending)
+part = ToolResultPart(tool_call_id="call", tool_name="lookup", content="answer", **identity.payload())
+event = Event(type=EventType.TOOL_CALL_COMPLETED, session_id="session", interaction_id="interaction",
+    tool_name="lookup", payload={**identity.payload(), "tool_call_id": "call", "idempotency_key": "stable",
+    "result": {"content": part.content, "structured": part.structured,
+               "artifacts": part.artifacts, "is_error": part.is_error}})
+marker = pending.model_dump(mode="json")
+request = RuntimePublicationRequest(publication_id="tool-round:" + identity.tool_round_id,
+    kind="tool-round", interaction_id="interaction",
+    intent={**identity.payload(), "round_id": identity.tool_round_id, "tool_call_ids": ["call"]},
+    mutation=RuntimePublicationMutation(operations=[RuntimePublicationCheckpointOperation(
+        key="pending_tool_round", action="delete", value=None,
+        expected_value_digest=runtime_publication_checkpoint_value_digest(marker))]),
+    transcript_messages=[Message(role="tool", content=(part,))], events=[],
+    referenced_events=[runtime_publication_event_reference(event)])
+rules._validate_tool_round_publication(request, {event.id: event})
+rules._validate_tool_round_checkpoint_mutation(request, {"pending_tool_round": marker})
+changed = {**marker, "task_id": "changed"}
+rejected(lambda: rules._validate_tool_round_checkpoint_mutation(
+    request, {"pending_tool_round": changed}), SessionRuntimePublicationConflict)
+event.payload["result"]["content"] = "forged"
+rejected(lambda: rules._validate_tool_round_publication(request, {event.id: event}))
+"""
+    )
