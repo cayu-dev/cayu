@@ -48,6 +48,7 @@ from cayu.sessions.messaging import (
 )
 from cayu.storage import _creation_fence
 from cayu.storage import _sqlite_event_delivery as event_delivery_ops
+from cayu.storage import _sqlite_event_publication as event_publication_ops
 from cayu.storage import _sqlite_peer_content as peer_content_ops
 from cayu.storage import _sqlite_session_messages as message_ops
 from cayu.storage import _sqlite_session_queries as session_queries
@@ -211,7 +212,6 @@ from cayu.sessions.base import (
     _child_session_notification_consumption_record,
     _child_session_notification_consumption_replays,
     _completion_result_event_publication_delete_block_reason,
-    _copy_mcp_manifest_publication,
     _copy_optional_event_id,
     _copy_optional_execution_profile,
     _copy_optional_execution_profile_decision,
@@ -220,7 +220,6 @@ from cayu.sessions.base import (
     _copy_session_event_batch,
     _copy_session_model_transition,
     _copy_transition_interaction_admission,
-    _copy_workflow_step_reservation,
     _current_session_run_epoch,
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
@@ -361,9 +360,6 @@ from cayu.sessions.mcp_manifest_history import (
     McpManifestBaseline,
     McpManifestBaselineLoadResult,
     McpManifestPublicationResult,
-    _stored_mcp_manifest_baseline_json,
-    _validate_mcp_manifest_history_keys,
-    _validate_mcp_manifest_publication_state,
 )
 from cayu.sessions.messaging import (
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
@@ -507,7 +503,6 @@ from cayu.tools.grants import (
     validate_targeted_tool_unresolved_rejection_evidence,
     validate_targeted_tool_use_rejection_evidence,
 )
-from cayu.workflows.base import WORKFLOW_ATTEMPT_EVENT_TYPE
 
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
 _SQLITE_SESSION_MIN_REQUIRED_REVISION = 113
@@ -8276,285 +8271,58 @@ class SQLiteSessionStore(
         await self.append_events(session_id, [event])
 
     async def claim_budget_reservation_identity(
-        self,
-        *,
-        reservation_id: str,
-        publication_session_id: str,
-        publication_id: str,
+        self, *, reservation_id: str, publication_session_id: str, publication_id: str
     ) -> None:
-        reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
-        publication_session_id = require_clean_nonblank(
-            publication_session_id,
-            "publication_session_id",
+        return await event_publication_ops.claim_budget_reservation_identity(
+            self._run_write,
+            reservation_id=reservation_id,
+            publication_session_id=publication_session_id,
+            publication_id=publication_id,
+            closure_owners=self._closure_lineage_owners_unlocked,
+            raise_write_conflict=_raise_session_write_conflict,
+            claim_identity=_claim_budget_reservation_identity,
         )
-        publication_id = require_clean_nonblank(publication_id, "publication_id")
-        expected_run_epoch = _current_session_run_epoch(publication_session_id)
-
-        def statement(connection: sqlite3.Connection) -> None:
-            with connection:
-                # The conditional no-op acquires SQLite's writer lock while it
-                # validates the session epoch, so a takeover cannot interleave
-                # between this check and the registry claim below.
-                if expected_run_epoch is None:
-                    cursor = connection.execute(
-                        "UPDATE cayu_sessions SET run_epoch = run_epoch WHERE id = ?",
-                        (publication_session_id,),
-                    )
-                else:
-                    cursor = connection.execute(
-                        "UPDATE cayu_sessions SET run_epoch = run_epoch "
-                        "WHERE id = ? AND run_epoch = ?",
-                        (publication_session_id, expected_run_epoch),
-                    )
-                if cursor.rowcount != 1:
-                    if expected_run_epoch is not None:
-                        _raise_session_write_conflict(
-                            connection,
-                            publication_session_id,
-                            expected_run_epoch,
-                        )
-                    raise KeyError(f"Session not found: {publication_session_id}")
-                existing = connection.execute(
-                    "SELECT 1 FROM cayu_budget_reservation_identities WHERE reservation_id = ?",
-                    (reservation_id,),
-                ).fetchone()
-                if existing is None:
-                    for owner in self._closure_lineage_owners_unlocked(
-                        (publication_session_id,), connection=connection
-                    ):
-                        _check_closure_lineage_owner(owner, (publication_session_id,))
-                _claim_budget_reservation_identity(
-                    connection,
-                    reservation_id=reservation_id,
-                    publication_session_id=publication_session_id,
-                    publication_id=publication_id,
-                )
-
-        await self._run_write(statement)
 
     async def append_events(self, session_id: str, events: list[Event]) -> None:
-        session_id, copied_events = _copy_session_event_batch(session_id, events)
-
-        def statement(connection: sqlite3.Connection) -> None:
-            if not copied_events:
-                if not sqlite_records.session_exists(connection, session_id):
-                    raise KeyError(f"Session not found: {session_id}")
-                return
-
-            try:
-                connection.execute("BEGIN IMMEDIATE")
-                if not sqlite_records.session_exists(connection, session_id):
-                    raise KeyError(f"Session not found: {session_id}")
-                activity_at = self._ownership_clock()
-                for owner in self._closure_lineage_owners_unlocked((session_id,)):
-                    _check_closure_lineage_owner(owner, (session_id,))
-                _append_events_in_transaction(
-                    connection,
-                    session_id,
-                    copied_events,
-                    activity_at=activity_at,
-                )
-                connection.commit()
-            except sqlite3.IntegrityError as exc:
-                connection.rollback()
-                existing_event_id = _first_existing_event_id(
-                    connection,
-                    session_id,
-                    [event.id for event in copied_events],
-                )
-                if existing_event_id is not None:
-                    raise ValueError(
-                        f"Event already exists for session {session_id}: {existing_event_id}"
-                    ) from exc
-                if "idx_cayu_events_budget_reservation_identity" in str(exc):
-                    raise BudgetReservationIdentityConflict(
-                        "Budget ledger reused a reservation identity."
-                    ) from exc
-                raise
-            except BaseException:
-                connection.rollback()
-                raise
-
-        await self._run_write(statement)
-
-    async def append_tool_effect_conflict(self, request: object) -> Event:
-        from cayu.runtime._tool_effect_conflicts import (
-            copy_tool_effect_conflict_audit,
-            reconcile_tool_effect_conflict_event,
+        return await event_publication_ops.append_events(
+            self._run_write,
+            session_id,
+            events,
+            store_now=self._ownership_clock,
+            closure_owners=self._closure_lineage_owners_unlocked,
+            append_events=_append_events_in_transaction,
+            first_existing_event_id=_first_existing_event_id,
         )
 
-        audit = copy_tool_effect_conflict_audit(request)
-        session_id = audit.executing.intent.session_id
-
-        def statement(connection: sqlite3.Connection) -> Event:
-            try:
-                connection.execute("BEGIN IMMEDIATE")
-                session = self._load_unlocked(session_id)
-                if session is None:
-                    raise KeyError("Tool effect audit session is unavailable.")
-                row = connection.execute(
-                    "SELECT record_json FROM cayu_session_operations "
-                    "WHERE session_id = ? AND idempotency_key = ?",
-                    (session_id, audit.storage_key),
-                ).fetchone()
-                current = None if row is None else json.loads(row["record_json"])
-                event = audit.prepare_event(session, current, now=self._ownership_clock())
-                existing = connection.execute(
-                    "SELECT * FROM cayu_events WHERE session_id = ? AND event_id = ?",
-                    (session_id, event.id),
-                ).fetchone()
-                if existing is not None:
-                    event = reconcile_tool_effect_conflict_event(
-                        event, sqlite_records.event_from_row(existing)
-                    )
-                else:
-                    for owner in self._closure_lineage_owners_unlocked(
-                        (session_id,), connection=connection
-                    ):
-                        _check_closure_lineage_owner(owner, (session_id,))
-                    # Evidence authority was established above; do not touch the
-                    # current run's liveness or weaken the ordinary append fence.
-                    _insert_event_rows_in_transaction(
-                        connection, session_id, [event], activity_at=event.timestamp
-                    )
-                connection.commit()
-                return event
-            except BaseException:
-                connection.rollback()
-                raise
-
-        return await self._run_write(statement)
+    async def append_tool_effect_conflict(self, request: object) -> Event:
+        return await event_publication_ops.append_tool_effect_conflict(
+            self._run_write,
+            request,
+            load_session=self._load_unlocked,
+            store_now=self._ownership_clock,
+            closure_owners=self._closure_lineage_owners_unlocked,
+            insert_events=_insert_event_rows_in_transaction,
+        )
 
     async def append_workflow_step_started(
-        self,
-        session_id: str,
-        event: Event,
-        *,
-        workflow_name: str,
-        attempt_id: str,
+        self, session_id: str, event: Event, *, workflow_name: str, attempt_id: str
     ) -> bool:
-        from cayu.sessions.pending_actions import pending_action_event_storage_values
-
-        session_id, copied_event, workflow_name, attempt_id = _copy_workflow_step_reservation(
+        return await event_publication_ops.append_workflow_step_started(
+            self._run_write,
             session_id,
             event,
             workflow_name=workflow_name,
             attempt_id=attempt_id,
+            store_now=self._ownership_clock,
+            closure_owners=self._closure_lineage_owners_unlocked,
+            first_existing_event_id=_first_existing_event_id,
+            touch_activity=_touch_session_activity,
         )
 
-        def statement(connection: sqlite3.Connection) -> bool:
-            try:
-                connection.execute("BEGIN IMMEDIATE")
-                if not sqlite_records.session_exists(connection, session_id):
-                    raise KeyError(f"Session not found: {session_id}")
-                row = connection.execute(
-                    """
-                    SELECT json_extract(payload_json, '$.attempt_id')
-                    FROM cayu_events
-                    WHERE session_id = ?
-                      AND workflow_name = ?
-                      AND event_type = ?
-                    ORDER BY sequence DESC
-                    LIMIT 1
-                    """,
-                    (session_id, workflow_name, WORKFLOW_ATTEMPT_EVENT_TYPE),
-                ).fetchone()
-                if row is None or row[0] != attempt_id:
-                    connection.rollback()
-                    return False
-                if _first_existing_event_id(connection, session_id, [copied_event.id]) is not None:
-                    connection.rollback()
-                    return False
-
-                for owner in self._closure_lineage_owners_unlocked(
-                    (session_id,), connection=connection
-                ):
-                    _check_closure_lineage_owner(owner, (session_id,))
-                _touch_session_activity(connection, session_id, self._ownership_clock())
-                lookup_key, projection, projection_bytes = pending_action_event_storage_values(
-                    copied_event
-                )
-                connection.execute(
-                    """
-                    INSERT INTO cayu_events (
-                        session_id,
-                        event_id,
-                        interaction_id,
-                        event_type,
-                        timestamp,
-                        agent_name,
-                        environment_name,
-                        workflow_name,
-                        tool_name,
-                        payload_json,
-                        pending_action_lookup_key,
-                        pending_action_projection_json,
-                        pending_action_projection_bytes
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        session_id,
-                        copied_event.id,
-                        copied_event.interaction_id,
-                        str(copied_event.type),
-                        sqlite_records.format_datetime(copied_event.timestamp),
-                        copied_event.agent_name,
-                        copied_event.environment_name,
-                        copied_event.workflow_name,
-                        copied_event.tool_name,
-                        sqlite_records.json_dumps(copied_event.payload),
-                        lookup_key,
-                        projection,
-                        projection_bytes,
-                    ),
-                )
-                event_delivery_ops.enqueue_persisted_event_side_effects(
-                    connection,
-                    session_id,
-                    [copied_event],
-                )
-                connection.commit()
-                return True
-            except sqlite3.IntegrityError as exc:
-                connection.rollback()
-                existing_event_id = _first_existing_event_id(
-                    connection,
-                    session_id,
-                    [copied_event.id],
-                )
-                if existing_event_id is not None:
-                    return False
-                raise exc
-            except Exception:
-                connection.rollback()
-                raise
-
-        return await self._run_write(statement)
-
     async def load_mcp_manifest_baselines(
-        self,
-        history_keys: tuple[str, ...],
+        self, history_keys: tuple[str, ...]
     ) -> McpManifestBaselineLoadResult:
-        keys = _validate_mcp_manifest_history_keys(history_keys)
-
-        def query(connection: sqlite3.Connection) -> McpManifestBaselineLoadResult:
-            result: dict[str, McpManifestBaseline] = {}
-            for key in keys:
-                row = connection.execute(
-                    "SELECT generation, baseline_json FROM cayu_mcp_manifest_baselines "
-                    "WHERE history_key = ?",
-                    (key,),
-                ).fetchone()
-                if row is not None:
-                    result[key] = _stored_mcp_manifest_baseline_json(
-                        key,
-                        row["generation"],
-                        row["baseline_json"],
-                    )
-            return McpManifestBaselineLoadResult(baselines=result)
-
-        return await self._run_read(query)
+        return await event_publication_ops.load_mcp_manifest_baselines(self._run_read, history_keys)
 
     async def compare_and_publish_mcp_manifest_checks(
         self,
@@ -8564,140 +8332,17 @@ class SQLiteSessionStore(
         baseline_updates: dict[str, McpManifestBaseline],
         events: list[Event],
     ) -> McpManifestPublicationResult:
-        from cayu.sessions.pending_actions import pending_action_event_storage_values
-
-        session_id, expected, updates, copied_events = _copy_mcp_manifest_publication(
+        return await event_publication_ops.compare_and_publish_mcp_manifest_checks(
+            self._run_write,
             session_id,
             expected_generations=expected_generations,
             baseline_updates=baseline_updates,
             events=events,
+            store_now=self._ownership_clock,
+            closure_owners=self._closure_lineage_owners_unlocked,
+            first_existing_event_id=_first_existing_event_id,
+            touch_activity=_touch_session_activity,
         )
-
-        def statement(connection: sqlite3.Connection) -> McpManifestPublicationResult:
-            try:
-                connection.execute("BEGIN IMMEDIATE")
-                session = sqlite_records.load_session(connection, session_id)
-                if session is None:
-                    raise KeyError(f"Session not found: {session_id}")
-                _assert_session_run_epoch(session_id, session)
-                current: dict[str, McpManifestBaseline] = {}
-                for key in expected:
-                    row = connection.execute(
-                        "SELECT generation, baseline_json "
-                        "FROM cayu_mcp_manifest_baselines "
-                        "WHERE history_key = ?",
-                        (key,),
-                    ).fetchone()
-                    if row is not None:
-                        current[key] = _stored_mcp_manifest_baseline_json(
-                            key,
-                            row["generation"],
-                            row["baseline_json"],
-                        )
-                if any(
-                    expected_generation
-                    != (None if (baseline := current.get(key)) is None else baseline.generation)
-                    for key, expected_generation in expected.items()
-                ):
-                    connection.rollback()
-                    return McpManifestPublicationResult(
-                        published=False,
-                        baselines=current,
-                    )
-
-                _validate_mcp_manifest_publication_state(
-                    expected_generations=expected,
-                    current_baselines=current,
-                    baseline_updates=updates,
-                    events=copied_events,
-                )
-                for owner in self._closure_lineage_owners_unlocked(
-                    (session_id,), connection=connection
-                ):
-                    _check_closure_lineage_owner(owner, (session_id,))
-                _touch_session_activity(connection, session_id, self._ownership_clock())
-                event_rows = []
-                for event in copied_events:
-                    lookup_key, projection, projection_bytes = pending_action_event_storage_values(
-                        event
-                    )
-                    event_rows.append(
-                        (
-                            session_id,
-                            event.id,
-                            event.interaction_id,
-                            str(event.type),
-                            sqlite_records.format_datetime(event.timestamp),
-                            event.agent_name,
-                            event.environment_name,
-                            event.workflow_name,
-                            event.tool_name,
-                            sqlite_records.json_dumps(event.payload),
-                            lookup_key,
-                            projection,
-                            projection_bytes,
-                        )
-                    )
-                connection.executemany(
-                    """
-                    INSERT INTO cayu_events (
-                        session_id, event_id, interaction_id, event_type, timestamp, agent_name,
-                        environment_name, workflow_name, tool_name, payload_json,
-                        pending_action_lookup_key, pending_action_projection_json,
-                        pending_action_projection_bytes
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    event_rows,
-                )
-                event_delivery_ops.enqueue_persisted_event_side_effects(
-                    connection,
-                    session_id,
-                    copied_events,
-                )
-                updated_at = sqlite_records.format_datetime(self._ownership_clock())
-                for key, baseline in updates.items():
-                    connection.execute(
-                        """
-                        INSERT INTO cayu_mcp_manifest_baselines (
-                            history_key, generation, baseline_json, updated_at
-                        )
-                        VALUES (?, ?, ?, ?)
-                        ON CONFLICT(history_key) DO UPDATE SET
-                            generation = excluded.generation,
-                            baseline_json = excluded.baseline_json,
-                            updated_at = excluded.updated_at
-                        """,
-                        (
-                            key,
-                            baseline.generation,
-                            sqlite_records.json_dumps(baseline.model_dump(mode="json")),
-                            updated_at,
-                        ),
-                    )
-                    current[key] = baseline.model_copy(deep=True)
-                connection.commit()
-                return McpManifestPublicationResult(
-                    published=True,
-                    baselines=current,
-                )
-            except sqlite3.IntegrityError as exc:
-                connection.rollback()
-                existing_event_id = _first_existing_event_id(
-                    connection,
-                    session_id,
-                    [event.id for event in copied_events],
-                )
-                if existing_event_id is not None:
-                    raise ValueError(
-                        f"Event already exists for session {session_id}: {existing_event_id}"
-                    ) from exc
-                raise
-            except Exception:
-                connection.rollback()
-                raise
-
-        return await self._run_write(statement)
 
     async def claim_first_persisted_event_side_effect(
         self, expected: PersistedEventSideEffectDelivery
