@@ -75,7 +75,7 @@ def test_foreground_subagent_generated_lineage_survives_short_secret_collision()
 def test_subagent_lineage_redaction_requires_exact_private_provenance(provenance):
     from cayu.runtime._child_session_identity import run_request_with_subagent_lineage
     from cayu.runtime._session_request_boundary import prepare_run_request
-    from cayu.sessions.base import run_request_with_runtime_generated_authority
+    from cayu.sessions.requests import run_request_with_runtime_generated_authority
 
     request = RunRequest(
         session_id="child",

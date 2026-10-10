@@ -130,3 +130,119 @@ for value in (None, True, 64, b"a" * 64, "A" * 64, "a" * 63, "a" * 65):
         "cayu.sessions.creation_claims",
     )
     assert "_require_raw_sha256_digest" not in vars(importlib.import_module("cayu.sessions.base"))
+
+
+def test_creation_claim_authentication_without_implementations():
+    _without_implementations(
+        """
+from cayu.events import Event, EventType
+from cayu.messages import Message
+from cayu.sessions.invocation import InvocationOrigin, SessionExecutionSource, SessionInvocation
+from cayu.sessions.records import RUNTIME_BUILD_PROVENANCE_METADATA_KEY, Session, SessionIdentity
+from cayu.sessions.requests import RunRequest, run_request_with_runtime_generated_authority
+from cayu.sessions.transcript_input import DeferredInteractionInput
+
+key = claims.RuntimeSessionCreateClaimReferenceKey(key_id="test", secret=b"k" * 32)
+source = run_request_with_runtime_generated_authority(
+    RunRequest(agent_name="agent", session_id="owned", messages=[Message.text("user", "input")]),
+    "session_id",
+)
+reference = claims.runtime_session_create_claim_reference(source, operation_id="operation", key=key)
+reference = type(reference).model_validate_json(reference.model_dump_json())
+attached, claim = claims.run_request_with_runtime_session_create_claim_reference(
+    source, reference, operation_id="operation", key=key,
+)
+prepared = claims.apply_runtime_session_create_claim(attached)
+identity = SessionIdentity(provider_name="fake", model="model")
+started = Event(type=EventType.INTERACTION_STARTED, session_id="owned", interaction_id="interaction")
+claims.bind_runtime_session_create_claim(prepared, identity=identity, interaction_started_event=started)
+session = Session(
+    id="owned", agent_name="agent", provider_name="fake", model="model", status="running",
+    invocation=SessionInvocation(origin=InvocationOrigin(trust="unattributed"),
+        root_invocation_id="12345678-1234-4234-8234-123456789abc", root_session_id="owned",
+        source=SessionExecutionSource.SDK_RUN),
+    metadata=prepared.metadata | {RUNTIME_BUILD_PROVENANCE_METADATA_KEY:
+                                 identity.runtime_build_provenance.model_dump(mode="json")},
+)
+deferred = DeferredInteractionInput(interaction_id="interaction", source_messages=source.messages)
+disposition = claims.RuntimeSessionCreateClaimAuthenticationDisposition
+def authenticate(value, pending=deferred, secret_key=key):
+    return claims.authenticate_runtime_session_create_claim_reference(
+        value, pending, claim, reference, request=attached, operation_id="operation",
+        parent_session=None, key=secret_key,
+    )
+assert authenticate(None).disposition is disposition.MISSING_SESSION
+matched = authenticate(session)
+assert matched.matches and matched.transient_input_authenticated
+assert claims.session_has_runtime_create_claim(session, claim)
+assert claims.session_matches_runtime_create_claim(
+    session, deferred, claim, request=attached, parent_session=None)
+assert claims.session_matches_reconstructed_runtime_create_claim(
+    session, deferred, claim, request=attached, parent_session=None)
+assert claims.session_invocation_matches_run_request(session, request=attached, parent_session=None)
+assert claims.strip_runtime_session_create_claim_before_redaction(prepared).metadata == source.metadata
+assert authenticate(session, None).disposition is disposition.INCOMPLETE_EVIDENCE
+terminal = session.model_copy(update={"status": SessionStatus.COMPLETED})
+assert authenticate(terminal, None).matches
+assert not authenticate(terminal, None).transient_input_authenticated
+tampered = deferred.model_copy(update={"source_messages": [Message.text("user", "different")]})
+assert authenticate(session, tampered).disposition is disposition.TAMPERED_EVIDENCE
+assert authenticate(session.model_copy(update={"agent_name": "foreign"})).disposition is disposition.FOREIGN_SESSION
+wrong_key = claims.RuntimeSessionCreateClaimReferenceKey(key_id="test", secret=b"x" * 32)
+assert authenticate(session, secret_key=wrong_key).disposition is disposition.IDENTITY_CONFLICT
+for name in ("runtime_session_create_claim_reference", "bind_runtime_session_create_claim",
+             "authenticate_runtime_session_create_claim_reference"):
+    assert get_type_hints(getattr(claims, name))
+""",
+        "cayu.sessions.creation_claims",
+    )
+
+
+def test_request_attestation_and_prepared_authority_without_implementations():
+    _without_implementations(
+        """
+from dataclasses import replace
+from cayu.sessions import requests
+
+source = requests.RunRequest(agent_name="agent", session_id="owned", messages=[])
+assert not requests.run_request_authority_is_runtime_generated(source, field_name="session_id", value="owned")
+owned = requests.run_request_with_runtime_generated_authority(source, "session_id")
+assert requests.run_request_authority_is_runtime_generated(owned, field_name="session_id", value="owned")
+assert not requests.run_request_authority_is_runtime_generated(owned, field_name="session_id", value="other")
+prepared = requests.run_request_with_prepared_session_authority(
+    owned, session_id="owned", queue_task_id="task", dispatch_operation_id="operation",
+    terminal_event_id="terminal", interaction_id="interaction", interaction_started_event_id="started",
+    idempotency_key="key", submission_sha256="a" * 64, provider_name="fake", model="model",
+    policy_evidence=None,
+)
+authority = requests.runtime_prepared_session_authority(prepared)
+assert authority is not None
+copied = requests.copy_run_request(prepared)
+assert requests.runtime_prepared_session_authority(copied) is authority
+fingerprint = requests._run_request_invocation_lifecycle_authority_sha256
+assert fingerprint(prepared) == fingerprint(copied) != fingerprint(owned)
+copied._runtime_prepared_session_authority = replace(authority, token=object())
+assert requests.runtime_prepared_session_authority(copied) is None
+assert copied._runtime_prepared_session_authority is None
+copied = prepared.model_copy(update={"session_id": "other"})
+assert requests.runtime_prepared_session_authority(copied) is None
+assert requests.runtime_prepared_session_authority(pickle.loads(pickle.dumps(prepared))) is None
+""",
+        "cayu.sessions.requests",
+    )
+
+
+@pytest.mark.parametrize(
+    "name,owner",
+    (
+        ("_runtime_session_create_reference_operation_id", "creation_claims"),
+        ("_runtime_session_create_reference_request_hmac_sha256", "creation_claims"),
+        ("_runtime_session_create_reference_claim_id", "creation_claims"),
+        ("_session_create_claim_record", "creation_claims"),
+        ("_runtime_session_create_authentication", "creation_claims"),
+        ("_run_request_invocation_lifecycle_authority_sha256", "requests"),
+    ),
+)
+def test_private_creation_rules_have_one_owner(name, owner):
+    assert name in vars(importlib.import_module("cayu.sessions." + owner))
+    assert name not in vars(importlib.import_module("cayu.sessions.base"))

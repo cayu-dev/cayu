@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import datetime
+from hashlib import sha256
 from typing import Any, Literal
 
 from pydantic import (
@@ -22,6 +23,7 @@ from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs 
 from cayu._clock import normalize_utc_datetime
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
+    canonical_durable_json_bytes,
     copy_durable_metadata,
     copy_label_map,
     require_durable_json_text,
@@ -1182,3 +1184,207 @@ class _PreparedWorkAttemptCreation:
 
     def __deepcopy__(self, memo: dict[int, Any]) -> _PreparedWorkAttemptCreation:
         return self
+
+
+def _run_request_invocation_lifecycle_authority_sha256(request: RunRequest) -> str:
+    """Hash authenticated private create authority omitted from model serialization."""
+
+    copied = copy_run_request(request)
+    create_claim = copied._runtime_session_create_claim
+    create_claim_material: dict[str, Any] | None = None
+    if type(create_claim) is _RuntimeSessionCreateClaim and (
+        create_claim.token is _RUNTIME_SESSION_CREATE_CLAIM_TOKEN
+    ):
+        expected = create_claim.expected_session_material
+        create_claim_material = {
+            "claim_id": create_claim.claim_id,
+            "session_id": create_claim.session_id,
+            "interaction_id": create_claim.interaction_id,
+            "messages_sha256": create_claim.messages_sha256,
+            "request_sha256": create_claim.request_sha256,
+            "expected_session_material": (
+                None
+                if expected is None
+                else {
+                    "agent_name": expected.agent_name,
+                    "provider_name": expected.provider_name,
+                    "model": expected.model,
+                    "parent_session_id": expected.parent_session_id,
+                    "causal_budget_id": expected.causal_budget_id,
+                    "runtime_name": expected.runtime_name,
+                    "runtime_version": expected.runtime_version,
+                    "environment_name": expected.environment_name,
+                }
+            ),
+        }
+    instance = copied._runtime_session_instance_authority
+    instance_material = (
+        None
+        if type(instance) is not _RuntimeSessionInstanceAuthority
+        or instance.token is not _RUNTIME_SESSION_INSTANCE_AUTHORITY_TOKEN
+        else {
+            "session_id": instance.session_id,
+            "session_instance_id": instance.session_instance_id,
+        }
+    )
+    transcript = copied._runtime_initial_transcript_authority
+    transcript_material = (
+        None
+        if type(transcript) is not _RuntimeInitialTranscriptAuthority
+        or transcript.token is not _RUNTIME_INITIAL_TRANSCRIPT_AUTHORITY_TOKEN
+        else {
+            "session_id": transcript.session_id,
+            "interaction_id": transcript.interaction_id,
+            "source_messages": [
+                item.model_dump(mode="json") for item in transcript.source_messages
+            ],
+            "initial_transcript_messages": [
+                item.model_dump(mode="json") for item in transcript.initial_transcript_messages
+            ],
+        }
+    )
+    prepared = runtime_prepared_session_authority(copied)
+    prepared_material = (
+        None
+        if prepared is None
+        else {
+            "session_id": prepared.session_id,
+            "queue_task_id": prepared.queue_task_id,
+            "dispatch_operation_id": prepared.dispatch_operation_id,
+            "terminal_event_id": prepared.terminal_event_id,
+            "interaction_id": prepared.interaction_id,
+            "interaction_started_event_id": prepared.interaction_started_event_id,
+            "idempotency_key": prepared.idempotency_key,
+            "submission_sha256": prepared.submission_sha256,
+        }
+    )
+    material = {
+        "runtime_generated_authority": [
+            list(item) for item in sorted(copied._runtime_generated_authority)
+        ],
+        "session_create_claim": create_claim_material,
+        "session_instance_authority": instance_material,
+        "initial_transcript_authority": transcript_material,
+        "input_redactions_applied": copied._input_redactions_applied,
+        "verified_invocation_origin": (
+            None
+            if copied._verified_invocation_origin is None
+            else copied._verified_invocation_origin.model_dump(mode="json")
+        ),
+        "runtime_invocation_source": (
+            None
+            if copied._runtime_invocation_source is None
+            else copied._runtime_invocation_source.value
+        ),
+        "task_invocation": (
+            None
+            if copied._runtime_task_invocation is None
+            else copied._runtime_task_invocation.model_dump(mode="json")
+        ),
+        "prepared_session_authority": prepared_material,
+    }
+    return sha256(
+        canonical_durable_json_bytes(material, "run request lifecycle authority")
+    ).hexdigest()
+
+
+def run_request_with_prepared_session_authority(
+    request: RunRequest,
+    *,
+    session_id: str,
+    queue_task_id: str,
+    dispatch_operation_id: str,
+    terminal_event_id: str,
+    interaction_id: str,
+    interaction_started_event_id: str,
+    idempotency_key: str,
+    submission_sha256: str,
+    provider_name: str,
+    model: str,
+    policy_evidence: bytes | None,
+) -> RunRequest:
+    """Bind a validated claimed queue operation to one pre-created child session."""
+
+    copied = copy_run_request(request)
+    if copied.session_id != session_id:
+        raise ValueError("Prepared session authority conflicts with the run request.")
+    copied._runtime_prepared_session_authority = _RuntimePreparedSessionAuthority(
+        token=_RUNTIME_PREPARED_SESSION_AUTHORITY_TOKEN,
+        session_id=session_id,
+        queue_task_id=queue_task_id,
+        dispatch_operation_id=dispatch_operation_id,
+        terminal_event_id=terminal_event_id,
+        interaction_id=interaction_id,
+        interaction_started_event_id=interaction_started_event_id,
+        idempotency_key=idempotency_key,
+        submission_sha256=submission_sha256,
+        provider_name=provider_name,
+        model=model,
+        policy_evidence=policy_evidence,
+    )
+    return copied
+
+
+def runtime_prepared_session_authority(
+    request: RunRequest,
+) -> _RuntimePreparedSessionAuthority | None:
+    """Return authenticated prepared-session authority, clearing malformed copies."""
+
+    if type(request) is not RunRequest:
+        raise TypeError("Prepared session authority requires a RunRequest.")
+    authority = request._runtime_prepared_session_authority
+    if authority is None:
+        return None
+    if (
+        type(authority) is not _RuntimePreparedSessionAuthority
+        or authority.token is not _RUNTIME_PREPARED_SESSION_AUTHORITY_TOKEN
+        or authority.session_id != request.session_id
+    ):
+        request._runtime_prepared_session_authority = None
+        return None
+    return authority
+
+
+def run_request_with_runtime_generated_authority(
+    request: RunRequest,
+    *field_names: str,
+) -> RunRequest:
+    """Attest exact run authority selected by a trusted runtime boundary."""
+
+    if type(request) is not RunRequest:
+        raise TypeError("Runtime authority requires a RunRequest.")
+    authority = set(request._runtime_generated_authority)
+    for field_name in field_names:
+        if field_name not in {
+            "session_id",
+            "task_id",
+            "parent_session_id",
+            "causal_budget_id",
+        }:
+            raise ValueError("Unsupported runtime-generated run authority field.")
+        value = getattr(request, field_name)
+        if type(value) is not str or not value.strip():
+            raise ValueError(
+                f"RunRequest.{field_name} must be a non-empty string before attestation."
+            )
+        authority.add((field_name, value))
+    copied = copy_run_request(request)
+    copied._runtime_generated_authority = frozenset(authority)
+    return copied
+
+
+def run_request_authority_is_runtime_generated(
+    request: RunRequest,
+    *,
+    field_name: str,
+    value: str,
+) -> bool:
+    """Return positive in-process provenance for exact generated run authority."""
+
+    return (
+        type(request) is RunRequest
+        and type(field_name) is str
+        and type(value) is str
+        and getattr(request, field_name, None) == value
+        and (field_name, value) in request._runtime_generated_authority
+    )

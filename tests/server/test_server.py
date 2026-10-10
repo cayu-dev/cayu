@@ -108,11 +108,7 @@ from cayu.server.sse import (
     SSE_REPLAY_PAGE_EVENTS,
     SSE_SEND_TIMEOUT_SECONDS,
 )
-from cayu.sessions.base import (
-    InMemorySessionStore,
-    ModelTarget,
-    run_request_with_runtime_generated_authority,
-)
+from cayu.sessions.base import InMemorySessionStore, ModelTarget
 from cayu.sessions.checkpoints import CURRENT_CHECKPOINT_SCHEMA_VERSION
 from cayu.sessions.event_delivery import PersistedEventSideEffectStatus
 from cayu.sessions.event_queries import EventQuery
@@ -130,6 +126,7 @@ from cayu.sessions.requests import (
     InterruptSessionRequest,
     ResumeRequest,
     RunRequest,
+    run_request_with_runtime_generated_authority,
 )
 from cayu.storage.memory import (
     InMemoryKnowledgeStore,

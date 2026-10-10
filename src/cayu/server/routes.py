@@ -291,7 +291,6 @@ from cayu.sessions.base import (
     ModelTarget,
     SessionStore,
     _with_runtime_resume_transport_metadata,
-    run_request_with_runtime_generated_authority,
     run_request_with_runtime_invocation,
 )
 from cayu.sessions.checkpoints import CheckpointCompatibilityError
@@ -353,6 +352,7 @@ from cayu.sessions.requests import (
     InterruptSessionRequest,
     ResumeRequest,
     RunRequest,
+    run_request_with_runtime_generated_authority,
 )
 from cayu.sessions.summaries import SessionOutcome
 from cayu.sessions.topology import (

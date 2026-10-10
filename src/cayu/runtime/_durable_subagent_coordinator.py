@@ -56,8 +56,6 @@ from cayu.sessions.base import (
     QueuedDispatchTerminalReceipt,
     SessionRunFenced,
     SessionStore,
-    run_request_with_prepared_session_authority,
-    run_request_with_runtime_generated_authority,
     run_request_with_runtime_invocation,
 )
 from cayu.sessions.invocation import (
@@ -71,7 +69,13 @@ from cayu.sessions.records import (
     SessionStatus,
     _queued_dispatch_session_instance_fingerprint,
 )
-from cayu.sessions.requests import InterruptSessionRequest, RunRequest, copy_run_request
+from cayu.sessions.requests import (
+    InterruptSessionRequest,
+    RunRequest,
+    copy_run_request,
+    run_request_with_prepared_session_authority,
+    run_request_with_runtime_generated_authority,
+)
 from cayu.tasks.dispatch import (
     DispatchHandle,
     DispatchStatus,

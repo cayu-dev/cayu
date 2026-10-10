@@ -6,29 +6,33 @@ from dataclasses import dataclass
 
 import pytest
 
-import cayu.sessions.base as sessions_module
 from cayu._validation import canonical_durable_json_bytes
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.runtime import _session_request_boundary as session_request_boundary
+from cayu.sessions import creation_claims as session_creation_claims
+from cayu.sessions import requests as session_request_contracts
 from cayu.sessions.base import (
     InMemorySessionStore,
     SessionExecutionSource,
-    authenticate_runtime_session_create_claim_reference,
-    bind_runtime_session_create_claim,
-    run_request_with_runtime_generated_authority,
     run_request_with_runtime_invocation,
-    run_request_with_runtime_session_create_claim_reference,
-    runtime_session_create_claim_reference,
 )
 from cayu.sessions.creation_claims import (
     SESSION_CREATE_CLAIM_METADATA_KEY,
     RuntimeSessionCreateClaimAuthenticationDisposition,
     RuntimeSessionCreateClaimReference,
     RuntimeSessionCreateClaimReferenceKey,
+    authenticate_runtime_session_create_claim_reference,
+    bind_runtime_session_create_claim,
+    run_request_with_runtime_session_create_claim_reference,
+    runtime_session_create_claim_reference,
 )
 from cayu.sessions.records import Session, SessionIdentity, SessionStatus
-from cayu.sessions.requests import RunRequest, copy_run_request
+from cayu.sessions.requests import (
+    RunRequest,
+    copy_run_request,
+    run_request_with_runtime_generated_authority,
+)
 from cayu.sessions.transcript_input import DeferredInteractionInput
 from cayu.vaults import SecretRedactor
 
@@ -173,7 +177,9 @@ def test_reference_is_bounded_durable_and_reconstructs_only_exact_request() -> N
                 {
                     "request": copied.model_dump(mode="json", warnings=False),
                     "lifecycle_authority_sha256": (
-                        sessions_module._run_request_invocation_lifecycle_authority_sha256(copied)
+                        session_request_contracts._run_request_invocation_lifecycle_authority_sha256(
+                            copied
+                        )
                     ),
                 },
                 "runtime session create reference request",
@@ -227,7 +233,7 @@ def test_reference_is_bounded_durable_and_reconstructs_only_exact_request() -> N
         rebound_reference = restored.model_copy(
             update={
                 "operation_id": rebound_operation_id,
-                "claim_id": sessions_module._runtime_session_create_reference_claim_id(
+                "claim_id": session_creation_claims._runtime_session_create_reference_claim_id(
                     session_id=restored.session_id,
                     operation_id=rebound_operation_id,
                 ),
@@ -483,8 +489,8 @@ def test_live_session_requires_matching_transient_input() -> None:
 def test_authentication_hmac_work_is_constant_per_bounded_request(monkeypatch) -> None:
     async def run() -> None:
         fixture = await _create_claimed_session()
-        request_hmac = sessions_module._runtime_session_create_reference_request_hmac_sha256
-        claim_hash = sessions_module._runtime_session_create_reference_claim_id
+        request_hmac = session_creation_claims._runtime_session_create_reference_request_hmac_sha256
+        claim_hash = session_creation_claims._runtime_session_create_reference_claim_id
         request_hmac_calls = 0
         claim_hash_calls = 0
 
@@ -499,12 +505,12 @@ def test_authentication_hmac_work_is_constant_per_bounded_request(monkeypatch) -
             return claim_hash(**kwargs)
 
         monkeypatch.setattr(
-            sessions_module,
+            session_creation_claims,
             "_runtime_session_create_reference_request_hmac_sha256",
             count_request_hmac,
         )
         monkeypatch.setattr(
-            sessions_module,
+            session_creation_claims,
             "_runtime_session_create_reference_claim_id",
             count_claim_hash,
         )

@@ -574,15 +574,20 @@ their validation, input-evidence composition and detached copy rules. It uses
 existing message, budget, profile, loop-policy and tool-completion contracts
 without loading session stores or execution orchestration. The private authority
 values checked during copying share this owner, preserving exact token identity
-and rejecting forged or mismatched handoffs. Authority issuance and authentication,
-runtime admission and native operations retain their existing owners.
+and rejecting forged or mismatched handoffs. Creation-claim authentication composes
+these values in `sessions/creation_claims.py`; runtime admission and native
+operations retain their existing owners.
 
 ### Session creation claims
 
-`sessions/creation_claims.py` owns bounded creation references, their secret keys
-and authentication results. These values compose without loading session stores
-or execution orchestration. The existing `sessions/authority.py` owns their shared
-raw digest validation, preserving the same checks used by durable record readers.
+`sessions/creation_claims.py` owns bounded creation references, their secret keys,
+claim attachment/binding and authentication against durable session evidence.
+These rules compose request, invocation and transcript-input contracts without
+loading session stores or execution orchestration. `sessions/requests.py` owns
+the prerequisite request attestation, prepared-authority inspection and private
+lifecycle fingerprint. The existing `sessions/authority.py` owns shared raw digest
+validation, preserving the same checks used by durable record readers. Callers
+retain atomic creation, native transactions and recovery sequencing.
 
 ### Session query contracts
 

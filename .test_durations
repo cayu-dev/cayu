@@ -46073,5 +46073,13 @@
     "tests/core/test_session_create_claim_layout.py::test_creation_claim_contract_historical_public_identity[RuntimeSessionCreateClaimReferenceKey]": 0.0007586669526062906,
     "tests/core/test_session_create_claim_layout.py::test_creation_claim_contract_historical_public_identity[RuntimeSessionCreateClaimReference]": 0.0004927499685436487,
     "tests/core/test_session_create_claim_layout.py::test_creation_claim_values_without_implementations": 0.8592407509568147,
-    "tests/core/test_session_create_claim_layout.py::test_raw_digest_validation_has_one_independent_owner": 1.5984826649655588
+    "tests/core/test_session_create_claim_layout.py::test_raw_digest_validation_has_one_independent_owner": 1.5984826649655588,
+    "tests/core/test_session_create_claim_layout.py::test_creation_claim_authentication_without_implementations": 0.5265392489382066,
+    "tests/core/test_session_create_claim_layout.py::test_private_creation_rules_have_one_owner[_run_request_invocation_lifecycle_authority_sha256-requests]": 0.00019037409219890833,
+    "tests/core/test_session_create_claim_layout.py::test_private_creation_rules_have_one_owner[_runtime_session_create_authentication-creation_claims]": 0.00018345797434449196,
+    "tests/core/test_session_create_claim_layout.py::test_private_creation_rules_have_one_owner[_runtime_session_create_reference_claim_id-creation_claims]": 0.00019199895905330777,
+    "tests/core/test_session_create_claim_layout.py::test_private_creation_rules_have_one_owner[_runtime_session_create_reference_operation_id-creation_claims]": 0.0004183329874649644,
+    "tests/core/test_session_create_claim_layout.py::test_private_creation_rules_have_one_owner[_runtime_session_create_reference_request_hmac_sha256-creation_claims]": 0.00020029203733429313,
+    "tests/core/test_session_create_claim_layout.py::test_private_creation_rules_have_one_owner[_session_create_claim_record-creation_claims]": 0.0001751260133460164,
+    "tests/core/test_session_create_claim_layout.py::test_request_attestation_and_prepared_authority_without_implementations": 0.47130154201295227
 }
