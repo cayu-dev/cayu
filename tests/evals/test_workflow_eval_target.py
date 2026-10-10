@@ -916,15 +916,19 @@ def _run_with_post_quiescence_profile_inspection(
         trial_post_close_calls = 0
         runtime_app = _register_app()
         original_inspect = runtime_app.inspect_run_execution_profile
+        initial_fingerprint: str | None = None
 
         async def inspect(request: RunRequest) -> str:
-            nonlocal post_close_calls, trial_post_close_calls
-            fingerprint = await original_inspect(request)
+            nonlocal post_close_calls, trial_post_close_calls, initial_fingerprint
             if not closed:
-                return fingerprint
+                initial_fingerprint = await original_inspect(request)
+                return initial_fingerprint
+            # These trials inject revalidation outcomes into an unchanged workflow.
+            # Keep real profile construction outside the controlled close deadline.
+            assert initial_fingerprint is not None
             post_close_calls += 1
             trial_post_close_calls += 1
-            return inspect_after_close(fingerprint, trial_post_close_calls)
+            return inspect_after_close(initial_fingerprint, trial_post_close_calls)
 
         monkeypatch.setattr(runtime_app, "inspect_run_execution_profile", inspect)
         return WorkflowEvalExecution(
