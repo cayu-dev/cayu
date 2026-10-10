@@ -1804,16 +1804,20 @@ def test_protected_read_fences_recreated_session_before_content_access(
                 # Observe the real hydration/digest entrance, not just the
                 # response postcheck. Positive reauthorization below proves
                 # this spy is on the actual protected reader path.
-                owner = store
-                if operation == "source":
-                    reader_name = "_session_message_source_unlocked"
-                elif backend == "memory":
-                    reader_name = "_inspect_session_message_unlocked"
+                if backend == "memory":
+                    owner = store
+                    reader_name = (
+                        "_session_message_source_unlocked"
+                        if operation == "source"
+                        else "_inspect_session_message_unlocked"
+                    )
                 else:
-                    import cayu.storage.sqlite as sqlite_module
+                    from cayu.storage import _sqlite_session_messages
 
-                    owner = sqlite_module
-                    reader_name = "_queued_session_message_from_row"
+                    owner = _sqlite_session_messages
+                    reader_name = (
+                        "_source_snapshot" if operation == "source" else "message_from_row"
+                    )
                 reader = getattr(owner, reader_name)
                 reads = []
 
